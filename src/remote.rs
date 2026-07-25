@@ -2481,6 +2481,7 @@ fn start_server_agent_session(
             discrete_review: app_config.thor.discrete_review,
             review_root: provenance_cwd.clone(),
             log_context,
+            held_completion_max_wait: None,
         },
     );
     let thor_orchestrator = orchestrated.handle.clone();

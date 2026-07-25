@@ -2803,10 +2803,20 @@ pub(crate) async fn kill_agent_tree(child: &mut Child, agent_pid: Option<u32>) -
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        // A group that still "exists" here is not a teardown failure worth
+        // failing the session over: SIGKILL was already delivered, and
+        // `killpg(pid, 0)` keeps succeeding for zombies whose reparented
+        // waiter never reaps them (common in minimal container inits), as
+        // well as for D-state stragglers under I/O load. Failing fatally
+        // here voided otherwise-completed headless runs whose retained
+        // Eitri workers were killed at session end (observed in benchmark
+        // fleets); the container/OS teardown collects the residue anyway.
         if unix_process_group_exists(pid) {
-            failures.push(format!(
-                "agent process group {pid} still exists after SIGKILL"
-            ));
+            tracing::warn!(
+                event = "agent_group_lingers_after_sigkill",
+                pid,
+                "agent process group still exists after SIGKILL; continuing teardown"
+            );
         }
     }
 

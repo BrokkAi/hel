@@ -299,6 +299,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 model: thor.model.model.clone(),
                 adapter: thor.launch.source_id.clone(),
             }),
+            held_completion_max_wait: None,
         },
     );
     let thor_orchestrator = orchestrated.handle.clone();

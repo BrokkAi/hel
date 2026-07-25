@@ -591,6 +591,20 @@ impl ServerHandler for McpHandler {
     }
 }
 
+// rmcp's LocalSessionManager evicts idle sessions after
+// SessionConfig::keep_alive (default 300s). Benchmark evidence showed a
+// retained mj-code-agent session evicted at exactly 300.014s idle, 404ing
+// every later delegation call; Loki's advisor and pull MCP servers are the
+// same single-tenant, process-lifetime shape, so disable idle eviction here
+// too rather than tuning the timeout. (`SessionConfig`/`LocalSessionManager`
+// are `#[non_exhaustive]`, so they must be built via `Default::default()`
+// plus field assignment rather than struct-literal syntax.)
+fn session_manager_without_idle_eviction() -> LocalSessionManager {
+    let mut manager = LocalSessionManager::default();
+    manager.session_config.keep_alive = None;
+    manager
+}
+
 struct HttpServer {
     advertised: McpServer,
     cancellation: CancellationToken,
@@ -610,7 +624,7 @@ impl HttpServer {
         config.cancellation_token = cancellation.clone();
         let service = StreamableHttpService::new(
             move || Ok(handler.clone()),
-            Arc::new(LocalSessionManager::default()),
+            Arc::new(session_manager_without_idle_eviction()),
             config,
         );
         let protected = axum::Router::new().nest_service(MCP_PATH, service).layer(
@@ -757,7 +771,7 @@ impl PullServer {
         config.cancellation_token = cancellation.clone();
         let service = StreamableHttpService::new(
             move || Ok(handler.clone()),
-            Arc::new(LocalSessionManager::default()),
+            Arc::new(session_manager_without_idle_eviction()),
             config,
         );
         let protected = axum::Router::new().nest_service(MCP_PATH, service).layer(

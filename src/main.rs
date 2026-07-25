@@ -2114,6 +2114,7 @@ async fn run_session(
                 model: council.thor.model.model.clone(),
                 adapter: council.thor.launch.source_id.clone(),
             }),
+            held_completion_max_wait: None,
         },
     );
     let thor_orchestrator = orchestrated.handle.clone();

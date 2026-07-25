@@ -5,6 +5,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{SessionUpdate, StopReason, UsageUpdate};
 use tokio::sync::{Mutex, mpsc};
@@ -183,6 +184,13 @@ fn outcome_label(outcome: &AgentCommandOutcome) -> String {
     }
 }
 
+/// Bound on how long a finished Thor turn can be withheld waiting for an
+/// outstanding Eitri run to resolve. Ordinary keep-running check-ins need
+/// only slice-scale patience; this fires only when an Eitri turn is
+/// wedged, releasing the session instead of hanging until an external kill
+/// (observed in production: 73-minute silent hang ending in SIGTERM).
+const HELD_COMPLETION_MAX_WAIT: Duration = Duration::from_secs(900);
+
 pub struct Config {
     pub reviewer: Option<loki::Handle>,
     pub runtime_commands: mpsc::UnboundedSender<UiCommand>,
@@ -191,6 +199,9 @@ pub struct Config {
     pub discrete_review: bool,
     pub review_root: PathBuf,
     pub log_context: Option<LogContext>,
+    /// Overrides `HELD_COMPLETION_MAX_WAIT` for tests; `None` in production
+    /// uses the real bound.
+    pub held_completion_max_wait: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -224,10 +235,17 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
         drain_used: Arc::new(AtomicBool::new(false)),
     };
     let task = tokio::spawn(async move {
+        let held_completion_max_wait = config
+            .held_completion_max_wait
+            .unwrap_or(HELD_COMPLETION_MAX_WAIT);
         let mut active_worker_updates = config.active_implementation_workers.subscribe();
         let mut advice_watch = config.reviewer.as_ref().map(loki::Handle::subscribe_advice);
         let mut trajectory = loki::BoundaryTracker::default();
         let mut held_completion = None;
+        // Set alongside `held_completion` the moment a finished Thor turn
+        // starts being withheld, and cleared everywhere `held_completion` is
+        // cleared or taken. Drives the bounded release below.
+        let mut held_since: Option<Instant> = None;
         let mut discrete_review_started = false;
         let mut idle_epoch = None;
         let mut interjected_epoch = None;
@@ -254,6 +272,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                         observed_epoch = active.epoch;
                         idle_epoch = None;
                         held_completion = None;
+                        held_since = None;
                         discrete_review_started = false;
                         trajectory = loki::BoundaryTracker::default();
                         manual_review_active = false;
@@ -290,19 +309,24 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                             reset_turn_state(
                                 &mut trajectory,
                                 &mut held_completion,
+                                &mut held_since,
                                 &mut discrete_review_started,
                             );
                             idle_epoch = None;
                             interjected_epoch = Some(active.epoch);
                             manual_review_active = false;
                         }
-                        UiEvent::PromptDone { .. } => held_completion = Some(event),
+                        UiEvent::PromptDone { .. } => {
+                            held_completion = Some(event);
+                            held_since.get_or_insert_with(Instant::now);
+                        }
                         UiEvent::PromptFailed { .. } => {
                             latest_usage_update = None;
                             let _ = events_tx.send(event);
                             reset_turn_state(
                                 &mut trajectory,
                                 &mut held_completion,
+                                &mut held_since,
                                 &mut discrete_review_started,
                             );
                             idle_epoch = None;
@@ -373,6 +397,13 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                         break;
                     }
                 }
+                // Wakes the loop purely on elapsed time so a held completion
+                // gets re-checked (and, past `held_completion_max_wait`,
+                // released) even if no other event ever arrives -- e.g. a
+                // wedged Eitri run that never emits another
+                // `ActiveCodeWorkers` update. A no-op arm (nothing is held)
+                // pends forever and never fires.
+                _ = held_completion_deadline(held_since, held_completion_max_wait) => {}
                 review_target = review_request_rx.recv() => {
                     let Some(review_target) = review_target else { continue; };
                     let active = turn.lock().await.clone();
@@ -436,7 +467,20 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                 continue;
             }
             if *active_worker_updates.borrow() > 0 {
-                continue;
+                let waited = held_since.map_or(Duration::ZERO, |since| since.elapsed());
+                if waited < held_completion_max_wait {
+                    continue;
+                }
+                // A genuinely wedged Eitri turn must not hold the session
+                // open forever behind it (production: a 73-minute silent
+                // hang that only ended via an external SIGTERM). Release
+                // the completion anyway; the still-active worker keeps
+                // running detached in the background.
+                tracing::warn!(
+                    event = "held_completion_released_with_active_worker",
+                    waited_secs = waited.as_secs_f64(),
+                    "held Thor completion released after exceeding the wait bound so the session can end instead of hanging"
+                );
             }
             let active = turn.lock().await.clone();
             if manual_review_active {
@@ -447,6 +491,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                 reset_turn_state(
                     &mut trajectory,
                     &mut held_completion,
+                    &mut held_since,
                     &mut discrete_review_started,
                 );
                 manual_review_active = false;
@@ -475,6 +520,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                 let context =
                     discrete_review_context(delta.as_ref(), trajectory.review_trajectory());
                 held_completion = None;
+                held_since = None;
                 discrete_review_started = true;
                 trajectory.reset_attempt();
                 let prompt = thor_discrete_review_prompt(
@@ -502,6 +548,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
             {
                 log_advice(config.log_context.as_ref(), &advice, "turn_boundary");
                 held_completion = None;
+                held_since = None;
                 trajectory.reset_attempt();
                 emit_internal(
                     &events_tx,
@@ -529,6 +576,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
             reset_turn_state(
                 &mut trajectory,
                 &mut held_completion,
+                &mut held_since,
                 &mut discrete_review_started,
             );
             idle_epoch = Some(active.epoch);
@@ -589,11 +637,26 @@ fn log_advice_drain(context: Option<&LogContext>, advice: &str, note_count: usiz
 fn reset_turn_state(
     trajectory: &mut loki::BoundaryTracker,
     held_completion: &mut Option<UiEvent>,
+    held_since: &mut Option<Instant>,
     discrete_review_started: &mut bool,
 ) {
     *trajectory = loki::BoundaryTracker::default();
     *held_completion = None;
+    *held_since = None;
     *discrete_review_started = false;
+}
+
+/// Resolves once `held_since + max_wait` has elapsed; pends forever while
+/// nothing is held. A select! arm on this is what lets the orchestrator loop
+/// wake up on elapsed time alone, so a held completion still gets released
+/// even if no other event (worker update, advice, etc.) ever arrives.
+async fn held_completion_deadline(held_since: Option<Instant>, max_wait: Duration) {
+    match held_since {
+        Some(since) => {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(since + max_wait)).await
+        }
+        None => std::future::pending().await,
+    }
 }
 
 fn loki_advice_prompt(advice: &str) -> String {
@@ -857,6 +920,7 @@ mod tests {
                 discrete_review: false,
                 review_root: PathBuf::from("."),
                 log_context: None,
+                held_completion_max_wait: None,
             },
         );
 
@@ -890,6 +954,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn held_completion_is_released_after_the_wait_bound_even_with_an_active_worker() {
+        let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let workers = ActiveCodeWorkers::default();
+        // Simulate a wedged Eitri run: ActiveCodeWorkers never drops back to
+        // zero, so nothing but the elapsed-time bound can release Thor's
+        // completion.
+        workers.set(1);
+        let mut running = spawn(
+            runtime_rx,
+            Config {
+                reviewer: None,
+                runtime_commands: command_tx,
+                implementation_handoffs: Arc::new(AtomicUsize::new(1)),
+                active_implementation_workers: workers.clone(),
+                discrete_review: false,
+                review_root: PathBuf::from("."),
+                log_context: None,
+                held_completion_max_wait: Some(Duration::from_millis(50)),
+            },
+        );
+
+        runtime_tx
+            .send(UiEvent::PromptDone {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            })
+            .expect("send completion");
+        assert!(matches!(
+            running.events.recv().await,
+            Some(UiEvent::CouncilUsage(_))
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), running.events.recv())
+                .await
+                .is_err(),
+            "completion escaped before the wait bound elapsed"
+        );
+
+        // Never clear the active worker -- only the bound should release
+        // the completion.
+        let completion =
+            tokio::time::timeout(std::time::Duration::from_secs(2), running.events.recv())
+                .await
+                .expect("completion released after the wait bound elapsed")
+                .expect("orchestrated event");
+        assert!(matches!(completion, UiEvent::PromptDone { .. }));
+        assert_eq!(
+            *workers.subscribe().borrow(),
+            1,
+            "the still-active worker must not be force-cleared, only released from"
+        );
+
+        drop(runtime_tx);
+        running.task.await.expect("orchestrator task");
+    }
+
+    #[tokio::test]
     async fn drain_before_shutdown_is_a_noop_without_a_reviewer() {
         let (_runtime_tx, runtime_rx) = mpsc::unbounded_channel();
         let (command_tx, _command_rx) = mpsc::unbounded_channel();
@@ -903,6 +1025,7 @@ mod tests {
                 discrete_review: false,
                 review_root: PathBuf::from("."),
                 log_context: None,
+                held_completion_max_wait: None,
             },
         );
         // A session without a reviewer configured has no advice to drain,
