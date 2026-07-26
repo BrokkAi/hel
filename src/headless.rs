@@ -402,7 +402,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                         .as_ref()
                         .map_or(1, |reviewer| reviewer.begin_turn(cfg.prompt.clone()));
                     thor_orchestrator
-                        .begin_turn(review_epoch, cfg.prompt.clone(), snapshot)
+                        .begin_turn(review_epoch, cfg.prompt.clone(), Vec::new(), snapshot)
                         .await;
                     let command = UiCommand::SendPrompt {
                         text: cfg.prompt.clone(),
@@ -585,6 +585,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                         crate::event::InternalMessageKind::Continuation => "continuation",
                         crate::event::InternalMessageKind::Interjection => "interjection",
                         crate::event::InternalMessageKind::ReviewLane => "review_lane",
+                        crate::event::InternalMessageKind::ReviewProgress => "review_progress",
                         crate::event::InternalMessageKind::ReviewSynthesis => "review_synthesis",
                     };
                     emit_json(&StreamRecord::Review {

@@ -2537,7 +2537,7 @@ fn start_server_agent_session(
                         continue;
                     }
                     tracker.observe_command(&command);
-                    if let UiCommand::SendPrompt { text, .. } = &command {
+                    if let UiCommand::SendPrompt { text, images } = &command {
                         local_epoch = local_epoch.saturating_add(1);
                         handoffs.store(0, std::sync::atomic::Ordering::Release);
                         let snapshot =
@@ -2547,13 +2547,14 @@ fn start_server_agent_session(
                             .as_ref()
                             .map_or(local_epoch, |reviewer| reviewer.begin_turn(text.clone()));
                         thor_orchestrator
-                            .begin_turn(epoch, text.clone(), snapshot)
+                            .begin_turn(epoch, text.clone(), images.clone(), snapshot)
                             .await;
                     }
-                    if matches!(command, UiCommand::CancelPrompt)
-                        && let Some(reviewer) = loki.as_ref()
-                    {
-                        reviewer.cancel_turn();
+                    if matches!(command, UiCommand::CancelPrompt) {
+                        thor_orchestrator.cancel_review();
+                        if let Some(reviewer) = loki.as_ref() {
+                            reviewer.cancel_turn();
+                        }
                     }
                     let shutdown = matches!(command, UiCommand::Shutdown);
                     if runtime_cmd_tx.send(command).is_err() || shutdown {
@@ -6073,6 +6074,36 @@ mod tests {
         assert_eq!(snapshot.transcript.len(), 2);
         assert_eq!(snapshot.transcript[1].kind, "system");
         assert_eq!(snapshot.transcript[1].text, "prompt already in flight");
+    }
+
+    #[test]
+    fn tracker_surfaces_review_supervisor_progress_without_ending_prompt() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.observe_command(&UiCommand::SendPrompt {
+            text: "implement it".to_string(),
+            images: Vec::new(),
+        });
+
+        state.observe_event(&UiEvent::InternalMessage(crate::event::InternalMessage {
+            source: "Thor".to_string(),
+            target: "Thor".to_string(),
+            kind: crate::event::InternalMessageKind::ReviewProgress,
+            text: "Adversarial synthesis started.".to_string(),
+        }));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert!(snapshot.prompt_in_flight);
+        assert_eq!(snapshot.transcript.len(), 2);
+        assert_eq!(snapshot.transcript[1].kind, "system");
+        assert_eq!(snapshot.transcript[1].actor.as_deref(), Some("thor"));
+        assert_eq!(
+            snapshot.transcript[1].text,
+            "Adversarial synthesis started."
+        );
     }
 
     #[test]

@@ -84,6 +84,9 @@ pub enum InternalMessageKind {
     Interjection,
     /// A specialist review lane's report from the discrete-review fan-out.
     ReviewLane,
+    /// Progress from the tool-using review supervisor while the held turn is
+    /// still being vetted.
+    ReviewProgress,
     /// The review supervisor's synthesis of all lane reports.
     ReviewSynthesis,
 }
