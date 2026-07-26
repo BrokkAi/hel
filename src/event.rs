@@ -82,6 +82,10 @@ pub enum InternalMessageKind {
     /// Loki finished reviewing after the turn already completed; the council
     /// starts a fresh Thor turn to surface the late advice to the user.
     Interjection,
+    /// A specialist review lane's report from the discrete-review fan-out.
+    ReviewLane,
+    /// The review supervisor's synthesis of all lane reports.
+    ReviewSynthesis,
 }
 
 /// Events flowing from the ACP runtime into the UI task.

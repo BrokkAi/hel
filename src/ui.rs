@@ -3618,7 +3618,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         state.scroll_input_to_bottom();
         let eitri = state.council_usage.eitri();
         state.push_system_message(format!(
-            "Council models\nThor   {}\nEitri  {}\nLoki   {}\n\nUsage (tokens)\nThor   {}\nEitri  {} (code {}, explore {})\nLoki   {}",
+            "Council models\nThor   {}\nEitri  {}\nLoki   {}\n\nUsage (tokens)\nThor   {}\nEitri  {} (code {}, explore {}, review {})\nLoki   {}",
             state.active_council_models.thor,
             state.active_council_models.eitri,
             state.active_council_models.loki,
@@ -3626,6 +3626,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
             council_role_usage_label(&eitri),
             council_role_usage_label(&state.council_usage.eitri_code),
             council_role_usage_label(&state.council_usage.eitri_explore),
+            council_role_usage_label(&state.council_usage.eitri_review),
             council_role_usage_label(&state.council_usage.loki),
         ));
         return;
@@ -4088,6 +4089,12 @@ fn transcript_export_markdown(state: &AppState) -> String {
                     }
                     crate::event::InternalMessageKind::Interjection => {
                         format!("{} → {} interjection", message.source, message.target)
+                    }
+                    crate::event::InternalMessageKind::ReviewLane => {
+                        format!("{} review lane", message.source)
+                    }
+                    crate::event::InternalMessageKind::ReviewSynthesis => {
+                        format!("{} review synthesis", message.source)
                     }
                 };
                 push_export_text(&mut out, &heading, &message.text);
@@ -6151,6 +6158,16 @@ fn render_transcript_entry_range(
                             message.target,
                             message_size_label(chars)
                         )
+                    }
+                    crate::event::InternalMessageKind::ReviewLane => {
+                        format!(
+                            "review lane {} · {}",
+                            message.source,
+                            message_size_label(chars)
+                        )
+                    }
+                    crate::event::InternalMessageKind::ReviewSynthesis => {
+                        format!("review synthesis · {}", message_size_label(chars))
                     }
                 };
                 out.push(Line::from(Span::styled(
@@ -13790,7 +13807,7 @@ mod tests {
         assert!(matches!(
             state.transcript.last(),
             Some(Entry::System(text))
-                if text == "Council models\nThor   claude-opus\nEitri  gpt-5.5\nLoki   off\n\nUsage (tokens)\nThor   0 tokens\nEitri  0 tokens (code 0 tokens, explore 0 tokens)\nLoki   0 tokens"
+                if text == "Council models\nThor   claude-opus\nEitri  gpt-5.5\nLoki   off\n\nUsage (tokens)\nThor   0 tokens\nEitri  0 tokens (code 0 tokens, explore 0 tokens, review 0 tokens)\nLoki   0 tokens"
         ));
     }
 

@@ -20,6 +20,7 @@ mod council_orchestrator;
 mod council_usage;
 mod deepseek_balance;
 mod deepswe;
+mod discrete_review;
 mod event;
 mod headless;
 mod install;
@@ -2018,6 +2019,10 @@ async fn run_session(
     };
     let mut ui_event_rx = ui_event_rx;
 
+    // The discrete review's specialist lanes run on Eitri's seat, so they need
+    // the pool that is about to move into the code-agent config.
+    let review_workers = eitri_pool.clone();
+
     let runtime_cfg = acp::AcpRuntimeConfig {
         command: agent.program.clone(),
         args: agent.args.clone(),
@@ -2115,6 +2120,15 @@ async fn run_session(
                 adapter: council.thor.launch.source_id.clone(),
             }),
             held_completion_max_wait: None,
+            review_fanout: review_workers.map(|workers| {
+                discrete_review::Spawner::live(discrete_review::FanoutConfig {
+                    workers,
+                    supervisor: council.thor.clone(),
+                    cwd: cwd.clone(),
+                    additional_directories: runtime_options.additional_directories.clone(),
+                    council_session: Some(council_session.clone()),
+                })
+            }),
         },
     );
     let thor_orchestrator = orchestrated.handle.clone();

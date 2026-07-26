@@ -16,6 +16,7 @@ pub enum Role {
 pub enum Purpose {
     Code,
     Explore,
+    Review,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +47,7 @@ pub struct Snapshot {
     pub loki: RoleUsage,
     pub eitri_code: RoleUsage,
     pub eitri_explore: RoleUsage,
+    pub eitri_review: RoleUsage,
     #[serde(skip)]
     baselines: HashMap<(Role, Option<Purpose>), Baseline>,
 }
@@ -79,6 +81,7 @@ impl Snapshot {
             (Role::Thor, _) => &mut self.thor,
             (Role::Loki, _) => &mut self.loki,
             (Role::Eitri, Some(Purpose::Explore)) => &mut self.eitri_explore,
+            (Role::Eitri, Some(Purpose::Review)) => &mut self.eitri_review,
             (Role::Eitri, _) => &mut self.eitri_code,
         };
         usage.prompts += 1;
@@ -151,6 +154,16 @@ impl Snapshot {
         for (currency, amount) in &self.eitri_explore.costs {
             *total.costs.entry(currency.clone()).or_default() += amount;
         }
+        total.prompts += self.eitri_review.prompts;
+        total.total_tokens += self.eitri_review.total_tokens;
+        total.input_tokens += self.eitri_review.input_tokens;
+        total.output_tokens += self.eitri_review.output_tokens;
+        total.thought_tokens += self.eitri_review.thought_tokens;
+        total.context_used += self.eitri_review.context_used;
+        total.context_size += self.eitri_review.context_size;
+        for (currency, amount) in &self.eitri_review.costs {
+            *total.costs.entry(currency.clone()).or_default() += amount;
+        }
         total
     }
 }
@@ -176,10 +189,18 @@ mod tests {
             update: None,
             session_id: None,
         });
+        snapshot.observe(Record {
+            role: Role::Eitri,
+            purpose: Some(Purpose::Review),
+            usage: Some(Usage::new(30, 25, 5)),
+            update: None,
+            session_id: None,
+        });
 
         assert_eq!(snapshot.eitri_code.total_tokens, 10);
         assert_eq!(snapshot.eitri_explore.total_tokens, 20);
-        assert_eq!(snapshot.eitri().total_tokens, 30);
+        assert_eq!(snapshot.eitri_review.total_tokens, 30);
+        assert_eq!(snapshot.eitri().total_tokens, 60);
     }
 
     #[test]

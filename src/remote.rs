@@ -1015,6 +1015,7 @@ impl TrackerState {
                 let purpose = record.purpose.map_or("", |purpose| match purpose {
                     crate::council_usage::Purpose::Code => " code",
                     crate::council_usage::Purpose::Explore => " explore",
+                    crate::council_usage::Purpose::Review => " review",
                 });
                 let cost = record
                     .update
@@ -2423,6 +2424,11 @@ fn start_server_agent_session(
     });
     let implementation_handoffs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let active_implementation_workers = code_agent::ActiveCodeWorkers::default();
+    // The discrete review's specialist lanes run on Eitri's seat and share
+    // Thor's workspace roots, so both have to be cloned before they move into
+    // the code-agent config and the runtime config respectively.
+    let review_workers = eitri_pool.clone();
+    let review_additional_directories = additional_directories.clone();
     let code_agent = eitri_pool.map(|eitri_pool| {
         code_agent::Config::council(eitri_pool, None, loki_handle.clone())
             .with_implementation_handoff_counter(implementation_handoffs.clone())
@@ -2482,6 +2488,17 @@ fn start_server_agent_session(
             review_root: provenance_cwd.clone(),
             log_context,
             held_completion_max_wait: None,
+            review_fanout: review_workers
+                .zip(council.as_ref())
+                .map(|(workers, resolved)| {
+                    crate::discrete_review::Spawner::live(crate::discrete_review::FanoutConfig {
+                        workers,
+                        supervisor: resolved.thor.clone(),
+                        cwd: provenance_cwd.clone(),
+                        additional_directories: review_additional_directories,
+                        council_session: Some(format!("remote-{}", std::process::id())),
+                    })
+                }),
         },
     );
     let thor_orchestrator = orchestrated.handle.clone();

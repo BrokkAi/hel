@@ -227,6 +227,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             event_tx.clone(),
         )
     });
+    // The discrete review's specialist lanes run on Eitri's seat, so they need
+    // the pool that is about to move into the code-agent config.
+    let review_workers = eitri_pool.clone();
     let implementation_handoffs = Arc::new(AtomicUsize::new(0));
     let active_implementation_workers = code_agent::ActiveCodeWorkers::default();
     let mut thor_env = thor.launch.env.clone();
@@ -300,6 +303,15 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 adapter: thor.launch.source_id.clone(),
             }),
             held_completion_max_wait: None,
+            review_fanout: review_workers.map(|workers| {
+                crate::discrete_review::Spawner::live(crate::discrete_review::FanoutConfig {
+                    workers,
+                    supervisor: thor.clone(),
+                    cwd: cfg.cwd.clone(),
+                    additional_directories: cfg.additional_directories.clone(),
+                    council_session: Some(format!("headless-{}", std::process::id())),
+                })
+            }),
         },
     );
     let thor_orchestrator = orchestrated.handle.clone();
@@ -572,6 +584,8 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                         crate::event::InternalMessageKind::DiscreteReview => "discrete_review",
                         crate::event::InternalMessageKind::Continuation => "continuation",
                         crate::event::InternalMessageKind::Interjection => "interjection",
+                        crate::event::InternalMessageKind::ReviewLane => "review_lane",
+                        crate::event::InternalMessageKind::ReviewSynthesis => "review_synthesis",
                     };
                     emit_json(&StreamRecord::Review {
                         actor: &message.source.to_ascii_lowercase(),
