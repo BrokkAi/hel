@@ -402,7 +402,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     let snapshot =
                         crate::workspace_snapshot::WorkspaceSnapshot::capture(&roots).await;
                     primary_orchestrator
-                        .begin_turn(1, cfg.prompt.clone(), snapshot)
+                        .begin_turn(1, cfg.prompt.clone(), Vec::new(), snapshot)
                         .await;
                     let command = UiCommand::SendPrompt {
                         text: cfg.prompt.clone(),
@@ -605,6 +605,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                         crate::event::InternalMessageKind::Delegation => "delegation",
                         crate::event::InternalMessageKind::DiscreteReview => "discrete_review",
                         crate::event::InternalMessageKind::ReviewLane => "review_lane",
+                        crate::event::InternalMessageKind::ReviewProgress => "review_progress",
                         crate::event::InternalMessageKind::ReviewSynthesis => "review_synthesis",
                     };
                     emit_json(&StreamRecord::Review {

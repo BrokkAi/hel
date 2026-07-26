@@ -16,8 +16,8 @@ use crate::{
     agent_usage::{Record, Seat},
     discrete_review,
     event::{
-        AgentCommandOutcome, CompactTrigger, InternalMessage, InternalMessageKind, ReviewTarget,
-        SubagentOutcome, UiCommand, UiEvent,
+        AgentCommandOutcome, CompactTrigger, InternalMessage, InternalMessageKind, PromptImage,
+        ReviewTarget, SubagentOutcome, UiCommand, UiEvent, content_block_text,
     },
     subagent::{ActiveSubagentWorkers, SubagentReport, SubagentReportBus},
     trajectory::BoundaryTracker,
@@ -30,7 +30,58 @@ use crate::{
 struct ActiveTurn {
     epoch: u64,
     task: String,
+    images: Arc<Vec<PromptImage>>,
     snapshot: Option<WorkspaceSnapshot>,
+}
+
+#[derive(Default)]
+struct UserMessageHistory {
+    messages: Vec<String>,
+    pending_replay: String,
+}
+
+impl UserMessageHistory {
+    fn clear(&mut self) {
+        self.messages.clear();
+        self.pending_replay.clear();
+    }
+
+    fn observe(&mut self, update: &SessionUpdate) {
+        match update {
+            SessionUpdate::UserMessageChunk(chunk) => {
+                self.pending_replay
+                    .push_str(&content_block_text(&chunk.content));
+            }
+            SessionUpdate::AgentMessageChunk(_)
+            | SessionUpdate::AgentThoughtChunk(_)
+            | SessionUpdate::ToolCall(_)
+            | SessionUpdate::Plan(_) => self.finish_pending(),
+            _ => {}
+        }
+    }
+
+    fn record_prompt(&mut self, text: String) {
+        self.finish_pending();
+        self.push_deduplicated(text);
+    }
+
+    fn snapshot(&mut self) -> Vec<String> {
+        self.finish_pending();
+        self.messages.clone()
+    }
+
+    fn finish_pending(&mut self) {
+        if !self.pending_replay.is_empty() {
+            let message = std::mem::take(&mut self.pending_replay);
+            self.push_deduplicated(message);
+        }
+    }
+
+    fn push_deduplicated(&mut self, text: String) {
+        if !text.trim().is_empty() && self.messages.last() != Some(&text) {
+            self.messages.push(text);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -44,19 +95,36 @@ struct ChangedTurnReview {
 #[derive(Clone)]
 pub struct Handle {
     turn: Arc<Mutex<ActiveTurn>>,
+    user_messages: Arc<Mutex<UserMessageHistory>>,
     review_enabled: Arc<AtomicBool>,
     runtime_commands: mpsc::UnboundedSender<UiCommand>,
     events: mpsc::UnboundedSender<UiEvent>,
     review_requests: mpsc::UnboundedSender<ReviewTarget>,
+    review_cancels: mpsc::UnboundedSender<()>,
 }
 
 impl Handle {
-    pub async fn begin_turn(&self, epoch: u64, task: String, snapshot: WorkspaceSnapshot) {
+    pub async fn begin_turn(
+        &self,
+        epoch: u64,
+        task: String,
+        images: Vec<PromptImage>,
+        snapshot: WorkspaceSnapshot,
+    ) {
+        self.user_messages.lock().await.record_prompt(task.clone());
         *self.turn.lock().await = ActiveTurn {
             epoch,
             task,
+            images: Arc::new(images),
             snapshot: Some(snapshot),
         };
+    }
+
+    /// Cancel review work that is holding an already-completed primary turn.
+    /// The orchestrator releases that completion instead of starting a
+    /// fallback review, so the visible Stop control is truthful.
+    pub fn cancel_review(&self) {
+        let _ = self.review_cancels.send(());
     }
 
     pub fn set_review_enabled(&self, enabled: bool) {
@@ -158,14 +226,18 @@ pub struct Running {
 pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: Config) -> Running {
     let (events_tx, events) = mpsc::unbounded_channel();
     let (review_requests, mut review_request_rx) = mpsc::unbounded_channel();
+    let (review_cancels, mut review_cancel_rx) = mpsc::unbounded_channel();
     let turn = Arc::new(Mutex::new(ActiveTurn::default()));
+    let user_messages = Arc::new(Mutex::new(UserMessageHistory::default()));
     let review_enabled = Arc::new(AtomicBool::new(config.discrete_review));
     let handle = Handle {
         turn: turn.clone(),
+        user_messages: user_messages.clone(),
         review_enabled: review_enabled.clone(),
         runtime_commands: config.runtime_commands.clone(),
         events: events_tx.clone(),
         review_requests,
+        review_cancels,
     };
     let (review_outcome_tx, mut review_outcome_rx) =
         mpsc::unbounded_channel::<discrete_review::ReviewOutcome>();
@@ -230,6 +302,16 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
             tokio::select! {
                 event = runtime_events.recv() => {
                     let Some(event) = event else { break; };
+                    if matches!(event, UiEvent::SessionStarted { .. }) {
+                        // Loading an existing session replays its complete
+                        // history even when the session id is unchanged.
+                        // Rebuild from that replay rather than appending a
+                        // second copy to the history already collected.
+                        user_messages.lock().await.clear();
+                    }
+                    if let UiEvent::SessionUpdate(update) = &event {
+                        user_messages.lock().await.observe(update);
+                    }
                     let active = turn.lock().await.clone();
                     if matches!(event, UiEvent::ContextCompacted) {
                         continue;
@@ -400,6 +482,36 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                         );
                     }
                 }
+                cancel = review_cancel_rx.recv() => {
+                    let Some(()) = cancel else { break; };
+                    let active = turn.lock().await.clone();
+                    if let Some(review) = review_in_flight.take() {
+                        review.cancel.cancel();
+                        let _ = events_tx.send(UiEvent::Info(
+                            "discrete review · cancelled; releasing completed turn".to_string(),
+                        ));
+                        let _ = events_tx.send(review.completion);
+                        reset_turn_state(
+                            &mut trajectory,
+                            &mut held_completion,
+                            &mut discrete_review_started,
+                            &mut review_in_flight,
+                        );
+                        idle_epoch = Some(active.epoch);
+                    } else if let Some(completion) = held_completion.take() {
+                        let _ = events_tx.send(UiEvent::Info(
+                            "discrete review · cancelled; releasing completed turn".to_string(),
+                        ));
+                        let _ = events_tx.send(completion);
+                        reset_turn_state(
+                            &mut trajectory,
+                            &mut held_completion,
+                            &mut discrete_review_started,
+                            &mut review_in_flight,
+                        );
+                        idle_epoch = Some(active.epoch);
+                    }
+                }
                 review_target = review_request_rx.recv() => {
                     let Some(review_target) = review_target else { continue; };
                     let active = turn.lock().await.clone();
@@ -516,6 +628,8 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                     let job = discrete_review::ReviewJob {
                         epoch: active.epoch,
                         task: active.task.clone(),
+                        images: active.images.as_ref().clone(),
+                        user_messages: user_messages.lock().await.snapshot(),
                         initial_result: initial_result.clone(),
                         trajectory: review_trajectory,
                         diff,
@@ -810,6 +924,46 @@ fn emit_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
+
+    fn text_chunk(text: &str) -> ContentChunk {
+        ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
+    }
+
+    #[test]
+    fn user_message_history_merges_replay_chunks_and_deduplicates_live_echoes() {
+        let mut history = UserMessageHistory::default();
+        history.observe(&SessionUpdate::UserMessageChunk(text_chunk("older ")));
+        history.observe(&SessionUpdate::UserMessageChunk(text_chunk("request")));
+        history.observe(&SessionUpdate::AgentMessageChunk(text_chunk("done")));
+        history.record_prompt("current request".to_string());
+        history.observe(&SessionUpdate::UserMessageChunk(text_chunk(
+            "current request",
+        )));
+        history.observe(&SessionUpdate::AgentThoughtChunk(text_chunk("working")));
+
+        assert_eq!(
+            history.snapshot(),
+            vec!["older request".to_string(), "current request".to_string()]
+        );
+
+        // A same-session load emits SessionStarted and then replays the full
+        // history. The event loop clears at SessionStarted; rebuilding must not
+        // append a second copy of the prior messages.
+        history.clear();
+        history.observe(&SessionUpdate::UserMessageChunk(text_chunk(
+            "older request",
+        )));
+        history.observe(&SessionUpdate::AgentMessageChunk(text_chunk("done")));
+        history.observe(&SessionUpdate::UserMessageChunk(text_chunk(
+            "current request",
+        )));
+        history.observe(&SessionUpdate::AgentThoughtChunk(text_chunk("working")));
+        assert_eq!(
+            history.snapshot(),
+            vec!["older request".to_string(), "current request".to_string()]
+        );
+    }
 
     #[test]
     fn review_requires_a_handoff_changes_and_a_drained_subagent_pool() {
@@ -976,7 +1130,7 @@ mod tests {
         let mut running = spawn(runtime_rx, fanout_config(command_tx, spawner));
         running
             .handle
-            .begin_turn(1, "add a retry".to_string(), snapshot)
+            .begin_turn(1, "add a retry".to_string(), Vec::new(), snapshot)
             .await;
         runtime_tx.send(completion()).expect("send completion");
 
@@ -1014,7 +1168,7 @@ mod tests {
         let mut running = spawn(runtime_rx, fanout_config(command_tx, spawner));
         running
             .handle
-            .begin_turn(1, "add a retry".to_string(), snapshot)
+            .begin_turn(1, "add a retry".to_string(), Vec::new(), snapshot)
             .await;
         runtime_tx.send(completion()).expect("send completion");
 
@@ -1054,7 +1208,7 @@ mod tests {
         let running = spawn(runtime_rx, fanout_config(command_tx, spawner));
         running
             .handle
-            .begin_turn(1, "add a retry".to_string(), snapshot)
+            .begin_turn(1, "add a retry".to_string(), Vec::new(), snapshot)
             .await;
         runtime_tx.send(completion()).expect("send completion");
 
@@ -1091,7 +1245,7 @@ mod tests {
         let mut running = spawn(runtime_rx, fanout_config(command_tx, spawner));
         running
             .handle
-            .begin_turn(1, "add a retry".to_string(), snapshot)
+            .begin_turn(1, "add a retry".to_string(), Vec::new(), snapshot)
             .await;
         runtime_tx.send(completion()).expect("send completion");
 
@@ -1106,6 +1260,7 @@ mod tests {
             .begin_turn(
                 2,
                 "something else".to_string(),
+                Vec::new(),
                 WorkspaceSnapshot::capture(&[]).await,
             )
             .await;
@@ -1130,6 +1285,49 @@ mod tests {
                 "the superseded turn's completion must not be released"
             );
         }
+
+        drop(runtime_tx);
+        running.task.await.expect("orchestrator task");
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_an_in_flight_review_and_releases_the_held_completion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let snapshot = changed_workspace(temp.path()).await;
+        let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+        let spawner = discrete_review::Spawner::stub(move |_job, _events, cancel, _outcomes| {
+            let _ = token_tx.send(cancel);
+        });
+        let mut running = spawn(runtime_rx, fanout_config(command_tx, spawner));
+        running
+            .handle
+            .begin_turn(1, "add a retry".to_string(), Vec::new(), snapshot)
+            .await;
+        runtime_tx.send(completion()).expect("send completion");
+
+        let cancel = tokio::time::timeout(Duration::from_secs(5), token_rx.recv())
+            .await
+            .expect("the fan-out was dispatched")
+            .expect("token channel open");
+        running.handle.cancel_review();
+
+        tokio::time::timeout(Duration::from_secs(5), cancel.cancelled())
+            .await
+            .expect("Stop must cancel the fan-out token");
+        let released = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(event) = running.events.recv().await
+                    && matches!(event, UiEvent::PromptDone { .. })
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("Stop must release the held completion");
+        assert!(matches!(released, UiEvent::PromptDone { .. }));
 
         drop(runtime_tx);
         running.task.await.expect("orchestrator task");
@@ -1238,6 +1436,7 @@ mod tests {
             .begin_turn(
                 1,
                 "do the thing".to_string(),
+                Vec::new(),
                 WorkspaceSnapshot::capture(&[]).await,
             )
             .await;

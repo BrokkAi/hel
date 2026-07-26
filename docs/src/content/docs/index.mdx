@@ -10,7 +10,7 @@ hero:
       link: install/
       icon: right-arrow
       variant: primary
-    - text: View on GitHub
+    - text: Overview
       link: https://github.com/BrokkAi/mjolnir
       icon: external
       variant: secondary
@@ -21,18 +21,26 @@ hero:
   <h2>One agent owns the outcome. Many do the work.</h2>
   <p>Mjolnir turns a single coding session into a small, deliberate crew. The primary agent plans, delegates, and reviews; each subagent runs in a fresh session and pushes its report back into the conversation.</p>
   <div class="role-grid">
-    <article>
-      <small>01 / COORDINATE</small>
-      <h3>The primary directs</h3>
-      <p>Owns every user turn, writes the standalone briefs, reviews what comes back, and delivers the answer.</p>
-      <code>agent://primary</code>
-    </article>
-    <article>
-      <small>02 / DELEGATE</small>
-      <h3>Subagents forge</h3>
-      <p>Up to sixteen background sessions, all write-capable, each reporting its result, activity log, and diff when it finishes.</p>
-      <code>tool://create_subagent</code>
-    </article>
+    <div class="role-grid__inner">
+      <article>
+        <small>01 / COORDINATE</small>
+        <h3>The primary directs</h3>
+        <p>Owns every user turn, writes the standalone briefs, reviews what comes back, and delivers the answer.</p>
+        <code>agent://primary</code>
+      </article>
+      <article>
+        <small>02 / DELEGATE</small>
+        <h3>Subagents forge</h3>
+        <p>Background sessions, all write-capable, each reporting its result, activity log, and diff when it finishes.</p>
+        <code>tool://create_subagent</code>
+      </article>
+      <article>
+        <small>03 / REVIEW</small>
+        <h3>Review challenges</h3>
+        <p>Once the delegated work lands, specialist lanes re-read the diff and an adversarial supervisor vets their findings before the turn completes.</p>
+        <code>agent://review</code>
+      </article>
+    </div>
   </div>
 </section>
 
@@ -41,18 +49,20 @@ hero:
   <h2>Agent work that feels native to the command line.</h2>
   <p>Inline rendering keeps the shell in view while Mjolnir handles streaming, permissions, tools, live subagent status, sessions, worktrees, and model-specific controls.</p>
   <div class="capability-grid">
-    <a href="subagents/">
-      <span>01 / ORCHESTRATE</span><h3>Parallel subagents</h3><p>Launch background work, watch it live, and get each report pushed back into the turn.</p>
-    </a>
-    <a href="configuration/">
-      <span>02 / CONTROL</span><h3>Explicit permissions</h3><p>Keep agent choices readable and interactive without leaving the terminal.</p>
-    </a>
-    <a href="sessions-worktrees/">
-      <span>03 / RESUME</span><h3>Durable sessions</h3><p>Resume the original route and isolate work in linked Git worktrees.</p>
-    </a>
-    <a href="remote/">
-      <span>04 / AUTOMATE</span><h3>Headless + remote</h3><p>Drive the same session from scripts, JSON streams, or a remote client.</p>
-    </a>
+    <div class="capability-grid__inner">
+      <a href="subagents/">
+        <span>01 / ORCHESTRATE</span><h3>Parallel subagents</h3><p>Launch background work, watch it live, and get each report pushed back into the turn.</p>
+      </a>
+      <a href="configuration/">
+        <span>02 / CONTROL</span><h3>Explicit permissions</h3><p>Keep agent choices readable and interactive without leaving the terminal.</p>
+      </a>
+      <a href="sessions-worktrees/">
+        <span>03 / RESUME</span><h3>Durable sessions</h3><p>Resume the original route and isolate work in linked Git worktrees.</p>
+      </a>
+      <a href="remote/">
+        <span>04 / AUTOMATE</span><h3>Headless + remote</h3><p>Drive the same session from scripts, JSON streams, or a remote client.</p>
+      </a>
+    </div>
   </div>
 </section>
 

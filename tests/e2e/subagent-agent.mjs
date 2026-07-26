@@ -130,13 +130,19 @@ function primaryReviewResult() {
     : "PRIMARY FINAL REVIEWED";
 }
 
-// The discrete review fans out over read-only specialist lanes and then vets
-// their reports with a single-shot synthesis on the primary's model. Both run
-// as their own ACP sessions through this same fixture, so they are recognized
-// by prompt shape rather than by model. Answering them immediately keeps the
-// fan-out deterministic: a lane that fell through to the ordinary subagent path
-// would sit in the permission/terminal dance until its 300s timeout.
+// The discrete review runs three kinds of read-only session: one intent
+// analyst on the subagent pool, the specialist lanes, and the adversarial
+// supervisor on the primary's model. All three arrive through this same
+// fixture, so they are recognized by prompt shape rather than by model.
+// Answering them immediately keeps the fan-out deterministic: a session that
+// fell through to the ordinary subagent path would sit in the
+// permission/terminal dance until its timeout.
 function answerReviewSession(text) {
+  if (text.includes("You are a read-only intent analyst")) {
+    append(primaryLog, "review-intent:1");
+    finishPrimary("Goal\nfixture intent brief");
+    return true;
+  }
   const lane = text.match(/specialist review lane in a fresh, read-only session: `([\w-]+)`/);
   if (lane) {
     append(primaryLog, `review-lane:${lane[1]}`);
@@ -153,7 +159,7 @@ function answerReviewSession(text) {
     finishPrimary("[P2] subagent-change.txt:1 -- fixture lane finding (evidence: source-reviewed)");
     return true;
   }
-  if (text.includes("You are the review supervisor for one user turn")) {
+  if (text.includes("You are the adversarial review supervisor for one completed user turn")) {
     append(primaryLog, "review-synthesis:1");
     // Anything but the clean sentinel on the first line means "findings", which
     // is what sends the corrective prompt back to the primary.

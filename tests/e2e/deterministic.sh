@@ -194,6 +194,9 @@ run_case() {
       # synthesis pass vets them, and the surviving findings come back to the
       # primary as a corrective turn.
       test "$(grep -ac '^review-lane:' "$root/primary.log")" -ge 1
+      # The supervisor is intent-aware: a separate read-only analyst session
+      # distils the turn's intent from the session's own user messages first.
+      grep -a '^review-intent:1$' "$root/primary.log" >/dev/null
       grep -a '^review-synthesis:1$' "$root/primary.log" >/dev/null
       grep -a 'discrete-review:' "$root/primary.log" >/dev/null
       # The reviewed diff travels in the lane packet, not in the corrective

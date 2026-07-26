@@ -4047,6 +4047,9 @@ fn transcript_export_markdown(state: &AppState) -> String {
                     crate::event::InternalMessageKind::ReviewLane => {
                         format!("{} review lane", message.source)
                     }
+                    crate::event::InternalMessageKind::ReviewProgress => {
+                        format!("{} review progress", message.source)
+                    }
                     crate::event::InternalMessageKind::ReviewSynthesis => {
                         format!("{} review synthesis", message.source)
                     }
@@ -6119,6 +6122,9 @@ fn render_transcript_entry_range(
                             message.source,
                             message_size_label(chars)
                         )
+                    }
+                    crate::event::InternalMessageKind::ReviewProgress => {
+                        format!("review supervisor · {}", message_size_label(chars))
                     }
                     crate::event::InternalMessageKind::ReviewSynthesis => {
                         format!("review synthesis · {}", message_size_label(chars))

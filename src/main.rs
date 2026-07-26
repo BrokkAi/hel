@@ -2294,14 +2294,17 @@ async fn run_session(
                 cmd_orchestrator.compact_manual().await;
                 continue;
             }
-            if let UiCommand::SendPrompt { text, .. } = &command {
+            if let UiCommand::SendPrompt { text, images } = &command {
                 local_epoch = local_epoch.saturating_add(1);
                 subagent_handoffs_this_turn.store(0, Ordering::Release);
                 let snapshot =
                     workspace_snapshot::WorkspaceSnapshot::capture(&cmd_workspace_roots).await;
                 cmd_orchestrator
-                    .begin_turn(local_epoch, text.clone(), snapshot)
+                    .begin_turn(local_epoch, text.clone(), images.clone(), snapshot)
                     .await;
+            }
+            if matches!(command, UiCommand::CancelPrompt) {
+                cmd_orchestrator.cancel_review();
             }
             let shutdown = matches!(command, UiCommand::Shutdown);
             if runtime_cmd_tx.send(command).is_err() || shutdown {
