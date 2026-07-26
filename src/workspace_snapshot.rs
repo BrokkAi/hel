@@ -1,5 +1,5 @@
 //! Dirty-worktree-aware Git tree snapshots used to attribute changes to one
-//! outer user turn or one Eitri invocation without touching the real index.
+//! outer user turn or one subagent invocation without touching the real index.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -649,10 +649,10 @@ mod tests {
             .expect("baseline deleted seed");
         commit_all(root);
 
-        std::fs::write(root.join("dirty.txt"), "dirty before Eitri\n").expect("predirty");
-        std::fs::write(root.join("staged.txt"), "staged before Eitri\n").expect("prestage");
+        std::fs::write(root.join("dirty.txt"), "dirty before subagent\n").expect("predirty");
+        std::fs::write(root.join("staged.txt"), "staged before subagent\n").expect("prestage");
         git(root, &["add", "staged.txt"]);
-        std::fs::write(root.join("untracked.txt"), "untracked before Eitri\n")
+        std::fs::write(root.join("untracked.txt"), "untracked before subagent\n")
             .expect("pre-untracked");
         std::fs::write(
             root.join("baseline-dirty-only.txt"),
@@ -687,17 +687,17 @@ mod tests {
 
         std::fs::write(
             root.join("dirty.txt"),
-            "dirty before Eitri\nchanged during invocation\n",
+            "dirty before subagent\nchanged during invocation\n",
         )
         .expect("change dirty");
         std::fs::write(
             root.join("staged.txt"),
-            "staged before Eitri\nchanged during invocation\n",
+            "staged before subagent\nchanged during invocation\n",
         )
         .expect("change staged");
         std::fs::write(
             root.join("untracked.txt"),
-            "untracked before Eitri\nchanged during invocation\n",
+            "untracked before subagent\nchanged during invocation\n",
         )
         .expect("change untracked");
         std::fs::write(root.join("created.txt"), "created during invocation\n").expect("create");
@@ -764,24 +764,26 @@ mod tests {
         git(root, &["commit", "--allow-empty", "-qm", "baseline"]);
 
         let outer = WorkspaceSnapshot::capture(&[root.to_path_buf()]).await;
-        std::fs::write(root.join("thor.txt"), "changed by Thor\n").expect("Thor edit");
+        std::fs::write(root.join("primary.txt"), "changed by the primary agent\n")
+            .expect("primary edit");
         let invocation = WorkspaceSnapshot::capture(&[root.to_path_buf()]).await;
-        std::fs::write(root.join("eitri.txt"), "changed by Eitri\n").expect("Eitri edit");
+        std::fs::write(root.join("subagent.txt"), "changed by a subagent\n")
+            .expect("subagent edit");
 
         let invocation_delta = invocation.delta().await;
-        assert!(invocation_delta.receipt().contains("eitri.txt"));
-        assert!(!invocation_delta.receipt().contains("thor.txt"));
+        assert!(invocation_delta.receipt().contains("subagent.txt"));
+        assert!(!invocation_delta.receipt().contains("primary.txt"));
 
         let outer_delta = outer.delta().await;
-        assert!(outer_delta.receipt().contains("thor.txt"));
-        assert!(outer_delta.receipt().contains("eitri.txt"));
+        assert!(outer_delta.receipt().contains("primary.txt"));
+        assert!(outer_delta.receipt().contains("subagent.txt"));
 
         let second_invocation = WorkspaceSnapshot::capture(&[root.to_path_buf()]).await;
-        std::fs::write(root.join("followup.txt"), "second Eitri call\n").expect("followup");
+        std::fs::write(root.join("followup.txt"), "second subagent call\n").expect("followup");
         let second_delta = second_invocation.delta().await;
         assert!(second_delta.receipt().contains("followup.txt"));
-        assert!(!second_delta.receipt().contains("thor.txt"));
-        assert!(!second_delta.receipt().contains("eitri.txt"));
+        assert!(!second_delta.receipt().contains("primary.txt"));
+        assert!(!second_delta.receipt().contains("subagent.txt"));
     }
 
     #[tokio::test]

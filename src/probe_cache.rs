@@ -1,4 +1,4 @@
-//! Disk-persisted ACP adapter probe results. Warm startups bind the Council
+//! Disk-persisted ACP adapter probe results. Warm startups bind the roster
 //! from this cache instead of relaunching every adapter; entries are keyed by
 //! the launch identity and invalidated by TTL or a changed adapter binary.
 

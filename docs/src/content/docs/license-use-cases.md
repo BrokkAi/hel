@@ -32,7 +32,7 @@ desktop bundle, or appliance. Those artifacts convey a copy.
 ### Individual or researcher
 
 You may install Mjolnir, run it on public or private repositories, benchmark
-Councils, and keep experimental modifications private. Provider terms,
+model routes, and keep experimental modifications private. Provider terms,
 repository confidentiality, and rights in generated output remain separate
 questions.
 

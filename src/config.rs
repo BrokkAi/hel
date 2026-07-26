@@ -1,7 +1,7 @@
 //! Persistent user config for `mj`.
 //!
-//! Stores role-owned Council preferences and custom ACP launches. Lives at
-//! `~/.config/mj/config.toml`.
+//! Stores the primary agent and subagent-pool preferences plus custom ACP
+//! launches. Lives at `~/.config/mj/config.toml`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -14,16 +14,17 @@ use crate::spinner::SpinnerStyle;
 use crate::theme::TerminalThemeKind;
 
 pub const DISABLED_MODEL: &str = "disabled";
-pub const CONFIG_VERSION: u32 = 2;
+pub const CONFIG_VERSION: u32 = 3;
+/// Schema version this build can migrate forward from.
+const MIGRATABLE_VERSION: u32 = 2;
 
+/// Per-invocation model overrides (`--model` / `--subagent-model`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RoleModelOverrides {
-    pub thor: Option<String>,
-    pub thor_reasoning_effort: Option<String>,
-    pub loki: Option<String>,
-    pub loki_reasoning_effort: Option<String>,
-    pub eitri: Option<String>,
-    pub eitri_reasoning_effort: Option<String>,
+pub struct ModelOverrides {
+    pub primary: Option<String>,
+    pub primary_effort: Option<String>,
+    pub subagent: Option<String>,
+    pub subagent_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -33,18 +34,12 @@ pub struct Config {
     pub theme: TerminalThemeKind,
     #[serde(default, skip_serializing_if = "SpinnerStyle::is_default")]
     pub spinner: SpinnerStyle,
-    /// Thor's coordination and review behavior.
-    #[serde(default, skip_serializing_if = "ThorConfig::is_default")]
-    pub thor: ThorConfig,
-    /// Loki's model preference; `disabled` turns the role off.
-    #[serde(default, skip_serializing_if = "LokiConfig::is_default")]
-    pub loki: LokiConfig,
-    /// Eitri's model preference.
-    #[serde(default, skip_serializing_if = "EitriConfig::is_default")]
-    pub eitri: EitriConfig,
-    /// Council-wide runtime behavior.
-    #[serde(default, skip_serializing_if = "CouncilConfig::is_default")]
-    pub council: CouncilConfig,
+    /// The primary agent's model and review behavior.
+    #[serde(default, skip_serializing_if = "AgentConfig::is_default")]
+    pub agent: AgentConfig,
+    /// Defaults for the shared subagent pool.
+    #[serde(default, skip_serializing_if = "SubagentsConfig::is_default")]
+    pub subagents: SubagentsConfig,
     /// ACP adapter enablement and explicit user-provisioned servers.
     #[serde(default, skip_serializing_if = "AcpConfig::is_default")]
     pub acp: AcpConfig,
@@ -59,51 +54,26 @@ impl Default for Config {
             version: CONFIG_VERSION,
             theme: TerminalThemeKind::default(),
             spinner: SpinnerStyle::default(),
-            thor: ThorConfig::default(),
-            loki: LokiConfig::default(),
-            eitri: EitriConfig::default(),
-            council: CouncilConfig::default(),
+            agent: AgentConfig::default(),
+            subagents: SubagentsConfig::default(),
             acp: AcpConfig::default(),
             ragnarok: RagnarokConfig::default(),
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct CouncilConfig {
-    #[serde(default = "default_true")]
-    pub auto_failover: bool,
-    #[serde(default)]
-    /// Compatibility-only value for older in-memory callers. Interactive and
-    /// remote Council sessions inherit the ACP harness permission policy.
-    pub permission_mode: CouncilPermissionMode,
-}
-
-impl Default for CouncilConfig {
-    fn default() -> Self {
-        Self {
-            auto_failover: true,
-            permission_mode: CouncilPermissionMode::default(),
-        }
-    }
-}
-
-impl CouncilConfig {
-    fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CouncilPermissionMode {
+/// Permission preset applied to an ACP runtime. Never persisted: interactive
+/// and remote sessions inherit the ACP harness policy, and headless sessions
+/// pass `--permission-mode` through directly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PermissionPreset {
     Manual,
     #[default]
     Auto,
     Yolo,
 }
 
-impl std::fmt::Display for CouncilPermissionMode {
+impl std::fmt::Display for PermissionPreset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Manual => "Manual",
@@ -117,40 +87,38 @@ fn default_auto() -> String {
     "auto".to_string()
 }
 
+/// The model names currently bound to each seat, for display only.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ModelsConfig {
     #[serde(default = "default_auto")]
-    pub thor: String,
+    pub primary: String,
     #[serde(default = "default_auto")]
-    pub loki: String,
-    #[serde(default = "default_auto")]
-    pub eitri: String,
+    pub subagent: String,
 }
 
 impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
-            thor: default_auto(),
-            loki: default_auto(),
-            eitri: default_auto(),
+            primary: default_auto(),
+            subagent: default_auto(),
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ThorConfig {
+pub struct AgentConfig {
     #[serde(default = "default_auto")]
     pub model: String,
-    /// Per-invocation reasoning-effort override for Thor's ACP session
-    /// (e.g. from `--thor MODEL+high`). Not meaningful outside a single
-    /// `--print` invocation; never written to the on-disk default.
+    /// Per-invocation reasoning-effort override for the primary agent's ACP
+    /// session (e.g. from `--model MODEL+high`). Not meaningful outside a
+    /// single `--print` invocation; never written to the on-disk default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     #[serde(default = "default_true")]
     pub discrete_review: bool,
 }
 
-impl Default for ThorConfig {
+impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             model: default_auto(),
@@ -160,60 +128,45 @@ impl Default for ThorConfig {
     }
 }
 
-impl ThorConfig {
+impl AgentConfig {
     fn is_default(&self) -> bool {
         *self == Self::default()
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct LokiConfig {
+pub struct SubagentsConfig {
     #[serde(default = "default_auto")]
     pub model: String,
-    /// Per-invocation reasoning-effort override for Loki's ACP session
-    /// (e.g. from `--loki MODEL+high`). Not meaningful outside a single
-    /// `--print` invocation; never written to the on-disk default.
+    /// Per-invocation reasoning-effort override for subagent ACP sessions
+    /// (e.g. from `--subagent-model MODEL+high`). Not meaningful outside a
+    /// single `--print` invocation; never written to the on-disk default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Concurrency cap for the shared subagent pool.
+    #[serde(default = "default_max_parallel")]
+    pub max_parallel: usize,
+    /// Move the pool to a fallback model when a provider nears its quota.
+    #[serde(default = "default_true")]
+    pub auto_failover: bool,
 }
 
-impl Default for LokiConfig {
+impl Default for SubagentsConfig {
     fn default() -> Self {
         Self {
             model: default_auto(),
             reasoning_effort: None,
+            max_parallel: default_max_parallel(),
+            auto_failover: true,
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct EitriConfig {
-    #[serde(default = "default_auto")]
-    pub model: String,
-    /// Per-invocation reasoning-effort override for Eitri's ACP session
-    /// (e.g. from `--eitri MODEL+high`). Not meaningful outside a single
-    /// `--print` invocation; never written to the on-disk default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
-    #[serde(default = "default_max_parallel_explores")]
-    pub max_parallel_explores: usize,
-}
-
-impl Default for EitriConfig {
-    fn default() -> Self {
-        Self {
-            model: default_auto(),
-            reasoning_effort: None,
-            max_parallel_explores: default_max_parallel_explores(),
-        }
-    }
-}
-
-fn default_max_parallel_explores() -> usize {
+fn default_max_parallel() -> usize {
     6
 }
 
-impl EitriConfig {
+impl SubagentsConfig {
     fn is_default(&self) -> bool {
         *self == Self::default()
     }
@@ -283,12 +236,6 @@ fn is_enabled_policy(policy: &AcpServerPolicy) -> bool {
     *policy == AcpServerPolicy::Enabled
 }
 
-impl LokiConfig {
-    fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
 /// Knobs for `/ragnarok` battles.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RagnarokConfig {
@@ -332,28 +279,31 @@ pub struct SelectedAgent {
 }
 
 impl Config {
+    /// True when `path` holds a config this build can use directly or migrate
+    /// forward. Callers use it to decide whether the user is already
+    /// onboarded, so a migratable v2 file counts as an existing config.
     pub fn path_has_current_version(path: &Path) -> bool {
         let Ok(contents) = std::fs::read_to_string(path) else {
             return false;
         };
-        toml::from_str::<toml::Value>(&contents)
-            .ok()
-            .and_then(|document| document.get("version").and_then(toml::Value::as_integer))
-            == Some(i64::from(CONFIG_VERSION))
+        matches!(
+            toml::from_str::<toml::Value>(&contents)
+                .ok()
+                .and_then(|document| document.get("version").and_then(toml::Value::as_integer)),
+            Some(version)
+                if version == i64::from(CONFIG_VERSION)
+                    || version == i64::from(MIGRATABLE_VERSION)
+        )
     }
 
-    pub fn apply_role_model_overrides(&mut self, overrides: &RoleModelOverrides) {
-        if let Some(model) = &overrides.thor {
-            self.thor.model.clone_from(model);
-            self.thor.reasoning_effort = overrides.thor_reasoning_effort.clone();
+    pub fn apply_model_overrides(&mut self, overrides: &ModelOverrides) {
+        if let Some(model) = &overrides.primary {
+            self.agent.model.clone_from(model);
+            self.agent.reasoning_effort = overrides.primary_effort.clone();
         }
-        if let Some(model) = &overrides.loki {
-            self.loki.model.clone_from(model);
-            self.loki.reasoning_effort = overrides.loki_reasoning_effort.clone();
-        }
-        if let Some(model) = &overrides.eitri {
-            self.eitri.model.clone_from(model);
-            self.eitri.reasoning_effort = overrides.eitri_reasoning_effort.clone();
+        if let Some(model) = &overrides.subagent {
+            self.subagents.model.clone_from(model);
+            self.subagents.reasoning_effort = overrides.subagent_effort.clone();
         }
     }
 
@@ -373,16 +323,16 @@ impl Config {
         true
     }
 
-    pub fn role_models(&self) -> ModelsConfig {
+    pub fn model_names(&self) -> ModelsConfig {
         ModelsConfig {
-            thor: self.thor.model.clone(),
-            loki: self.loki.model.clone(),
-            eitri: self.eitri.model.clone(),
+            primary: self.agent.model.clone(),
+            subagent: self.subagents.model.clone(),
         }
     }
 
     /// Read the config from `path`. Returns `Config::default()` when the
-    /// file does not exist; surfaces a parse error otherwise.
+    /// file does not exist; surfaces a parse error otherwise. A `version = 2`
+    /// file is migrated to the current schema and written back in place.
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -392,6 +342,18 @@ impl Config {
         let document: toml::Value =
             toml::from_str(&s).with_context(|| format!("parse {}", path.display()))?;
         let version = document.get("version").and_then(toml::Value::as_integer);
+        if version == Some(i64::from(MIGRATABLE_VERSION)) {
+            let mut cfg = migrate_v2(&s).with_context(|| format!("migrate {}", path.display()))?;
+            cfg.normalize()?;
+            if let Err(error) = cfg.save(path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "config migrated to v3 in memory but could not be written back"
+                );
+            }
+            return Ok(cfg);
+        }
         if version != Some(i64::from(CONFIG_VERSION)) {
             tracing::warn!(
                 path = %path.display(),
@@ -423,15 +385,12 @@ impl Config {
     }
 
     fn normalize(&mut self) -> Result<()> {
-        if self.loki.model.eq_ignore_ascii_case("none") {
-            self.loki.model = DISABLED_MODEL.to_string();
-        }
-        if self.eitri.model.eq_ignore_ascii_case("none") {
-            self.eitri.model = DISABLED_MODEL.to_string();
+        if self.subagents.model.eq_ignore_ascii_case("none") {
+            self.subagents.model = DISABLED_MODEL.to_string();
         }
         anyhow::ensure!(
-            self.eitri.max_parallel_explores <= 16,
-            "eitri.max_parallel_explores must be between 0 and 16"
+            self.subagents.max_parallel <= 16,
+            "subagents.max_parallel must be between 0 and 16"
         );
 
         let mut names = std::collections::HashSet::new();
@@ -472,6 +431,107 @@ impl AcpConfig {
     pub fn policy(&self, id: &str) -> AcpServerPolicy {
         self.policies.get(id).copied().unwrap_or_default()
     }
+}
+
+/// The v2 (`[thor]`/`[eitri]`/`[loki]`/`[council]`) schema, parsed leniently so
+/// a stale file never blocks startup. Unknown keys are ignored; sections that
+/// survived the schema change (`theme`, `spinner`, `acp`, `ragnarok`) are
+/// carried over verbatim by reusing their current types.
+#[derive(Debug, Default, Deserialize)]
+struct ConfigV2 {
+    #[serde(default)]
+    theme: TerminalThemeKind,
+    #[serde(default)]
+    spinner: SpinnerStyle,
+    #[serde(default)]
+    thor: ThorV2,
+    #[serde(default)]
+    eitri: EitriV2,
+    #[serde(default)]
+    council: CouncilV2,
+    #[serde(default)]
+    acp: AcpConfig,
+    #[serde(default)]
+    ragnarok: RagnarokConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThorV2 {
+    #[serde(default = "default_auto")]
+    model: String,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default = "default_true")]
+    discrete_review: bool,
+}
+
+impl Default for ThorV2 {
+    fn default() -> Self {
+        Self {
+            model: default_auto(),
+            reasoning_effort: None,
+            discrete_review: true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EitriV2 {
+    #[serde(default = "default_auto")]
+    model: String,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default = "default_max_parallel")]
+    max_parallel_explores: usize,
+}
+
+impl Default for EitriV2 {
+    fn default() -> Self {
+        Self {
+            model: default_auto(),
+            reasoning_effort: None,
+            max_parallel_explores: default_max_parallel(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CouncilV2 {
+    #[serde(default = "default_true")]
+    auto_failover: bool,
+}
+
+impl Default for CouncilV2 {
+    fn default() -> Self {
+        Self {
+            auto_failover: true,
+        }
+    }
+}
+
+/// Map a `version = 2` document onto the current schema. `[loki]` and
+/// `council.permission_mode` are dropped: Loki is gone and the permission
+/// preset is no longer persisted.
+fn migrate_v2(body: &str) -> Result<Config> {
+    let old: ConfigV2 = toml::from_str(body).context("parse v2 config")?;
+    Ok(Config {
+        version: CONFIG_VERSION,
+        theme: old.theme,
+        spinner: old.spinner,
+        agent: AgentConfig {
+            model: old.thor.model,
+            reasoning_effort: old.thor.reasoning_effort,
+            discrete_review: old.thor.discrete_review,
+        },
+        subagents: SubagentsConfig {
+            model: old.eitri.model,
+            reasoning_effort: old.eitri.reasoning_effort,
+            max_parallel: old.eitri.max_parallel_explores,
+            auto_failover: old.council.auto_failover,
+        },
+        acp: old.acp,
+        ragnarok: old.ragnarok,
+    })
 }
 
 /// Default config path: `$XDG_CONFIG_HOME/mj/config.toml` (or
@@ -637,18 +697,18 @@ mod tests {
         let path = dir.path().join("nope.toml");
         let cfg = Config::load(&path).expect("load");
         assert_eq!(cfg.theme, TerminalThemeKind::Dark);
-        assert_eq!(cfg.role_models(), ModelsConfig::default());
-        assert!(cfg.thor.discrete_review);
-        assert_eq!(cfg.loki.model, "auto");
+        assert_eq!(cfg.model_names(), ModelsConfig::default());
+        assert!(cfg.agent.discrete_review);
+        assert_eq!(cfg.subagents.model, "auto");
     }
 
     #[test]
-    fn incompatible_config_starts_fresh() {
+    fn versionless_config_starts_fresh() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "[thor]\ndiscrete_review = false\n\n[loki]\nstreaming_review = false\n",
+            "[agent]\ndiscrete_review = false\n\n[subagents]\nmax_parallel = 3\n",
         )
         .expect("write config");
 
@@ -657,13 +717,162 @@ mod tests {
     }
 
     #[test]
-    fn only_current_schema_counts_as_an_existing_config() {
+    fn current_and_migratable_schemas_count_as_an_existing_config() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "version = 1\n").expect("old config");
         assert!(!Config::path_has_current_version(&path));
+        // A v2 file is migrated on load, so the user is already onboarded.
+        std::fs::write(&path, "version = 2\n").expect("v2 config");
+        assert!(Config::path_has_current_version(&path));
         Config::default().save(&path).expect("current config");
         assert!(Config::path_has_current_version(&path));
+    }
+
+    #[test]
+    fn v2_config_migrates_every_mapped_field_and_is_written_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+version = 2
+theme = "ansi-light"
+spinner = "bars"
+
+[thor]
+model = "gpt-5-6-sol"
+reasoning_effort = "high"
+discrete_review = false
+
+[eitri]
+model = "gpt-5-6-terra"
+max_parallel_explores = 9
+
+[loki]
+model = "claude-fable-5"
+
+[council]
+auto_failover = false
+permission_mode = "manual"
+
+[ragnarok]
+max_competitors = 4
+
+[acp.policies]
+codex-acp = "disabled"
+
+[[acp.servers]]
+id = "custom:company"
+label = "company"
+command = "/usr/local/bin/company-acp"
+args = ["--stdio"]
+origin = "custom"
+"#,
+        )
+        .expect("write v2 config");
+
+        let cfg = Config::load(&path).expect("migrate v2");
+        assert_eq!(cfg.version, CONFIG_VERSION);
+        assert_eq!(cfg.theme, TerminalThemeKind::AnsiLight);
+        assert_eq!(cfg.spinner, SpinnerStyle::Bars);
+        assert_eq!(cfg.agent.model, "gpt-5-6-sol");
+        assert_eq!(cfg.agent.reasoning_effort.as_deref(), Some("high"));
+        assert!(!cfg.agent.discrete_review);
+        assert_eq!(cfg.subagents.model, "gpt-5-6-terra");
+        assert_eq!(cfg.subagents.max_parallel, 9);
+        assert!(!cfg.subagents.auto_failover);
+        assert_eq!(cfg.ragnarok.max_competitors, 4);
+        assert_eq!(cfg.acp.policy("codex-acp"), AcpServerPolicy::Disabled);
+        assert_eq!(cfg.acp.servers[0].id, "custom:company");
+        assert_eq!(cfg.acp.servers[0].args, vec!["--stdio"]);
+
+        // The migrated file is persisted, so the next load is a plain v3 read.
+        let body = std::fs::read_to_string(&path).expect("read migrated");
+        println!("--- migrated v3 config.toml ---\n{body}--- end ---");
+        assert!(body.contains("version = 3"), "{body}");
+        assert!(!body.contains("[thor]"), "{body}");
+        assert!(!body.contains("[eitri]"), "{body}");
+        assert!(!body.contains("[loki]"), "{body}");
+        assert!(!body.contains("[council]"), "{body}");
+        assert!(!body.contains("permission_mode"), "{body}");
+        assert_eq!(Config::load(&path).expect("reload migrated"), cfg);
+    }
+
+    #[test]
+    fn v2_migration_keeps_defaults_for_absent_sections() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "version = 2\n").expect("write");
+        let cfg = Config::load(&path).expect("migrate");
+        assert_eq!(
+            cfg,
+            Config {
+                version: CONFIG_VERSION,
+                ..Config::default()
+            }
+        );
+    }
+
+    #[test]
+    fn v1_config_starts_fresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "version = 1\n[thor]\nmodel = \"gpt-5-6-sol\"\n").expect("write");
+        assert_eq!(Config::load(&path).expect("load"), Config::default());
+    }
+
+    /// `--subagent-model none` and `--subagent-model disabled` are the same
+    /// switch; a hand-written config gets the same spelling latitude.
+    #[test]
+    fn subagent_model_none_normalizes_to_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!("version = {CONFIG_VERSION}\n[subagents]\nmodel = \"NoNe\"\n"),
+        )
+        .expect("write");
+        assert_eq!(
+            Config::load(&path).expect("load").subagents.model,
+            DISABLED_MODEL
+        );
+
+        std::fs::write(
+            &path,
+            format!("version = {CONFIG_VERSION}\n[subagents]\nmodel = \"disabled\"\n"),
+        )
+        .expect("write");
+        assert_eq!(
+            Config::load(&path).expect("load").subagents.model,
+            DISABLED_MODEL
+        );
+    }
+
+    #[test]
+    fn max_parallel_above_the_cap_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!("version = {CONFIG_VERSION}\n[subagents]\nmax_parallel = 17\n"),
+        )
+        .expect("write");
+        let error = Config::load(&path).expect_err("cap exceeded");
+        assert!(
+            error.to_string().contains("subagents.max_parallel"),
+            "{error:#}"
+        );
+
+        std::fs::write(
+            &path,
+            format!("version = {CONFIG_VERSION}\n[subagents]\nmax_parallel = 16\n"),
+        )
+        .expect("write");
+        assert_eq!(
+            Config::load(&path).expect("at cap").subagents.max_parallel,
+            16
+        );
     }
 
     #[test]
@@ -672,14 +881,14 @@ mod tests {
         let path = dir.path().join("config.toml");
         let cfg = Config {
             theme: TerminalThemeKind::Light,
-            thor: ThorConfig {
+            agent: AgentConfig {
                 model: "gpt-5-6-sol".to_string(),
                 reasoning_effort: None,
                 discrete_review: false,
             },
-            council: CouncilConfig {
+            subagents: SubagentsConfig {
                 auto_failover: false,
-                permission_mode: CouncilPermissionMode::Manual,
+                ..SubagentsConfig::default()
             },
             acp: AcpConfig {
                 servers: vec![ConfiguredAcpServer {
@@ -698,53 +907,46 @@ mod tests {
         cfg.save(&path).expect("save");
         let loaded = Config::load(&path).expect("load");
         assert_eq!(loaded.theme, TerminalThemeKind::Light);
-        assert_eq!(loaded.thor.model, "gpt-5-6-sol");
-        assert!(!loaded.thor.discrete_review);
-        assert!(!loaded.council.auto_failover);
-        assert_eq!(
-            loaded.council.permission_mode,
-            CouncilPermissionMode::Manual
-        );
+        assert_eq!(loaded.agent.model, "gpt-5-6-sol");
+        assert!(!loaded.agent.discrete_review);
+        assert!(!loaded.subagents.auto_failover);
         assert_eq!(loaded.acp.servers[0].id, "custom:company");
         assert_eq!(loaded.acp.servers[0].args, vec!["--stdio"]);
     }
 
     #[test]
-    fn role_model_overrides_do_not_mutate_the_source_config() {
+    fn model_overrides_do_not_mutate_the_source_config() {
         let saved = Config::default();
         let mut invocation = saved.clone();
-        invocation.apply_role_model_overrides(&RoleModelOverrides {
-            thor: Some("gpt-test".to_string()),
-            thor_reasoning_effort: Some("high".to_string()),
-            loki: Some(DISABLED_MODEL.to_string()),
-            loki_reasoning_effort: None,
-            eitri: Some("qwen-test".to_string()),
-            eitri_reasoning_effort: Some("medium".to_string()),
+        invocation.apply_model_overrides(&ModelOverrides {
+            primary: Some("gpt-test".to_string()),
+            primary_effort: Some("high".to_string()),
+            subagent: Some("qwen-test".to_string()),
+            subagent_effort: Some("medium".to_string()),
         });
 
-        assert_eq!(saved.role_models(), ModelsConfig::default());
-        assert_eq!(invocation.thor.model, "gpt-test");
-        assert_eq!(invocation.thor.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(invocation.loki.model, DISABLED_MODEL);
-        assert_eq!(invocation.loki.reasoning_effort, None);
-        assert_eq!(invocation.eitri.model, "qwen-test");
-        assert_eq!(invocation.eitri.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(saved.model_names(), ModelsConfig::default());
+        assert_eq!(invocation.agent.model, "gpt-test");
+        assert_eq!(invocation.agent.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(invocation.subagents.model, "qwen-test");
+        assert_eq!(
+            invocation.subagents.reasoning_effort.as_deref(),
+            Some("medium")
+        );
     }
 
     #[test]
-    fn role_model_overrides_without_effort_leave_reasoning_effort_unset() {
+    fn model_overrides_without_effort_leave_reasoning_effort_unset() {
         let mut invocation = Config::default();
-        invocation.apply_role_model_overrides(&RoleModelOverrides {
-            thor: Some("deepseek-v4-pro".to_string()),
-            thor_reasoning_effort: None,
-            loki: None,
-            loki_reasoning_effort: None,
-            eitri: None,
-            eitri_reasoning_effort: None,
+        invocation.apply_model_overrides(&ModelOverrides {
+            primary: Some("deepseek-v4-pro".to_string()),
+            primary_effort: None,
+            subagent: None,
+            subagent_effort: None,
         });
 
-        assert_eq!(invocation.thor.model, "deepseek-v4-pro");
-        assert_eq!(invocation.thor.reasoning_effort, None);
+        assert_eq!(invocation.agent.model, "deepseek-v4-pro");
+        assert_eq!(invocation.agent.reasoning_effort, None);
     }
 
     #[test]
@@ -768,7 +970,6 @@ mod tests {
             r#"
 [models]
 thor = "gpt-5-6-sol"
-loki = "claude-opus-4-8"
 eitri = "gpt-5-6-luna"
 "#,
         )
@@ -798,7 +999,7 @@ eitri = "gpt-5-6-luna"
         std::fs::write(
             &path,
             r#"
-version = 2
+version = 3
 [[acp.servers]]
 id = "custom:my-agent"
 label = "my-agent"
@@ -826,15 +1027,15 @@ origin = "custom"
     fn configured_acp_servers_validate_ids_commands_and_duplicates() {
         for (body, expected) in [
             (
-                "version = 2\n[[acp.servers]]\nid = 'bad name'\nlabel = 'bad'\ncommand = 'server'\norigin = 'custom'\n",
+                "version = 3\n[[acp.servers]]\nid = 'bad name'\nlabel = 'bad'\ncommand = 'server'\norigin = 'custom'\n",
                 "unsupported characters",
             ),
             (
-                "version = 2\n[[acp.servers]]\nid = 'empty'\nlabel = 'empty'\ncommand = ''\norigin = 'custom'\n",
+                "version = 3\n[[acp.servers]]\nid = 'empty'\nlabel = 'empty'\ncommand = ''\norigin = 'custom'\n",
                 "empty command",
             ),
             (
-                "version = 2\n[[acp.servers]]\nid = 'same'\nlabel = 'one'\ncommand = 'one'\norigin = 'custom'\n[[acp.servers]]\nid = 'same'\nlabel = 'two'\ncommand = 'two'\norigin = 'custom'\n",
+                "version = 3\n[[acp.servers]]\nid = 'same'\nlabel = 'one'\ncommand = 'one'\norigin = 'custom'\n[[acp.servers]]\nid = 'same'\nlabel = 'two'\ncommand = 'two'\norigin = 'custom'\n",
                 "duplicate",
             ),
         ] {
@@ -899,7 +1100,7 @@ mode = "ask"
         let path = dir.path().join("config.toml");
         Config::default().save(&path).expect("save");
         let body = std::fs::read_to_string(&path).expect("read");
-        assert!(body.contains("version = 2"), "config: {body:?}");
+        assert!(body.contains("version = 3"), "config: {body:?}");
         assert!(
             !body.contains("theme"),
             "default theme should not be serialized: {body:?}"

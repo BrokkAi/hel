@@ -11,7 +11,7 @@ const root = siteTitleHref.endsWith('/') ? siteTitleHref : `${siteTitleHref}/`;
 const navItems = [
   { label: 'Overview', slug: 'overview/' },
   { label: 'Evaluate', slug: 'evaluate/' },
-  { label: 'Council', slug: 'council/' },
+  { label: 'Subagents', slug: 'subagents/' },
   { label: 'Reference', slug: 'cli-reference/' },
 ];
 const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
@@ -21,7 +21,7 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
   <div class="mj-brand sl-flex">
     <span class="mj-mark" aria-hidden="true"><i></i><b></b></span>
     <SiteTitle />
-    <small>terminal council</small>
+    <small>terminal agent</small>
   </div>
 
   <nav class="mj-primary-nav print:hidden" aria-label="Primary">

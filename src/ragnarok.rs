@@ -3,7 +3,7 @@
 //! `/ragnarok <task>` summons THOR, a router agent running on the
 //! strongest DeepSWE-ranked model available. Thor sizes up the task and decrees
 //! how many champions battle (2–10). Each champion is a distinct model —
-//! ideally from distinct providers — chosen by Pass@1 from the shared Council
+//! ideally from distinct providers — chosen by Pass@1 from the shared model
 //! catalog. Unranked models are not eligible. Every champion implements the task in
 //! parallel inside its own git worktree with permissions bypassed, then each
 //! is assigned a rival's implementation to adversarially review (never their
@@ -33,13 +33,13 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::acp;
-use crate::council;
 use crate::event::{
     AgentCommandOutcome, CompactTrigger, ElicitationOutcome, PermissionDecision,
     SessionConfigTarget, UiCommand, UiEvent, content_block_text,
 };
 use crate::headless::choose_allow_option;
 use crate::labels::stop_reason_label;
+use crate::roster;
 use crate::worktree;
 
 /// Thor may field at most this many champions.
@@ -73,10 +73,11 @@ const CONFIG_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Defense in depth: how many times one turn re-sends a prompt the runtime
 /// rejected with "config update already in flight" (250ms apart).
 const PROMPT_RESEND_LIMIT: usize = 20;
-/// Hard ceiling on an advertised session command (e.g. Loki's `/compact`).
+/// Hard ceiling on an advertised session command (e.g. `/compact`).
 /// This does not race the per-turn abort watch (see `run_advertised_command`
 /// doc comment), so this timeout is the only thing standing between a hung
 /// agent and a permanently wedged worker loop.
+#[allow(dead_code)]
 const ADVERTISED_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Straggler judgment never begins before this much combat time has passed…
@@ -313,8 +314,8 @@ pub struct BattleConfig {
     pub task: String,
     /// The current session cwd; worktrees are forged off its git project.
     pub cwd: PathBuf,
-    /// Ranked launchable models from the session's unified Council catalog.
-    pub available_models: Vec<council::ResolvedRole>,
+    /// Ranked launchable models from the session's unified model catalog.
+    pub available_models: Vec<roster::ResolvedAgent>,
     /// Active session agent/model used for Thor. Competitors are selected from
     /// the scored pool; Thor follows the user's current session config.
     pub thor_host: Option<ThorHost>,
@@ -925,7 +926,7 @@ pub(crate) async fn muster(
                 args: role.launch.args.clone(),
                 env: role.launch.env.clone(),
             },
-            vendor: Some(council_provider(&role.model.model)),
+            vendor: Some(catalog_provider(&role.model.model)),
             match_key: role.model.model.clone(),
         })
         .collect::<Vec<_>>();
@@ -945,7 +946,7 @@ pub(crate) async fn muster(
     Ok(pool)
 }
 
-fn council_provider(model: &str) -> String {
+fn catalog_provider(model: &str) -> String {
     let provider = crate::deepswe::model_provider(model);
     if provider.is_empty() {
         model
@@ -1185,13 +1186,12 @@ pub(crate) struct AgentHandle {
 }
 
 impl AgentHandle {
-    /// Run an advertised session command (currently only Loki's `/compact`)
-    /// and wait for its outcome.
+    /// Run an advertised session command (e.g. `/compact`) and wait for its
+    /// outcome.
     ///
     /// This deliberately does **not** race `self.abort`: `abort` means "the
-    /// target turn ended, stop reviewing" (see `Handle::cancel_turn` in
-    /// `loki.rs`, fired on `UiCommand::CancelPrompt`), which is a review-work
-    /// cancellation signal. Compaction is session maintenance, not review
+    /// target turn ended, stop working" (fired on `UiCommand::CancelPrompt`),
+    /// which is a work-cancellation signal. Compaction is session maintenance, not review
     /// work, and must survive a turn ending mid-compact -- racing abort here
     /// previously made a perfectly healthy compact report as
     /// `Failed("agent command aborted")` whenever the user's turn happened to
@@ -1200,6 +1200,7 @@ impl AgentHandle {
     /// command to completion once dispatched, so the fix is confined to not
     /// giving up early here. A generous hard timeout still bounds how long a
     /// hung agent can wedge the worker.
+    #[allow(dead_code)]
     pub(crate) async fn run_advertised_command(
         &mut self,
         name: &str,
@@ -1209,6 +1210,7 @@ impl AgentHandle {
             .await
     }
 
+    #[allow(dead_code)]
     async fn run_advertised_command_with_timeout(
         &mut self,
         name: &str,
@@ -1750,7 +1752,7 @@ fn runtime_config(
         config_path: None,
         saved_session_config,
         role_config,
-        code_agent: None,
+        subagents: None,
         side_prompt_policy: false,
         termination,
     }
@@ -3669,7 +3671,7 @@ mod tests {
                 args: vec![],
                 env: HashMap::new(),
             },
-            vendor: Some(council_provider(model)),
+            vendor: Some(catalog_provider(model)),
             match_key: key.to_string(),
         }
     }
@@ -4432,7 +4434,7 @@ mod tests {
 
         let run = tokio::spawn(async move {
             handle
-                .run_advertised_command("compact", CompactTrigger::Loki128k)
+                .run_advertised_command("compact", CompactTrigger::Manual)
                 .await
         });
 
@@ -4470,7 +4472,7 @@ mod tests {
             handle
                 .run_advertised_command_with_timeout(
                     "compact",
-                    CompactTrigger::Loki128k,
+                    CompactTrigger::Manual,
                     Duration::from_millis(20),
                 )
                 .await
@@ -4508,7 +4510,7 @@ mod tests {
         let mut rig = test_rig();
         rig.event_tx
             .send(UiEvent::SessionStarted {
-                session_id: "loki-acp-session".to_string(),
+                session_id: "side-acp-session".to_string(),
                 resumed: true,
             })
             .expect("send session start");
@@ -4519,7 +4521,7 @@ mod tests {
             .expect("session started");
         assert_eq!(
             rig.handle.session_started(),
-            Some(("loki-acp-session", true))
+            Some(("side-acp-session", true))
         );
     }
 
@@ -4538,11 +4540,11 @@ mod tests {
             HashMap::new(),
             None,
             Vec::new(),
-            Some("loki-acp-session".to_string()),
+            Some("side-acp-session".to_string()),
             None,
         );
 
-        assert_eq!(config.resume_session.as_deref(), Some("loki-acp-session"));
+        assert_eq!(config.resume_session.as_deref(), Some("side-acp-session"));
     }
 
     #[tokio::test]

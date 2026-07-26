@@ -172,7 +172,7 @@ pub fn ensure_clean_for_automation(cwd: &Path) -> Result<()> {
     )
 }
 
-/// Remove a linked worktree created by an automated flow (Thor's camp).
+/// Remove a linked worktree created by an automated flow.
 /// Same cleanup as the interactive exit prompt, without the prompt.
 pub fn remove_automation_worktree(project_root: &Path, worktree_root: &Path) -> Result<()> {
     remove_worktree(project_root, worktree_root)

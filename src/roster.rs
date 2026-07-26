@@ -1,5 +1,5 @@
-//! Model-first resolution for Thor (primary), Loki (reviewer), and Eitri
-//! (builder). ACP adapters are an implementation detail selected from local
+//! Model-first resolution of the primary agent and the default subagent
+//! model. ACP adapters are an implementation detail selected from local
 //! capabilities.
 
 use std::collections::{HashMap, HashSet};
@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{StreamExt, stream};
 
-use crate::config::{AcpServerOrigin, AcpServerPolicy, Config, CouncilPermissionMode};
+use crate::config::{AcpServerOrigin, AcpServerPolicy, Config, PermissionPreset};
 use crate::deepswe::{self, Row};
 use crate::{model_resolve, probe};
 
@@ -61,27 +61,27 @@ pub struct RuntimePermissionConfig {
     pub config_id: String,
     pub value: String,
     pub manual_fallback: Option<String>,
-    pub mode: CouncilPermissionMode,
+    pub mode: PermissionPreset,
 }
 
 pub fn configure_permissions(
     kind: AdapterKind,
-    mode: CouncilPermissionMode,
+    mode: PermissionPreset,
     _env: &mut HashMap<String, String>,
 ) -> Option<RuntimePermissionConfig> {
     let (config_id, value, manual_fallback) = match (kind, mode) {
-        (AdapterKind::Codex, CouncilPermissionMode::Manual) => ("mode", "read-only", None),
-        (AdapterKind::Codex, CouncilPermissionMode::Auto) => ("mode", "agent", Some("read-only")),
-        (AdapterKind::Codex, CouncilPermissionMode::Yolo) => ("mode", "agent-full-access", None),
-        (AdapterKind::Claude, CouncilPermissionMode::Manual) => ("mode", "default", None),
-        (AdapterKind::Claude, CouncilPermissionMode::Auto) => ("mode", "auto", Some("default")),
-        (AdapterKind::Claude, CouncilPermissionMode::Yolo) => ("mode", "bypassPermissions", None),
+        (AdapterKind::Codex, PermissionPreset::Manual) => ("mode", "read-only", None),
+        (AdapterKind::Codex, PermissionPreset::Auto) => ("mode", "agent", Some("read-only")),
+        (AdapterKind::Codex, PermissionPreset::Yolo) => ("mode", "agent-full-access", None),
+        (AdapterKind::Claude, PermissionPreset::Manual) => ("mode", "default", None),
+        (AdapterKind::Claude, PermissionPreset::Auto) => ("mode", "auto", Some("default")),
+        (AdapterKind::Claude, PermissionPreset::Yolo) => ("mode", "bypassPermissions", None),
         (AdapterKind::Kimi, _) => return None,
-        (AdapterKind::Anvil, CouncilPermissionMode::Manual) => ("permission_mode", "default", None),
-        (AdapterKind::Anvil, CouncilPermissionMode::Auto) => {
+        (AdapterKind::Anvil, PermissionPreset::Manual) => ("permission_mode", "default", None),
+        (AdapterKind::Anvil, PermissionPreset::Auto) => {
             ("permission_mode", "auto", Some("default"))
         }
-        (AdapterKind::Anvil, CouncilPermissionMode::Yolo) => {
+        (AdapterKind::Anvil, PermissionPreset::Yolo) => {
             ("permission_mode", "bypassPermissions", None)
         }
         (AdapterKind::Custom, _) => return None,
@@ -95,38 +95,36 @@ pub fn configure_permissions(
 }
 
 #[derive(Debug, Clone)]
-pub struct ResolvedRole {
+pub struct ResolvedAgent {
     pub model: Row,
     pub model_value: String,
     pub launch: AdapterLaunch,
     pub ranked: bool,
-    /// Per-seat reasoning-effort override applied to this role's ACP
-    /// session (e.g. from `--thor MODEL+high`). `None` leaves the
+    /// Per-seat reasoning-effort override applied to this agent's ACP
+    /// session (e.g. from `--model MODEL+high`). `None` leaves the
     /// adapter's own default effort untouched.
     pub reasoning_effort: Option<String>,
 }
 
+/// Everything one resolution pass bound: the seats in use plus the catalog the
+/// UI and the subagent MCP surface offer.
 #[derive(Debug, Clone)]
-pub struct ResolvedCouncil {
-    pub thor: ResolvedRole,
-    pub loki: Option<ResolvedRole>,
-    pub eitri: Option<ResolvedRole>,
-    pub available: Vec<ResolvedRole>,
+pub struct Roster {
+    /// The agent that owns the conversation.
+    pub primary: ResolvedAgent,
+    /// Default model for `create_subagent` delegations. `None` disables them.
+    pub subagent_default: Option<ResolvedAgent>,
+    pub available: Vec<ResolvedAgent>,
     pub choices: Vec<ModelChoice>,
     pub warnings: Vec<String>,
     pub inventory: AcpInventory,
 }
 
-impl ResolvedCouncil {
-    pub fn loki_failover_roles(&self) -> Vec<ResolvedRole> {
-        let Some(initial) = self.loki.clone() else {
-            return Vec::new();
-        };
-        failover_roles(initial, &self.available, true)
-    }
-
-    pub fn eitri_failover_roles(&self) -> Vec<ResolvedRole> {
-        let Some(initial) = self.eitri.clone() else {
+impl Roster {
+    /// The subagent pool's model preference order: its bound default first,
+    /// then every other ranked model as quota failover.
+    pub fn subagent_failover_roles(&self) -> Vec<ResolvedAgent> {
+        let Some(initial) = self.subagent_default.clone() else {
             return Vec::new();
         };
         failover_roles(initial, &self.available, false)
@@ -134,10 +132,10 @@ impl ResolvedCouncil {
 }
 
 fn failover_roles(
-    initial: ResolvedRole,
-    available: &[ResolvedRole],
+    initial: ResolvedAgent,
+    available: &[ResolvedAgent],
     prefer_other_provider: bool,
-) -> Vec<ResolvedRole> {
+) -> Vec<ResolvedAgent> {
     let mut roles = vec![initial.clone()];
     let mut alternatives = available
         .iter()
@@ -565,7 +563,7 @@ fn option_matches(launch: &AdapterLaunch, option: &probe::ModelOption, row: &Row
 }
 
 struct Discovery {
-    available: Vec<ResolvedRole>,
+    available: Vec<ResolvedAgent>,
     adapter_errors: HashMap<String, String>,
 }
 
@@ -579,7 +577,7 @@ fn resolve_probes(rows: &[Row], mut probes: Vec<(usize, AdapterLaunch, ProbeResu
             Ok(capabilities) => capabilities,
             Err(reason) => {
                 adapter_errors.insert(launch.source_id.clone(), reason);
-                tracing::warn!(adapter = %launch.source_id, "council adapter probe failed");
+                tracing::warn!(adapter = %launch.source_id, "roster adapter probe failed");
                 continue;
             }
         };
@@ -590,7 +588,7 @@ fn resolve_probes(rows: &[Row], mut probes: Vec<(usize, AdapterLaunch, ProbeResu
             );
             tracing::warn!(
                 adapter = %launch.source_id,
-                "Council adapter excluded because HTTP MCP is unavailable"
+                "roster adapter excluded because HTTP MCP is unavailable"
             );
             continue;
         }
@@ -617,7 +615,7 @@ fn resolve_probes(rows: &[Row], mut probes: Vec<(usize, AdapterLaunch, ProbeResu
                 .find(|option| option_matches(&launch, option, row))
             {
                 claimed_ranked.insert(row.model.clone());
-                resolved.push(ResolvedRole {
+                resolved.push(ResolvedAgent {
                     model: row.clone(),
                     model_value: option.value.clone(),
                     launch: launch.clone(),
@@ -632,7 +630,7 @@ fn resolve_probes(rows: &[Row], mut probes: Vec<(usize, AdapterLaunch, ProbeResu
                 .filter(|option| !matched_values.contains(&option.value))
             {
                 let id = custom_model_id(&launch.source_id, &option.value);
-                resolved.push(ResolvedRole {
+                resolved.push(ResolvedAgent {
                     model: Row {
                         model: id,
                         reasoning_effort: None,
@@ -723,11 +721,11 @@ async fn discover_available(rows: &[Row], inventory: &AcpInventory, cwd: &Path) 
 }
 
 fn explicit<'a>(
-    role: &str,
+    seat: &str,
     selector: &str,
     rows: &[Row],
-    available: &'a [ResolvedRole],
-) -> Result<&'a ResolvedRole> {
+    available: &'a [ResolvedAgent],
+) -> Result<&'a ResolvedAgent> {
     if let Some(candidate) = available
         .iter()
         .find(|candidate| candidate.model.model == selector)
@@ -741,34 +739,37 @@ fn explicit<'a>(
         }) {
             return Ok(candidate);
         }
-        bail!("{role} model '{selector}' is unavailable from its configured custom ACP server");
+        bail!("{seat} model '{selector}' is unavailable from its configured custom ACP server");
     }
     if !rows.iter().any(|row| row.model == selector) {
-        bail!("{role} model '{selector}' is not an eligible DeepSWE High/default model");
+        bail!("{seat} model '{selector}' is not an eligible DeepSWE High/default model");
     }
-    bail!("{role} model '{selector}' is unavailable: no HTTP-MCP-capable ACP adapter advertised it")
+    bail!("{seat} model '{selector}' is unavailable: no HTTP-MCP-capable ACP adapter advertised it")
 }
 
-fn choose_eitri<'a>(rows: &[Row], available: &'a [ResolvedRole]) -> Option<&'a ResolvedRole> {
+fn choose_subagent_default<'a>(
+    rows: &[Row],
+    available: &'a [ResolvedAgent],
+) -> Option<&'a ResolvedAgent> {
     let anchor = deepswe::sonnet_anchor(rows)?;
     let launchable_rows: Vec<Row> = available
         .iter()
         .filter(|role| role.ranked)
         .map(|role| role.model.clone())
         .collect();
-    deepswe::eitri_frontier_choice(&launchable_rows, anchor.pass_at_1).and_then(|row| {
+    deepswe::subagent_frontier_choice(&launchable_rows, anchor.pass_at_1).and_then(|row| {
         available
             .iter()
             .find(|candidate| candidate.model.model == row.model)
     })
 }
 
-fn resolve_eitri(
+fn resolve_subagent_default(
     selector: &str,
     rows: &[Row],
-    available: &[ResolvedRole],
+    available: &[ResolvedAgent],
     excluded_models: &[&str],
-) -> Result<Option<ResolvedRole>> {
+) -> Result<Option<ResolvedAgent>> {
     if selector == crate::config::DISABLED_MODEL || selector == "none" {
         Ok(None)
     } else if selector == "auto" {
@@ -777,49 +778,11 @@ fn resolve_eitri(
             .filter(|role| !excluded_models.contains(&role.model.model.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        Ok(choose_eitri(rows, &distinct)
-            .or_else(|| choose_eitri(rows, available))
+        Ok(choose_subagent_default(rows, &distinct)
+            .or_else(|| choose_subagent_default(rows, available))
             .cloned())
     } else {
-        explicit("Eitri", selector, rows, available).map(|role| Some(role.clone()))
-    }
-}
-
-fn provider_key(model: &str) -> &str {
-    let provider = deepswe::model_provider(model);
-    if provider.is_empty() {
-        model.split_once('-').map_or(model, |(prefix, _)| prefix)
-    } else {
-        provider
-    }
-}
-
-fn choose_loki<'a>(thor: &ResolvedRole, available: &'a [ResolvedRole]) -> Option<&'a ResolvedRole> {
-    let thor_provider = provider_key(&thor.model.model);
-    let mut ranked = available.iter().filter(|candidate| candidate.ranked);
-    ranked
-        .clone()
-        .find(|candidate| provider_key(&candidate.model.model) != thor_provider)
-        .or_else(|| {
-            ranked
-                .clone()
-                .find(|candidate| candidate.model.model != thor.model.model)
-        })
-        .or_else(|| ranked.next())
-}
-
-fn resolve_loki(
-    selector: &str,
-    thor: &ResolvedRole,
-    rows: &[Row],
-    available: &[ResolvedRole],
-) -> Result<Option<ResolvedRole>> {
-    if selector == crate::config::DISABLED_MODEL || selector == "none" {
-        Ok(None)
-    } else if selector == "auto" {
-        Ok(choose_loki(thor, available).cloned())
-    } else {
-        explicit("Loki", selector, rows, available).map(|role| Some(role.clone()))
+        explicit("Subagent", selector, rows, available).map(|role| Some(role.clone()))
     }
 }
 
@@ -890,11 +853,11 @@ fn unavailable_reason(
     reasons.join("; ")
 }
 
-pub async fn resolve(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
+pub async fn resolve(config: &Config, cwd: &Path) -> Result<Roster> {
     resolve_inner(config, cwd).await
 }
 
-pub async fn resolve_waiting_for_installs(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
+pub async fn resolve_waiting_for_installs(config: &Config, cwd: &Path) -> Result<Roster> {
     if config.acp.policy("anvil") != AcpServerPolicy::Disabled
         && crate::anvil::detect().path.is_none()
     {
@@ -913,24 +876,24 @@ pub async fn resolve_waiting_for_installs(config: &Config, cwd: &Path) -> Result
     resolve_inner(config, cwd).await
 }
 
-/// A council bound from instantly-known adapters, plus a stream of refreshed
-/// councils as the remaining adapters finish probing in the background.
+/// A roster bound from instantly-known adapters, plus a stream of refreshed
+/// rosters as the remaining adapters finish probing in the background.
 pub struct StreamingResolution {
-    pub council: ResolvedCouncil,
-    /// New council snapshots as background probes land. `None` when every
+    pub roster: Roster,
+    /// New roster snapshots as background probes land. `None` when every
     /// adapter resolved instantly. Snapshots never rebind the running
-    /// session's roles; they refresh choices, inventory, and warnings.
-    pub updates: Option<tokio::sync::watch::Receiver<ResolvedCouncil>>,
-    /// Adapters still probing when the initial council was returned.
+    /// session's seats; they refresh choices, inventory, and warnings.
+    pub updates: Option<tokio::sync::watch::Receiver<Roster>>,
+    /// Adapters still probing when the initial roster was returned.
     pub pending_servers: Vec<String>,
 }
 
-/// Resolve the council without waiting on adapter launches when possible.
+/// Resolve the roster without waiting on adapter launches when possible.
 ///
 /// Adapters whose capabilities are known instantly (credentialed built-ins,
 /// completed in-process probes, fresh disk cache entries) bind immediately;
 /// the rest are probed in the background and delivered as update snapshots.
-/// Only when the initial set cannot bind the configured council does this
+/// Only when the initial set cannot bind the configured roster does this
 /// wait, and then only until the earliest set of probe results that can.
 pub async fn resolve_streaming(config: &Config, cwd: &Path) -> Result<StreamingResolution> {
     let leaderboard = deepswe::load(
@@ -966,13 +929,13 @@ pub async fn resolve_streaming(config: &Config, cwd: &Path) -> Result<StreamingR
                     availability: &Availability,
                     inventory: &AcpInventory| {
         let discovery = resolve_probes(rows, results);
-        assemble_council(config, rows, availability, inventory.clone(), discovery)
+        assemble_roster(config, rows, availability, inventory.clone(), discovery)
     };
 
     if pending.is_empty() {
-        let council = assemble(results, config, &rows, &availability, &inventory)?;
+        let roster = assemble(results, config, &rows, &availability, &inventory)?;
         return Ok(StreamingResolution {
-            council,
+            roster,
             updates: None,
             pending_servers: Vec::new(),
         });
@@ -1010,22 +973,22 @@ pub async fn resolve_streaming(config: &Config, cwd: &Path) -> Result<StreamingR
         });
     }
 
-    // Wait only while the instantly-known adapters cannot bind the council.
-    let mut council = assemble(results.clone(), config, &rows, &availability, &inventory);
-    while council.is_err() {
+    // Wait only while the instantly-known adapters cannot bind the roster.
+    let mut roster = assemble(results.clone(), config, &rows, &availability, &inventory);
+    while roster.is_err() {
         let Some(item) = probe_rx.recv().await else {
-            return council.map(|council| StreamingResolution {
-                council,
+            return roster.map(|roster| StreamingResolution {
+                roster,
                 updates: None,
                 pending_servers: Vec::new(),
             });
         };
         results.push(item);
-        council = assemble(results.clone(), config, &rows, &availability, &inventory);
+        roster = assemble(results.clone(), config, &rows, &availability, &inventory);
     }
-    let council = council.expect("council bound");
+    let roster = roster.expect("roster bound");
 
-    let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(council.clone());
+    let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(roster.clone());
     {
         let config = config.clone();
         let inventory = inventory.clone();
@@ -1037,7 +1000,7 @@ pub async fn resolve_streaming(config: &Config, cwd: &Path) -> Result<StreamingR
                 results.push(item);
                 let discovery = resolve_probes(&rows, results.clone());
                 if let Ok(snapshot) =
-                    assemble_council(&config, &rows, &availability, inventory.clone(), discovery)
+                    assemble_roster(&config, &rows, &availability, inventory.clone(), discovery)
                     && snapshot_tx.send(snapshot).is_err()
                 {
                     break;
@@ -1046,13 +1009,13 @@ pub async fn resolve_streaming(config: &Config, cwd: &Path) -> Result<StreamingR
         });
     }
     Ok(StreamingResolution {
-        council,
+        roster,
         updates: Some(snapshot_rx),
         pending_servers,
     })
 }
 
-async fn resolve_inner(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
+async fn resolve_inner(config: &Config, cwd: &Path) -> Result<Roster> {
     let leaderboard = deepswe::load(
         &deepswe::default_cache_path(),
         deepswe::CACHE_TTL,
@@ -1063,19 +1026,19 @@ async fn resolve_inner(config: &Config, cwd: &Path) -> Result<ResolvedCouncil> {
     let availability = Availability::detect();
     let inventory = discover_inventory(config);
     let discovery = discover_available(&rows, &inventory, cwd).await;
-    assemble_council(config, &rows, &availability, inventory, discovery)
+    assemble_roster(config, &rows, &availability, inventory, discovery)
 }
 
-/// Bind Thor, Loki, and Eitri plus the model catalog from one set of probe
-/// results. Pure with respect to probing: callable repeatedly as additional
-/// adapters finish probing in the background.
-fn assemble_council(
+/// Bind the primary agent and the default subagent model plus the model
+/// catalog from one set of probe results. Pure with respect to probing:
+/// callable repeatedly as additional adapters finish probing in the background.
+fn assemble_roster(
     config: &Config,
     rows: &[Row],
     availability: &Availability,
     mut inventory: AcpInventory,
     discovery: Discovery,
-) -> Result<ResolvedCouncil> {
+) -> Result<Roster> {
     for server in &mut inventory.servers {
         server.model_count = discovery
             .available
@@ -1127,42 +1090,36 @@ fn assemble_council(
             .map(|reason| format!(" ({reason})"))
             .unwrap_or_default();
         bail!(
-            "no Council model is launchable{diagnostic}: install or authenticate an ACP adapter, or configure a custom ACP server"
+            "no model is launchable{diagnostic}: install or authenticate an ACP adapter, or configure a custom ACP server"
         );
     }
 
     if matches!(
-        config.thor.model.as_str(),
+        config.agent.model.as_str(),
         crate::config::DISABLED_MODEL | "none"
     ) {
-        bail!("Thor cannot be disabled");
+        bail!("the primary agent cannot be disabled");
     }
-    let thor = if config.thor.model == "auto" {
+    let primary = if config.agent.model == "auto" {
         available
             .iter()
             .find(|candidate| candidate.ranked)
-            .ok_or_else(|| anyhow!("Thor Auto requires at least one ranked DeepSWE model"))?
+            .ok_or_else(|| anyhow!("Agent Auto requires at least one ranked DeepSWE model"))?
     } else {
-        explicit("Thor", &config.thor.model, rows, &available)?
+        explicit("Agent", &config.agent.model, rows, &available)?
     };
-    let mut loki = resolve_loki(&config.loki.model, thor, rows, &available)?;
-    let mut occupied = vec![thor.model.model.as_str()];
-    if let Some(loki) = loki.as_ref() {
-        occupied.push(loki.model.model.as_str());
-    }
-    let mut eitri = resolve_eitri(&config.eitri.model, rows, &available, &occupied)?;
+    let occupied = vec![primary.model.model.as_str()];
+    let mut subagent_default =
+        resolve_subagent_default(&config.subagents.model, rows, &available, &occupied)?;
 
     // Attach each seat's per-invocation reasoning-effort override (from
-    // `--thor/--loki/--eitri MODEL+effort`, threaded via `Config`). This
-    // only touches the exact role selected for the seat; failover
+    // `--model`/`--subagent-model MODEL+effort`, threaded via `Config`). This
+    // only touches the exact agent selected for the seat; failover
     // alternates discovered elsewhere in `available` are unaffected.
-    let mut thor = thor.clone();
-    thor.reasoning_effort = config.thor.reasoning_effort.clone();
-    if let Some(loki) = loki.as_mut() {
-        loki.reasoning_effort = config.loki.reasoning_effort.clone();
-    }
-    if let Some(eitri) = eitri.as_mut() {
-        eitri.reasoning_effort = config.eitri.reasoning_effort.clone();
+    let mut primary = primary.clone();
+    primary.reasoning_effort = config.agent.reasoning_effort.clone();
+    if let Some(subagent_default) = subagent_default.as_mut() {
+        subagent_default.reasoning_effort = config.subagents.reasoning_effort.clone();
     }
 
     let mut warned = WARNED_ADAPTERS
@@ -1175,24 +1132,23 @@ fn assemble_council(
         .map(|(adapter, reason)| format!("{adapter} unavailable: {reason}"))
         .collect::<Vec<_>>();
     drop(warned);
-    if eitri.is_none()
+    if subagent_default.is_none()
         && !matches!(
-            config.eitri.model.as_str(),
+            config.subagents.model.as_str(),
             crate::config::DISABLED_MODEL | "none"
         )
     {
         warnings.push(
-            "Eitri/code-agent delegation is disabled: no launchable Eitri model is available. \
+            "subagent delegation is disabled: no launchable subagent model is available. \
              Install and authenticate a supported ACP adapter (for Codex: install `@openai/codex` \
              and run `codex login`), then restart or retry with /models."
                 .to_string(),
         );
     }
     warnings.sort();
-    Ok(ResolvedCouncil {
-        thor,
-        loki,
-        eitri,
+    Ok(Roster {
+        primary,
+        subagent_default,
         available,
         choices,
         warnings,
@@ -1207,21 +1163,18 @@ mod tests {
     #[test]
     fn permission_presets_map_to_provider_controls() {
         let mut env = HashMap::new();
-        let codex =
-            configure_permissions(AdapterKind::Codex, CouncilPermissionMode::Auto, &mut env)
-                .expect("Codex preset");
+        let codex = configure_permissions(AdapterKind::Codex, PermissionPreset::Auto, &mut env)
+            .expect("Codex preset");
         assert_eq!(codex.config_id, "mode");
         assert_eq!(codex.value, "agent");
         assert_eq!(codex.manual_fallback.as_deref(), Some("read-only"));
 
-        let claude =
-            configure_permissions(AdapterKind::Claude, CouncilPermissionMode::Manual, &mut env)
-                .expect("Claude preset");
+        let claude = configure_permissions(AdapterKind::Claude, PermissionPreset::Manual, &mut env)
+            .expect("Claude preset");
         assert_eq!(claude.value, "default");
 
-        let anvil =
-            configure_permissions(AdapterKind::Anvil, CouncilPermissionMode::Yolo, &mut env)
-                .expect("Anvil preset");
+        let anvil = configure_permissions(AdapterKind::Anvil, PermissionPreset::Yolo, &mut env)
+            .expect("Anvil preset");
         assert_eq!(anvil.config_id, "permission_mode");
         assert_eq!(anvil.value, "bypassPermissions");
     }
@@ -1251,12 +1204,12 @@ mod tests {
         }
     }
 
-    fn role(model: &str, pass_at_1: f64) -> ResolvedRole {
+    fn role(model: &str, pass_at_1: f64) -> ResolvedAgent {
         role_at(model, pass_at_1, 1.0)
     }
 
-    fn role_at(model: &str, pass_at_1: f64, mean_cost_usd: f64) -> ResolvedRole {
-        ResolvedRole {
+    fn role_at(model: &str, pass_at_1: f64, mean_cost_usd: f64) -> ResolvedAgent {
+        ResolvedAgent {
             model: Row {
                 model: model.to_string(),
                 reasoning_effort: Some("high".to_string()),
@@ -1558,7 +1511,7 @@ mod tests {
         );
 
         let resolved = explicit(
-            "Thor",
+            "Agent",
             "custom/bpr-agent/openrouter::moonshotai/kimi-k2.7-code",
             &rows,
             &discovery.available,
@@ -1607,7 +1560,7 @@ mod tests {
             kimi: None,
             anvil: None,
         };
-        let error = explicit("Thor", "gpt-5-6-sol", &rows, &[])
+        let error = explicit("Agent", "gpt-5-6-sol", &rows, &[])
             .expect_err("must reject unavailable explicit model");
         assert!(
             error
@@ -1618,64 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_loki_chooses_best_model_from_a_different_provider() {
-        let available = vec![
-            role("gpt-5-6-sol", 0.70),
-            role("gpt-5-5", 0.65),
-            role("claude-fable-5", 0.64),
-            role("gemini-3-1-pro-preview", 0.60),
-        ];
-
-        assert_eq!(
-            choose_loki(&available[0], &available)
-                .expect("cross-provider Loki")
-                .model
-                .model,
-            "claude-fable-5"
-        );
-    }
-
-    #[test]
-    fn auto_loki_falls_back_to_a_different_same_provider_model() {
-        let available = vec![role("gpt-5-6-sol", 0.70), role("gpt-5-5", 0.65)];
-
-        assert_eq!(
-            choose_loki(&available[0], &available)
-                .expect("fallback Loki")
-                .model
-                .model,
-            "gpt-5-5"
-        );
-    }
-
-    #[test]
-    fn auto_loki_reuses_thor_when_it_is_the_only_ranked_model() {
-        let available = vec![role("gpt-5-6-sol", 0.70)];
-
-        assert_eq!(
-            choose_loki(&available[0], &available)
-                .expect("fallback Loki")
-                .model
-                .model,
-            "gpt-5-6-sol"
-        );
-    }
-
-    #[test]
-    fn explicit_loki_may_match_thor() {
-        let thor = role("gpt-5-6-sol", 0.70);
-        let rows = vec![thor.model.clone()];
-        let available = vec![thor.clone()];
-
-        let loki = resolve_loki("gpt-5-6-sol", &thor, &rows, &available)
-            .expect("explicit Loki selection")
-            .expect("Loki role");
-
-        assert_eq!(loki.model.model, thor.model.model);
-    }
-
-    #[test]
-    fn auto_eitri_uses_sonnet_quality_floor_and_selects_terra() {
+    fn auto_subagent_default_uses_sonnet_quality_floor_and_selects_terra() {
         let rows = vec![
             role_at("claude-sonnet-5", 0.482, 7.43).model,
             role_at("gpt-5-6-sol", 0.694, 3.47).model,
@@ -1689,8 +1585,8 @@ mod tests {
         ];
 
         assert_eq!(
-            choose_eitri(&rows, &available)
-                .expect("Eitri choice")
+            choose_subagent_default(&rows, &available)
+                .expect("subagent default choice")
                 .model
                 .model,
             "gpt-5-6-terra"
@@ -1698,44 +1594,40 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_explicit_eitri_fails_resolution() {
+    fn unavailable_explicit_subagent_model_fails_resolution() {
         let rows = vec![role_at("gpt-5-6-sol", 0.694, 3.47).model];
         let available = vec![role_at("claude-fable-5", 0.64, 4.0)];
 
-        let error = resolve_eitri("gpt-5-6-sol", &rows, &available, &[])
-            .expect_err("explicit unavailable Eitri must fail");
+        let error = resolve_subagent_default("gpt-5-6-sol", &rows, &available, &[])
+            .expect_err("explicit unavailable subagent model must fail");
         assert!(
             error
                 .to_string()
-                .contains("Eitri model 'gpt-5-6-sol' is unavailable"),
+                .contains("Subagent model 'gpt-5-6-sol' is unavailable"),
             "{error:#}"
         );
     }
 
     #[test]
     fn optional_roles_accept_disabled_and_none() {
-        let thor = role("gpt-5-6-sol", 0.70);
-        let rows = vec![thor.model.clone()];
-        let available = vec![thor.clone()];
+        let primary = role("gpt-5-6-sol", 0.70);
+        let rows = vec![primary.model.clone()];
+        let available = vec![primary.clone()];
 
+        let _ = &primary;
         assert!(
-            resolve_loki("disabled", &thor, &rows, &available)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            resolve_eitri("none", &rows, &available, &[])
+            resolve_subagent_default("none", &rows, &available, &[])
                 .unwrap()
                 .is_none()
         );
     }
 
     #[test]
-    fn assemble_council_threads_reasoning_effort_onto_the_selected_roles_only() {
-        let thor_role = role_at("gpt-5-6-sol", 0.70, 3.0);
-        let loki_role = role_at("claude-sonnet-5", 0.60, 4.0);
-        let rows = vec![thor_role.model.clone(), loki_role.model.clone()];
-        let available = vec![thor_role.clone(), loki_role.clone()];
+    fn assemble_roster_threads_reasoning_effort_onto_the_selected_agents_only() {
+        let primary_role = role_at("gpt-5-6-sol", 0.70, 3.0);
+        let other_role = role_at("claude-sonnet-5", 0.60, 4.0);
+        let rows = vec![primary_role.model.clone(), other_role.model.clone()];
+        let available = vec![primary_role.clone(), other_role.clone()];
         let discovery = Discovery {
             available,
             adapter_errors: HashMap::new(),
@@ -1749,43 +1641,34 @@ mod tests {
         };
 
         let mut config = Config::default();
-        config.thor.model = "gpt-5-6-sol".to_string();
-        config.thor.reasoning_effort = Some("high".to_string());
-        config.loki.model = "claude-sonnet-5".to_string();
-        config.loki.reasoning_effort = None;
-        config.eitri.model = crate::config::DISABLED_MODEL.to_string();
+        config.agent.model = "gpt-5-6-sol".to_string();
+        config.agent.reasoning_effort = Some("high".to_string());
+        config.subagents.model = crate::config::DISABLED_MODEL.to_string();
 
-        let resolved = assemble_council(
+        let resolved = assemble_roster(
             &config,
             &rows,
             &availability,
             AcpInventory::default(),
             discovery,
         )
-        .expect("assemble council");
+        .expect("assemble roster");
 
-        assert_eq!(resolved.thor.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(
-            resolved
-                .loki
-                .as_ref()
-                .and_then(|loki| loki.reasoning_effort.clone()),
-            None
-        );
-        assert!(resolved.eitri.is_none());
+        assert_eq!(resolved.primary.reasoning_effort.as_deref(), Some("high"));
+        assert!(resolved.subagent_default.is_none());
     }
 
     #[test]
-    fn auto_eitri_reuses_an_excluded_model_when_needed() {
-        let eitri = role_at("gpt-5-6-terra", 0.538, 1.13);
+    fn auto_subagent_default_reuses_an_excluded_model_when_needed() {
+        let subagent = role_at("gpt-5-6-terra", 0.538, 1.13);
         let rows = vec![
             role_at("claude-sonnet-5", 0.482, 7.43).model,
-            eitri.model.clone(),
+            subagent.model.clone(),
         ];
-        let available = vec![eitri];
+        let available = vec![subagent];
 
         assert_eq!(
-            resolve_eitri("auto", &rows, &available, &["gpt-5-6-terra"])
+            resolve_subagent_default("auto", &rows, &available, &["gpt-5-6-terra"])
                 .unwrap()
                 .unwrap()
                 .model
@@ -1795,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_eitri_prefers_a_model_distinct_from_thor_and_loki() {
+    fn auto_subagent_default_prefers_a_model_distinct_from_the_occupied_seats() {
         let rows = vec![
             role_at("claude-sonnet-5", 0.482, 7.43).model,
             role_at("gpt-5-6-sol", 0.694, 3.47).model,
@@ -1809,7 +1692,7 @@ mod tests {
         ];
 
         assert_eq!(
-            resolve_eitri("auto", &rows, &available, &["gpt-5-6-sol", "gpt-5-6-terra"])
+            resolve_subagent_default("auto", &rows, &available, &["gpt-5-6-sol", "gpt-5-6-terra"])
                 .unwrap()
                 .unwrap()
                 .model

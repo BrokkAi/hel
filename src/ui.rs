@@ -53,8 +53,8 @@ use crate::clipboard::{
 };
 use crate::config;
 use crate::event::{
-    LokiActivity, LokiIdentity, PermissionDecision, PermissionPrompt, PromptImage, ReviewTarget,
-    UiCommand, UiEvent,
+    PermissionDecision, PermissionPrompt, PromptImage, ReviewTarget, SubagentOutcome, UiCommand,
+    UiEvent,
 };
 use crate::notifications::TerminalNotificationBackend;
 use crate::palette::TerminalTheme;
@@ -79,6 +79,8 @@ const HELP_SCROLL_PAGE_STEP: u16 = 10;
 /// Inline viewport height for the `/mjconfig` overlay (border + two sections).
 const INLINE_MJCONFIG_HEIGHT: u16 = 24;
 const QUEUED_PROMPT_VISIBLE_ROWS: usize = 3;
+/// Subagent status rows rendered before the area folds into a "… N more" line.
+const SUBAGENT_VISIBLE_ROWS: usize = 4;
 const CURSOR_POSITION_TIMEOUT_MESSAGE: &str =
     "The cursor position could not be read within a normal duration";
 const INLINE_SETUP_RETRY_DELAY: Duration = Duration::from_millis(75);
@@ -374,7 +376,7 @@ fn turn_final_response_index(state: &AppState, start: usize, end: usize) -> Opti
         .or_else(|| {
             (start..end)
                 .rev()
-                .find(|&index| matches!(&state.transcript[index], Entry::CodeAgentMessage(_)))
+                .find(|&index| matches!(&state.transcript[index], Entry::SubagentMessage(_)))
         })
 }
 
@@ -386,7 +388,7 @@ fn turn_tool_summary(state: &AppState, start: usize, end: usize) -> Option<TurnT
     };
     for entry in &state.transcript[start..end] {
         match entry {
-            Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
+            Entry::ToolCall(id) | Entry::SubagentToolCall(id) => {
                 // Count each source entry exactly once, even if a malformed
                 // transcript no longer has its associated live view.
                 summary.tools += 1;
@@ -417,21 +419,20 @@ fn transcript_entry_is_stable(state: &AppState, idx: usize, entry: &Entry) -> bo
         | Entry::System(_)
         | Entry::SessionBoundary(_)
         | Entry::Plan(_)
-        | Entry::CodeAgentPlan(_)
-        | Entry::LokiActivity(_)
+        | Entry::SubagentPlan(_)
         | Entry::InternalMessage(_) => true,
         Entry::AgentThought(thought) => thought.completed,
-        Entry::CodeAgentThought(thought) => thought.completed,
+        Entry::SubagentThought(thought) => thought.completed,
         // An actor may append coordination activity after its active message.
         // Hold only that exact owned entry; historical messages from the same
         // actor are already immutable and must remain flushable.
         Entry::AgentMessage(_) => {
             !state.is_streaming() || state.agent_open_message_index() != Some(idx)
         }
-        Entry::CodeAgentMessage(_) => {
-            !state.code_agent_active || state.code_agent_open_message_index() != Some(idx)
+        Entry::SubagentMessage(_) => {
+            !state.subagent_active || state.subagent_open_message_index() != Some(idx)
         }
-        Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
+        Entry::ToolCall(id) | Entry::SubagentToolCall(id) => {
             state.tool_calls.get(id).is_some_and(|view| {
                 matches!(
                     view.status,
@@ -496,12 +497,12 @@ pub struct UiRunOptions<'a> {
     pub session_boundary: Option<String>,
     /// The ACP session cwd; `/ragnarok` battles are rooted here.
     pub session_cwd: PathBuf,
-    pub council_choices: Vec<crate::council::ModelChoice>,
-    pub council_inventory: crate::council::AcpInventory,
-    pub council_models: crate::config::ModelsConfig,
-    pub active_council_models: crate::config::ModelsConfig,
-    pub thor_review_enabled: bool,
-    pub ragnarok_models: Vec<crate::council::ResolvedRole>,
+    pub model_choices: Vec<crate::roster::ModelChoice>,
+    pub acp_inventory: crate::roster::AcpInventory,
+    pub configured_models: crate::config::ModelsConfig,
+    pub active_models: crate::config::ModelsConfig,
+    pub review_enabled: bool,
+    pub ragnarok_models: Vec<crate::roster::ResolvedAgent>,
     pub primary_acp_name: String,
     pub termination: CancellationToken,
 }
@@ -526,12 +527,12 @@ struct UiInitialState {
     spinner_style: SpinnerStyle,
     session_boundary: Option<String>,
     session_cwd: PathBuf,
-    council_choices: Vec<crate::council::ModelChoice>,
-    council_inventory: crate::council::AcpInventory,
-    council_models: crate::config::ModelsConfig,
-    active_council_models: crate::config::ModelsConfig,
-    thor_review_enabled: bool,
-    ragnarok_models: Vec<crate::council::ResolvedRole>,
+    model_choices: Vec<crate::roster::ModelChoice>,
+    acp_inventory: crate::roster::AcpInventory,
+    configured_models: crate::config::ModelsConfig,
+    active_models: crate::config::ModelsConfig,
+    review_enabled: bool,
+    ragnarok_models: Vec<crate::roster::ResolvedAgent>,
     primary_acp_name: String,
 }
 
@@ -586,11 +587,11 @@ pub async fn run(
             spinner_style: options.spinner_style,
             session_boundary: options.session_boundary,
             session_cwd: options.session_cwd,
-            council_choices: options.council_choices,
-            council_inventory: options.council_inventory,
-            council_models: options.council_models,
-            active_council_models: options.active_council_models,
-            thor_review_enabled: options.thor_review_enabled,
+            model_choices: options.model_choices,
+            acp_inventory: options.acp_inventory,
+            configured_models: options.configured_models,
+            active_models: options.active_models,
+            review_enabled: options.review_enabled,
             ragnarok_models: options.ragnarok_models,
             primary_acp_name: options.primary_acp_name,
         },
@@ -709,13 +710,15 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
     match event {
         UiEvent::Side(event) => ui_event_redraw_cause(event),
         UiEvent::SideStartFailed { .. } => RedrawCause::Interactive,
-        UiEvent::SessionUpdate(_) | UiEvent::TerminalOutput(_) | UiEvent::LokiActivity(_) => {
-            RedrawCause::Stream
-        }
-        UiEvent::CodeAgent(crate::event::CodeAgentEvent::SessionUpdate(_))
-        | UiEvent::CodeAgent(crate::event::CodeAgentEvent::TerminalOutput(_)) => {
-            RedrawCause::Stream
-        }
+        UiEvent::SessionUpdate(_) | UiEvent::TerminalOutput(_) => RedrawCause::Stream,
+        // Activity only rewrites one status row's text, so it coalesces with
+        // streaming output. Started/Finished change the status area's height
+        // and fall through to the interactive arm below.
+        UiEvent::Subagent(
+            crate::event::SubagentEvent::SessionUpdate { .. }
+            | crate::event::SubagentEvent::TerminalOutput { .. }
+            | crate::event::SubagentEvent::Activity { .. },
+        ) => RedrawCause::Stream,
         UiEvent::Connected { .. }
         | UiEvent::SessionStarted { .. }
         | UiEvent::ContextCompacted
@@ -727,8 +730,8 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::PromptDone { .. }
         | UiEvent::ClaudeUsage(_)
         | UiEvent::CodexUsage(_)
-        | UiEvent::CouncilUsage(_)
-        | UiEvent::CouncilRoleChanged { .. }
+        | UiEvent::AgentUsage(_)
+        | UiEvent::SubagentPoolModelChanged { .. }
         | UiEvent::PromptFailed { .. }
         | UiEvent::SessionForkFailed { .. }
         | UiEvent::RemotePermissionDecision { .. }
@@ -736,8 +739,8 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         | UiEvent::Info(_)
         | UiEvent::InternalMessage(_)
         | UiEvent::Fatal(_)
-        | UiEvent::CouncilUpdate { .. }
-        | UiEvent::CodeAgent(_) => RedrawCause::Interactive,
+        | UiEvent::RosterUpdate { .. }
+        | UiEvent::Subagent(_) => RedrawCause::Interactive,
     }
 }
 
@@ -791,11 +794,11 @@ async fn ui_loop(
     }
     state.active_agent_launch = initial.active_agent_launch;
     state.session_cwd = initial.session_cwd;
-    state.council_choices = initial.council_choices;
-    state.council_inventory = initial.council_inventory;
-    state.council_models = initial.council_models;
-    state.active_council_models = initial.active_council_models;
-    state.thor_review_enabled = initial.thor_review_enabled;
+    state.model_choices = initial.model_choices;
+    state.acp_inventory = initial.acp_inventory;
+    state.configured_models = initial.configured_models;
+    state.active_models = initial.active_models;
+    state.review_enabled = initial.review_enabled;
     state.ragnarok_models = initial.ragnarok_models;
     state.set_primary_acp_name(initial.primary_acp_name);
     state.transcript_export_dir = initial.transcript_export_dir;
@@ -1273,9 +1276,13 @@ fn notification_message_for_event(
             preview_notification_text(message).unwrap_or_else(|| "agent error".to_string())
         )),
         UiEvent::PermissionRequest(prompt) => Some(permission_request_notification(prompt)),
-        UiEvent::CodeAgent(crate::event::CodeAgentEvent::PermissionRequest(prompt)) => Some(
-            format!("Eitri · {}", permission_request_notification(prompt)),
-        ),
+        UiEvent::Subagent(crate::event::SubagentEvent::PermissionRequest {
+            subagent_id,
+            prompt,
+        }) => Some(format!(
+            "subagent #{subagent_id} · {}",
+            permission_request_notification(prompt)
+        )),
         _ => None,
     }
 }
@@ -1382,9 +1389,11 @@ fn should_force_inline_repair_for_ui_event(mode: UiMode, ev: &UiEvent) -> bool {
                 | UiEvent::CancelPendingPermissions
                 | UiEvent::RemotePermissionDecision { .. }
                 | UiEvent::ElicitationRequest(_)
-                | UiEvent::CodeAgent(crate::event::CodeAgentEvent::PermissionRequest(_))
-                | UiEvent::CodeAgent(crate::event::CodeAgentEvent::ElicitationRequest(_))
-                | UiEvent::CodeAgent(crate::event::CodeAgentEvent::CancelPendingPermissions)
+                | UiEvent::Subagent(
+                    crate::event::SubagentEvent::PermissionRequest { .. }
+                        | crate::event::SubagentEvent::ElicitationRequest { .. }
+                        | crate::event::SubagentEvent::CancelPendingPermissions { .. }
+                )
         )
 }
 
@@ -1456,7 +1465,9 @@ fn timer_driven_live_redraw(mode: UiMode, state: &AppState) -> bool {
         return true;
     }
     if mode == UiMode::InlineChat && state.is_busy() {
-        return should_show_spinner(state);
+        // Subagent rows animate and expire on wall-clock time, so they need the
+        // timer even in the inline mode that otherwise suppresses it.
+        return should_show_spinner(state) || state.has_live_subagent_rows();
     }
 
     needs_live_redraw(state)
@@ -1481,6 +1492,10 @@ fn needs_live_redraw(state: &AppState) -> bool {
         || state.config_picker.is_some()
         // Keep redrawing so the menu's live spinner previews keep animating.
         || state.mjconfig_menu.is_some()
+        // Background subagents outlive the primary's turn: without this their
+        // spinners freeze and finished rows never reach their TTL, because no
+        // event fires when a row expires.
+        || state.has_live_subagent_rows()
         || should_show_spinner(state)
 }
 
@@ -1843,6 +1858,7 @@ fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
         // the input box keeps its full height while the queue is visible.
         usize::from(INLINE_CHAT_HEIGHT)
             + usize::from(queued_prompt_row_count(state))
+            + usize::from(subagent_status_row_count(state))
             + usage_quota_row_count(state, width)
             + inline_transcript_tail_row_count(state, width)
     };
@@ -3317,7 +3333,7 @@ fn latest_visible_tool_call_id(state: &AppState, compact_completed_turns: bool) 
         .enumerate()
         .rev()
         .find_map(|(index, entry)| {
-            let (Entry::ToolCall(id) | Entry::CodeAgentToolCall(id)) = entry else {
+            let (Entry::ToolCall(id) | Entry::SubagentToolCall(id)) = entry else {
                 return None;
             };
             let hidden = turns.as_ref().is_some_and(|turns| {
@@ -3579,8 +3595,8 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         clear_attachments(state);
         state.input_cursor = 0;
         state.scroll_input_to_bottom();
-        let _ = cmd_tx.send(UiCommand::CompactCouncil);
-        state.record_status_message(StatusKind::Info, "compacting Council context…");
+        let _ = cmd_tx.send(UiCommand::CompactPrimary);
+        state.record_status_message(StatusKind::Info, "compacting agent context…");
         return;
     }
 
@@ -3611,24 +3627,12 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && text == "/council" {
+    if images.is_empty() && text == "/agents" {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
         state.scroll_input_to_bottom();
-        let eitri = state.council_usage.eitri();
-        state.push_system_message(format!(
-            "Council models\nThor   {}\nEitri  {}\nLoki   {}\n\nUsage (tokens)\nThor   {}\nEitri  {} (code {}, explore {}, review {})\nLoki   {}",
-            state.active_council_models.thor,
-            state.active_council_models.eitri,
-            state.active_council_models.loki,
-            council_role_usage_label(&state.council_usage.thor),
-            council_role_usage_label(&eitri),
-            council_role_usage_label(&state.council_usage.eitri_code),
-            council_role_usage_label(&state.council_usage.eitri_explore),
-            council_role_usage_label(&state.council_usage.eitri_review),
-            council_role_usage_label(&state.council_usage.loki),
-        ));
+        state.push_system_message(active_models_and_usage_report(state));
         return;
     }
 
@@ -3646,11 +3650,11 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
                 "manual review is unavailable in side conversations",
             );
         } else if state.runtime_closed || state.session_id.is_none() {
-            state.record_status_message(StatusKind::Warning, "Thor is unavailable");
+            state.record_status_message(StatusKind::Warning, "the primary agent is unavailable");
         } else if state.is_busy() {
             state.record_status_message(
                 StatusKind::Warning,
-                "manual review is only available while Thor is idle",
+                "manual review is only available while the primary agent is idle",
             );
         } else if rest.trim().is_empty() {
             state.open_review_picker();
@@ -3909,21 +3913,21 @@ fn persist_mjconfig_selection(
 ) {
     let theme = config.theme;
     let style = config.spinner;
-    let thor_changed = state.thor_review_enabled != config.thor.discrete_review;
+    let review_changed = state.review_enabled != config.agent.discrete_review;
     if let Some(path) = state.config_path.clone() {
         match config.save(&path) {
             Ok(()) => {
-                state.council_models = config.role_models();
-                state.council_inventory = crate::council::discover_inventory(&config);
-                state.thor_review_enabled = config.thor.discrete_review;
-                if thor_changed {
-                    let _ = cmd_tx.send(UiCommand::SetThorReviewPolicy {
-                        enabled: config.thor.discrete_review,
+                state.configured_models = config.model_names();
+                state.acp_inventory = crate::roster::discover_inventory(&config);
+                state.review_enabled = config.agent.discrete_review;
+                if review_changed {
+                    let _ = cmd_tx.send(UiCommand::SetReviewPolicy {
+                        enabled: config.agent.discrete_review,
                     });
                 }
                 state.record_status_message(
                     StatusKind::Info,
-                    format!("config saved — theme {theme}, spinner {style}; Council model, permission, and ACP changes apply on /new or /clear"),
+                    format!("config saved — theme {theme}, spinner {style}; model, permission, and ACP changes apply on /new or /clear"),
                 );
             }
             Err(e) => state.record_status_message(
@@ -3941,42 +3945,6 @@ fn draw_mjconfig_menu(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         return;
     };
     draw_settings_panel(f, area, &menu.editor, "mj config");
-}
-
-fn loki_identity_label(actor: &LokiIdentity) -> String {
-    let role = loki_role_name(actor);
-    actor
-        .model_name
-        .as_deref()
-        .or(actor.model_value.as_deref())
-        .map(|model| format!("{role} · {model}"))
-        .unwrap_or(role)
-}
-
-fn loki_role_name(actor: &LokiIdentity) -> String {
-    if actor.role == "nested" {
-        "Nested agent".to_string()
-    } else {
-        let mut chars = actor.role.chars();
-        chars
-            .next()
-            .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-            .unwrap_or_else(|| "Agent".to_string())
-    }
-}
-
-fn loki_activity_label(activity: &LokiActivity) -> String {
-    match activity {
-        LokiActivity::Warning { actor, .. } => {
-            format!("{} · warning", loki_identity_label(actor))
-        }
-    }
-}
-
-fn loki_activity_text(activity: &LokiActivity) -> String {
-    match activity {
-        LokiActivity::Warning { message, .. } => message.clone(),
-    }
 }
 
 fn export_transcript(state: &AppState) -> Result<PathBuf> {
@@ -4064,31 +4032,17 @@ fn transcript_export_markdown(state: &AppState) -> String {
             Entry::UserPrompt(text) => push_export_text(&mut out, "You", text),
             Entry::AgentMessage(text) => push_export_text(&mut out, "Agent", text),
             Entry::AgentThought(thought) => push_export_text(&mut out, "Thought", &thought.text),
-            Entry::CodeAgentMessage(text) => push_export_text(&mut out, "Eitri", text),
-            Entry::CodeAgentThought(thought) => {
-                push_export_text(&mut out, "Eitri Thought", &thought.text)
+            Entry::SubagentMessage(text) => push_export_text(&mut out, "subagent", text),
+            Entry::SubagentThought(thought) => {
+                push_export_text(&mut out, "subagent Thought", &thought.text)
             }
-            Entry::LokiActivity(activity) => push_export_text(
-                &mut out,
-                &loki_activity_label(activity),
-                &loki_activity_text(activity),
-            ),
             Entry::InternalMessage(message) => {
                 let heading = match message.kind {
                     crate::event::InternalMessageKind::Delegation => {
                         format!("{} → {} delegation", message.source, message.target)
                     }
-                    crate::event::InternalMessageKind::Exploration => {
-                        format!("{} → {} · explore", message.source, message.target)
-                    }
                     crate::event::InternalMessageKind::DiscreteReview => {
                         format!("{} discrete review", message.source)
-                    }
-                    crate::event::InternalMessageKind::Continuation => {
-                        format!("{} → {} continuation", message.source, message.target)
-                    }
-                    crate::event::InternalMessageKind::Interjection => {
-                        format!("{} → {} interjection", message.source, message.target)
                     }
                     crate::event::InternalMessageKind::ReviewLane => {
                         format!("{} review lane", message.source)
@@ -4101,9 +4055,9 @@ fn transcript_export_markdown(state: &AppState) -> String {
             }
             Entry::System(text) => push_export_text(&mut out, "System", text),
             Entry::SessionBoundary(text) => push_export_text(&mut out, "Session", text),
-            Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
-                let heading = if matches!(entry, Entry::CodeAgentPlan(_)) {
-                    "## Eitri Plan\n\n"
+            Entry::Plan(entries) | Entry::SubagentPlan(entries) => {
+                let heading = if matches!(entry, Entry::SubagentPlan(_)) {
+                    "## subagent Plan\n\n"
                 } else {
                     "## Plan\n\n"
                 };
@@ -4118,10 +4072,10 @@ fn transcript_export_markdown(state: &AppState) -> String {
                 }
                 out.push('\n');
             }
-            Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
+            Entry::ToolCall(id) | Entry::SubagentToolCall(id) => {
                 if let Some(view) = state.tool_calls.get(id) {
-                    let label = if matches!(entry, Entry::CodeAgentToolCall(_)) {
-                        "Eitri Tool"
+                    let label = if matches!(entry, Entry::SubagentToolCall(_)) {
+                        "subagent Tool"
                     } else {
                         "Tool"
                     };
@@ -4603,11 +4557,12 @@ fn handle_agent_picker_key(
                 .is_some_and(|picker| picker.confirming);
             if confirming {
                 if let Some(role) = state.agent_picker_confirm() {
-                    persist_thor_picker_selection(state, role);
+                    persist_primary_picker_selection(state, role);
                 }
             } else if !state.agent_picker_request_confirmation() {
-                state.status_line =
-                    Some(StatusMessage::info("Thor is already using that ACP agent"));
+                state.status_line = Some(StatusMessage::info(
+                    "the primary agent is already using that ACP agent",
+                ));
             }
             inline_repair_request(mode)
         }
@@ -4625,7 +4580,7 @@ fn handle_agent_picker_key(
     }
 }
 
-fn persist_thor_picker_selection(state: &mut AppState, role: crate::council::ResolvedRole) {
+fn persist_primary_picker_selection(state: &mut AppState, role: crate::roster::ResolvedAgent) {
     let Some(path) = state.config_path.as_deref() else {
         state.record_status_message(StatusKind::Warning, "config path is unavailable");
         return;
@@ -4640,21 +4595,18 @@ fn persist_thor_picker_selection(state: &mut AppState, role: crate::council::Res
             return;
         }
     };
-    config.thor.model.clone_from(&role.model.model);
+    config.agent.model.clone_from(&role.model.model);
     match config.save(path) {
         Ok(()) => {
-            state.council_models = config.role_models();
+            state.configured_models = config.model_names();
             state.record_status_message(
                 StatusKind::Info,
-                format!(
-                    "Thor {} saved; use /new or /clear to apply",
-                    role.model.model
-                ),
+                format!("{} saved; use /new or /clear to apply", role.model.model),
             );
         }
         Err(error) => state.record_status_message(
             StatusKind::Warning,
-            format!("Thor selection was not saved: {error:#}"),
+            format!("model selection was not saved: {error:#}"),
         ),
     }
 }
@@ -5101,12 +5053,14 @@ fn draw(
     let input_height = input_height.clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT);
 
     let queued_row = queued_prompt_row_count(state);
+    let subagent_rows = subagent_status_row_count(state);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
             Constraint::Length(1),
+            Constraint::Length(subagent_rows),
             Constraint::Length(queued_row),
             Constraint::Length(input_height),
             Constraint::Length(usage_quota_rows),
@@ -5120,10 +5074,11 @@ fn draw(
         draw_transcript(f, chunks[0], state, transcript_scroll);
     }
     draw_header(f, chunks[1], state);
-    draw_queued_prompt_row(f, chunks[2], state);
-    draw_input(f, chunks[3], state, mode);
-    draw_usage_quota_row(f, chunks[4], state);
-    draw_config_shortcuts_row(f, chunks[5], state);
+    draw_subagent_status_rows(f, chunks[2], state);
+    draw_queued_prompt_row(f, chunks[3], state);
+    draw_input(f, chunks[4], state, mode);
+    draw_usage_quota_row(f, chunks[5], state);
+    draw_config_shortcuts_row(f, chunks[6], state);
 
     // Autocomplete sits above the input box (so it doesn't collide with
     // the cursor) and is rendered last among the input-area widgets so
@@ -5283,6 +5238,7 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
     let has_config_options = !state.selectable_config_options().is_empty();
     let usage_quota_rows = usage_quota_row_count(state, f.area().width) as u16;
     let queued_row = queued_prompt_row_count(state);
+    let subagent_rows = subagent_status_row_count(state);
     let live_rows = inline_transcript_tail_row_count(state, f.area().width)
         .min(usize::from(f.area().height)) as u16;
     let chunks = Layout::default()
@@ -5290,6 +5246,7 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
         .constraints([
             Constraint::Length(live_rows),
             Constraint::Length(1),
+            Constraint::Length(subagent_rows),
             Constraint::Length(queued_row),
             Constraint::Min(MIN_INPUT_HEIGHT),
             Constraint::Length(usage_quota_rows),
@@ -5299,10 +5256,11 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
 
     draw_inline_transcript_tail(f, chunks[0], state);
     draw_header(f, chunks[1], state);
-    draw_queued_prompt_row(f, chunks[2], state);
-    draw_input(f, chunks[3], state, UiMode::InlineChat);
-    draw_usage_quota_row(f, chunks[4], state);
-    draw_config_shortcuts_row(f, chunks[5], state);
+    draw_subagent_status_rows(f, chunks[2], state);
+    draw_queued_prompt_row(f, chunks[3], state);
+    draw_input(f, chunks[4], state, UiMode::InlineChat);
+    draw_usage_quota_row(f, chunks[5], state);
+    draw_config_shortcuts_row(f, chunks[6], state);
 
     if state.autocomplete.visible
         && !state.has_pending_permission()
@@ -5382,7 +5340,7 @@ fn agent_picker_items(state: &AppState, width: u16, visible: usize) -> Vec<ListI
         .filter_map(|(offset, &role_index)| {
             let position = range.start + offset;
             let role = state.ragnarok_models.get(role_index)?;
-            let current = role.model.model == state.active_council_models.thor;
+            let current = role.model.model == state.active_models.primary;
             let suffix = if current { "  current" } else { "" };
             Some(truncate_line(
                 format!("{} via {}{suffix}", role.model.model, role.launch.source_id),
@@ -5410,7 +5368,7 @@ fn draw_inline_agent_picker(f: &mut ratatui::Frame, area: Rect, state: &AppState
         ])
         .split(content);
     f.render_widget(
-        Paragraph::new("Select Thor model").style(
+        Paragraph::new("Select primary model").style(
             Style::default()
                 .fg(state.theme.primary)
                 .add_modifier(Modifier::BOLD),
@@ -5422,9 +5380,9 @@ fn draw_inline_agent_picker(f: &mut ratatui::Frame, area: Rect, state: &AppState
         .as_ref()
         .is_some_and(|picker| picker.confirming);
     let detail = if confirming {
-        "Save this Thor model for /new or /clear?"
+        "Save this model for /new or /clear?"
     } else {
-        "Choose a model for Thor"
+        "Choose a model for the primary agent"
     };
     f.render_widget(
         Paragraph::new(detail).style(Style::default().fg(state.theme.muted)),
@@ -5748,9 +5706,9 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         Span::raw("   "),
     ];
     let agent_label = state
-        .code_agent_label
+        .subagent_label
         .as_deref()
-        .or_else(|| (!state.agent_label.starts_with("Thor · ")).then_some(&state.agent_label))
+        .or(Some(state.agent_label.as_str()))
         .map(str::trim)
         .filter(|label| !label.is_empty());
     if let Some(agent_label) = agent_label {
@@ -5764,13 +5722,6 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         spans.push(Span::styled(
             notice.to_string(),
             Style::default().fg(state.theme.warning),
-        ));
-        spans.push(Span::raw("   "));
-    }
-    if state.active_explorations > 0 {
-        spans.push(Span::styled(
-            format!("explore ×{}", state.active_explorations),
-            Style::default().fg(state.theme.tool),
         ));
         spans.push(Span::raw("   "));
     }
@@ -5885,7 +5836,7 @@ fn turn_elapsed_value_label(state: &AppState) -> Option<String> {
     }
 }
 
-fn format_duration(duration: Duration) -> String {
+pub(crate) fn format_duration(duration: Duration) -> String {
     let secs = duration.as_secs();
     let minutes = secs / 60;
     let seconds = secs % 60;
@@ -5921,24 +5872,52 @@ fn token_usage_label(state: &AppState) -> String {
 }
 
 fn header_token_usage_label(state: &AppState, _width: usize) -> String {
-    let usage = &state.council_usage;
-    if usage.thor.prompts + usage.loki.prompts + usage.eitri().prompts > 0 {
-        return format!(
-            "T {} · L {} · E {}",
-            compact_count(usage.thor.total_tokens),
-            compact_count(usage.loki.total_tokens),
-            compact_count(usage.eitri().total_tokens),
+    let usage = &state.agent_usage;
+    if usage.total().prompts > 0 {
+        let mut label = format!(
+            "primary {} · subagents {}",
+            compact_count(usage.primary.total_tokens),
+            compact_count(usage.subagents.total_tokens),
         );
+        if usage.review.total_tokens > 0 {
+            label.push_str(&format!(
+                " · review {}",
+                compact_count(usage.review.total_tokens)
+            ));
+        }
+        return label;
     }
     token_usage_label(state)
 }
 
-fn council_role_usage_label(usage: &crate::council_usage::RoleUsage) -> String {
+fn seat_usage_label(usage: &crate::agent_usage::RoleUsage) -> String {
     let mut label = format!("{} tokens", usage.total_tokens);
     for (currency, amount) in &usage.costs {
         label.push_str(&format!(" · {amount:.4} {currency}"));
     }
     label
+}
+
+/// The `/agents` panel body: the models each seat is currently bound to,
+/// per-seat usage, and a per-model breakdown when more than the two bound
+/// models did work.
+fn active_models_and_usage_report(state: &AppState) -> String {
+    let usage = &state.agent_usage;
+    let mut report = format!(
+        "Active models\nprimary    {}\nsubagents  {}\n\nUsage (tokens)\nprimary    {}\nsubagents  {}\nreview     {}",
+        state.active_models.primary,
+        state.active_models.subagent,
+        seat_usage_label(&usage.primary),
+        seat_usage_label(&usage.subagents),
+        seat_usage_label(&usage.review),
+    );
+    if !usage.per_model.is_empty() {
+        report.push_str("\n\nBy model");
+        for (model, model_usage) in &usage.per_model {
+            report.push_str(&format!("\n{model}  {}", seat_usage_label(model_usage)));
+        }
+    }
+    report
 }
 
 fn compact_count(value: u64) -> String {
@@ -6081,7 +6060,7 @@ fn render_transcript_entry_range(
         // Completed successful tools are represented by the turn summary.
         // Do this before speaker grouping so a nested actor with only compacted
         // tool activity cannot leave behind an empty attribution header.
-        if matches!(entry, Entry::ToolCall(_) | Entry::CodeAgentToolCall(_))
+        if matches!(entry, Entry::ToolCall(_) | Entry::SubagentToolCall(_))
             && compact_turn.is_some()
             && tool_entry_is_successful(state, entry)
         {
@@ -6112,22 +6091,14 @@ fn render_transcript_entry_range(
                     // The turn header is the primary-agent grouping anchor.
                     // Nested actors still replace it when their visible activity
                     // appears below.
-                    speaker = Some("Thor".to_string());
+                    speaker = Some("agent".to_string());
                 }
             }
-            Entry::AgentMessage(text) | Entry::CodeAgentMessage(text) => {
+            Entry::AgentMessage(text) | Entry::SubagentMessage(text) => {
                 push_markdown_message(&mut out, text, collapse_message, width, theme)
             }
-            Entry::AgentThought(thought) | Entry::CodeAgentThought(thought) => {
+            Entry::AgentThought(thought) | Entry::SubagentThought(thought) => {
                 push_thinking(&mut out, thought, collapse_limit.is_some(), theme)
-            }
-            Entry::LokiActivity(activity) => {
-                let text = loki_activity_text(activity);
-                match activity.as_ref() {
-                    LokiActivity::Warning { .. } => {
-                        push_styled_message(&mut out, &text, theme.warning, collapse_message, theme)
-                    }
-                }
             }
             Entry::InternalMessage(message) => {
                 let chars = message.text.chars().count();
@@ -6139,25 +6110,8 @@ fn render_transcript_entry_range(
                             message_size_label(chars)
                         )
                     }
-                    crate::event::InternalMessageKind::Exploration => {
-                        format!("{} → {} · explore", message.source, message.target)
-                    }
                     crate::event::InternalMessageKind::DiscreteReview => {
                         format!("discrete review brief · {}", message_size_label(chars))
-                    }
-                    crate::event::InternalMessageKind::Continuation => {
-                        format!(
-                            "continuation for {} · {}",
-                            message.target,
-                            message_size_label(chars)
-                        )
-                    }
-                    crate::event::InternalMessageKind::Interjection => {
-                        format!(
-                            "post-turn thoughts for {} · {}",
-                            message.target,
-                            message_size_label(chars)
-                        )
                     }
                     crate::event::InternalMessageKind::ReviewLane => {
                         format!(
@@ -6178,7 +6132,7 @@ fn render_transcript_entry_range(
                 )));
                 push_markdown_message(&mut out, &message.text, collapse_message, width, theme);
             }
-            Entry::Plan(entries) | Entry::CodeAgentPlan(entries) => {
+            Entry::Plan(entries) | Entry::SubagentPlan(entries) => {
                 out.push(Line::from(Span::styled(
                     "plan",
                     Style::default().fg(theme.tool).add_modifier(Modifier::BOLD),
@@ -6188,7 +6142,7 @@ fn render_transcript_entry_range(
                 }
                 out.push(Line::from(""));
             }
-            Entry::ToolCall(id) | Entry::CodeAgentToolCall(id) => {
+            Entry::ToolCall(id) | Entry::SubagentToolCall(id) => {
                 if let Some(view) = state.tool_calls.get(id) {
                     let color = tool_status_color(view.status, theme);
                     let terminal_exit_status = view.body.iter().rev().find_map(|output| {
@@ -6254,7 +6208,7 @@ fn render_transcript_entry_range(
                         state.transcript.get(entry_index + 1).is_some_and(|next| {
                             matches!(
                                 next,
-                                Entry::ToolCall(next_id) | Entry::CodeAgentToolCall(next_id)
+                                Entry::ToolCall(next_id) | Entry::SubagentToolCall(next_id)
                                     if state.tool_calls.contains_key(next_id)
                             )
                         });
@@ -6267,7 +6221,7 @@ fn render_transcript_entry_range(
                 push_styled_message(&mut out, text, theme.accent, collapse_message, theme);
             }
             Entry::SessionBoundary(text) => {
-                if !text.starts_with("Eitri ·") {
+                if !text.starts_with("subagent ·") {
                     out.push(Line::from(""));
                     out.push(session_boundary_line(text, width, theme));
                     out.push(Line::from(""));
@@ -6279,7 +6233,7 @@ fn render_transcript_entry_range(
 }
 
 fn tool_entry_is_successful(state: &AppState, entry: &Entry) -> bool {
-    let (Entry::ToolCall(id) | Entry::CodeAgentToolCall(id)) = entry else {
+    let (Entry::ToolCall(id) | Entry::SubagentToolCall(id)) = entry else {
         return false;
     };
     state
@@ -6290,8 +6244,8 @@ fn tool_entry_is_successful(state: &AppState, entry: &Entry) -> bool {
 
 fn push_turn_header(out: &mut Vec<Line<'static>>, elapsed: Option<Duration>, theme: TerminalTheme) {
     let label = elapsed
-        .map(|elapsed| format!("Thor · {}", format_duration(elapsed)))
-        .unwrap_or_else(|| "Thor".to_string());
+        .map(|elapsed| format!("agent · {}", format_duration(elapsed)))
+        .unwrap_or_else(|| "agent".to_string());
     out.push(Line::from(Span::styled(
         label,
         Style::default()
@@ -6339,23 +6293,16 @@ fn push_turn_final_response_label(out: &mut Vec<Line<'static>>, theme: TerminalT
     )));
 }
 
-fn loki_for_activity(activity: &LokiActivity) -> &LokiIdentity {
-    match activity {
-        LokiActivity::Warning { actor, .. } => actor,
-    }
-}
-
 fn entry_speaker(entry: &Entry) -> Option<String> {
     match entry {
         Entry::UserPrompt(_) => Some("You".to_string()),
         Entry::AgentMessage(_) | Entry::AgentThought(_) | Entry::ToolCall(_) | Entry::Plan(_) => {
-            Some("Thor".to_string())
+            Some("agent".to_string())
         }
-        Entry::CodeAgentMessage(_)
-        | Entry::CodeAgentThought(_)
-        | Entry::CodeAgentToolCall(_)
-        | Entry::CodeAgentPlan(_) => Some("Eitri".to_string()),
-        Entry::LokiActivity(activity) => Some(loki_role_name(loki_for_activity(activity))),
+        Entry::SubagentMessage(_)
+        | Entry::SubagentThought(_)
+        | Entry::SubagentToolCall(_)
+        | Entry::SubagentPlan(_) => Some("subagent".to_string()),
         Entry::InternalMessage(message) => Some(message.source.clone()),
         Entry::System(_) | Entry::SessionBoundary(_) => None,
     }
@@ -6384,19 +6331,17 @@ fn push_speaker_name(out: &mut Vec<Line<'static>>, name: &str, theme: TerminalTh
     out.push(Line::from(Span::styled(
         name.to_string(),
         Style::default()
-            .fg(god_name_color(name, theme))
+            .fg(speaker_color(name, theme))
             .add_modifier(Modifier::BOLD),
     )));
 }
 
-fn god_name_color(role: &str, theme: TerminalTheme) -> Color {
+fn speaker_color(role: &str, theme: TerminalTheme) -> Color {
     if role.eq_ignore_ascii_case("You") {
         theme.user
-    } else if role.eq_ignore_ascii_case("Thor") {
+    } else if role.eq_ignore_ascii_case("agent") || role.eq_ignore_ascii_case("primary") {
         theme.primary
-    } else if role.eq_ignore_ascii_case("Loki") {
-        theme.secondary
-    } else if role.eq_ignore_ascii_case("Eitri") {
+    } else if role.eq_ignore_ascii_case("subagent") {
         theme.code
     } else {
         theme.agent
@@ -8635,6 +8580,107 @@ fn queued_prompt_row_count(state: &AppState) -> u16 {
     (visible + overflow).min(u16::MAX as usize) as u16
 }
 
+/// Height of the dedicated subagent status area: zero when nothing is running
+/// (so every existing layout is untouched), otherwise one line per visible
+/// subagent plus an overflow line when there are more than fit.
+fn subagent_status_row_count(state: &AppState) -> u16 {
+    let count = state.subagent_status_rows().count();
+    if count == 0 {
+        return 0;
+    }
+    let visible = count.min(SUBAGENT_VISIBLE_ROWS);
+    let overflow = usize::from(count > SUBAGENT_VISIBLE_ROWS);
+    (visible + overflow).min(u16::MAX as usize) as u16
+}
+
+/// One line per background subagent, between the header and the input box.
+/// Running rows animate (shared wall-clock spinner, ticking elapsed time);
+/// finished rows linger for [`app::SUBAGENT_DONE_TTL`] with their outcome and
+/// are dropped by the next redraw after that.
+fn draw_subagent_status_rows(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let now = Instant::now();
+    let rows: Vec<(u64, &crate::app::SubagentStatus)> =
+        state.subagent_status_rows_at(now).collect();
+    if rows.is_empty() {
+        return;
+    }
+    let total = rows.len();
+    // Rows arrive running-first, so truncating the tail folds finished rows
+    // before it ever hides live work.
+    let capacity = usize::from(area.height);
+    let visible = if total > capacity {
+        capacity.saturating_sub(1)
+    } else {
+        total.min(SUBAGENT_VISIBLE_ROWS)
+    };
+    let spinner = state.spinner_style.current_frame();
+    let width = usize::from(area.width);
+    let mut lines: Vec<Line<'static>> = rows
+        .iter()
+        .take(visible)
+        .map(|(_, row)| subagent_status_line(row, spinner, now, width, state.theme))
+        .collect();
+    if total > visible && lines.len() < capacity {
+        lines.push(Line::from(Span::styled(
+            fit_width(format!(" … {} more", total - visible), width),
+            Style::default().fg(state.theme.muted),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn subagent_status_line(
+    row: &crate::app::SubagentStatus,
+    spinner: &str,
+    now: Instant,
+    width: usize,
+    theme: TerminalTheme,
+) -> Line<'static> {
+    let model = row
+        .model
+        .as_deref()
+        .map(|model| format!(" ({model})"))
+        .unwrap_or_default();
+    let elapsed = format_duration(row.elapsed_at(now));
+    let (mark, detail, detail_color) = match row.outcome() {
+        None => {
+            let activity = row.activity.trim();
+            let detail = if activity.is_empty() {
+                format!("· {elapsed}")
+            } else {
+                format!("· {activity} · {elapsed}")
+            };
+            (spinner.to_string(), detail, theme.tool)
+        }
+        Some(SubagentOutcome::Completed) => (
+            "✔".to_string(),
+            format!("· done · {elapsed}"),
+            theme.success,
+        ),
+        Some(SubagentOutcome::Cancelled) => {
+            ("⊘".to_string(), "· cancelled".to_string(), theme.muted)
+        }
+        Some(SubagentOutcome::Failed(message)) => (
+            "✘".to_string(),
+            format!("· failed · {}", crate::ragnarok::first_line(message, 120)),
+            theme.error,
+        ),
+    };
+    // Truncate the assembled line as one unit so a long activity string can
+    // never push the row past the pane.
+    let head = format!(" {mark} {}{model} ", row.label);
+    let head = fit_width(head, width);
+    let head_width = head.width();
+    let detail = fit_width(detail, width.saturating_sub(head_width));
+    Line::from(vec![
+        Span::styled(head, Style::default().fg(theme.accent)),
+        Span::styled(detail, Style::default().fg(detail_color)),
+    ])
+}
+
 /// Render queued prompts directly above the input box. Visible only while
 /// prompts are waiting behind the active turn. Styled as distinct chips so
 /// they read as "waiting to send", never as messages already in the
@@ -9050,8 +9096,8 @@ fn permission_view_lines(
     theme: TerminalTheme,
 ) -> Vec<Line<'static>> {
     let selected = clamp_permission_selected(pending.selected, pending.prompt.options.len());
-    let source = if pending.code_agent {
-        "Eitri permission"
+    let source = if pending.subagent {
+        "subagent permission"
     } else {
         "permission request"
     };
@@ -9144,8 +9190,8 @@ fn elicitation_view_lines(
     theme: TerminalTheme,
 ) -> ElicitationContent {
     let view = classify_elicitation(&pending.prompt);
-    let source = if pending.code_agent {
-        "Eitri setup"
+    let source = if pending.subagent {
+        "subagent setup"
     } else {
         "setup request"
     };
@@ -9681,23 +9727,17 @@ fn help_modal_lines(
     theme: TerminalTheme,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
-        help_section_line("Council roles", theme),
+        help_section_line("Agent seats", theme),
         help_binding_line_with_color(
-            "Thor",
-            "coordinates each turn and the final response",
+            "agent",
+            "owns each turn and the final response",
             theme.primary,
             theme,
         ),
         help_binding_line_with_color(
-            "Eitri",
-            "explores or implements when delegated",
+            "subagents",
+            "run delegated work in the background and report back",
             theme.code,
-            theme,
-        ),
-        help_binding_line_with_color(
-            "Loki",
-            "independently reviews safe boundaries when needed",
-            theme.secondary,
             theme,
         ),
         help_blank_line(),
@@ -9760,7 +9800,7 @@ fn general_help_lines(voice_input_supported: bool, theme: TerminalTheme) -> Vec<
         help_section_line("General", theme),
         help_binding_line("Ctrl-N", "new session", theme),
         help_binding_line("Ctrl-O", "load session", theme),
-        help_binding_line("Shift-Tab", "choose Thor's ACP agent", theme),
+        help_binding_line("Shift-Tab", "choose the primary ACP agent", theme),
         help_binding_line("Enter", "send prompt / accept selected item", theme),
         help_binding_line(PROMPT_NEWLINE_HINT, "insert a newline in the prompt", theme),
         help_binding_line("Left/Right", "move the prompt cursor", theme),
@@ -9997,7 +10037,7 @@ fn draw_agent_picker_modal(f: &mut ratatui::Frame, area: Rect, state: &AppState)
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Select Thor model ")
+        .title(" Select primary model ")
         .style(Style::default().fg(state.theme.primary));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -10012,12 +10052,12 @@ fn draw_agent_picker_modal(f: &mut ratatui::Frame, area: Rect, state: &AppState)
     let confirming = picker.confirming;
     let header = if confirming {
         vec![
-            Line::from("Save this Thor model for /new or /clear?"),
+            Line::from("Save this model for /new or /clear?"),
             Line::from("Enter confirm | Esc back"),
         ]
     } else {
         vec![
-            Line::from("Choose a model for Thor."),
+            Line::from("Choose a model for the primary agent."),
             Line::from("Enter continue | Esc cancel"),
         ]
     };
@@ -11678,11 +11718,42 @@ mod tests {
     use crate::app::StatusKind;
     use crate::claude_usage::{ClaudeUsageReport, ClaudeUsageStatus};
     use crate::event::{
-        CodeAgentEvent, CodeAgentOutcome, ElicitationPrompt, InternalMessage, SessionConfigTarget,
+        ElicitationPrompt, InternalMessage, SessionConfigTarget, SubagentEvent,
         TerminalOutputSnapshot,
     };
 
     use super::*;
+
+    fn subagent_session_update(update: SessionUpdate) -> UiEvent {
+        UiEvent::Subagent(SubagentEvent::SessionUpdate {
+            subagent_id: 1,
+            update,
+        })
+    }
+
+    fn subagent_finished(outcome: SubagentOutcome) -> UiEvent {
+        UiEvent::Subagent(SubagentEvent::Finished {
+            subagent_id: 1,
+            outcome,
+        })
+    }
+
+    fn start_subagent(state: &mut AppState, subagent_id: u64, label: &str, objective: &str) {
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id,
+            label: label.to_string(),
+            model: Some("gpt-y".to_string()),
+            agent: "codex-acp".to_string(),
+            objective: objective.to_string(),
+        }));
+    }
+
+    fn finish_subagent(state: &mut AppState, subagent_id: u64, outcome: SubagentOutcome) {
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Finished {
+            subagent_id,
+            outcome,
+        }));
+    }
     use agent_client_protocol::schema::v1::{
         AvailableCommand, ContentBlock, ContentChunk, ElicitationFormMode, ElicitationId,
         ElicitationMode, ElicitationSchema, ElicitationSessionScope, ElicitationUrlMode,
@@ -12016,7 +12087,7 @@ mod tests {
         ]));
 
         let expected = vec![
-            "Thor",
+            "agent",
             "plan",
             "  [pending] write tests",
             "  [running] [high] render output",
@@ -12131,6 +12202,90 @@ mod tests {
     }
 
     #[test]
+    fn header_token_usage_label_reports_seat_totals_once_a_seat_has_billed() {
+        let mut state = AppState::new();
+        state.token_usage.input_tokens = Some(10);
+        state.token_usage.output_tokens = Some(20);
+        state.token_usage.context_used = Some(30);
+
+        // No seat usage yet: the header falls back to the plain token label.
+        assert_eq!(
+            header_token_usage_label(&state, 80),
+            "in: 10 · out: 20 · ctx: 30"
+        );
+
+        state.agent_usage.observe(crate::agent_usage::Record {
+            seat: crate::agent_usage::Seat::Primary,
+            model: Some("gpt-primary".to_string()),
+            usage: Some(agent_client_protocol::schema::v1::Usage::new(
+                1200, 900, 300,
+            )),
+            update: None,
+            session_id: Some("p1".to_string()),
+        });
+        state.agent_usage.observe(crate::agent_usage::Record {
+            seat: crate::agent_usage::Seat::Subagent,
+            model: Some("gpt-worker".to_string()),
+            usage: Some(agent_client_protocol::schema::v1::Usage::new(
+                3400, 3000, 400,
+            )),
+            update: None,
+            session_id: Some("s1".to_string()),
+        });
+        assert_eq!(
+            header_token_usage_label(&state, 80),
+            "primary 1200 · subagents 3400"
+        );
+
+        // Review overhead only appears once it is nonzero.
+        state.agent_usage.observe(crate::agent_usage::Record {
+            seat: crate::agent_usage::Seat::Review,
+            model: Some("gpt-worker".to_string()),
+            usage: Some(agent_client_protocol::schema::v1::Usage::new(500, 400, 100)),
+            update: None,
+            session_id: Some("r1".to_string()),
+        });
+        assert_eq!(
+            header_token_usage_label(&state, 80),
+            "primary 1200 · subagents 3400 · review 500"
+        );
+    }
+
+    #[test]
+    fn slash_agents_panel_breaks_usage_down_per_model() {
+        let mut state = AppState::new();
+        state.active_models = crate::config::ModelsConfig {
+            primary: "claude-opus".to_string(),
+            subagent: "gpt-worker".to_string(),
+        };
+        for (seat, model, total) in [
+            (crate::agent_usage::Seat::Primary, "claude-opus", 100),
+            (crate::agent_usage::Seat::Subagent, "gpt-worker", 40),
+            (crate::agent_usage::Seat::Review, "gpt-worker", 60),
+        ] {
+            state.agent_usage.observe(crate::agent_usage::Record {
+                seat,
+                model: Some(model.to_string()),
+                usage: Some(agent_client_protocol::schema::v1::Usage::new(
+                    total, total, 0,
+                )),
+                update: None,
+                session_id: Some(format!("{model}-{total}")),
+            });
+        }
+
+        let report = active_models_and_usage_report(&state);
+        assert!(report.contains("primary    100 tokens"), "{report}");
+        assert!(report.contains("subagents  40 tokens"), "{report}");
+        assert!(report.contains("review     60 tokens"), "{report}");
+        // Per-model lines aggregate across seats: the worker model billed both
+        // the subagent run and the review lane.
+        assert!(report.contains("\nBy model"), "{report}");
+        assert!(report.contains("\nclaude-opus  100 tokens"), "{report}");
+        assert!(report.contains("\ngpt-worker  100 tokens"), "{report}");
+    }
+
+    #[test]
     fn token_usage_label_omits_rate_limit_from_header() {
         // The Claude rate-limit status belongs in the transcript, not the
         // header, so the header label must not surface it even when present.
@@ -12168,25 +12323,31 @@ mod tests {
     }
 
     #[test]
-    fn header_switches_to_fresh_eitri_usage_and_restores_thor_afterward() {
+    fn header_switches_to_fresh_subagent_usage_and_restores_primary_afterward() {
         let mut state = AppState::new();
         state.token_usage.context_used = Some(42_000);
         state.token_usage.context_size = Some(128_000);
         assert_eq!(token_usage_label(&state), "ctx: 42.0k");
 
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
-            label: "Eitri · builder".to_string(),
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
+            label: "subagent".to_string(),
         }));
-        assert_eq!(token_usage_label(&state), "in: - · out: - · ctx: -");
+        assert_eq!(
+            token_usage_label(&state),
+            "ctx: 42.0k",
+            "a subagent that has reported no usage yet must not blank the header"
+        );
 
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::UsageUpdate(UsageUpdate::new(900, 128_000)),
+        state.apply_event(subagent_session_update(SessionUpdate::UsageUpdate(
+            UsageUpdate::new(900, 128_000),
         )));
         assert_eq!(token_usage_label(&state), "ctx: 900");
 
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
-            outcome: CodeAgentOutcome::Completed,
-        }));
+        state.apply_event(subagent_finished(SubagentOutcome::Completed));
         assert_eq!(token_usage_label(&state), "ctx: 42.0k");
     }
 
@@ -12323,7 +12484,7 @@ mod tests {
             },
             selected,
             scroll_offset: None,
-            code_agent: false,
+            subagent: false,
         }
     }
 
@@ -12371,7 +12532,7 @@ mod tests {
             selected: 0,
             scroll_offset: None,
             input: String::new(),
-            code_agent: false,
+            subagent: false,
         };
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -12405,7 +12566,7 @@ mod tests {
             selected: 0,
             scroll_offset: None,
             input: String::new(),
-            code_agent: false,
+            subagent: false,
         };
         let backend = TestBackend::new(100, 60);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -12560,7 +12721,7 @@ mod tests {
             selected: 0,
             scroll_offset: None,
             input: "sk-or-abc".to_string(),
-            code_agent: false,
+            subagent: false,
         };
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -12795,6 +12956,144 @@ mod tests {
             FRAME_BUDGET
         );
         assert_eq!(SPINNER_FRAME_BUDGET, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn subagent_status_area_appears_only_while_subagents_exist() {
+        let mut state = AppState::new();
+        assert_eq!(
+            subagent_status_row_count(&state),
+            0,
+            "no subagents means no layout change at all"
+        );
+
+        for id in 1..=SUBAGENT_VISIBLE_ROWS as u64 {
+            start_subagent(&mut state, id, &format!("lane-{id}"), "work");
+            assert_eq!(subagent_status_row_count(&state), id as u16);
+        }
+
+        // Past the visible limit the area stops growing and spends one line on
+        // the overflow summary instead.
+        start_subagent(&mut state, 5, "lane-5", "work");
+        assert_eq!(
+            subagent_status_row_count(&state),
+            SUBAGENT_VISIBLE_ROWS as u16 + 1
+        );
+    }
+
+    #[test]
+    fn subagent_status_rows_show_activity_elapsed_and_outcome() {
+        let mut state = AppState::new();
+        start_subagent(&mut state, 1, "fix-tests", "fix the parser tests");
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Activity {
+            subagent_id: 1,
+            activity: "running cargo test".to_string(),
+        }));
+        start_subagent(&mut state, 2, "docs", "update the docs");
+        finish_subagent(&mut state, 2, SubagentOutcome::Completed);
+        start_subagent(&mut state, 3, "build", "build it");
+        finish_subagent(
+            &mut state,
+            3,
+            SubagentOutcome::Failed("adapter exited".to_string()),
+        );
+
+        let rows = subagent_status_row_count(&state);
+        assert_eq!(rows, 3);
+        let backend = TestBackend::new(80, rows);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_subagent_status_rows(frame, frame.area(), &state))
+            .expect("draw status rows");
+        let rendered = buffer_lines(terminal.backend().buffer());
+
+        assert!(rendered[0].contains("fix-tests (gpt-y)"), "{rendered:?}");
+        assert!(rendered[0].contains("running cargo test"), "{rendered:?}");
+        assert!(rendered[0].contains("0s"), "{rendered:?}");
+        assert!(rendered[1].contains("✔ docs"), "{rendered:?}");
+        assert!(rendered[1].contains("done"), "{rendered:?}");
+        assert!(rendered[2].contains("✘ build"), "{rendered:?}");
+        assert!(rendered[2].contains("adapter exited"), "{rendered:?}");
+    }
+
+    #[test]
+    fn overflowing_status_rows_fold_finished_work_before_running_work() {
+        let mut state = AppState::new();
+        for id in 1..=5 {
+            start_subagent(&mut state, id, &format!("lane-{id}"), "work");
+        }
+        finish_subagent(&mut state, 1, SubagentOutcome::Completed);
+
+        let rows = subagent_status_row_count(&state);
+        let backend = TestBackend::new(60, rows);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_subagent_status_rows(frame, frame.area(), &state))
+            .expect("draw status rows");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+        for id in 2..=5 {
+            assert!(rendered.contains(&format!("lane-{id}")), "{rendered}");
+        }
+        assert!(
+            !rendered.contains("lane-1 "),
+            "the finished row is what folds away: {rendered}"
+        );
+        assert!(rendered.contains("… 1 more"), "{rendered}");
+    }
+
+    #[test]
+    fn live_subagent_rows_force_timer_redraws_while_the_primary_is_idle() {
+        let mut state = AppState::new();
+        state.set_connection_state(ConnectionState::Ready);
+        assert!(!should_show_spinner(&state));
+        assert!(!needs_live_redraw(&state));
+        assert!(!timer_driven_live_redraw(UiMode::InlineChat, &state));
+        assert!(!timer_driven_live_redraw(UiMode::FullscreenTui, &state));
+
+        start_subagent(&mut state, 1, "fix-tests", "fix the parser tests");
+        assert!(
+            needs_live_redraw(&state),
+            "elapsed time must keep ticking with an idle primary"
+        );
+        assert!(timer_driven_live_redraw(UiMode::InlineChat, &state));
+        assert!(timer_driven_live_redraw(UiMode::FullscreenTui, &state));
+
+        // A finished row still needs redraws: nothing but a timer removes it
+        // when its TTL runs out.
+        finish_subagent(&mut state, 1, SubagentOutcome::Completed);
+        assert!(needs_live_redraw(&state));
+    }
+
+    #[test]
+    fn subagent_status_events_pick_their_redraw_cause() {
+        assert_eq!(
+            ui_event_redraw_cause(&UiEvent::Subagent(SubagentEvent::Activity {
+                subagent_id: 1,
+                activity: "reading".to_string(),
+            })),
+            RedrawCause::Stream,
+            "activity only rewrites one row's text"
+        );
+        for event in [
+            UiEvent::Subagent(SubagentEvent::Started {
+                subagent_id: 1,
+                label: "fix-tests".to_string(),
+                model: None,
+                agent: "codex-acp".to_string(),
+                objective: "fix".to_string(),
+            }),
+            UiEvent::Subagent(SubagentEvent::Finished {
+                subagent_id: 1,
+                outcome: SubagentOutcome::Completed,
+            }),
+        ] {
+            assert_eq!(
+                ui_event_redraw_cause(&event),
+                RedrawCause::Interactive,
+                "start and finish change the status area's height"
+            );
+        }
     }
 
     #[test]
@@ -13474,7 +13773,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_saves_thor_for_the_next_clear_or_new_boundary() {
+    fn shift_tab_saves_the_primary_model_for_the_next_clear_or_new_boundary() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
         config::Config::default()
@@ -13483,13 +13782,13 @@ mod tests {
         let mut state = AppState::new();
         state.config_path = Some(config_path.clone());
         state.agent_source_id = "codex-acp".to_string();
-        state.active_council_models.thor = "codex-acp".to_string();
+        state.active_models.primary = "codex-acp".to_string();
         state.ragnarok_models = [
-            (crate::council::AdapterKind::Codex, "codex-acp"),
-            (crate::council::AdapterKind::Claude, "claude-acp"),
+            (crate::roster::AdapterKind::Codex, "codex-acp"),
+            (crate::roster::AdapterKind::Claude, "claude-acp"),
         ]
         .into_iter()
-        .map(|(kind, source_id)| crate::council::ResolvedRole {
+        .map(|(kind, source_id)| crate::roster::ResolvedAgent {
             model: crate::deepswe::Row {
                 model: source_id.to_string(),
                 reasoning_effort: None,
@@ -13497,7 +13796,7 @@ mod tests {
                 mean_cost_usd: 1.0,
             },
             model_value: source_id.to_string(),
-            launch: crate::council::AdapterLaunch {
+            launch: crate::roster::AdapterLaunch {
                 kind,
                 source_id: source_id.to_string(),
                 command: PathBuf::from(source_id),
@@ -13535,7 +13834,7 @@ mod tests {
         assert_eq!(
             config::Config::load(&config_path)
                 .expect("load config")
-                .thor
+                .agent
                 .model,
             "claude-acp"
         );
@@ -13551,10 +13850,10 @@ mod tests {
     fn agent_selector_navigation_wraps() {
         let mut state = AppState::new();
         state.agent_source_id = "codex-acp".to_string();
-        state.active_council_models.thor = "codex-acp".to_string();
+        state.active_models.primary = "codex-acp".to_string();
         state.ragnarok_models = ["codex-acp", "claude-acp"]
             .into_iter()
-            .map(|source_id| crate::council::ResolvedRole {
+            .map(|source_id| crate::roster::ResolvedAgent {
                 model: crate::deepswe::Row {
                     model: source_id.to_string(),
                     reasoning_effort: None,
@@ -13562,8 +13861,8 @@ mod tests {
                     mean_cost_usd: 1.0,
                 },
                 model_value: source_id.to_string(),
-                launch: crate::council::AdapterLaunch {
-                    kind: crate::council::AdapterKind::Custom,
+                launch: crate::roster::AdapterLaunch {
+                    kind: crate::roster::AdapterKind::Custom,
                     source_id: source_id.to_string(),
                     command: PathBuf::from(source_id),
                     args: Vec::new(),
@@ -13586,10 +13885,10 @@ mod tests {
     fn selecting_current_agent_closes_selector_without_restart() {
         let mut state = AppState::new();
         state.agent_source_id = "codex-acp".to_string();
-        state.active_council_models.thor = "codex-acp".to_string();
+        state.active_models.primary = "codex-acp".to_string();
         state.ragnarok_models = ["codex-acp", "claude-acp"]
             .into_iter()
-            .map(|source_id| crate::council::ResolvedRole {
+            .map(|source_id| crate::roster::ResolvedAgent {
                 model: crate::deepswe::Row {
                     model: source_id.to_string(),
                     reasoning_effort: None,
@@ -13597,8 +13896,8 @@ mod tests {
                     mean_cost_usd: 1.0,
                 },
                 model_value: source_id.to_string(),
-                launch: crate::council::AdapterLaunch {
-                    kind: crate::council::AdapterKind::Custom,
+                launch: crate::roster::AdapterLaunch {
+                    kind: crate::roster::AdapterKind::Custom,
                     source_id: source_id.to_string(),
                     command: PathBuf::from(source_id),
                     args: Vec::new(),
@@ -13618,11 +13917,11 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_can_stage_a_thor_change_during_a_turn() {
+    fn shift_tab_can_stage_a_primary_model_change_during_a_turn() {
         let mut state = AppState::new();
         state.ragnarok_models = ["codex-acp", "claude-acp"]
             .into_iter()
-            .map(|source_id| crate::council::ResolvedRole {
+            .map(|source_id| crate::roster::ResolvedAgent {
                 model: crate::deepswe::Row {
                     model: source_id.to_string(),
                     reasoning_effort: None,
@@ -13630,8 +13929,8 @@ mod tests {
                     mean_cost_usd: 1.0,
                 },
                 model_value: source_id.to_string(),
-                launch: crate::council::AdapterLaunch {
-                    kind: crate::council::AdapterKind::Custom,
+                launch: crate::roster::AdapterLaunch {
+                    kind: crate::roster::AdapterKind::Custom,
                     source_id: source_id.to_string(),
                     command: PathBuf::from(source_id),
                     args: Vec::new(),
@@ -13704,7 +14003,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_compact_routes_to_the_council_coordinator() {
+    fn slash_compact_routes_to_the_orchestrator() {
         let mut state = AppState::new();
         state.input = "/compact".to_string();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
@@ -13712,7 +14011,7 @@ mod tests {
         submit_prompt(&mut state, &cmd_tx);
 
         assert!(state.input.is_empty());
-        assert!(matches!(cmd_rx.try_recv(), Ok(UiCommand::CompactCouncil)));
+        assert!(matches!(cmd_rx.try_recv(), Ok(UiCommand::CompactPrimary)));
     }
 
     #[test]
@@ -13747,12 +14046,11 @@ mod tests {
 
         assert!(cmd_rx.try_recv().is_err());
         assert_eq!(state.queued_prompt_count(), 0);
-        assert!(
-            state
-                .status_line
-                .as_ref()
-                .is_some_and(|status| status.text.contains("only available while Thor is idle"))
-        );
+        assert!(state.status_line.as_ref().is_some_and(|status| {
+            status
+                .text
+                .contains("only available while the primary agent is idle")
+        }));
     }
 
     #[test]
@@ -13768,7 +14066,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_models_opens_shared_menu_on_council_tab() {
+    fn slash_models_opens_shared_menu_on_agents_tab() {
         let mut state = AppState::new();
         state.input = "/models".to_string();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
@@ -13776,19 +14074,18 @@ mod tests {
         submit_prompt(&mut state, &cmd_tx);
 
         let menu = state.mjconfig_menu.as_ref().expect("menu should be open");
-        assert_eq!(menu.editor.tab, crate::settings::SettingsTab::Council);
+        assert_eq!(menu.editor.tab, crate::settings::SettingsTab::Agents);
         assert!(state.input.is_empty(), "input should be consumed");
     }
 
     #[test]
-    fn slash_council_adds_active_models_system_entry() {
+    fn slash_agents_adds_active_models_system_entry() {
         let mut state = AppState::new();
-        state.active_council_models = crate::config::ModelsConfig {
-            thor: "claude-opus".to_string(),
-            eitri: "gpt-5.5".to_string(),
-            loki: "off".to_string(),
+        state.active_models = crate::config::ModelsConfig {
+            primary: "claude-opus".to_string(),
+            subagent: "gpt-5.5".to_string(),
         };
-        state.input = "/council".to_string();
+        state.input = "/agents".to_string();
         state.input_cursor = 2;
         state.attachments.push(crate::app::PastedAttachment {
             id: 1,
@@ -13807,7 +14104,8 @@ mod tests {
         assert!(matches!(
             state.transcript.last(),
             Some(Entry::System(text))
-                if text == "Council models\nThor   claude-opus\nEitri  gpt-5.5\nLoki   off\n\nUsage (tokens)\nThor   0 tokens\nEitri  0 tokens (code 0 tokens, explore 0 tokens, review 0 tokens)\nLoki   0 tokens"
+                if text
+                    == "Active models\nprimary    claude-opus\nsubagents  gpt-5.5\n\nUsage (tokens)\nprimary    0 tokens\nsubagents  0 tokens\nreview     0 tokens"
         ));
     }
 
@@ -13842,9 +14140,9 @@ mod tests {
         state.mjconfig_menu_key(KeyCode::Right);
         let previewed = state.spinner_style;
 
-        // Council tab: toggle Thor review and apply it to the running session.
+        // Agents tab: toggle discrete review and apply it to the running session.
         state.mjconfig_menu_key(KeyCode::Tab);
-        for _ in 0..3 {
+        for _ in 0..2 {
             state.mjconfig_menu_key(KeyCode::Down);
         }
         state.mjconfig_menu_key(KeyCode::Char(' '));
@@ -13865,10 +14163,10 @@ mod tests {
             saved.acp.policy("codex-acp"),
             crate::config::AcpServerPolicy::Disabled
         );
-        assert!(!saved.thor.discrete_review);
+        assert!(!saved.agent.discrete_review);
         assert!(matches!(
             cmd_rx.try_recv(),
-            Ok(UiCommand::SetThorReviewPolicy { enabled: false })
+            Ok(UiCommand::SetReviewPolicy { enabled: false })
         ));
     }
 
@@ -13955,11 +14253,11 @@ mod tests {
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(rendered.contains("mj config"), "rendered:\n{rendered}");
-        assert!(rendered.contains("Council"), "rendered:\n{rendered}");
+        assert!(rendered.contains("Agents"), "rendered:\n{rendered}");
         assert!(rendered.contains("ACP Servers"), "rendered:\n{rendered}");
         assert!(rendered.contains("Appearance"), "rendered:\n{rendered}");
         assert!(
-            rendered.contains("primary model; plans and reviews work"),
+            rendered.contains("primary model; plans, implements, and answers"),
             "rendered:\n{rendered}"
         );
     }
@@ -14584,14 +14882,14 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(rendered, vec!["Thor", "world", ""]);
+        assert_eq!(rendered, vec!["agent", "world", ""]);
         assert!(sink.pending_lines(&state, 80).is_empty());
     }
 
     #[test]
-    fn transcript_sink_flushes_old_thor_message_while_later_one_streams() {
+    fn transcript_sink_flushes_old_agent_message_while_later_one_streams() {
         // Do not drain the first turn before beginning the second. The sink
-        // must still flush its completed Thor result even though a later Thor
+        // must still flush its completed agent result even though a later agent
         // entry is the exact one currently receiving chunks.
         let mut state = AppState::new();
         let mut sink = TranscriptSink::default();
@@ -14621,7 +14919,7 @@ mod tests {
                 "You",
                 "first prompt",
                 "",
-                "Thor",
+                "agent",
                 "first result",
                 "",
                 "You",
@@ -14633,14 +14931,18 @@ mod tests {
     }
 
     #[test]
-    fn transcript_sink_holds_mutable_thor_thought_during_eitri_activity() {
+    fn transcript_sink_holds_mutable_primary_thought_during_subagent_activity() {
         let mut state = AppState::new();
         let mut sink = TranscriptSink::default();
 
         state.record_user_prompt("delegate this".to_string());
         let _ = sink.pending_lines(&state, 80);
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
-            label: "Eitri · builder".to_string(),
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
+            label: "subagent".to_string(),
         }));
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
             text_chunk("I"),
@@ -14654,30 +14956,39 @@ mod tests {
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::UserPrompt(_), Entry::AgentThought(text)] if text.text == "I need to inspect this"
+            [Entry::UserPrompt(_), Entry::System(started), Entry::AgentThought(text)]
+                if started.contains("subagent #1") && text.text == "I need to inspect this"
         ));
-        assert_eq!(stable_transcript_entry_count(&state), 1);
-        assert!(sink.pending_lines(&state, 80).is_empty());
+        // The subagent's one permanent start record is immediately flushable;
+        // nothing else about the subagent ever rewrites the transcript.
+        assert_eq!(stable_transcript_entry_count(&state), 2);
+        let started_flush = sink
+            .pending_lines(&state, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(started_flush.contains("subagent #1"), "{started_flush}");
 
         let tail = inline_transcript_tail_lines(&state, 80)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>();
-        assert_eq!(tail, vec!["Thor", "I need to inspect this"]);
+        assert_eq!(tail, vec!["agent", "I need to inspect this"]);
 
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentThoughtChunk(text_chunk("implementing")),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentThoughtChunk(
+            text_chunk("implementing"),
         )));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentMessageChunk(text_chunk("done")),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentMessageChunk(
+            text_chunk("done"),
         )));
-        assert_eq!(stable_transcript_entry_count(&state), 1);
+        assert_eq!(stable_transcript_entry_count(&state), 2);
 
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
             text_chunk(" and report"),
         )));
         assert!(matches!(
-            &state.transcript[1],
+            &state.transcript[2],
             Entry::AgentThought(thought)
                 if thought.text == "I need to inspect this and report" && !thought.completed
         ));
@@ -14697,13 +15008,13 @@ mod tests {
         assert_eq!(
             flushed,
             vec![
-                "Thor",
+                "agent",
                 "thought · 1 line",
-                "Eitri",
+                "subagent",
                 "thought · 1 line",
                 "done",
                 "",
-                "Thor",
+                "agent",
                 "Here is the result",
                 "",
             ]
@@ -14734,7 +15045,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             replayed,
-            vec!["You", "replayed prompt", "", "Thor", "replayed answer", ""]
+            vec!["You", "replayed prompt", "", "agent", "replayed answer", ""]
         );
 
         state.record_user_prompt("local prompt".to_string());
@@ -14820,7 +15131,7 @@ mod tests {
         );
         state
             .transcript
-            .push(Entry::CodeAgentToolCall("nested-write".to_string()));
+            .push(Entry::SubagentToolCall("nested-write".to_string()));
         state.tool_calls.insert(
             "failed-test".to_string(),
             crate::app::ToolCallView {
@@ -14883,7 +15194,7 @@ mod tests {
         assert!(full.contains("write src/main.rs"), "{full}");
         assert!(full.contains("src/lib.rs"), "{full}");
         assert!(full.contains("src/main.rs"), "{full}");
-        assert!(full.contains("Eitri"), "{full}");
+        assert!(full.contains("subagent"), "{full}");
 
         let markdown = transcript_export_markdown(&state);
         assert!(markdown.contains("write src/lib\\.rs"));
@@ -14893,7 +15204,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_handoff_streams_completed_eitri_activity_to_scrollback() {
+    fn foreground_handoff_streams_completed_subagent_activity_to_scrollback() {
         let mut state = AppState::new();
         let mut sink = TranscriptSink::default();
 
@@ -14905,28 +15216,30 @@ mod tests {
             .collect();
         assert_eq!(initial, vec!["You", "delegate this", ""]);
 
-        let bridge = ToolCall::new("bridge-call", "mcp.mj-code-agent.code_agent")
+        let bridge = ToolCall::new("bridge-call", "mcp.mj-subagents.create_subagent")
             .status(ToolCallStatus::InProgress)
             .raw_input(serde_json::json!({
-                "server": "mj-code-agent",
-                "tool": "code_agent",
-                "arguments": { "instructions": "forge the change" }
+                "server": "mj-subagents",
+                "tool": "create_subagent",
+                "arguments": { "prompt": "forge the change" }
             }));
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(bridge)));
         state.apply_event(UiEvent::InternalMessage(InternalMessage {
-            source: "Thor".to_string(),
-            target: "Eitri".to_string(),
+            source: "primary".to_string(),
+            target: "subagent".to_string(),
             kind: crate::event::InternalMessageKind::Delegation,
             text: "forge the change".to_string(),
         }));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
-            label: "Eitri · builder".to_string(),
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
+            label: "subagent".to_string(),
         }));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::ToolCall(
-                ToolCall::new("nested-call", "completed nested command")
-                    .status(ToolCallStatus::Completed),
-            ),
+        state.apply_event(subagent_session_update(SessionUpdate::ToolCall(
+            ToolCall::new("nested-call", "completed nested command")
+                .status(ToolCallStatus::Completed),
         )));
 
         assert_eq!(
@@ -14950,28 +15263,32 @@ mod tests {
             .join("\n");
         assert!(streamed.contains("forge the change"), "{streamed}");
         assert!(streamed.contains("completed nested command"), "{streamed}");
-        assert!(!streamed.contains("mcp.mj-code-agent"), "{streamed}");
+        assert!(!streamed.contains("mcp.mj-subagents"), "{streamed}");
         assert!(inline_transcript_tail_lines(&state, 80).is_empty());
     }
 
     #[test]
-    fn foreground_exploration_has_a_distinct_handoff_and_live_eitri_activity() {
+    fn foreground_delegation_has_a_distinct_handoff_and_live_subagent_activity() {
         let mut state = AppState::new();
         let mut sink = TranscriptSink::default();
 
         state.record_user_prompt("trace startup".to_string());
         let _ = sink.pending_lines(&state, 80);
         state.apply_event(UiEvent::InternalMessage(InternalMessage {
-            source: "Thor".to_string(),
-            target: "Eitri".to_string(),
-            kind: crate::event::InternalMessageKind::Exploration,
+            source: "primary".to_string(),
+            target: "subagent #1".to_string(),
+            kind: crate::event::InternalMessageKind::Delegation,
             text: "trace startup".to_string(),
         }));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
-            label: "Eitri · explorer".to_string(),
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
+            label: "explorer".to_string(),
         }));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentThoughtChunk(text_chunk("searching entry points")),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentThoughtChunk(
+            text_chunk("searching entry points"),
         )));
 
         let streamed = sink
@@ -14980,62 +15297,39 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(streamed.contains("Thor → Eitri · explore"), "{streamed}");
+        assert!(streamed.contains("delegated to subagent #1"), "{streamed}");
         let live = inline_transcript_tail_lines(&state, 80)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(live.contains("searching entry points"), "{live}");
-        state.apply_event(UiEvent::LokiActivity(LokiActivity::Warning {
-            actor: LokiIdentity {
-                role: "Loki".to_string(),
-                connection_id: "explore-review".to_string(),
-                source_id: None,
-                model_name: Some("reviewer".to_string()),
-                model_value: None,
-            },
-            message: "trace the fallback path too".to_string(),
-        }));
-        let interjection = sink
-            .pending_lines(&state, 80)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(interjection.is_empty(), "{interjection}");
-        let live_after_loki = inline_transcript_tail_lines(&state, 80)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(live_after_loki.contains("Loki"), "{live_after_loki}");
-        assert!(
-            live_after_loki.contains("trace the fallback path too"),
-            "{live_after_loki}"
-        );
-        assert!(transcript_export_markdown(&state).contains("Thor → Eitri · explore"));
+        assert!(transcript_export_markdown(&state).contains("primary → subagent #1 delegation"));
     }
 
     #[test]
-    fn inline_chat_streams_thor_and_eitri_through_one_transcript_tail() {
+    fn inline_chat_streams_primary_and_subagent_through_one_transcript_tail() {
         let mut state = AppState::new();
-        state.agent_label = "Thor · gpt-primary".to_string();
+        state.agent_label = "gpt-primary".to_string();
         state.record_user_prompt("delegate this".to_string());
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
             text_chunk("planning the handoff"),
         )));
-        let thor_tail = inline_transcript_tail_lines(&state, 80)
+        let primary_tail = inline_transcript_tail_lines(&state, 80)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>();
-        assert_eq!(thor_tail, vec!["Thor", "planning the handoff"]);
+        assert_eq!(primary_tail, vec!["agent", "planning the handoff"]);
 
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
-            label: "Eitri · gpt-builder".to_string(),
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
+            label: "subagent · gpt-builder".to_string(),
         }));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentThoughtChunk(text_chunk("working now")),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentThoughtChunk(
+            text_chunk("working now"),
         )));
 
         let live = inline_transcript_tail_lines(&state, 80)
@@ -15044,7 +15338,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             live,
-            vec!["Thor", "planning the handoff", "Eitri", "working now"]
+            vec![
+                "agent",
+                "planning the handoff",
+                "subagent #1 · subagent · gpt-builder · started",
+                "",
+                "subagent",
+                "working now"
+            ]
         );
         assert!(inline_transcript_tail_row_count(&state, 80) > 0);
         assert!(
@@ -15063,28 +15364,35 @@ mod tests {
             .draw(|frame| draw_header(frame, frame.area(), &state))
             .expect("draw active header");
         let active = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(active.contains("Eitri · gpt-builder"), "{active}");
-        assert!(!active.contains("Thor · gpt-primary"), "{active}");
+        assert!(active.contains("subagent · gpt-builder"), "{active}");
+        assert!(!active.contains("gpt-primary"), "{active}");
 
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
-            outcome: CodeAgentOutcome::Completed,
-        }));
+        state.apply_event(subagent_finished(SubagentOutcome::Completed));
         assert_eq!(
             inline_transcript_tail_lines(&state, 80)
                 .iter()
                 .map(line_text)
                 .collect::<Vec<_>>(),
-            vec!["Thor", "planning the handoff", "Eitri", "thought · 1 line"]
+            vec![
+                "agent",
+                "planning the handoff",
+                "subagent #1 · subagent · gpt-builder · started",
+                "",
+                "subagent",
+                "thought · 1 line",
+                "subagent #1 · subagent · gpt-builder · completed · 0s",
+                ""
+            ]
         );
         terminal
             .draw(|frame| draw_header(frame, frame.area(), &state))
             .expect("draw restored header");
         let restored = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(!restored.contains("Thor · gpt-primary"), "{restored}");
+        assert!(restored.contains("gpt-primary"), "{restored}");
     }
 
     #[test]
-    fn foreground_handoff_holds_active_eitri_result_across_loki_and_reattaches_thor() {
+    fn foreground_handoff_holds_active_subagent_result_and_reattaches_primary() {
         let mut state = AppState::new();
         let mut sink = TranscriptSink::default();
         state.record_user_prompt("delegate this".to_string());
@@ -15097,107 +15405,109 @@ mod tests {
         );
 
         state.apply_event(UiEvent::InternalMessage(InternalMessage {
-            source: "Thor".to_string(),
-            target: "Eitri".to_string(),
+            source: "primary".to_string(),
+            target: "subagent".to_string(),
             kind: crate::event::InternalMessageKind::Delegation,
             text: "forge it".to_string(),
         }));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
-            label: "Eitri · builder".to_string(),
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
+            label: "subagent".to_string(),
         }));
-        assert!(state.code_agent_active);
+        assert!(state.subagent_active);
         let handoff = sink
             .pending_lines(&state, 80)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(handoff.contains("delegated to Eitri"), "{handoff}");
+        assert!(handoff.contains("delegated to subagent"), "{handoff}");
 
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentMessageChunk(text_chunk("first Eitri segment")),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentMessageChunk(
+            text_chunk("first subagent segment"),
         )));
         assert!(sink.pending_lines(&state, 80).is_empty());
 
-        state.apply_event(UiEvent::LokiActivity(LokiActivity::Warning {
-            actor: LokiIdentity {
-                role: "Loki".to_string(),
-                connection_id: "loki-review".to_string(),
-                source_id: None,
-                model_name: Some("reviewer".to_string()),
-                model_value: None,
-            },
-            message: "material concern".to_string(),
-        }));
-        let interjection = sink
-            .pending_lines(&state, 80)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(interjection.is_empty(), "{interjection}");
         let live = inline_transcript_tail_lines(&state, 80)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(live.contains("first Eitri segment"), "{live}");
-        assert!(live.contains("Loki"), "{live}");
-        assert!(live.contains("material concern"), "{live}");
+        assert!(live.contains("first subagent segment"), "{live}");
 
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentMessageChunk(text_chunk("Eitri final")),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentMessageChunk(
+            text_chunk("subagent final"),
         )));
         assert!(sink.pending_lines(&state, 80).is_empty());
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
-            outcome: CodeAgentOutcome::Completed,
-        }));
-        assert!(!state.code_agent_active);
-        let eitri_final = sink
+        state.apply_event(subagent_finished(SubagentOutcome::Completed));
+        assert!(!state.subagent_active);
+        let subagent_final = sink
             .pending_lines(&state, 80)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(eitri_final.contains("Eitri final"), "{eitri_final}");
+        assert!(
+            subagent_final.contains("subagent final"),
+            "{subagent_final}"
+        );
 
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
-            text_chunk("Thor resumed"),
+            text_chunk("primary resumed"),
         )));
         assert!(sink.pending_lines(&state, 80).is_empty());
         state.apply_event(UiEvent::PromptDone {
             stop_reason: StopReason::EndTurn,
             usage: None,
         });
-        let thor_resumed = sink
+        let primary_resumed = sink
             .pending_lines(&state, 80)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(thor_resumed.contains("Thor resumed"), "{thor_resumed}");
+        assert!(
+            primary_resumed.contains("primary resumed"),
+            "{primary_resumed}"
+        );
     }
 
     #[test]
-    fn transcript_sink_keeps_alternating_thor_activity_out_of_eitri_result_fragments() {
+    fn transcript_sink_keeps_alternating_primary_activity_out_of_subagent_result_fragments() {
         let mut state = AppState::new();
         let mut sink = TranscriptSink::default();
-        let first = "EITRI-FIRST ".repeat(30);
-        let second = "EITRI-SECOND ".repeat(30);
+        let first = "SUB-FIRST ".repeat(30);
+        let second = "SUB-SECOND ".repeat(30);
         let full_result = format!("{first}{second}");
 
         state.record_user_prompt("forge this".to_string());
         let _ = sink.pending_lines(&state, 20);
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
-            label: "Eitri · builder".to_string(),
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
+            label: "subagent".to_string(),
         }));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentMessageChunk(text_chunk(&first)),
+        // The start record is immutable and flushes at once; everything the
+        // subagent streams afterwards stays held.
+        let started = sink
+            .pending_lines(&state, 20)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(started.contains("subagent #1"), "{started}");
+        state.apply_event(subagent_session_update(SessionUpdate::AgentMessageChunk(
+            text_chunk(&first),
         )));
         assert!(sink.pending_lines(&state, 20).is_empty());
 
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
-            text_chunk("waiting for Eitri's first result"),
+            text_chunk("waiting for the subagent's first result"),
         )));
         assert!(sink.pending_lines(&state, 20).is_empty());
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
@@ -15205,56 +15515,63 @@ mod tests {
         )));
         assert!(sink.pending_lines(&state, 20).is_empty());
 
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentMessageChunk(text_chunk(&second)),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentMessageChunk(
+            text_chunk(&second),
         )));
         assert!(sink.pending_lines(&state, 20).is_empty());
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::UserPrompt(_), Entry::CodeAgentMessage(result), Entry::AgentThought(thought)]
+            [
+                Entry::UserPrompt(_),
+                Entry::System(_),
+                Entry::SubagentMessage(result),
+                Entry::AgentThought(thought)
+            ]
                 if result == &full_result
-                    && thought.text == "waiting for Eitri's first result; coordinating the next step"
+                    && thought.text
+                        == "waiting for the subagent's first result; coordinating the next step"
                     && !thought.completed
         ));
 
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
-            outcome: CodeAgentOutcome::Completed,
-        }));
-        let eitri = sink
+        state.apply_event(subagent_finished(SubagentOutcome::Completed));
+        let subagent = sink
             .pending_lines(&state, 20)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(eitri.contains("EITRI-FIRST"), "{eitri}");
-        assert!(eitri.contains("EITRI-SECOND"), "{eitri}");
-        assert!(!eitri.contains("waiting for Eitri"), "{eitri}");
+        assert!(subagent.contains("SUB-FIRST"), "{subagent}");
+        assert!(subagent.contains("SUB-SECOND"), "{subagent}");
+        assert!(!subagent.contains("waiting for the subagent"), "{subagent}");
 
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
-            text_chunk("Thor completed coordination."),
+            text_chunk("primary completed coordination."),
         )));
-        let thor_thought = sink
+        let primary_thought = sink
             .pending_lines(&state, 20)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(thor_thought.contains("thought · 1 line"), "{thor_thought}");
-        assert!(!thor_thought.contains("EITRI-FIRST"), "{thor_thought}");
+        assert!(
+            primary_thought.contains("thought · 1 line"),
+            "{primary_thought}"
+        );
+        assert!(!primary_thought.contains("SUB-FIRST"), "{primary_thought}");
         state.apply_event(UiEvent::PromptDone {
             stop_reason: StopReason::EndTurn,
             usage: None,
         });
-        let thor = sink
+        let primary = sink
             .pending_lines(&state, 20)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(thor.contains("Thor completed"), "{thor}");
-        assert!(thor.contains("coordination."), "{thor}");
-        assert!(!thor.contains("EITRI-FIRST"), "{thor}");
-        assert!(!thor.contains("EITRI-SECOND"), "{thor}");
+        assert!(primary.contains("primary completed"), "{primary}");
+        assert!(primary.contains("coordination."), "{primary}");
+        assert!(!primary.contains("SUB-FIRST"), "{primary}");
+        assert!(!primary.contains("SUB-SECOND"), "{primary}");
     }
 
     #[test]
@@ -15294,7 +15611,7 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert_eq!(rendered, vec!["Thor", "│ exec cargo test", "│   ok"]);
+        assert_eq!(rendered, vec!["agent", "│ exec cargo test", "│   ok"]);
         assert!(sink.pending_lines(&state, 80).is_empty());
 
         // When the turn ends with nothing after the tool call, the held
@@ -15357,7 +15674,7 @@ mod tests {
             .collect();
         assert_eq!(
             rendered,
-            vec!["Thor", "│ exec cargo test · exit 0", "│   ok"]
+            vec!["agent", "│ exec cargo test · exit 0", "│   ok"]
         );
     }
 
@@ -15395,7 +15712,7 @@ mod tests {
             .map(line_text)
             .collect();
         let cancelled_tool = cancelled_tool.join("\n");
-        assert!(cancelled_tool.contains("Thor"), "{cancelled_tool}");
+        assert!(cancelled_tool.contains("agent"), "{cancelled_tool}");
         assert!(cancelled_tool.contains("[failed]"), "{cancelled_tool}");
         assert!(cancelled_tool.contains("cargo test"), "{cancelled_tool}");
         assert!(cancelled_tool.contains("running"), "{cancelled_tool}");
@@ -15885,6 +16202,60 @@ mod tests {
     }
 
     #[test]
+    fn both_ui_modes_reserve_the_subagent_status_area_between_header_and_input() {
+        let mut state = AppState::new();
+        let baseline = desired_inline_height(
+            &state,
+            Size {
+                width: 100,
+                height: 40,
+            },
+        );
+        start_subagent(&mut state, 1, "fix-tests", "fix the parser tests");
+        assert_eq!(
+            desired_inline_height(
+                &state,
+                Size {
+                    width: 100,
+                    height: 40
+                }
+            ),
+            baseline + 1,
+            "the inline viewport grows by exactly the status area"
+        );
+
+        let mut inline = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+        inline
+            .draw(|frame| draw_inline_chat(frame, &mut state))
+            .expect("inline draw");
+        assert!(
+            buffer_lines(inline.backend().buffer())
+                .join("\n")
+                .contains("fix-tests (gpt-y)"),
+            "inline mode must render the status row"
+        );
+
+        let mut fullscreen = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        let mut scroll = TranscriptScrollState::default();
+        fullscreen
+            .draw(|frame| draw(frame, &mut state, &mut scroll, UiMode::FullscreenTui))
+            .expect("fullscreen draw");
+        let rendered = buffer_lines(fullscreen.backend().buffer());
+        let row = rendered
+            .iter()
+            .position(|line| line.contains("fix-tests (gpt-y)"))
+            .expect("fullscreen mode must render the status row");
+        let header = rendered
+            .iter()
+            .position(|line| line.contains(&mjolnir_version_label()))
+            .expect("header row");
+        assert!(
+            row > header,
+            "the status area sits below the header: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn f12_ignores_text_selection_toggle_while_overlay_owns_input() {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
@@ -16223,25 +16594,14 @@ mod tests {
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let actor = LokiIdentity {
-            role: "Loki".to_string(),
-            connection_id: "loki".to_string(),
-            source_id: None,
-            model_name: None,
-            model_value: None,
-        };
         state.transcript.extend([
             Entry::UserPrompt(long.clone()),
             Entry::AgentMessage(long.clone()),
-            Entry::CodeAgentMessage(long.clone()),
-            Entry::LokiActivity(Box::new(LokiActivity::Warning {
-                actor,
-                message: long.clone(),
-            })),
+            Entry::SubagentMessage(long.clone()),
             Entry::System(long.clone()),
             Entry::InternalMessage(crate::event::InternalMessage {
-                source: "Thor".to_string(),
-                target: "Eitri".to_string(),
+                source: "primary".to_string(),
+                target: "subagent".to_string(),
                 kind: crate::event::InternalMessageKind::Delegation,
                 text: long,
             }),
@@ -16256,14 +16616,14 @@ mod tests {
                 .iter()
                 .filter(|line| line.as_str() == "… details hidden")
                 .count(),
-            6,
+            5,
             "rendered: {rendered:?}"
         );
         assert!(!rendered.iter().any(|line| line == "line 7"));
         assert!(
             rendered
                 .iter()
-                .any(|line| line.starts_with("delegated to Eitri ·"))
+                .any(|line| line.starts_with("delegated to subagent ·"))
         );
     }
 
@@ -16335,8 +16695,8 @@ mod tests {
         state
             .transcript
             .push(Entry::InternalMessage(crate::event::InternalMessage {
-                source: "Thor".to_string(),
-                target: "Eitri".to_string(),
+                source: "primary".to_string(),
+                target: "subagent".to_string(),
                 kind: crate::event::InternalMessageKind::Delegation,
                 text: full.clone(),
             }));
@@ -16362,7 +16722,7 @@ mod tests {
         );
 
         let exported = transcript_export_markdown(&state);
-        assert!(exported.contains("## Thor → Eitri delegation"));
+        assert!(exported.contains("## primary → subagent delegation"));
         assert!(exported.contains("INTERNAL\\_EXACT\\_SUFFIX"));
     }
 
@@ -17018,7 +17378,7 @@ mod tests {
             .map(line_text)
             .collect();
 
-        assert!(rendered.iter().any(|line| line == "Thor"));
+        assert!(rendered.iter().any(|line| line == "agent"));
         assert!(rendered.iter().any(|line| line == "# Result"));
         assert!(rendered.iter().any(|line| line == "- bold item"));
         assert!(rendered.iter().any(|line| line == "code rs"));
@@ -17029,7 +17389,7 @@ mod tests {
     fn multiline_system_messages_preserve_logical_lines() {
         let mut state = AppState::new();
         state.transcript.push(Entry::System(
-            "Council models\n\nConfigured\n  Thor   auto\n  Loki   auto".to_string(),
+            "Active models\n\nConfigured\n  primary    auto\n  subagents  auto".to_string(),
         ));
 
         let rendered: Vec<String> = render_transcript_lines(&state, 80)
@@ -17040,11 +17400,11 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                "Council models",
+                "Active models",
                 "",
                 "Configured",
-                "  Thor   auto",
-                "  Loki   auto",
+                "  primary    auto",
+                "  subagents  auto",
                 "",
             ]
         );
@@ -17062,7 +17422,7 @@ mod tests {
             }));
         state
             .transcript
-            .push(Entry::CodeAgentThought(crate::app::ThoughtEntry {
+            .push(Entry::SubagentThought(crate::app::ThoughtEntry {
                 text: "Checking the implementation".to_string(),
                 completed: true,
             }));
@@ -17070,7 +17430,7 @@ mod tests {
         let text = rendered.iter().map(line_text).collect::<Vec<_>>();
         assert_eq!(
             text,
-            vec!["Thor", "thought · 5 lines", "Eitri", "thought · 1 line",]
+            vec!["agent", "thought · 5 lines", "subagent", "thought · 1 line",]
         );
         assert_eq!(rendered[0].spans[0].style.fg, Some(theme.primary));
         assert_eq!(rendered[2].spans[0].style.fg, Some(theme.code));
@@ -17115,14 +17475,14 @@ mod tests {
         let compact = render_transcript_lines(&state, 80);
         assert_eq!(
             compact.iter().map(line_text).collect::<Vec<_>>(),
-            vec!["Thor", "thought · 2 lines"]
+            vec!["agent", "thought · 2 lines"]
         );
 
         state.expand_transcript_details = true;
         let expanded = render_transcript_lines(&state, 80);
         assert_eq!(
             expanded.iter().map(line_text).collect::<Vec<_>>(),
-            vec!["Thor", "first line", "second line"]
+            vec!["agent", "first line", "second line"]
         );
         for line in expanded.iter().skip(1) {
             assert!(
@@ -17138,7 +17498,7 @@ mod tests {
                 .iter()
                 .map(line_text)
                 .collect::<Vec<_>>(),
-            vec!["Thor", "first line", "second line"]
+            vec!["agent", "first line", "second line"]
         );
     }
 
@@ -17152,9 +17512,9 @@ mod tests {
             .transcript
             .push(Entry::AgentMessage("delegating".to_string()));
         state.tool_calls.insert(
-            "thor-tool".to_string(),
+            "primary-tool".to_string(),
             crate::app::ToolCallView {
-                title: "call Eitri".to_string(),
+                title: "call a subagent".to_string(),
                 kind: ToolKind::Other,
                 status: ToolCallStatus::Completed,
                 body: Vec::new(),
@@ -17162,15 +17522,15 @@ mod tests {
         );
         state
             .transcript
-            .push(Entry::ToolCall("thor-tool".to_string()));
+            .push(Entry::ToolCall("primary-tool".to_string()));
         state
             .transcript
             .push(Entry::AgentMessage("handoff accepted".to_string()));
         state
             .transcript
-            .push(Entry::CodeAgentMessage("forging".to_string()));
+            .push(Entry::SubagentMessage("forging".to_string()));
         state.tool_calls.insert(
-            "eitri-tool".to_string(),
+            "subagent-tool".to_string(),
             crate::app::ToolCallView {
                 title: "edit file".to_string(),
                 kind: ToolKind::Edit,
@@ -17180,10 +17540,10 @@ mod tests {
         );
         state
             .transcript
-            .push(Entry::CodeAgentToolCall("eitri-tool".to_string()));
+            .push(Entry::SubagentToolCall("subagent-tool".to_string()));
         state
             .transcript
-            .push(Entry::CodeAgentMessage("finished".to_string()));
+            .push(Entry::SubagentMessage("finished".to_string()));
         state
             .transcript
             .push(Entry::AgentMessage("here is the result".to_string()));
@@ -17191,7 +17551,7 @@ mod tests {
         let rendered = render_transcript_lines(&state, 80);
         let speaker_lines = rendered
             .iter()
-            .filter(|line| matches!(line_text(line).as_str(), "You" | "Thor" | "Eitri"))
+            .filter(|line| matches!(line_text(line).as_str(), "You" | "agent" | "subagent"))
             .collect::<Vec<_>>();
 
         assert_eq!(
@@ -17199,7 +17559,7 @@ mod tests {
                 .iter()
                 .map(|line| line_text(line))
                 .collect::<Vec<_>>(),
-            vec!["You", "Thor", "Eitri", "Thor"]
+            vec!["You", "agent", "subagent", "agent"]
         );
         for line in speaker_lines {
             assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
@@ -17363,7 +17723,7 @@ mod tests {
         assert_eq!(
             rendered,
             [
-                "Thor",
+                "agent",
                 "- bold italic",
                 "  code tail",
                 "  123. wide界",
@@ -17714,7 +18074,7 @@ mod tests {
 
         // The agent message stays flush-left with no rail; that contrast is
         // the fix for issue #257.
-        assert!(lines.iter().any(|l| line_text(l) == "Thor"));
+        assert!(lines.iter().any(|l| line_text(l) == "agent"));
         assert!(lines.iter().any(|l| line_text(l) == "hi there"));
         assert!(
             !lines
@@ -17747,10 +18107,10 @@ mod tests {
         // wrapped continuation rows never read as flush-left agent prose) and
         // must fit inside the render width (so the transcript Paragraph does
         // not re-wrap it and strip the rail). See issue #257.
-        assert_eq!(rendered.first().map(String::as_str), Some("Thor"));
+        assert_eq!(rendered.first().map(String::as_str), Some("agent"));
         let block_rows: Vec<&String> = rendered
             .iter()
-            .filter(|line| !line.is_empty() && line.as_str() != "Thor")
+            .filter(|line| !line.is_empty() && line.as_str() != "agent")
             .collect();
         assert!(
             block_rows.len() > 2,
@@ -17855,7 +18215,7 @@ mod tests {
             .iter()
             .find(|l| line_text(l).contains("weighing"))
             .expect("thought row");
-        assert!(lines.iter().any(|line| line_text(line) == "Thor"));
+        assert!(lines.iter().any(|line| line_text(line) == "agent"));
         for span in &row.spans {
             assert_eq!(
                 span.style.fg,
@@ -17982,7 +18342,7 @@ mod tests {
             .collect();
 
         assert!(
-            rendered.iter().any(|line| line == "Thor"),
+            rendered.iter().any(|line| line == "agent"),
             "speaker must render before the message: {rendered:?}"
         );
         assert!(
@@ -18610,7 +18970,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_quota_label_prefers_selected_anvil_provider_over_council_pollers() {
+    fn usage_quota_label_prefers_selected_anvil_provider_over_background_pollers() {
         let mut state = AppState::new();
         state.set_bedrock_credits(crate::bedrock_credits::BedrockCreditsStatus::Unavailable(
             "bedrock unavailable".to_string(),
@@ -20902,11 +21262,15 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_cancels_whole_turn_while_code_agent_is_active() {
+    fn ctrl_c_cancels_whole_turn_while_a_subagent_is_active() {
         let mut state = ready_state_with_session();
         state.record_user_prompt("delegate".to_string());
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
-            label: "Eitri".to_string(),
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
+            label: "subagent".to_string(),
         }));
 
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();

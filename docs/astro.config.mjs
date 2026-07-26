@@ -23,7 +23,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'Mjolnir',
-      description: 'A forge-grade terminal client for a council of coding agents.',
+      description: 'A forge-grade terminal client for a coding agent and its subagents.',
       head: [
         { tag: 'meta', attrs: { property: 'og:type', content: 'website' } },
         { tag: 'meta', attrs: { property: 'og:image', content: socialCardUrl } },
@@ -34,7 +34,7 @@ export default defineConfig({
           tag: 'meta',
           attrs: {
             property: 'og:image:alt',
-            content: 'Mjolnir: one terminal, a council of agents, with an ASCII-art hammer.',
+            content: 'Mjolnir: one terminal, a swarm of subagents, with an ASCII-art hammer.',
           },
         },
         { tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
@@ -43,7 +43,7 @@ export default defineConfig({
           tag: 'meta',
           attrs: {
             name: 'twitter:image:alt',
-            content: 'Mjolnir: one terminal, a council of agents, with an ASCII-art hammer.',
+            content: 'Mjolnir: one terminal, a swarm of subagents, with an ASCII-art hammer.',
           },
         },
       ],
@@ -75,9 +75,9 @@ export default defineConfig({
           ],
         },
         {
-          label: 'The Council',
+          label: 'Agents',
           items: [
-            { label: 'Thor, Eitri, and Loki', slug: 'council' },
+            { label: 'Subagents', slug: 'subagents' },
             { label: 'ACP adapters and models', slug: 'adapters' },
             { label: 'Delegation and review', slug: 'delegation-review' },
           ],

@@ -1,4 +1,4 @@
-//! One-shot ACP adapter probing for the model-first Council catalog.
+//! One-shot ACP adapter probing for the model-first catalog.
 
 use std::collections::HashMap;
 use std::future::Future;

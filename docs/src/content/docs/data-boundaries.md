@@ -3,8 +3,7 @@ title: Data and trust boundaries
 description: What Mjolnir reads, stores, downloads, and can send to providers.
 ---
 
-Mjolnir is local software, but a normal Council session is not necessarily
-offline. Provider agents can receive prompts, source, diffs, tool results, and
+Mjolnir is local software, but a normal session is not necessarily offline. Provider agents can receive prompts, source, diffs, tool results, and
 transcript context. Their retention, training, residency, and account policies
 are separate from Mjolnir's license and local controls.
 
@@ -15,7 +14,7 @@ are separate from Mjolnir's license and local controls.
 | Mjolnir UI/runtime | User input, ACP events, workspace paths, config, session metadata | Terminal rendering, local state, provider-bound ACP prompts |
 | Provider ACP adapter | Credentials/environment, prompts, source/tool context | Provider API requests, ACP messages and tool requests |
 | Mjolnir filesystem/terminal tools | Files and commands under active workspace roots | Approved file and process effects under those roots |
-| Eitri MCP server | Thor's authenticated local tool calls | Nested implementation/exploration sessions and results |
+| `mj-subagents` MCP server | The primary agent's authenticated local tool calls | Background subagent sessions, their reports, and their workspace diffs |
 | Custom ACP server | Inherited environment, workspace cwd, ACP messages | Server-defined network, file, and provider behavior |
 | Remote server | Viewer login, prompts, permissions, transcript activity | Local SQLite/session state, cookies, TLS material, downloads |
 | Voice worker | Microphone audio after Ctrl-R activation | Local model cache and transcribed prompt text |
@@ -66,7 +65,7 @@ session metadata. Read [Remote control](/remote/) before leaving loopback.
 ## Private-repository checklist
 
 1. Choose providers whose data terms match the repository.
-2. Confirm the actual Council with `/council`; optional roles can create additional provider calls and cost.
+2. Confirm the active models with `/agents`; subagents and discrete review can create many additional provider calls and cost.
 3. Limit workspace roots and use a worktree for change-producing evaluation.
 4. Review every permission request and avoid unattended `yolo` mode.
 5. Inspect custom ACP commands and inherited environment values.

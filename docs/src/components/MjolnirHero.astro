@@ -45,17 +45,16 @@ const hammerArt = [...hammerMask]
   .map((cell, index) => (cell === '#' ? hammerGlyphs[(index * 7) % hammerGlyphs.length] : cell))
   .join('');
 
-const councilTopology = `              THOR / DIRECTOR
-        plan · route · synthesize
+const agentTopology = `            PRIMARY / DIRECTOR
+        plan · brief · review · answer
                     │
-             ┌──────┴──────┐
-             ▼             ▼
-       EITRI / FORGE   LOKI / REVIEW
-       isolate · build  inspect · challenge
-             │             │
-             └──────┬──────┘
+      ┌─────────────┼─────────────┐
+      ▼             ▼             ▼
+  SUBAGENT #1   SUBAGENT #2   SUBAGENT #3
+   fresh session · writes · reports back
+                    │
                     ▼
-             COUNCIL / READY`;
+            REPORTS / INJECTED`;
 ---
 
 <section class="mj-hero" aria-labelledby="_top">
@@ -64,8 +63,8 @@ const councilTopology = `              THOR / DIRECTOR
       <pre class="hammer-art" data-hammer-art data-mask={hammerMask}><code>{hammerArt}</code></pre>
     </div>
     <p class="hero-kicker"><span aria-hidden="true">⚡</span> MJOLNIR / NATIVE RUST TUI</p>
-    <h1 id="_top">One terminal.<br /><em>A council</em> of agents.</h1>
-    <p class="hero-tagline">Mjolnir gives coding agents distinct roles, a shared terminal, and one consistent way to work—no matter which model is behind the hammer.</p>
+    <h1 id="_top">One terminal.<br /><em>A swarm</em> of subagents.</h1>
+    <p class="hero-tagline">Mjolnir gives one coding agent a workshop of background subagents, a shared terminal, and one consistent way to work—no matter which model is behind the hammer.</p>
     {
       actions.length > 0 && (
         <div class="hero-actions">
@@ -78,30 +77,29 @@ const councilTopology = `              THOR / DIRECTOR
         </div>
       )
     }
-    <ul class="hero-facts" aria-label="Council roles">
-      <li><span>01 / THOR</span><strong>Directs the work</strong></li>
-      <li><span>02 / EITRI</span><strong>Forges the change</strong></li>
-      <li><span>03 / LOKI</span><strong>Tests the thinking</strong></li>
+    <ul class="hero-facts" aria-label="How the work is split">
+      <li><span>01 / PRIMARY</span><strong>Directs the work</strong></li>
+      <li><span>02 / SUBAGENTS</span><strong>Forge it in parallel</strong></li>
     </ul>
   </div>
 
-  <div class="storm-console" aria-label="Example Mjolnir council session">
+  <div class="storm-console" aria-label="Example Mjolnir session">
     <div class="console-bar">
-      <span><i></i> COUNCIL / SESSION 0042</span>
+      <span><i></i> SESSION 0042</span>
       <small>RAGNAROK: STANDBY</small>
     </div>
     <div class="ascii-storm" aria-hidden="true">
-      <pre class="council-topology"><code>{councilTopology}</code></pre>
+      <pre class="agent-topology"><code>{agentTopology}</code></pre>
     </div>
-    <div class="council-feed">
-      <div><b>THOR</b><span>plans the turn and delegates the seam</span><small>COORDINATING</small></div>
-      <div><b>EITRI</b><span>implements in a fresh agent context</span><small>FORGING</small></div>
-      <div><b>LOKI</b><span>reviews checkpoints without blocking progress</span><small>OBSERVING</small></div>
+    <div class="agent-feed">
+      <div><b>PRIMARY</b><span>plans the turn and writes the briefs</span><small>COORDINATING</small></div>
+      <div><b>#1 tests</b><span>green the parser suite</span><small>1m04s</small></div>
+      <div><b>#2 docs</b><span>sweep docs/src/content</span><small>42s</small></div>
     </div>
     <div class="console-prompt"><span>❯</span><code>mj --worktree quiet-forge</code><i></i></div>
   </div>
 
-  <p class="hero-rail" aria-hidden="true">MODEL FIRST // ACP NATIVE // INLINE TUI // COUNCIL CONTROL</p>
+  <p class="hero-rail" aria-hidden="true">MODEL FIRST // ACP NATIVE // INLINE TUI // PARALLEL SUBAGENTS</p>
 </section>
 
 <script>
@@ -288,14 +286,14 @@ const councilTopology = `              THOR / DIRECTOR
     .console-bar i { display: inline-block; width: 0.42rem; height: 0.42rem; margin-right: 0.4rem; border-radius: 50%; background: var(--mj-violet); box-shadow: 0 0 11px var(--mj-violet); }
     .console-bar small { color: var(--mj-gold); font-size: inherit; }
     .ascii-storm { min-height: 18rem; display: grid; place-items: center; padding: 1.15rem 0.75rem; overflow: hidden; background: radial-gradient(circle, color-mix(in srgb, var(--mj-violet) 10%, transparent), transparent 62%); }
-    .council-topology { margin: 0; padding: 0; border: 0; background: transparent; color: var(--mj-violet-soft); font-size: clamp(0.48rem, 1vw, 0.68rem); line-height: 1.65; text-shadow: 0 0 10px color-mix(in srgb, var(--mj-violet) 24%, transparent); }
-    .council-topology code { background: transparent; color: inherit; }
-    .council-feed { border-block: 1px solid var(--mj-line-strong); }
-    .council-feed > div { display: grid; grid-template-columns: 3.4rem 1fr auto; gap: 0.7rem; align-items: center; padding: 0.68rem 0.85rem; }
-    .council-feed > div + div { border-top: 1px solid var(--mj-line); }
-    .council-feed b { color: var(--mj-violet); font-size: 0.6rem; letter-spacing: 0.08em; }
-    .council-feed span { color: var(--mj-copy); font-size: 0.61rem; }
-    .council-feed small { color: var(--mj-muted); font-size: 0.5rem; letter-spacing: 0.07em; }
+    .agent-topology { margin: 0; padding: 0; border: 0; background: transparent; color: var(--mj-violet-soft); font-size: clamp(0.48rem, 1vw, 0.68rem); line-height: 1.65; text-shadow: 0 0 10px color-mix(in srgb, var(--mj-violet) 24%, transparent); }
+    .agent-topology code { background: transparent; color: inherit; }
+    .agent-feed { border-block: 1px solid var(--mj-line-strong); }
+    .agent-feed > div { display: grid; grid-template-columns: 3.4rem 1fr auto; gap: 0.7rem; align-items: center; padding: 0.68rem 0.85rem; }
+    .agent-feed > div + div { border-top: 1px solid var(--mj-line); }
+    .agent-feed b { color: var(--mj-violet); font-size: 0.6rem; letter-spacing: 0.08em; }
+    .agent-feed span { color: var(--mj-copy); font-size: 0.61rem; }
+    .agent-feed small { color: var(--mj-muted); font-size: 0.5rem; letter-spacing: 0.07em; }
     .console-prompt { display: flex; align-items: center; gap: 0.65rem; padding: 0.85rem; color: var(--mj-copy); font-size: 0.66rem; }
     .console-prompt span { color: var(--mj-gold); }
     .console-prompt i { width: 0.48rem; height: 0.9rem; background: var(--mj-violet); animation: cursor-pulse 1.1s steps(2, jump-none) infinite; }
@@ -313,8 +311,8 @@ const councilTopology = `              THOR / DIRECTOR
       .hero-facts li + li { padding-inline-start: 0; border-inline-start: 0; border-top: 1px solid var(--mj-line); }
       .ascii-storm { min-height: 14rem; }
       .ascii-storm pre { font-size: clamp(0.43rem, 2.5vw, 0.62rem); }
-      .council-feed > div { grid-template-columns: 3.2rem 1fr; }
-      .council-feed small { display: none; }
+      .agent-feed > div { grid-template-columns: 3.2rem 1fr; }
+      .agent-feed small { display: none; }
     }
     @media (prefers-reduced-motion: reduce) {
       .console-prompt i { animation: none; }

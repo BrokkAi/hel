@@ -1,6 +1,6 @@
 ---
 title: Overview
-description: What Mjolnir owns, how the Council fits together, and when to use it.
+description: What Mjolnir owns, how the primary agent and subagents fit together, and when to use it.
 ---
 
 Mjolnir (`mj`) is a native terminal client for Agent Client Protocol (ACP)
@@ -13,37 +13,37 @@ adapter owns the provider-specific model session.
 | --- | --- |
 | Inline and fullscreen terminal UI | Provider authentication and model APIs |
 | User input, session controls, and permission presentation | Provider-specific tools and session behavior |
-| Council selection, delegation, and review timing | Model reasoning and generated content |
-| Mjolnir-hosted filesystem, terminal, and Council MCP tools | Any adapter-hosted tools and their policies |
+| Model selection, subagent lifecycle, and review timing | Model reasoning and generated content |
+| Mjolnir-hosted filesystem, terminal, and subagent MCP tools | Any adapter-hosted tools and their policies |
 | Session provenance, worktrees, and remote-control state | Provider data retention and service terms |
 
 This division keeps the terminal workflow stable when the selected model is
 available through more than one adapter.
 
-## Council architecture
+## Architecture
 
 ```text
 user
   │
   ▼
-Thor ───── bounded implementation ────▶ Eitri
-  │                                        │
-  ├──── owns the user turn                 └──── result + diff return to Thor
-  │
-  └──── transcript checkpoints ───────▶ Loki
-                                           └──── best-effort review advice
+primary agent ──── create_subagent ────▶ subagent #1  (fresh session, writes)
+  │                                 └──▶ subagent #2  (fresh session, writes)
+  │                                            │
+  └──── owns every user turn                   └──── report injected back as a
+                                                     user message when it finishes
 ```
 
-Thor always owns the foreground user turn. Eitri and Loki can be disabled.
-Their exact models are selected independently from launchable routes.
+The primary agent owns every user turn and cannot be disabled. Subagents are
+launched on demand, run in the background, and push their reports back into the
+primary session. The primary model and the default subagent model are selected
+independently from launchable routes; subagents can be turned off entirely.
 
 ## Good first uses
 
 - Work in one repository from an inline terminal interface.
-- Let a coordinator hand a bounded change to a fresh implementation context.
-- Keep a second model reviewing work without blocking the active agent.
+- Let the primary agent hand bounded work to several fresh contexts at once.
 - Isolate a session in a linked Git worktree and resume it later.
-- Run the same Council headlessly or through Mjolnir's remote viewer.
+- Run the same setup headlessly or through Mjolnir's remote viewer.
 
 Mjolnir is not a model provider, a hosted agent service, or a guarantee that an
 agent will make a correct change. Provider cost, capability, and data handling
@@ -58,7 +58,7 @@ still apply. Start with [Install and run](/install/), then use the checked
 | Isolated terminal | `mj --worktree` | Changes that should not touch the current checkout |
 | Headless | `mj --print ...` | Scripts and machine-readable output |
 | Resume | `mj resume` | Returning to an ACP session with saved route provenance |
-| Remote viewer | `mj server` | Driving the same Council from another browser or device |
+| Remote viewer | `mj server` | Driving the same session from another browser or device |
 
-Continue with [Thor, Eitri, and Loki](/council/) for role semantics or [ACP
+Continue with [Subagents](/subagents/) for delegation semantics or [ACP
 adapters and models](/adapters/) for discovery and selection.

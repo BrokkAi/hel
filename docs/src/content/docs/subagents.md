@@ -1,0 +1,182 @@
+---
+title: Subagents
+description: How the primary agent launches background subagents, and how their reports come back.
+---
+
+Mjolnir runs one **primary agent** — the ACP session that owns every user turn —
+plus any number of **subagents** it launches in the background. A subagent is
+not a second configured role: it is a fresh ACP process and session that exists
+for one task and then reports back.
+
+## The two tools
+
+Mjolnir advertises a local MCP server named `mj-subagents` to the primary
+session over ACP Streamable HTTP (loopback URL, bearer token). It exposes
+exactly two tools:
+
+| Tool | Arguments | Purpose |
+| --- | --- | --- |
+| `create_subagent` | `prompt`, optional `agent`, `model`, `label`, `cwd`, `resume` | Launch one background subagent |
+| `subagent_cancel` | `subagent_id` | Interrupt a running subagent or release a finished one |
+
+`create_subagent` returns as soon as the subagent has started. The tool result
+carries `subagentId`, `status: "started"`, the resolved `agent` and `model`, and
+the display `label` — never the subagent's work. The tool description says so
+explicitly, because an agent that waits for a result it will never receive is
+the main failure mode of a push-delivered design.
+
+## Lifecycle
+
+1. The primary calls `create_subagent` with a complete standalone brief.
+2. Mjolnir admits the run against the pool, spawns a fresh ACP session, and
+   returns the id immediately. A row appears in the subagent status area.
+3. The primary keeps working or ends its turn. The turn is not held open.
+4. When the subagent finishes, Mjolnir **injects its report into the primary
+   session as a new user message**, which starts a normal turn.
+
+Nothing polls. There is no wait tool, and the primary is told not to invent one.
+
+### The injected report
+
+```text
+<subagent_result id="3" label="fix-tests" agent="codex-acp" model="gpt-5.6-sol" outcome="completed" elapsed="4m12s">
+<report>
+…the subagent's final message…
+</report>
+<activity_summary>
+…condensed log of the tool calls it made…
+</activity_summary>
+<workspace_diff>
+…the diff that run produced…
+</workspace_diff>
+</subagent_result>
+
+Review this report critically against the repository before relying on it.
+```
+
+`outcome` is `completed`, `cancelled`, or `failed`. Reports that finish while
+the primary is mid-turn are queued and injected together as one message after
+that turn completes, so a burst of subagents produces one follow-up turn rather
+than several.
+
+The report is the subagent's own account of its work. Mjolnir does not verify
+it, and the injected message says so.
+
+### Shared workspaces suppress the diff
+
+Each run is snapshotted independently, so its `workspace_diff` is that
+subagent's own changes. When another subagent was working in the same workspace
+during the run the two sets of edits cannot be separated, and the section is
+replaced with a note:
+
+```text
+omitted: 2 subagents shared this workspace during the run — inspect git diff yourself
+```
+
+### Cancelling
+
+`subagent_cancel` interrupts a running subagent's turn and returns everything it
+did up to that point — its activity log and workspace diff — in the tool result
+itself. A cancelled subagent injects no report: the tool result is the whole
+story. On a finished subagent, cancel releases the retained session instead.
+
+Cancel never reverts edits. Whatever the subagent already wrote stays in the
+workspace exactly as it left it.
+
+Ctrl-C during a turn cancels the primary turn and every running subagent at
+once; cancelling only the subagents would leave the primary free to launch the
+same work again. Ctrl-C on an idle, empty prompt still quits, and quitting tears
+down running subagents with the process.
+
+### Resuming
+
+A finished subagent's session is retained warm, so `resume: <id>` continues it
+with a new prompt and the context it already built. Mjolnir retains up to
+`subagents.max_parallel` finished sessions and reaps the oldest beyond that; a
+reaped, unknown, or still-running id fails with an explicit error rather than
+silently starting something else.
+
+## Parallelism and write access
+
+All subagents are equal. Up to `subagents.max_parallel` run concurrently
+(default 6, maximum 16), every one of them has full write access to the
+workspace, and none is confined to a read-only role.
+
+When the pool is full, `create_subagent` fails immediately, naming the active
+ids and the capacity. Nothing is queued — the primary decides what to do next.
+
+Two subagents editing the same files will conflict. Mjolnir does not arbitrate
+that: the primary is instructed to hand out non-overlapping work, and the
+suppressed diff above is the signal that it did not.
+
+An explicit `cwd` must be an absolute directory inside the workspace roots
+Mjolnir already authorized (`--cwd` plus any `--additional-directory`). A
+subagent cannot use those roots to reach an arbitrary sibling directory.
+
+## Choosing an agent and a model per call
+
+`agent` and `model` are optional. Omit both and the subagent runs on the
+configured default pool, with quota failover across the roster when
+`subagents.auto_failover` is on.
+
+The `create_subagent` description carries the live inventory, generated from the
+launchable roster:
+
+```text
+Available agents and models:
+- codex-acp (Codex): gpt-5.6-sol*, gpt-5.6-terra, gpt-5.5
+- claude-acp (Claude): fable, opus, sonnet
+(* = default when agent and model are omitted)
+```
+
+Resolution rules:
+
+- both given — the pair is validated against the inventory;
+- `model` only — the first agent that advertises that model;
+- `agent` only — that agent's best ranked model;
+- no match — an `invalid_params` error listing the valid agents and models.
+
+An explicit pick bypasses the failover pool but still consults the quota gate
+once, so a provider with 5% or less remaining fails fast instead of stalling
+inside the adapter. Adapters that snapshot the tool list at session start see
+the inventory as it was at startup.
+
+## The status area
+
+Running subagents get a dedicated area between the header and the input box, in
+both inline and fullscreen modes:
+
+```text
+ ⠹ fix-tests (gpt-5.6-sol) · running the parser tests · 1m04s
+ ⠹ docs-sweep (fable) · reading docs/src/content · 42s
+ … 2 more
+```
+
+Each row shows a spinner, the label, the model, the most recent tool objective,
+and elapsed time. Finished rows stay for five seconds marked `✔` completed,
+`✘` failed, or `⊘` cancelled, then disappear. Four rows are shown at a time and
+the rest fold into a `… N more` line, with running rows preferred over finished
+ones. The area collapses to nothing when no subagent is active.
+
+Every start and finish also lands in the transcript as a permanent
+`subagent #N · label · …` line. Live activity updates only the status row, so
+scrollback is never rewritten.
+
+## Discrete review
+
+When a turn that used at least one subagent completes with the pool drained and
+the workspace changed, Mjolnir reviews the finished work before releasing the
+turn: read-only specialist lanes fan out over the diff, a synthesis pass on the
+primary's model vets their reports, and surviving findings come back as a
+corrective turn. Review lanes appear in the status area as `review · {lane}`
+rows. See [Delegation and review](/delegation-review/).
+
+## Turning subagents off
+
+Set `model = "disabled"` under `[subagents]`. The primary keeps working; the
+`mj-subagents` server is not advertised and neither tool exists. For one
+headless invocation, `--subagent-model disabled` overrides the saved choice
+without changing the config file.
+
+Continue with [Delegation and review](/delegation-review/) for task shaping, or
+[ACP adapters and models](/adapters/) for how routes are selected.

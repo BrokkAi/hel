@@ -10,7 +10,7 @@
 //!   [`ReviewVerdict::Failed`]; the orchestrator's held completion is never
 //!   stranded waiting for a message that will not arrive.
 //! * Lane sessions are throwaway: fresh ACP session, `ReadOnly` access, one
-//!   prompt, always dismissed. They never touch Thor's session and never
+//!   prompt, always dismissed. They never touch the primary session and never
 //!   write to the workspace.
 //! * A failed lane becomes an explicit failure record in the supervisor's
 //!   packet. Silence would read as "nothing found" -- coverage gaps must be
@@ -36,11 +36,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     acp::{RuntimeAccessMode, RuntimeRoleConfig},
-    council::ResolvedRole,
-    council_usage::{Purpose, Record, Role},
-    event::{InternalMessage, InternalMessageKind, UiEvent},
+    agent_usage::{Record, Seat},
+    event::{InternalMessage, InternalMessageKind, SubagentEvent, SubagentOutcome, UiEvent},
     quota,
     ragnarok::{AgentHandle, Launch, TurnEvent},
+    roster::ResolvedAgent,
+    subagent::SubagentIdAllocator,
 };
 
 /// Wall-clock budget for one lane's single prompt.
@@ -186,17 +187,21 @@ pub(crate) const REVIEW_LANES: [ReviewLane; 6] = [
 ];
 
 /// Everything the fan-out needs that does not change between turns. Built
-/// once where the council is resolved and shared by every dispatch.
+/// once where the roster is resolved and shared by every dispatch.
 pub(crate) struct FanoutConfig {
-    /// Eitri's pool, cloned before it moves into the code-agent config, so
+    /// The subagent pool, cloned before it moves into the subagent config, so
     /// lanes inherit the same quota failover ladder as delegated work.
     pub workers: quota::RolePool,
-    /// Thor's seat, used directly (no pool): the supervisor's failure mode is
-    /// the orchestrator's fallback ladder, not a model swap.
-    pub supervisor: ResolvedRole,
+    /// The primary agent's model, used directly (no pool): the supervisor's
+    /// failure mode is the orchestrator's fallback ladder, not a model swap.
+    pub supervisor: ResolvedAgent,
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
-    pub council_session: Option<String>,
+    pub session_tag: Option<String>,
+    /// Shared with the subagent pool so a lane's status row cannot land on the
+    /// same id as a running subagent's. Lanes are *not* pool members: they keep
+    /// their own [`MAX_PARALLEL_LANES`] semaphore and never occupy a slot.
+    pub id_allocator: SubagentIdAllocator,
 }
 
 /// The turn under review, snapshotted at the turn boundary so later work
@@ -211,7 +216,7 @@ pub(crate) struct ReviewJob {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReviewVerdict {
-    /// Findings survived vetting; the orchestrator hands them back to Thor.
+    /// Findings survived vetting; the orchestrator hands them back to the primary.
     Findings { synthesis: String },
     /// The supervisor vetted everything away; the held completion is released.
     Clean,
@@ -368,13 +373,22 @@ async fn run(
 ) -> ReviewVerdict {
     // `AgentHandle` cancels turns through a `watch` receiver, not a token;
     // bridge the orchestrator's token onto one for the duration of the run.
+    // The bridge task owns `abort_tx`, and `wait_abort` treats a dropped
+    // sender as an abort, so the task must outlive the supervisor synthesis:
+    // abort it only when this function returns, never mid-run.
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
     let (abort_tx, abort_rx) = watch::channel(false);
-    let bridge = {
+    let _bridge = {
         let cancel = cancel.clone();
-        tokio::spawn(async move {
+        AbortOnDrop(tokio::spawn(async move {
             cancel.cancelled().await;
             let _ = abort_tx.send(true);
-        })
+        }))
     };
 
     let bifrost = detect_bifrost();
@@ -391,25 +405,36 @@ async fn run(
         let context = Arc::clone(&context);
         let admission = Arc::clone(&admission);
         let abort_rx = abort_rx.clone();
+        let status_abort = abort_rx.clone();
         let events = events.clone();
         let bifrost = bifrost.clone();
+        // Allocated here rather than inside the task so the status rows appear
+        // in lane-roster order regardless of which task is polled first.
+        let subagent_id = config.id_allocator.next();
         let setup = LaneSetup {
             workers: config.workers.clone(),
             cwd: config.cwd.clone(),
             additional_directories: config.additional_directories.clone(),
-            council_session: config.council_session.clone(),
+            session_tag: config.session_tag.clone(),
         };
         lanes.spawn(async move {
             let _permit = admission.acquire().await;
+            let mut row = StatusRow::new(events.clone(), subagent_id);
             let result = run_lane(
                 &setup,
                 lane,
+                &mut row,
                 &context,
                 bifrost.as_deref(),
                 abort_rx,
                 &events,
             )
             .await;
+            row.finish(match &result {
+                Ok(_) => SubagentOutcome::Completed,
+                Err(_) if *status_abort.borrow() => SubagentOutcome::Cancelled,
+                Err(reason) => SubagentOutcome::Failed(reason.clone()),
+            });
             (index, result)
         });
     }
@@ -451,7 +476,6 @@ async fn run(
         );
         collected[index] = Some(report);
     }
-    bridge.abort();
 
     if cancel.is_cancelled() {
         return ReviewVerdict::Failed {
@@ -481,12 +505,20 @@ async fn run(
         };
     }
 
-    match run_supervisor(config, &job, &reports, abort_rx, events).await {
+    let mut row = StatusRow::new(events.clone(), config.id_allocator.next());
+    let synthesis = run_supervisor(config, &mut row, &job, &reports, abort_rx, events).await;
+    row.finish(match &synthesis {
+        Ok(_) => SubagentOutcome::Completed,
+        Err(_) if cancel.is_cancelled() => SubagentOutcome::Cancelled,
+        Err(reason) => SubagentOutcome::Failed(reason.clone()),
+    });
+    drop(row);
+    match synthesis {
         Ok(text) => {
             emit_internal(
                 events,
                 "review supervisor",
-                "Thor",
+                "primary",
                 InternalMessageKind::ReviewSynthesis,
                 &text,
             );
@@ -502,7 +534,7 @@ struct LaneSetup {
     workers: quota::RolePool,
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
-    council_session: Option<String>,
+    session_tag: Option<String>,
 }
 
 /// One lane: fresh read-only session, one prompt, always dismissed. `Err`
@@ -510,17 +542,29 @@ struct LaneSetup {
 async fn run_lane(
     setup: &LaneSetup,
     lane: &'static ReviewLane,
+    row: &mut StatusRow,
     context: &str,
     bifrost: Option<&Path>,
     abort: watch::Receiver<bool>,
     events: &UnboundedSender<UiEvent>,
 ) -> Result<String, String> {
-    let role = setup
-        .workers
-        .select_for_work()
-        .await
-        .map_err(|error| error.to_string())?
-        .role;
+    let subagent_id = row.subagent_id;
+    let label = lane_status_label(lane);
+    let role = match setup.workers.select_for_work().await {
+        Ok(selection) => selection.role,
+        Err(error) => {
+            // The row still opens: a lane that never found a model is visible
+            // work that failed, not work that never existed.
+            row.start(&label, None, "review", lane.focus);
+            return Err(error.to_string());
+        }
+    };
+    row.start(
+        &label,
+        Some(role.model.model.clone()),
+        &role.launch.source_id,
+        lane.focus,
+    );
     let launch = Launch {
         program: role.launch.command.clone(),
         args: role.launch.args.clone(),
@@ -547,12 +591,12 @@ async fn run_lane(
         RuntimeAccessMode::ReadOnly,
         HashMap::new(),
         Some(RuntimeRoleConfig {
-            label: format!("Eitri · review {}", lane.id),
+            label: format!("review lane {}", lane.id),
             model_id: role.model.model.clone(),
             model_value: role.model_value.clone(),
             adapter_source_id: role.launch.source_id.clone(),
             permission: None,
-            council_session: setup.council_session.clone(),
+            session_tag: setup.session_tag.clone(),
             reasoning_effort: role.reasoning_effort.clone(),
         }),
         mcp_servers,
@@ -568,18 +612,32 @@ async fn run_lane(
     };
 
     let prompt = lane_prompt(lane, context, bifrost.is_some());
-    let outcome = match agent.arm_model(&role.model_value).await {
-        Ok(()) => {
-            agent
-                .prompt(prompt, WORKER_TIMEOUT, handle_turn_event)
-                .await
+    // Each tool the lane starts becomes its status-row activity, the same
+    // one-liner a pool subagent shows.
+    let activity_events = events.clone();
+    let on_event = move |event: TurnEvent| {
+        if let TurnEvent::Tool {
+            title,
+            started: true,
+            ..
+        } = &event
+        {
+            let _ = activity_events.send(UiEvent::Subagent(SubagentEvent::Activity {
+                subagent_id,
+                activity: title.clone(),
+            }));
         }
-        Err(error) => Err(error),
+        handle_turn_event(event);
     };
+    // No arm_model here: the RuntimeRoleConfig passed to connect already
+    // selected the model (with the runtime's fuzzy value matching). arm_model
+    // compares exact option values and cannot match a roster value that was
+    // synthesized from the leaderboard rather than probed from the adapter.
+    let outcome = agent.prompt(prompt, WORKER_TIMEOUT, on_event).await;
     if let Ok(turn) = &outcome {
-        let _ = events.send(UiEvent::CouncilUsage(Record {
-            role: Role::Eitri,
-            purpose: Some(Purpose::Review),
+        let _ = events.send(UiEvent::AgentUsage(Record {
+            seat: Seat::Review,
+            model: Some(role.model.model.clone()),
             usage: turn.usage.clone(),
             update: turn.usage_update.clone(),
             session_id: agent
@@ -609,11 +667,13 @@ async fn run_lane(
     }
 }
 
-/// Single-shot synthesis on Thor's seat: no MCP servers, no pool, no tools.
+/// Single-shot synthesis on the primary agent's model: no MCP servers, no
+/// pool, no tools.
 /// Its failure is not fatal to review value -- the orchestrator falls back to
 /// the single-prompt path -- so it gets no failover ladder of its own.
 async fn run_supervisor(
     config: &FanoutConfig,
+    row: &mut StatusRow,
     job: &ReviewJob,
     reports: &[LaneReport],
     abort: watch::Receiver<bool>,
@@ -625,6 +685,12 @@ async fn run_supervisor(
         args: role.launch.args.clone(),
         env: role.launch.env.clone(),
     };
+    row.start(
+        SUPERVISOR_STATUS_LABEL,
+        Some(role.model.model.clone()),
+        &role.launch.source_id,
+        "Vetting the specialist lane reports into one verdict.",
+    );
     tracing::info!(
         event = "review_synthesis_started",
         model = %role.model.model,
@@ -642,12 +708,12 @@ async fn run_supervisor(
         RuntimeAccessMode::ReadOnly,
         HashMap::new(),
         Some(RuntimeRoleConfig {
-            label: "Thor · review supervisor".to_string(),
+            label: "review supervisor".to_string(),
             model_id: role.model.model.clone(),
             model_value: role.model_value.clone(),
             adapter_source_id: role.launch.source_id.clone(),
             permission: None,
-            council_session: config.council_session.clone(),
+            session_tag: config.session_tag.clone(),
             reasoning_effort: role.reasoning_effort.clone(),
         }),
         Vec::new(),
@@ -657,18 +723,15 @@ async fn run_supervisor(
     .map_err(|error| error.to_string())?;
 
     let prompt = synthesis_prompt(job, reports);
-    let outcome = match agent.arm_model(&role.model_value).await {
-        Ok(()) => {
-            agent
-                .prompt(prompt, SUPERVISOR_TIMEOUT, handle_turn_event)
-                .await
-        }
-        Err(error) => Err(error),
-    };
+    // Same as the lanes: the role config already armed the model; arm_model's
+    // exact-value match cannot handle synthesized roster values.
+    let outcome = agent
+        .prompt(prompt, SUPERVISOR_TIMEOUT, handle_turn_event)
+        .await;
     if let Ok(turn) = &outcome {
-        let _ = events.send(UiEvent::CouncilUsage(Record {
-            role: Role::Thor,
-            purpose: Some(Purpose::Review),
+        let _ = events.send(UiEvent::AgentUsage(Record {
+            seat: Seat::Review,
+            model: Some(role.model.model.clone()),
             usage: turn.usage.clone(),
             update: turn.usage_update.clone(),
             session_id: agent
@@ -716,6 +779,67 @@ fn handle_turn_event(event: TurnEvent) {
     }
 }
 
+/// Status-row label for one lane. Review lanes render in the subagent status
+/// area exactly like pool subagents, prefixed so their origin is obvious.
+fn lane_status_label(lane: &ReviewLane) -> String {
+    format!("review · {}", lane.id)
+}
+
+const SUPERVISOR_STATUS_LABEL: &str = "review · synthesis";
+
+/// One review session's row in the subagent status area, closed exactly once.
+///
+/// The close lives in `Drop` because the fan-out's total-timeout guard drops
+/// the whole `run` future -- and with it every lane task -- mid-await. A row
+/// closed only on the happy path would spin in the status area forever.
+struct StatusRow {
+    events: UnboundedSender<UiEvent>,
+    subagent_id: u64,
+    /// `Started` has been sent, so a `Finished` is owed.
+    open: bool,
+    outcome: Option<SubagentOutcome>,
+}
+
+impl StatusRow {
+    fn new(events: UnboundedSender<UiEvent>, subagent_id: u64) -> Self {
+        Self {
+            events,
+            subagent_id,
+            open: false,
+            outcome: None,
+        }
+    }
+
+    fn start(&mut self, label: &str, model: Option<String>, agent: &str, objective: &str) {
+        let _ = self.events.send(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: self.subagent_id,
+            label: label.to_string(),
+            model,
+            agent: agent.to_string(),
+            objective: objective.to_string(),
+        }));
+        self.open = true;
+    }
+
+    fn finish(&mut self, outcome: SubagentOutcome) {
+        self.outcome = Some(outcome);
+    }
+}
+
+impl Drop for StatusRow {
+    fn drop(&mut self) {
+        if !self.open {
+            return;
+        }
+        // No recorded outcome means the task was aborted rather than finished.
+        let outcome = self.outcome.take().unwrap_or(SubagentOutcome::Cancelled);
+        let _ = self.events.send(UiEvent::Subagent(SubagentEvent::Finished {
+            subagent_id: self.subagent_id,
+            outcome,
+        }));
+    }
+}
+
 fn emit_internal(
     events: &UnboundedSender<UiEvent>,
     source: &str,
@@ -743,7 +867,7 @@ fn failure_record(lane: &ReviewLane, reason: &str) -> String {
 /// Classify the supervisor's reply. Deliberately lenient on the clean
 /// sentinel's own line but strict about position: a sentinel buried under
 /// findings means findings. The failure direction is safe -- a spurious
-/// `Findings` costs one Thor turn that dismisses a weak prompt, while a
+/// `Findings` costs one primary turn that dismisses a weak prompt, while a
 /// spurious `Clean` would drop real findings on the floor.
 pub(crate) fn synthesis_verdict(text: &str) -> ReviewVerdict {
     let trimmed = text.trim();
@@ -921,7 +1045,7 @@ mod tests {
             epoch: 7,
             task: "add a retry to the uploader".to_string(),
             initial_result: "added retry".to_string(),
-            trajectory: "Thor step 1: delegated to Eitri".to_string(),
+            trajectory: "step 1: delegated to a subagent".to_string(),
             diff: "+++ b/src/upload.rs\n@@\n+fn retry() {}".to_string(),
         }
     }
@@ -944,6 +1068,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Lanes render as ordinary subagent status rows, so their ids must come
+    /// from the same sequence the subagent pool draws from and their labels
+    /// must say where the row came from.
+    #[test]
+    fn lane_status_rows_are_labelled_and_share_the_subagent_id_sequence() {
+        let allocator = SubagentIdAllocator::default();
+        let pool_id = allocator.next();
+        let lane_ids: Vec<u64> = REVIEW_LANES.iter().map(|_| allocator.next()).collect();
+        let supervisor_id = allocator.next();
+
+        let mut all = vec![pool_id];
+        all.extend(lane_ids.iter().copied());
+        all.push(supervisor_id);
+        let mut unique = all.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), all.len(), "ids must never collide: {all:?}");
+
+        assert_eq!(
+            lane_status_label(&REVIEW_LANES[0]),
+            "review · cognitive-complexity"
+        );
+        assert!(SUPERVISOR_STATUS_LABEL.starts_with("review · "));
+    }
+
+    /// The total-timeout guard drops every lane task mid-await, so a row that
+    /// closed only on the happy path would spin in the status area forever.
+    #[test]
+    fn an_aborted_status_row_still_closes_itself() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Never started: the row was never announced, so nothing is owed.
+        drop(StatusRow::new(tx.clone(), 1));
+        assert!(rx.try_recv().is_err());
+
+        // Started and then dropped without an outcome: aborted.
+        {
+            let mut row = StatusRow::new(tx.clone(), 2);
+            row.start("review · dead-code", None, "review", "focus");
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiEvent::Subagent(SubagentEvent::Started {
+                subagent_id: 2,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiEvent::Subagent(SubagentEvent::Finished {
+                subagent_id: 2,
+                outcome: SubagentOutcome::Cancelled,
+            }))
+        ));
+
+        {
+            let mut row = StatusRow::new(tx.clone(), 3);
+            row.start("review · synthesis", None, "review", "focus");
+            row.finish(SubagentOutcome::Completed);
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiEvent::Subagent(SubagentEvent::Started { .. }))
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiEvent::Subagent(SubagentEvent::Finished {
+                subagent_id: 3,
+                outcome: SubagentOutcome::Completed,
+            }))
+        ));
+        assert!(rx.try_recv().is_err(), "exactly one close per row");
     }
 
     #[test]

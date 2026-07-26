@@ -1,12 +1,15 @@
 ---
 title: ACP adapters and models
-description: How Mjolnir discovers providers, probes ACP capabilities, and selects Council routes.
+description: How Mjolnir discovers providers, probes ACP capabilities, and selects model routes.
 ---
 
-Mjolnir selects a model for each Council role, then chooses a launchable Agent
-Client Protocol adapter that can provide it. A compatible Council adapter must
-advertise ACP Streamable HTTP MCP support so Thor can call Mjolnir's Eitri
-tools.
+Mjolnir selects a model for the primary agent and a default model for
+subagents, then chooses a launchable Agent Client Protocol adapter that can
+provide each. An adapter must advertise ACP Streamable HTTP MCP support to enter
+the roster at all: that is how Mjolnir attaches the `mj-subagents` server the
+primary agent calls `create_subagent` through. An adapter that does not is
+excluded with `ACP server does not advertise mcpCapabilities.http`, and with no
+qualifying adapter no model is launchable.
 
 ## Built-in routes
 
@@ -27,7 +30,7 @@ authentication.
 Native routes with fresh capability cache entries can bind immediately. Other
 routes are probed in the background and appear in `/models` or the ACP Servers
 tab when their catalog is ready. A wedged probe does not block an otherwise
-launchable Council.
+launchable session.
 
 Probe results and the live DeepSWE ranking are cached for 24 hours. A bundled
 snapshot is available when the ranking endpoint cannot be refreshed. Read
@@ -35,21 +38,22 @@ snapshot is available when the ranking endpoint cannot be refreshed. Read
 
 ## Auto selection
 
-- Thor prefers the strongest launchable eligible row.
-- Loki prefers a strong model from another provider, then another model, then
-  reuses Thor when necessary.
-- Eitri prefers a cost-efficient qualifying model on the current quality
-  frontier, but can reuse another Council model.
+- The primary prefers the strongest launchable eligible row.
+- The default subagent model prefers a cost-efficient qualifying model on the
+  current quality frontier, but can reuse the primary's model.
+- Every launchable model stays individually addressable: `create_subagent`
+  advertises the whole inventory so one call can pick a different agent or
+  model than the default.
 - Unranked custom models are selectable explicitly but do not participate in
   Auto or Ragnarok.
 
 Availability, credentials, cached capabilities, and the current ranking can
-change the result. Use `/council` to record what actually launched.
+change the result. Use `/agents` to record what actually launched.
 
 ## Custom ACP servers
 
 ```toml
-version = 2
+version = 3
 
 [[acp.servers]]
 id = "custom:company"
@@ -68,5 +72,6 @@ precedence. Use an absolute command path where possible and avoid putting secret
 values directly in a committed config file.
 
 ACP servers are model agents. They are not the same as MCP servers: Mjolnir does
-not expose a generic user-facing MCP-server list here. Its internal MCP server
-exists to give Thor authenticated access to Eitri orchestration tools.
+not expose a generic user-facing MCP-server list here. Its internal `mj-subagents`
+MCP server exists only to give the primary agent authenticated access to
+`create_subagent` and `subagent_cancel`.

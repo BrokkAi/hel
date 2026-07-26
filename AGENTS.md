@@ -14,7 +14,7 @@ This repository is a Rust 2024 crate named `mjolnir` that builds the `mj` binary
 - `src/event.rs` defines messages shared between the ACP runtime and UI task.
 - `src/ui.rs` renders and drives the ratatui/crossterm terminal interface.
 
-There is no separate `tests/` directory today; tests are colocated in module-level `#[cfg(test)]` blocks.
+Unit tests are colocated in module-level `#[cfg(test)]` blocks. `tests/` holds only the PTY termination test and the `tests/e2e/` shell/expect harness.
 
 ## Build, Test, and Development Commands
 
@@ -23,7 +23,7 @@ There is no separate `tests/` directory today; tests are colocated in module-lev
 - `cargo clippy --all-targets -- -D warnings` runs lints with warnings treated as errors, matching CI.
 - `cargo test` runs unit tests.
 - `cargo build --release` builds the optimized `mj` binary.
-- `cargo run -- --cwd .` runs the TUI in the current workspace and resolves the configured Council models through available ACP adapters.
+- `cargo run -- --cwd .` runs the TUI in the current workspace and resolves the configured primary and subagent models through available ACP adapters.
 
 ## Coding Style & Naming Conventions
 

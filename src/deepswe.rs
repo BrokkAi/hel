@@ -1,4 +1,4 @@
-//! DeepSWE Pass@1/cost catalog used by the Thor/Loki/Eitri council.
+//! DeepSWE Pass@1/cost catalog used to rank models for each agent seat.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -214,7 +214,7 @@ pub fn sonnet_anchor(rows: &[Row]) -> Option<&Row> {
 
 /// Choose the cheapest Pareto point that meets the Sonnet High quality
 /// floor. If none does, retain the strongest point on the frontier.
-pub fn eitri_frontier_choice(rows: &[Row], sonnet_pass_at_1: f64) -> Option<Row> {
+pub fn subagent_frontier_choice(rows: &[Row], sonnet_pass_at_1: f64) -> Option<Row> {
     let frontier = pareto_frontier(rows);
     frontier
         .iter()
@@ -291,16 +291,22 @@ mod tests {
             row("sol", Some("high"), 0.69, 3.4),
             row("dominated", Some("high"), 0.43, 2.0),
         ];
-        assert_eq!(eitri_frontier_choice(&rows, 0.48).unwrap().model, "terra");
+        assert_eq!(
+            subagent_frontier_choice(&rows, 0.48).unwrap().model,
+            "terra"
+        );
     }
 
     #[test]
-    fn eitri_floor_falls_back_to_strongest_frontier_model() {
+    fn subagent_floor_falls_back_to_strongest_frontier_model() {
         let rows = vec![
             row("cheap", Some("high"), 0.40, 0.5),
             row("strong", Some("high"), 0.47, 1.5),
         ];
-        assert_eq!(eitri_frontier_choice(&rows, 0.48).unwrap().model, "strong");
+        assert_eq!(
+            subagent_frontier_choice(&rows, 0.48).unwrap().model,
+            "strong"
+        );
     }
 
     #[test]
@@ -337,7 +343,7 @@ mod tests {
         assert_eq!(eligible[0].model, "gpt-5-6-sol");
         let anchor = sonnet_anchor(&eligible).expect("Sonnet anchor");
         assert_eq!(
-            eitri_frontier_choice(&eligible, anchor.pass_at_1)
+            subagent_frontier_choice(&eligible, anchor.pass_at_1)
                 .unwrap()
                 .model,
             "gpt-5-6-terra"

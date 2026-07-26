@@ -10,7 +10,7 @@ that the action is correct, necessary, or safe.
 
 | Context | Default | Behavior |
 | --- | --- | --- |
-| Interactive Council | `auto` | Applies Mjolnir's interactive Council permission policy and still surfaces requests that need a decision |
+| Interactive session | `auto` | Applies Mjolnir's interactive permission policy and still surfaces requests that need a decision |
 | Headless `--print` | `manual` | Rejects permission requests so an unattended process cannot hang |
 
 Headless modes:
@@ -40,12 +40,22 @@ requests to them. Agent-owned tools can have provider- or adapter-owned policy
 that Mjolnir does not replace. Custom ACP servers inherit the environment and
 run from the workspace directory.
 
-## Nested Council requests
+## Nested subagent requests
 
-Thor calls Eitri through a local authenticated MCP server. Nested permission IDs
-are namespaced so the active Eitri request can be answered without confusing it
-with Thor's foreground session. The same identity is preserved through the
-remote viewer.
+The primary agent launches subagents through Mjolnir's local authenticated
+`mj-subagents` MCP server, and each subagent runs its own ACP session with full
+write access. A permission request raised by a subagent is prefixed with that
+subagent's id (`subagent #3 · …`), so several concurrent subagents cannot be
+confused with each other or with the primary's foreground session. The same
+per-id identity is preserved through the remote viewer, where MCP approvals for
+`mcp__mj_subagents__*` are recognized as Mjolnir's own tools.
+
+Headless runs answer subagent permission requests with the same
+`--permission-mode` policy they apply to the primary; `manual` rejects them so an
+unattended run cannot hang on a background subagent.
+
+Subagents inherit the workspace roots below. A `create_subagent` call may narrow
+its subagent to a directory inside those roots, never outside them.
 
 ## Safe automation checklist
 
