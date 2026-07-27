@@ -86,10 +86,6 @@ impl BoundaryTracker {
                 None
             }
             UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)) => {
-                let terminal_backed = call
-                    .content
-                    .iter()
-                    .any(|content| matches!(content, ToolCallContent::Terminal(_)));
                 for content in &call.content {
                     if let ToolCallContent::Terminal(terminal) = content {
                         self.terminals.insert(
@@ -101,13 +97,9 @@ impl BoundaryTracker {
                         );
                     }
                 }
-                let complete = matches!(
-                    call.status,
-                    ToolCallStatus::Completed | ToolCallStatus::Failed
-                );
                 self.tools
                     .insert(call.tool_call_id.to_string(), call.clone());
-                (complete && !terminal_backed).then(|| {
+                tool_completes_agent_message_segment(call).then(|| {
                     self.final_message.clear();
                     let activity = tool_activity(call);
                     let previous = flush(self);
@@ -130,7 +122,7 @@ impl BoundaryTracker {
                         .entry(id.clone())
                         .or_insert_with(|| ToolCall::new(id.clone(), "tool"));
                     tool.update(update.fields.clone());
-                    (completed && !tool_has_terminal(tool))
+                    (completed && tool_completes_agent_message_segment(tool))
                         .then(|| (render_tool_delta(tool), render_review_tool_delta(tool)))
                 };
                 rendered.map(|(rendered, review_rendered)| {
@@ -152,7 +144,10 @@ impl BoundaryTracker {
                 let text = join_boundary(flush(self), format!("plan update:\n{plan:?}"));
                 Some((text.clone(), text, vec!["plan update".to_string()]))
             }
-            UiEvent::TerminalOutput(snapshot) if snapshot.exit_status.is_some() => {
+            UiEvent::TerminalOutput(snapshot)
+                if terminal_output_completes_agent_message_segment(snapshot) =>
+            {
+                self.final_message.clear();
                 let terminal = self
                     .terminals
                     .get(&snapshot.terminal_id)
@@ -222,6 +217,25 @@ fn tool_has_terminal(tool: &agent_client_protocol::schema::v1::ToolCall) -> bool
     tool.content
         .iter()
         .any(|content| matches!(content, ToolCallContent::Terminal(_)))
+}
+
+/// A completed non-terminal tool starts a new candidate final-message segment.
+/// Both the trajectory tracker and headless result collector use this boundary
+/// so the user-facing answer cannot drift from the orchestrator's definition.
+pub(crate) fn tool_completes_agent_message_segment(
+    tool: &agent_client_protocol::schema::v1::ToolCall,
+) -> bool {
+    use agent_client_protocol::schema::v1::ToolCallStatus;
+    matches!(
+        tool.status,
+        ToolCallStatus::Completed | ToolCallStatus::Failed
+    ) && !tool_has_terminal(tool)
+}
+
+pub(crate) fn terminal_output_completes_agent_message_segment(
+    snapshot: &crate::event::TerminalOutputSnapshot,
+) -> bool {
+    snapshot.exit_status.is_some()
 }
 
 fn render_tool_delta(tool: &agent_client_protocol::schema::v1::ToolCall) -> String {
@@ -791,6 +805,15 @@ mod tests {
                 .status(ToolCallStatus::InProgress),
         ));
         assert!(tracker.observe(&pending).is_none());
+        tracker.observe(&UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+            agent_client_protocol::schema::v1::ContentChunk::new(
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(
+                        "progress before terminal completion",
+                    ),
+                ),
+            ),
+        )));
         let terminal = UiEvent::TerminalOutput(TerminalOutputSnapshot {
             terminal_id: "term".into(),
             output: "alpha\nbeta\n".into(),
@@ -799,7 +822,14 @@ mod tests {
         });
         let checkpoint = tracker.observe(&terminal).expect("terminal checkpoint");
         assert_eq!(checkpoint.step, 1);
-        assert_eq!(checkpoint.text, "**agent**:\n→ printf() ⇒ ok · 3 lines");
+        assert_eq!(
+            checkpoint.text,
+            "**agent**:\nprogress before terminal completion\n→ printf() ⇒ ok · 3 lines"
+        );
+        assert!(
+            tracker.final_message().is_empty(),
+            "terminal completion supersedes pre-tool progress"
+        );
 
         let completed = UiEvent::SessionUpdate(SessionUpdate::ToolCall(
             ToolCall::new("tool", "printf")

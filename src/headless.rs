@@ -12,7 +12,8 @@ use std::sync::{
 };
 
 use agent_client_protocol::schema::v1::{
-    PermissionOptionKind, SessionUpdate, StopReason, ToolCall, ToolCallUpdate, ToolKind, Usage,
+    PermissionOptionKind, SessionUpdate, StopReason, ToolCall, ToolCallStatus, ToolCallUpdate,
+    ToolKind, Usage,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
@@ -424,7 +425,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             }
             UiEvent::ContextCompacted => {}
             UiEvent::WorkspaceDiff(_) => {}
-            UiEvent::TerminalOutput(_) => {}
+            UiEvent::TerminalOutput(snapshot) => apply_terminal_output(&mut state, &snapshot),
             UiEvent::SessionConfigOptions { .. } => {}
             UiEvent::RosterUpdate { .. } => {}
             UiEvent::PermissionRequest(prompt) => {
@@ -473,8 +474,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 if subagent_reports.pending() > 0 {
                     // The answer the user sees is the last turn's, so drop the
                     // text collected before the injection.
-                    state.final_text.clear();
-                    collecting_turn_output = false;
+                    prepare_headless_followup(&mut state, &mut collecting_turn_output);
                     continue;
                 }
                 saw_terminal_event = true;
@@ -722,8 +722,21 @@ fn reset_superseded_headless_answer(
         // A findings correction supersedes the withheld answer. PromptDone has
         // intentionally not arrived yet, so this is the boundary where
         // headless output must start fresh.
+        prepare_headless_followup(state, collecting_turn_output);
+    }
+}
+
+fn prepare_headless_followup(state: &mut HeadlessState, collecting_turn_output: &mut bool) {
+    state.final_text.clear();
+    *collecting_turn_output = false;
+}
+
+fn apply_terminal_output(
+    state: &mut HeadlessState,
+    snapshot: &crate::event::TerminalOutputSnapshot,
+) {
+    if crate::trajectory::terminal_output_completes_agent_message_segment(snapshot) {
         state.final_text.clear();
-        *collecting_turn_output = false;
     }
 }
 
@@ -746,23 +759,44 @@ fn apply_session_update(
                 .push_str(&content_block_text(&chunk.content));
         }
         SessionUpdate::ToolCall(tool_call) => {
+            let id = tool_call.tool_call_id.to_string();
+            let completes_segment =
+                crate::trajectory::tool_completes_agent_message_segment(&tool_call);
+            state.tool_calls.insert(id, tool_call);
+            if prompt_sent && completes_segment {
+                state.final_text.clear();
+            }
             if prompt_sent {
                 *collecting_turn_output = true;
             }
-            state
-                .tool_calls
-                .insert(tool_call.tool_call_id.to_string(), tool_call);
         }
         SessionUpdate::ToolCallUpdate(update) => {
+            let id = update.tool_call_id.to_string();
+            let completed = matches!(
+                update.fields.status,
+                Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
+            );
+            // Apply every update, not only terminal ones. The status gate below
+            // controls just the final-message boundary.
+            let tool_call = state
+                .tool_calls
+                .entry(id.clone())
+                .or_insert_with(|| ToolCall::new(id, "tool"));
+            tool_call.update(update.fields);
+            let completes_segment =
+                completed && crate::trajectory::tool_completes_agent_message_segment(tool_call);
+            if prompt_sent && completes_segment {
+                state.final_text.clear();
+            }
             if prompt_sent {
                 *collecting_turn_output = true;
             }
-            let id = update.tool_call_id.to_string();
-            if let Some(existing) = state.tool_calls.get_mut(&id) {
-                existing.update(update.fields);
-            } else if let Ok(tool_call) = ToolCall::try_from(update) {
-                state.tool_calls.insert(id, tool_call);
-            }
+        }
+        SessionUpdate::Plan(_) if prompt_sent => {
+            // BoundaryTracker treats a plan update as a semantic checkpoint;
+            // subsequent prose is the new candidate final response.
+            state.final_text.clear();
+            *collecting_turn_output = true;
         }
         _ => {}
     }
@@ -958,6 +992,237 @@ mod tests {
         };
 
         reset_superseded_headless_answer(&mut state, &mut collecting, &message);
+
+        assert!(state.final_text.is_empty());
+        assert!(!collecting);
+    }
+
+    #[test]
+    fn headless_result_keeps_only_message_after_completed_tool_update() {
+        use agent_client_protocol::schema::v1::{
+            ContentBlock, ContentChunk, TextContent, ToolCallStatus, ToolCallUpdate,
+            ToolCallUpdateFields,
+        };
+
+        let chunk = |text| ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+        let mut state = HeadlessState::default();
+        let mut collecting = false;
+
+        apply_session_update(
+            &mut state,
+            SessionUpdate::UserMessageChunk(chunk("correct the finding")),
+            true,
+            &mut collecting,
+        );
+        apply_session_update(
+            &mut state,
+            SessionUpdate::AgentMessageChunk(chunk("I will verify it first.")),
+            true,
+            &mut collecting,
+        );
+        assert_eq!(state.final_text, "I will verify it first.");
+
+        apply_session_update(
+            &mut state,
+            SessionUpdate::ToolCall(ToolCall::new("tool-1", "verify")),
+            true,
+            &mut collecting,
+        );
+        assert_eq!(
+            state.final_text, "I will verify it first.",
+            "pending tools do not establish the final-message boundary"
+        );
+
+        apply_session_update(
+            &mut state,
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "tool-1",
+                ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+            )),
+            true,
+            &mut collecting,
+        );
+        assert!(
+            state.final_text.is_empty(),
+            "pre-tool progress must not leak into the released answer"
+        );
+
+        apply_session_update(
+            &mut state,
+            SessionUpdate::AgentMessageChunk(chunk("Corrected and validated.")),
+            true,
+            &mut collecting,
+        );
+        assert_eq!(state.final_text, "Corrected and validated.");
+    }
+
+    #[test]
+    fn headless_result_honors_already_completed_tool_call_boundary() {
+        use agent_client_protocol::schema::v1::{
+            ContentBlock, ContentChunk, TextContent, ToolCallStatus,
+        };
+
+        let chunk = |text| ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+        let mut state = HeadlessState {
+            final_text: "progress before a one-shot tool".to_string(),
+            ..HeadlessState::default()
+        };
+        let mut collecting = true;
+
+        apply_session_update(
+            &mut state,
+            SessionUpdate::ToolCall(
+                ToolCall::new("tool-1", "verify").status(ToolCallStatus::Completed),
+            ),
+            true,
+            &mut collecting,
+        );
+        assert!(state.final_text.is_empty());
+
+        apply_session_update(
+            &mut state,
+            SessionUpdate::AgentMessageChunk(chunk("Final answer.")),
+            true,
+            &mut collecting,
+        );
+        assert_eq!(state.final_text, "Final answer.");
+    }
+
+    #[test]
+    fn headless_result_honors_update_only_completed_tool_boundary() {
+        use agent_client_protocol::schema::v1::{
+            Terminal, TerminalExitStatus, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+            ToolCallUpdateFields,
+        };
+
+        let mut state = HeadlessState {
+            final_text: "progress before a late-attached tool".to_string(),
+            ..HeadlessState::default()
+        };
+        let mut collecting = true;
+
+        let mut pending = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
+        pending.content = Some(vec![ToolCallContent::Terminal(Terminal::new(
+            "late-terminal",
+        ))]);
+        apply_session_update(
+            &mut state,
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new("late-tool", pending)),
+            true,
+            &mut collecting,
+        );
+        assert_eq!(
+            state.final_text, "progress before a late-attached tool",
+            "nonterminal updates must not clear the candidate answer"
+        );
+        assert_eq!(
+            state
+                .tool_calls
+                .get("late-tool")
+                .expect("late-attached tool")
+                .content
+                .len(),
+            1,
+            "the nonterminal update must be retained"
+        );
+
+        apply_session_update(
+            &mut state,
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "late-tool",
+                ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+            )),
+            true,
+            &mut collecting,
+        );
+
+        assert_eq!(
+            state.final_text, "progress before a late-attached tool",
+            "terminal-backed completion waits for TerminalOutput"
+        );
+        assert_eq!(
+            state
+                .tool_calls
+                .get("late-tool")
+                .expect("late-attached tool")
+                .content
+                .len(),
+            1,
+            "later completion must not discard prior update content"
+        );
+
+        apply_terminal_output(
+            &mut state,
+            &crate::event::TerminalOutputSnapshot {
+                terminal_id: "late-terminal".to_string(),
+                output: "done".to_string(),
+                truncated: false,
+                exit_status: Some(TerminalExitStatus::new().exit_code(0)),
+            },
+        );
+        assert!(
+            state.final_text.is_empty(),
+            "terminal exit establishes the final-message boundary"
+        );
+    }
+
+    #[test]
+    fn headless_result_honors_terminal_output_completion_boundary() {
+        use agent_client_protocol::schema::v1::TerminalExitStatus;
+
+        let mut state = HeadlessState {
+            final_text: "progress before terminal completion".to_string(),
+            ..HeadlessState::default()
+        };
+        let snapshot = crate::event::TerminalOutputSnapshot {
+            terminal_id: "terminal-1".to_string(),
+            output: "done".to_string(),
+            truncated: false,
+            exit_status: Some(TerminalExitStatus::new().exit_code(0)),
+        };
+
+        apply_terminal_output(&mut state, &snapshot);
+
+        assert!(state.final_text.is_empty());
+    }
+
+    #[test]
+    fn headless_result_honors_plan_boundary() {
+        use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, Plan, TextContent};
+
+        let chunk = |text| ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+        let mut state = HeadlessState {
+            final_text: "progress before plan update".to_string(),
+            ..HeadlessState::default()
+        };
+        let mut collecting = true;
+
+        apply_session_update(
+            &mut state,
+            SessionUpdate::Plan(Plan::new(Vec::new())),
+            true,
+            &mut collecting,
+        );
+        assert!(state.final_text.is_empty());
+
+        apply_session_update(
+            &mut state,
+            SessionUpdate::AgentMessageChunk(chunk("Final answer after plan.")),
+            true,
+            &mut collecting,
+        );
+        assert_eq!(state.final_text, "Final answer after plan.");
+    }
+
+    #[test]
+    fn subagent_followup_discards_the_prior_headless_answer() {
+        let mut state = HeadlessState {
+            final_text: "answer before an injected report".to_string(),
+            ..HeadlessState::default()
+        };
+        let mut collecting = true;
+
+        prepare_headless_followup(&mut state, &mut collecting);
 
         assert!(state.final_text.is_empty());
         assert!(!collecting);
