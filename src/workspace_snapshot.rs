@@ -63,6 +63,7 @@ pub(crate) struct WorkspaceDelta {
 pub(crate) struct ReviewSnapshot {
     repo_root: PathBuf,
     object_dir: PathBuf,
+    alternate_object_dir: PathBuf,
     base_tree: String,
     target_tree: String,
     diffstat: String,
@@ -102,6 +103,93 @@ impl ReviewSnapshot {
             .map_err(|error| format!("could not read captured turn patch: {error}"))
     }
 
+    /// Capture the exact corrective interval from `previous` to this snapshot.
+    ///
+    /// Both endpoints must come from repeated deltas of the same workspace
+    /// capture. Tree identifiers are meaningful only while that capture's
+    /// private object database is leased, so snapshots from another repository
+    /// or scratch object store cannot be combined.
+    pub(crate) async fn interval_since(&self, previous: &Self) -> Result<Self, String> {
+        if self.repo_root != previous.repo_root {
+            return Err(
+                "cannot compare review snapshots from different repository roots".to_string(),
+            );
+        }
+        if self.object_dir != previous.object_dir
+            || self.alternate_object_dir != previous.alternate_object_dir
+        {
+            return Err(
+                "cannot compare review snapshots from different Git object stores".to_string(),
+            );
+        }
+
+        let patch = self
+            .diff_trees(&previous.target_tree, &self.target_tree, &[])
+            .await?;
+        let diffstat = self
+            .diff_trees(
+                &previous.target_tree,
+                &self.target_tree,
+                &["--stat", "--summary"],
+            )
+            .await?;
+        let full_patch_path = self._lease.path().join(format!(
+            "review-interval-{}-{}.patch",
+            previous.target_tree, self.target_tree
+        ));
+        tokio::fs::write(&full_patch_path, &patch)
+            .await
+            .map_err(|error| format!("could not persist captured corrective patch: {error}"))?;
+
+        Ok(Self {
+            repo_root: self.repo_root.clone(),
+            object_dir: self.object_dir.clone(),
+            alternate_object_dir: self.alternate_object_dir.clone(),
+            base_tree: previous.target_tree.clone(),
+            target_tree: self.target_tree.clone(),
+            diffstat,
+            changed_line_count: changed_line_count(&patch),
+            full_patch_path,
+            _lease: Arc::clone(&self._lease),
+        })
+    }
+
+    async fn diff_trees(
+        &self,
+        base_tree: &str,
+        target_tree: &str,
+        display_args: &[&str],
+    ) -> Result<String, String> {
+        let mut args = vec![
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--find-renames",
+        ];
+        args.extend_from_slice(display_args);
+        args.push(base_tree);
+        args.push(target_tree);
+        args.push("--");
+        let output = Command::new("git")
+            .current_dir(&self.repo_root)
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_OBJECT_DIRECTORY", &self.object_dir)
+            .env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                &self.alternate_object_dir,
+            )
+            .args(args)
+            .output()
+            .await
+            .map_err(|_| "could not launch Git corrective snapshot command".to_string())?;
+        if !output.status.success() {
+            return Err(git_failure(&output));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|_| "Git corrective snapshot output was not UTF-8".to_string())
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         repo_root: PathBuf,
@@ -117,9 +205,11 @@ impl ReviewSnapshot {
         std::fs::create_dir_all(object_dir.join("pack")).expect("snapshot object pack dir");
         let full_patch_path = scratch.path().join("review.patch");
         std::fs::write(&full_patch_path, patch).expect("snapshot patch");
+        let alternate_object_dir = repo_root.join(".git").join("objects");
         Self {
             repo_root,
             object_dir,
+            alternate_object_dir,
             base_tree: base_tree.to_string(),
             target_tree: target_tree.to_string(),
             diffstat: diffstat.to_string(),
@@ -542,6 +632,7 @@ impl GitTreeSnapshot {
         let review_snapshot = ReviewSnapshot {
             repo_root: self.repo_root.clone(),
             object_dir: self.object_dir.clone(),
+            alternate_object_dir: self.alternate_object_dir.clone(),
             base_tree: self.baseline_tree.clone(),
             target_tree: after_tree,
             diffstat: receipt.clone(),
@@ -1020,6 +1111,144 @@ mod tests {
                 .expect("leased full patch")
                 .contains("-dirty before turn")
         );
+    }
+
+    #[tokio::test]
+    async fn review_snapshot_interval_captures_exact_corrective_trees_and_retains_lease() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        init_repo(root);
+        std::fs::write(root.join("state.txt"), "baseline\n").expect("baseline");
+        commit_all(root);
+
+        let workspace = WorkspaceSnapshot::capture(&[root.to_path_buf()]).await;
+        std::fs::write(root.join("state.txt"), "first review state\n").expect("first edit");
+        let first_delta = workspace.delta().await;
+        let previous = first_delta
+            .review_snapshot()
+            .expect("first review snapshot")
+            .clone();
+
+        std::fs::write(root.join("state.txt"), "corrected state\n").expect("correction");
+        std::fs::write(root.join("added.txt"), "added by correction\n")
+            .expect("corrective addition");
+        let corrected_delta = workspace.delta().await;
+        let current = corrected_delta
+            .review_snapshot()
+            .expect("corrected review snapshot")
+            .clone();
+        let interval = current
+            .interval_since(&previous)
+            .await
+            .expect("corrective interval");
+
+        assert_eq!(interval.repo_root(), root);
+        assert_eq!(interval.object_dir(), current.object_dir());
+        assert_eq!(interval.base_tree(), previous.target_tree());
+        assert_eq!(interval.target_tree(), current.target_tree());
+        assert_eq!(interval.changed_line_count(), 3);
+        assert!(interval.diffstat().contains("state.txt"));
+        assert!(interval.diffstat().contains("added.txt"));
+        let patch = interval.full_patch().await.expect("corrective patch");
+        assert!(patch.contains("-first review state"), "{patch}");
+        assert!(patch.contains("+corrected state"), "{patch}");
+        assert!(patch.contains("+added by correction"), "{patch}");
+        assert!(!patch.contains("-baseline"), "{patch}");
+
+        drop(current);
+        drop(corrected_delta);
+        drop(previous);
+        drop(first_delta);
+        drop(workspace);
+        assert!(interval.object_dir().is_dir());
+        assert!(
+            interval
+                .full_patch()
+                .await
+                .expect("leased corrective patch")
+                .contains("+corrected state")
+        );
+    }
+
+    #[tokio::test]
+    async fn review_snapshot_interval_keeps_revert_to_baseline_nonempty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        init_repo(root);
+        std::fs::write(root.join("state.txt"), "baseline\n").expect("baseline");
+        commit_all(root);
+
+        let workspace = WorkspaceSnapshot::capture(&[root.to_path_buf()]).await;
+        std::fs::write(root.join("state.txt"), "reviewed change\n").expect("reviewed edit");
+        let previous_delta = workspace.delta().await;
+        let previous = previous_delta
+            .review_snapshot()
+            .expect("reviewed snapshot")
+            .clone();
+
+        std::fs::write(root.join("state.txt"), "baseline\n").expect("revert correction");
+        let reverted_delta = workspace.delta().await;
+        let reverted = reverted_delta
+            .review_snapshot()
+            .expect("reverted snapshot")
+            .clone();
+        assert_eq!(reverted.target_tree(), previous.base_tree());
+
+        let interval = reverted
+            .interval_since(&previous)
+            .await
+            .expect("revert interval");
+        let patch = interval.full_patch().await.expect("revert patch");
+        assert!(!patch.trim().is_empty());
+        assert!(!interval.diffstat().trim().is_empty());
+        assert_eq!(interval.changed_line_count(), 2);
+        assert!(patch.contains("-reviewed change"), "{patch}");
+        assert!(patch.contains("+baseline"), "{patch}");
+    }
+
+    #[tokio::test]
+    async fn review_snapshot_interval_rejects_different_roots_and_object_stores() {
+        let first = tempfile::tempdir().expect("first tempdir");
+        init_repo(first.path());
+        std::fs::write(first.path().join("state.txt"), "baseline\n").expect("first baseline");
+        commit_all(first.path());
+
+        let first_workspace = WorkspaceSnapshot::capture(&[first.path().to_path_buf()]).await;
+        let first_snapshot = first_workspace
+            .delta()
+            .await
+            .review_snapshot()
+            .expect("first snapshot")
+            .clone();
+        let separate_workspace = WorkspaceSnapshot::capture(&[first.path().to_path_buf()]).await;
+        let separate_snapshot = separate_workspace
+            .delta()
+            .await
+            .review_snapshot()
+            .expect("separate snapshot")
+            .clone();
+        let store_error = separate_snapshot
+            .interval_since(&first_snapshot)
+            .await
+            .expect_err("different scratch object stores must be rejected");
+        assert!(store_error.contains("different Git object stores"));
+
+        let second = tempfile::tempdir().expect("second tempdir");
+        init_repo(second.path());
+        std::fs::write(second.path().join("state.txt"), "baseline\n").expect("second baseline");
+        commit_all(second.path());
+        let second_workspace = WorkspaceSnapshot::capture(&[second.path().to_path_buf()]).await;
+        let second_snapshot = second_workspace
+            .delta()
+            .await
+            .review_snapshot()
+            .expect("second snapshot")
+            .clone();
+        let root_error = second_snapshot
+            .interval_since(&first_snapshot)
+            .await
+            .expect_err("different repository roots must be rejected");
+        assert!(root_error.contains("different repository roots"));
     }
 
     #[tokio::test]

@@ -21,7 +21,8 @@ use crate::{
     subagent::{ActiveSubagentWorkers, SubagentReport, SubagentReportBus, format_report_injection},
     trajectory::BoundaryTracker,
     workspace_snapshot::{
-        RepositoryReviewTarget, WorkspaceDelta, WorkspaceSnapshot, repository_review_patch,
+        RepositoryReviewTarget, ReviewSnapshot, WorkspaceDelta, WorkspaceSnapshot,
+        repository_review_patch,
     },
 };
 
@@ -208,9 +209,19 @@ struct ReviewInFlight {
     /// Exact workspace state reviewed by this pass. A findings correction that
     /// changes this fingerprint earns another specialist pass before completion.
     reviewed_workspace_fingerprint: Option<String>,
+    /// Cumulative original-turn-base -> reviewed-target snapshot. A findings
+    /// correction uses its target as the exact base of the next focused pass.
+    reviewed_snapshot: Option<ReviewSnapshot>,
     cancel: CancellationToken,
     /// Owns the complete fan-out lifecycle, including ACP process reaping.
     review_task: tokio::task::JoinHandle<()>,
+}
+
+struct CorrectionReviewBase {
+    fingerprint: String,
+    snapshot: Option<ReviewSnapshot>,
+    synthesis: String,
+    evidence: discrete_review::ReviewPassEvidence,
 }
 
 pub struct Running {
@@ -243,7 +254,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
         let mut held_completion = None;
         let mut discrete_review_started = false;
         let mut review_in_flight: Option<ReviewInFlight> = None;
-        let mut correction_base_fingerprint: Option<String> = None;
+        let mut correction_review_base: Option<CorrectionReviewBase> = None;
         let mut primary_review_prompt_active = false;
         let mut review_cancel_pending: Option<u64> = None;
         let mut idle_epoch = None;
@@ -323,7 +334,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                         idle_epoch = None;
                         held_completion = None;
                         discrete_review_started = false;
-                        correction_base_fingerprint = None;
+                        correction_review_base = None;
                         primary_review_prompt_active = false;
                         if review_cancel_pending != Some(active.epoch) {
                             review_cancel_pending = None;
@@ -365,7 +376,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                                 &mut held_completion,
                                 &mut discrete_review_started,
                                 &mut review_in_flight,
-                                &mut correction_base_fingerprint,
+                                &mut correction_review_base,
                                 &mut primary_review_prompt_active,
                                 &mut review_cancel_pending,
                             )
@@ -384,7 +395,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                                 &mut held_completion,
                                 &mut discrete_review_started,
                                 &mut review_in_flight,
-                                &mut correction_base_fingerprint,
+                                &mut correction_review_base,
                                 &mut primary_review_prompt_active,
                                 &mut review_cancel_pending,
                             )
@@ -429,12 +440,16 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                         initial_result,
                         saved_turn,
                         reviewed_workspace_fingerprint,
+                        reviewed_snapshot,
                         cancel: _,
                         review_task,
                     } = review_in_flight.take().expect("in-flight review matched by epoch");
                     await_review_task(review_task).await;
                     match outcome.verdict {
-                        discrete_review::ReviewVerdict::Findings { synthesis } => {
+                        discrete_review::ReviewVerdict::Findings {
+                            synthesis,
+                            evidence,
+                        } => {
                             // The withheld completion is deliberately dropped:
                             // the corrective turn produces the real one, the
                             // same way today's single-prompt review does.
@@ -453,7 +468,15 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                                 text: prompt,
                                 images: Vec::new(),
                             });
-                            correction_base_fingerprint = reviewed_workspace_fingerprint;
+                            correction_review_base =
+                                reviewed_workspace_fingerprint.map(|fingerprint| {
+                                    CorrectionReviewBase {
+                                        fingerprint,
+                                        snapshot: reviewed_snapshot,
+                                        synthesis,
+                                        evidence,
+                                    }
+                                });
                             primary_review_prompt_active = true;
                         }
                         discrete_review::ReviewVerdict::Clean => {
@@ -469,7 +492,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                                 &mut held_completion,
                                 &mut discrete_review_started,
                                 &mut review_in_flight,
-                                &mut correction_base_fingerprint,
+                                &mut correction_review_base,
                                 &mut primary_review_prompt_active,
                                 &mut review_cancel_pending,
                             )
@@ -477,7 +500,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                             idle_epoch = Some(epoch);
                         }
                         discrete_review::ReviewVerdict::Failed { reason } => {
-                            correction_base_fingerprint = None;
+                            correction_review_base = None;
                             fall_back_to_single_prompt_review(
                                 &events_tx,
                                 &config.runtime_commands,
@@ -505,7 +528,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                             &mut held_completion,
                             &mut discrete_review_started,
                             &mut review_in_flight,
-                            &mut correction_base_fingerprint,
+                            &mut correction_review_base,
                             &mut primary_review_prompt_active,
                             &mut review_cancel_pending,
                         )
@@ -521,7 +544,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                             &mut held_completion,
                             &mut discrete_review_started,
                             &mut review_in_flight,
-                            &mut correction_base_fingerprint,
+                            &mut correction_review_base,
                             &mut primary_review_prompt_active,
                             &mut review_cancel_pending,
                         )
@@ -630,7 +653,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                     &mut held_completion,
                     &mut discrete_review_started,
                     &mut review_in_flight,
-                    &mut correction_base_fingerprint,
+                    &mut correction_review_base,
                     &mut primary_review_prompt_active,
                     &mut review_cancel_pending,
                 )
@@ -648,7 +671,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                     &mut held_completion,
                     &mut discrete_review_started,
                     &mut review_in_flight,
-                    &mut correction_base_fingerprint,
+                    &mut correction_review_base,
                     &mut primary_review_prompt_active,
                     &mut review_cancel_pending,
                 )
@@ -662,13 +685,10 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                 Some(snapshot) => Some(snapshot.delta().await),
                 None => None,
             };
-            let correction_changed =
-                correction_base_fingerprint
-                    .as_deref()
-                    .is_some_and(|reviewed| {
-                        delta.as_ref().and_then(WorkspaceDelta::review_fingerprint)
-                            != Some(reviewed)
-                    });
+            let correction_changed = correction_review_base.as_ref().is_some_and(|reviewed| {
+                delta.as_ref().and_then(WorkspaceDelta::review_fingerprint)
+                    != Some(reviewed.fingerprint.as_str())
+            });
             if should_start_discrete_review(
                 review,
                 discrete_review_started && !correction_changed,
@@ -686,6 +706,37 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                         .as_ref()
                         .and_then(WorkspaceDelta::review_snapshot)
                         .cloned();
+                    let (focus_snapshot, prior_review) = if let Some(previous) =
+                        correction_review_base.as_ref()
+                    {
+                        let focus = match (review_snapshot.as_ref(), previous.snapshot.as_ref()) {
+                            (Some(current), Some(prior)) => {
+                                match current.interval_since(prior).await {
+                                    Ok(interval) => Some(interval),
+                                    Err(reason) => {
+                                        tracing::warn!(
+                                            event = "corrective_review_interval_unavailable",
+                                            reason,
+                                            "falling back to cumulative corrective review"
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            _ => None,
+                        };
+                        let exact_delta = focus.is_some();
+                        (
+                            focus,
+                            Some(discrete_review::PriorReviewContext {
+                                synthesis: previous.synthesis.clone(),
+                                evidence: previous.evidence.clone(),
+                                exact_delta,
+                            }),
+                        )
+                    } else {
+                        (None, None)
+                    };
                     let reviewed_workspace_fingerprint = delta
                         .as_ref()
                         .and_then(WorkspaceDelta::review_fingerprint)
@@ -710,7 +761,9 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                         initial_result: initial_result.clone(),
                         trajectory: review_trajectory,
                         diff,
-                        snapshot: review_snapshot,
+                        snapshot: review_snapshot.clone(),
+                        focus_snapshot,
+                        prior_review,
                     };
                     trajectory.reset_attempt();
                     let cancel = CancellationToken::new();
@@ -731,10 +784,11 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                         initial_result,
                         saved_turn,
                         reviewed_workspace_fingerprint,
+                        reviewed_snapshot: review_snapshot,
                         cancel,
                         review_task: task,
                     });
-                    correction_base_fingerprint = None;
+                    correction_review_base = None;
                     primary_review_prompt_active = false;
                     continue;
                 }
@@ -772,7 +826,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                 &mut held_completion,
                 &mut discrete_review_started,
                 &mut review_in_flight,
-                &mut correction_base_fingerprint,
+                &mut correction_review_base,
                 &mut primary_review_prompt_active,
                 &mut review_cancel_pending,
             )
@@ -794,14 +848,14 @@ async fn reset_turn_state(
     held_completion: &mut Option<UiEvent>,
     discrete_review_started: &mut bool,
     review_in_flight: &mut Option<ReviewInFlight>,
-    correction_base_fingerprint: &mut Option<String>,
+    correction_review_base: &mut Option<CorrectionReviewBase>,
     primary_review_prompt_active: &mut bool,
     review_cancel_pending: &mut Option<u64>,
 ) {
     *trajectory = BoundaryTracker::default();
     *held_completion = None;
     *discrete_review_started = false;
-    *correction_base_fingerprint = None;
+    *correction_review_base = None;
     *primary_review_prompt_active = false;
     *review_cancel_pending = None;
     cancel_review(review_in_flight).await;
@@ -1165,6 +1219,7 @@ mod tests {
                 epoch: job.epoch,
                 verdict: discrete_review::ReviewVerdict::Findings {
                     synthesis: "[P1] src/upload.rs:12 -- swallowed error".to_string(),
+                    evidence: discrete_review::ReviewPassEvidence::default(),
                 },
             });
         });
@@ -1207,8 +1262,27 @@ mod tests {
             let verdict = if pass == 0 {
                 discrete_review::ReviewVerdict::Findings {
                     synthesis: "[P1] src/upload.rs:12 -- swallowed error".to_string(),
+                    evidence: discrete_review::ReviewPassEvidence {
+                        intent_brief: "Goal: preserve retries".to_string(),
+                        intent_available: true,
+                        lanes: vec![discrete_review::ReviewLaneEvidence {
+                            id: "tyr".to_string(),
+                            outcome: SubagentOutcome::Completed,
+                        }],
+                    },
                 }
             } else {
+                let cumulative = job.snapshot.as_ref().expect("cumulative snapshot");
+                let focus = job
+                    .focus_snapshot
+                    .as_ref()
+                    .expect("exact corrective interval");
+                assert_eq!(focus.target_tree(), cumulative.target_tree());
+                assert_ne!(focus.base_tree(), cumulative.base_tree());
+                let prior = job.prior_review.as_ref().expect("prior review evidence");
+                assert!(prior.exact_delta);
+                assert_eq!("Goal: preserve retries", prior.evidence.intent_brief);
+                assert_eq!("tyr", prior.evidence.lanes[0].id);
                 discrete_review::ReviewVerdict::Clean
             };
             let _ = outcomes.send(discrete_review::ReviewOutcome {
@@ -1252,6 +1326,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_findings_carry_prior_lane_coverage_into_third_pass() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let snapshot = changed_workspace(temp.path()).await;
+        let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawned_passes = Arc::clone(&passes);
+        let spawner = discrete_review::Spawner::stub(move |job, _events, _cancel, outcomes| {
+            let pass = spawned_passes.fetch_add(1, Ordering::SeqCst);
+            let verdict = match pass {
+                0 => discrete_review::ReviewVerdict::Findings {
+                    synthesis: "[P1] tracked.txt:1 -- first finding".to_string(),
+                    evidence: discrete_review::ReviewPassEvidence {
+                        intent_brief: "Goal: correct the change".to_string(),
+                        intent_available: true,
+                        lanes: vec![discrete_review::ReviewLaneEvidence {
+                            id: "mimir".to_string(),
+                            outcome: SubagentOutcome::Completed,
+                        }],
+                    },
+                },
+                1 => {
+                    let prior = job.prior_review.as_ref().expect("first-pass evidence");
+                    assert_eq!(
+                        vec!["mimir"],
+                        prior
+                            .evidence
+                            .lanes
+                            .iter()
+                            .map(|lane| lane.id.as_str())
+                            .collect::<Vec<_>>()
+                    );
+                    discrete_review::ReviewVerdict::Findings {
+                        synthesis: "[P2] tracked.txt:1 -- second finding".to_string(),
+                        // `run_async` merges the inherited Mímir outcome with
+                        // the newly selected Týr outcome before returning.
+                        evidence: discrete_review::ReviewPassEvidence {
+                            intent_brief: prior.evidence.intent_brief.clone(),
+                            intent_available: true,
+                            lanes: vec![
+                                discrete_review::ReviewLaneEvidence {
+                                    id: "mimir".to_string(),
+                                    outcome: SubagentOutcome::Completed,
+                                },
+                                discrete_review::ReviewLaneEvidence {
+                                    id: "tyr".to_string(),
+                                    outcome: SubagentOutcome::Completed,
+                                },
+                            ],
+                        },
+                    }
+                }
+                2 => {
+                    let prior = job.prior_review.as_ref().expect("second-pass evidence");
+                    assert_eq!(
+                        vec!["mimir", "tyr"],
+                        prior
+                            .evidence
+                            .lanes
+                            .iter()
+                            .map(|lane| lane.id.as_str())
+                            .collect::<Vec<_>>()
+                    );
+                    discrete_review::ReviewVerdict::Clean
+                }
+                _ => panic!("unexpected fourth review pass"),
+            };
+            let _ = outcomes.send(discrete_review::ReviewOutcome {
+                epoch: job.epoch,
+                verdict,
+            });
+        });
+        let mut running = spawn(runtime_rx, fanout_config(command_tx, spawner));
+        running
+            .handle
+            .begin_turn(1, "change behavior".to_string(), Vec::new(), snapshot)
+            .await;
+        runtime_tx.send(completion()).expect("send completion");
+
+        let _ = next_prompt(&mut command_rx).await;
+        std::fs::write(temp.path().join("tracked.txt"), "first correction\n")
+            .expect("first correction");
+        runtime_tx
+            .send(completion())
+            .expect("send first corrective completion");
+
+        let _ = next_prompt(&mut command_rx).await;
+        std::fs::write(temp.path().join("tracked.txt"), "second correction\n")
+            .expect("second correction");
+        runtime_tx
+            .send(completion())
+            .expect("send second corrective completion");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = tokio::time::timeout_at(deadline, running.events.recv())
+                .await
+                .expect("third-pass clean verdict released completion")
+                .expect("orchestrated event");
+            if matches!(event, UiEvent::PromptDone { .. }) {
+                break;
+            }
+        }
+        assert_eq!(3, passes.load(Ordering::SeqCst));
+
+        drop(runtime_tx);
+        running.task.await.expect("orchestrator task");
+    }
+
+    #[tokio::test]
     async fn correction_that_reverts_to_baseline_gets_another_specialist_pass() {
         let temp = tempfile::tempdir().expect("tempdir");
         let snapshot = changed_workspace(temp.path()).await;
@@ -1264,6 +1448,7 @@ mod tests {
             let verdict = if pass == 0 {
                 discrete_review::ReviewVerdict::Findings {
                     synthesis: "[P1] tracked.txt:1 -- wrong behavior".to_string(),
+                    evidence: discrete_review::ReviewPassEvidence::default(),
                 }
             } else {
                 discrete_review::ReviewVerdict::Clean
@@ -1317,6 +1502,7 @@ mod tests {
                 epoch: job.epoch,
                 verdict: discrete_review::ReviewVerdict::Findings {
                     synthesis: "[P2] src/upload.rs:12 -- suspected issue".to_string(),
+                    evidence: discrete_review::ReviewPassEvidence::default(),
                 },
             });
         });
@@ -1363,6 +1549,7 @@ mod tests {
             let verdict = if pass == 0 {
                 discrete_review::ReviewVerdict::Findings {
                     synthesis: "[P1] tracked.txt:1 -- wrong behavior".to_string(),
+                    evidence: discrete_review::ReviewPassEvidence::default(),
                 }
             } else {
                 assert!(
@@ -1422,6 +1609,7 @@ mod tests {
                 epoch: job.epoch,
                 verdict: discrete_review::ReviewVerdict::Findings {
                     synthesis: "[P1] tracked.txt:1 -- wrong behavior".to_string(),
+                    evidence: discrete_review::ReviewPassEvidence::default(),
                 },
             });
         });
@@ -1655,6 +1843,7 @@ mod tests {
                         epoch: job.epoch,
                         verdict: discrete_review::ReviewVerdict::Findings {
                             synthesis: "[P0] src/a.rs:1 -- stale finding".to_string(),
+                            evidence: discrete_review::ReviewPassEvidence::default(),
                         },
                     });
                 }

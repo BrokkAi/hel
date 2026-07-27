@@ -2451,6 +2451,19 @@ fn termination_error(cause: TerminationCause) -> anyhow::Error {
     }
 }
 
+/// Resolve termination while the worker is idle after a successful retained
+/// turn. Runtime shutdown is normal lifecycle completion in this state, not an
+/// agent failure; user cancellation remains distinguishable in the UI and
+/// telemetry.
+fn retained_termination_result(cause: TerminationCause) -> Result<String> {
+    match cause {
+        TerminationCause::RuntimeShutdown => {
+            Ok("the completed retained subagent session was shut down".to_string())
+        }
+        _ => Err(termination_error(cause)),
+    }
+}
+
 /// Maps the nested ACP runtime's join outcome to (a) the raw result recorded
 /// for teardown-failure logging and (b) the run-level error it implies.
 fn map_runtime_join(
@@ -2918,7 +2931,7 @@ async fn run(
                 tokio::select! {
                 biased;
                 () = termination.cancelled() => {
-                    break 'session Err(termination_error(termination.cause()));
+                    break 'session retained_termination_result(termination.cause());
                 }
                 joined = &mut runtime => {
                     let (runtime_result, run_result) = map_runtime_join(joined);
@@ -4081,6 +4094,20 @@ mod tests {
             TerminationCause::RuntimeShutdown
         );
         controller.finish(shutdown.subagent_id).await;
+    }
+
+    #[test]
+    fn idle_retained_runtime_shutdown_is_clean_for_outcome_and_telemetry() {
+        let shutdown = retained_termination_result(TerminationCause::RuntimeShutdown);
+        assert!(
+            shutdown.is_ok(),
+            "reaping an idle retained session must not look like an agent failure"
+        );
+        assert_eq!(outcome_for(&shutdown), SubagentOutcome::Completed);
+
+        let cancelled = retained_termination_result(TerminationCause::UserCancelled);
+        assert!(cancelled.is_err());
+        assert_eq!(outcome_for(&cancelled), SubagentOutcome::Cancelled);
     }
 
     #[tokio::test]
