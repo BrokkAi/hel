@@ -615,6 +615,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 | SubagentEvent::Status { .. } => {}
             },
             UiEvent::InternalMessage(message) => {
+                reset_superseded_headless_answer(&mut state, &mut collecting_turn_output, &message);
                 if matches!(cfg.output_format, OutputFormat::StreamJson) {
                     let kind = match message.kind {
                         crate::event::InternalMessageKind::Delegation => "delegation",
@@ -704,6 +705,25 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("prompt stopped with {}", stop_reason_label))
+    }
+}
+
+fn reset_superseded_headless_answer(
+    state: &mut HeadlessState,
+    collecting_turn_output: &mut bool,
+    message: &crate::event::InternalMessage,
+) {
+    if matches!(
+        message.kind,
+        crate::event::InternalMessageKind::DiscreteReview
+    ) && message.source.eq_ignore_ascii_case("primary")
+        && message.target.eq_ignore_ascii_case("primary")
+    {
+        // A findings correction supersedes the withheld answer. PromptDone has
+        // intentionally not arrived yet, so this is the boundary where
+        // headless output must start fresh.
+        state.final_text.clear();
+        *collecting_turn_output = false;
     }
 }
 
@@ -921,6 +941,26 @@ mod tests {
 
     fn record_json(record: &StreamRecord<'_>) -> serde_json::Value {
         serde_json::to_value(record).expect("stream record serializes")
+    }
+
+    #[test]
+    fn corrective_review_discards_superseded_headless_answer() {
+        let mut state = HeadlessState {
+            final_text: "stale initial answer".to_string(),
+            ..HeadlessState::default()
+        };
+        let mut collecting = true;
+        let message = crate::event::InternalMessage {
+            source: "primary".to_string(),
+            target: "primary".to_string(),
+            kind: crate::event::InternalMessageKind::DiscreteReview,
+            text: "correct these findings".to_string(),
+        };
+
+        reset_superseded_headless_answer(&mut state, &mut collecting, &message);
+
+        assert!(state.final_text.is_empty());
+        assert!(!collecting);
     }
 
     #[test]

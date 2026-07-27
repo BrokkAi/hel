@@ -52,6 +52,7 @@ pub(crate) struct WorkspaceDelta {
     changed: bool,
     receipt: String,
     review_patch: Option<String>,
+    review_fingerprint: Option<String>,
     review_snapshot: Option<ReviewSnapshot>,
 }
 
@@ -142,6 +143,13 @@ impl WorkspaceDelta {
         self.review_patch.as_deref()
     }
 
+    /// Exact, ordered identity of every captured repository's current tree.
+    /// This includes baseline-equal roots and remains available for multi-root
+    /// turns where one [`ReviewSnapshot`] cannot represent the whole workspace.
+    pub(crate) fn review_fingerprint(&self) -> Option<&str> {
+        self.review_fingerprint.as_deref()
+    }
+
     pub(crate) fn review_snapshot(&self) -> Option<&ReviewSnapshot> {
         self.review_snapshot.as_ref()
     }
@@ -152,12 +160,14 @@ impl WorkspaceDelta {
             changed: true,
             receipt: String::new(),
             review_patch: Some(patch),
+            review_fingerprint: Some("test-workspace".to_string()),
             review_snapshot: None,
         }
     }
 }
 
 struct RootDelta {
+    changed: bool,
     receipt: String,
     patch: String,
     review_snapshot: ReviewSnapshot,
@@ -259,26 +269,33 @@ impl WorkspaceSnapshot {
     pub(crate) async fn delta(&self) -> WorkspaceDelta {
         let mut receipt_sections = Vec::new();
         let mut patch_sections = Vec::new();
+        let mut review_fingerprint_sections = Vec::new();
         let mut review_snapshots = Vec::new();
         let mut review_notices = Vec::new();
 
         for root in &self.inner.roots {
             let mut root = root.lock().await;
             match root.delta().await {
-                Ok(Some(delta)) => {
-                    receipt_sections.push(format!(
-                        "Repository: {}\n{}",
+                Ok(delta) => {
+                    review_fingerprint_sections.push(format!(
+                        "{}\0{}",
                         root.repo_root.display(),
-                        delta.receipt.trim_end()
+                        delta.review_snapshot.target_tree()
                     ));
-                    patch_sections.push(format!(
-                        "Repository: {}\n{}",
-                        root.repo_root.display(),
-                        delta.patch.trim_end()
-                    ));
+                    if delta.changed {
+                        receipt_sections.push(format!(
+                            "Repository: {}\n{}",
+                            root.repo_root.display(),
+                            delta.receipt.trim_end()
+                        ));
+                        patch_sections.push(format!(
+                            "Repository: {}\n{}",
+                            root.repo_root.display(),
+                            delta.patch.trim_end()
+                        ));
+                    }
                     review_snapshots.push(delta.review_snapshot);
                 }
-                Ok(None) => {}
                 Err(message) => {
                     let notice = format!(
                         "Repository: {}\n  delta unavailable: {message}",
@@ -314,10 +331,13 @@ impl WorkspaceSnapshot {
         }
         let review_patch =
             changed.then(|| bound_text(patch_sections.join("\n\n"), REVIEW_PATCH_LIMIT));
+        let review_fingerprint = (!review_fingerprint_sections.is_empty())
+            .then(|| review_fingerprint_sections.join("\n"));
         WorkspaceDelta {
             changed,
             receipt,
             review_patch,
+            review_fingerprint,
             review_snapshot: (review_snapshots.len() == 1)
                 .then(|| review_snapshots.pop().expect("one review snapshot")),
         }
@@ -347,19 +367,18 @@ pub(crate) async fn repository_review_patch(
                 GitTreeSnapshot::capture_head(repo_root.clone(), common_dir, vec![pathspec])
                     .await?;
             snapshot.delta().await.map(|delta| {
-                delta.map_or_else(
-                    || "No uncommitted changes.".to_string(),
-                    |delta| {
-                        bound_text(
-                            format!(
-                                "Repository: {}\n{}",
-                                repo_root.display(),
-                                delta.patch.trim_end()
-                            ),
-                            REVIEW_PATCH_LIMIT,
-                        )
-                    },
-                )
+                if delta.changed {
+                    bound_text(
+                        format!(
+                            "Repository: {}\n{}",
+                            repo_root.display(),
+                            delta.patch.trim_end()
+                        ),
+                        REVIEW_PATCH_LIMIT,
+                    )
+                } else {
+                    "No uncommitted changes.".to_string()
+                }
             })
         }
         RepositoryReviewTarget::Head => {
@@ -499,14 +518,20 @@ impl GitTreeSnapshot {
         Ok(snapshot)
     }
 
-    async fn delta(&mut self) -> Result<Option<RootDelta>, String> {
+    async fn delta(&mut self) -> Result<RootDelta, String> {
         self.refresh_index().await?;
         let after_tree = self.write_tree().await?;
-        if after_tree == self.baseline_tree {
-            return Ok(None);
-        }
-        let receipt = self.diff(&after_tree, &["--stat", "--summary"]).await?;
-        let patch = self.diff(&after_tree, &[]).await?;
+        let changed = after_tree != self.baseline_tree;
+        let receipt = if changed {
+            self.diff(&after_tree, &["--stat", "--summary"]).await?
+        } else {
+            String::new()
+        };
+        let patch = if changed {
+            self.diff(&after_tree, &[]).await?
+        } else {
+            String::new()
+        };
         let full_patch_path = self
             .scratch
             .path()
@@ -524,11 +549,12 @@ impl GitTreeSnapshot {
             full_patch_path,
             _lease: Arc::clone(&self.scratch),
         };
-        Ok(Some(RootDelta {
+        Ok(RootDelta {
+            changed,
             receipt,
             patch,
             review_snapshot,
-        }))
+        })
     }
 
     async fn refresh_index(&self) -> Result<(), String> {
@@ -1126,6 +1152,45 @@ mod tests {
         assert!(second_delta.receipt().contains("followup.txt"));
         assert!(!second_delta.receipt().contains("primary.txt"));
         assert!(!second_delta.receipt().contains("subagent.txt"));
+    }
+
+    #[tokio::test]
+    async fn multi_root_fingerprint_tracks_cumulative_corrections() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).expect("first root");
+        std::fs::create_dir_all(&second).expect("second root");
+        for root in [&first, &second] {
+            init_repo(root);
+            std::fs::write(root.join("tracked.txt"), "baseline\n").expect("baseline");
+            commit_all(root);
+        }
+
+        let workspace = WorkspaceSnapshot::capture(&[first.clone(), second.clone()]).await;
+        std::fs::write(first.join("tracked.txt"), "first change\n").expect("first change");
+        let first_delta = workspace.delta().await;
+        let first_fingerprint = first_delta
+            .review_fingerprint()
+            .expect("first fingerprint")
+            .to_string();
+        assert!(
+            first_delta.review_snapshot().is_none(),
+            "one exact analyze-diff snapshot cannot represent two repositories"
+        );
+
+        std::fs::write(second.join("tracked.txt"), "correction\n").expect("second change");
+        let corrected_delta = workspace.delta().await;
+        assert_ne!(
+            first_fingerprint,
+            corrected_delta
+                .review_fingerprint()
+                .expect("corrected fingerprint")
+        );
+        assert!(
+            corrected_delta.review_snapshot().is_none(),
+            "one exact analyze-diff snapshot cannot represent two repositories"
+        );
     }
 
     #[tokio::test]
