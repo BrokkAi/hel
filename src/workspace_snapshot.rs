@@ -2,6 +2,7 @@
 //! outer user turn or one subagent invocation without touching the real index.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -38,6 +39,7 @@ struct SnapshotNotice {
 struct GitTreeSnapshot {
     repo_root: PathBuf,
     pathspecs: Vec<PathBuf>,
+    excluded_pathspecs: Vec<OsString>,
     index_path: PathBuf,
     object_dir: PathBuf,
     alternate_object_dir: PathBuf,
@@ -162,9 +164,21 @@ struct RootDelta {
 }
 
 impl WorkspaceSnapshot {
+    #[cfg(test)]
     pub(crate) async fn capture(workspace_roots: &[PathBuf]) -> Self {
+        Self::capture_excluding(workspace_roots, &[]).await
+    }
+
+    /// Capture the workspace while ignoring only the configured artifact
+    /// files. Relative exclusions are resolved against the Mjolnir process
+    /// cwd, matching how debug and agent-stderr paths are opened.
+    pub(crate) async fn capture_excluding(
+        workspace_roots: &[PathBuf],
+        excluded_paths: &[PathBuf],
+    ) -> Self {
         let mut repositories: BTreeMap<PathBuf, (PathBuf, BTreeSet<PathBuf>)> = BTreeMap::new();
         let mut unavailable = Vec::new();
+        let excluded_paths = canonicalize_excluded_paths(excluded_paths).await;
 
         for requested_root in workspace_roots {
             let root = match tokio::fs::canonicalize(requested_root).await {
@@ -208,7 +222,20 @@ impl WorkspaceSnapshot {
                 pathspecs.clear();
                 pathspecs.insert(PathBuf::from("."));
             }
-            match GitTreeSnapshot::capture(repo_root.clone(), common_dir, pathspecs).await {
+            let excluded_pathspecs = excluded_paths
+                .iter()
+                .filter_map(|path| path.strip_prefix(&repo_root).ok())
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(git_literal_exclude_pathspec)
+                .collect();
+            match GitTreeSnapshot::capture(
+                repo_root.clone(),
+                common_dir,
+                pathspecs,
+                excluded_pathspecs,
+            )
+            .await
+            {
                 Ok(snapshot) => roots.push(Mutex::new(snapshot)),
                 Err(message) => unavailable.push(SnapshotNotice {
                     root: repo_root,
@@ -372,6 +399,7 @@ impl GitTreeSnapshot {
         repo_root: PathBuf,
         common_dir: PathBuf,
         pathspecs: BTreeSet<PathBuf>,
+        excluded_pathspecs: Vec<OsString>,
     ) -> Result<Self, String> {
         let scratch = tempfile::Builder::new()
             .prefix("mj-workspace-snapshot-")
@@ -388,6 +416,7 @@ impl GitTreeSnapshot {
         let mut snapshot = Self {
             repo_root,
             pathspecs,
+            excluded_pathspecs,
             index_path: scratch.path().join("index"),
             object_dir: scratch.path().join("objects"),
             alternate_object_dir,
@@ -438,6 +467,7 @@ impl GitTreeSnapshot {
         let mut snapshot = Self {
             repo_root,
             pathspecs,
+            excluded_pathspecs: Vec::new(),
             index_path: scratch.path().join("index"),
             object_dir: scratch.path().join("objects"),
             alternate_object_dir,
@@ -502,11 +532,12 @@ impl GitTreeSnapshot {
     }
 
     async fn refresh_index(&self) -> Result<(), String> {
-        let pathspecs = self
+        let mut pathspecs = self
             .pathspecs
             .iter()
-            .map(|path| path.as_os_str())
+            .map(|path| path.as_os_str().to_os_string())
             .collect::<Vec<_>>();
+        pathspecs.extend(self.excluded_pathspecs.iter().cloned());
         self.run_scratch_git(["add", "-A", "--"], pathspecs).await
     }
 
@@ -584,6 +615,50 @@ impl GitTreeSnapshot {
         String::from_utf8(output.stdout)
             .map_err(|_| "Git snapshot output was not UTF-8".to_string())
     }
+}
+
+async fn canonicalize_excluded_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let process_cwd = std::env::current_dir().ok();
+    let mut canonical = BTreeSet::new();
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else if let Some(cwd) = &process_cwd {
+            cwd.join(path)
+        } else {
+            continue;
+        };
+        if let Ok(path) = tokio::fs::canonicalize(&absolute).await {
+            canonical.insert(path);
+            continue;
+        }
+        let Some(file_name) = absolute.file_name() else {
+            continue;
+        };
+        let Some(parent) = absolute.parent() else {
+            continue;
+        };
+        if let Ok(parent) = tokio::fs::canonicalize(parent).await {
+            canonical.insert(parent.join(file_name));
+        }
+    }
+    canonical.into_iter().collect()
+}
+
+fn git_literal_exclude_pathspec(path: &Path) -> OsString {
+    let mut pathspec = OsString::from(":(top,literal,exclude)");
+    #[cfg(windows)]
+    {
+        for (index, component) in path.components().enumerate() {
+            if index > 0 {
+                pathspec.push("/");
+            }
+            pathspec.push(component.as_os_str());
+        }
+    }
+    #[cfg(not(windows))]
+    pathspec.push(path.as_os_str());
+    pathspec
 }
 
 async fn discover_repository(workspace_root: &Path) -> Option<(PathBuf, PathBuf)> {
@@ -919,6 +994,83 @@ mod tests {
                 .expect("leased full patch")
                 .contains("-dirty before turn")
         );
+    }
+
+    #[tokio::test]
+    async fn configured_runtime_artifacts_are_excluded_without_hiding_other_logs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        init_repo(root);
+        std::fs::write(root.join("tracked.txt"), "baseline\n").expect("tracked baseline");
+        std::fs::write(root.join("debug.log"), "old debug output\n").expect("debug baseline");
+        commit_all(root);
+
+        let debug_file = root.join("debug.log");
+        let agent_stderr = root.join("agent.stderr");
+        let snapshot = WorkspaceSnapshot::capture_excluding(
+            &[root.to_path_buf()],
+            &[debug_file.clone(), agent_stderr.clone()],
+        )
+        .await;
+
+        std::fs::write(&debug_file, "old debug output\nnew debug output\n")
+            .expect("append debug output");
+        std::fs::write(&agent_stderr, "agent stderr created during turn\n")
+            .expect("create agent stderr");
+        std::fs::write(root.join("ordinary.log"), "agent-created log\n").expect("ordinary log");
+        std::fs::write(root.join("tracked.txt"), "changed\n").expect("tracked edit");
+
+        let status_before = git(root, &["status", "--porcelain=v1", "--untracked-files=all"]);
+        let delta = snapshot.delta().await;
+        assert!(delta.changed());
+        let receipt = delta.receipt();
+        assert!(receipt.contains("ordinary.log"), "{receipt}");
+        assert!(receipt.contains("tracked.txt"), "{receipt}");
+        assert!(!receipt.contains("debug.log"), "{receipt}");
+        assert!(!receipt.contains("agent.stderr"), "{receipt}");
+        let patch = delta.review_patch().expect("review patch");
+        assert!(patch.contains("ordinary.log"), "{patch}");
+        assert!(patch.contains("tracked.txt"), "{patch}");
+        assert!(!patch.contains("debug.log"), "{patch}");
+        assert!(!patch.contains("agent.stderr"), "{patch}");
+        assert_eq!(
+            git(root, &["status", "--porcelain=v1", "--untracked-files=all"]),
+            status_before
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_runtime_artifact_with_literal_backslash_is_exact() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        init_repo(root);
+        std::fs::create_dir(root.join("logs")).expect("logs directory");
+        std::fs::write(root.join("tracked.txt"), "baseline\n").expect("tracked baseline");
+        commit_all(root);
+
+        let runtime_log = root.join(r"logs\agent.log");
+        let non_utf8_runtime_log = root.join(OsString::from_vec(b"runtime-\xff.log".to_vec()));
+        let user_log = root.join("logs/agent.log");
+        let snapshot = WorkspaceSnapshot::capture_excluding(
+            &[root.to_path_buf()],
+            &[runtime_log.clone(), non_utf8_runtime_log.clone()],
+        )
+        .await;
+
+        std::fs::write(&runtime_log, "Mjolnir runtime output\n").expect("runtime log");
+        std::fs::write(&non_utf8_runtime_log, "non-UTF-8 runtime output\n")
+            .expect("non-UTF-8 runtime log");
+        std::fs::write(&user_log, "agent-created output\n").expect("user log");
+
+        let delta = snapshot.delta().await;
+        assert!(delta.changed());
+        let patch = delta.review_patch().expect("review patch");
+        assert!(patch.contains("logs/agent.log"), "{patch}");
+        assert!(!patch.contains("Mjolnir runtime output"), "{patch}");
+        assert!(!patch.contains("non-UTF-8 runtime output"), "{patch}");
     }
 
     #[tokio::test]

@@ -58,6 +58,7 @@ pub struct RunConfig {
     pub additional_directories: Vec<PathBuf>,
     pub resume_session: Option<String>,
     pub agent_stderr: Option<PathBuf>,
+    pub snapshot_exclusions: Vec<PathBuf>,
     pub fs_max_text_bytes: u64,
     pub output_format: OutputFormat,
     pub permission_mode: PermissionMode,
@@ -276,6 +277,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 .with_prewarm(subagent::RunContext {
                     cwd: cfg.cwd.clone(),
                     additional_directories: cfg.additional_directories.clone(),
+                    snapshot_exclusions: cfg.snapshot_exclusions.clone(),
                     fs_max_text_bytes: cfg.fs_max_text_bytes,
                     access_mode: acp::RuntimeAccessMode::Full,
                 })
@@ -298,7 +300,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         event_rx,
         crate::orchestrator::Config {
             runtime_commands: cmd_tx.clone(),
-            subagent_handoffs: subagent_handoffs.clone(),
             active_subagent_workers: active_implementation_workers.clone(),
             subagent_reports: subagent_report_rx,
             subagent_report_bus: subagent_reports.clone(),
@@ -313,6 +314,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     additional_directories: cfg.additional_directories.clone(),
                     session_tag: Some(format!("headless-{}", std::process::id())),
                     agent_stderr: cfg.agent_stderr.clone(),
+                    snapshot_exclusions: cfg.snapshot_exclusions.clone(),
                     fs_max_text_bytes: cfg.fs_max_text_bytes,
                     id_allocator: subagent_ids.clone(),
                 })
@@ -401,8 +403,11 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     let mut roots = Vec::with_capacity(1 + cfg.additional_directories.len());
                     roots.push(cfg.cwd.clone());
                     roots.extend(cfg.additional_directories.iter().cloned());
-                    let snapshot =
-                        crate::workspace_snapshot::WorkspaceSnapshot::capture(&roots).await;
+                    let snapshot = crate::workspace_snapshot::WorkspaceSnapshot::capture_excluding(
+                        &roots,
+                        &cfg.snapshot_exclusions,
+                    )
+                    .await;
                     primary_orchestrator
                         .begin_turn(1, cfg.prompt.clone(), Vec::new(), snapshot)
                         .await;

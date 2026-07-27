@@ -836,6 +836,7 @@ struct ServerSessionManager {
     agent: SelectedAgent,
     roster: Option<roster::Roster>,
     additional_directories: Vec<PathBuf>,
+    snapshot_exclusions: Vec<PathBuf>,
     fs_max_text_bytes: u64,
     sessions: Mutex<Vec<ServerAgentSession>>,
 }
@@ -851,6 +852,7 @@ impl ServerSessionManager {
             agent,
             roster: None,
             additional_directories,
+            snapshot_exclusions: Vec::new(),
             fs_max_text_bytes,
             sessions: Mutex::new(Vec::new()),
         }
@@ -859,6 +861,7 @@ impl ServerSessionManager {
     fn new_roster(
         roster: roster::Roster,
         additional_directories: Vec<PathBuf>,
+        snapshot_exclusions: Vec<PathBuf>,
         fs_max_text_bytes: u64,
     ) -> Self {
         let primary = &roster.primary;
@@ -871,6 +874,7 @@ impl ServerSessionManager {
             },
             roster: Some(roster),
             additional_directories,
+            snapshot_exclusions,
             fs_max_text_bytes,
             sessions: Mutex::new(Vec::new()),
         }
@@ -882,6 +886,7 @@ impl ServerSessionManager {
             self.roster.clone(),
             cwd,
             self.additional_directories.clone(),
+            self.snapshot_exclusions.clone(),
             self.fs_max_text_bytes,
         );
         if let Ok(mut sessions) = self.sessions.lock() {
@@ -2271,6 +2276,7 @@ pub struct ServerOptions {
     pub logout_all: bool,
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
+    pub snapshot_exclusions: Vec<PathBuf>,
     pub fs_max_text_bytes: u64,
     pub termination: CancellationToken,
 }
@@ -2284,6 +2290,7 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
         logout_all,
         cwd,
         additional_directories,
+        snapshot_exclusions,
         fs_max_text_bytes,
         termination,
     } = options;
@@ -2318,6 +2325,7 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     let session_manager = Arc::new(ServerSessionManager::new_roster(
         resolved,
         additional_directories,
+        snapshot_exclusions,
         fs_max_text_bytes,
     ));
     let session_ttl = session_ttl_from_days(session_ttl_days);
@@ -2457,6 +2465,7 @@ fn start_server_agent_session(
     roster: Option<roster::Roster>,
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
+    snapshot_exclusions: Vec<PathBuf>,
     fs_max_text_bytes: u64,
 ) -> ServerAgentSession {
     let (runtime_event_tx, runtime_event_rx) = mpsc::unbounded_channel();
@@ -2540,6 +2549,7 @@ fn start_server_agent_session(
             .with_prewarm(subagent::RunContext {
                 cwd: cwd.clone(),
                 additional_directories: additional_directories.clone(),
+                snapshot_exclusions: snapshot_exclusions.clone(),
                 fs_max_text_bytes,
                 access_mode: crate::acp::RuntimeAccessMode::Full,
             })
@@ -2574,7 +2584,6 @@ fn start_server_agent_session(
         runtime_event_rx,
         crate::orchestrator::Config {
             runtime_commands: runtime_cmd_tx.clone(),
-            subagent_handoffs: subagent_handoffs.clone(),
             active_subagent_workers: active_implementation_workers.clone(),
             subagent_reports: subagent_report_rx,
             subagent_report_bus: subagent_reports,
@@ -2593,6 +2602,7 @@ fn start_server_agent_session(
                         additional_directories: review_additional_directories,
                         session_tag: Some(format!("remote-{}", std::process::id())),
                         agent_stderr: None,
+                        snapshot_exclusions: snapshot_exclusions.clone(),
                         fs_max_text_bytes,
                         id_allocator: subagent_ids.clone(),
                     })
@@ -2637,8 +2647,11 @@ fn start_server_agent_session(
                         local_epoch = local_epoch.saturating_add(1);
                         handoffs.store(0, std::sync::atomic::Ordering::Release);
                         let snapshot =
-                            crate::workspace_snapshot::WorkspaceSnapshot::capture(&workspace_roots)
-                                .await;
+                            crate::workspace_snapshot::WorkspaceSnapshot::capture_excluding(
+                                &workspace_roots,
+                                &snapshot_exclusions,
+                            )
+                            .await;
                         primary_orchestrator
                             .begin_turn(local_epoch, text.clone(), images.clone(), snapshot)
                             .await;

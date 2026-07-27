@@ -103,6 +103,7 @@ pub struct Config {
     pub subagent_handoff_counter: Option<Arc<AtomicUsize>>,
     pub active_implementation_workers: ActiveSubagentWorkers,
     pub max_parallel: usize,
+    pub snapshot_exclusions: Vec<PathBuf>,
     /// Id source installed on the controller when the MCP server starts, so
     /// discrete-review lanes can draw from the same sequence.
     pub id_allocator: SubagentIdAllocator,
@@ -180,6 +181,7 @@ impl Config {
             subagent_handoff_counter: None,
             active_implementation_workers: ActiveSubagentWorkers::default(),
             max_parallel: DEFAULT_MAX_PARALLEL,
+            snapshot_exclusions: Vec::new(),
             id_allocator: SubagentIdAllocator::default(),
             headless_permission_mode: None,
             role_pool,
@@ -263,7 +265,8 @@ impl Config {
         self
     }
 
-    pub fn with_prewarm(self, context: RunContext) -> Self {
+    pub fn with_prewarm(mut self, context: RunContext) -> Self {
+        self.snapshot_exclusions = context.snapshot_exclusions.clone();
         self.ensure_warm(context);
         self
     }
@@ -804,6 +807,7 @@ impl SubagentInventory {
 pub struct RunContext {
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
+    pub snapshot_exclusions: Vec<PathBuf>,
     pub fs_max_text_bytes: u64,
     pub access_mode: RuntimeAccessMode,
 }
@@ -1153,6 +1157,7 @@ async fn resolve_subagent_context(
     Ok(RunContext {
         cwd: delegated_cwd,
         additional_directories: Vec::new(),
+        snapshot_exclusions: outer.snapshot_exclusions.clone(),
         fs_max_text_bytes: outer.fs_max_text_bytes,
         access_mode: outer.access_mode,
     })
@@ -1169,7 +1174,11 @@ fn subagent_workspace_roots(context: &RunContext) -> Vec<PathBuf> {
 }
 
 async fn capture_workspace_snapshot(context: &RunContext) -> WorkspaceSnapshot {
-    WorkspaceSnapshot::capture(&subagent_workspace_roots(context)).await
+    WorkspaceSnapshot::capture_excluding(
+        &subagent_workspace_roots(context),
+        &context.snapshot_exclusions,
+    )
+    .await
 }
 
 async fn canonical_root(cwd: &Path) -> PathBuf {
@@ -3446,6 +3455,7 @@ mod tests {
             subagent_handoff_counter: None,
             active_implementation_workers: ActiveSubagentWorkers::default(),
             max_parallel: 2,
+            snapshot_exclusions: Vec::new(),
             id_allocator: SubagentIdAllocator::default(),
             headless_permission_mode: None,
             role_pool: None,
@@ -3464,6 +3474,7 @@ mod tests {
         RunContext {
             cwd: PathBuf::from("/workspace"),
             additional_directories: Vec::new(),
+            snapshot_exclusions: Vec::new(),
             fs_max_text_bytes: 1,
             access_mode: RuntimeAccessMode::Full,
         }
@@ -4298,6 +4309,7 @@ mod tests {
             additional_directories: vec![
                 std::fs::canonicalize(delegated.path()).expect("canonical delegated worktree"),
             ],
+            snapshot_exclusions: Vec::new(),
             fs_max_text_bytes: 1,
             access_mode: RuntimeAccessMode::Full,
         };
@@ -4322,6 +4334,7 @@ mod tests {
         let context = RunContext {
             cwd: std::fs::canonicalize(&primary).expect("canonical primary"),
             additional_directories: Vec::new(),
+            snapshot_exclusions: Vec::new(),
             fs_max_text_bytes: 1,
             access_mode: RuntimeAccessMode::Full,
         };
@@ -4344,9 +4357,11 @@ mod tests {
         init_repo(&external);
         let primary = std::fs::canonicalize(&primary).expect("canonical primary");
         let external = std::fs::canonicalize(&external).expect("canonical external");
+        let runtime_log = external.join("mj-debug.log");
         let outer = RunContext {
             cwd: primary.clone(),
             additional_directories: vec![external.clone()],
+            snapshot_exclusions: vec![runtime_log.clone()],
             fs_max_text_bytes: 1,
             access_mode: RuntimeAccessMode::Full,
         };
@@ -4358,6 +4373,7 @@ mod tests {
         let snapshot = capture_workspace_snapshot(&delegated).await;
 
         std::fs::write(external.join("subagent-change.txt"), "changed\n").expect("change");
+        std::fs::write(runtime_log, "Mjolnir runtime output\n").expect("runtime log");
 
         let delta = snapshot.delta().await;
         assert!(delta.changed());
@@ -4372,6 +4388,7 @@ mod tests {
                 .contains(&format!("Repository: {}", primary.display()))
         );
         assert!(delta.receipt().contains("subagent-change.txt"));
+        assert!(!delta.receipt().contains("mj-debug.log"));
     }
 
     #[tokio::test]
@@ -4461,6 +4478,7 @@ mod tests {
         let context = RunContext {
             cwd: cwd.clone(),
             additional_directories: Vec::new(),
+            snapshot_exclusions: Vec::new(),
             fs_max_text_bytes: 1_000_000,
             access_mode: RuntimeAccessMode::Full,
         };

@@ -427,6 +427,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     anvil::configure_cli_override(cli.anvil_path.clone());
     init_logging(cli.log_file.as_deref())?;
+    let debug_file = cli.log_file.clone();
+    let snapshot_exclusions =
+        configured_snapshot_exclusions(cli.log_file.as_deref(), cli.agent_stderr.as_deref());
     let termination = termination::Coordinator::install();
     #[cfg(unix)]
     if std::env::var_os("MJ_TERMINATION_PTY_INTEGRATION").is_some() {
@@ -457,6 +460,7 @@ async fn main() -> Result<()> {
                     args,
                     fs_max_text_bytes,
                     top_level_additional_directories,
+                    debug_file,
                     termination.token(),
                 )
                 .await
@@ -472,6 +476,7 @@ async fn main() -> Result<()> {
                     logout_all: args.logout_all,
                     cwd,
                     additional_directories: workspace_roots.additional_directories().to_vec(),
+                    snapshot_exclusions,
                     fs_max_text_bytes,
                     termination: termination.token(),
                 })
@@ -489,6 +494,7 @@ async fn main() -> Result<()> {
             additional_directories: workspace_roots.additional_directories().to_vec(),
             resume_session: cli.resume_session,
             agent_stderr: cli.agent_stderr,
+            snapshot_exclusions,
             fs_max_text_bytes,
             output_format: cli.output_format.into(),
             permission_mode: cli.permission_mode.into(),
@@ -511,6 +517,7 @@ async fn main() -> Result<()> {
         cwd,
         RuntimeOptions {
             agent_stderr: cli.agent_stderr,
+            snapshot_exclusions,
             additional_directories: workspace_roots.additional_directories().to_vec(),
             fs_max_text_bytes,
             termination: termination.token(),
@@ -724,6 +731,7 @@ async fn run_resume(
     args: ResumeArgs,
     fs_max_text_bytes: u64,
     top_level_additional_directories: Vec<PathBuf>,
+    debug_file: Option<PathBuf>,
     termination: CancellationToken,
 ) -> Result<()> {
     let mode = ui_mode(args.fullscreen_tui);
@@ -843,6 +851,10 @@ async fn run_resume(
             cwd,
             RuntimeOptions {
                 agent_stderr: args.agent_stderr.clone(),
+                snapshot_exclusions: configured_snapshot_exclusions(
+                    debug_file.as_deref(),
+                    args.agent_stderr.as_deref(),
+                ),
                 additional_directories: additional_directories.clone(),
                 fs_max_text_bytes,
                 termination: termination.clone(),
@@ -929,6 +941,10 @@ async fn run_resume(
                 let result = run_app(
                     cwd,
                     RuntimeOptions {
+                        snapshot_exclusions: configured_snapshot_exclusions(
+                            debug_file.as_deref(),
+                            args.agent_stderr.as_deref(),
+                        ),
                         agent_stderr: args.agent_stderr,
                         additional_directories: additional_directories.clone(),
                         fs_max_text_bytes,
@@ -999,6 +1015,20 @@ fn absolutize_cwd(cwd: PathBuf) -> Result<PathBuf> {
     } else {
         Ok(std::env::current_dir().context("current dir")?.join(cwd))
     }
+}
+
+fn configured_snapshot_exclusions(
+    debug_file: Option<&Path>,
+    agent_stderr: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = debug_file
+        .into_iter()
+        .chain(agent_stderr)
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn validate_workspace_roots(
@@ -1092,6 +1122,7 @@ fn prepare_existing_worktree(cwd: &std::path::Path, name_or_path: &str) -> Resul
 #[derive(Debug, Clone)]
 struct RuntimeOptions {
     agent_stderr: Option<PathBuf>,
+    snapshot_exclusions: Vec<PathBuf>,
     additional_directories: Vec<PathBuf>,
     fs_max_text_bytes: u64,
     termination: CancellationToken,
@@ -2009,6 +2040,7 @@ async fn run_session(
                 .with_prewarm(subagent::RunContext {
                     cwd: cwd.clone(),
                     additional_directories: runtime_options.additional_directories.clone(),
+                    snapshot_exclusions: runtime_options.snapshot_exclusions.clone(),
                     fs_max_text_bytes: runtime_options.fs_max_text_bytes,
                     access_mode: acp::RuntimeAccessMode::Full,
                 })
@@ -2053,7 +2085,6 @@ async fn run_session(
         runtime_event_rx,
         orchestrator::Config {
             runtime_commands: runtime_cmd_tx.clone(),
-            subagent_handoffs: subagent_handoffs_this_turn.clone(),
             active_subagent_workers: active_implementation_workers.clone(),
             subagent_reports: subagent_report_rx,
             subagent_report_bus: subagent_reports.clone(),
@@ -2068,6 +2099,7 @@ async fn run_session(
                     additional_directories: runtime_options.additional_directories.clone(),
                     session_tag: Some(session_tag.clone()),
                     agent_stderr: runtime_options.agent_stderr.clone(),
+                    snapshot_exclusions: runtime_options.snapshot_exclusions.clone(),
                     fs_max_text_bytes: runtime_options.fs_max_text_bytes,
                     id_allocator: subagent_ids.clone(),
                 })
@@ -2118,6 +2150,7 @@ async fn run_session(
         Vec::with_capacity(1 + runtime_options.additional_directories.len());
     cmd_workspace_roots.push(cwd.clone());
     cmd_workspace_roots.extend(runtime_options.additional_directories.iter().cloned());
+    let cmd_snapshot_exclusions = runtime_options.snapshot_exclusions.clone();
     let side_agent = agent.clone();
     let side_cwd = cwd.clone();
     let side_additional_directories = runtime_options.additional_directories.clone();
@@ -2299,8 +2332,11 @@ async fn run_session(
             if let UiCommand::SendPrompt { text, images } = &command {
                 local_epoch = local_epoch.saturating_add(1);
                 subagent_handoffs_this_turn.store(0, Ordering::Release);
-                let snapshot =
-                    workspace_snapshot::WorkspaceSnapshot::capture(&cmd_workspace_roots).await;
+                let snapshot = workspace_snapshot::WorkspaceSnapshot::capture_excluding(
+                    &cmd_workspace_roots,
+                    &cmd_snapshot_exclusions,
+                )
+                .await;
                 cmd_orchestrator
                     .begin_turn(local_epoch, text.clone(), images.clone(), snapshot)
                     .await;

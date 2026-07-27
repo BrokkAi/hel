@@ -1837,6 +1837,7 @@ async fn drive_session(
         let context = subagent::RunContext {
             cwd: cwd.clone(),
             additional_directories: additional_directories.clone(),
+            snapshot_exclusions: config.snapshot_exclusions.clone(),
             fs_max_text_bytes,
             access_mode,
         };

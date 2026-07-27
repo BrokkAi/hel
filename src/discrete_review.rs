@@ -229,6 +229,7 @@ pub(crate) struct FanoutConfig {
     pub additional_directories: Vec<PathBuf>,
     pub session_tag: Option<String>,
     pub agent_stderr: Option<PathBuf>,
+    pub snapshot_exclusions: Vec<PathBuf>,
     pub fs_max_text_bytes: u64,
     /// Shared with the subagent pool so a lane's status row cannot land on the
     /// same id as a running subagent's. Lanes are *not* pool members: they keep
@@ -744,6 +745,7 @@ fn review_run_context(config: &FanoutConfig) -> RunContext {
     RunContext {
         cwd: config.cwd.clone(),
         additional_directories: config.additional_directories.clone(),
+        snapshot_exclusions: config.snapshot_exclusions.clone(),
         fs_max_text_bytes: config.fs_max_text_bytes,
         access_mode: RuntimeAccessMode::ReadOnly,
     }

@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 use agent_client_protocol::schema::v1::{SessionUpdate, StopReason, UsageUpdate};
@@ -172,7 +172,6 @@ fn outcome_label(outcome: &AgentCommandOutcome) -> String {
 
 pub struct Config {
     pub runtime_commands: mpsc::UnboundedSender<UiCommand>,
-    pub subagent_handoffs: Arc<AtomicUsize>,
     pub active_subagent_workers: ActiveSubagentWorkers,
     /// Finished subagent reports, injected into the primary session as user
     /// messages.
@@ -581,7 +580,6 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                 idle_epoch = Some(active.epoch);
                 continue;
             }
-            let handoffs = config.subagent_handoffs.load(Ordering::Acquire);
             let review = review_enabled.load(Ordering::Acquire);
             let delta = match active.snapshot.as_ref() {
                 Some(snapshot) => Some(snapshot.delta().await),
@@ -590,7 +588,6 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
             if should_start_discrete_review(
                 review,
                 discrete_review_started,
-                handoffs,
                 delta.as_ref().is_some_and(WorkspaceDelta::changed),
                 *active_worker_updates.borrow(),
             ) {
@@ -764,20 +761,15 @@ fn fall_back_to_single_prompt_review(
 /// completion; each later report injection produces another completion, and the
 /// last one -- with the pool drained -- is the one that reviews.
 ///
-/// One delegation is enough to qualify: a turn that spawned a single subagent
-/// and changed the workspace is exactly the case the review exists for.
+/// Any changed turn qualifies, whether the primary implemented it directly or
+/// delegated some of the work. Only live implementation workers defer review.
 fn should_start_discrete_review(
     enabled: bool,
     already_started: bool,
-    subagent_handoffs: usize,
     workspace_changed: bool,
     active_subagents: usize,
 ) -> bool {
-    enabled
-        && !already_started
-        && subagent_handoffs > 0
-        && workspace_changed
-        && active_subagents == 0
+    enabled && !already_started && workspace_changed && active_subagents == 0
 }
 
 fn discrete_review_prompt(task: &str, initial_result: &str, context: &str) -> String {
@@ -907,22 +899,25 @@ mod tests {
     }
 
     #[test]
-    fn review_requires_a_handoff_changes_and_a_drained_subagent_pool() {
+    fn direct_changed_turn_is_reviewable_without_subagent_handoffs() {
         assert!(
-            should_start_discrete_review(true, false, 1, true, 0),
-            "a single subagent handoff that changed the workspace is reviewable work"
+            should_start_discrete_review(true, false, true, 0),
+            "a changed turn implemented directly by the primary must be reviewed"
         );
-        assert!(should_start_discrete_review(true, false, 2, true, 0));
+        assert!(!should_start_discrete_review(false, false, true, 0));
+        assert!(!should_start_discrete_review(true, true, true, 0));
+        assert!(!should_start_discrete_review(true, false, false, 0));
+    }
+
+    #[test]
+    fn active_implementation_workers_defer_review() {
         assert!(
-            !should_start_discrete_review(true, false, 0, true, 0),
-            "a turn the primary did entirely by itself is not reviewed"
-        );
-        assert!(!should_start_discrete_review(false, false, 1, true, 0));
-        assert!(!should_start_discrete_review(true, true, 2, true, 0));
-        assert!(!should_start_discrete_review(true, false, 2, false, 0));
-        assert!(
-            !should_start_discrete_review(true, false, 2, true, 1),
+            !should_start_discrete_review(true, false, true, 1),
             "a review must not audit a workspace subagents are still mutating"
+        );
+        assert!(
+            should_start_discrete_review(true, false, true, 0),
+            "the changed turn becomes reviewable once the implementation pool drains"
         );
     }
 
@@ -1009,9 +1004,6 @@ mod tests {
         let (bus, reports) = SubagentReportBus::channel();
         Config {
             runtime_commands: command_tx,
-            // The gate needs at least one subagent handoff and a changed
-            // workspace before a discrete review fires at all.
-            subagent_handoffs: Arc::new(AtomicUsize::new(1)),
             active_subagent_workers: ActiveSubagentWorkers::default(),
             subagent_reports: reports,
             subagent_report_bus: bus,
@@ -1357,7 +1349,6 @@ mod tests {
             runtime_rx,
             Config {
                 runtime_commands: command_tx,
-                subagent_handoffs: Arc::new(AtomicUsize::new(1)),
                 active_subagent_workers: workers.clone(),
                 subagent_reports: reports,
                 subagent_report_bus: bus,
@@ -1395,7 +1386,6 @@ mod tests {
     ) -> Config {
         Config {
             runtime_commands: command_tx,
-            subagent_handoffs: Arc::new(AtomicUsize::new(1)),
             active_subagent_workers: ActiveSubagentWorkers::default(),
             subagent_reports: reports,
             subagent_report_bus: bus,
