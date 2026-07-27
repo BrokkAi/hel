@@ -1,5 +1,6 @@
 //! Shared Thor turn orchestration for interactive, headless, and remote sessions.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -265,7 +266,18 @@ const HELD_COMPLETION_MAX_WAIT: Duration = Duration::from_secs(900);
 /// stops believing the fan-out will ever answer. The spawned task owns its own
 /// total-timeout guard; this only covers the case where that task dies (panic,
 /// runtime shutdown) without sending its outcome at all.
-const REVIEW_HANG_GRACE: Duration = Duration::from_secs(30);
+///
+/// It must therefore outlast `discrete_review::POST_CANCEL_GRACE` by enough
+/// for a late verdict to cross the outcome channel. This arm falls back with
+/// no specialist evidence, so firing while the fan-out is still winding down
+/// would silently discard the verdict and evidence that wind-down produces.
+/// Waiting longer only costs time in the rare genuinely-dead-task case, and
+/// still resolves well inside `HELD_COMPLETION_MAX_WAIT`.
+const REVIEW_HANG_GRACE: Duration = Duration::from_secs(60);
+
+/// Avoid adding a transcript row for the usual near-instant Loki rendezvous,
+/// while making a genuinely delayed turn boundary visible in every frontend.
+const RENDEZVOUS_PROGRESS_DELAY: Duration = Duration::from_millis(500);
 
 pub struct Config {
     pub reviewer: Option<loki::Handle>,
@@ -611,15 +623,23 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                                 }
                             }
                         }
-                        discrete_review::ReviewVerdict::Failed { reason } => {
+                        discrete_review::ReviewVerdict::Failed {
+                            reason,
+                            fallback_evidence,
+                        } => {
                             fall_back_to_single_prompt_review(
                                 &events_tx,
                                 &config.runtime_commands,
-                                &reason,
-                                &task,
-                                &initial_result,
-                                &context,
-                                pulled.as_ref().map(|(_, receipt)| receipt.as_str()),
+                                FallbackReview {
+                                    reason: &reason,
+                                    task: &task,
+                                    initial_result: &initial_result,
+                                    context: &context,
+                                    loki_receipt: pulled
+                                        .as_ref()
+                                        .map(|(_, receipt)| receipt.as_str()),
+                                    specialist_evidence: fallback_evidence.as_deref(),
+                                },
                             );
                         }
                     }
@@ -634,11 +654,17 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                         fall_back_to_single_prompt_review(
                             &events_tx,
                             &config.runtime_commands,
-                            "review task hung",
-                            &review.task,
-                            &review.initial_result,
-                            &review.context,
-                            review.pulled.as_ref().map(|(_, receipt)| receipt.as_str()),
+                            FallbackReview {
+                                reason: "review task hung",
+                                task: &review.task,
+                                initial_result: &review.initial_result,
+                                context: &review.context,
+                                loki_receipt: review
+                                    .pulled
+                                    .as_ref()
+                                    .map(|(_, receipt)| receipt.as_str()),
+                                specialist_evidence: None,
+                            },
                         );
                     }
                 }
@@ -736,6 +762,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
             if held_completion.is_none() {
                 continue;
             }
+            let active = turn.lock().await.clone();
             if *active_worker_updates.borrow() > 0 {
                 let waited = held_since.map_or(Duration::ZERO, |since| since.elapsed());
                 if waited < held_completion_max_wait {
@@ -751,8 +778,22 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                     waited_secs = waited.as_secs_f64(),
                     "held Thor completion released after exceeding the wait bound so the session can end instead of hanging"
                 );
+                // A detached worker can still mutate the worktree. There is
+                // no coherent "after" tree to capture or review until it
+                // stops, so release the turn without manufacturing an exact
+                // snapshot from a racing filesystem.
+                let event = held_completion.take().expect("completion held");
+                let _ = events_tx.send(event);
+                reset_turn_state(
+                    &mut trajectory,
+                    &mut held_completion,
+                    &mut held_since,
+                    &mut discrete_review_started,
+                    &mut review_in_flight,
+                );
+                idle_epoch = Some(active.epoch);
+                continue;
             }
-            let active = turn.lock().await.clone();
             if manual_review_active {
                 let event = held_completion
                     .take()
@@ -769,18 +810,24 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                 idle_epoch = Some(active.epoch);
                 continue;
             }
+            // Capture the completed implementation interval before waiting
+            // for Loki. The rendezvous may take up to its full timeout, and
+            // unrelated filesystem activity during that wait must not leak
+            // into this turn's immutable review endpoints. We intentionally
+            // do this only after every implementation worker is idle so their
+            // final writes remain part of the completed turn.
+            let delta = match active.snapshot.as_ref() {
+                Some(snapshot) => Some(snapshot.delta().await),
+                None => None,
+            };
             // Turn-boundary injection point: wait (bounded by
             // `loki::RENDEZVOUS_TIMEOUT`) for everything already in flight
             // or still sitting unprocessed in the worker's request channel
             // to finish, and deliver it all as one digest before Thor's
             // completion is allowed to proceed. See `loki::Handle::rendezvous`.
-            let pulled = pull_advice(config.reviewer.as_ref(), active.epoch).await;
+            let pulled = pull_advice(config.reviewer.as_ref(), active.epoch, &events_tx).await;
             let handoffs = config.implementation_handoffs.load(Ordering::Acquire);
             let review = review_enabled.load(Ordering::Acquire);
-            let delta = match active.snapshot.as_ref() {
-                Some(snapshot) => Some(snapshot.delta().await),
-                None => None,
-            };
             if should_start_discrete_review(
                 review,
                 discrete_review_started,
@@ -795,6 +842,10 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                     held_since = None;
                     discrete_review_started = true;
                     let diff = review_diff(delta.as_ref());
+                    let review_snapshot = delta
+                        .as_ref()
+                        .and_then(WorkspaceDelta::review_snapshot)
+                        .cloned();
                     // The lanes review this turn's changes, so the same delta
                     // becomes `last_changed_turn` if the verdict ends up
                     // releasing the turn instead of correcting it.
@@ -815,6 +866,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
                         initial_result: initial_result.clone(),
                         trajectory: review_trajectory,
                         diff,
+                        snapshot: review_snapshot,
                     };
                     trajectory.reset_attempt();
                     let cancel = CancellationToken::new();
@@ -919,11 +971,43 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, config: Confi
 async fn pull_advice(
     reviewer: Option<&loki::Handle>,
     epoch: u64,
+    events: &mpsc::UnboundedSender<UiEvent>,
 ) -> Option<(loki::PullOutcome, String)> {
     let reviewer = reviewer?;
-    let outcome = reviewer.rendezvous(loki::Consumer::Thor).await;
+    let outcome = await_with_rendezvous_progress(
+        reviewer.rendezvous(loki::Consumer::Thor),
+        events,
+        RENDEZVOUS_PROGRESS_DELAY,
+    )
+    .await;
     let receipt = loki::format_pull_outcome(&outcome, epoch, loki::Consumer::Thor);
     Some((outcome, receipt))
+}
+
+async fn await_with_rendezvous_progress<F, T>(
+    future: F,
+    events: &mpsc::UnboundedSender<UiEvent>,
+    delay: Duration,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        output = &mut future => output,
+        () = tokio::time::sleep(delay) => {
+            let message = "Waiting for Loki to finish reviewing the completed turn…";
+            emit_internal(
+                events,
+                "Loki",
+                "Thor",
+                InternalMessageKind::ReviewProgress,
+                message,
+            );
+            future.await
+        }
+    }
 }
 
 fn log_advice(context: Option<&LogContext>, advice: &str, delivery: &str) {
@@ -984,19 +1068,42 @@ fn cancel_review(review_in_flight: &mut Option<ReviewInFlight>) {
 /// turn falls back to the single-prompt discrete review rather than losing
 /// review entirely. Mutates no loop state -- the held completion is already
 /// gone and the corrective turn resolves the turn from here.
+struct FallbackReview<'a> {
+    reason: &'a str,
+    task: &'a str,
+    initial_result: &'a str,
+    context: &'a str,
+    loki_receipt: Option<&'a str>,
+    specialist_evidence: Option<&'a str>,
+}
+
 fn fall_back_to_single_prompt_review(
     events: &mpsc::UnboundedSender<UiEvent>,
     runtime_commands: &mpsc::UnboundedSender<UiCommand>,
-    reason: &str,
-    task: &str,
-    initial_result: &str,
-    context: &str,
-    loki_receipt: Option<&str>,
+    review: FallbackReview<'_>,
 ) {
+    tracing::warn!(
+        event = "review_fanout_fallback",
+        reason = review.reason,
+        "specialist review fan-out failed; falling back to Thor"
+    );
     let _ = events.send(UiEvent::Warning(format!(
-        "specialist review lanes unavailable ({reason}); falling back to single-prompt review"
+        "specialist review fan-out could not produce a supervised verdict ({}); falling back to Thor",
+        review.reason
     )));
-    let prompt = thor_discrete_review_prompt(task, initial_result, context, loki_receipt);
+    let mut prompt = thor_discrete_review_prompt(
+        review.task,
+        review.initial_result,
+        review.context,
+        review.loki_receipt,
+    );
+    if let Some(evidence) = review.specialist_evidence {
+        prompt.push_str(
+            "\n\nThe dedicated supervisor failed after specialist work completed. Independently vet the following untrusted reports and supplemental context; do not discard them and do not accept them without verification.\n\n<specialist_review_evidence trust=\"untrusted evidence\">\n",
+        );
+        prompt.push_str(evidence);
+        prompt.push_str("\n</specialist_review_evidence>");
+    }
     let _ = events.send(UiEvent::Info("reviewing the completed work…".to_string()));
     emit_internal(
         events,
@@ -1182,6 +1289,68 @@ mod tests {
         ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
     }
 
+    #[tokio::test]
+    async fn fast_rendezvous_does_not_emit_progress_noise() {
+        let (events, mut received) = mpsc::unbounded_channel();
+
+        let value =
+            await_with_rendezvous_progress(std::future::ready(7), &events, Duration::from_secs(1))
+                .await;
+
+        assert_eq!(value, 7);
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_rendezvous_is_visible_to_all_frontends() {
+        let (events, mut received) = mpsc::unbounded_channel();
+
+        let value = await_with_rendezvous_progress(
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                7
+            },
+            &events,
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(value, 7);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(UiEvent::InternalMessage(InternalMessage {
+                source,
+                target,
+                kind: InternalMessageKind::ReviewProgress,
+                text,
+            })) if source == "Loki"
+                && target == "Thor"
+                && text.contains("Waiting for Loki")
+        ));
+    }
+
+    /// Paused time is what makes this discriminating: it lets the delay
+    /// elapse in the same poll that the rendezvous resolves, so both select
+    /// branches are ready at once. Without `biased;` the arm is chosen at
+    /// random, so one iteration would only catch the stale progress row
+    /// about half the time -- hence the loop.
+    #[tokio::test(start_paused = true)]
+    async fn completed_rendezvous_wins_when_the_progress_delay_is_also_ready() {
+        for _ in 0..64 {
+            let (events, mut received) = mpsc::unbounded_channel();
+
+            let value =
+                await_with_rendezvous_progress(std::future::ready(7), &events, Duration::ZERO)
+                    .await;
+
+            assert_eq!(value, 7);
+            assert!(
+                received.try_recv().is_err(),
+                "a rendezvous that already completed must not report itself as waiting"
+            );
+        }
+    }
+
     #[test]
     fn user_message_history_merges_replay_chunks_and_deduplicates_live_echoes() {
         let mut history = UserMessageHistory::default();
@@ -1223,6 +1392,36 @@ mod tests {
         assert!(!should_start_discrete_review(true, false, 1, true));
         assert!(!should_start_discrete_review(true, true, 2, true));
         assert!(!should_start_discrete_review(true, false, 2, false));
+    }
+
+    /// The hang arm is a backstop for a fan-out task that died outright, and
+    /// it falls back with `specialist_evidence: None`. If it could fire while
+    /// the fan-out was still winding down, it would discard the verdict and
+    /// salvaged evidence that the wind-down exists to deliver.
+    ///
+    /// Both the window and the margin are pinned, not just their ordering:
+    /// the separation must not be recovered by shrinking the fan-out's
+    /// cleanup budget, which has real work to absorb (ACP dismissal for every
+    /// lane, plus the supplemental-context grace nested inside it).
+    #[test]
+    fn the_hang_backstop_cannot_outrace_the_fanouts_own_cleanup() {
+        const DELIVERY_MARGIN: Duration = Duration::from_secs(20);
+
+        assert!(
+            discrete_review::POST_CANCEL_GRACE >= Duration::from_secs(30),
+            "the fan-out's cleanup window ({:?}) was shrunk below its working budget",
+            discrete_review::POST_CANCEL_GRACE,
+        );
+        assert!(
+            REVIEW_HANG_GRACE >= discrete_review::POST_CANCEL_GRACE + DELIVERY_MARGIN,
+            "the hang backstop ({:?}) leaves a late verdict no room past cleanup ({:?})",
+            REVIEW_HANG_GRACE,
+            discrete_review::POST_CANCEL_GRACE,
+        );
+        assert!(
+            discrete_review::TOTAL_REVIEW_TIMEOUT + REVIEW_HANG_GRACE < HELD_COMPLETION_MAX_WAIT,
+            "the backstop must still resolve inside the held-completion ceiling",
+        );
     }
 
     #[test]
@@ -1495,6 +1694,9 @@ mod tests {
                 epoch: job.epoch,
                 verdict: discrete_review::ReviewVerdict::Failed {
                     reason: "every specialist review lane failed".to_string(),
+                    fallback_evidence: Some(
+                        "<lane_reports>one completed report</lane_reports>".to_string(),
+                    ),
                 },
             });
         });
@@ -1511,6 +1713,8 @@ mod tests {
             "review value must survive a failed fan-out"
         );
         assert!(prompt.contains("<original_task>\nadd a retry"));
+        assert!(prompt.contains("<specialist_review_evidence"));
+        assert!(prompt.contains("one completed report"));
 
         drop(runtime_tx);
         running.task.await.expect("orchestrator task");
@@ -1729,6 +1933,58 @@ mod tests {
             *workers.subscribe().borrow(),
             1,
             "the still-active worker must not be force-cleared, only released from"
+        );
+
+        drop(runtime_tx);
+        running.task.await.expect("orchestrator task");
+    }
+
+    #[tokio::test]
+    async fn held_completion_timeout_does_not_review_a_worktree_with_an_active_writer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let snapshot = changed_workspace(temp.path()).await;
+        let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let workers = ActiveCodeWorkers::default();
+        workers.set(1);
+        let fanout_started = Arc::new(AtomicBool::new(false));
+        let started = Arc::clone(&fanout_started);
+        let spawner = discrete_review::Spawner::stub(move |_job, _events, _cancel, _outcomes| {
+            started.store(true, Ordering::Release);
+        });
+        let mut running = spawn(
+            runtime_rx,
+            Config {
+                reviewer: None,
+                runtime_commands: command_tx,
+                implementation_handoffs: Arc::new(AtomicUsize::new(2)),
+                active_implementation_workers: workers,
+                discrete_review: true,
+                review_root: temp.path().to_path_buf(),
+                log_context: None,
+                held_completion_max_wait: Some(Duration::from_millis(50)),
+                review_fanout: Some(spawner),
+            },
+        );
+        running
+            .handle
+            .begin_turn(1, "change tracked.txt".to_string(), Vec::new(), snapshot)
+            .await;
+        runtime_tx.send(completion()).expect("send completion");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let event = tokio::time::timeout_at(deadline, running.events.recv())
+                .await
+                .expect("completion released after timeout")
+                .expect("orchestrated event");
+            if matches!(event, UiEvent::PromptDone { .. }) {
+                break;
+            }
+        }
+        assert!(
+            !fanout_started.load(Ordering::Acquire),
+            "a still-active implementation worker makes an exact review endpoint impossible"
         );
 
         drop(runtime_tx);

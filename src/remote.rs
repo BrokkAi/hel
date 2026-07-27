@@ -1062,7 +1062,7 @@ impl TrackerState {
             }
             UiEvent::InternalMessage(message) => {
                 self.push_actor_transcript_entry(
-                    "system",
+                    message.kind.wire_name(),
                     &message.source.to_ascii_lowercase(),
                     message.text.clone(),
                 );
@@ -2521,6 +2521,7 @@ fn start_server_agent_session(
             let runtime_cmd_tx = runtime_cmd_tx.clone();
             let loki = loki_handle.clone();
             let handoffs = implementation_handoffs.clone();
+            let active_workers = active_implementation_workers.clone();
             let thor_orchestrator = thor_orchestrator.clone();
             let workspace_roots = workspace_roots.clone();
             tokio::spawn(async move {
@@ -2540,9 +2541,15 @@ fn start_server_agent_session(
                     if let UiCommand::SendPrompt { text, images } = &command {
                         local_epoch = local_epoch.saturating_add(1);
                         handoffs.store(0, std::sync::atomic::Ordering::Release);
-                        let snapshot =
+                        let snapshot = if active_workers.count() == 0 {
                             crate::workspace_snapshot::WorkspaceSnapshot::capture(&workspace_roots)
-                                .await;
+                                .await
+                        } else {
+                            warn!(
+                                "exact turn snapshot unavailable: a prior implementation worker is still active; discrete review will be skipped for this remote turn"
+                            );
+                            crate::workspace_snapshot::WorkspaceSnapshot::capture(&[]).await
+                        };
                         let epoch = loki
                             .as_ref()
                             .map_or(local_epoch, |reviewer| reviewer.begin_turn(text.clone()));
@@ -6098,12 +6105,160 @@ mod tests {
         let snapshot = state.snapshot().expect("snapshot");
         assert!(snapshot.prompt_in_flight);
         assert_eq!(snapshot.transcript.len(), 2);
-        assert_eq!(snapshot.transcript[1].kind, "system");
+        assert_eq!(snapshot.transcript[1].kind, "review_progress");
         assert_eq!(snapshot.transcript[1].actor.as_deref(), Some("thor"));
         assert_eq!(
             snapshot.transcript[1].text,
             "Adversarial synthesis started."
         );
+    }
+
+    #[test]
+    fn tracker_preserves_internal_message_subtypes() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        for (kind, expected) in [
+            (crate::event::InternalMessageKind::Delegation, "delegation"),
+            (
+                crate::event::InternalMessageKind::Exploration,
+                "exploration",
+            ),
+            (
+                crate::event::InternalMessageKind::DiscreteReview,
+                "discrete_review",
+            ),
+            (
+                crate::event::InternalMessageKind::Continuation,
+                "continuation",
+            ),
+            (
+                crate::event::InternalMessageKind::Interjection,
+                "interjection",
+            ),
+            (crate::event::InternalMessageKind::ReviewLane, "review_lane"),
+            (
+                crate::event::InternalMessageKind::ReviewProgress,
+                "review_progress",
+            ),
+            (
+                crate::event::InternalMessageKind::ReviewSynthesis,
+                "review_synthesis",
+            ),
+        ] {
+            state.observe_event(&UiEvent::InternalMessage(crate::event::InternalMessage {
+                source: "reviewer".to_string(),
+                target: "Thor".to_string(),
+                kind,
+                text: expected.to_string(),
+            }));
+        }
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot
+                .transcript
+                .iter()
+                .map(|entry| entry.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "delegation",
+                "exploration",
+                "discrete_review",
+                "continuation",
+                "interjection",
+                "review_lane",
+                "review_progress",
+                "review_synthesis",
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_viewer_labels_every_internal_wire_kind() {
+        let viewer = include_str!("remote_viewer.html");
+        let entry_label = remote_viewer_function(viewer, "entryLabel");
+        for (wire_kind, label, actor_qualified) in [
+            ("delegation", "Delegation", true),
+            ("exploration", "Exploration", true),
+            ("discrete_review", "Discrete review", true),
+            ("continuation", "Continuation", true),
+            ("interjection", "Interjection", true),
+            ("review_lane", "Review lane", true),
+            ("review_progress", "Review progress", false),
+            ("review_synthesis", "Review synthesis", false),
+        ] {
+            let marker = format!(r#"case "{wire_kind}":"#);
+            let start = entry_label
+                .find(&marker)
+                .unwrap_or_else(|| panic!("entryLabel is missing a {wire_kind} case"));
+            let block = &entry_label[start..];
+            let end = block
+                .find("\n          case ")
+                .or_else(|| block.find("\n        }"))
+                .unwrap_or(block.len());
+            let block = &block[..end];
+            let fallback = format!(r#": "{label}""#);
+            let direct = format!(r#"return "{label}""#);
+            assert!(
+                block.contains(&fallback) || block.contains(&direct),
+                "entryLabel's {wire_kind} case is missing the no-actor {label} label"
+            );
+            let qualified = format!(r#"`{label} · ${{actorLabel}}`"#);
+            assert_eq!(
+                block.contains(&qualified),
+                actor_qualified,
+                "entryLabel's actor-qualified behavior changed for {wire_kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_viewer_uses_entry_label_in_dom_and_markdown_export_paths() {
+        let viewer = include_str!("remote_viewer.html");
+        let create_entry_refs = remote_viewer_function(viewer, "createEntryRefs");
+        assert!(
+            create_entry_refs.contains(
+                r#"el.querySelector(".entry-kind").textContent = entryLabel(kind, entry.actor);"#
+            ),
+            "DOM transcript labels must be rendered through entryLabel"
+        );
+
+        let markdown_for_entry = remote_viewer_function(viewer, "markdownForEntry");
+        assert!(
+            markdown_for_entry.contains("entryLabel(kind, entry.actor)"),
+            "actor-qualified markdown labels must be rendered through entryLabel"
+        );
+        assert!(
+            markdown_for_entry.contains(r#"entryLabel(kind, "")"#),
+            "actorless markdown labels must be rendered through entryLabel"
+        );
+        for review_kind in ["review_lane", "review_progress", "review_synthesis"] {
+            assert!(
+                !markdown_for_entry.contains(review_kind),
+                "markdownForEntry must keep {review_kind} on the generic entryLabel path"
+            );
+        }
+
+        let download = remote_viewer_function(viewer, "downloadTranscriptMarkdown");
+        assert!(
+            download.contains("...transcript.map(markdownForEntry).filter(Boolean),"),
+            "markdown export must render every transcript entry through markdownForEntry"
+        );
+    }
+
+    fn remote_viewer_function<'a>(viewer: &'a str, name: &str) -> &'a str {
+        let marker = format!("      function {name}(");
+        let start = viewer
+            .find(&marker)
+            .unwrap_or_else(|| panic!("remote viewer is missing function {name}"));
+        let rest = &viewer[start..];
+        let end = rest[marker.len()..]
+            .find("\n      function ")
+            .map_or(rest.len(), |offset| marker.len() + offset);
+        &rest[..end]
     }
 
     #[test]

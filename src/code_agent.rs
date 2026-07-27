@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
     HttpHeader, McpServer, McpServerHttp, SessionUpdate, StopReason, ToolCallContent,
-    ToolCallStatus, UsageUpdate,
+    ToolCallStatus, Usage, UsageUpdate,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::{Request, State};
@@ -45,6 +45,7 @@ use crate::event::{
     content_block_text,
 };
 use crate::loki;
+use crate::ragnarok::PromptToolLifecycle;
 use crate::workspace_snapshot::{WorkspaceDelta, WorkspaceSnapshot};
 
 pub const LABEL: &str = "Eitri";
@@ -355,6 +356,10 @@ impl Default for ActiveCodeWorkers {
 impl ActiveCodeWorkers {
     pub fn subscribe(&self) -> watch::Receiver<usize> {
         self.updates.subscribe()
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        *self.updates.borrow()
     }
 
     pub(crate) fn set(&self, count: usize) {
@@ -1648,7 +1653,7 @@ enum WorkerRequest {
 enum SliceOutcome {
     /// Eitri finished the whole delegation; the worker has already been torn
     /// down and the controller's Code slot released.
-    Complete(EitriRunResult),
+    Complete(Box<EitriRunResult>),
     /// The check-in deadline elapsed before Eitri finished. Its turn was
     /// never interrupted: the nested ACP process and session are still
     /// alive, actively working, and continue to hold the single Code slot.
@@ -2121,11 +2126,30 @@ fn deliver_result(
         let _ = cancel_respond.send(result);
         None
     } else if let Some(respond) = pending_respond {
-        let _ = respond.send(SliceOutcome::Complete(result));
+        let _ = respond.send(SliceOutcome::Complete(Box::new(result)));
         None
     } else {
         Some(result)
     }
+}
+
+fn emit_eitri_prompt_usage(
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    purpose: EitriPurpose,
+    usage: Option<Usage>,
+    latest_usage_update: &mut Option<UsageUpdate>,
+    session_id: Option<&str>,
+) {
+    let _ = ui_tx.send(UiEvent::CouncilUsage(Record {
+        role: Role::Eitri,
+        purpose: Some(match purpose {
+            EitriPurpose::Code => Purpose::Code,
+            EitriPurpose::Explore => Purpose::Explore,
+        }),
+        usage,
+        update: latest_usage_update.take(),
+        session_id: session_id.map(str::to_string),
+    }));
 }
 
 /// Runs one Eitri invocation end to end. For `EitriPurpose::Explore` this is
@@ -2292,6 +2316,8 @@ async fn run(
     let mut cancelled_while_running = false;
     let mut result: Result<String> = 'session: loop {
         let mut collector = AgentMessageCollector::new();
+        let mut tool_lifecycle = PromptToolLifecycle::default();
+        let mut deferred_prompt_done: Option<(StopReason, Option<Usage>)> = None;
         // Distinguishes our own `code_agent_cancel`-triggered CancelPrompt
         // settling from an external cancellation (e.g. `Controller::cancel`)
         // reaching the same `StopReason::Cancelled` event.
@@ -2396,6 +2422,9 @@ async fn run(
                     let Some(event) = event else {
                         break 'turn Err(anyhow!("Eitri event stream closed before completing"));
                     };
+                    if let UiEvent::SessionUpdate(update) = &event {
+                        tool_lifecycle.observe(update);
+                    }
                     let boundary = tracker.observe(&event);
                     activity.observe(&event, boundary.as_ref());
                     if epoch > 0
@@ -2483,17 +2512,14 @@ async fn run(
                             let _ = ui_tx.send(UiEvent::CodeAgent(event));
                         }
                         UiEvent::PromptDone { stop_reason, usage } => {
-                            let _ = ui_tx.send(UiEvent::CouncilUsage(Record {
-                                role: Role::Eitri,
-                                purpose: Some(match purpose {
-                                    EitriPurpose::Code => Purpose::Code,
-                                    EitriPurpose::Explore => Purpose::Explore,
-                                }),
-                                usage,
-                                update: latest_usage_update.take(),
-                                session_id: session_id.clone(),
-                            }));
                             if matches!(stop_reason, StopReason::Cancelled) {
+                                emit_eitri_prompt_usage(
+                                    &ui_tx,
+                                    purpose,
+                                    usage,
+                                    &mut latest_usage_update,
+                                    session_id.as_deref(),
+                                );
                                 if awaiting_cancel_settle
                                     && termination.cause() == TerminationCause::None
                                 {
@@ -2508,7 +2534,22 @@ async fn run(
                                 }
                                 break 'turn Err(anyhow!("Eitri cancelled"));
                             }
-                            break 'turn collector.finish();
+                            if tool_lifecycle.has_active_tools() {
+                                deferred_prompt_done.get_or_insert((stop_reason, usage));
+                            } else {
+                                let (stop_reason, usage) = deferred_prompt_done
+                                    .take()
+                                    .unwrap_or((stop_reason, usage));
+                                emit_eitri_prompt_usage(
+                                    &ui_tx,
+                                    purpose,
+                                    usage,
+                                    &mut latest_usage_update,
+                                    session_id.as_deref(),
+                                );
+                                debug_assert!(!matches!(stop_reason, StopReason::Cancelled));
+                                break 'turn collector.finish();
+                            }
                         }
                         UiEvent::PromptFailed { message }
                         | UiEvent::SessionForkFailed { message }
@@ -2525,6 +2566,19 @@ async fn run(
                         UiEvent::CodeAgent(_) => {
                             break 'turn Err(anyhow!("Eitri attempted recursive delegation"));
                         }
+                    }
+                    if !tool_lifecycle.has_active_tools()
+                        && let Some((stop_reason, usage)) = deferred_prompt_done.take()
+                    {
+                        emit_eitri_prompt_usage(
+                            &ui_tx,
+                            purpose,
+                            usage,
+                            &mut latest_usage_update,
+                            session_id.as_deref(),
+                        );
+                        debug_assert!(!matches!(stop_reason, StopReason::Cancelled));
+                        break 'turn collector.finish();
                     }
                 }
             }
@@ -2568,12 +2622,12 @@ async fn run(
                 "Eitri implementation run completed and its session was retained"
             );
             if let Some(respond) = pending_respond.take() {
-                let _ = respond.send(SliceOutcome::Complete(EitriRunResult {
+                let _ = respond.send(SliceOutcome::Complete(Box::new(EitriRunResult {
                     outcome: Ok(message.clone()),
                     workspace_delta: Some(delta.clone()),
                     activity_log: activity_log.clone(),
                     cancelled_while_running: false,
-                }));
+                })));
             }
             if !finish_event_sent {
                 let _ = ui_tx.send(UiEvent::CodeAgent(CodeAgentEvent::Finished {
@@ -2607,23 +2661,23 @@ async fn run(
                                 run_id,
                                 "ignoring an Attach against a retained-complete Eitri run"
                             );
-                            let _ = respond.send(SliceOutcome::Complete(EitriRunResult {
+                            let _ = respond.send(SliceOutcome::Complete(Box::new(EitriRunResult {
                                 outcome: Err(anyhow!(
                                     "Eitri run {run_id} is retained-complete, not running; call code_agent_continue with guidance, or code_agent_cancel to release it"
                                 )),
                                 workspace_delta: Some(delta.clone()),
                                 activity_log: activity_log.clone(),
                                 cancelled_while_running: false,
-                            }));
+                            })));
                         }
                         Some(WorkerRequest::Continue { prompt, respond }) => {
                             if !controller.resume_retained_code(run_id).await {
-                                let _ = respond.send(SliceOutcome::Complete(EitriRunResult {
+                                let _ = respond.send(SliceOutcome::Complete(Box::new(EitriRunResult {
                                     outcome: Err(anyhow!(outstanding_code_run_message(run_id))),
                                     workspace_delta: Some(delta),
                                     activity_log,
                                     cancelled_while_running: false,
-                                }));
+                                })));
                                 break 'session Err(anyhow!(
                                     "Eitri retained session could not resume because another implementation run is active"
                                 ));
@@ -2999,7 +3053,9 @@ fn with_workspace_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
+    use agent_client_protocol::schema::v1::{
+        ContentBlock, ContentChunk, TextContent, ToolCall, ToolCallUpdate, ToolCallUpdateFields,
+    };
 
     fn init_repo(root: &Path) {
         for args in [
@@ -3460,9 +3516,9 @@ mod tests {
             });
             match control_rx.recv().await {
                 Some(WorkerRequest::Attach { respond }) => {
-                    let _ = respond.send(SliceOutcome::Complete(test_result(
+                    let _ = respond.send(SliceOutcome::Complete(Box::new(test_result(
                         "finished after attaching",
-                    )));
+                    ))));
                 }
                 _ => panic!("expected an attach request"),
             }
@@ -3525,7 +3581,7 @@ mod tests {
             }
             match control_rx.recv().await {
                 Some(WorkerRequest::Attach { respond }) => {
-                    let _ = respond.send(SliceOutcome::Complete(test_result("finished")));
+                    let _ = respond.send(SliceOutcome::Complete(Box::new(test_result("finished"))));
                 }
                 _ => panic!("expected the second attach request"),
             }
@@ -3793,7 +3849,9 @@ mod tests {
             Some(WorkerRequest::Continue { prompt, respond }) => {
                 assert!(prompt.contains("Guidance from review"));
                 assert!(prompt.contains("cover the edge case"));
-                let _ = respond.send(SliceOutcome::Complete(test_result("second final")));
+                let _ = respond.send(SliceOutcome::Complete(Box::new(test_result(
+                    "second final",
+                ))));
             }
             _ => panic!("expected retained continue"),
         }
@@ -4521,6 +4579,26 @@ mod tests {
         ))
     }
 
+    fn active_tool_call(id: &'static str, title: &'static str) -> UiEvent {
+        UiEvent::SessionUpdate(SessionUpdate::ToolCall(
+            ToolCall::new(id, title).status(ToolCallStatus::InProgress),
+        ))
+    }
+
+    fn tool_terminal_update(id: &'static str, status: ToolCallStatus) -> UiEvent {
+        let mut fields = ToolCallUpdateFields::default();
+        fields.status = Some(status);
+        UiEvent::SessionUpdate(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            id, fields,
+        )))
+    }
+
+    fn agent_message(text: &'static str) -> UiEvent {
+        UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(text)),
+        )))
+    }
+
     /// Test list item (a): the check-in deadline snapshots the transcript
     /// and delivers RUNNING without ever sending `CancelPrompt` to the
     /// nested runtime — the in-flight turn is never interrupted.
@@ -4567,6 +4645,67 @@ mod tests {
             run.controller.active_code_run_id().await,
             Some(run.run_id),
             "the run keeps the single Code slot while still active"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_completion_waits_for_all_tools_after_premature_prompt_done() {
+        let mut run = spawn_fake_code_run().await;
+
+        run.nested_events
+            .send(UiEvent::SessionStarted {
+                session_id: "s1".to_string(),
+                resumed: false,
+            })
+            .expect("send session started");
+        assert!(matches!(
+            run.nested_commands.recv().await,
+            Some(UiCommand::SendPrompt { .. })
+        ));
+
+        run.nested_events
+            .send(active_tool_call("first", "first build"))
+            .expect("first tool");
+        run.nested_events
+            .send(active_tool_call("second", "second build"))
+            .expect("second tool");
+        run.nested_events
+            .send(agent_message("implementation finished"))
+            .expect("final agent message");
+        run.nested_events
+            .send(UiEvent::PromptDone {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            })
+            .expect("premature prompt done");
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            run.respond_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        run.nested_events
+            .send(tool_terminal_update("first", ToolCallStatus::Completed))
+            .expect("first terminal update");
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(
+                run.respond_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "one completed tool must not let another active id escape"
+        );
+
+        run.nested_events
+            .send(tool_terminal_update("second", ToolCallStatus::Failed))
+            .expect("second terminal update");
+        let SliceOutcome::Complete(result) = run.respond_rx.await.expect("completed code response")
+        else {
+            panic!("expected a final response after every tool became terminal");
+        };
+        assert_eq!(
+            result.outcome.expect("successful Eitri outcome"),
+            "implementation finished"
         );
     }
 

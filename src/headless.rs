@@ -335,7 +335,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         let event = tokio::select! {
             _ = cfg.termination.cancelled() => {
                 terminated = true;
-                let _ = cmd_tx.send(UiCommand::Shutdown);
                 break;
             }
             event = event_rx.recv() => event,
@@ -388,7 +387,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                         state.final_text = thor_orchestrator.compact_manual().await;
                         stop_reason = Some(StopReason::EndTurn);
                         saw_terminal_event = true;
-                        let _ = cmd_tx.send(UiCommand::Shutdown);
                         break;
                     }
                     prompt_sent = true;
@@ -455,7 +453,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 stop_reason = Some(reason);
                 usage = prompt_usage;
                 saw_terminal_event = true;
-                let _ = cmd_tx.send(UiCommand::Shutdown);
                 break;
             }
             UiEvent::PromptFailed { message } => {
@@ -464,7 +461,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 }
                 terminal_error = Some(message);
                 saw_terminal_event = true;
-                let _ = cmd_tx.send(UiCommand::Shutdown);
                 break;
             }
             UiEvent::SessionForkFailed { message } | UiEvent::Fatal(message) => {
@@ -473,7 +469,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 }
                 terminal_error = Some(message);
                 saw_terminal_event = true;
-                let _ = cmd_tx.send(UiCommand::Shutdown);
                 break;
             }
             UiEvent::Warning(message) => {
@@ -578,20 +573,10 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             }
             UiEvent::InternalMessage(message) => {
                 if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                    let kind = match message.kind {
-                        crate::event::InternalMessageKind::Delegation => "delegation",
-                        crate::event::InternalMessageKind::Exploration => "exploration",
-                        crate::event::InternalMessageKind::DiscreteReview => "discrete_review",
-                        crate::event::InternalMessageKind::Continuation => "continuation",
-                        crate::event::InternalMessageKind::Interjection => "interjection",
-                        crate::event::InternalMessageKind::ReviewLane => "review_lane",
-                        crate::event::InternalMessageKind::ReviewProgress => "review_progress",
-                        crate::event::InternalMessageKind::ReviewSynthesis => "review_synthesis",
-                    };
                     emit_json(&StreamRecord::Review {
                         actor: &message.source.to_ascii_lowercase(),
                         target: &message.target.to_ascii_lowercase(),
-                        kind,
+                        kind: message.kind.wire_name(),
                         text: &message.text,
                     })?;
                 }
@@ -605,9 +590,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         }
     }
 
-    if !saw_terminal_event {
-        let _ = cmd_tx.send(UiCommand::Shutdown);
-    }
+    finish_runtime_shutdown(&cmd_tx, &cfg.termination, saw_terminal_event);
     let abort_handle = runtime.abort_handle();
     match tokio::time::timeout(std::time::Duration::from_secs(2), runtime).await {
         Ok(joined) => {
@@ -672,6 +655,23 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("prompt stopped with {}", stop_reason_label))
+    }
+}
+
+/// Queue the protocol-level shutdown in every exit path. Once headless has
+/// received a terminal event it also marks process teardown as expected, so a
+/// clean adapter exit racing the queued command cannot be misreported by the
+/// ACP child-wait guard as a crash. If the event channel merely closed, leave
+/// termination untouched: the runtime result still needs to surface a real
+/// unexpected agent exit.
+fn finish_runtime_shutdown(
+    commands: &mpsc::UnboundedSender<UiCommand>,
+    termination: &CancellationToken,
+    saw_terminal_event: bool,
+) {
+    let _ = commands.send(UiCommand::Shutdown);
+    if saw_terminal_event {
+        termination.cancel();
     }
 }
 
@@ -812,3 +812,30 @@ fn emit_json<T: Serialize>(value: &T) -> Result<()> {
 
 // Stop-reason / tool-kind / tool-status labels live in `crate::labels` so the
 // MCP server and this runner cannot drift apart on `#[non_exhaustive]` enums.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_headless_shutdown_marks_adapter_exit_as_expected() {
+        let (commands, mut receiver) = mpsc::unbounded_channel();
+        let termination = CancellationToken::new();
+
+        finish_runtime_shutdown(&commands, &termination, true);
+
+        assert!(termination.is_cancelled());
+        assert!(matches!(receiver.try_recv(), Ok(UiCommand::Shutdown)));
+    }
+
+    #[test]
+    fn closed_event_channel_does_not_mask_unexpected_adapter_exit() {
+        let (commands, mut receiver) = mpsc::unbounded_channel();
+        let termination = CancellationToken::new();
+
+        finish_runtime_shutdown(&commands, &termination, false);
+
+        assert!(!termination.is_cancelled());
+        assert!(matches!(receiver.try_recv(), Ok(UiCommand::Shutdown)));
+    }
+}

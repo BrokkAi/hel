@@ -873,13 +873,22 @@ pub async fn run(
                 Ok(())
             }
             wait_result = child.wait() => {
-                let detail = match wait_result {
-                    Ok(status) => format!("exit status {status}"),
-                    Err(e) => format!("wait failed: {e}"),
-                };
-                let msg = agent_exited_unexpectedly_msg(detail);
-                emit_fatal(&ui_tx, &fatal_emitted, msg.clone());
-                Err(anyhow::anyhow!(msg))
+                // Headless marks its terminal completion by cancelling the
+                // shared termination token as well as queueing Shutdown. The
+                // adapter may observe stdin/transport closure and exit 0 in
+                // the same scheduler tick; if wait wins that race, it is
+                // still an expected teardown rather than an agent crash.
+                if termination.is_cancelled() {
+                    Ok(())
+                } else {
+                    let detail = match wait_result {
+                        Ok(status) => status.to_string(),
+                        Err(e) => format!("wait failed: {e}"),
+                    };
+                    let msg = agent_exited_unexpectedly_msg(detail);
+                    emit_fatal(&ui_tx, &fatal_emitted, msg.clone());
+                    Err(anyhow::anyhow!(msg))
+                }
             }
         }
     };
@@ -905,7 +914,7 @@ pub async fn run(
         // user with no action text. If the child *had* already exited at
         // that point, swap in the friendly "agent exited" wording.
         let msg = if let Some(status) = pre_kill_exit {
-            agent_exited_unexpectedly_msg(format!("exit status {status}"))
+            agent_exited_unexpectedly_msg(status)
         } else {
             format!("acp: {e}")
         };
@@ -9298,6 +9307,53 @@ mod tests {
             termination: None,
         };
         assert_run_reports_agent_exited(cfg).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_treats_requested_termination_before_clean_child_exit_as_shutdown() {
+        let (command, args) = hang_then_exit_command();
+        let termination = CancellationToken::new();
+        let cfg = AcpRuntimeConfig {
+            command,
+            args,
+            cwd: std::env::temp_dir(),
+            additional_directories: Vec::new(),
+            mcp_servers: Vec::new(),
+            resume_session: None,
+            env: HashMap::new(),
+            agent_stderr: None,
+            fs_max_text_bytes: DEFAULT_FS_TEXT_BYTES,
+            access_mode: RuntimeAccessMode::Full,
+            agent_source_id: None,
+            config_path: None,
+            saved_session_config: HashMap::new(),
+            role_config: None,
+            code_agent: None,
+            side_prompt_policy: false,
+            termination: Some(termination.clone()),
+        };
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+        let run_task = tokio::spawn(run(cfg, ui_tx, cmd_rx));
+
+        // The helper child exits after a short platform-specific delay. Mark
+        // teardown expected while it is still alive, matching headless after
+        // it receives PromptDone and before the adapter observes the queued
+        // shutdown.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        termination.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("run task did not finish")
+            .expect("run task panicked");
+        assert!(result.is_ok(), "requested termination was treated as fatal");
+        while let Ok(event) = ui_rx.try_recv() {
+            assert!(
+                !matches!(event, UiEvent::Fatal(_)),
+                "requested termination emitted a Fatal: {event:?}"
+            );
+        }
     }
 
     #[test]

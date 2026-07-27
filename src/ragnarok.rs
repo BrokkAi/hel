@@ -55,6 +55,88 @@ const JUDGE_ONLY_VENDOR_SELECTION_BONUS: i32 = NEW_VENDOR_SELECTION_BONUS * 2;
 const SELECTION_RANDOM_TOP_N: usize = 4;
 /// Budget for an agent to reach `SessionStarted` (covers cold npx/uvx runs).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(180);
+/// Maximum wait for an owned ACP runtime to acknowledge shutdown before the
+/// handle aborts it. Callers holding admission permits include this in their
+/// wall-clock occupancy bounds.
+pub(crate) const DISMISS_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Typed startup expiry lets callers that share a larger stage budget report
+/// connection timeouts separately from prompt timeouts.
+#[derive(Debug)]
+pub(crate) struct SessionStartTimeout;
+
+impl std::fmt::Display for SessionStartTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("timed out waiting for session")
+    }
+}
+
+impl std::error::Error for SessionStartTimeout {}
+
+/// Typed prompt expiry, the turn-level counterpart to [`SessionStartTimeout`].
+/// Callers that share one stage budget across connection and prompting match
+/// on the type, not on this message, so rewording it cannot silently demote a
+/// timeout to an unclassified failure.
+#[derive(Debug)]
+pub(crate) struct PromptTimeout;
+
+impl std::fmt::Display for PromptTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ran out of time")
+    }
+}
+
+impl std::error::Error for PromptTimeout {}
+
+/// Per-prompt ACP tool lifecycle state.
+///
+/// Some adapters return `PromptDone` while asynchronous tools are still
+/// running. Treating that as a safe turn boundary races tool side effects and
+/// can tear down review tools before their results arrive. A tool is therefore
+/// active until its latest explicit status is `Completed` or `Failed`.
+///
+/// Metadata-only updates for an unseen id conservatively create a pending
+/// entry. This both fails closed when an adapter omits the initial `ToolCall`
+/// event and preserves terminal state when later updates merely add a title,
+/// kind, or content.
+#[derive(Debug, Default)]
+pub(crate) struct PromptToolLifecycle {
+    statuses: HashMap<String, ToolCallStatus>,
+}
+
+impl PromptToolLifecycle {
+    pub(crate) fn observe(&mut self, update: &SessionUpdate) {
+        match update {
+            SessionUpdate::ToolCall(call) => {
+                self.statuses
+                    .insert(call.tool_call_id.to_string(), call.status);
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                let status = update.fields.status;
+                self.statuses
+                    .entry(update.tool_call_id.to_string())
+                    .and_modify(|current| {
+                        if let Some(status) = status {
+                            *current = status;
+                        }
+                    })
+                    .or_insert_with(|| status.unwrap_or(ToolCallStatus::Pending));
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn has_active_tools(&self) -> bool {
+        self.statuses
+            .values()
+            .any(|status| !matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed))
+    }
+
+    fn clear(&mut self) {
+        self.statuses.clear();
+    }
+}
+
 /// Budget for one champion to implement the task.
 const FIGHT_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 /// A no-diff champion gets one explicit second chance before the tournament
@@ -1181,6 +1263,9 @@ pub(crate) struct AgentHandle {
     abort: watch::Receiver<bool>,
     access_mode: acp::RuntimeAccessMode,
     session_started: Option<(String, bool)>,
+    /// The role-configured model selected during ACP setup, which may use an
+    /// adapter-specific alias that `arm_model` cannot resolve.
+    role_armed_model_value: Option<String>,
     termination: CancellationToken,
 }
 
@@ -1334,6 +1419,39 @@ impl AgentHandle {
         mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
         resume_session: Option<String>,
     ) -> Result<Self> {
+        Self::connect_with_role_config_and_mcp_resuming_with_startup_timeout(
+            launch,
+            cwd,
+            additional_directories,
+            abort,
+            access_mode,
+            saved_session_config,
+            role_config,
+            mcp_servers,
+            resume_session,
+            CONNECT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Like [`Self::connect_with_role_config_and_mcp_resuming`], but bounds
+    /// startup by the caller's whole-stage budget. On timeout this method
+    /// dismisses the constructed handle before returning, so the ACP runtime
+    /// and its subprocess cannot outlive the stage that owns it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn connect_with_role_config_and_mcp_resuming_with_startup_timeout(
+        launch: &Launch,
+        cwd: &Path,
+        additional_directories: &[PathBuf],
+        abort: watch::Receiver<bool>,
+        access_mode: acp::RuntimeAccessMode,
+        saved_session_config: HashMap<String, String>,
+        role_config: Option<acp::RuntimeRoleConfig>,
+        mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
+        resume_session: Option<String>,
+        startup_timeout: Duration,
+    ) -> Result<Self> {
+        let role_armed_model_value = role_config.as_ref().map(|role| role.model_value.clone());
         let (event_tx, events) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let termination = CancellationToken::new();
@@ -1358,9 +1476,13 @@ impl AgentHandle {
             abort,
             access_mode,
             session_started: None,
+            role_armed_model_value,
             termination,
         };
-        if let Err(error) = handle.wait_session_started().await {
+        if let Err(error) = handle
+            .wait_session_started_with_timeout(startup_timeout)
+            .await
+        {
             // `JoinHandle` detaches when dropped. Explicitly dismiss here so
             // a failed startup cannot leave the ACP runtime/process behind.
             handle.dismiss().await;
@@ -1369,13 +1491,19 @@ impl AgentHandle {
         Ok(handle)
     }
 
+    #[cfg(test)]
     async fn wait_session_started(&mut self) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+        self.wait_session_started_with_timeout(CONNECT_TIMEOUT)
+            .await
+    }
+
+    async fn wait_session_started_with_timeout(&mut self, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let ev = tokio::select! {
                 ev = self.events.recv() => ev,
                 _ = wait_abort(self.abort.clone()) => bail!("battle aborted"),
-                _ = tokio::time::sleep_until(deadline) => bail!("timed out waiting for session"),
+                _ = tokio::time::sleep_until(deadline) => return Err(SessionStartTimeout.into()),
             };
             let Some(ev) = ev else {
                 bail!("agent runtime closed before a session started");
@@ -1447,8 +1575,13 @@ impl AgentHandle {
     /// next turn. Confirmation is a refreshed `SessionConfigOptions` whose
     /// model option carries the requested value; failure surfaces as a
     /// "session config update failed" warning. Already-current models skip
-    /// the round trip entirely.
+    /// the round trip entirely. Repeating the role-configured model also
+    /// skips it: ACP already selected that model with adapter-aware alias
+    /// resolution.
     pub(crate) async fn arm_model(&mut self, model_value: &str) -> Result<()> {
+        if self.role_armed_model_value.as_deref() == Some(model_value) {
+            return Ok(());
+        }
         if self.model_is_current(model_value) {
             return Ok(());
         }
@@ -1479,9 +1612,19 @@ impl AgentHandle {
                 None => bail!("agent runtime closed"),
             }
         };
-        let _ = self
+        if self
             .cmd_tx
-            .send(UiCommand::SetSessionConfigOption { target, value });
+            .send(UiCommand::SetSessionConfigOption { target, value })
+            .is_ok()
+        {
+            // The runtime is now switching away from whatever the role config
+            // selected, so that selection is no longer something a later call
+            // may short-circuit on -- even if the confirmation below fails,
+            // which leaves the live selection unknown rather than unchanged.
+            // Nothing is forgotten before this point: a switch that never got
+            // sent left the role's model armed and still worth trusting.
+            self.role_armed_model_value = None;
+        }
 
         // Await the confirmation before releasing the caller to prompt.
         let deadline = tokio::time::Instant::now() + CONFIG_UPDATE_TIMEOUT;
@@ -1582,6 +1725,8 @@ impl AgentHandle {
         let mut acc = String::new();
         let mut truncated = false;
         let mut known_tools: HashMap<String, (String, Option<ToolKind>)> = HashMap::new();
+        let mut tool_lifecycle = PromptToolLifecycle::default();
+        let mut deferred_completion: Option<(StopReason, Option<Usage>)> = None;
         let mut latest_usage_update = None;
         loop {
             let ev = tokio::select! {
@@ -1592,55 +1737,71 @@ impl AgentHandle {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     let _ = self.cmd_tx.send(UiCommand::CancelPrompt);
-                    bail!("ran out of time");
+                    return Err(PromptTimeout.into());
                 }
             };
             let Some(ev) = ev else {
                 bail!("agent runtime closed mid-turn");
             };
             match ev {
-                UiEvent::SessionUpdate(update) => match update {
-                    SessionUpdate::AgentMessageChunk(chunk) => {
-                        let piece = content_block_text(&chunk.content);
-                        if acc.len() + piece.len() <= FINAL_TEXT_LIMIT {
-                            acc.push_str(&piece);
-                        } else {
-                            truncated = true;
+                UiEvent::SessionUpdate(update) => {
+                    tool_lifecycle.observe(&update);
+                    match update {
+                        SessionUpdate::AgentMessageChunk(chunk) => {
+                            let piece = content_block_text(&chunk.content);
+                            if acc.len() + piece.len() <= FINAL_TEXT_LIMIT {
+                                acc.push_str(&piece);
+                            } else {
+                                truncated = true;
+                            }
+                            on_event(TurnEvent::Message(piece));
                         }
-                        on_event(TurnEvent::Message(piece));
+                        SessionUpdate::AgentThoughtChunk(chunk) => {
+                            on_event(TurnEvent::Thought(content_block_text(&chunk.content)));
+                        }
+                        SessionUpdate::ToolCall(call) => {
+                            let id = call.tool_call_id.to_string();
+                            known_tools.insert(id, (call.title.clone(), Some(call.kind)));
+                            on_event(TurnEvent::Tool {
+                                title: call.title,
+                                kind: Some(call.kind),
+                                status: Some(call.status),
+                                started: true,
+                            });
+                        }
+                        SessionUpdate::ToolCallUpdate(update) => {
+                            let id = update.tool_call_id.to_string();
+                            let entry = known_tools.entry(id).or_default();
+                            if let Some(title) = &update.fields.title {
+                                entry.0 = title.clone();
+                            }
+                            if let Some(kind) = update.fields.kind {
+                                entry.1 = Some(kind);
+                            }
+                            on_event(TurnEvent::Tool {
+                                title: entry.0.clone(),
+                                kind: entry.1,
+                                status: update.fields.status,
+                                started: false,
+                            });
+                        }
+                        SessionUpdate::UsageUpdate(update) => latest_usage_update = Some(update),
+                        _ => {}
                     }
-                    SessionUpdate::AgentThoughtChunk(chunk) => {
-                        on_event(TurnEvent::Thought(content_block_text(&chunk.content)));
-                    }
-                    SessionUpdate::ToolCall(call) => {
-                        let id = call.tool_call_id.to_string();
-                        known_tools.insert(id, (call.title.clone(), Some(call.kind)));
-                        on_event(TurnEvent::Tool {
-                            title: call.title,
-                            kind: Some(call.kind),
-                            status: Some(call.status),
-                            started: true,
+                    if !tool_lifecycle.has_active_tools()
+                        && let Some((stop_reason, usage)) = deferred_completion.take()
+                    {
+                        if truncated {
+                            acc.push_str("\n…[output truncated]");
+                        }
+                        return Ok(TurnOutcome {
+                            text: acc,
+                            stop: stop_reason,
+                            usage,
+                            usage_update: latest_usage_update,
                         });
                     }
-                    SessionUpdate::ToolCallUpdate(update) => {
-                        let id = update.tool_call_id.to_string();
-                        let entry = known_tools.entry(id).or_default();
-                        if let Some(title) = &update.fields.title {
-                            entry.0 = title.clone();
-                        }
-                        if let Some(kind) = update.fields.kind {
-                            entry.1 = Some(kind);
-                        }
-                        on_event(TurnEvent::Tool {
-                            title: entry.0.clone(),
-                            kind: entry.1,
-                            status: update.fields.status,
-                            started: false,
-                        });
-                    }
-                    SessionUpdate::UsageUpdate(update) => latest_usage_update = Some(update),
-                    _ => {}
-                },
+                }
                 UiEvent::SessionConfigOptions {
                     options, targets, ..
                 } => self.store_config(options, targets),
@@ -1654,19 +1815,26 @@ impl AgentHandle {
                     let _ = e.responder.send(ElicitationOutcome::Decline);
                 }
                 UiEvent::PromptDone { stop_reason, usage } => {
-                    if truncated {
-                        acc.push_str("\n…[output truncated]");
+                    if tool_lifecycle.has_active_tools() && stop_reason != StopReason::Cancelled {
+                        deferred_completion.get_or_insert((stop_reason, usage));
+                    } else {
+                        if truncated {
+                            acc.push_str("\n…[output truncated]");
+                        }
+                        return Ok(TurnOutcome {
+                            text: acc,
+                            stop: stop_reason,
+                            usage,
+                            usage_update: latest_usage_update,
+                        });
                     }
-                    return Ok(TurnOutcome {
-                        text: acc,
-                        stop: stop_reason,
-                        usage,
-                        usage_update: latest_usage_update,
-                    });
                 }
                 UiEvent::PromptFailed { message } => {
                     if prompt_rejected_transiently(&message) && resends < PROMPT_RESEND_LIMIT {
                         resends += 1;
+                        known_tools.clear();
+                        tool_lifecycle.clear();
+                        deferred_completion = None;
                         on_event(TurnEvent::Note(format!(
                             "runtime rejected prompt ({message}); retrying {resends}/{PROMPT_RESEND_LIMIT}"
                         )));
@@ -1684,6 +1852,9 @@ impl AgentHandle {
                     if prompt_rejected_transiently(&w) {
                         if resends < PROMPT_RESEND_LIMIT {
                             resends += 1;
+                            known_tools.clear();
+                            tool_lifecycle.clear();
+                            deferred_completion = None;
                             on_event(TurnEvent::Note(format!(
                                 "runtime warning ({w}); retrying prompt {resends}/{PROMPT_RESEND_LIMIT}"
                             )));
@@ -1713,7 +1884,7 @@ impl AgentHandle {
         // teardown path, which reaps the whole agent process tree.
         self.termination.cancel();
         let mut runtime = self.runtime;
-        if tokio::time::timeout(Duration::from_secs(3), &mut runtime)
+        if tokio::time::timeout(DISMISS_TIMEOUT, &mut runtime)
             .await
             .is_err()
         {
@@ -4352,7 +4523,8 @@ mod tests {
     // ---- AgentHandle: model arming + prompt turn contract -----------------
 
     use agent_client_protocol::schema::v1::{
-        SessionConfigOptionCategory, SessionConfigSelectOption,
+        SessionConfigOptionCategory, SessionConfigSelectOption, ToolCall, ToolCallUpdate,
+        ToolCallUpdateFields,
     };
 
     /// A handle wired to test-owned channels, plus the guards that keep it
@@ -4381,6 +4553,7 @@ mod tests {
             abort,
             access_mode,
             session_started: None,
+            role_armed_model_value: None,
             termination: CancellationToken::new(),
         };
         TestRig {
@@ -4389,6 +4562,19 @@ mod tests {
             cmd_rx,
             _abort_tx: abort_tx,
         }
+    }
+
+    fn tool_status_update(
+        id: &'static str,
+        status: Option<ToolCallStatus>,
+        title: Option<&str>,
+    ) -> UiEvent {
+        let mut fields = ToolCallUpdateFields::default();
+        fields.status = status;
+        fields.title = title.map(str::to_string);
+        UiEvent::SessionUpdate(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            id, fields,
+        )))
     }
 
     #[tokio::test]
@@ -4414,6 +4600,7 @@ mod tests {
             abort,
             access_mode: acp::RuntimeAccessMode::ReadOnly,
             session_started: None,
+            role_armed_model_value: None,
             termination,
         };
 
@@ -4503,6 +4690,53 @@ mod tests {
         (vec![option], vec![target])
     }
 
+    fn model_options_with_choice(
+        current: &str,
+        value: &'static str,
+        name: &'static str,
+    ) -> (Vec<SessionConfigOption>, Vec<SessionConfigTarget>) {
+        let option = SessionConfigOption::select(
+            "model",
+            "Model",
+            current.to_string(),
+            vec![SessionConfigSelectOption::new(value, name)],
+        )
+        .category(Some(SessionConfigOptionCategory::Model));
+        let target = SessionConfigTarget::ConfigOption {
+            config_id: option.id.clone(),
+        };
+        (vec![option], vec![target])
+    }
+
+    #[tokio::test]
+    async fn an_expired_prompt_budget_returns_the_typed_prompt_timeout() {
+        // Callers that bound preflight and prompting separately classify the
+        // two by error type. Pin the production construction site: this drives
+        // a real turn to its deadline rather than building the error by hand,
+        // so swapping the typed error back for a bare `bail!` fails here.
+        let mut rig = test_rig();
+        rig.handle
+            .session_started
+            .replace(("session".to_string(), false));
+
+        let error = rig
+            .handle
+            .prompt("anything".to_string(), Duration::from_millis(1), |_| {})
+            .await
+            .expect_err("an expired budget must not resolve to a turn");
+        assert!(
+            error.is::<PromptTimeout>(),
+            "an expired prompt budget must surface as PromptTimeout, got: {error}"
+        );
+
+        // The turn is cancelled on the way out rather than left running.
+        let mut cancelled = false;
+        while let Ok(command) = rig.cmd_rx.try_recv() {
+            cancelled |= matches!(command, UiCommand::CancelPrompt);
+        }
+        assert!(cancelled, "an expired prompt budget must cancel the turn");
+    }
+
     #[tokio::test]
     async fn session_started_event_captures_identity_and_resume_status() {
         let mut rig = test_rig();
@@ -4555,6 +4789,129 @@ mod tests {
             rig.cmd_rx.try_recv().is_err(),
             "no command should be sent for an already-current model"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arm_model_skips_role_configured_adapter_alias() {
+        let mut rig = test_rig();
+        rig.handle.role_armed_model_value = Some("catalog-opus".to_string());
+        let (options, targets) =
+            model_options_with_choice("adapter-opus-id", "adapter-opus-id", "Opus");
+        rig.handle.store_config(options, targets);
+
+        rig.handle
+            .arm_model("catalog-opus")
+            .await
+            .expect("role config selected adapter alias");
+        assert!(
+            rig.cmd_rx.try_recv().is_err(),
+            "role-configured handles must not send a redundant exact-value selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_model_can_switch_away_from_role_configured_model() {
+        let mut rig = test_rig();
+        rig.handle.role_armed_model_value = Some("catalog-opus".to_string());
+        let (options, targets) = model_options("adapter-opus-id");
+        rig.handle.store_config(options, targets);
+        let (confirmed_options, confirmed_targets) = model_options("sonnet");
+        rig.event_tx
+            .send(UiEvent::SessionConfigOptions {
+                options: confirmed_options,
+                targets: confirmed_targets,
+                hidden_config_ids: Vec::new(),
+            })
+            .expect("send model confirmation");
+
+        rig.handle
+            .arm_model("sonnet")
+            .await
+            .expect("switched model");
+        assert!(
+            matches!(
+                rig.cmd_rx.try_recv(),
+                Ok(UiCommand::SetSessionConfigOption { value, .. }) if value.to_string() == "sonnet"
+            ),
+            "a different model must still use the normal selection round trip"
+        );
+        assert!(rig.handle.model_is_current("sonnet"));
+    }
+
+    /// Once a seat has been switched away from its role-configured model, the
+    /// role's selection is stale. Re-requesting it must perform a real round
+    /// trip; short-circuiting there would report success while the session
+    /// sits on the model armed in between.
+    #[tokio::test]
+    async fn arm_model_stops_trusting_the_role_selection_after_a_switch() {
+        let mut rig = test_rig();
+        rig.handle.role_armed_model_value = Some("opus".to_string());
+        let (options, targets) = model_options("adapter-opus-id");
+        rig.handle.store_config(options, targets);
+
+        // Confirmation for the switch away, then for the switch back.
+        for current in ["sonnet", "opus"] {
+            let (confirmed_options, confirmed_targets) = model_options(current);
+            rig.event_tx
+                .send(UiEvent::SessionConfigOptions {
+                    options: confirmed_options,
+                    targets: confirmed_targets,
+                    hidden_config_ids: Vec::new(),
+                })
+                .expect("send model confirmation");
+        }
+
+        rig.handle.arm_model("sonnet").await.expect("switched away");
+        assert!(
+            matches!(
+                rig.cmd_rx.try_recv(),
+                Ok(UiCommand::SetSessionConfigOption { value, .. }) if value.to_string() == "sonnet"
+            ),
+            "the switch away must have been sent"
+        );
+
+        rig.handle.arm_model("opus").await.expect("switched back");
+        assert!(
+            matches!(
+                rig.cmd_rx.try_recv(),
+                Ok(UiCommand::SetSessionConfigOption { value, .. }) if value.to_string() == "opus"
+            ),
+            "the stale role selection must not skip the round trip back"
+        );
+        assert!(rig.handle.model_is_current("opus"));
+    }
+
+    /// The mirror image: a switch that never reached the runtime changed
+    /// nothing, so the role's selection is still live and must still be
+    /// trusted. Forgetting it there would reintroduce the exact-match
+    /// timeout for a model the session is already sitting on.
+    #[tokio::test(start_paused = true)]
+    async fn arm_model_keeps_the_role_selection_when_no_switch_was_sent() {
+        let mut rig = test_rig();
+        rig.handle.role_armed_model_value = Some("catalog-opus".to_string());
+        let (options, targets) =
+            model_options_with_choice("adapter-opus-id", "adapter-opus-id", "Opus");
+        rig.handle.store_config(options, targets);
+
+        let error = rig
+            .handle
+            .arm_model("never-offered")
+            .await
+            .expect_err("an unavailable model cannot be armed");
+        assert!(
+            format!("{error:#}").contains("never offered"),
+            "err: {error:#}"
+        );
+        assert!(
+            rig.cmd_rx.try_recv().is_err(),
+            "no selection can have been sent for a model that was never offered"
+        );
+
+        rig.handle
+            .arm_model("catalog-opus")
+            .await
+            .expect("the role selection survives a switch that never happened");
+        assert!(rig.cmd_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -4679,6 +5036,100 @@ mod tests {
             }
         }
         assert_eq!(sends, 2, "the bounced prompt must be re-sent once");
+    }
+
+    #[tokio::test]
+    async fn prompt_done_waits_for_every_active_tool_and_keeps_merged_metadata() {
+        let TestRig {
+            mut handle,
+            event_tx,
+            mut cmd_rx,
+            _abort_tx,
+        } = test_rig();
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prompt_observed = observed.clone();
+        let prompt = tokio::spawn(async move {
+            handle
+                .prompt("review".to_string(), Duration::from_secs(5), move |event| {
+                    if let TurnEvent::Tool {
+                        title,
+                        kind,
+                        status,
+                        ..
+                    } = event
+                    {
+                        prompt_observed
+                            .lock()
+                            .expect("observed tool events")
+                            .push((title, kind, status));
+                    }
+                })
+                .await
+        });
+        assert!(matches!(
+            cmd_rx.recv().await,
+            Some(UiCommand::SendPrompt { .. })
+        ));
+
+        event_tx
+            .send(UiEvent::SessionUpdate(SessionUpdate::ToolCall(
+                ToolCall::new("first", "initial title")
+                    .kind(ToolKind::Read)
+                    .status(ToolCallStatus::InProgress),
+            )))
+            .expect("first tool");
+        event_tx
+            .send(UiEvent::SessionUpdate(SessionUpdate::ToolCall(
+                ToolCall::new("second", "second tool").status(ToolCallStatus::Pending),
+            )))
+            .expect("second tool");
+        event_tx
+            .send(UiEvent::PromptDone {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            })
+            .expect("premature prompt done");
+        tokio::task::yield_now().await;
+        assert!(
+            !prompt.is_finished(),
+            "PromptDone must not finish while either tool is active"
+        );
+
+        event_tx
+            .send(tool_status_update("first", None, Some("renamed title")))
+            .expect("metadata-only update");
+        event_tx
+            .send(tool_status_update(
+                "second",
+                Some(ToolCallStatus::Failed),
+                None,
+            ))
+            .expect("second terminal update");
+        tokio::task::yield_now().await;
+        assert!(
+            !prompt.is_finished(),
+            "one terminal tool must not hide another active id"
+        );
+
+        event_tx
+            .send(tool_status_update(
+                "first",
+                Some(ToolCallStatus::Completed),
+                None,
+            ))
+            .expect("first terminal update");
+        let outcome = prompt.await.expect("prompt task").expect("prompt outcome");
+        assert_eq!(outcome.stop, StopReason::EndTurn);
+
+        let observed = observed.lock().expect("observed tool events");
+        assert!(
+            observed.iter().any(|(title, kind, status)| {
+                title == "renamed title"
+                    && *kind == Some(ToolKind::Read)
+                    && *status == Some(ToolCallStatus::Completed)
+            }),
+            "a status-only terminal update must retain the earlier title and kind: {observed:?}"
+        );
     }
 
     #[tokio::test]

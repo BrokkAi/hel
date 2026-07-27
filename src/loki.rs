@@ -55,7 +55,11 @@ use crate::council_usage::{Record, Role};
 use crate::event::{AgentCommandOutcome, CompactTrigger, LokiActivity, LokiIdentity, UiEvent};
 use crate::ragnarok::{AgentHandle, Launch, TurnEvent};
 
-const REVIEW_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+// Keep this no longer than the turn-boundary rendezvous. A review that can
+// occupy the sole worker for ten minutes leaves later checkpoints queued
+// behind it, so even a bounded rendezvous can spend its full two minutes
+// waiting on work that has no chance to finish in time.
+const REVIEW_TIMEOUT: Duration = Duration::from_secs(120);
 const MCP_PATH: &str = "/mcp";
 const MCP_SERVER_NAME: &str = "mj-loki-advisor";
 const PULL_MCP_SERVER_NAME: &str = "mj-loki-pull";
@@ -2606,8 +2610,8 @@ fn review_prompt(
 ) -> String {
     let mut prompt = String::new();
     if include_contract {
-        prompt.push_str("You are Loki, Mjolnir's one persistent read-only advisor. Take a different, user-aligned angle from Thor and implementation Eitri and verify assumptions when useful. You do not observe read-only Explore runs. Do not restate failures they already know. Stay silent for style, uncertainty, optional improvements, incomplete work, or activity that is on track. The advise tool accepts one structured list containing at most one note for each exact reviewed (god, ordinal) step. Advice is queued for the associated role and pulled at natural stopping points, never delivered as an interruption, so reserve it for material correctness, safety, scope, or strategy problems that remain worth raising even if later work may have already addressed them. Never implement changes yourself. Advice is not delivered the moment you submit it: it is handed to its target only at that role's next turn boundary. Every review prompt you receive includes a \"Your advice ledger\" section reporting what happened to your recent advice. A note listed there as QUEUED has already been accepted and WILL be delivered at the next boundary -- do not resubmit it; near-duplicate resubmissions can overflow the queue and silently drop other advice. Only resubmit a note if the ledger shows its submission was REJECTED (and you have fixed the rejection reason) or if materially new information changes the advice.\n\n");
-        prompt.push_str("Three additional patterns are always material even though they look like passing verification, and you see the terminal commands and tool titles needed to catch them in your checkpoints. Regenerating golden files or snapshots (for example `-update` or snapshot-update flags) to match new output instead of investigating the mismatch is self-referential, not verification. Declaring a multi-part spec complete when the new feature's own tests were never executed is not verification, even when build, lint, or pre-existing suites passed. Narrowing the test-run scope after a failure (for example switching to `-run` filters that exclude previously failing or hanging tests) and then claiming completeness without disclosing the exclusion is also material.\n\n");
+        prompt.push_str("You are Loki, Mjolnir's one persistent read-only advisor. Take a different, user-aligned angle from Thor and implementation Eitri and verify assumptions when useful. You do not observe read-only Explore runs. Do not restate failures they already know. Stay silent for style, uncertainty, optional improvements, incomplete work that is visibly still in progress, or activity that is on track. The advise tool accepts one structured list containing at most one note for each exact reviewed (god, ordinal) step. Advice is queued for the associated role and pulled at natural stopping points, never delivered as an interruption, so reserve it for material correctness, safety, scope, or strategy problems that remain worth raising even if later work may have already addressed them. Never implement changes yourself. Advice is not delivered the moment you submit it: it is handed to its target only at that role's next turn boundary. Every review prompt you receive includes a \"Your advice ledger\" section reporting what happened to your recent advice. A note listed there as QUEUED has already been accepted and WILL be delivered at the next boundary -- do not resubmit it; near-duplicate resubmissions can overflow the queue and silently drop other advice. Only resubmit a note if the ledger shows its submission was REJECTED (and you have fixed the rejection reason) or if materially new information changes the advice.\n\n");
+        prompt.push_str("Four additional patterns are always material even though they can look like ordinary progress or passing verification, and you see the final responses, terminal commands, and tool titles needed to catch them in your checkpoints. A final response that acknowledges required work remains is an incomplete user outcome, even if it promises to continue later; advise on that exact final-response step so the turn continues. Regenerating golden files or snapshots (for example `-update` or snapshot-update flags) to match new output instead of investigating the mismatch is self-referential, not verification. Declaring a multi-part spec complete when the new feature's own tests were never executed is not verification, even when build, lint, or pre-existing suites passed. Narrowing the test-run scope after a failure (for example switching to `-run` filters that exclude previously failing or hanging tests) and then claiming completeness without disclosing the exclusion is also material.\n\n");
     }
     for context in context {
         prompt.push_str(context);
@@ -4239,8 +4243,11 @@ mod tests {
     }
 
     #[test]
-    fn contract_text_flags_the_three_verification_laundering_patterns() {
+    fn contract_text_flags_incomplete_final_answers_and_verification_laundering() {
         let contract = review_prompt(&[], &[], &[], true, &LedgerSnapshot::default());
+        assert!(contract.contains(
+            "A final response that acknowledges required work remains is an incomplete user outcome"
+        ));
         assert!(contract.contains(
             "Regenerating golden files or snapshots (for example `-update` or snapshot-update flags) to match new output instead of investigating the mismatch is self-referential, not verification."
         ));

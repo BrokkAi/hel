@@ -42,14 +42,89 @@ struct GitTreeSnapshot {
     object_dir: PathBuf,
     alternate_object_dir: PathBuf,
     baseline_tree: String,
-    _scratch: tempfile::TempDir,
+    scratch: Arc<tempfile::TempDir>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct WorkspaceDelta {
     changed: bool,
     receipt: String,
     review_patch: Option<String>,
+    review_snapshot: Option<ReviewSnapshot>,
+}
+
+/// Immutable Git endpoints and human-facing evidence for one captured change
+/// interval. The scratch-directory lease keeps the private object database and
+/// full patch alive until every review consumer has finished.
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewSnapshot {
+    repo_root: PathBuf,
+    object_dir: PathBuf,
+    base_tree: String,
+    target_tree: String,
+    diffstat: String,
+    changed_line_count: usize,
+    full_patch_path: PathBuf,
+    _lease: Arc<tempfile::TempDir>,
+}
+
+impl ReviewSnapshot {
+    pub(crate) fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
+    pub(crate) fn object_dir(&self) -> &Path {
+        &self.object_dir
+    }
+
+    pub(crate) fn base_tree(&self) -> &str {
+        &self.base_tree
+    }
+
+    pub(crate) fn target_tree(&self) -> &str {
+        &self.target_tree
+    }
+
+    pub(crate) fn diffstat(&self) -> &str {
+        &self.diffstat
+    }
+
+    pub(crate) fn changed_line_count(&self) -> usize {
+        self.changed_line_count
+    }
+
+    pub(crate) async fn full_patch(&self) -> Result<String, String> {
+        tokio::fs::read_to_string(&self.full_patch_path)
+            .await
+            .map_err(|error| format!("could not read captured turn patch: {error}"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        repo_root: PathBuf,
+        base_tree: &str,
+        target_tree: &str,
+        diffstat: &str,
+        changed_line_count: usize,
+        patch: &str,
+    ) -> Self {
+        let scratch = Arc::new(tempfile::tempdir().expect("review snapshot tempdir"));
+        let object_dir = scratch.path().join("objects");
+        std::fs::create_dir_all(object_dir.join("info")).expect("snapshot object info dir");
+        std::fs::create_dir_all(object_dir.join("pack")).expect("snapshot object pack dir");
+        let full_patch_path = scratch.path().join("review.patch");
+        std::fs::write(&full_patch_path, patch).expect("snapshot patch");
+        Self {
+            repo_root,
+            object_dir,
+            base_tree: base_tree.to_string(),
+            target_tree: target_tree.to_string(),
+            diffstat: diffstat.to_string(),
+            changed_line_count,
+            full_patch_path,
+            _lease: scratch,
+        }
+    }
 }
 
 impl WorkspaceDelta {
@@ -65,12 +140,17 @@ impl WorkspaceDelta {
         self.review_patch.as_deref()
     }
 
+    pub(crate) fn review_snapshot(&self) -> Option<&ReviewSnapshot> {
+        self.review_snapshot.as_ref()
+    }
+
     #[cfg(test)]
     pub(crate) fn changed_for_test(patch: String) -> Self {
         Self {
             changed: true,
             receipt: String::new(),
             review_patch: Some(patch),
+            review_snapshot: None,
         }
     }
 }
@@ -78,6 +158,7 @@ impl WorkspaceDelta {
 struct RootDelta {
     receipt: String,
     patch: String,
+    review_snapshot: ReviewSnapshot,
 }
 
 impl WorkspaceSnapshot {
@@ -151,6 +232,7 @@ impl WorkspaceSnapshot {
     pub(crate) async fn delta(&self) -> WorkspaceDelta {
         let mut receipt_sections = Vec::new();
         let mut patch_sections = Vec::new();
+        let mut review_snapshots = Vec::new();
         let mut review_notices = Vec::new();
 
         for root in &self.inner.roots {
@@ -167,6 +249,7 @@ impl WorkspaceSnapshot {
                         root.repo_root.display(),
                         delta.patch.trim_end()
                     ));
+                    review_snapshots.push(delta.review_snapshot);
                 }
                 Ok(None) => {}
                 Err(message) => {
@@ -208,6 +291,8 @@ impl WorkspaceSnapshot {
             changed,
             receipt,
             review_patch,
+            review_snapshot: (review_snapshots.len() == 1)
+                .then(|| review_snapshots.pop().expect("one review snapshot")),
         }
     }
 }
@@ -292,7 +377,6 @@ impl GitTreeSnapshot {
             .prefix("mj-workspace-snapshot-")
             .tempdir()
             .map_err(|_| "could not create temporary snapshot storage".to_string())?;
-        let index_path = scratch.path().join("index");
         let object_dir = scratch.path().join("objects");
         std::fs::create_dir_all(object_dir.join("info"))
             .and_then(|_| std::fs::create_dir_all(object_dir.join("pack")))
@@ -300,14 +384,15 @@ impl GitTreeSnapshot {
         let alternate_object_dir = common_dir.join("objects");
         let pathspecs = pathspecs.into_iter().collect::<Vec<_>>();
 
+        let scratch = Arc::new(scratch);
         let mut snapshot = Self {
             repo_root,
             pathspecs,
-            index_path,
-            object_dir,
+            index_path: scratch.path().join("index"),
+            object_dir: scratch.path().join("objects"),
             alternate_object_dir,
             baseline_tree: String::new(),
-            _scratch: scratch,
+            scratch,
         };
 
         let head_tree = run_plain_git(
@@ -344,20 +429,20 @@ impl GitTreeSnapshot {
             .prefix("mj-workspace-review-")
             .tempdir()
             .map_err(|_| "could not create temporary snapshot storage".to_string())?;
-        let index_path = scratch.path().join("index");
         let object_dir = scratch.path().join("objects");
         std::fs::create_dir_all(object_dir.join("info"))
             .and_then(|_| std::fs::create_dir_all(object_dir.join("pack")))
             .map_err(|_| "could not initialize temporary Git object storage".to_string())?;
         let alternate_object_dir = common_dir.join("objects");
+        let scratch = Arc::new(scratch);
         let mut snapshot = Self {
             repo_root,
             pathspecs,
-            index_path,
-            object_dir,
+            index_path: scratch.path().join("index"),
+            object_dir: scratch.path().join("objects"),
             alternate_object_dir,
             baseline_tree: String::new(),
-            _scratch: scratch,
+            scratch,
         };
         let head_tree = run_plain_git(
             &snapshot.repo_root,
@@ -392,7 +477,28 @@ impl GitTreeSnapshot {
         }
         let receipt = self.diff(&after_tree, &["--stat", "--summary"]).await?;
         let patch = self.diff(&after_tree, &[]).await?;
-        Ok(Some(RootDelta { receipt, patch }))
+        let full_patch_path = self
+            .scratch
+            .path()
+            .join(format!("review-{after_tree}.patch"));
+        tokio::fs::write(&full_patch_path, &patch)
+            .await
+            .map_err(|error| format!("could not persist captured turn patch: {error}"))?;
+        let review_snapshot = ReviewSnapshot {
+            repo_root: self.repo_root.clone(),
+            object_dir: self.object_dir.clone(),
+            base_tree: self.baseline_tree.clone(),
+            target_tree: after_tree,
+            diffstat: receipt.clone(),
+            changed_line_count: changed_line_count(&patch),
+            full_patch_path,
+            _lease: Arc::clone(&self.scratch),
+        };
+        Ok(Some(RootDelta {
+            receipt,
+            patch,
+            review_snapshot,
+        }))
     }
 
     async fn refresh_index(&self) -> Result<(), String> {
@@ -536,6 +642,21 @@ fn bound_text(text: String, limit: usize) -> String {
     let head_end = text.floor_char_boundary(head_len);
     let tail_start = text.ceil_char_boundary(text.len().saturating_sub(tail_len));
     format!("{}{}{}", &text[..head_end], MARKER, &text[tail_start..])
+}
+
+fn changed_line_count(diff: &str) -> usize {
+    let mut in_hunk = false;
+    let mut count = 0usize;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            in_hunk = false;
+        } else if line.starts_with("@@ ") {
+            in_hunk = true;
+        } else if in_hunk && (line.starts_with('+') || line.starts_with('-')) {
+            count = count.saturating_add(1);
+        }
+    }
+    count
 }
 
 fn truncate_chars(text: &str, limit: usize) -> String {
@@ -754,6 +875,75 @@ mod tests {
         assert_eq!(git(root, &["show-ref"]), refs_before);
         assert_eq!(git(root, &["symbolic-ref", "HEAD"]), branch_before);
         assert_eq!(object_files(root), objects_before);
+    }
+
+    #[tokio::test]
+    async fn review_snapshot_captures_dirty_baseline_reversion_and_outlives_workspace_snapshot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        init_repo(root);
+        std::fs::write(root.join("state.txt"), "head\n").expect("head state");
+        commit_all(root);
+
+        // The outer turn begins from a dirty state, then deliberately reverts
+        // that state to HEAD. HEAD-to-worktree analysis would see no change,
+        // but the captured tree interval must retain it.
+        std::fs::write(root.join("state.txt"), "dirty before turn\n").expect("dirty baseline");
+        let workspace = WorkspaceSnapshot::capture(&[root.to_path_buf()]).await;
+        std::fs::write(root.join("state.txt"), "head\n").expect("turn reversion");
+
+        let delta = workspace.delta().await;
+        let review = delta
+            .review_snapshot()
+            .expect("exact review snapshot")
+            .clone();
+        assert_eq!(review.repo_root(), root);
+        assert_ne!(review.base_tree(), review.target_tree());
+        assert_eq!(review.changed_line_count(), 2);
+        assert!(review.diffstat().contains("state.txt"));
+        let patch = review.full_patch().await.expect("full patch");
+        assert!(patch.contains("-dirty before turn"));
+        assert!(patch.contains("+head"));
+        assert!(
+            git(root, &["diff", "HEAD"]).trim().is_empty(),
+            "the live HEAD diff is intentionally empty in this regression"
+        );
+
+        drop(delta);
+        drop(workspace);
+        assert!(review.object_dir().is_dir());
+        assert!(
+            review
+                .full_patch()
+                .await
+                .expect("leased full patch")
+                .contains("-dirty before turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn review_snapshot_keeps_full_large_patch_and_exact_line_count_beyond_prompt_limit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        init_repo(root);
+        std::fs::write(root.join("large.txt"), "baseline\n").expect("baseline");
+        commit_all(root);
+        let workspace = WorkspaceSnapshot::capture(&[root.to_path_buf()]).await;
+
+        let replacement = (0..200)
+            .map(|index| format!("{index:03}-{}\n", "x".repeat(1024)))
+            .collect::<String>();
+        std::fs::write(root.join("large.txt"), replacement).expect("large turn edit");
+        let delta = workspace.delta().await;
+        let bounded = delta.review_patch().expect("bounded prompt patch");
+        assert!(bounded.contains("workspace delta truncated"));
+        assert!(bounded.len() <= REVIEW_PATCH_LIMIT);
+
+        let review = delta.review_snapshot().expect("exact review snapshot");
+        let full = review.full_patch().await.expect("full patch");
+        assert!(full.len() > REVIEW_PATCH_LIMIT);
+        assert_eq!(review.changed_line_count(), 201);
+        assert!(review.diffstat().contains("large.txt"));
     }
 
     #[tokio::test]

@@ -1311,6 +1311,14 @@
         &[data-kind="agent"] { --kind-color: var(--agent); }
         &[data-kind="thought"] { --kind-color: var(--thought); }
         &[data-kind="tool"] { --kind-color: var(--tool); }
+        /* delegation, exploration, discrete_review, continuation and
+           interjection get no kind rule of their own: they fall through to
+           the `--system` default above, and in practice the actor rules
+           below claim most of them anyway (discrete_review is emitted by
+           Thor, continuation and interjection by Loki). */
+        &[data-kind="review_lane"] { --kind-color: var(--eitri); }
+        &[data-kind="review_progress"],
+        &[data-kind="review_synthesis"] { --kind-color: var(--thor); }
         &[data-actor="thor"] { --kind-color: var(--thor); }
         &[data-actor="loki"] { --kind-color: var(--loki); }
         &[data-actor="eitri"] { --kind-color: var(--eitri); }
@@ -1578,8 +1586,17 @@
         color: var(--user-entry-text);
       }
 
+      /* Internal-message rows used to arrive as a single "system" kind. They
+         now carry their own wire names, so each one that should stay muted
+         has to be listed. The review_* kinds are deliberately absent: the
+         fan-out gives them their own rails and full-strength text. */
       .entry[data-kind="tool"] .entry-text,
-      .entry[data-kind="system"] .entry-text {
+      .entry[data-kind="system"] .entry-text,
+      .entry[data-kind="delegation"] .entry-text,
+      .entry[data-kind="exploration"] .entry-text,
+      .entry[data-kind="discrete_review"] .entry-text,
+      .entry[data-kind="continuation"] .entry-text,
+      .entry[data-kind="interjection"] .entry-text {
         color: var(--muted);
       }
 
@@ -4479,8 +4496,31 @@
       }
 
       function entryLabel(kind, actor) {
-        if (typeof actor === "string" && actor) {
-          return actor.charAt(0).toUpperCase() + actor.slice(1);
+        const actorLabel = typeof actor === "string" && actor
+          ? actor.charAt(0).toUpperCase() + actor.slice(1)
+          : "";
+        switch (kind) {
+          case "delegation":
+            return actorLabel ? `Delegation · ${actorLabel}` : "Delegation";
+          case "exploration":
+            return actorLabel ? `Exploration · ${actorLabel}` : "Exploration";
+          case "discrete_review":
+            return actorLabel ? `Discrete review · ${actorLabel}` : "Discrete review";
+          case "continuation":
+            return actorLabel ? `Continuation · ${actorLabel}` : "Continuation";
+          case "interjection":
+            return actorLabel ? `Interjection · ${actorLabel}` : "Interjection";
+          case "review_lane":
+            return actorLabel
+              ? `Review lane · ${actorLabel}`
+              : "Review lane";
+          case "review_progress":
+            return "Review progress";
+          case "review_synthesis":
+            return "Review synthesis";
+        }
+        if (actorLabel) {
+          return actorLabel;
         }
         switch (kind) {
           case "user":
@@ -4952,8 +4992,8 @@
           return [`### Tool: ${title}`, "", body].join("\n").trim();
         }
         const label = entry.actor
-          ? entry.actor.charAt(0).toUpperCase() + entry.actor.slice(1)
-          : kind === "user" ? "You" : kind === "agent" ? "Agent" : kind;
+          ? entryLabel(kind, entry.actor)
+          : kind === "user" ? "You" : kind === "agent" ? "Agent" : entryLabel(kind, "");
         return [`### ${label}`, "", entry.text || ""].join("\n").trim();
       }
 

@@ -91,6 +91,21 @@ pub enum InternalMessageKind {
     ReviewSynthesis,
 }
 
+impl InternalMessageKind {
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::Delegation => "delegation",
+            Self::Exploration => "exploration",
+            Self::DiscreteReview => "discrete_review",
+            Self::Continuation => "continuation",
+            Self::Interjection => "interjection",
+            Self::ReviewLane => "review_lane",
+            Self::ReviewProgress => "review_progress",
+            Self::ReviewSynthesis => "review_synthesis",
+        }
+    }
+}
+
 /// Events flowing from the ACP runtime into the UI task.
 #[derive(Debug)]
 pub enum UiEvent {
