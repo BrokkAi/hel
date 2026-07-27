@@ -1,5 +1,5 @@
 //! Resolve ACP-advertised model options and canonical DeepSWE model IDs to a
-//! common normalized match key for the Council catalog.
+//! common normalized match key for the model catalog.
 //!
 //! Matching is deliberately **exact** on the normalized key: we never
 //! fuzzy-match or substring-match. An option that produces no key present in the

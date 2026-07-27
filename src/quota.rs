@@ -1,4 +1,4 @@
-//! Proactive quota gating for Council background roles.
+//! Proactive quota gating for background agent pools.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -9,8 +9,8 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 use crate::claude_usage::{ClaudeUsageReport, ClaudeUsageStatus};
 use crate::codex_usage::{CodexUsageClient, CodexUsageReport, CodexUsageStatus};
-use crate::council::{AdapterKind, ResolvedRole};
 use crate::event::UiEvent;
+use crate::roster::{AdapterKind, ResolvedAgent};
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
 const REMAINING_LIMIT_PERCENT: u8 = 5;
@@ -47,15 +47,15 @@ impl Gate {
         }
     }
 
-    pub async fn check(&self, role: &ResolvedRole) -> Check {
+    pub async fn check(&self, role: &ResolvedAgent) -> Check {
         self.check_inner(role, false).await
     }
 
-    async fn refresh(&self, role: &ResolvedRole) -> Check {
+    async fn refresh(&self, role: &ResolvedAgent) -> Check {
         self.check_inner(role, true).await
     }
 
-    async fn check_inner(&self, role: &ResolvedRole, force: bool) -> Check {
+    async fn check_inner(&self, role: &ResolvedAgent, force: bool) -> Check {
         let key = role.launch.source_id.clone();
         if !force {
             let cached = self.cache.lock().await.get(&key).and_then(|cached| {
@@ -168,16 +168,17 @@ fn codex_check(report: &CodexUsageReport) -> Check {
 
 #[derive(Debug, Clone)]
 pub struct Selection {
-    pub role: ResolvedRole,
+    pub role: ResolvedAgent,
 }
 
 #[derive(Clone)]
 pub struct RolePool {
-    roles: Arc<Vec<ResolvedRole>>,
+    roles: Arc<Vec<ResolvedAgent>>,
     state: Arc<Mutex<PoolState>>,
     gate: Gate,
     auto_failover: bool,
-    role: crate::council_usage::Role,
+    /// Human-readable name of the pool, used in quota status messages.
+    label: &'static str,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
 }
 
@@ -190,10 +191,10 @@ struct PoolState {
 
 impl RolePool {
     pub fn new(
-        roles: Vec<ResolvedRole>,
+        roles: Vec<ResolvedAgent>,
         gate: Gate,
         auto_failover: bool,
-        role: crate::council_usage::Role,
+        label: &'static str,
         ui_tx: mpsc::UnboundedSender<UiEvent>,
     ) -> Self {
         assert!(!roles.is_empty(), "role pool requires an initial role");
@@ -202,12 +203,12 @@ impl RolePool {
             state: Arc::default(),
             gate,
             auto_failover,
-            role,
+            label,
             ui_tx,
         }
     }
 
-    pub fn current(&self) -> ResolvedRole {
+    pub fn current(&self) -> ResolvedAgent {
         let state = self.state.lock().expect("role pool poisoned");
         self.roles[state.current].clone()
     }
@@ -232,8 +233,7 @@ impl RolePool {
                     }
                     return Err(format!(
                         "{} is paused because {} quota has 5% or less remaining",
-                        self.label(),
-                        role.launch.source_id
+                        self.label, role.launch.source_id
                     ));
                 }
             }
@@ -242,7 +242,7 @@ impl RolePool {
 
     /// Recheck a provider after an agent error. A positive quota result is
     /// handled here so callers can suppress the ordinary failure message.
-    pub async fn observe_failure(&self, role: &ResolvedRole) -> bool {
+    pub async fn observe_failure(&self, role: &ResolvedAgent) -> bool {
         match self.gate.refresh(role).await {
             Check::NearLimit { resets_at } => {
                 self.handle_near_limit(role, resets_at);
@@ -253,7 +253,7 @@ impl RolePool {
     }
 
     /// Returns true when the current role moved to a fallback.
-    fn handle_near_limit(&self, failed: &ResolvedRole, resets_at: Option<i64>) -> bool {
+    fn handle_near_limit(&self, failed: &ResolvedAgent, resets_at: Option<i64>) -> bool {
         let provider = failed.launch.source_id.clone();
         let mut state = self.state.lock().expect("role pool poisoned");
         state.excluded_providers.insert(provider.clone());
@@ -272,12 +272,9 @@ impl RolePool {
             state.announced_block = false;
             let _ = self.ui_tx.send(UiEvent::Info(format!(
                 "{} quota guard switched {} to {}",
-                self.label(),
-                failed.model.model,
-                replacement.model.model
+                self.label, failed.model.model, replacement.model.model
             )));
-            let _ = self.ui_tx.send(UiEvent::CouncilRoleChanged {
-                role: self.role,
+            let _ = self.ui_tx.send(UiEvent::SubagentPoolModelChanged {
                 model: replacement.model.model.clone(),
             });
             return true;
@@ -289,21 +286,11 @@ impl RolePool {
                 .unwrap_or_default();
             let _ = self.ui_tx.send(UiEvent::Warning(format!(
                 "{} paused: {} quota has 5% or less remaining{}",
-                self.label(),
-                provider,
-                reset
+                self.label, provider, reset
             )));
             state.announced_block = true;
         }
         false
-    }
-
-    fn label(&self) -> &'static str {
-        match self.role {
-            crate::council_usage::Role::Thor => "Thor",
-            crate::council_usage::Role::Loki => "Loki",
-            crate::council_usage::Role::Eitri => "Eitri",
-        }
     }
 }
 
@@ -312,11 +299,11 @@ mod tests {
     use super::*;
     use crate::claude_usage::ClaudeUsageWindow;
     use crate::codex_usage::CodexUsageWindow;
-    use crate::council::{AdapterKind, AdapterLaunch};
     use crate::deepswe::Row;
+    use crate::roster::{AdapterKind, AdapterLaunch};
 
-    fn role(model: &str, source_id: &str, kind: AdapterKind) -> ResolvedRole {
-        ResolvedRole {
+    fn role(model: &str, source_id: &str, kind: AdapterKind) -> ResolvedAgent {
+        ResolvedAgent {
             model: Row {
                 model: model.into(),
                 reasoning_effort: None,
@@ -379,7 +366,7 @@ mod tests {
             vec![claude.clone(), codex.clone()],
             Gate::new(PathBuf::from("."), ui_tx.clone()),
             true,
-            crate::council_usage::Role::Loki,
+            "subagents",
             ui_tx,
         );
 
@@ -388,10 +375,7 @@ mod tests {
         assert!(matches!(ui_rx.try_recv(), Ok(UiEvent::Info(_))));
         assert!(matches!(
             ui_rx.try_recv(),
-            Ok(UiEvent::CouncilRoleChanged {
-                role: crate::council_usage::Role::Loki,
-                ..
-            })
+            Ok(UiEvent::SubagentPoolModelChanged { .. })
         ));
     }
 
@@ -403,7 +387,7 @@ mod tests {
             vec![claude.clone()],
             Gate::new(PathBuf::from("."), ui_tx.clone()),
             false,
-            crate::council_usage::Role::Loki,
+            "subagents",
             ui_tx,
         );
 

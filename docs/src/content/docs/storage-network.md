@@ -12,7 +12,7 @@ equivalents.
 
 | Category | Purpose |
 | --- | --- |
-| `config.toml` | Council, ACP policy, permissions, review, theme, and spinner preferences |
+| `config.toml` | Primary/subagent models, ACP policy, review, theme, and spinner preferences |
 | Session provenance | Maps resumable session IDs to their original adapter/model route |
 | Transcript exports | User-requested Markdown exports |
 | DeepSWE cache | Live model-ranking snapshot, refreshed on a time-to-live |
@@ -35,13 +35,13 @@ a worktree does not delete remote or provider session records.
 | DeepSWE/DataCurve | Model ranking refresh |
 | ACP registry CDN | Adapter catalog and supported binary downloads |
 | npm registry | `npx`-launched Codex and Claude ACP bridges |
-| Model providers | Active Thor, Eitri, and Loki sessions |
+| Model providers | Active primary, subagent, and review sessions |
 | Voice model hosts | First-use speech model download |
 | Tailscale/Let's Encrypt | Optional trusted remote-server certificate issuance |
 
 Network failures normally degrade one route or refresh rather than making every
 cached route unavailable. An initial setup with no cached or installed route
-can still require network access before a Council is launchable.
+can still require network access before any model is launchable.
 
 ## Logs
 

@@ -24,9 +24,9 @@ use agent_client_protocol::schema::v1::{
 };
 
 use crate::event::{
-    CodeAgentEvent, CodeAgentOutcome, ElicitationOutcome, ElicitationPrompt, InternalMessage,
-    LokiActivity, PermissionDecision, PermissionPrompt, PromptImage, ReviewTarget,
-    SessionConfigTarget, TerminalOutputSnapshot, UiEvent, content_block_text,
+    ElicitationOutcome, ElicitationPrompt, InternalMessage, PermissionDecision, PermissionPrompt,
+    PromptImage, ReviewTarget, SessionConfigTarget, SubagentEvent, SubagentOutcome,
+    TerminalOutputSnapshot, UiEvent, content_block_text,
 };
 use crate::palette::TerminalTheme;
 use crate::ragnarok;
@@ -37,6 +37,55 @@ use crate::theme::TerminalThemeKind;
 /// Maximum width of the queued-prompt preview shown above the input.
 /// Beyond this we truncate with an ellipsis.
 pub const QUEUED_PROMPT_PREVIEW_WIDTH: usize = 40;
+
+/// How long a finished subagent's status row stays on screen before it is
+/// pruned. Long enough to read the outcome, short enough that the status area
+/// tracks what is actually running.
+pub const SUBAGENT_DONE_TTL: Duration = Duration::from_secs(5);
+
+/// Longest excerpt of an objective or failure message kept in a subagent's
+/// permanent transcript record.
+const SUBAGENT_RECORD_LINE_CHARS: usize = 160;
+
+/// One subagent's live progress line in the dedicated status area. The
+/// transcript keeps only the permanent start/finish records; everything that
+/// changes many times per turn lives here instead, so a chatty subagent never
+/// rewrites transcript history.
+#[derive(Debug, Clone)]
+pub struct SubagentStatus {
+    pub label: String,
+    pub model: Option<String>,
+    /// Latest distilled one-liner: the objective at spawn, then whatever the
+    /// subagent is doing now.
+    pub activity: String,
+    /// Stamped UI-side on `Started`, so elapsed time is measured against the
+    /// same clock that renders it.
+    pub started_at: Instant,
+    /// Outcome and the moment it landed, once the subagent is done.
+    pub finished: Option<(SubagentOutcome, Instant)>,
+}
+
+impl SubagentStatus {
+    /// Wall-clock the row displays: still counting while running, frozen at the
+    /// finish for a done row.
+    pub fn elapsed_at(&self, now: Instant) -> Duration {
+        let end = match self.finished.as_ref() {
+            Some((_, finished_at)) => *finished_at,
+            None => now,
+        };
+        end.saturating_duration_since(self.started_at)
+    }
+
+    pub fn outcome(&self) -> Option<&SubagentOutcome> {
+        self.finished.as_ref().map(|(outcome, _)| outcome)
+    }
+
+    fn expired_at(&self, now: Instant) -> bool {
+        self.finished
+            .as_ref()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= SUBAGENT_DONE_TTL)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnvilQuotaSource {
@@ -54,7 +103,7 @@ const BUILTIN_SIDE_COMMAND: &str = "side";
 const BUILTIN_EXPORT_COMMAND: &str = "export";
 const BUILTIN_MJCONFIG_COMMAND: &str = "mjconfig";
 const BUILTIN_MODELS_COMMAND: &str = "models";
-const BUILTIN_COUNCIL_COMMAND: &str = "council";
+const BUILTIN_AGENTS_COMMAND: &str = "agents";
 const BUILTIN_REVIEW_COMMAND: &str = "review";
 const BUILTIN_RAGNAROK_COMMAND: &str = "ragnarok";
 const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
@@ -73,7 +122,7 @@ fn builtin_clear_command() -> AvailableCommand {
 fn builtin_compact_command() -> AvailableCommand {
     AvailableCommand::new(
         BUILTIN_COMPACT_COMMAND,
-        "compact Thor and Loki where supported",
+        "compact the primary agent's session where supported",
     )
 }
 
@@ -102,18 +151,18 @@ fn builtin_export_command() -> AvailableCommand {
 fn builtin_mjconfig_command() -> AvailableCommand {
     AvailableCommand::new(
         BUILTIN_MJCONFIG_COMMAND,
-        "configure Council, ACP servers, and appearance",
+        "configure agents, ACP servers, and appearance",
     )
 }
 
 fn builtin_models_command() -> AvailableCommand {
-    AvailableCommand::new(BUILTIN_MODELS_COMMAND, "open Council model settings")
+    AvailableCommand::new(BUILTIN_MODELS_COMMAND, "open model settings")
 }
 
-fn builtin_council_command() -> AvailableCommand {
+fn builtin_agents_command() -> AvailableCommand {
     AvailableCommand::new(
-        BUILTIN_COUNCIL_COMMAND,
-        "show active Council model selections",
+        BUILTIN_AGENTS_COMMAND,
+        "show active model selections and usage",
     )
 }
 
@@ -146,7 +195,7 @@ fn install_builtin_commands(
             && command.name != BUILTIN_EXPORT_COMMAND
             && command.name != BUILTIN_MJCONFIG_COMMAND
             && command.name != BUILTIN_MODELS_COMMAND
-            && command.name != BUILTIN_COUNCIL_COMMAND
+            && command.name != BUILTIN_AGENTS_COMMAND
             && command.name != BUILTIN_REVIEW_COMMAND
             && command.name != BUILTIN_RAGNAROK_COMMAND
     });
@@ -159,7 +208,7 @@ fn install_builtin_commands(
     commands.insert(0, builtin_ragnarok_command());
     commands.insert(0, builtin_mjconfig_command());
     commands.insert(0, builtin_review_command());
-    commands.insert(0, builtin_council_command());
+    commands.insert(0, builtin_agents_command());
     commands.insert(0, builtin_models_command());
     commands.insert(0, builtin_export_command());
     commands.insert(0, builtin_load_command());
@@ -179,7 +228,7 @@ fn install_side_builtin_commands(commands: &mut Vec<AvailableCommand>) {
             BUILTIN_SIDE_COMMAND,
             BUILTIN_MJCONFIG_COMMAND,
             BUILTIN_MODELS_COMMAND,
-            BUILTIN_COUNCIL_COMMAND,
+            BUILTIN_AGENTS_COMMAND,
             BUILTIN_REVIEW_COMMAND,
             BUILTIN_RAGNAROK_COMMAND,
         ]
@@ -190,7 +239,7 @@ fn install_side_builtin_commands(commands: &mut Vec<AvailableCommand>) {
 }
 
 /// How the UI loop ends, so `main` can decide whether to quit entirely
-/// or start a fresh session from the saved Council preferences.
+/// or start a fresh session from the saved model preferences.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum UiExitReason {
     Quit,
@@ -216,18 +265,16 @@ pub enum Entry {
     /// Streaming agent reasoning ("thoughts").
     AgentThought(ThoughtEntry),
     /// Nested agent response and reasoning, kept visually distinct from the primary.
-    CodeAgentMessage(String),
-    CodeAgentThought(ThoughtEntry),
+    SubagentMessage(String),
+    SubagentThought(ThoughtEntry),
     /// A tool call slot identified by id. The body is rendered from
     /// `tool_calls[id]`; we keep an entry pointer so it shows up in order.
     ToolCall(String),
-    CodeAgentToolCall(String),
+    SubagentToolCall(String),
     /// Latest plan posted by the agent.
     Plan(Vec<PlanEntry>),
-    CodeAgentPlan(Vec<PlanEntry>),
-    /// Role/model-attributed Loki reviewer activity.
-    LokiActivity(Box<LokiActivity>),
-    /// Council coordination prompt retained in full but normally rendered compactly.
+    SubagentPlan(Vec<PlanEntry>),
+    /// Orchestration prompt retained in full but normally rendered compactly.
     InternalMessage(InternalMessage),
     /// System-level note (errors, warnings, mode changes).
     System(String),
@@ -377,62 +424,50 @@ impl ToolCallView {
     }
 }
 
-pub(crate) fn is_code_agent_transport_call(tool_call: &ToolCall) -> bool {
-    code_agent_identity_from_raw_input(tool_call.raw_input.as_ref())
-        || code_agent_identity_from_name(&tool_call.title)
-        || code_agent_identity_from_meta(tool_call.meta.as_ref())
+/// Prefix stamped onto every id that came from a subagent's ACP session.
+const SUBAGENT_ID_PREFIX: &str = "subagent-";
+
+pub(crate) fn is_subagent_transport_call(tool_call: &ToolCall) -> bool {
+    subagent_identity_from_raw_input(tool_call.raw_input.as_ref())
+        || subagent_identity_from_name(&tool_call.title)
+        || subagent_identity_from_meta(tool_call.meta.as_ref())
 }
 
-pub(crate) fn is_code_agent_transport_update(update: &ToolCallUpdate) -> bool {
-    code_agent_identity_from_raw_input(update.fields.raw_input.as_ref())
+pub(crate) fn is_subagent_transport_update(update: &ToolCallUpdate) -> bool {
+    subagent_identity_from_raw_input(update.fields.raw_input.as_ref())
         || update
             .fields
             .title
             .as_deref()
-            .is_some_and(code_agent_identity_from_name)
-        || code_agent_identity_from_meta(update.meta.as_ref())
+            .is_some_and(subagent_identity_from_name)
+        || subagent_identity_from_meta(update.meta.as_ref())
 }
 
-fn code_agent_identity_from_raw_input(raw_input: Option<&serde_json::Value>) -> bool {
+fn subagent_identity_from_raw_input(raw_input: Option<&serde_json::Value>) -> bool {
     let Some(object) = raw_input.and_then(serde_json::Value::as_object) else {
         return false;
     };
     object
         .get("server")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|server| server == "mj-code-agent")
+        .is_some_and(|server| server == "mj-subagents")
         && object
             .get("tool")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|tool| {
-                matches!(
-                    tool,
-                    "code_agent"
-                        | "code_agent_continue"
-                        | "code_agent_cancel"
-                        | "explore_agent"
-                        | "explore_agents"
-                )
-            })
+            .is_some_and(|tool| matches!(tool, "create_subagent" | "subagent_cancel"))
 }
 
-fn code_agent_identity_from_name(name: &str) -> bool {
+fn subagent_identity_from_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    name.contains("mj-code-agent")
-        && [
-            "code_agent",
-            "code_agent_continue",
-            "code_agent_cancel",
-            "explore_agent",
-            "explore_agents",
-        ]
-        .into_iter()
-        .any(|tool| contains_tool_identifier(&name, tool))
+    name.contains("mj-subagents")
+        && ["create_subagent", "subagent_cancel"]
+            .into_iter()
+            .any(|tool| contains_tool_identifier(&name, tool))
 }
 
 /// Tool titles arrive in a few transport-specific forms (for example
-/// `mcp.mj-code-agent.explore_agents` and
-/// `mcp__mj-code-agent__explore_agents`).  Match complete identifiers so a
+/// `mcp.mj-subagents.create_subagent` and
+/// `mcp__mj-subagents__create_subagent`).  Match complete identifiers so a
 /// similarly named third-party tool is not hidden from the transcript.
 fn contains_tool_identifier(name: &str, tool: &str) -> bool {
     name.match_indices(tool).any(|(start, _)| {
@@ -447,21 +482,19 @@ fn contains_tool_identifier(name: &str, tool: &str) -> bool {
     })
 }
 
-fn code_agent_identity_from_meta(
-    meta: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> bool {
+fn subagent_identity_from_meta(meta: Option<&serde_json::Map<String, serde_json::Value>>) -> bool {
     let Some(meta) = meta else {
         return false;
     };
     meta.get("toolName")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(code_agent_identity_from_name)
+        .is_some_and(subagent_identity_from_name)
         || meta
             .get("claudeCode")
             .and_then(serde_json::Value::as_object)
             .and_then(|claude| claude.get("toolName"))
             .and_then(serde_json::Value::as_str)
-            .is_some_and(code_agent_identity_from_name)
+            .is_some_and(subagent_identity_from_name)
 }
 
 /// Lifecycle of the ACP connection from launch through shutdown.
@@ -553,6 +586,17 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// True once this seat has reported any token or context figure.
+    fn has_counts(&self) -> bool {
+        self.total_tokens.is_some()
+            || self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.thought_tokens.is_some()
+            || self.context_used.is_some()
+            || self.context_size.is_some()
+            || self.cost.is_some()
+    }
+
     fn apply_prompt_usage(&mut self, usage: Usage) {
         self.total_tokens = Some(usage.total_tokens);
         self.input_tokens = Some(usage.input_tokens);
@@ -676,7 +720,7 @@ pub struct AppState {
     pub spinner_style: SpinnerStyle,
     /// Open `/mjconfig` overlay, if any.
     pub mjconfig_menu: Option<MjConfigMenu>,
-    pub council_inventory: crate::council::AcpInventory,
+    pub acp_inventory: crate::roster::AcpInventory,
     /// Active `/ragnarok` battle (arena overlay), if any.
     pub ragnarok: Option<RagnarokUi>,
     /// One-shot launch request set by `/ragnarok <task>`. The UI loop takes
@@ -695,7 +739,7 @@ pub struct AppState {
     /// resolver keys on. Empty until the launch site fills it in.
     pub agent_source_id: String,
     /// Launch command for the active session agent. Ragnarok uses this for
-    /// Thor so the router follows the user's current agent instead of the
+    /// the primary agent so the router follows the user's current agent instead of the
     /// competitor pool.
     pub active_agent_launch: Option<crate::ragnarok::Launch>,
     /// Score catalog for this UI run. It may be populated asynchronously after
@@ -725,9 +769,20 @@ pub struct AppState {
     /// Actor-owned streaming message blocks.  Unlike thoughts, a message can
     /// remain open while another actor reports coordination activity after it.
     /// Keeping that ownership separate from transcript position prevents a
-    /// later Thor/Loki row from splitting Eitri's result into immutable pieces.
+    /// later primary row from splitting a subagent's result into immutable pieces.
     agent_open_message_index: Option<usize>,
-    code_agent_open_message_index: Option<usize>,
+    subagent_open_message_index: Option<usize>,
+    /// Owner of the one mutable subagent message slot. Transcript entries do
+    /// not carry an actor id, so switching between concurrent subagents closes
+    /// the previous slot before opening another instead of merging their text.
+    subagent_open_message_owner: Option<u64>,
+    /// Owner of the one unfinished subagent thought entry. As with messages,
+    /// an actor switch creates a transcript boundary rather than interleaving
+    /// two sessions into one thought.
+    subagent_open_thought_owner: Option<u64>,
+    /// Latest plan entry for each subagent. A global "last subagent plan"
+    /// lookup lets one concurrent worker overwrite another worker's plan.
+    subagent_plan_indices: HashMap<u64, usize>,
     pub tool_calls: HashMap<String, ToolCallView>,
     /// Per-tool expansion choices, keyed by ACP tool-call ID. `true` means
     /// expanded; entries matching the renderer's default are omitted.
@@ -739,7 +794,7 @@ pub struct AppState {
     /// Consumed when that turn completes so an older diff cannot affect a
     /// later no-diff turn's status.
     pending_workspace_diff_total: Option<usize>,
-    /// Primary-agent MCP calls that transport an Eitri turn. Their protocol
+    /// Primary-agent MCP calls that transport a subagent turn. Their protocol
     /// state remains available, but the redundant parent row is omitted from
     /// the transcript so it cannot pin nested activity behind a pending tool.
     suppressed_tool_calls: HashSet<String>,
@@ -815,15 +870,17 @@ pub struct AppState {
     pub exit_reason: Option<UiExitReason>,
     /// True once the runtime has stopped accepting commands.
     pub runtime_closed: bool,
-    /// Eitri currently owns the foreground ACP lane while Thor is suspended in
-    /// the `code_agent` MCP request.
-    pub code_agent_active: bool,
-    /// Eitri identity currently holding the interactive UI/control lane.
-    pub code_agent_label: Option<String>,
-    /// Number of read-only Eitri scouts currently running in the background.
-    pub active_explorations: usize,
-    exploration_entries: HashMap<u64, usize>,
-    pub council_usage: crate::council_usage::Snapshot,
+    /// At least one subagent is currently running in the background.
+    pub subagent_active: bool,
+    /// Display label of the most recently started subagent.
+    pub subagent_label: Option<String>,
+    /// Number of subagents currently running in the background.
+    pub active_subagents: usize,
+    /// One row per subagent for the dedicated status area, keyed by id so the
+    /// map iterates in spawn order. Finished rows linger for
+    /// [`SUBAGENT_DONE_TTL`] and are pruned lazily.
+    subagents: BTreeMap<u64, SubagentStatus>,
+    pub agent_usage: crate::agent_usage::Snapshot,
     /// Transient status line with severity.
     pub status_line: Option<StatusMessage>,
     /// True while the local microphone dictation helper is running.
@@ -841,9 +898,10 @@ pub struct AppState {
     connection_state_started_at: Instant,
     /// Last token/context usage reported by the agent.
     pub token_usage: TokenUsage,
-    /// Usage for the fresh nested Eitri session currently holding the wheel.
-    /// Kept separate so the header never presents Thor's context as Eitri's.
-    code_agent_token_usage: TokenUsage,
+    /// Usage for the most recently started nested subagent session. Kept
+    /// separate so the header never presents the primary's context as a
+    /// subagent's.
+    subagent_token_usage: TokenUsage,
     /// Last Claude Code `/usage` quota scrape, when the active agent is Claude.
     pub claude_usage: Option<ClaudeUsageStatus>,
     /// Last Codex app-server quota query, including explicit unavailable states.
@@ -876,14 +934,14 @@ pub struct AppState {
     pub transcript_export_dir: Option<PathBuf>,
     /// Config file used by local UI-only settings such as `/mjconfig`.
     pub config_path: Option<PathBuf>,
-    /// DeepSWE model catalog and current model-first council selectors.
-    pub council_choices: Vec<crate::council::ModelChoice>,
+    /// DeepSWE model catalog and current model-first selectors.
+    pub model_choices: Vec<crate::roster::ModelChoice>,
     /// Preferences saved for the next `/new` or `/clear` boundary and immutable
     /// resolutions used by the current session are deliberately shown separately.
-    pub council_models: crate::config::ModelsConfig,
-    pub active_council_models: crate::config::ModelsConfig,
-    pub thor_review_enabled: bool,
-    pub ragnarok_models: Vec<crate::council::ResolvedRole>,
+    pub configured_models: crate::config::ModelsConfig,
+    pub active_models: crate::config::ModelsConfig,
+    pub review_enabled: bool,
+    pub ragnarok_models: Vec<crate::roster::ResolvedAgent>,
     /// Holds the platform clipboard lease so copied text remains available
     /// on Linux/X11 where the owning process must stay alive.
     #[allow(dead_code)]
@@ -917,7 +975,7 @@ pub struct PendingPermission {
     pub prompt: PermissionPrompt,
     pub selected: usize,
     pub scroll_offset: Option<usize>,
-    pub code_agent: bool,
+    pub subagent: bool,
 }
 
 #[derive(Debug)]
@@ -933,7 +991,7 @@ pub struct PendingElicitation {
     /// append/backspace at the end (the cursor renders after the last char);
     /// empty for every other view.
     pub input: String,
-    pub code_agent: bool,
+    pub subagent: bool,
 }
 
 /// How a pending elicitation should be rendered and resolved, derived once
@@ -1062,7 +1120,7 @@ impl InputPasteBurst {
     }
 }
 
-/// Deferred Thor model picker overlay state.
+/// Deferred primary-agent model picker overlay state.
 #[derive(Debug, Clone)]
 pub struct AgentPicker {
     pub selected: usize,
@@ -1110,7 +1168,7 @@ impl AppState {
             theme: theme_kind.palette(),
             spinner_style: SpinnerStyle::default(),
             mjconfig_menu: None,
-            council_inventory: crate::council::AcpInventory::default(),
+            acp_inventory: crate::roster::AcpInventory::default(),
             ragnarok: None,
             ragnarok_launch: None,
             session_cwd: PathBuf::from("."),
@@ -1141,7 +1199,10 @@ impl AppState {
             side_main_notice: None,
             transcript: Vec::new(),
             agent_open_message_index: None,
-            code_agent_open_message_index: None,
+            subagent_open_message_index: None,
+            subagent_open_message_owner: None,
+            subagent_open_thought_owner: None,
+            subagent_plan_indices: HashMap::new(),
             tool_calls: HashMap::new(),
             tool_detail_overrides: HashMap::new(),
             workspace_diffs: Vec::new(),
@@ -1171,11 +1232,11 @@ impl AppState {
             workspace_diff_scroll_offset: 0,
             exit_reason: None,
             runtime_closed: false,
-            code_agent_active: false,
-            code_agent_label: None,
-            active_explorations: 0,
-            exploration_entries: HashMap::new(),
-            council_usage: crate::council_usage::Snapshot::default(),
+            subagent_active: false,
+            subagent_label: None,
+            active_subagents: 0,
+            subagents: BTreeMap::new(),
+            agent_usage: crate::agent_usage::Snapshot::default(),
             status_line: None,
             voice_input_active: false,
             voice_input_range: None,
@@ -1186,7 +1247,7 @@ impl AppState {
             active_prompt_turn: None,
             connection_state_started_at: now,
             token_usage: TokenUsage::default(),
-            code_agent_token_usage: TokenUsage::default(),
+            subagent_token_usage: TokenUsage::default(),
             claude_usage: None,
             codex_usage: None,
             bedrock_credits: None,
@@ -1202,10 +1263,10 @@ impl AppState {
             additional_roots: 0,
             transcript_export_dir: None,
             config_path: None,
-            council_choices: Vec::new(),
-            council_models: crate::config::ModelsConfig::default(),
-            active_council_models: crate::config::ModelsConfig::default(),
-            thor_review_enabled: true,
+            model_choices: Vec::new(),
+            configured_models: crate::config::ModelsConfig::default(),
+            active_models: crate::config::ModelsConfig::default(),
+            review_enabled: true,
             ragnarok_models: Vec::new(),
             clipboard_lease: None,
             queued_prompts: VecDeque::new(),
@@ -1225,7 +1286,7 @@ impl AppState {
         side.worktree_label = self.worktree_label.clone();
         side.additional_roots = self.additional_roots;
         side.session_cwd = self.session_cwd.clone();
-        side.agent_label = format!("Side · {}", self.agent_label.trim_start_matches("Thor · "));
+        side.agent_label = format!("Side · {}", self.agent_label);
         side.primary_acp_name = self.primary_acp_name.clone();
         side.agent_source_id = self.agent_source_id.clone();
         side.active_agent_launch = self.active_agent_launch.clone();
@@ -1248,8 +1309,8 @@ impl AppState {
         self.agent_open_message_index
     }
 
-    pub(crate) fn code_agent_open_message_index(&self) -> Option<usize> {
-        self.code_agent_open_message_index
+    pub(crate) fn subagent_open_message_index(&self) -> Option<usize> {
+        self.subagent_open_message_index
     }
 
     /// Select the Anvil provider reported by valid metadata and clear its stale peer.
@@ -1320,7 +1381,7 @@ impl AppState {
         let selected = role_indices
             .iter()
             .position(|&index| {
-                self.ragnarok_models[index].model.model == self.active_council_models.thor
+                self.ragnarok_models[index].model.model == self.active_models.primary
             })
             .unwrap_or(0);
         self.agent_picker = Some(AgentPicker {
@@ -1349,7 +1410,7 @@ impl AppState {
         let Some(role) = self.ragnarok_models.get(role_index) else {
             return false;
         };
-        if role.model.model == self.active_council_models.thor {
+        if role.model.model == self.active_models.primary {
             self.agent_picker = None;
             return false;
         }
@@ -1357,7 +1418,7 @@ impl AppState {
         true
     }
 
-    pub fn agent_picker_confirm(&mut self) -> Option<crate::council::ResolvedRole> {
+    pub fn agent_picker_confirm(&mut self) -> Option<crate::roster::ResolvedAgent> {
         let picker = self.agent_picker.take()?;
         if !picker.confirming {
             return None;
@@ -1376,9 +1437,9 @@ impl AppState {
         config.theme = self.theme_kind;
         config.spinner = self.spinner_style;
         self.mjconfig_menu = Some(MjConfigMenu {
-            editor: SettingsEditor::new(config, self.council_choices.clone(), None)
-                .with_active_models(self.active_council_models.clone())
-                .with_inventory(self.council_inventory.clone()),
+            editor: SettingsEditor::new(config, self.model_choices.clone(), None)
+                .with_active_models(self.active_models.clone())
+                .with_inventory(self.acp_inventory.clone()),
             orig_theme: self.theme_kind,
             orig_spinner: self.spinner_style,
         });
@@ -1698,13 +1759,12 @@ impl AppState {
             Entry::AgentMessage(text) => Some(text.clone()),
             Entry::UserPrompt(_)
             | Entry::AgentThought(_)
-            | Entry::CodeAgentMessage(_)
-            | Entry::CodeAgentThought(_)
+            | Entry::SubagentMessage(_)
+            | Entry::SubagentThought(_)
             | Entry::ToolCall(_)
-            | Entry::CodeAgentToolCall(_)
+            | Entry::SubagentToolCall(_)
             | Entry::Plan(_)
-            | Entry::CodeAgentPlan(_)
-            | Entry::LokiActivity(_)
+            | Entry::SubagentPlan(_)
             | Entry::InternalMessage(_)
             | Entry::System(_)
             | Entry::SessionBoundary(_) => None,
@@ -1779,8 +1839,11 @@ impl AppState {
     }
 
     pub fn displayed_token_usage(&self) -> &TokenUsage {
-        if self.code_agent_active {
-            &self.code_agent_token_usage
+        // A subagent that has not reported usage yet -- and a discrete-review
+        // lane, which has no nested session in this UI at all -- must not blank
+        // out the primary's numbers.
+        if self.subagent_active && self.subagent_token_usage.has_counts() {
+            &self.subagent_token_usage
         } else {
             &self.token_usage
         }
@@ -1835,7 +1898,7 @@ impl AppState {
 
     pub fn push_session_boundary(&mut self, text: impl Into<String>) {
         self.finalize_message(EntryKind::Agent);
-        self.finalize_message(EntryKind::CodeAgent);
+        self.finalize_message(EntryKind::Subagent);
         self.transcript.push(Entry::SessionBoundary(text.into()));
         self.bump_transcript_revision();
     }
@@ -2103,7 +2166,8 @@ impl AppState {
     pub fn record_user_prompt(&mut self, text: String) {
         self.pending_workspace_diff_total = None;
         self.agent_open_message_index = None;
-        self.code_agent_open_message_index = None;
+        self.subagent_open_message_index = None;
+        self.subagent_open_message_owner = None;
         let prompt_index = self.transcript.len();
         self.transcript.push(Entry::UserPrompt(text.clone()));
         self.prompt_turns.push(PromptTurn {
@@ -2439,20 +2503,27 @@ impl AppState {
                 self.hidden_session_config_ids.extend(hidden_config_ids);
                 self.apply_session_config_options(options, targets);
             }
-            UiEvent::CouncilUpdate { choices, inventory } => {
-                self.council_choices = choices;
-                self.council_inventory = inventory;
+            UiEvent::RosterUpdate { choices, inventory } => {
+                self.model_choices = choices;
+                self.acp_inventory = inventory;
             }
-            UiEvent::LokiActivity(activity) => self.apply_loki_activity(activity),
             UiEvent::InternalMessage(message) => {
-                // A Loki interjection starts a fresh council-initiated Thor
+                // An internal message starts a fresh orchestrator-initiated
+                // exchange. The previous turn's completion may have been
+                // deliberately withheld (a Findings verdict drops it and lets
+                // the corrective turn produce the real one), so no PromptDone
+                // finalized the open message; close it here or the next
+                // turn's chunks silently append onto the stale entry.
+                self.finalize_thinking(EntryKind::Thought);
+                self.finalize_message(EntryKind::Agent);
+                self.finalize_message(EntryKind::Subagent);
+                // A discrete review starts a fresh orchestrator-initiated
                 // turn after the user's turn already completed. Re-enter the
                 // streaming state so submissions queue behind it instead of
                 // racing the in-flight prompt.
                 if matches!(
                     message.kind,
-                    crate::event::InternalMessageKind::Interjection
-                        | crate::event::InternalMessageKind::DiscreteReview
+                    crate::event::InternalMessageKind::DiscreteReview
                 ) && self.connection_state == ConnectionState::Ready
                 {
                     self.set_connection_state(ConnectionState::Streaming);
@@ -2462,12 +2533,10 @@ impl AppState {
                 self.transcript.push(Entry::InternalMessage(message));
                 self.bump_transcript_revision();
             }
-            UiEvent::CouncilUsage(record) => self.council_usage.observe(record),
-            UiEvent::CouncilRoleChanged { role, model } => match role {
-                crate::council_usage::Role::Thor => self.active_council_models.thor = model,
-                crate::council_usage::Role::Loki => self.active_council_models.loki = model,
-                crate::council_usage::Role::Eitri => self.active_council_models.eitri = model,
-            },
+            UiEvent::AgentUsage(record) => self.agent_usage.observe(record),
+            UiEvent::SubagentPoolModelChanged { model } => {
+                self.active_models.subagent = model;
+            }
             UiEvent::WorkspaceDiff(diff) => {
                 self.pending_workspace_diff_total = Some(diff.total_files);
                 self.workspace_diffs.push(diff);
@@ -2487,7 +2556,7 @@ impl AppState {
                     prompt,
                     selected: 0,
                     scroll_offset: None,
-                    code_agent: false,
+                    subagent: false,
                 });
                 self.update_autocomplete();
             }
@@ -2509,11 +2578,11 @@ impl AppState {
                     selected: 0,
                     scroll_offset: None,
                     input: String::new(),
-                    code_agent: false,
+                    subagent: false,
                 });
                 self.update_autocomplete();
             }
-            UiEvent::CodeAgent(event) => self.apply_code_agent_event(event),
+            UiEvent::Subagent(event) => self.apply_subagent_event(event),
             UiEvent::RemotePermissionDecision {
                 request_id,
                 option_id,
@@ -2523,7 +2592,7 @@ impl AppState {
             UiEvent::PromptDone { stop_reason, usage } => {
                 self.finalize_thinking(EntryKind::Thought);
                 self.finalize_message(EntryKind::Agent);
-                self.finalize_message(EntryKind::CodeAgent);
+                self.finalize_message(EntryKind::Subagent);
                 self.finish_prompt_turn(matches!(stop_reason, StopReason::Cancelled));
                 if let Some(usage) = usage {
                     self.token_usage.apply_prompt_usage(usage);
@@ -2560,7 +2629,7 @@ impl AppState {
             UiEvent::PromptFailed { message } => {
                 self.finalize_thinking(EntryKind::Thought);
                 self.finalize_message(EntryKind::Agent);
-                self.finalize_message(EntryKind::CodeAgent);
+                self.finalize_message(EntryKind::Subagent);
                 self.finish_prompt_turn(true);
                 self.pending_workspace_diff_total = None;
                 // Drop queued prompts: finish_prompt_turn flips back to
@@ -2599,7 +2668,7 @@ impl AppState {
             UiEvent::Fatal(msg) => {
                 self.finalize_thinking(EntryKind::Thought);
                 self.finalize_message(EntryKind::Agent);
-                self.finalize_message(EntryKind::CodeAgent);
+                self.finalize_message(EntryKind::Subagent);
                 self.set_connection_state(ConnectionState::Fatal);
                 self.record_status_message(StatusKind::Fatal, msg);
                 self.mark_runtime_closed();
@@ -2607,106 +2676,155 @@ impl AppState {
         }
     }
 
-    fn apply_code_agent_event(&mut self, event: CodeAgentEvent) {
-        const PREFIX: &str = "codeagent:";
+    fn apply_subagent_event(&mut self, event: SubagentEvent) {
         match event {
-            CodeAgentEvent::Started { label } => {
-                self.code_agent_open_message_index = None;
-                self.code_agent_active = true;
-                self.code_agent_label = Some(label.clone());
-                self.code_agent_token_usage = TokenUsage::default();
-                self.set_status_line(StatusKind::Info, label);
-            }
-            CodeAgentEvent::ExplorationStarted { run_id, label } => {
-                let index = self.transcript.len();
-                self.transcript.push(Entry::System(format!(
-                    "{label} · explore #{run_id} · starting"
-                )));
-                self.exploration_entries.insert(run_id, index);
-                self.active_explorations = self.active_explorations.saturating_add(1);
-                self.bump_transcript_revision();
-            }
-            CodeAgentEvent::ExplorationProgress { run_id, activity } => {
-                if let Some(index) = self.exploration_entries.get(&run_id).copied()
-                    && let Some(Entry::System(text)) = self.transcript.get_mut(index)
-                {
-                    *text = format!("Eitri · explore #{run_id} · {activity}");
-                    self.bump_transcript_revision();
-                }
-            }
-            CodeAgentEvent::ExplorationFinished { run_id, outcome } => {
-                let status = match outcome {
-                    CodeAgentOutcome::Completed => "complete".to_string(),
-                    CodeAgentOutcome::Cancelled => "cancelled".to_string(),
-                    CodeAgentOutcome::Failed(message) => format!("failed · {message}"),
+            SubagentEvent::Started {
+                subagent_id,
+                label,
+                model,
+                agent,
+                objective,
+            } => {
+                self.subagent_active = true;
+                self.subagent_label = Some(label.clone());
+                self.subagent_token_usage = TokenUsage::default();
+                let objective = objective.trim().to_string();
+                self.subagents.insert(
+                    subagent_id,
+                    SubagentStatus {
+                        label: label.clone(),
+                        model: model.clone(),
+                        activity: objective.clone(),
+                        started_at: Instant::now(),
+                        finished: None,
+                    },
+                );
+                self.active_subagents = self.running_subagent_count();
+                let backend = match model {
+                    Some(model) => format!("{agent}/{model}"),
+                    None => agent,
                 };
-                if let Some(index) = self.exploration_entries.remove(&run_id)
-                    && let Some(Entry::System(text)) = self.transcript.get_mut(index)
-                {
-                    *text = format!("Eitri · explore #{run_id} · {status}");
-                    self.bump_transcript_revision();
-                }
-                self.active_explorations = self.active_explorations.saturating_sub(1);
+                // The transcript keeps exactly one permanent record per
+                // subagent start; live progress belongs to the status area.
+                let headline = ragnarok::first_line(&objective, SUBAGENT_RECORD_LINE_CHARS);
+                let started = if headline.is_empty() {
+                    format!("subagent #{subagent_id} · {label} · started")
+                } else {
+                    format!("subagent #{subagent_id} · {label} · started · {headline}")
+                };
+                self.push_system_message(started);
+                self.set_status_line(
+                    StatusKind::Info,
+                    format!("subagent #{subagent_id} · {label} ({backend})"),
+                );
             }
-            CodeAgentEvent::SessionUpdate(update) => self.apply_code_agent_update(update),
-            CodeAgentEvent::TerminalOutput(mut snapshot) => {
-                self.finalize_thinking(EntryKind::CodeAgentThought);
-                snapshot.terminal_id = format!("{PREFIX}{}", snapshot.terminal_id);
+            SubagentEvent::Activity {
+                subagent_id,
+                activity,
+            } => {
+                // Status-row only: no transcript entry, no revision bump. An
+                // in-place transcript rewrite here is what used to corrupt
+                // already-flushed inline scrollback.
+                if let Some(status) = self.subagents.get_mut(&subagent_id) {
+                    status.activity = activity;
+                }
+            }
+            SubagentEvent::SessionUpdate {
+                subagent_id,
+                update,
+            } => self.apply_subagent_update(subagent_id, update),
+            SubagentEvent::TerminalOutput {
+                subagent_id,
+                mut snapshot,
+            } => {
+                self.finalize_subagent_thinking(subagent_id);
+                snapshot.terminal_id = format!(
+                    "{}{}",
+                    Self::subagent_id_prefix(subagent_id),
+                    snapshot.terminal_id
+                );
                 self.terminal_outputs
                     .insert(snapshot.terminal_id.clone(), snapshot);
                 self.apply_known_terminal_outputs();
             }
-            CodeAgentEvent::PermissionRequest(prompt) => {
-                self.finalize_thinking(EntryKind::CodeAgentThought);
+            SubagentEvent::PermissionRequest {
+                subagent_id,
+                mut prompt,
+            } => {
+                self.finalize_subagent_thinking(subagent_id);
                 self.help_overlay = false;
+                let local_id = prompt.tool_call.tool_call_id.to_string();
+                prompt.tool_call.tool_call_id = format!("subagent-{subagent_id}:{local_id}").into();
                 self.permission_queue.push_back(PendingPermission {
                     prompt,
                     selected: 0,
                     scroll_offset: None,
-                    code_agent: true,
+                    subagent: true,
                 });
                 self.update_autocomplete();
             }
-            CodeAgentEvent::ElicitationRequest(prompt) => {
-                self.finalize_thinking(EntryKind::CodeAgentThought);
+            SubagentEvent::ElicitationRequest {
+                subagent_id,
+                mut prompt,
+            } => {
+                self.finalize_subagent_thinking(subagent_id);
                 self.help_overlay = false;
+                // Concurrent subagents can each raise a form; say which one.
+                prompt.message = format!("subagent #{subagent_id} · {}", prompt.message);
                 self.elicitation_queue.push_back(PendingElicitation {
                     prompt,
                     selected: 0,
                     scroll_offset: None,
                     input: String::new(),
-                    code_agent: true,
+                    subagent: true,
                 });
                 self.update_autocomplete();
             }
-            CodeAgentEvent::CancelPendingPermissions => {
-                self.finalize_thinking(EntryKind::CodeAgentThought);
-                self.cancel_code_agent_prompts();
-                self.mark_code_agent_tools_failed("tool call cancelled");
+            SubagentEvent::CancelPendingPermissions { subagent_id } => {
+                self.finalize_subagent_thinking(subagent_id);
+                self.cancel_subagent_prompts(subagent_id);
+                self.mark_subagent_tools_failed(subagent_id, "tool call cancelled");
             }
-            CodeAgentEvent::Status(message) => {
-                self.finalize_thinking(EntryKind::CodeAgentThought);
-                self.push_system_message(format!("Eitri · {message}"));
+            SubagentEvent::Status {
+                subagent_id,
+                message,
+            } => {
+                self.finalize_subagent_thinking(subagent_id);
+                self.push_system_message(format!("subagent #{subagent_id} · {message}"));
             }
-            CodeAgentEvent::Finished { outcome } => {
-                self.finalize_thinking(EntryKind::CodeAgentThought);
-                self.finalize_message(EntryKind::CodeAgent);
-                self.code_agent_active = false;
-                self.code_agent_label = None;
-                self.cancel_code_agent_prompts();
+            SubagentEvent::Finished {
+                subagent_id,
+                outcome,
+            } => {
+                self.finalize_subagent_thinking(subagent_id);
+                self.finalize_subagent_message(subagent_id);
+                self.cancel_subagent_prompts(subagent_id);
+                self.subagent_plan_indices.remove(&subagent_id);
+                self.finish_subagent_row(subagent_id, &outcome);
+                self.active_subagents = self.running_subagent_count();
+                if self.active_subagents == 0 {
+                    self.subagent_active = false;
+                    self.subagent_label = None;
+                }
                 match outcome {
-                    CodeAgentOutcome::Completed => {
-                        self.set_status_line(StatusKind::Info, "Eitri complete")
+                    SubagentOutcome::Completed => self.set_status_line(
+                        StatusKind::Info,
+                        format!("subagent #{subagent_id} complete"),
+                    ),
+                    SubagentOutcome::Cancelled => {
+                        self.mark_subagent_tools_failed(subagent_id, "tool call cancelled");
+                        self.set_status_line(
+                            StatusKind::Info,
+                            format!("subagent #{subagent_id} cancelled"),
+                        );
                     }
-                    CodeAgentOutcome::Cancelled => {
-                        self.mark_code_agent_tools_failed("tool call cancelled");
-                        self.set_status_line(StatusKind::Info, "Eitri cancelled");
-                    }
-                    CodeAgentOutcome::Failed(message) => {
-                        self.mark_code_agent_tools_failed("tool call failed");
-                        self.record_status_message(
+                    SubagentOutcome::Failed(message) => {
+                        self.mark_subagent_tools_failed(subagent_id, "tool call failed");
+                        // Status line only: the finish record above is already
+                        // this subagent's permanent transcript entry.
+                        self.set_status_line(
                             StatusKind::Warning,
-                            format!("Eitri failed · {message}"),
+                            format!("subagent #{subagent_id} failed · {message}"),
                         );
                     }
                 }
@@ -2714,16 +2832,92 @@ impl AppState {
         }
     }
 
+    /// Closes out a subagent's status row and appends its one permanent
+    /// transcript record. The row survives for [`SUBAGENT_DONE_TTL`] so the
+    /// outcome is readable, then a later render prunes it.
+    fn finish_subagent_row(&mut self, subagent_id: u64, outcome: &SubagentOutcome) {
+        let now = Instant::now();
+        let status = match outcome {
+            SubagentOutcome::Completed => "completed".to_string(),
+            SubagentOutcome::Cancelled => "cancelled".to_string(),
+            SubagentOutcome::Failed(message) => format!(
+                "failed: {}",
+                ragnarok::first_line(message, SUBAGENT_RECORD_LINE_CHARS)
+            ),
+        };
+        let record = match self.subagents.get_mut(&subagent_id) {
+            Some(row) => {
+                row.finished = Some((outcome.clone(), now));
+                format!(
+                    "subagent #{subagent_id} · {} · {status} · {}",
+                    row.label,
+                    crate::ui::format_duration(row.elapsed_at(now))
+                )
+            }
+            // A `Finished` with no row (a start this UI never saw) still gets
+            // its record; there is simply no elapsed time to report.
+            None => format!("subagent #{subagent_id} · {status}"),
+        };
+        self.push_system_message(record);
+        self.prune_finished_subagents(now);
+    }
+
+    fn prune_finished_subagents(&mut self, now: Instant) {
+        self.subagents.retain(|_, row| !row.expired_at(now));
+    }
+
+    /// Status rows in render order: everything still running first (in spawn
+    /// order), then rows that finished recently enough to still be shown.
+    pub fn subagent_status_rows_at(
+        &self,
+        now: Instant,
+    ) -> impl Iterator<Item = (u64, &SubagentStatus)> {
+        let running = self
+            .subagents
+            .iter()
+            .filter(|(_, row)| row.finished.is_none());
+        let done = self
+            .subagents
+            .iter()
+            .filter(move |(_, row)| row.finished.is_some() && !row.expired_at(now));
+        running.chain(done).map(|(id, row)| (*id, row))
+    }
+
+    pub fn subagent_status_rows(&self) -> impl Iterator<Item = (u64, &SubagentStatus)> {
+        self.subagent_status_rows_at(Instant::now())
+    }
+
+    /// True while the status area has anything to animate or expire, which is
+    /// what keeps timer-driven redraws running with an idle primary agent.
+    pub fn has_live_subagent_rows(&self) -> bool {
+        self.subagent_status_rows_at(Instant::now())
+            .next()
+            .is_some()
+    }
+
+    pub fn running_subagent_count(&self) -> usize {
+        self.subagents
+            .values()
+            .filter(|row| row.finished.is_none())
+            .count()
+    }
+
     fn finalize_thinking(&mut self, kind: EntryKind) {
         if finalize_active_thinking(&mut self.transcript, kind) {
             self.bump_transcript_revision();
+        }
+        if kind == EntryKind::SubagentThought {
+            self.subagent_open_thought_owner = None;
         }
     }
 
     fn finalize_message(&mut self, kind: EntryKind) {
         match kind {
             EntryKind::Agent => self.agent_open_message_index = None,
-            EntryKind::CodeAgent => self.code_agent_open_message_index = None,
+            EntryKind::Subagent => {
+                self.subagent_open_message_index = None;
+                self.subagent_open_message_owner = None;
+            }
             _ => unreachable!("finalize_message requires a message entry kind"),
         }
     }
@@ -2731,7 +2925,7 @@ impl AppState {
     fn append_message_chunk(&mut self, kind: EntryKind, text: String) {
         let open_entry = match kind {
             EntryKind::Agent => &mut self.agent_open_message_index,
-            EntryKind::CodeAgent => &mut self.code_agent_open_message_index,
+            EntryKind::Subagent => &mut self.subagent_open_message_index,
             _ => unreachable!("append_message_chunk requires a message entry kind"),
         };
         *open_entry = Some(append_or_start_owned(
@@ -2742,41 +2936,86 @@ impl AppState {
         ));
     }
 
-    fn apply_code_agent_update(&mut self, update: SessionUpdate) {
-        const PREFIX: &str = "codeagent:";
+    /// Namespaces one subagent's ACP ids so concurrent subagents (and the
+    /// primary) cannot collide on tool-call or terminal ids.
+    fn subagent_id_prefix(subagent_id: u64) -> String {
+        format!("{SUBAGENT_ID_PREFIX}{subagent_id}:")
+    }
+
+    fn finalize_subagent_thinking(&mut self, subagent_id: u64) {
+        if self.subagent_open_thought_owner != Some(subagent_id) {
+            return;
+        }
+        self.finalize_thinking(EntryKind::SubagentThought);
+    }
+
+    fn finalize_subagent_message(&mut self, subagent_id: u64) {
+        if self.subagent_open_message_owner == Some(subagent_id) {
+            self.finalize_message(EntryKind::Subagent);
+        }
+    }
+
+    fn append_subagent_message_chunk(&mut self, subagent_id: u64, text: String) {
+        if self.subagent_open_message_owner != Some(subagent_id) {
+            // Only one transcript entry can be advertised to the renderer as
+            // mutable. Close the previous actor's segment on an actor switch;
+            // later chunks from it start a new, correctly separated segment.
+            self.subagent_open_message_index = None;
+            self.subagent_open_message_owner = Some(subagent_id);
+        }
+        self.subagent_open_message_index = Some(append_or_start_owned(
+            &mut self.transcript,
+            EntryKind::Subagent,
+            text,
+            self.subagent_open_message_index,
+        ));
+    }
+
+    fn append_subagent_thinking_chunk(&mut self, subagent_id: u64, text: String) {
+        if self.subagent_open_thought_owner != Some(subagent_id) {
+            // `Entry::SubagentThought` has no actor field. Finish the prior
+            // actor's segment before using the generic append helper.
+            self.finalize_thinking(EntryKind::SubagentThought);
+            self.subagent_open_thought_owner = Some(subagent_id);
+        }
+        append_thinking_chunk(&mut self.transcript, EntryKind::SubagentThought, text);
+    }
+
+    fn apply_subagent_update(&mut self, subagent_id: u64, update: SessionUpdate) {
+        let prefix = Self::subagent_id_prefix(subagent_id);
+        let prefix = prefix.as_str();
         match update {
             SessionUpdate::UserMessageChunk(_) => {}
             SessionUpdate::AgentMessageChunk(chunk) => {
-                self.finalize_thinking(EntryKind::CodeAgentThought);
-                self.append_message_chunk(EntryKind::CodeAgent, content_block_text(&chunk.content));
+                self.finalize_subagent_thinking(subagent_id);
+                self.append_subagent_message_chunk(subagent_id, content_block_text(&chunk.content));
                 self.bump_transcript_revision();
             }
             SessionUpdate::AgentThoughtChunk(chunk) => {
-                self.finalize_message(EntryKind::CodeAgent);
-                append_thinking_chunk(
-                    &mut self.transcript,
-                    EntryKind::CodeAgentThought,
+                self.finalize_subagent_message(subagent_id);
+                self.append_subagent_thinking_chunk(
+                    subagent_id,
                     content_block_text(&chunk.content),
                 );
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCall(tool_call) => {
-                self.finalize_thinking(EntryKind::CodeAgentThought);
-                self.finalize_message(EntryKind::CodeAgent);
-                let key = format!("{PREFIX}{}", tool_call.tool_call_id);
+                self.finalize_subagent_thinking(subagent_id);
+                self.finalize_subagent_message(subagent_id);
+                let key = format!("{prefix}{}", tool_call.tool_call_id);
                 let mut view = ToolCallView::from_tool_call(&tool_call);
-                view.namespace_terminal_ids(PREFIX);
+                view.namespace_terminal_ids(prefix);
                 self.tool_calls.insert(key.clone(), view);
-                self.transcript.push(Entry::CodeAgentToolCall(key));
+                self.transcript.push(Entry::SubagentToolCall(key));
                 self.bump_transcript_revision();
             }
             SessionUpdate::ToolCallUpdate(update) => {
-                self.finalize_thinking(EntryKind::CodeAgentThought);
-                self.finalize_message(EntryKind::CodeAgent);
-                let key = format!("{PREFIX}{}", update.tool_call_id);
+                self.finalize_subagent_thinking(subagent_id);
+                self.finalize_subagent_message(subagent_id);
+                let key = format!("{prefix}{}", update.tool_call_id);
                 if let Some(view) = self.tool_calls.get_mut(&key) {
                     view.apply_update(&update);
-                    view.namespace_terminal_ids(PREFIX);
+                    view.namespace_terminal_ids(prefix);
                 } else {
                     let mut view = ToolCallView {
                         title: update
@@ -2790,46 +3029,47 @@ impl AppState {
                     };
                     if let Some(content) = &update.fields.content {
                         view.set_content(content);
-                        view.namespace_terminal_ids(PREFIX);
+                        view.namespace_terminal_ids(prefix);
                     }
                     self.tool_calls.insert(key.clone(), view);
-                    self.transcript.push(Entry::CodeAgentToolCall(key));
+                    self.transcript.push(Entry::SubagentToolCall(key));
                 }
                 self.bump_transcript_revision();
             }
             SessionUpdate::Plan(Plan { entries, .. }) => {
-                self.finalize_thinking(EntryKind::CodeAgentThought);
-                self.finalize_message(EntryKind::CodeAgent);
-                if let Some(Entry::CodeAgentPlan(existing)) = self
-                    .transcript
-                    .iter_mut()
-                    .rev()
-                    .find(|entry| matches!(entry, Entry::CodeAgentPlan(_)))
+                self.finalize_subagent_thinking(subagent_id);
+                self.finalize_subagent_message(subagent_id);
+                if let Some(index) = self.subagent_plan_indices.get(&subagent_id).copied()
+                    && let Some(Entry::SubagentPlan(existing)) = self.transcript.get_mut(index)
                 {
                     *existing = entries;
                 } else {
-                    self.transcript.push(Entry::CodeAgentPlan(entries));
+                    let index = self.transcript.len();
+                    self.transcript.push(Entry::SubagentPlan(entries));
+                    self.subagent_plan_indices.insert(subagent_id, index);
                 }
                 self.bump_transcript_revision();
             }
             SessionUpdate::UsageUpdate(update) => {
-                let _ = self.code_agent_token_usage.apply_usage_update(update);
+                let _ = self.subagent_token_usage.apply_usage_update(update);
             }
             _ => {}
         }
         self.apply_known_terminal_outputs();
     }
 
-    fn apply_loki_activity(&mut self, activity: LokiActivity) {
-        self.transcript
-            .push(Entry::LokiActivity(Box::new(activity)));
-        self.bump_transcript_revision();
-    }
-
-    fn cancel_code_agent_prompts(&mut self) {
+    fn cancel_subagent_prompts(&mut self, subagent_id: u64) {
+        let permission_prefix = format!("subagent-{subagent_id}:");
         let mut primary_permissions = VecDeque::new();
         while let Some(pending) = self.permission_queue.pop_front() {
-            if pending.code_agent {
+            if pending.subagent
+                && pending
+                    .prompt
+                    .tool_call
+                    .tool_call_id
+                    .to_string()
+                    .starts_with(&permission_prefix)
+            {
                 let _ = pending.prompt.responder.send(PermissionDecision::Cancelled);
             } else {
                 primary_permissions.push_back(pending);
@@ -2837,9 +3077,10 @@ impl AppState {
         }
         self.permission_queue = primary_permissions;
 
+        let elicitation_prefix = format!("subagent #{subagent_id} · ");
         let mut primary_elicitations = VecDeque::new();
         while let Some(pending) = self.elicitation_queue.pop_front() {
-            if pending.code_agent {
+            if pending.subagent && pending.prompt.message.starts_with(&elicitation_prefix) {
                 let _ = pending.prompt.responder.send(ElicitationOutcome::Cancel);
             } else {
                 primary_elicitations.push_back(pending);
@@ -2849,10 +3090,11 @@ impl AppState {
         self.update_autocomplete();
     }
 
-    fn mark_code_agent_tools_failed(&mut self, note: &str) {
+    fn mark_subagent_tools_failed(&mut self, subagent_id: u64, note: &str) {
+        let prefix = Self::subagent_id_prefix(subagent_id);
         let mut changed = false;
         for (id, view) in &mut self.tool_calls {
-            if id.starts_with("codeagent:")
+            if id.starts_with(&prefix)
                 && matches!(
                     view.status,
                     ToolCallStatus::Pending | ToolCallStatus::InProgress
@@ -2943,7 +3185,7 @@ impl AppState {
                     return;
                 }
                 self.finalize_message(EntryKind::Agent);
-                self.finalize_message(EntryKind::CodeAgent);
+                self.finalize_message(EntryKind::Subagent);
                 let text = content_block_text(&c.content);
                 append_or_start(&mut self.transcript, EntryKind::User, text);
                 self.bump_transcript_revision();
@@ -2964,7 +3206,7 @@ impl AppState {
                 self.finalize_thinking(EntryKind::Thought);
                 self.finalize_message(EntryKind::Agent);
                 let id = tc.tool_call_id.to_string();
-                let suppressed = is_code_agent_transport_call(&tc);
+                let suppressed = is_subagent_transport_call(&tc);
                 self.tool_calls
                     .insert(id.clone(), ToolCallView::from_tool_call(&tc));
                 if suppressed {
@@ -2979,7 +3221,7 @@ impl AppState {
                 self.finalize_message(EntryKind::Agent);
                 let id = u.tool_call_id.to_string();
                 let suppressed =
-                    self.suppressed_tool_calls.contains(&id) || is_code_agent_transport_update(&u);
+                    self.suppressed_tool_calls.contains(&id) || is_subagent_transport_update(&u);
                 if suppressed {
                     self.suppressed_tool_calls.insert(id.clone());
                     if matches!(self.transcript.last(), Some(Entry::ToolCall(entry_id)) if entry_id == &id)
@@ -3211,8 +3453,8 @@ enum EntryKind {
     User,
     Agent,
     Thought,
-    CodeAgent,
-    CodeAgentThought,
+    Subagent,
+    SubagentThought,
 }
 
 /// Append `text` to the trailing entry of the same kind, or start a new
@@ -3222,7 +3464,7 @@ fn append_or_start(transcript: &mut Vec<Entry>, kind: EntryKind, text: String) {
         match (&kind, last) {
             (EntryKind::User, Entry::UserPrompt(s))
             | (EntryKind::Agent, Entry::AgentMessage(s))
-            | (EntryKind::CodeAgent, Entry::CodeAgentMessage(s)) => {
+            | (EntryKind::Subagent, Entry::SubagentMessage(s)) => {
                 s.push_str(&text);
                 return;
             }
@@ -3236,8 +3478,8 @@ fn append_or_start(transcript: &mut Vec<Entry>, kind: EntryKind, text: String) {
             text,
             completed: false,
         }),
-        EntryKind::CodeAgent => Entry::CodeAgentMessage(text),
-        EntryKind::CodeAgentThought => Entry::CodeAgentThought(ThoughtEntry {
+        EntryKind::Subagent => Entry::SubagentMessage(text),
+        EntryKind::SubagentThought => Entry::SubagentThought(ThoughtEntry {
             text,
             completed: false,
         }),
@@ -3257,7 +3499,7 @@ fn append_or_start_owned(
     if let Some(index) = open_entry {
         let existing = match (kind, transcript.get_mut(index)) {
             (EntryKind::Agent, Some(Entry::AgentMessage(message))) => Some(message),
-            (EntryKind::CodeAgent, Some(Entry::CodeAgentMessage(message))) => Some(message),
+            (EntryKind::Subagent, Some(Entry::SubagentMessage(message))) => Some(message),
             _ => None,
         };
         if let Some(message) = existing {
@@ -3268,7 +3510,7 @@ fn append_or_start_owned(
     let index = transcript.len();
     transcript.push(match kind {
         EntryKind::Agent => Entry::AgentMessage(text),
-        EntryKind::CodeAgent => Entry::CodeAgentMessage(text),
+        EntryKind::Subagent => Entry::SubagentMessage(text),
         _ => unreachable!("append_or_start_owned requires a message entry kind"),
     });
     index
@@ -3280,8 +3522,8 @@ fn append_thinking_chunk(transcript: &mut Vec<Entry>, kind: EntryKind, text: Str
             Entry::AgentThought(thought) if !thought.completed => Some(thought),
             _ => None,
         }),
-        EntryKind::CodeAgentThought => transcript.iter_mut().rev().find_map(|entry| match entry {
-            Entry::CodeAgentThought(thought) if !thought.completed => Some(thought),
+        EntryKind::SubagentThought => transcript.iter_mut().rev().find_map(|entry| match entry {
+            Entry::SubagentThought(thought) if !thought.completed => Some(thought),
             _ => None,
         }),
         _ => unreachable!("append_thinking_chunk requires a thought entry kind"),
@@ -3295,7 +3537,7 @@ fn append_thinking_chunk(transcript: &mut Vec<Entry>, kind: EntryKind, text: Str
             text,
             completed: false,
         })),
-        EntryKind::CodeAgentThought => transcript.push(Entry::CodeAgentThought(ThoughtEntry {
+        EntryKind::SubagentThought => transcript.push(Entry::SubagentThought(ThoughtEntry {
             text,
             completed: false,
         })),
@@ -3309,8 +3551,8 @@ fn finalize_active_thinking(transcript: &mut [Entry], kind: EntryKind) -> bool {
             Entry::AgentThought(thought) if !thought.completed => Some(thought),
             _ => None,
         }),
-        EntryKind::CodeAgentThought => transcript.iter_mut().rev().find_map(|entry| match entry {
-            Entry::CodeAgentThought(thought) if !thought.completed => Some(thought),
+        EntryKind::SubagentThought => transcript.iter_mut().rev().find_map(|entry| match entry {
+            Entry::SubagentThought(thought) if !thought.completed => Some(thought),
             _ => None,
         }),
         _ => unreachable!("finalize_active_thinking requires a thought entry kind"),
@@ -3975,6 +4217,48 @@ fn ragnarok_summary(arena: &RagnarokUi) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn subagent_session_update(update: SessionUpdate) -> UiEvent {
+        subagent_session_update_for(1, update)
+    }
+
+    fn subagent_session_update_for(subagent_id: u64, update: SessionUpdate) -> UiEvent {
+        UiEvent::Subagent(SubagentEvent::SessionUpdate {
+            subagent_id,
+            update,
+        })
+    }
+
+    fn subagent_finished(outcome: SubagentOutcome) -> UiEvent {
+        UiEvent::Subagent(SubagentEvent::Finished {
+            subagent_id: 1,
+            outcome,
+        })
+    }
+
+    fn subagent_started(subagent_id: u64, label: &str, objective: &str) -> UiEvent {
+        UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id,
+            label: label.to_string(),
+            model: Some("gpt-y".to_string()),
+            agent: "codex-acp".to_string(),
+            objective: objective.to_string(),
+        })
+    }
+
+    fn subagent_activity(subagent_id: u64, activity: &str) -> UiEvent {
+        UiEvent::Subagent(SubagentEvent::Activity {
+            subagent_id,
+            activity: activity.to_string(),
+        })
+    }
+
+    fn finished_subagent(subagent_id: u64, outcome: SubagentOutcome) -> UiEvent {
+        UiEvent::Subagent(SubagentEvent::Finished {
+            subagent_id,
+            outcome,
+        })
+    }
     use agent_client_protocol::schema::v1::{
         AudioContent, AvailableCommand, AvailableCommandsUpdate, ConfigOptionUpdate, Content,
         ContentBlock, ContentChunk, Cost, CreateElicitationRequest, CreateElicitationResponse,
@@ -3993,7 +4277,7 @@ mod tests {
     #[test]
     fn side_conversation_keeps_main_transcript_and_usage_independent() {
         let mut main = AppState::new();
-        main.agent_label = "Thor · model".to_string();
+        main.agent_label = "model".to_string();
         main.session_id = Some("main-session".to_string());
         main.set_connection_state(ConnectionState::Streaming);
         let side = main.side_conversation(None);
@@ -4343,22 +4627,113 @@ mod tests {
     }
 
     #[test]
-    fn code_agent_thinking_chunks_accumulate() {
+    fn subagent_thinking_chunks_accumulate() {
         let mut state = AppState::new();
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
-            label: "Eitri · builder".to_string(),
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
+            label: "subagent".to_string(),
         }));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentThoughtChunk(text_chunk("forging")),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentThoughtChunk(
+            text_chunk("forging"),
         )));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentThoughtChunk(text_chunk(" now")),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentThoughtChunk(
+            text_chunk(" now"),
         )));
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::CodeAgentThought(text)] if text.text == "forging now" && !text.completed
+            [Entry::System(started), Entry::SubagentThought(text)]
+                if started.contains("subagent #1") && text.text == "forging now" && !text.completed
         ));
+    }
+
+    #[test]
+    fn concurrent_subagent_message_and_thought_streams_never_merge() {
+        let mut state = AppState::new();
+        state.apply_event(subagent_started(1, "one", ""));
+        state.apply_event(subagent_started(2, "two", ""));
+
+        state.apply_event(subagent_session_update_for(
+            1,
+            SessionUpdate::AgentMessageChunk(text_chunk("one-a")),
+        ));
+        state.apply_event(subagent_session_update_for(
+            2,
+            SessionUpdate::AgentMessageChunk(text_chunk("two")),
+        ));
+        state.apply_event(subagent_session_update_for(
+            1,
+            SessionUpdate::AgentMessageChunk(text_chunk("one-b")),
+        ));
+
+        let messages: Vec<&str> = state
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::SubagentMessage(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(messages, ["one-a", "two", "one-b"]);
+
+        state.apply_event(subagent_session_update_for(
+            1,
+            SessionUpdate::AgentThoughtChunk(text_chunk("thought-one")),
+        ));
+        state.apply_event(subagent_session_update_for(
+            2,
+            SessionUpdate::AgentThoughtChunk(text_chunk("thought-two")),
+        ));
+        state.apply_event(subagent_session_update_for(
+            1,
+            SessionUpdate::AgentThoughtChunk(text_chunk("thought-one-again")),
+        ));
+
+        let thoughts: Vec<(&str, bool)> = state
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::SubagentThought(thought) => Some((thought.text.as_str(), thought.completed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thoughts,
+            [
+                ("thought-one", true),
+                ("thought-two", true),
+                ("thought-one-again", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn concurrent_subagent_plans_update_only_their_own_entry() {
+        let mut state = AppState::new();
+        let plan = |text: &str| {
+            SessionUpdate::Plan(Plan::new(vec![PlanEntry::new(
+                text,
+                PlanEntryPriority::Medium,
+                PlanEntryStatus::Pending,
+            )]))
+        };
+
+        state.apply_event(subagent_session_update_for(1, plan("one-old")));
+        state.apply_event(subagent_session_update_for(2, plan("two")));
+        state.apply_event(subagent_session_update_for(1, plan("one-new")));
+
+        let plans: Vec<&str> = state
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::SubagentPlan(entries) => entries.first().map(|entry| entry.content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(plans, ["one-new", "two"]);
     }
 
     #[test]
@@ -4389,46 +4764,60 @@ mod tests {
     }
 
     #[test]
-    fn code_agent_finish_finalizes_thought_without_reply() {
+    fn subagent_finish_finalizes_thought_without_reply() {
         let mut state = AppState::new();
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
-            label: "Eitri · builder".to_string(),
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
+            label: "subagent".to_string(),
         }));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentThoughtChunk(text_chunk("forging")),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentThoughtChunk(
+            text_chunk("forging"),
         )));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
-            outcome: CodeAgentOutcome::Completed,
-        }));
+        state.apply_event(subagent_finished(SubagentOutcome::Completed));
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::CodeAgentThought(thought)]
-                if thought.text == "forging" && thought.completed
+            [Entry::System(started), Entry::SubagentThought(thought), Entry::System(finished)]
+                if started.contains("started")
+                    && thought.text == "forging" && thought.completed
+                    && finished.contains("completed")
         ));
     }
 
     #[test]
-    fn thor_and_eitri_thoughts_finalize_without_reordering_each_other() {
+    fn primary_and_subagent_thoughts_finalize_without_reordering_each_other() {
         let mut state = AppState::new();
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentThoughtChunk(
             text_chunk("planning"),
         )));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
-            label: "Eitri · builder".to_string(),
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
+            label: "subagent".to_string(),
         }));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentThoughtChunk(text_chunk("forging")),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentThoughtChunk(
+            text_chunk("forging"),
         )));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentMessageChunk(text_chunk("built")),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentMessageChunk(
+            text_chunk("built"),
         )));
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::AgentThought(thor), Entry::CodeAgentThought(eitri), Entry::CodeAgentMessage(message)]
-                if thor.text == "planning" && !thor.completed
-                    && eitri.text == "forging" && eitri.completed
+            [
+                Entry::AgentThought(primary),
+                Entry::System(started),
+                Entry::SubagentThought(sub),
+                Entry::SubagentMessage(message)
+            ]
+                if primary.text == "planning" && !primary.completed
+                    && started.contains("subagent #1")
+                    && sub.text == "forging" && sub.completed
                     && message == "built"
         ));
 
@@ -4440,45 +4829,201 @@ mod tests {
         )));
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::AgentThought(thor), Entry::CodeAgentThought(eitri), Entry::CodeAgentMessage(eitri_message), Entry::AgentMessage(thor_message)]
-                if thor.text == "planning more" && thor.completed
-                    && eitri.text == "forging" && eitri.completed
-                    && eitri_message == "built" && thor_message == "answer"
+            [
+                Entry::AgentThought(primary),
+                Entry::System(started),
+                Entry::SubagentThought(sub),
+                Entry::SubagentMessage(sub_message),
+                Entry::AgentMessage(primary_message)
+            ]
+                if primary.text == "planning more" && primary.completed
+                    && started.contains("subagent #1")
+                    && sub.text == "forging" && sub.completed
+                    && sub_message == "built" && primary_message == "answer"
         ));
     }
 
     #[test]
-    fn code_agent_handoff_has_no_transcript_boundary_or_prompt_block() {
+    fn subagent_handoff_has_no_transcript_boundary_or_prompt_block() {
         let mut state = AppState::new();
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
-            label: "Eitri · builder".to_string(),
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
+            label: "subagent".to_string(),
         }));
-        assert!(state.transcript.is_empty());
+        // One permanent record, no session boundary and no prompt block.
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::System(started)] if started == "subagent #1 · subagent · started"
+        ));
 
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentThoughtChunk(text_chunk("forging")),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentThoughtChunk(
+            text_chunk("forging"),
         )));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentMessageChunk(text_chunk("done")),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentMessageChunk(
+            text_chunk("done"),
         )));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Finished {
-            outcome: CodeAgentOutcome::Completed,
-        }));
+        state.apply_event(subagent_finished(SubagentOutcome::Completed));
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::CodeAgentThought(thought), Entry::CodeAgentMessage(text)]
+            [
+                Entry::System(_),
+                Entry::SubagentThought(thought),
+                Entry::SubagentMessage(text),
+                Entry::System(finished)
+            ]
                 if thought.text == "forging" && thought.completed && text == "done"
+                    && finished.starts_with("subagent #1 · subagent · completed · ")
         ));
     }
 
     #[test]
-    fn council_update_refreshes_choices_and_inventory() {
+    fn a_started_subagent_opens_a_status_row_and_one_transcript_record() {
         let mut state = AppState::new();
-        assert!(state.council_choices.is_empty());
+        state.apply_event(subagent_started(
+            3,
+            "fix-tests",
+            "Fix the failing parser tests\ndetail",
+        ));
 
-        state.apply_event(UiEvent::CouncilUpdate {
-            choices: vec![crate::council::ModelChoice {
+        let rows: Vec<(u64, &SubagentStatus)> = state.subagent_status_rows().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 3);
+        assert_eq!(rows[0].1.label, "fix-tests");
+        assert_eq!(rows[0].1.model.as_deref(), Some("gpt-y"));
+        assert_eq!(
+            rows[0].1.activity, "Fix the failing parser tests\ndetail",
+            "the objective seeds the row's activity until the first update"
+        );
+        assert!(rows[0].1.finished.is_none());
+        assert!(state.has_live_subagent_rows());
+        assert_eq!(state.running_subagent_count(), 1);
+
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Entry::System(record)]
+                if record == "subagent #3 · fix-tests · started · Fix the failing parser tests"
+        ));
+    }
+
+    #[test]
+    fn subagent_activity_updates_the_row_without_touching_the_transcript() {
+        let mut state = AppState::new();
+        state.apply_event(subagent_started(1, "explore", "look around"));
+        let entries = state.transcript.len();
+        let revision = state.transcript_revision();
+
+        state.apply_event(subagent_activity(1, "reading src/main.rs"));
+        state.apply_event(subagent_activity(1, "running cargo test"));
+
+        assert_eq!(
+            state.subagent_status_rows().next().expect("row").1.activity,
+            "running cargo test"
+        );
+        assert_eq!(
+            state.transcript.len(),
+            entries,
+            "activity must never append a transcript entry"
+        );
+        assert_eq!(
+            state.transcript_revision(),
+            revision,
+            "activity must not invalidate already-flushed scrollback"
+        );
+
+        // An activity for an unknown id is dropped rather than resurrecting a row.
+        state.apply_event(subagent_activity(99, "ghost"));
+        assert_eq!(state.subagent_status_rows().count(), 1);
+    }
+
+    #[test]
+    fn a_finished_subagent_records_its_outcome_and_expires_after_the_ttl() {
+        let mut state = AppState::new();
+        state.apply_event(subagent_started(1, "fix-tests", "fix them"));
+        state.apply_event(finished_subagent(1, SubagentOutcome::Completed));
+
+        let record = match state.transcript.last() {
+            Some(Entry::System(text)) => text.clone(),
+            other => panic!("expected a finish record, got {other:?}"),
+        };
+        assert!(
+            record.starts_with("subagent #1 · fix-tests · completed · "),
+            "{record}"
+        );
+
+        let now = Instant::now();
+        assert_eq!(
+            state.subagent_status_rows_at(now).count(),
+            1,
+            "a done row stays readable inside its TTL"
+        );
+        assert_eq!(state.running_subagent_count(), 0);
+
+        // Age the finish stamp past the TTL: the row filters itself out, which
+        // is what a timer-driven redraw observes.
+        let expired = now
+            .checked_sub(SUBAGENT_DONE_TTL + Duration::from_secs(1))
+            .expect("an instant before the TTL window");
+        if let Some((_, at)) = state.subagents.get_mut(&1).expect("row").finished.as_mut() {
+            *at = expired;
+        }
+        assert_eq!(state.subagent_status_rows_at(now).count(), 0);
+        assert!(!state.has_live_subagent_rows());
+    }
+
+    #[test]
+    fn a_failed_subagent_records_the_first_line_of_its_message() {
+        let mut state = AppState::new();
+        state.apply_event(subagent_started(2, "build", "build it"));
+        state.apply_event(finished_subagent(
+            2,
+            SubagentOutcome::Failed("adapter exited\nstack trace".to_string()),
+        ));
+
+        let record = match state.transcript.last() {
+            Some(Entry::System(text)) => text.clone(),
+            other => panic!("expected a finish record, got {other:?}"),
+        };
+        assert!(record.contains("failed: adapter exited"), "{record}");
+        assert!(!record.contains("stack trace"), "{record}");
+        assert!(matches!(
+            state
+                .subagent_status_rows()
+                .next()
+                .expect("row")
+                .1
+                .outcome(),
+            Some(SubagentOutcome::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn status_rows_list_running_subagents_in_spawn_order_before_finished_ones() {
+        let mut state = AppState::new();
+        for id in [1, 2, 3] {
+            state.apply_event(subagent_started(id, &format!("lane-{id}"), "work"));
+        }
+        state.apply_event(finished_subagent(1, SubagentOutcome::Completed));
+
+        let order: Vec<u64> = state.subagent_status_rows().map(|(id, _)| id).collect();
+        assert_eq!(
+            order,
+            vec![2, 3, 1],
+            "running rows come first in spawn order, then recently finished ones"
+        );
+        assert_eq!(state.running_subagent_count(), 2);
+    }
+
+    #[test]
+    fn roster_update_refreshes_choices_and_inventory() {
+        let mut state = AppState::new();
+        assert!(state.model_choices.is_empty());
+
+        state.apply_event(UiEvent::RosterUpdate {
+            choices: vec![crate::roster::ModelChoice {
                 model: "glm-5-2".to_string(),
                 pass_at_1: 0.5,
                 mean_cost_usd: 1.0,
@@ -4487,36 +5032,36 @@ mod tests {
                 adapter: Some("anvil".to_string()),
                 ranked: true,
             }],
-            inventory: crate::council::AcpInventory::default(),
+            inventory: crate::roster::AcpInventory::default(),
         });
 
-        assert_eq!(state.council_choices.len(), 1);
-        assert_eq!(state.council_choices[0].model, "glm-5-2");
+        assert_eq!(state.model_choices.len(), 1);
+        assert_eq!(state.model_choices[0].model, "glm-5-2");
         assert!(state.transcript.is_empty(), "catalog refreshes are silent");
     }
 
     #[test]
-    fn loki_interjection_reenters_streaming_so_submissions_queue() {
+    fn discrete_review_reenters_streaming_so_submissions_queue() {
         let mut state = AppState::new();
         state.set_connection_state(ConnectionState::Ready);
 
         state.apply_event(UiEvent::InternalMessage(InternalMessage {
-            source: "Loki".to_string(),
-            target: "Thor".to_string(),
-            kind: crate::event::InternalMessageKind::Continuation,
-            text: "boundary advice".to_string(),
+            source: "primary".to_string(),
+            target: "primary".to_string(),
+            kind: crate::event::InternalMessageKind::Delegation,
+            text: "boundary note".to_string(),
         }));
         assert_eq!(
             state.connection_state,
             ConnectionState::Ready,
-            "continuations ride held completions and must not change state"
+            "delegation notes ride held completions and must not change state"
         );
 
         state.apply_event(UiEvent::InternalMessage(InternalMessage {
-            source: "Loki".to_string(),
-            target: "Thor".to_string(),
-            kind: crate::event::InternalMessageKind::Interjection,
-            text: "post-turn thoughts".to_string(),
+            source: "primary".to_string(),
+            target: "primary".to_string(),
+            kind: crate::event::InternalMessageKind::DiscreteReview,
+            text: "review the completed work".to_string(),
         }));
         assert_eq!(state.connection_state, ConnectionState::Streaming);
         assert!(state.is_busy());
@@ -4532,24 +5077,29 @@ mod tests {
     fn internal_coordination_stays_inline_in_transcript_order() {
         let mut state = AppState::new();
         state.apply_event(UiEvent::InternalMessage(InternalMessage {
-            source: "Thor".to_string(),
-            target: "Eitri".to_string(),
+            source: "primary".to_string(),
+            target: "subagent".to_string(),
             kind: crate::event::InternalMessageKind::Delegation,
             text: "implementation brief".to_string(),
         }));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
-            label: "Eitri · builder".to_string(),
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
+            label: "subagent".to_string(),
         }));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::AgentMessageChunk(text_chunk("working")),
+        state.apply_event(subagent_session_update(SessionUpdate::AgentMessageChunk(
+            text_chunk("working"),
         )));
 
         assert!(matches!(
             state.transcript.as_slice(),
-            [Entry::InternalMessage(message), Entry::CodeAgentMessage(text)]
-                if message.source == "Thor"
-                    && message.target == "Eitri"
+            [Entry::InternalMessage(message), Entry::System(started), Entry::SubagentMessage(text)]
+                if message.source == "primary"
+                    && message.target == "subagent"
                     && message.text == "implementation brief"
+                    && started.contains("subagent #1")
                     && text == "working"
         ));
         assert!(
@@ -4577,14 +5127,14 @@ mod tests {
     }
 
     #[test]
-    fn primary_code_agent_transport_call_is_tracked_but_not_transcribed() {
+    fn primary_create_subagent_transport_call_is_tracked_but_not_transcribed() {
         let mut state = AppState::new();
-        let call = ToolCall::new("bridge-call", "mcp.mj-code-agent.code_agent")
+        let call = ToolCall::new("bridge-call", "mcp.mj-subagents.create_subagent")
             .status(ToolCallStatus::InProgress)
             .raw_input(serde_json::json!({
-                "server": "mj-code-agent",
-                "tool": "code_agent",
-                "arguments": { "instructions": "build it" }
+                "server": "mj-subagents",
+                "tool": "create_subagent",
+                "arguments": { "prompt": "build it" }
             }));
 
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)));
@@ -4606,65 +5156,14 @@ mod tests {
     }
 
     #[test]
-    fn primary_explore_agent_transport_call_is_tracked_but_not_transcribed() {
+    fn primary_subagent_cancel_transport_call_is_tracked_but_not_transcribed() {
         let mut state = AppState::new();
-        let call = ToolCall::new("explore-bridge", "mcp.mj-code-agent.explore_agent")
+        let call = ToolCall::new("cancel-bridge", "mcp__mj-subagents__subagent_cancel")
             .status(ToolCallStatus::InProgress)
             .raw_input(serde_json::json!({
-                "server": "mj-code-agent",
-                "tool": "explore_agent",
-                "arguments": { "prompt": "trace startup" }
-            }));
-
-        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)));
-
-        assert!(state.tool_calls.contains_key("explore-bridge"));
-        assert!(state.transcript.is_empty());
-    }
-
-    #[test]
-    fn primary_explore_agents_transport_call_is_tracked_but_not_transcribed() {
-        let mut state = AppState::new();
-        let call = ToolCall::new("fanout-bridge", "mcp.mj-code-agent.explore_agents")
-            .status(ToolCallStatus::InProgress)
-            .raw_input(serde_json::json!({
-                "server": "mj-code-agent",
-                "tool": "explore_agents",
-                "arguments": { "prompts": ["trace startup", "trace shutdown"] }
-            }));
-
-        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)));
-
-        assert!(state.tool_calls.contains_key("fanout-bridge"));
-        assert!(state.transcript.is_empty());
-    }
-
-    #[test]
-    fn primary_code_agent_continue_transport_call_is_tracked_but_not_transcribed() {
-        let mut state = AppState::new();
-        let call = ToolCall::new("continue-bridge", "mcp__mj-code-agent__code_agent_continue")
-            .status(ToolCallStatus::InProgress)
-            .raw_input(serde_json::json!({
-                "server": "mj-code-agent",
-                "tool": "code_agent_continue",
-                "arguments": { "run_id": 42 }
-            }));
-
-        state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)));
-
-        assert!(state.tool_calls.contains_key("continue-bridge"));
-        assert!(state.transcript.is_empty());
-    }
-
-    #[test]
-    fn primary_code_agent_cancel_transport_call_is_tracked_but_not_transcribed() {
-        let mut state = AppState::new();
-        let call = ToolCall::new("cancel-bridge", "mcp__mj-code-agent__code_agent_cancel")
-            .status(ToolCallStatus::InProgress)
-            .raw_input(serde_json::json!({
-                "server": "mj-code-agent",
-                "tool": "code_agent_cancel",
-                "arguments": { "run_id": 42 }
+                "server": "mj-subagents",
+                "tool": "subagent_cancel",
+                "arguments": { "subagent_id": 42 }
             }));
 
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(call)));
@@ -4674,16 +5173,16 @@ mod tests {
     }
 
     #[test]
-    fn similarly_named_mcp_tools_are_not_filtered_as_eitri_transport() {
-        let call = ToolCall::new("other-tool", "mcp.mj-code-agent.explore_agents_extra");
-        let wait = ToolCall::new("other-wait", "mcp.mj-code-agent.code_agent_continue_extra");
+    fn similarly_named_mcp_tools_are_not_filtered_as_subagent_transport() {
+        let call = ToolCall::new("other-tool", "mcp.mj-subagents.create_subagent_extra");
+        let cancel = ToolCall::new("other-cancel", "mcp.mj-subagents.subagent_cancel_extra");
 
-        assert!(!is_code_agent_transport_call(&call));
-        assert!(!is_code_agent_transport_call(&wait));
+        assert!(!is_subagent_transport_call(&call));
+        assert!(!is_subagent_transport_call(&cancel));
     }
 
     #[test]
-    fn claude_code_agent_transport_update_before_create_is_not_transcribed() {
+    fn claude_subagent_transport_update_before_create_is_not_transcribed() {
         let mut state = AppState::new();
         let fields = agent_client_protocol::schema::v1::ToolCallUpdateFields::default()
             .title("Running MCP tool")
@@ -4691,7 +5190,7 @@ mod tests {
         let mut meta = serde_json::Map::new();
         meta.insert(
             "claudeCode".to_string(),
-            serde_json::json!({ "toolName": "mcp__mj-code-agent__code_agent" }),
+            serde_json::json!({ "toolName": "mcp__mj-subagents__create_subagent" }),
         );
         let mut update = ToolCallUpdate::new("claude-bridge", fields);
         update.meta = Some(meta);
@@ -4704,16 +5203,20 @@ mod tests {
     }
 
     #[test]
-    fn code_agent_tool_ids_are_isolated_from_primary_tools() {
+    fn subagent_tool_ids_are_isolated_from_primary_tools() {
         let mut state = AppState::new();
         state.apply_event(UiEvent::SessionUpdate(SessionUpdate::ToolCall(
             ToolCall::new("shared-id", "primary tool"),
         )));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
             label: "codex".to_string(),
         }));
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::SessionUpdate(
-            SessionUpdate::ToolCall(ToolCall::new("shared-id", "nested tool")),
+        state.apply_event(subagent_session_update(SessionUpdate::ToolCall(
+            ToolCall::new("shared-id", "nested tool"),
         )));
 
         assert_eq!(
@@ -4723,7 +5226,7 @@ mod tests {
         assert_eq!(
             state
                 .tool_calls
-                .get("codeagent:shared-id")
+                .get("subagent-1:shared-id")
                 .expect("nested")
                 .title,
             "nested tool"
@@ -4731,10 +5234,14 @@ mod tests {
     }
 
     #[test]
-    fn whole_turn_enters_cancelling_while_code_agent_is_active() {
+    fn whole_turn_enters_cancelling_while_a_subagent_is_active() {
         let mut state = AppState::new();
         state.record_user_prompt("delegate".to_string());
-        state.apply_event(UiEvent::CodeAgent(CodeAgentEvent::Started {
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id: 1,
+            model: None,
+            agent: "codex-acp".to_string(),
+            objective: String::new(),
             label: "codex".to_string(),
         }));
         state.mark_cancelling();
@@ -5054,7 +5561,7 @@ mod tests {
     }
 
     #[test]
-    fn council_owned_permission_option_stays_out_of_session_picker() {
+    fn harness_owned_permission_option_stays_out_of_session_picker() {
         let mut s = AppState::new();
         let option = SessionConfigOption::select(
             "mode",
@@ -6259,6 +6766,110 @@ mod tests {
     }
 
     #[test]
+    fn subagent_permission_cancellation_is_scoped_to_its_owner() {
+        let mut state = AppState::new();
+        let (first, first_rx) = permission_prompt_with_id("same-local-id");
+        let (second, _second_rx) = permission_prompt_with_id("same-local-id");
+        state.apply_event(UiEvent::Subagent(SubagentEvent::PermissionRequest {
+            subagent_id: 1,
+            prompt: first,
+        }));
+        state.apply_event(UiEvent::Subagent(SubagentEvent::PermissionRequest {
+            subagent_id: 2,
+            prompt: second,
+        }));
+
+        state.apply_event(UiEvent::Subagent(SubagentEvent::CancelPendingPermissions {
+            subagent_id: 1,
+        }));
+
+        assert!(matches!(
+            first_rx.blocking_recv(),
+            Ok(PermissionDecision::Cancelled)
+        ));
+        assert_eq!(state.pending_permission_count(), 1);
+        assert_eq!(
+            state
+                .pending_permission()
+                .expect("second subagent prompt remains")
+                .prompt
+                .tool_call
+                .tool_call_id
+                .to_string(),
+            "subagent-2:same-local-id"
+        );
+    }
+
+    #[test]
+    fn subagent_elicitation_cancellation_is_scoped_to_its_owner() {
+        let mut state = AppState::new();
+        let (first, first_rx) = elicitation_prompt();
+        let (second, _second_rx) = elicitation_prompt();
+        state.apply_event(UiEvent::Subagent(SubagentEvent::ElicitationRequest {
+            subagent_id: 1,
+            prompt: first,
+        }));
+        state.apply_event(UiEvent::Subagent(SubagentEvent::ElicitationRequest {
+            subagent_id: 2,
+            prompt: second,
+        }));
+
+        state.apply_event(UiEvent::Subagent(SubagentEvent::CancelPendingPermissions {
+            subagent_id: 1,
+        }));
+
+        assert!(matches!(
+            first_rx.blocking_recv(),
+            Ok(ElicitationOutcome::Cancel)
+        ));
+        assert_eq!(state.pending_elicitation_count(), 1);
+        assert!(
+            state
+                .pending_elicitation()
+                .expect("second subagent elicitation remains")
+                .prompt
+                .message
+                .starts_with("subagent #2 · ")
+        );
+    }
+
+    #[test]
+    fn subagent_failure_marks_only_its_own_tools_failed() {
+        let mut state = AppState::new();
+        for subagent_id in [1, 2] {
+            state.apply_event(subagent_started(subagent_id, "worker", ""));
+            state.apply_event(subagent_session_update_for(
+                subagent_id,
+                SessionUpdate::ToolCall(
+                    ToolCall::new("same-local-id", "work").status(ToolCallStatus::InProgress),
+                ),
+            ));
+        }
+
+        state.apply_event(finished_subagent(
+            1,
+            SubagentOutcome::Failed("boom".to_string()),
+        ));
+
+        assert_eq!(
+            state
+                .tool_calls
+                .get("subagent-1:same-local-id")
+                .expect("first tool")
+                .status,
+            ToolCallStatus::Failed
+        );
+        assert_eq!(
+            state
+                .tool_calls
+                .get("subagent-2:same-local-id")
+                .expect("sibling tool")
+                .status,
+            ToolCallStatus::InProgress
+        );
+    }
+
+    #[test]
     fn prompt_done_after_fatal_does_not_resurrect_ready() {
         // A stray PromptDone arriving after Fatal (e.g. queued before the
         // fatal error propagated) must not flip the lifecycle back to
@@ -6785,7 +7396,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "compact", "load", "export", "models", "council", "review",
+                "new", "clear", "compact", "load", "export", "models", "agents", "review",
                 "mjconfig", "ragnarok"
             ]
         );
@@ -6815,7 +7426,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "new", "clear", "compact", "load", "export", "models", "council", "review",
+                "new", "clear", "compact", "load", "export", "models", "agents", "review",
                 "mjconfig", "ragnarok", "fork"
             ]
         );
@@ -6839,7 +7450,7 @@ mod tests {
                 AvailableCommand::new("clear", "agent-provided command"),
                 AvailableCommand::new("load", "agent-provided command"),
                 AvailableCommand::new("fork", "agent-provided command"),
-                AvailableCommand::new("council", "agent-provided command"),
+                AvailableCommand::new("agents", "agent-provided command"),
             ])),
         ));
 
@@ -6857,7 +7468,7 @@ mod tests {
                 "load",
                 "export",
                 "models",
-                "council",
+                "agents",
                 "review",
                 "mjconfig",
                 "ragnarok",
@@ -6872,7 +7483,7 @@ mod tests {
         );
         assert_eq!(
             s.available_commands[2].description,
-            "compact Thor and Loki where supported"
+            "compact the primary agent's session where supported"
         );
         assert_eq!(
             s.available_commands[3].description,
@@ -6882,13 +7493,10 @@ mod tests {
             s.available_commands[4].description,
             "export transcript to markdown"
         );
-        assert_eq!(
-            s.available_commands[5].description,
-            "open Council model settings"
-        );
+        assert_eq!(s.available_commands[5].description, "open model settings");
         assert_eq!(
             s.available_commands[6].description,
-            "show active Council model selections"
+            "show active model selections and usage"
         );
         assert_eq!(
             s.available_commands[10].description,
@@ -6920,7 +7528,7 @@ mod tests {
                 "load",
                 "export",
                 "models",
-                "council",
+                "agents",
                 "review",
                 "mjconfig",
                 "ragnarok",

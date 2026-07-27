@@ -128,9 +128,8 @@
         --thought: #c79a4b;
         --tool: #9a8cc9;
         --system: #6f7375;
-        --thor: #78c5ff;
-        --loki: #6edb78;
-        --eitri: #9a8cc9;
+        --primary: #78c5ff;
+        --subagent: #9a8cc9;
 
         /* type */
         --font-display: "Staatliches", "Arial Narrow", Impact, sans-serif;
@@ -202,9 +201,8 @@
         --thought: #88600e;
         --tool: #6c58a0;
         --system: #777c7f;
-        --thor: #0066b3;
-        --loki: #197a32;
-        --eitri: #6c58a0;
+        --primary: #0066b3;
+        --subagent: #6c58a0;
       }
 
       * {
@@ -1311,17 +1309,8 @@
         &[data-kind="agent"] { --kind-color: var(--agent); }
         &[data-kind="thought"] { --kind-color: var(--thought); }
         &[data-kind="tool"] { --kind-color: var(--tool); }
-        /* delegation, exploration, discrete_review, continuation and
-           interjection get no kind rule of their own: they fall through to
-           the `--system` default above, and in practice the actor rules
-           below claim most of them anyway (discrete_review is emitted by
-           Thor, continuation and interjection by Loki). */
-        &[data-kind="review_lane"] { --kind-color: var(--eitri); }
-        &[data-kind="review_progress"],
-        &[data-kind="review_synthesis"] { --kind-color: var(--thor); }
-        &[data-actor="thor"] { --kind-color: var(--thor); }
-        &[data-actor="loki"] { --kind-color: var(--loki); }
-        &[data-actor="eitri"] { --kind-color: var(--eitri); }
+        &[data-actor="primary"] { --kind-color: var(--primary); }
+        &[data-actor="subagent"], &[data-actor="subagents"] { --kind-color: var(--subagent); }
       }
 
       @keyframes entry-in {
@@ -1586,17 +1575,8 @@
         color: var(--user-entry-text);
       }
 
-      /* Internal-message rows used to arrive as a single "system" kind. They
-         now carry their own wire names, so each one that should stay muted
-         has to be listed. The review_* kinds are deliberately absent: the
-         fan-out gives them their own rails and full-strength text. */
       .entry[data-kind="tool"] .entry-text,
-      .entry[data-kind="system"] .entry-text,
-      .entry[data-kind="delegation"] .entry-text,
-      .entry[data-kind="exploration"] .entry-text,
-      .entry[data-kind="discrete_review"] .entry-text,
-      .entry[data-kind="continuation"] .entry-text,
-      .entry[data-kind="interjection"] .entry-text {
+      .entry[data-kind="system"] .entry-text {
         color: var(--muted);
       }
 
@@ -1856,6 +1836,69 @@
         word-break: break-word;
         font: 400 12px/1.55 var(--font-mono);
         color: var(--text-control);
+      }
+
+      /* Live per-subagent status rows, mirroring the TUI's subagent area:
+         one line each, running rows first, done rows dimmed with a glyph. */
+      .subagent-list {
+        display: flex;
+        flex-direction: column;
+        max-height: 22dvh;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+
+        &:empty {
+          display: none;
+        }
+      }
+
+      .subagent-row {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding: 5px 10px 5px 12px;
+        border-bottom: 1px solid var(--line-row);
+        background: var(--row-subtle);
+        font: 400 11.5px/1.45 var(--font-mono);
+        color: var(--muted);
+
+        &:last-child {
+          border-bottom: 0;
+        }
+
+        &.is-done {
+          opacity: 0.66;
+        }
+
+        &.is-ok .subagent-glyph { color: var(--agent); }
+        &.is-error .subagent-glyph { color: var(--red); }
+        &.is-muted .subagent-glyph { color: var(--dim); }
+      }
+
+      .subagent-glyph {
+        flex: 0 0 auto;
+        color: var(--subagent);
+        font-weight: 700;
+      }
+
+      .subagent-label {
+        flex: 0 0 auto;
+        color: var(--text-control);
+        font-weight: 700;
+      }
+
+      .subagent-activity {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .subagent-elapsed {
+        flex: 0 0 auto;
+        color: var(--dim);
+        letter-spacing: 0.06em;
       }
 
       /* The frame is a dedicated child (edge bg + gap/fill pseudos) instead of
@@ -2432,6 +2475,7 @@
           <button id="jump-to-latest" class="jump-to-latest" type="button" hidden>Jump to latest</button>
         </div>
         <section class="composer">
+          <div id="subagents" class="subagent-list" role="status" aria-label="Subagent status"></div>
           <div id="permissions" class="permission-list"></div>
           <div id="queue-list" class="queue-list"></div>
           <div class="console">
@@ -2601,6 +2645,7 @@
       const stopTurnEl = $("stop-turn");
       const backButtonEl = $("back-button");
       const permissionsEl = $("permissions");
+      const subagentsEl = $("subagents");
       const sessionConfigEl = $("session-config");
       const queueInputEl = $("queue-input");
       const commandPaletteEl = $("command-palette");
@@ -4496,31 +4541,8 @@
       }
 
       function entryLabel(kind, actor) {
-        const actorLabel = typeof actor === "string" && actor
-          ? actor.charAt(0).toUpperCase() + actor.slice(1)
-          : "";
-        switch (kind) {
-          case "delegation":
-            return actorLabel ? `Delegation · ${actorLabel}` : "Delegation";
-          case "exploration":
-            return actorLabel ? `Exploration · ${actorLabel}` : "Exploration";
-          case "discrete_review":
-            return actorLabel ? `Discrete review · ${actorLabel}` : "Discrete review";
-          case "continuation":
-            return actorLabel ? `Continuation · ${actorLabel}` : "Continuation";
-          case "interjection":
-            return actorLabel ? `Interjection · ${actorLabel}` : "Interjection";
-          case "review_lane":
-            return actorLabel
-              ? `Review lane · ${actorLabel}`
-              : "Review lane";
-          case "review_progress":
-            return "Review progress";
-          case "review_synthesis":
-            return "Review synthesis";
-        }
-        if (actorLabel) {
-          return actorLabel;
+        if (typeof actor === "string" && actor) {
+          return actor.charAt(0).toUpperCase() + actor.slice(1);
         }
         switch (kind) {
           case "user":
@@ -4693,8 +4715,10 @@
         const kind = entryKind(entry);
         const actor = typeof entry.actor === "string" ? entry.actor.toLowerCase() : "";
         el.dataset.kind = kind;
-        if (actor === "thor" || actor === "loki" || actor === "eitri") {
+        if (actor === "primary" || actor === "subagent" || actor === "subagents") {
           el.dataset.actor = actor;
+        } else if (actor.startsWith("subagent-")) {
+          el.dataset.actor = "subagent";
         }
         el.querySelector(".entry-kind").textContent = entryLabel(kind, entry.actor);
         setTimestamp(el.querySelector(".entry-time"), entry.timestamp || "");
@@ -4992,8 +5016,8 @@
           return [`### Tool: ${title}`, "", body].join("\n").trim();
         }
         const label = entry.actor
-          ? entryLabel(kind, entry.actor)
-          : kind === "user" ? "You" : kind === "agent" ? "Agent" : entryLabel(kind, "");
+          ? entry.actor.charAt(0).toUpperCase() + entry.actor.slice(1)
+          : kind === "user" ? "You" : kind === "agent" ? "Agent" : kind;
         return [`### ${label}`, "", entry.text || ""].join("\n").trim();
       }
 
@@ -5084,6 +5108,67 @@
             void deleteQueuedPrompt(prompt);
           });
           queueListEl.appendChild(item);
+        }
+      }
+
+      function sessionSubagents(session) {
+        return session && Array.isArray(session.subagents) ? session.subagents : [];
+      }
+
+      function subagentElapsed(row) {
+        const started = new Date(row.started_at || "").getTime();
+        if (Number.isNaN(started)) {
+          return "";
+        }
+        const end = row.finished_at ? new Date(row.finished_at).getTime() : Date.now();
+        const seconds = Math.max(0, Math.round(((Number.isNaN(end) ? Date.now() : end) - started) / 1000));
+        const minutes = Math.floor(seconds / 60);
+        return minutes > 0 ? `${minutes}m${String(seconds % 60).padStart(2, "0")}s` : `${seconds}s`;
+      }
+
+      const SUBAGENT_OUTCOME_GLYPHS = {
+        completed: { glyph: "✔", state: "is-ok" },
+        failed: { glyph: "✘", state: "is-error" },
+        cancelled: { glyph: "⊘", state: "is-muted" },
+      };
+
+      // A compact mirror of the TUI status rows: running first (spawn order),
+      // then the finished rows the session still reports.
+      function renderSubagents(session) {
+        subagentsEl.replaceChildren();
+        const rows = [...sessionSubagents(session)].sort((a, b) => {
+          const doneA = a.finished_at ? 1 : 0;
+          const doneB = b.finished_at ? 1 : 0;
+          return doneA - doneB || (a.subagent_id || 0) - (b.subagent_id || 0);
+        });
+        for (const row of rows) {
+          const done = Boolean(row.finished_at);
+          const outcome = SUBAGENT_OUTCOME_GLYPHS[row.outcome] || { glyph: "⊘", state: "is-muted" };
+          const el = document.createElement("div");
+          el.className = done ? `subagent-row is-done ${outcome.state}` : "subagent-row";
+
+          const glyph = document.createElement("span");
+          glyph.className = "subagent-glyph";
+          glyph.setAttribute("aria-hidden", "true");
+          glyph.textContent = done ? outcome.glyph : "▸";
+
+          const label = document.createElement("span");
+          label.className = "subagent-label";
+          label.textContent = `#${row.subagent_id} ${row.label || "subagent"}`;
+          if (row.model) {
+            label.title = row.model;
+          }
+
+          const activity = document.createElement("span");
+          activity.className = "subagent-activity";
+          activity.textContent = row.activity || (done ? row.outcome || "done" : "");
+
+          const elapsed = document.createElement("span");
+          elapsed.className = "subagent-elapsed";
+          elapsed.textContent = subagentElapsed(row);
+
+          el.append(glyph, label, activity, elapsed);
+          subagentsEl.appendChild(el);
         }
       }
 
@@ -5527,6 +5612,7 @@
         const session = sessions.find((s) => s.session_id === selectedSessionId) || null;
         renderTranscript(session);
         renderConfig(session);
+        renderSubagents(session);
         renderPermissions(session);
         renderQueue(session);
         updateCommandPalette();

@@ -10,7 +10,7 @@ use ratatui::Terminal;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::council::ResolvedCouncil;
+use crate::roster::Roster;
 use crate::settings::{SettingsAction, SettingsEditor, draw_settings_panel};
 use crate::term::TrackedBackend;
 
@@ -23,28 +23,24 @@ pub enum Outcome {
 pub async fn run(
     terminal: &mut Terminal<TrackedBackend<Stdout>>,
     config: Config,
-    council: Option<ResolvedCouncil>,
+    roster: Option<Roster>,
     notice: Option<String>,
     termination: CancellationToken,
 ) -> Result<Outcome> {
-    let inventory = council
+    let inventory = roster
         .as_ref()
-        .map(|council| council.inventory.clone())
-        .unwrap_or_else(|| crate::council::discover_inventory(&config));
-    let choices = council
+        .map(|roster| roster.inventory.clone())
+        .unwrap_or_else(|| crate::roster::discover_inventory(&config));
+    let choices = roster
         .as_ref()
-        .map(|council| council.choices.clone())
+        .map(|roster| roster.choices.clone())
         .unwrap_or_default();
     let mut editor = SettingsEditor::new(config, choices, notice).with_inventory(inventory);
-    if let Some(council) = council {
+    if let Some(roster) = roster {
         editor = editor.with_active_models(crate::config::ModelsConfig {
-            thor: council.thor.model.model,
-            eitri: council
-                .eitri
-                .map(|role| role.model.model)
-                .unwrap_or_else(|| "off".to_string()),
-            loki: council
-                .loki
+            primary: roster.primary.model.model,
+            subagent: roster
+                .subagent_default
                 .map(|role| role.model.model)
                 .unwrap_or_else(|| "off".to_string()),
         });
@@ -115,15 +111,15 @@ fn handle_event(editor: &mut SettingsEditor, event: CtEvent) -> Option<SettingsA
 mod tests {
     use std::path::PathBuf;
 
-    use crate::council::{AdapterKind, AdapterLaunch, ModelChoice, ResolvedRole};
     use crate::deepswe::Row;
+    use crate::roster::{AdapterKind, AdapterLaunch, ModelChoice, ResolvedAgent};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     use super::*;
 
-    fn role(model: &str, source_id: &str) -> ResolvedRole {
-        ResolvedRole {
+    fn role(model: &str, source_id: &str) -> ResolvedAgent {
+        ResolvedAgent {
             model: Row {
                 model: model.to_string(),
                 reasoning_effort: None,
@@ -143,13 +139,12 @@ mod tests {
         }
     }
 
-    fn council() -> ResolvedCouncil {
-        let thor = role("gpt-test", "codex-acp");
-        ResolvedCouncil {
-            thor: thor.clone(),
-            loki: None,
-            eitri: None,
-            available: vec![thor],
+    fn roster() -> Roster {
+        let primary = role("gpt-test", "codex-acp");
+        Roster {
+            primary: primary.clone(),
+            subagent_default: None,
+            available: vec![primary],
             choices: vec![ModelChoice {
                 model: "gpt-test".to_string(),
                 pass_at_1: 0.5,
@@ -160,13 +155,13 @@ mod tests {
                 ranked: true,
             }],
             warnings: Vec::new(),
-            inventory: crate::council::AcpInventory::default(),
+            inventory: crate::roster::AcpInventory::default(),
         }
     }
 
     #[test]
     fn startup_uses_shared_settings_panel() {
-        let editor = SettingsEditor::new(Config::default(), council().choices, None);
+        let editor = SettingsEditor::new(Config::default(), roster().choices, None);
         let backend = TestBackend::new(90, 28);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -174,8 +169,8 @@ mod tests {
             .expect("draw");
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("Welcome to Mjolnir"));
-        assert!(rendered.contains("Council"));
-        assert!(rendered.contains("primary model; plans and reviews work"));
+        assert!(rendered.contains("Agents"));
+        assert!(rendered.contains("primary model; plans, implements, and answers"));
         assert!(rendered.contains("Enter save"));
     }
 }

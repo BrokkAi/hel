@@ -1,20 +1,20 @@
 ---
 title: Evaluate Mjolnir in ten minutes
-description: Exercise Thor, Eitri, review, resume, and headless output in a disposable fixture.
+description: Exercise the primary agent, subagents, review, resume, and headless output in a disposable fixture.
 ---
 
-> Fixture and CLI surface reviewed against Mjolnir 1.0.2 on 2026-07-21.
+> Fixture and CLI surface reviewed against Mjolnir 1.0.2 on 2026-07-26.
 > Live provider output is model- and availability-dependent and is not run in docs CI.
 
 This evaluation uses a checked-in Python fixture in a disposable Git
-repository. It proves that a configured Thor session can inspect a small
-project, request an Eitri implementation handoff, present role-labelled work,
-run an explicit review, preserve a resumable session, and emit headless stream
-records.
+repository. It proves that a configured session can inspect a small project,
+delegate a bounded change to a background subagent, surface that subagent's live
+status and its pushed-back report, run an explicit review, preserve a resumable
+session, and emit headless stream records.
 
 It does not prove large-repository performance, consistent quality across
-models, predictable provider cost, safe unattended shell execution, spontaneous
-Loki timing, or remote-server security.
+models, predictable provider cost, safe unattended shell execution, or
+remote-server security.
 
 ## Before you start
 
@@ -25,9 +25,9 @@ You need:
 - Git.
 - At least one authenticated, launchable provider route. Provider use may cost money.
 
-Run `mj`, open `/mjconfig`, and confirm that Thor and Eitri resolve to available
-models. Loki is optional. Model or ACP-server changes apply to the next
-session, so exit and relaunch after changing them.
+Run `mj`, open `/mjconfig`, and confirm on the Agents tab that the primary and
+subagent models resolve to available models. Model or ACP-server changes apply to the next session, so exit and
+relaunch after changing them.
 
 ## Prepare the disposable fixture
 
@@ -57,7 +57,7 @@ cd mjolnir
 
 Then run the preparation block above.
 
-## Journey 1: Council implementation
+## Journey 1: delegated implementation
 
 Start Mjolnir in the fixture:
 
@@ -68,23 +68,30 @@ mj --cwd "$EVAL_DIR"
 Send this prompt:
 
 ```text
-Use your implementation agent, Eitri, for this bounded change. Update weather.py
-so status(0) returns "freezing", negative values return "below freezing", values
-below 20 return "cold", and all other values return "warm". Add focused tests,
-run python3 -m unittest -v, and explain the result. Do not change anything else.
+Launch a subagent for this bounded change. Update weather.py so status(0)
+returns "freezing", negative values return "below freezing", values below 20
+return "cold", and all other values return "warm". Add focused tests, run
+python3 -m unittest -v, and explain the result. Do not change anything else.
 ```
 
 Expected observations:
 
-1. Thor owns the user turn and presents the plan or handoff.
-2. An Eitri-labelled implementation run appears in the normal transcript.
-3. Any requested permission remains fully readable before you decide.
-4. The returned change is limited to `weather.py` and `test_weather.py`.
-5. `python3 -m unittest -v` reports four passing tests.
+1. The primary agent launches a subagent and ends its turn instead of waiting.
+2. A `subagent #1 · …` row appears in the status area with a live activity line
+   and elapsed time, then clears a few seconds after it finishes.
+3. Any requested permission remains fully readable before you decide, and is
+   labelled with the subagent's id.
+4. When the subagent finishes, its report is injected as a new user turn and the
+   primary responds to it.
+5. The returned change is limited to `weather.py` and `test_weather.py`.
+6. `python3 -m unittest -v` reports four passing tests.
+7. Because a subagent changed the workspace, a discrete review may run before
+   the turn is released; `review · …` rows appear in the status area.
 
-The exact wording and tool sequence can differ by model. If Thor ignores the
-explicit handoff or the result is wrong, record the selected models and adapter
-in your evaluation notes; that is a failed outcome, not a docs failure.
+The exact wording and tool sequence can differ by model. If the primary ignores
+the explicit delegation, polls for a result, or the change is wrong, record the
+selected models and adapter in your evaluation notes; that is a failed outcome,
+not a docs failure.
 
 ## Journey 2: explicit review
 
@@ -95,8 +102,7 @@ Run:
 ```
 
 Choose the most recent change-producing turn. Review is findings-only; a clean
-result is valid. Loki's background advice is best-effort and may arrive before
-or after this step, so spontaneous advice is not a pass condition.
+result is valid.
 
 Exit with Ctrl-D on an empty prompt. Mjolnir prints a command shaped like:
 
@@ -122,15 +128,17 @@ mj --cwd "$EVAL_DIR" \
 ```
 
 The output is newline-delimited JSON. It should contain connection/session
-records, role-labelled message or thought records, and a final `result` record.
-`manual` rejects any permission request rather than hanging an unattended run.
+records, actor-labelled message or thought records, any `subagent` lifecycle
+records, and a final `result` record. `manual` rejects any permission request
+rather than hanging an unattended run, and the process does not exit until every
+subagent report has been delivered.
 
 ## Interpret the result
 
 A successful run proves the selected provider route can support the core
-Council path on one small repository. Compare providers by repeating the same
+delegation path on one small repository. Compare providers by repeating the same
 fixture and recording model IDs, elapsed time, token/cost telemetry, whether the
-handoff occurred, test outcome, review outcome, and any manual intervention.
+delegation occurred, test outcome, review outcome, and any manual intervention.
 
 Before broader use, read [Permissions and workspace scope](/permissions/) and
 [Data and trust boundaries](/data-boundaries/).

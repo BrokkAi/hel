@@ -1,5 +1,13 @@
 # Mjolnir Code-Agent MCP Tool
 
+> **Superseded (2026-07).** The `code_agent`/`explore_agent` tools described
+> below no longer exist. They were replaced by the subagent system: a single
+> `mj-subagents` MCP server exposing `create_subagent` and `subagent_cancel`,
+> with results pushed back into the primary session as injected
+> `<subagent_result>` user messages instead of returned from the tool call. See
+> `docs/src/content/docs/subagents.md`. This document is kept as history and is
+> not maintained.
+
 Interactive Mjolnir sessions automatically start an authenticated Streamable
 HTTP MCP server on a random loopback port and include it in the primary ACP
 session's `mcpServers`. The server exposes `code_agent` for implementation and
@@ -38,7 +46,6 @@ One implementation run and a configurable bounded pool of exploration runs may
 execute concurrently. Invalid parameters are rejected, while busy,
 nested-runtime, cancellation, and message-less failures return MCP tool errors.
 Explorations are forced read-only and render as collapsed background status
-rows. Loki is connected only to implementation runs, never explorations.
 While nested work is active, Ctrl-C cancels the active nested runs and the
 primary turn so the primary agent cannot retry cancelled work without new user input.
 The nested runtime is not given this MCP server, so it cannot recursively

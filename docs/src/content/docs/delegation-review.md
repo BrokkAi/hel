@@ -1,58 +1,105 @@
 ---
 title: Delegation and review
-description: Shape bounded Eitri tasks and interpret asynchronous Council review.
+description: Shape standalone subagent briefs and interpret Mjolnir's discrete review.
 ---
 
 Delegation works best when the task has a clear seam, concrete inputs, and an
-observable finish condition.
+observable finish condition. A subagent runs in a brand-new session with no
+memory of the conversation, so the brief has to carry everything.
 
-## A useful handoff
+## A useful brief
 
-Ask Thor to give Eitri:
+Ask the primary agent to give each subagent:
 
 1. one bounded objective;
-2. the relevant repository and constraints;
+2. the context and decisions it needs to start immediately, quoted rather than
+   paraphrased;
 3. exact validation to run;
 4. files or behaviors that must not change; and
-5. the expected return evidence.
+5. the report you expect back.
 
 Example:
 
 ```text
-Delegate this to Eitri: fix the parser's empty-input panic without changing the
-public AST. Add the smallest regression test, run that test and the parser module
-tests, and return the root cause plus the diff summary.
+Launch a subagent for this: fix the parser's empty-input panic without changing
+the public AST. Add the smallest regression test, run that test and the parser
+module tests, and report the root cause plus what you verified.
 ```
 
-Small edits that require the same context as Thor's current reasoning are often
-better done directly. Open-ended, read-only questions are better suited to
-`explore_agent` or parallel `explore_agents`.
+Small edits that need the same context the primary is already holding are
+usually faster done directly — delegation pays off when the work is clearly
+larger than writing the brief and reviewing the result. Read-only investigation
+is a normal subagent task too; there is no separate explore tool and no
+read-only variant.
+
+## Parallel work
+
+Several subagents run at once and all of them can write, so the split matters
+more than the count. Give each one files or modules the others will not touch.
+When two share a workspace, neither report can show an isolated diff and you are
+told to inspect `git diff` yourself — treat that note as a sign the split was
+too coarse.
+
+Ask for a specific `agent` or `model` when a task deserves a different backend
+than the default pool; the available combinations are listed in the
+`create_subagent` tool description. Use `resume` for a follow-up on work a
+subagent already did, so its context is not rebuilt from scratch.
 
 ## Cancellation and permissions
 
-The role currently streaming in the foreground owns Ctrl-C. During a handoff,
-that means Eitri is cancelled while Thor remains paused. Permission requests are
-namespaced so the user or remote client answers the active nested request.
+Ctrl-C during a turn cancels the primary turn and every running subagent
+together. `subagent_cancel` stops one by id. Neither reverts edits already made.
 
-Permission approval does not make the model correct. Review the requested
-command, path, workspace root, and side effects before accepting it.
+Permission requests raised by a subagent are prefixed with its id
+(`subagent #3 · …`), so concurrent prompts stay attributable in the terminal and
+in the remote viewer. Permission approval does not make the model correct;
+review the requested command, path, workspace root, and side effects first.
+
+## Discrete review
+
+When a turn that launched at least one subagent completes with the pool drained
+and the workspace changed, Mjolnir holds the completion and reviews the work
+before releasing it:
+
+1. A visible read-only intent analyst extracts the governing contract from the
+   chronological user messages for that primary session.
+2. A first-class review supervisor on the primary model receives Bifrost core
+   navigation tools and an immutable change packet. Changes under 200 lines
+   include the complete captured diff; larger changes include the complete
+   diffstat plus `analyze_diff` results for the captured base and target trees.
+3. The supervisor may launch any useful subset of six read-only Norse reviewers
+   with one asynchronous call: Mímir (complexity), Völundr (duplication), Týr
+   (error handling), Hel (dead code), Heimdall (tests), and Bragi (comments and
+   contracts). Reports arrive as later turns in the same supervisor session,
+   where the supervisor verifies them and returns one adversarial verdict.
+4. Surviving findings are injected as a corrective turn on the primary, framed
+   as strong leads to verify rather than instructions to obey. Nothing survives
+   vetting means the turn is released as it stands.
+
+The supervisor and reviewers have no model-turn deadline. They remain visible
+as `review · supervisor` and `review · {name}` rows, with streamed activity in
+the terminal, headless output, and remote viewer. The normal Stop action
+cancels the supervisor and all of its reviewers and reaps their processes.
+Reviewers cannot delegate further or write to the workspace. Model usage is
+accounted to the review seat. Discrete review is toggled on the Agents tab of
+`/mjconfig`.
 
 ## Review surfaces
 
 | Surface | Behavior |
 | --- | --- |
-| Loki | Best-effort asynchronous advice over transcript checkpoints |
-| Automatic Thor review | Optional end-of-turn discrete workspace review |
+| Discrete review | Automatic end-of-turn lane review after subagent work changed the workspace |
 | `/review recent` | Findings-only review of the latest change-producing turn |
 | `/review uncommitted` | Findings-only review of all current worktree changes |
 | `/review head` | Findings-only review of `HEAD` |
 
-A review can legitimately report no findings. Advice is evidence to consider,
+A review can legitimately report no findings. Findings are evidence to consider,
 not an automatic rollback or proof that the change is safe.
 
 ## Record evaluations
 
-When comparing Councils, record the exact Thor/Eitri/Loki models and adapters,
-permission decisions, elapsed time, token and cost telemetry, validation result,
-review findings, and whether the requested handoff actually occurred. The
-checked [10-minute evaluation](/evaluate/) provides a small common task.
+When comparing setups, record the exact primary and subagent models and
+adapters, how many subagents ran and whether they overlapped, permission
+decisions, elapsed time, token and cost telemetry, validation result, review
+findings, and whether the requested delegation actually occurred. The checked
+[10-minute evaluation](/evaluate/) provides a small common task.

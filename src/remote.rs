@@ -51,9 +51,10 @@ use crate::acp::{self, AcpRuntimeConfig};
 use crate::config::{self, SelectedAgent};
 use crate::event::{
     ElicitationOutcome, ElicitationPrompt, PermissionDecision, PermissionPrompt,
-    SessionConfigTarget, TerminalOutputSnapshot, UiCommand, UiEvent,
+    SessionConfigTarget, SubagentEvent, SubagentOutcome, TerminalOutputSnapshot, UiCommand,
+    UiEvent,
 };
-use crate::{code_agent, council, loki};
+use crate::{roster, subagent};
 
 const REMOTE_CONTROL_LOCAL_ADDR: &str = "127.0.0.1:11921";
 const REMOTE_CONTROL_LOCAL_ADDR_V6: &str = "[::1]:11921";
@@ -77,6 +78,8 @@ const QUEUED_PROMPT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// in a live session's memory. A live session claims within seconds, so an
 /// old unclaimed decision is unambiguously dead.
 const PERMISSION_DECISION_TTL: Duration = Duration::from_secs(60 * 60);
+/// How many finished subagent rows the live status list keeps.
+const REMOTE_FINISHED_SUBAGENT_ROWS: usize = 4;
 const NATIVE_MCP_APPROVAL_PROPERTY: &str = "persist";
 const NATIVE_MCP_APPROVAL_CHOICES: [(&str, &str, &str); 3] = [
     ("once", "Allow once", "allow_once"),
@@ -164,7 +167,7 @@ pub struct SessionRecord {
     /// Editable session configuration options the agent currently advertises.
     #[serde(default)]
     pub session_config: Vec<SessionConfigOptionRecord>,
-    /// The native Codex Mode currently advertised by this live Thor session.
+    /// The native Codex Mode currently advertised by this live primary session.
     /// It is intentionally status-only: Mjolnir never changes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_mode: Option<NativeModeRecord>,
@@ -173,6 +176,30 @@ pub struct SessionRecord {
     /// web equivalent.
     #[serde(default)]
     pub available_commands: Vec<CommandRecord>,
+    /// Live per-subagent status rows, mirroring the TUI's subagent status area.
+    #[serde(default)]
+    pub subagents: Vec<SubagentStatusRecord>,
+}
+
+/// One background subagent as the viewer sees it: keyed by `subagent_id`,
+/// carrying the label, the latest activity line and the done state. The
+/// transcript keeps the permanent started/finished lines; this list is the live
+/// status area.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubagentStatusRecord {
+    pub subagent_id: u64,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Objective at `started`, then the newest distilled activity line.
+    pub activity: String,
+    pub started_at: String,
+    /// Set once the subagent finishes; the viewer derives "done" from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// `completed` | `cancelled` | `failed`, absent while running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 /// A slash command projected for the remote viewer. Kept separate from ACP's
@@ -213,7 +240,7 @@ fn remote_builtin_command_records(include_fork: bool) -> Vec<CommandRecord> {
         ),
         command_record(
             REMOTE_BUILTIN_COMPACT_COMMAND,
-            "compact Thor and Loki where supported",
+            "compact the primary agent's session where supported",
             None,
             "mjolnir",
         ),
@@ -738,7 +765,9 @@ struct TrackerState {
     transcript: Vec<TranscriptEntry>,
     terminal_outputs: HashMap<String, TerminalOutputSnapshot>,
     tool_transcript_entries: HashMap<usize, ToolTranscriptEntry>,
-    exploration_entries: HashMap<u64, usize>,
+    /// Live per-subagent status rows, keyed by `subagent_id` and ordered by it
+    /// (ids are monotonic in spawn order).
+    subagents: BTreeMap<u64, SubagentStatusRecord>,
     pending_permissions: Vec<PendingPermissionRecord>,
     session_config: Vec<SessionConfigOptionRecord>,
     native_mode: Option<NativeModeRecord>,
@@ -805,7 +834,7 @@ struct ServerAgentSession {
 #[derive(Debug)]
 struct ServerSessionManager {
     agent: SelectedAgent,
-    council: Option<council::ResolvedCouncil>,
+    roster: Option<roster::Roster>,
     additional_directories: Vec<PathBuf>,
     fs_max_text_bytes: u64,
     sessions: Mutex<Vec<ServerAgentSession>>,
@@ -820,27 +849,27 @@ impl ServerSessionManager {
     ) -> Self {
         Self {
             agent,
-            council: None,
+            roster: None,
             additional_directories,
             fs_max_text_bytes,
             sessions: Mutex::new(Vec::new()),
         }
     }
 
-    fn new_council(
-        council: council::ResolvedCouncil,
+    fn new_roster(
+        roster: roster::Roster,
         additional_directories: Vec<PathBuf>,
         fs_max_text_bytes: u64,
     ) -> Self {
-        let thor = &council.thor;
+        let primary = &roster.primary;
         Self {
             agent: SelectedAgent {
-                source_id: format!("council:{}", thor.model.model),
-                program: thor.launch.command.clone(),
-                args: thor.launch.args.clone(),
-                env: thor.launch.env.clone(),
+                source_id: format!("roster:{}", primary.model.model),
+                program: primary.launch.command.clone(),
+                args: primary.launch.args.clone(),
+                env: primary.launch.env.clone(),
             },
-            council: Some(council),
+            roster: Some(roster),
             additional_directories,
             fs_max_text_bytes,
             sessions: Mutex::new(Vec::new()),
@@ -850,7 +879,7 @@ impl ServerSessionManager {
     fn start_session(&self, cwd: PathBuf) {
         let session = start_server_agent_session(
             self.agent.clone(),
-            self.council.clone(),
+            self.roster.clone(),
             cwd,
             self.additional_directories.clone(),
             self.fs_max_text_bytes,
@@ -892,7 +921,7 @@ impl TrackerState {
             transcript: Vec::new(),
             terminal_outputs: HashMap::new(),
             tool_transcript_entries: HashMap::new(),
-            exploration_entries: HashMap::new(),
+            subagents: BTreeMap::new(),
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
             native_mode: None,
@@ -920,7 +949,7 @@ impl TrackerState {
         self.transcript.clear();
         self.terminal_outputs.clear();
         self.tool_transcript_entries.clear();
-        self.exploration_entries.clear();
+        self.subagents.clear();
         self.pending_permissions.clear();
         self.session_config.clear();
         self.native_mode = None;
@@ -1005,18 +1034,22 @@ impl TrackerState {
                 self.touch();
             }
             UiEvent::ClaudeUsage(_) | UiEvent::CodexUsage(_) => {}
-            UiEvent::CouncilUsage(record) => {
-                let actor = match record.role {
-                    crate::council_usage::Role::Thor => "thor",
-                    crate::council_usage::Role::Loki => "loki",
-                    crate::council_usage::Role::Eitri => "eitri",
+            UiEvent::AgentUsage(record) => {
+                let actor = match record.seat {
+                    crate::agent_usage::Seat::Primary => "primary",
+                    crate::agent_usage::Seat::Subagent | crate::agent_usage::Seat::Review => {
+                        "subagent"
+                    }
                 };
                 let tokens = record.usage.as_ref().map_or(0, |usage| usage.total_tokens);
-                let purpose = record.purpose.map_or("", |purpose| match purpose {
-                    crate::council_usage::Purpose::Code => " code",
-                    crate::council_usage::Purpose::Explore => " explore",
-                    crate::council_usage::Purpose::Review => " review",
-                });
+                let seat = match record.seat {
+                    crate::agent_usage::Seat::Review => " review",
+                    _ => "",
+                };
+                let model = record
+                    .model
+                    .as_deref()
+                    .map_or_else(String::new, |model| format!(" · {model}"));
                 let cost = record
                     .update
                     .as_ref()
@@ -1027,11 +1060,11 @@ impl TrackerState {
                 self.push_actor_transcript_entry(
                     "system",
                     actor,
-                    format!("usage{purpose} · {tokens} tokens{cost}"),
+                    format!("usage{seat} · {tokens} tokens{model}{cost}"),
                 );
                 self.touch();
             }
-            UiEvent::CouncilRoleChanged { .. } => {}
+            UiEvent::SubagentPoolModelChanged { .. } => {}
             UiEvent::CancelPendingPermissions => {
                 self.pending_permissions.clear();
                 self.touch();
@@ -1041,28 +1074,19 @@ impl TrackerState {
             // remote viewer is a read-only mirror and has nothing to track.
             | UiEvent::ElicitationRequest(_)
             | UiEvent::RemotePermissionDecision { .. }
-            | UiEvent::CodeAgent(_)
-            | UiEvent::CouncilUpdate { .. } => {}
+            | UiEvent::RosterUpdate { .. } => {}
+            UiEvent::Subagent(subagent_event) => self.observe_subagent_event(subagent_event),
             UiEvent::Info(message) => {
-                if message.starts_with("Council compact:") {
+                if message.starts_with("compact: primary") {
                     self.record_system_notice(message.clone());
                 }
             }
             UiEvent::Warning(message) => {
                 self.record_system_notice(message.clone());
             }
-            UiEvent::LokiActivity(activity) => {
-                let (kind, text) = match activity {
-                    crate::event::LokiActivity::Warning { message, .. } => {
-                        ("system", message.clone())
-                    }
-                };
-                self.push_actor_transcript_entry(kind, "loki", text);
-                self.touch();
-            }
             UiEvent::InternalMessage(message) => {
                 self.push_actor_transcript_entry(
-                    message.kind.wire_name(),
+                    "system",
                     &message.source.to_ascii_lowercase(),
                     message.text.clone(),
                 );
@@ -1071,12 +1095,126 @@ impl TrackerState {
         }
     }
 
+    /// Mirror one subagent event. Lifecycle events maintain the live status
+    /// area, while session and terminal updates retain their per-subagent actor
+    /// and identifier namespaces in the transcript.
+    fn observe_subagent_event(&mut self, event: &SubagentEvent) {
+        match event {
+            SubagentEvent::Started {
+                subagent_id,
+                label,
+                model,
+                objective,
+                ..
+            } => {
+                let now = now_rfc3339();
+                self.subagents.insert(
+                    *subagent_id,
+                    SubagentStatusRecord {
+                        subagent_id: *subagent_id,
+                        label: label.clone(),
+                        model: model.clone(),
+                        activity: objective.clone(),
+                        started_at: now,
+                        finished_at: None,
+                        outcome: None,
+                    },
+                );
+                self.prune_finished_subagents();
+                self.push_actor_transcript_entry(
+                    "system",
+                    "subagent",
+                    format!("subagent #{subagent_id} · {label} · started · {objective}"),
+                );
+                self.touch();
+            }
+            SubagentEvent::Activity {
+                subagent_id,
+                activity,
+            } => {
+                if let Some(record) = self.subagents.get_mut(subagent_id) {
+                    record.activity = activity.clone();
+                    self.touch();
+                }
+            }
+            SubagentEvent::Finished {
+                subagent_id,
+                outcome,
+            } => {
+                let summary = match outcome {
+                    SubagentOutcome::Failed(message) => format!("failed: {message}"),
+                    other => other.label().to_string(),
+                };
+                let label = self
+                    .subagents
+                    .get(subagent_id)
+                    .map(|record| record.label.clone());
+                if let Some(record) = self.subagents.get_mut(subagent_id) {
+                    record.finished_at = Some(now_rfc3339());
+                    record.outcome = Some(outcome.label().to_string());
+                    // A failure message is the only outcome detail the row
+                    // itself can carry; otherwise the last activity stands.
+                    if matches!(outcome, SubagentOutcome::Failed(_)) {
+                        record.activity = summary.clone();
+                    }
+                }
+                self.prune_finished_subagents();
+                let label = label.unwrap_or_else(|| "subagent".to_string());
+                self.push_actor_transcript_entry(
+                    "system",
+                    "subagent",
+                    format!("subagent #{subagent_id} · {label} · {summary}"),
+                );
+                self.touch();
+            }
+            SubagentEvent::SessionUpdate {
+                subagent_id,
+                update,
+            } => {
+                let actor = remote_subagent_actor(*subagent_id);
+                self.observe_session_update_as(update, &actor, Some(&actor));
+            }
+            SubagentEvent::TerminalOutput {
+                subagent_id,
+                snapshot,
+            } => {
+                let actor = remote_subagent_actor(*subagent_id);
+                let mut snapshot = snapshot.clone();
+                snapshot.terminal_id = namespace_remote_id(Some(&actor), &snapshot.terminal_id);
+                self.observe_terminal_output(&snapshot);
+            }
+            _ => {}
+        }
+    }
+
+    /// The status list is a live area, so only the most recent completions stay
+    /// in it; the permanent record lives in the transcript.
+    fn prune_finished_subagents(&mut self) {
+        let mut finished: Vec<(String, u64)> = self
+            .subagents
+            .values()
+            .filter_map(|record| {
+                record
+                    .finished_at
+                    .clone()
+                    .map(|finished_at| (finished_at, record.subagent_id))
+            })
+            .collect();
+        if finished.len() <= REMOTE_FINISHED_SUBAGENT_ROWS {
+            return;
+        }
+        finished.sort();
+        for (_, subagent_id) in &finished[..finished.len() - REMOTE_FINISHED_SUBAGENT_ROWS] {
+            self.subagents.remove(subagent_id);
+        }
+    }
+
     fn take_sessions_to_disconnect(&mut self) -> Vec<String> {
         std::mem::take(&mut self.sessions_to_disconnect)
     }
 
     fn observe_session_update(&mut self, update: &SessionUpdate) {
-        self.observe_session_update_as(update, "thor", None);
+        self.observe_session_update_as(update, "primary", None);
     }
 
     fn observe_session_update_as(
@@ -1100,7 +1238,7 @@ impl TrackerState {
                 self.touch();
             }
             SessionUpdate::ToolCall(tool_call) => {
-                if actor == "thor" && crate::app::is_code_agent_transport_call(tool_call) {
+                if actor == "primary" && crate::app::is_subagent_transport_call(tool_call) {
                     return;
                 }
                 self.agent_message_open = false;
@@ -1117,7 +1255,7 @@ impl TrackerState {
                 self.touch();
             }
             SessionUpdate::ToolCallUpdate(update) => {
-                if actor == "thor" && crate::app::is_code_agent_transport_update(update) {
+                if actor == "primary" && crate::app::is_subagent_transport_update(update) {
                     return;
                 }
                 self.agent_message_open = false;
@@ -1339,6 +1477,7 @@ impl TrackerState {
             session_config: self.session_config.clone(),
             native_mode: self.native_mode.clone(),
             available_commands: self.available_commands.clone(),
+            subagents: self.subagents.values().cloned().collect(),
         })
     }
 
@@ -1612,6 +1751,7 @@ impl RemoteSessionTracker {
         self.request_flush();
     }
 
+    #[cfg(test)]
     fn observe_actor_session_update(
         &self,
         update: &SessionUpdate,
@@ -1627,25 +1767,16 @@ impl RemoteSessionTracker {
         self.request_flush();
     }
 
-    fn observe_exploration(&self, run_id: u64, status: String, finished: bool) {
+    /// Mirror a subagent lifecycle event. `mj server` sessions call this
+    /// directly because they intercept `UiEvent::Subagent` before it reaches
+    /// [`Self::observe_event`]; the TUI and headless paths reach the same state
+    /// method through `observe_event`.
+    fn observe_subagent_event(&self, event: &SubagentEvent) {
         if self.shutting_down.load(Ordering::Relaxed) {
             return;
         }
         if let Ok(mut state) = self.state.lock() {
-            let text = format!("explore #{run_id} · {status}");
-            if let Some(index) = state.exploration_entries.get(&run_id).copied()
-                && let Some(entry) = state.transcript.get_mut(index)
-            {
-                entry.text = text;
-                entry.timestamp = now_rfc3339();
-                state.touch();
-            } else {
-                let index = state.push_actor_transcript_entry("system", "eitri", text);
-                state.exploration_entries.insert(run_id, index);
-            }
-            if finished {
-                state.exploration_entries.remove(&run_id);
-            }
+            state.observe_subagent_event(event);
         }
         self.request_flush();
     }
@@ -2162,7 +2293,7 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     let config_path = config::default_config_path();
     let cfg = config::Config::load(&config_path)
         .with_context(|| format!("load {}", config_path.display()))?;
-    let resolved = council::resolve(&cfg, &cwd).await?;
+    let resolved = roster::resolve(&cfg, &cwd).await?;
 
     let requested_hostname = normalize_requested_hostname(hostname.as_deref());
     let tailscale_tls = if tailscale {
@@ -2184,7 +2315,7 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     };
     let workspace_roots =
         crate::paths::WorkspaceRoots::new(&cwd, &additional_directories)?.active_roots();
-    let session_manager = Arc::new(ServerSessionManager::new_council(
+    let session_manager = Arc::new(ServerSessionManager::new_roster(
         resolved,
         additional_directories,
         fs_max_text_bytes,
@@ -2323,7 +2454,7 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
 
 fn start_server_agent_session(
     agent: SelectedAgent,
-    council: Option<council::ResolvedCouncil>,
+    roster: Option<roster::Roster>,
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
     fs_max_text_bytes: u64,
@@ -2345,30 +2476,18 @@ fn start_server_agent_session(
         Some(server_cmd_tx.clone()),
         Some(remote_event_tx),
     );
-    if let Some(resolved) = council.as_ref() {
+    if let Some(resolved) = roster.as_ref() {
         for warning in &resolved.warnings {
             tracker.observe_event(&UiEvent::Warning(warning.clone()));
         }
     }
-    let mut council_setup_error = None;
-    let (loki_roles, loki_codex_home) = match council.as_ref() {
+    let mut roster_setup_error = None;
+    let (subagent_roles, subagent_codex_home) = match roster.as_ref() {
         Some(resolved) => {
-            match crate::isolated_council_roles(resolved.loki_failover_roles(), "loki") {
+            match crate::isolated_subagent_roles(resolved.subagent_failover_roles(), "subagent") {
                 Ok(pair) => pair,
                 Err(error) => {
-                    council_setup_error = Some(format!("prepare Loki: {error:#}"));
-                    (Vec::new(), None)
-                }
-            }
-        }
-        None => (Vec::new(), None),
-    };
-    let (eitri_roles, eitri_codex_home) = match council.as_ref() {
-        Some(resolved) => {
-            match crate::isolated_council_roles(resolved.eitri_failover_roles(), "eitri") {
-                Ok(pair) => pair,
-                Err(error) => {
-                    council_setup_error = Some(format!("prepare Eitri: {error:#}"));
+                    roster_setup_error = Some(format!("prepare subagents: {error:#}"));
                     (Vec::new(), None)
                 }
             }
@@ -2376,72 +2495,56 @@ fn start_server_agent_session(
         None => (Vec::new(), None),
     };
     let quota_gate = crate::quota::Gate::new(cwd.clone(), runtime_event_tx.clone());
-    let loki_pool = (!loki_roles.is_empty()).then(|| {
+    let subagent_pool = (!subagent_roles.is_empty()).then(|| {
         crate::quota::RolePool::new(
-            loki_roles,
-            quota_gate.clone(),
-            app_config.council.auto_failover,
-            crate::council_usage::Role::Loki,
-            runtime_event_tx.clone(),
-        )
-    });
-    let eitri_pool = (!eitri_roles.is_empty()).then(|| {
-        crate::quota::RolePool::new(
-            eitri_roles,
+            subagent_roles,
             quota_gate,
-            app_config.council.auto_failover,
-            crate::council_usage::Role::Eitri,
+            app_config.subagents.auto_failover,
+            "subagents",
             runtime_event_tx.clone(),
         )
     });
-    let loki_handle = loki_pool.map(|pool| {
-        loki::Handle::start(
-            pool,
-            cwd.clone(),
-            additional_directories.clone(),
-            runtime_event_tx.clone(),
-            format!("remote-{}", std::process::id()),
-        )
-    });
-    let thor_pull_server = match loki_handle.as_ref() {
-        Some(reviewer) => match loki::PullServer::start(reviewer.clone(), loki::Consumer::Thor) {
-            Ok(server) => Some(server),
-            Err(error) => {
-                council_setup_error = Some(format!("prepare Loki pull tool: {error:#}"));
-                None
-            }
-        },
-        None => None,
-    };
-    let role_config = council.as_ref().map(|resolved| acp::RuntimeRoleConfig {
-        label: "Thor".to_string(),
-        model_id: resolved.thor.model.model.clone(),
-        model_value: resolved.thor.model_value.clone(),
-        adapter_source_id: resolved.thor.launch.source_id.clone(),
+    let role_config = roster.as_ref().map(|resolved| acp::RuntimeRoleConfig {
+        label: "primary".to_string(),
+        model_id: resolved.primary.model.model.clone(),
+        model_value: resolved.primary.model_value.clone(),
+        adapter_source_id: resolved.primary.launch.source_id.clone(),
         permission: None,
-        council_session: None,
-        reasoning_effort: resolved.thor.reasoning_effort.clone(),
+        session_tag: None,
+        reasoning_effort: resolved.primary.reasoning_effort.clone(),
     });
-    let implementation_handoffs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let active_implementation_workers = code_agent::ActiveCodeWorkers::default();
-    // The discrete review's specialist lanes run on Eitri's seat and share
-    // Thor's workspace roots, so both have to be cloned before they move into
-    // the code-agent config and the runtime config respectively.
-    let review_workers = eitri_pool.clone();
+    let subagent_handoffs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Shared with the review fan-out so lane ids never collide with pool ids.
+    let subagent_ids = subagent::SubagentIdAllocator::default();
+    let active_implementation_workers = subagent::ActiveSubagentWorkers::default();
+    let (subagent_reports, subagent_report_rx) = subagent::SubagentReportBus::channel();
+    let subagent_inventory = std::sync::Arc::new(std::sync::RwLock::new(
+        roster
+            .as_ref()
+            .map(subagent::SubagentInventory::from_roster)
+            .unwrap_or_default(),
+    ));
+    // The discrete review's specialist lanes run on the subagent pool and share
+    // the primary's workspace roots, so both have to be cloned before they move
+    // into the subagent config and the runtime config respectively.
+    let review_workers = subagent_pool.clone();
     let review_additional_directories = additional_directories.clone();
-    let code_agent = eitri_pool.map(|eitri_pool| {
-        code_agent::Config::council(eitri_pool, None, loki_handle.clone())
-            .with_implementation_handoff_counter(implementation_handoffs.clone())
+    let subagents = subagent_pool.map(|subagent_pool| {
+        subagent::Config::new(subagent_pool, None)
+            .with_subagent_handoff_counter(subagent_handoffs.clone())
+            .with_id_allocator(subagent_ids.clone())
             .with_active_implementation_workers(active_implementation_workers.clone())
-            .with_max_parallel_explores(app_config.eitri.max_parallel_explores)
-            .with_prewarm(code_agent::RunContext {
+            .with_max_parallel(app_config.subagents.max_parallel)
+            .with_inventory(subagent_inventory)
+            .with_reports(subagent_reports.clone())
+            .with_prewarm(subagent::RunContext {
                 cwd: cwd.clone(),
                 additional_directories: additional_directories.clone(),
                 fs_max_text_bytes,
                 access_mode: crate::acp::RuntimeAccessMode::Full,
             })
     });
-    let provenance_thor = council.as_ref().map(|resolved| resolved.thor.clone());
+    let provenance_primary = roster.as_ref().map(|resolved| resolved.primary.clone());
     let provenance_cwd = cwd.clone();
     let mut workspace_roots = Vec::with_capacity(1 + additional_directories.len());
     workspace_roots.push(cwd.clone());
@@ -2451,10 +2554,7 @@ fn start_server_agent_session(
         args: agent.args,
         cwd,
         additional_directories,
-        mcp_servers: thor_pull_server
-            .as_ref()
-            .map(|server| vec![server.advertised().clone()])
-            .unwrap_or_default(),
+        mcp_servers: Vec::new(),
         resume_session: None,
         env: agent.env,
         agent_stderr: None,
@@ -2464,49 +2564,46 @@ fn start_server_agent_session(
         config_path: Some(config_path),
         saved_session_config: HashMap::new(),
         role_config,
-        code_agent,
+        subagents,
         side_prompt_policy: false,
         termination: None,
     };
     let command_tx = server_cmd_tx.clone();
     let shutdown_tx = runtime_cmd_tx.clone();
-    let log_context = council
-        .as_ref()
-        .map(|resolved| crate::council_orchestrator::LogContext {
-            council_session: format!("remote-{}", std::process::id()),
-            model: resolved.thor.model.model.clone(),
-            adapter: resolved.thor.launch.source_id.clone(),
-        });
-    let orchestrated = crate::council_orchestrator::spawn(
+    let orchestrated = crate::orchestrator::spawn(
         runtime_event_rx,
-        crate::council_orchestrator::Config {
-            reviewer: loki_handle.clone(),
+        crate::orchestrator::Config {
             runtime_commands: runtime_cmd_tx.clone(),
-            implementation_handoffs: implementation_handoffs.clone(),
-            active_implementation_workers: active_implementation_workers.clone(),
-            discrete_review: app_config.thor.discrete_review,
+            subagent_handoffs: subagent_handoffs.clone(),
+            active_subagent_workers: active_implementation_workers.clone(),
+            subagent_reports: subagent_report_rx,
+            subagent_report_bus: subagent_reports,
+            discrete_review: app_config.agent.discrete_review,
+            primary_model: roster
+                .as_ref()
+                .map(|resolved| resolved.primary.model.model.clone()),
             review_root: provenance_cwd.clone(),
-            log_context,
-            held_completion_max_wait: None,
             review_fanout: review_workers
-                .zip(council.as_ref())
+                .zip(roster.as_ref())
                 .map(|(workers, resolved)| {
                     crate::discrete_review::Spawner::live(crate::discrete_review::FanoutConfig {
                         workers,
-                        supervisor: resolved.thor.clone(),
+                        supervisor: resolved.primary.clone(),
                         cwd: provenance_cwd.clone(),
                         additional_directories: review_additional_directories,
-                        council_session: Some(format!("remote-{}", std::process::id())),
+                        session_tag: Some(format!("remote-{}", std::process::id())),
+                        agent_stderr: None,
+                        fs_max_text_bytes,
+                        id_allocator: subagent_ids.clone(),
                     })
                 }),
         },
     );
-    let thor_orchestrator = orchestrated.handle.clone();
+    let primary_orchestrator = orchestrated.handle.clone();
 
     let task = tokio::spawn(async move {
-        let _council_homes = (loki_codex_home, eitri_codex_home);
-        let _thor_pull_server = thor_pull_server;
-        if let Some(error) = council_setup_error {
+        let _subagent_homes = subagent_codex_home;
+        if let Some(error) = roster_setup_error {
             tracker.observe_event(&UiEvent::Fatal(error));
             tracker.shutdown().await;
             return;
@@ -2519,49 +2616,35 @@ fn start_server_agent_session(
         let command_proxy = {
             let tracker = tracker.clone();
             let runtime_cmd_tx = runtime_cmd_tx.clone();
-            let loki = loki_handle.clone();
-            let handoffs = implementation_handoffs.clone();
-            let active_workers = active_implementation_workers.clone();
-            let thor_orchestrator = thor_orchestrator.clone();
+            let handoffs = subagent_handoffs.clone();
+            let primary_orchestrator = primary_orchestrator.clone();
             let workspace_roots = workspace_roots.clone();
             tokio::spawn(async move {
                 let mut local_epoch = 0_u64;
                 while let Some(command) = server_cmd_rx.recv().await {
                     if let UiCommand::RunReview { target } = command {
-                        thor_orchestrator.request_review(target);
+                        primary_orchestrator.request_review(target);
                         continue;
                     }
-                    if matches!(command, UiCommand::CompactCouncil)
+                    if matches!(command, UiCommand::CompactPrimary)
                         || matches!(&command, UiCommand::SendPrompt { text, images } if text == "/compact" && images.is_empty())
                     {
-                        thor_orchestrator.compact_manual().await;
+                        primary_orchestrator.compact_manual().await;
                         continue;
                     }
                     tracker.observe_command(&command);
                     if let UiCommand::SendPrompt { text, images } = &command {
                         local_epoch = local_epoch.saturating_add(1);
                         handoffs.store(0, std::sync::atomic::Ordering::Release);
-                        let snapshot = if active_workers.count() == 0 {
+                        let snapshot =
                             crate::workspace_snapshot::WorkspaceSnapshot::capture(&workspace_roots)
-                                .await
-                        } else {
-                            warn!(
-                                "exact turn snapshot unavailable: a prior implementation worker is still active; discrete review will be skipped for this remote turn"
-                            );
-                            crate::workspace_snapshot::WorkspaceSnapshot::capture(&[]).await
-                        };
-                        let epoch = loki
-                            .as_ref()
-                            .map_or(local_epoch, |reviewer| reviewer.begin_turn(text.clone()));
-                        thor_orchestrator
-                            .begin_turn(epoch, text.clone(), images.clone(), snapshot)
+                                .await;
+                        primary_orchestrator
+                            .begin_turn(local_epoch, text.clone(), images.clone(), snapshot)
                             .await;
                     }
                     if matches!(command, UiCommand::CancelPrompt) {
-                        thor_orchestrator.cancel_review();
-                        if let Some(reviewer) = loki.as_ref() {
-                            reviewer.cancel_turn();
-                        }
+                        primary_orchestrator.cancel_review();
                     }
                     let shutdown = matches!(command, UiCommand::Shutdown);
                     if runtime_cmd_tx.send(command).is_err() || shutdown {
@@ -2583,15 +2666,15 @@ fn start_server_agent_session(
                     let Some(event) = event else {
                         break;
                     };
-                    if let (Some(thor), UiEvent::SessionStarted { session_id, .. }) =
-                        (provenance_thor.as_ref(), &event)
+                    if let (Some(primary), UiEvent::SessionStarted { session_id, .. }) =
+                        (provenance_primary.as_ref(), &event)
                     {
                         crate::session_provenance::record(crate::session_provenance::Record {
                             session_id: session_id.clone(),
                             cwd: provenance_cwd.clone(),
-                            adapter_source_id: thor.launch.source_id.clone(),
-                            model: thor.model.model.clone(),
-                            model_value: thor.model_value.clone(),
+                            adapter_source_id: primary.launch.source_id.clone(),
+                            model: primary.model.model.clone(),
+                            model_value: primary.model_value.clone(),
                         });
                     }
                     handle_server_agent_event(event, &tracker, &mut pending_permissions);
@@ -2630,9 +2713,6 @@ fn start_server_agent_session(
             }
         }
         pending_permissions.clear();
-        if let Some(reviewer) = loki_handle.as_ref() {
-            reviewer.shutdown_and_wait().await;
-        }
         let _ = tokio::time::timeout(Duration::from_secs(2), orchestrator_task).await;
         tracker.shutdown().await;
     });
@@ -2660,20 +2740,20 @@ fn handle_server_agent_event(
     tracker: &RemoteSessionTracker,
     pending_permissions: &mut HashMap<String, RemotePendingApproval>,
 ) {
-    if let UiEvent::CodeAgent(code_event) = event {
-        match code_event {
-            crate::event::CodeAgentEvent::ExplorationStarted { run_id, label } => {
-                tracker.observe_exploration(run_id, format!("starting · {label}"), false);
-            }
-            crate::event::CodeAgentEvent::ExplorationProgress { run_id, activity } => {
-                tracker.observe_exploration(run_id, activity, false);
-            }
-            crate::event::CodeAgentEvent::ExplorationFinished { run_id, outcome } => {
-                tracker.observe_exploration(run_id, format!("{outcome:?}"), true);
-            }
-            crate::event::CodeAgentEvent::PermissionRequest(mut prompt) => {
+    if let UiEvent::Subagent(subagent_event) = event {
+        // Mirror status and transcript state first. The arms below only own
+        // interactions that the server must answer or retain.
+        tracker.observe_subagent_event(&subagent_event);
+        match subagent_event {
+            crate::event::SubagentEvent::Started { .. }
+            | crate::event::SubagentEvent::Activity { .. }
+            | crate::event::SubagentEvent::Finished { .. } => {}
+            crate::event::SubagentEvent::PermissionRequest {
+                subagent_id,
+                mut prompt,
+            } => {
                 let local_id = prompt.tool_call.tool_call_id.to_string();
-                prompt.tool_call.tool_call_id = format!("eitri:{local_id}").into();
+                prompt.tool_call.tool_call_id = format!("subagent-{subagent_id}:{local_id}").into();
                 let event = tracker.intercept_event(UiEvent::PermissionRequest(prompt));
                 tracker.observe_event(&event);
                 if let UiEvent::PermissionRequest(prompt) = event {
@@ -2683,22 +2763,18 @@ fn handle_server_agent_event(
                     );
                 }
             }
-            crate::event::CodeAgentEvent::SessionUpdate(update) => {
-                tracker.observe_actor_session_update(&update, "eitri", Some("eitri"));
-            }
-            crate::event::CodeAgentEvent::TerminalOutput(mut snapshot) => {
-                snapshot.terminal_id = namespace_remote_id(Some("eitri"), &snapshot.terminal_id);
-                tracker.observe_event(&UiEvent::TerminalOutput(snapshot));
-            }
-            crate::event::CodeAgentEvent::Finished { .. } => {
-                pending_permissions.retain(|id, _| !id.starts_with("eitri:"));
-            }
-            crate::event::CodeAgentEvent::ElicitationRequest(prompt) => {
+            crate::event::SubagentEvent::SessionUpdate { .. }
+            | crate::event::SubagentEvent::TerminalOutput { .. } => {}
+            crate::event::SubagentEvent::ElicitationRequest { prompt, .. } => {
                 let _ = prompt
                     .responder
                     .send(crate::event::ElicitationOutcome::Decline);
             }
-            _ => {}
+            crate::event::SubagentEvent::CancelPendingPermissions { subagent_id } => {
+                let prefix = format!("subagent-{subagent_id}:");
+                pending_permissions.retain(|id, _| !id.starts_with(&prefix));
+            }
+            crate::event::SubagentEvent::Status { .. } => {}
         }
         return;
     }
@@ -2771,18 +2847,14 @@ fn is_native_injected_mcp_approval(prompt: &ElicitationPrompt) -> bool {
 /// Match only the fully qualified identities of tools injected by Mjolnir.
 /// Server names or arbitrary tool names mentioned in prose are insufficient.
 fn message_has_exact_native_mcp_tool_identity(message: &str) -> bool {
-    ["mj-code-agent", "mj-loki-pull"].into_iter().any(|server| {
+    ["mj-subagents"].into_iter().any(|server| {
         known_native_mcp_tools(server).iter().any(|tool| {
             let dotted_identity = format!("mcp.{server}.{tool}");
             message_has_exact_mcp_identity(message, &dotted_identity)
                 || match server {
-                    "mj-code-agent" => message_has_exact_mcp_identity(
+                    "mj-subagents" => message_has_exact_mcp_identity(
                         message,
-                        &format!("mcp__mj_code_agent__{tool}"),
-                    ),
-                    "mj-loki-pull" => message_has_exact_mcp_identity(
-                        message,
-                        &format!("mcp__mj-loki-pull__{tool}"),
+                        &format!("mcp__mj_subagents__{tool}"),
                     ),
                     _ => false,
                 }
@@ -2803,14 +2875,7 @@ fn message_has_exact_mcp_identity(message: &str, identity: &str) -> bool {
 
 fn known_native_mcp_tools(server: &str) -> &'static [&'static str] {
     match server {
-        "mj-code-agent" => &[
-            "explore_agent",
-            "explore_agents",
-            "code_agent",
-            "code_agent_continue",
-            "code_agent_cancel",
-        ],
-        "mj-loki-pull" => &["pull_advice"],
+        "mj-subagents" => &["create_subagent", "subagent_cancel"],
         _ => &[],
     }
 }
@@ -2844,6 +2909,10 @@ fn native_mcp_approval_outcome(option_id: &str) -> Option<ElicitationOutcome> {
 
 fn namespace_remote_id(prefix: Option<&str>, id: &str) -> String {
     prefix.map_or_else(|| id.to_string(), |prefix| format!("{prefix}:{id}"))
+}
+
+fn remote_subagent_actor(subagent_id: u64) -> String {
+    format!("subagent-{subagent_id}")
 }
 
 fn namespace_remote_terminals(content: &mut [ToolCallContent], prefix: Option<&str>) {
@@ -3791,7 +3860,7 @@ async fn queue_prompt(
     if !queued {
         return Err((
             StatusCode::CONFLICT,
-            "manual review is only available while Thor is idle".to_string(),
+            "manual review is only available while the primary agent is idle".to_string(),
         ));
     }
     Ok(StatusCode::ACCEPTED)
@@ -4332,6 +4401,7 @@ fn init_db(db_path: &Path) -> Result<()> {
     )?;
     ensure_sessions_column(&conn, "prompt_in_flight", "integer not null default 0")?;
     ensure_sessions_column(&conn, "worktree", "text")?;
+    ensure_sessions_column(&conn, "subagents_json", "text not null default '[]'")?;
     Ok(())
 }
 
@@ -4375,6 +4445,8 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
         .context("serialize remote-control session config")?;
     let available_commands_json = serde_json::to_string(&session.available_commands)
         .context("serialize remote-control available commands")?;
+    let subagents_json = serde_json::to_string(&session.subagents)
+        .context("serialize remote-control subagent status")?;
     let last_prompt_at = session_last_prompt_at(session);
     let prompt_in_flight = if session.prompt_in_flight { 1_i64 } else { 0 };
     // The conflict arm refuses to move `last_update` backwards: every state
@@ -4397,8 +4469,9 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             available_commands_json,
             prompt_in_flight,
             worktree,
+            subagents_json,
             connected
-        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1)
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 1)
         on conflict(session_id) do update set
             name = excluded.name,
             start_time = sessions.start_time,
@@ -4418,6 +4491,7 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             available_commands_json = excluded.available_commands_json,
             prompt_in_flight = excluded.prompt_in_flight,
             worktree = excluded.worktree,
+            subagents_json = excluded.subagents_json,
             connected = 1
         where excluded.last_update >= sessions.last_update",
         params![
@@ -4435,6 +4509,7 @@ fn upsert_session_record(db_path: &Path, session: &SessionRecord) -> Result<()> 
             available_commands_json,
             prompt_in_flight,
             session.worktree,
+            subagents_json,
         ],
     )
     .context("upsert remote-control session")?;
@@ -4611,7 +4686,8 @@ fn load_session_records(db_path: &Path) -> Result<Vec<SessionRecord>> {
                     from queued_prompts
                     where queued_prompts.session_id = sessions.session_id
                 ) as queued_prompt_count,
-                worktree
+                worktree,
+                subagents_json
             from sessions
             order by session_id asc",
         )
@@ -4651,7 +4727,8 @@ fn load_connected_session_records(db_path: &Path, cutoff: &str) -> Result<Vec<Se
                     from queued_prompts
                     where queued_prompts.session_id = sessions.session_id
                 ) as queued_prompt_count,
-                worktree
+                worktree,
+                subagents_json
             from sessions
             where connected = 1 and last_update >= ?1
             order by session_id asc",
@@ -4676,11 +4753,13 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
     let available_commands_json: String = row.get(11)?;
     let prompt_in_flight: i64 = row.get(12)?;
     let queued_prompt_count: i64 = row.get(13)?;
+    let subagents_json: String = row.get(15)?;
     let transcript: Vec<TranscriptEntry> =
         serde_json::from_str(&transcript_json).unwrap_or_default();
     let pending_permissions = serde_json::from_str(&pending_permissions_json).unwrap_or_default();
     let session_config = serde_json::from_str(&session_config_json).unwrap_or_default();
     let available_commands = serde_json::from_str(&available_commands_json).unwrap_or_default();
+    let subagents = serde_json::from_str(&subagents_json).unwrap_or_default();
     let last_prompt_at: Option<String> = row
         .get::<_, Option<String>>(4)?
         .filter(|value| !value.is_empty())
@@ -4702,6 +4781,7 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         session_config,
         native_mode: None,
         available_commands,
+        subagents,
     })
 }
 
@@ -5502,11 +5582,12 @@ fn parse_rfc3339_datetime(
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
-        AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Diff,
-        ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, EnumOption,
-        PermissionOption, SessionConfigSelect, SessionConfigSelectOption, StopReason,
-        StringPropertySchema, Terminal, TerminalExitStatus, TerminalId, ToolCall, ToolCallContent,
-        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UnstructuredCommandInput,
+        AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ContentBlock,
+        ContentChunk, Diff, ElicitationFormMode, ElicitationSchema, ElicitationSessionScope,
+        EnumOption, PermissionOption, SessionConfigSelect, SessionConfigSelectOption, StopReason,
+        StringPropertySchema, Terminal, TerminalExitStatus, TerminalId, TextContent, ToolCall,
+        ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        UnstructuredCommandInput,
     };
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
@@ -5660,21 +5741,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn top_level_code_agent_mcp_approvals_track_cards_and_forward_persist_choices() {
+    async fn top_level_subagent_mcp_approvals_track_cards_and_forward_persist_choices() {
         for (tool, choice) in [
-            ("explore_agent", "once"),
-            ("code_agent", "once"),
-            ("code_agent_continue", "session"),
-            ("code_agent_cancel", "always"),
+            ("create_subagent", "once"),
+            ("create_subagent", "session"),
+            ("subagent_cancel", "always"),
         ] {
-            let tracker =
-                RemoteSessionTracker::new_disconnected("project".to_string(), "thor".to_string());
+            let tracker = RemoteSessionTracker::new_disconnected(
+                "project".to_string(),
+                "primary".to_string(),
+            );
             tracker.observe_event(&UiEvent::SessionStarted {
                 session_id: "sess-1".to_string(),
                 resumed: false,
             });
             let (prompt, rx) = mcp_approval_prompt(
-                format!("MCP approval for mcp__mj_code_agent__{tool}"),
+                format!("MCP approval for mcp__mj_subagents__{tool}"),
                 native_mcp_approval_schema(),
             );
             let mut pending = HashMap::new();
@@ -5728,15 +5810,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn top_level_code_agent_mcp_approval_decline_forwards_and_cleans_up() {
+    async fn top_level_subagent_mcp_approval_decline_forwards_and_cleans_up() {
         let tracker =
-            RemoteSessionTracker::new_disconnected("project".to_string(), "thor".to_string());
+            RemoteSessionTracker::new_disconnected("project".to_string(), "primary".to_string());
         tracker.observe_event(&UiEvent::SessionStarted {
             session_id: "sess-1".to_string(),
             resumed: false,
         });
         let (prompt, rx) = mcp_approval_prompt(
-            "MCP approval for mcp__mj_code_agent__code_agent_cancel",
+            "MCP approval for mcp__mj_subagents__subagent_cancel",
             native_mcp_approval_schema(),
         );
         let mut pending = HashMap::new();
@@ -5775,18 +5857,10 @@ mod tests {
     #[test]
     fn native_mcp_approval_accepts_exact_known_tool_identities() {
         for message in [
-            "MCP approval for mcp.mj-code-agent.code_agent",
-            "MCP approval for mcp.mj-code-agent.explore_agent",
-            "MCP approval for mcp.mj-code-agent.explore_agents",
-            "MCP approval for mcp.mj-code-agent.code_agent_continue",
-            "MCP approval for mcp.mj-code-agent.code_agent_cancel",
-            "MCP approval for mcp__mj_code_agent__code_agent",
-            "MCP approval for mcp__mj_code_agent__explore_agent",
-            "MCP approval for mcp__mj_code_agent__explore_agents",
-            "MCP approval for mcp__mj_code_agent__code_agent_continue",
-            "MCP approval for mcp__mj_code_agent__code_agent_cancel",
-            "MCP approval for mcp.mj-loki-pull.pull_advice",
-            "MCP approval for mcp__mj-loki-pull__pull_advice",
+            "MCP approval for mcp.mj-subagents.create_subagent",
+            "MCP approval for mcp.mj-subagents.subagent_cancel",
+            "MCP approval for mcp__mj_subagents__create_subagent",
+            "MCP approval for mcp__mj_subagents__subagent_cancel",
         ] {
             let (prompt, _) = mcp_approval_prompt(message, native_mcp_approval_schema());
             assert!(is_native_injected_mcp_approval(&prompt), "{message}");
@@ -5797,7 +5871,7 @@ mod tests {
     fn native_mcp_approval_rejects_wrong_values_extra_fields_and_non_server_tokens() {
         let extra_field = native_mcp_approval_schema().string("extra", false);
         let (prompt, _) = mcp_approval_prompt(
-            "MCP approval for mcp__mj_code_agent__code_agent",
+            "MCP approval for mcp__mj_subagents__create_subagent",
             extra_field,
         );
         assert!(!is_native_injected_mcp_approval(&prompt));
@@ -5812,7 +5886,7 @@ mod tests {
         };
         approval.one_of.as_mut().expect("persist choices")[1].value = "forever".to_string();
         let (prompt, _) = mcp_approval_prompt(
-            "MCP approval for mcp__mj_code_agent__code_agent",
+            "MCP approval for mcp__mj_subagents__create_subagent",
             wrong_values,
         );
         assert!(!is_native_injected_mcp_approval(&prompt));
@@ -5820,55 +5894,39 @@ mod tests {
         let mut optional_persist = native_mcp_approval_schema();
         optional_persist.required = Some(Vec::new());
         let (prompt, _) = mcp_approval_prompt(
-            "MCP approval for mcp__mj_code_agent__code_agent",
+            "MCP approval for mcp__mj_subagents__create_subagent",
             optional_persist,
         );
         assert!(!is_native_injected_mcp_approval(&prompt));
 
         for message in [
-            "MCP approval for xmcp__mj_code_agent__code_agent",
-            "MCP approval for mcp__mj-code-agent__code_agent",
-            "MCP approval for mcp__mj_code-agent__code_agent",
-            "MCP approval for mcp__mj_code_agent__code-agent",
-            "MCP approval for mcp__mj__code_agent__code_agent",
-            "MCP approval for mcp__mj_code__agent__code_agent",
-            "MCP approval for mcp__mj-code-agent-extra__code_agent",
-            "MCP approval for mcp__mj-code-agent_extra__code_agent",
-            "MCP approval for mcp__mj-code-agent___code_agent",
-            "MCP approval for mj-code-agent.extra",
-            "MCP approval for mj-code-agent-extra",
-            "MCP approval for mcp.mj-code-agent-extra.code_agent",
-            "MCP approval for mcp.mj-code-agent.extra",
-            "MCP approval for mcp.mj-code-agent.a_future_top_level_code_agent_operation",
-            "MCP approval for mcp.mj-code-agent.code_agent.extra",
-            "MCP approval for mcp.mj-code-agent.code_agent_extra",
-            "MCP approval for mcp__mj-code-agent__a_future_top_level_code_agent_operation",
-            "MCP approval for mcp__mj-code-agent__code_agent_extra",
-            "MCP approval for mcp__mj-code-agent__code_agent__extra",
-            "MCP approval for mcp__mj_code_agent__a_future_top_level_code_agent_operation",
-            "MCP approval for mcp__mj_code_agent__code_agent_extra",
-            "MCP approval for mcp__mj_code_agent__code_agent__extra",
-            "MCP approval for mcp__mj-loki-pull__code_agent",
-            "MCP approval for mj-code-agent",
-            "MCP approval mentions mcp__mj_code_agent__code_agent_extra",
-            "MCP approval for mcp.mj-loki-pull.pull_advice.extra",
-            "MCP approval for mcp__MJ-code-agent__code_agent",
+            "MCP approval for xmcp__mj_subagents__create_subagent",
+            "MCP approval for mcp__mj-subagents__create_subagent",
+            "MCP approval for mcp__mj_subagents__create-subagent",
+            "MCP approval for mcp__mj__subagents__create_subagent",
+            "MCP approval for mcp__mj_subagents_extra__create_subagent",
+            "MCP approval for mcp__mj-subagents-extra__create_subagent",
+            "MCP approval for mcp__mj-subagents___create_subagent",
+            "MCP approval for mj-subagents.extra",
+            "MCP approval for mj-subagents-extra",
+            "MCP approval for mcp.mj-subagents-extra.create_subagent",
+            "MCP approval for mcp.mj-subagents.extra",
+            "MCP approval for mcp.mj-subagents.a_future_top_level_subagent_operation",
+            "MCP approval for mcp.mj-subagents.create_subagent.extra",
+            "MCP approval for mcp.mj-subagents.create_subagent_extra",
+            "MCP approval for mcp__mj-subagents__a_future_top_level_subagent_operation",
+            "MCP approval for mcp__mj-subagents__create_subagent_extra",
+            "MCP approval for mcp__mj-subagents__create_subagent__extra",
+            "MCP approval for mcp__mj_subagents__a_future_top_level_subagent_operation",
+            "MCP approval for mcp__mj_subagents__create_subagent_extra",
+            "MCP approval for mcp__mj_subagents__create_subagent__extra",
+            "MCP approval for mj-subagents",
+            "MCP approval mentions mcp__mj_subagents__create_subagent_extra",
+            "MCP approval for mcp__MJ-subagents__create_subagent",
         ] {
             let (prompt, _) = mcp_approval_prompt(message, native_mcp_approval_schema());
             assert!(!is_native_injected_mcp_approval(&prompt), "{message}");
         }
-
-        let (loki, _) = mcp_approval_prompt(
-            "MCP approval for mcp__mj-loki-pull__pull_advice",
-            native_mcp_approval_schema(),
-        );
-        assert!(is_native_injected_mcp_approval(&loki));
-
-        let (dotted_loki, _) = mcp_approval_prompt(
-            "MCP approval for mcp.mj-loki-pull.pull_advice",
-            native_mcp_approval_schema(),
-        );
-        assert!(is_native_injected_mcp_approval(&dotted_loki));
     }
 
     #[test]
@@ -5885,28 +5943,31 @@ mod tests {
         approval.meta = Some(serde_json::Map::new());
         approval.one_of.as_mut().expect("persist choices")[0].meta = Some(serde_json::Map::new());
         let (prompt, _) = mcp_approval_prompt(
-            "MCP approval for mcp__mj_code_agent__code_agent",
+            "MCP approval for mcp__mj_subagents__create_subagent",
             altered_label,
         );
         assert!(is_native_injected_mcp_approval(&prompt));
     }
 
     #[test]
-    fn nested_code_agent_elicitation_is_declined_without_a_remote_card() {
+    fn nested_subagent_elicitation_is_declined_without_a_remote_card() {
         let tracker =
-            RemoteSessionTracker::new_disconnected("project".to_string(), "thor".to_string());
+            RemoteSessionTracker::new_disconnected("project".to_string(), "primary".to_string());
         tracker.observe_event(&UiEvent::SessionStarted {
             session_id: "sess-1".to_string(),
             resumed: false,
         });
         let (prompt, mut rx) = mcp_approval_prompt(
-            "MCP approval for mcp__mj_code_agent__code_agent",
+            "MCP approval for mcp__mj_subagents__create_subagent",
             native_mcp_approval_schema(),
         );
         let mut pending = HashMap::new();
 
         handle_server_agent_event(
-            UiEvent::CodeAgent(crate::event::CodeAgentEvent::ElicitationRequest(prompt)),
+            UiEvent::Subagent(crate::event::SubagentEvent::ElicitationRequest {
+                subagent_id: 1,
+                prompt,
+            }),
             &tracker,
             &mut pending,
         );
@@ -6038,6 +6099,273 @@ mod tests {
         assert!(!snapshot.transcript[1].timestamp.is_empty());
     }
 
+    fn started_subagent(subagent_id: u64, label: &str, objective: &str) -> UiEvent {
+        UiEvent::Subagent(SubagentEvent::Started {
+            subagent_id,
+            label: label.to_string(),
+            model: Some("gpt-5.6".to_string()),
+            agent: "codex-acp".to_string(),
+            objective: objective.to_string(),
+        })
+    }
+
+    fn subagent_message(subagent_id: u64, text: &str) -> UiEvent {
+        UiEvent::Subagent(SubagentEvent::SessionUpdate {
+            subagent_id,
+            update: SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(text),
+            ))),
+        })
+    }
+
+    fn subagent_terminal_events(subagent_id: u64) -> Vec<UiEvent> {
+        let mut tool_call = ToolCall::new("call-1", "run checks");
+        tool_call.content = vec![ToolCallContent::Terminal(Terminal::new(TerminalId::new(
+            "term-1",
+        )))];
+        vec![
+            UiEvent::Subagent(SubagentEvent::SessionUpdate {
+                subagent_id,
+                update: SessionUpdate::ToolCall(tool_call),
+            }),
+            UiEvent::Subagent(SubagentEvent::TerminalOutput {
+                subagent_id,
+                snapshot: TerminalOutputSnapshot {
+                    terminal_id: "term-1".to_string(),
+                    output: "all green\n".to_string(),
+                    truncated: false,
+                    exit_status: Some(TerminalExitStatus::new().exit_code(0)),
+                },
+            }),
+        ]
+    }
+
+    #[test]
+    fn tracker_keeps_interleaved_subagent_transcript_actors_distinct() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+
+        state.observe_event(&subagent_message(11, "mimir first"));
+        state.observe_event(&subagent_message(22, "heimdall"));
+        state.observe_event(&subagent_message(11, "mimir second"));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        let entries: Vec<_> = snapshot
+            .transcript
+            .iter()
+            .map(|entry| (entry.actor.as_deref(), entry.text.as_str()))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                (Some("subagent-11"), "mimir first"),
+                (Some("subagent-22"), "heimdall"),
+                (Some("subagent-11"), "mimir second"),
+            ]
+        );
+    }
+
+    #[test]
+    fn interactive_and_server_trackers_mirror_subagent_tool_output_identically() {
+        let session_started = || UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        };
+
+        let mut interactive = TrackerState::new("proj".to_string(), "agent".to_string());
+        interactive.observe_event(&session_started());
+        for event in subagent_terminal_events(9) {
+            interactive.observe_event(&event);
+        }
+
+        let server =
+            RemoteSessionTracker::new_disconnected("proj".to_string(), "agent".to_string());
+        server.observe_event(&session_started());
+        let mut pending_permissions = HashMap::new();
+        for event in subagent_terminal_events(9) {
+            handle_server_agent_event(event, &server, &mut pending_permissions);
+        }
+
+        let interactive = interactive.snapshot().expect("interactive snapshot");
+        let server = server
+            .state
+            .lock()
+            .expect("server tracker state")
+            .snapshot()
+            .expect("server snapshot");
+        let entry_signature = |entry: &TranscriptEntry| {
+            (
+                entry.kind.clone(),
+                entry.actor.clone(),
+                entry.tool_title.clone(),
+                entry.tool_body.clone(),
+            )
+        };
+        assert_eq!(interactive.transcript.len(), 1);
+        assert_eq!(server.transcript.len(), 1);
+        assert_eq!(
+            entry_signature(&interactive.transcript[0]),
+            entry_signature(&server.transcript[0])
+        );
+        assert_eq!(
+            interactive.transcript[0].actor.as_deref(),
+            Some("subagent-9")
+        );
+        assert!(
+            interactive.transcript[0]
+                .tool_body
+                .as_deref()
+                .is_some_and(|body| body.contains("all green"))
+        );
+    }
+
+    #[test]
+    fn tracker_mirrors_subagent_status_rows_by_id() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+
+        state.observe_event(&started_subagent(1, "fix-tests", "green the suite"));
+        state.observe_event(&started_subagent(2, "audit-config", "check config v3"));
+        state.observe_event(&UiEvent::Subagent(SubagentEvent::Activity {
+            subagent_id: 1,
+            activity: "running cargo test".to_string(),
+        }));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.subagents.len(), 2);
+        let first = &snapshot.subagents[0];
+        assert_eq!(first.subagent_id, 1);
+        assert_eq!(first.label, "fix-tests");
+        assert_eq!(first.model.as_deref(), Some("gpt-5.6"));
+        assert_eq!(first.activity, "running cargo test");
+        assert!(first.finished_at.is_none() && first.outcome.is_none());
+        // The other row is untouched by its sibling's activity.
+        assert_eq!(snapshot.subagents[1].subagent_id, 2);
+        assert_eq!(snapshot.subagents[1].activity, "check config v3");
+        // Activity refreshes the row only; started lines stay in the transcript.
+        assert_eq!(
+            snapshot
+                .transcript
+                .iter()
+                .filter(|entry| entry.actor.as_deref() == Some("subagent"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn tracker_marks_finished_subagents_done_and_keeps_failure_text() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        state.observe_event(&started_subagent(1, "fix-tests", "green the suite"));
+        state.observe_event(&started_subagent(2, "audit-config", "check config v3"));
+
+        state.observe_event(&UiEvent::Subagent(SubagentEvent::Finished {
+            subagent_id: 1,
+            outcome: SubagentOutcome::Completed,
+        }));
+        state.observe_event(&UiEvent::Subagent(SubagentEvent::Finished {
+            subagent_id: 2,
+            outcome: SubagentOutcome::Failed("adapter exited".to_string()),
+        }));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.subagents[0].outcome.as_deref(), Some("completed"));
+        assert!(snapshot.subagents[0].finished_at.is_some());
+        // The last activity survives a clean completion.
+        assert_eq!(snapshot.subagents[0].activity, "green the suite");
+        assert_eq!(snapshot.subagents[1].outcome.as_deref(), Some("failed"));
+        assert_eq!(snapshot.subagents[1].activity, "failed: adapter exited");
+        assert!(
+            snapshot
+                .transcript
+                .iter()
+                .any(|entry| entry.text == "subagent #2 · audit-config · failed: adapter exited")
+        );
+    }
+
+    #[test]
+    fn tracker_caps_finished_subagent_rows() {
+        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
+        state.observe_event(&UiEvent::SessionStarted {
+            session_id: "sess-1".to_string(),
+            resumed: false,
+        });
+        for id in 1..=6 {
+            state.observe_event(&started_subagent(id, &format!("lane-{id}"), "work"));
+            state.observe_event(&UiEvent::Subagent(SubagentEvent::Finished {
+                subagent_id: id,
+                outcome: SubagentOutcome::Completed,
+            }));
+        }
+        state.observe_event(&started_subagent(7, "still-running", "work"));
+
+        let snapshot = state.snapshot().expect("snapshot");
+        let ids: Vec<u64> = snapshot
+            .subagents
+            .iter()
+            .map(|record| record.subagent_id)
+            .collect();
+        // Four most recent completions plus the live row; the transcript keeps
+        // the full history.
+        assert_eq!(ids, vec![3, 4, 5, 6, 7]);
+        assert_eq!(
+            snapshot
+                .transcript
+                .iter()
+                .filter(|entry| entry.actor.as_deref() == Some("subagent"))
+                .count(),
+            13
+        );
+    }
+
+    #[test]
+    fn subagent_rows_survive_the_session_record_round_trip() {
+        let record = SubagentStatusRecord {
+            subagent_id: 3,
+            label: "fix-tests".to_string(),
+            model: None,
+            activity: "running cargo test".to_string(),
+            started_at: "2026-06-03T10:00:00Z".to_string(),
+            finished_at: None,
+            outcome: None,
+        };
+        let json = serde_json::to_value(&record).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "subagent_id": 3,
+                "label": "fix-tests",
+                "activity": "running cargo test",
+                "started_at": "2026-06-03T10:00:00Z",
+            }),
+            "absent model/finish state stay off the wire"
+        );
+        let parsed: SubagentStatusRecord = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(parsed, record);
+        // Older viewers/servers send no `subagents` field at all.
+        let legacy = serde_json::json!({
+            "session_id": "sess-1",
+            "name": "demo",
+            "start_time": "2026-06-03T10:00:00Z",
+            "last_update": "2026-06-03T10:00:00Z",
+            "total_messages": 0,
+            "project": "mjolnir",
+            "agent": "anvil",
+        });
+        let session: SessionRecord = serde_json::from_value(legacy).expect("legacy record");
+        assert!(session.subagents.is_empty());
+    }
+
     #[test]
     fn tracker_records_warnings_as_system_transcript_entries() {
         let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
@@ -6046,12 +6374,12 @@ mod tests {
             resumed: false,
         });
 
-        state.observe_event(&UiEvent::Warning("Loki is unavailable".to_string()));
+        state.observe_event(&UiEvent::Warning("subagents are unavailable".to_string()));
 
         let snapshot = state.snapshot().expect("snapshot");
         assert_eq!(snapshot.transcript.len(), 1);
         assert_eq!(snapshot.transcript[0].kind, "system");
-        assert_eq!(snapshot.transcript[0].text, "Loki is unavailable");
+        assert_eq!(snapshot.transcript[0].text, "subagents are unavailable");
         assert_eq!(snapshot.transcript[0].actor, None);
     }
 
@@ -6096,8 +6424,8 @@ mod tests {
         });
 
         state.observe_event(&UiEvent::InternalMessage(crate::event::InternalMessage {
-            source: "Thor".to_string(),
-            target: "Thor".to_string(),
+            source: "review supervisor".to_string(),
+            target: "primary".to_string(),
             kind: crate::event::InternalMessageKind::ReviewProgress,
             text: "Adversarial synthesis started.".to_string(),
         }));
@@ -6105,160 +6433,15 @@ mod tests {
         let snapshot = state.snapshot().expect("snapshot");
         assert!(snapshot.prompt_in_flight);
         assert_eq!(snapshot.transcript.len(), 2);
-        assert_eq!(snapshot.transcript[1].kind, "review_progress");
-        assert_eq!(snapshot.transcript[1].actor.as_deref(), Some("thor"));
+        assert_eq!(snapshot.transcript[1].kind, "system");
+        assert_eq!(
+            snapshot.transcript[1].actor.as_deref(),
+            Some("review supervisor")
+        );
         assert_eq!(
             snapshot.transcript[1].text,
             "Adversarial synthesis started."
         );
-    }
-
-    #[test]
-    fn tracker_preserves_internal_message_subtypes() {
-        let mut state = TrackerState::new("proj".to_string(), "agent".to_string());
-        state.observe_event(&UiEvent::SessionStarted {
-            session_id: "sess-1".to_string(),
-            resumed: false,
-        });
-        for (kind, expected) in [
-            (crate::event::InternalMessageKind::Delegation, "delegation"),
-            (
-                crate::event::InternalMessageKind::Exploration,
-                "exploration",
-            ),
-            (
-                crate::event::InternalMessageKind::DiscreteReview,
-                "discrete_review",
-            ),
-            (
-                crate::event::InternalMessageKind::Continuation,
-                "continuation",
-            ),
-            (
-                crate::event::InternalMessageKind::Interjection,
-                "interjection",
-            ),
-            (crate::event::InternalMessageKind::ReviewLane, "review_lane"),
-            (
-                crate::event::InternalMessageKind::ReviewProgress,
-                "review_progress",
-            ),
-            (
-                crate::event::InternalMessageKind::ReviewSynthesis,
-                "review_synthesis",
-            ),
-        ] {
-            state.observe_event(&UiEvent::InternalMessage(crate::event::InternalMessage {
-                source: "reviewer".to_string(),
-                target: "Thor".to_string(),
-                kind,
-                text: expected.to_string(),
-            }));
-        }
-
-        let snapshot = state.snapshot().expect("snapshot");
-        assert_eq!(
-            snapshot
-                .transcript
-                .iter()
-                .map(|entry| entry.kind.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "delegation",
-                "exploration",
-                "discrete_review",
-                "continuation",
-                "interjection",
-                "review_lane",
-                "review_progress",
-                "review_synthesis",
-            ]
-        );
-    }
-
-    #[test]
-    fn remote_viewer_labels_every_internal_wire_kind() {
-        let viewer = include_str!("remote_viewer.html");
-        let entry_label = remote_viewer_function(viewer, "entryLabel");
-        for (wire_kind, label, actor_qualified) in [
-            ("delegation", "Delegation", true),
-            ("exploration", "Exploration", true),
-            ("discrete_review", "Discrete review", true),
-            ("continuation", "Continuation", true),
-            ("interjection", "Interjection", true),
-            ("review_lane", "Review lane", true),
-            ("review_progress", "Review progress", false),
-            ("review_synthesis", "Review synthesis", false),
-        ] {
-            let marker = format!(r#"case "{wire_kind}":"#);
-            let start = entry_label
-                .find(&marker)
-                .unwrap_or_else(|| panic!("entryLabel is missing a {wire_kind} case"));
-            let block = &entry_label[start..];
-            let end = block
-                .find("\n          case ")
-                .or_else(|| block.find("\n        }"))
-                .unwrap_or(block.len());
-            let block = &block[..end];
-            let fallback = format!(r#": "{label}""#);
-            let direct = format!(r#"return "{label}""#);
-            assert!(
-                block.contains(&fallback) || block.contains(&direct),
-                "entryLabel's {wire_kind} case is missing the no-actor {label} label"
-            );
-            let qualified = format!(r#"`{label} · ${{actorLabel}}`"#);
-            assert_eq!(
-                block.contains(&qualified),
-                actor_qualified,
-                "entryLabel's actor-qualified behavior changed for {wire_kind}"
-            );
-        }
-    }
-
-    #[test]
-    fn remote_viewer_uses_entry_label_in_dom_and_markdown_export_paths() {
-        let viewer = include_str!("remote_viewer.html");
-        let create_entry_refs = remote_viewer_function(viewer, "createEntryRefs");
-        assert!(
-            create_entry_refs.contains(
-                r#"el.querySelector(".entry-kind").textContent = entryLabel(kind, entry.actor);"#
-            ),
-            "DOM transcript labels must be rendered through entryLabel"
-        );
-
-        let markdown_for_entry = remote_viewer_function(viewer, "markdownForEntry");
-        assert!(
-            markdown_for_entry.contains("entryLabel(kind, entry.actor)"),
-            "actor-qualified markdown labels must be rendered through entryLabel"
-        );
-        assert!(
-            markdown_for_entry.contains(r#"entryLabel(kind, "")"#),
-            "actorless markdown labels must be rendered through entryLabel"
-        );
-        for review_kind in ["review_lane", "review_progress", "review_synthesis"] {
-            assert!(
-                !markdown_for_entry.contains(review_kind),
-                "markdownForEntry must keep {review_kind} on the generic entryLabel path"
-            );
-        }
-
-        let download = remote_viewer_function(viewer, "downloadTranscriptMarkdown");
-        assert!(
-            download.contains("...transcript.map(markdownForEntry).filter(Boolean),"),
-            "markdown export must render every transcript entry through markdownForEntry"
-        );
-    }
-
-    fn remote_viewer_function<'a>(viewer: &'a str, name: &str) -> &'a str {
-        let marker = format!("      function {name}(");
-        let start = viewer
-            .find(&marker)
-            .unwrap_or_else(|| panic!("remote viewer is missing function {name}"));
-        let rest = &viewer[start..];
-        let end = rest[marker.len()..]
-            .find("\n      function ")
-            .map_or(rest.len(), |offset| marker.len() + offset);
-        &rest[..end]
     }
 
     #[test]
@@ -6690,7 +6873,7 @@ mod tests {
                 TranscriptEntry {
                     kind: "agent".to_string(),
                     text: "hi".to_string(),
-                    actor: Some("thor".to_string()),
+                    actor: Some("primary".to_string()),
                     timestamp: "2026-06-03T10:00:06Z".to_string(),
                     tool_kind: None,
                     tool_title: None,
@@ -6709,6 +6892,15 @@ mod tests {
                 "agent",
             )],
             native_mode: None,
+            subagents: vec![SubagentStatusRecord {
+                subagent_id: 3,
+                label: "fix-tests".to_string(),
+                model: Some("gpt-5.6".to_string()),
+                activity: "running cargo test".to_string(),
+                started_at: "2026-06-03T10:00:10Z".to_string(),
+                finished_at: None,
+                outcome: None,
+            }],
         };
 
         upsert_session_record(&db_path, &session).expect("insert");
@@ -6731,7 +6923,7 @@ mod tests {
                     TranscriptEntry {
                         kind: "agent".to_string(),
                         text: "hi there".to_string(),
-                        actor: Some("thor".to_string()),
+                        actor: Some("primary".to_string()),
                         timestamp: "2026-06-03T10:00:06Z".to_string(),
                         tool_kind: None,
                         tool_title: None,
@@ -6762,6 +6954,7 @@ mod tests {
         assert_eq!(sessions[0].transcript[1].text, "hi there");
         assert_eq!(sessions[0].available_commands, session.available_commands);
         assert_eq!(sessions[0].worktree.as_deref(), Some("bold-fox"));
+        assert_eq!(sessions[0].subagents, session.subagents);
     }
 
     #[test]
@@ -6912,6 +7105,7 @@ mod tests {
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
             available_commands: Vec::new(),
+            subagents: Vec::new(),
             native_mode: None,
         };
         let disconnected = SessionRecord {
@@ -7423,6 +7617,7 @@ mod tests {
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
             available_commands: Vec::new(),
+            subagents: Vec::new(),
             native_mode: None,
         }
     }
@@ -7599,7 +7794,7 @@ mod tests {
     #[test]
     fn nested_session_updates_preserve_actor_and_namespace_tool_ids() {
         let tracker =
-            RemoteSessionTracker::new_disconnected("proj".to_string(), "Thor".to_string());
+            RemoteSessionTracker::new_disconnected("proj".to_string(), "primary".to_string());
         tracker.observe_event(&UiEvent::SessionStarted {
             session_id: "sess-1".to_string(),
             resumed: false,
@@ -7612,13 +7807,13 @@ mod tests {
                     ),
                 ),
             ),
-            "eitri",
-            Some("eitri"),
+            "subagent",
+            Some("subagent"),
         );
         tracker.observe_actor_session_update(
             &SessionUpdate::ToolCall(ToolCall::new("call-1", "search")),
-            "eitri",
-            Some("eitri"),
+            "subagent",
+            Some("subagent"),
         );
 
         let snapshot = tracker
@@ -7627,9 +7822,9 @@ mod tests {
             .expect("state")
             .snapshot()
             .expect("snapshot");
-        assert_eq!(snapshot.transcript[0].actor.as_deref(), Some("eitri"));
+        assert_eq!(snapshot.transcript[0].actor.as_deref(), Some("subagent"));
         assert_eq!(snapshot.transcript[0].text, "nested reply");
-        assert_eq!(snapshot.transcript[1].actor.as_deref(), Some("eitri"));
+        assert_eq!(snapshot.transcript[1].actor.as_deref(), Some("subagent"));
         assert!(
             tracker
                 .state
@@ -7637,7 +7832,7 @@ mod tests {
                 .expect("state")
                 .tool_transcript_entries
                 .values()
-                .any(|tool| tool.tool_call_id == "eitri:call-1")
+                .any(|tool| tool.tool_call_id == "subagent:call-1")
         );
     }
 
@@ -8059,6 +8254,7 @@ mod tests {
             pending_permissions: vec![pending.clone()],
             session_config: Vec::new(),
             available_commands: Vec::new(),
+            subagents: Vec::new(),
             native_mode: None,
         };
 
@@ -8272,7 +8468,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_config_hides_council_owned_model_and_reasoning_controls() {
+    fn remote_config_hides_harness_owned_model_and_reasoning_controls() {
         let options = vec![
             SessionConfigOption::select(
                 "model",
@@ -9101,6 +9297,7 @@ mod tests {
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
             available_commands: Vec::new(),
+            subagents: Vec::new(),
             native_mode: None,
         };
 

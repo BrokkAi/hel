@@ -1,7 +1,7 @@
 //! ACP client runtime: spawns the agent subprocess, wires JSON-RPC over
 //! stdio, and bridges UI commands/events through two mpsc channels.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,7 +39,6 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::archive;
-use crate::code_agent;
 use crate::event::{
     AgentCommandOutcome, CompactTrigger, ElicitationOutcome, ElicitationPrompt, LoadSessionResult,
     PermissionDecision, PermissionPrompt, PromptImage, SessionConfigTarget, SideSessionSource,
@@ -47,6 +46,7 @@ use crate::event::{
     content_block_text,
 };
 use crate::paths::{WorkspaceRoots, normalize_spawn_program, path_is_under_any_root};
+use crate::subagent;
 use crate::{deepswe, model_resolve};
 
 pub struct AcpRuntimeConfig {
@@ -57,7 +57,8 @@ pub struct AcpRuntimeConfig {
     /// requests. These expand workspace scope but do not imply trust.
     pub additional_directories: Vec<PathBuf>,
     /// MCP servers provisioned for every session lifecycle request made by
-    /// this runtime. Runtime-owned services (currently Eitri) are appended.
+    /// this runtime. Runtime-owned services (currently the subagent MCP server)
+    /// are appended.
     pub mcp_servers: Vec<McpServer>,
     pub resume_session: Option<String>,
     /// Environment variables to inject into the spawned agent process.
@@ -79,15 +80,15 @@ pub struct AcpRuntimeConfig {
     pub config_path: Option<PathBuf>,
     /// Values remembered from the last prompt submitted for this agent.
     pub saved_session_config: HashMap<String, String>,
-    /// Council role configuration applied before the first substantive prompt.
+    /// Seat configuration applied before the first substantive prompt.
     pub role_config: Option<RuntimeRoleConfig>,
-    /// Optional model-visible code-agent MCP service. Interactive TUI sessions
+    /// Optional model-visible subagent MCP service. Interactive TUI sessions
     /// set this; nested and non-interactive runtimes leave it absent.
-    pub code_agent: Option<code_agent::Config>,
+    pub subagents: Option<subagent::Config>,
     /// Apply the model-visible policy used by ephemeral side conversations.
     pub side_prompt_policy: bool,
     /// Forces the runtime through its normal process-tree teardown path. This
-    /// is used by supervised nested Eitri runs; ordinary runtimes get a fresh,
+    /// is used by supervised nested subagent runs; ordinary runtimes get a fresh,
     /// never-cancelled token.
     pub termination: Option<CancellationToken>,
 }
@@ -99,9 +100,9 @@ pub struct RuntimeRoleConfig {
     pub model_value: String,
     pub adapter_source_id: String,
     /// Provider-native permission preset applied after model selection.
-    pub permission: Option<crate::council::RuntimePermissionConfig>,
-    /// Correlates Thor, Eitri, and Loki records in one interactive session.
-    pub council_session: Option<String>,
+    pub permission: Option<crate::roster::RuntimePermissionConfig>,
+    /// Correlates primary and subagent records in one interactive session.
+    pub session_tag: Option<String>,
     /// Per-seat reasoning-effort override (e.g. `high`, `medium`, `off`)
     /// applied to this seat's ACP session after the model is set. `None`
     /// leaves the adapter's own default effort untouched.
@@ -412,9 +413,9 @@ pub enum LaunchError {
     UnsupportedProtocolVersion { negotiated: ProtocolVersion },
     /// The user requested a lifecycle method the agent did not advertise.
     UnsupportedCapability { capability: &'static str },
-    /// Interactive code-agent delegation requires the primary agent to accept
+    /// Interactive subagent delegation requires the primary agent to accept
     /// client-provided Streamable HTTP MCP servers.
-    CodeAgentHttpUnsupported,
+    SubagentHttpUnsupported,
     /// `session/new` failed for some other reason (bad cwd, agent-side
     /// crash, ...).
     SessionCreateFailed {
@@ -469,9 +470,9 @@ impl std::fmt::Display for LaunchError {
                 "agent does not advertise ACP capability {capability}\n\
                  hint: choose an agent that supports {capability}, or avoid the command that requires it"
             ),
-            LaunchError::CodeAgentHttpUnsupported => write!(
+            LaunchError::SubagentHttpUnsupported => write!(
                 f,
-                "configured ACP agent does not support HTTP MCP servers required for code-agent delegation\n\
+                "configured ACP agent does not support HTTP MCP servers required for subagent delegation\n\
                  hint: update or choose an ACP adapter that advertises mcpCapabilities.http"
             ),
             LaunchError::SessionCreateFailed { source } => write!(
@@ -789,16 +790,16 @@ pub async fn run(
 ) -> Result<()> {
     let fatal_emitted = Arc::new(AtomicBool::new(false));
     if let Some(role) = cfg.role_config.as_ref()
-        && let Some(council_session) = role.council_session.as_deref()
+        && let Some(session_tag) = role.session_tag.as_deref()
     {
         tracing::info!(
             event = "agent_runtime_started",
-            council_session,
+            session_tag,
             god = %role.label,
             model = %role.model_id,
             adapter = %role.adapter_source_id,
             command = %cfg.command.display(),
-            "Council agent runtime started"
+            "agent runtime started"
         );
     }
 
@@ -861,7 +862,7 @@ pub async fn run(
             cfg.config_path.clone(),
             cfg.saved_session_config.clone(),
             cfg.role_config.clone(),
-            cfg.code_agent.clone(),
+            cfg.subagents.clone(),
             cfg.side_prompt_policy,
         );
         tokio::pin!(drive);
@@ -925,11 +926,11 @@ pub async fn run(
         emit_fatal(&ui_tx, &fatal_emitted, message);
     }
     if let Some(role) = cfg.role_config.as_ref()
-        && let Some(council_session) = role.council_session.as_deref()
+        && let Some(session_tag) = role.session_tag.as_deref()
     {
         tracing::info!(
             event = "agent_runtime_finished",
-            council_session,
+            session_tag,
             god = %role.label,
             model = %role.model_id,
             adapter = %role.adapter_source_id,
@@ -939,7 +940,7 @@ pub async fn run(
                 .err()
                 .map(|error| format!("{error:#}"))
                 .or_else(|| teardown.as_ref().err().map(|error| format!("{error:#}"))),
-            "Council agent runtime finished"
+            "agent runtime finished"
         );
     }
     teardown.map_err(|error| anyhow::anyhow!("reap agent process tree: {error:#}"))?;
@@ -1474,7 +1475,7 @@ async fn drive_client_with_fs_limit<T>(
     config_path: Option<PathBuf>,
     saved_session_config: HashMap<String, String>,
     role_config: Option<RuntimeRoleConfig>,
-    code_agent: Option<code_agent::Config>,
+    subagents: Option<subagent::Config>,
     side_prompt_policy: bool,
 ) -> Result<()>
 where
@@ -1521,8 +1522,8 @@ where
     let wait_terminals = terminals.clone();
     let kill_terminals = terminals.clone();
     let drive_terminals = terminals.clone();
-    let code_agent_controller = code_agent::Controller::default();
-    let drive_code_agent_controller = code_agent_controller.clone();
+    let subagent_controller = subagent::Controller::default();
+    let drive_subagent_controller = subagent_controller.clone();
     let result = Client
         .builder()
         .on_receive_notification(
@@ -1558,20 +1559,20 @@ where
                         let _ = notif_ui_tx.send(UiEvent::ContextCompacted);
                     }
                     if let Some(role) = notification_role.as_ref()
-                        && let Some(council_session) = role.council_session.as_deref()
+                        && let Some(session_tag) = role.session_tag.as_deref()
                     {
                         let (update_kind, summary) =
                             session_update_summary(&notification.update);
                         tracing::debug!(
                             event = "agent_update",
-                            council_session,
+                            session_tag,
                             god = %role.label,
                             model = %role.model_id,
                             adapter = %role.adapter_source_id,
                             acp_session = %notification.session_id,
                             update_kind,
                             summary,
-                            "Council agent update"
+                            "agent update"
                         );
                     }
                     let forward = !notif_control_in_flight.load(Ordering::Acquire)
@@ -1731,9 +1732,9 @@ where
                 config_path,
                 saved_session_config,
                 role_config,
-                code_agent,
+                subagents,
                 side_prompt_policy,
-                drive_code_agent_controller,
+                drive_subagent_controller,
                 context_usage,
                 advertised_commands,
                 control_in_flight,
@@ -1749,7 +1750,7 @@ where
         })
         .await;
 
-    code_agent_controller.shutdown_and_wait().await;
+    subagent_controller.shutdown_and_wait().await;
     terminals.shutdown_all().await;
     result.map_err(|e| anyhow::anyhow!("acp client error: {e}"))?;
     Ok(())
@@ -1776,9 +1777,9 @@ async fn drive_session(
     _config_path: Option<PathBuf>,
     saved_session_config: HashMap<String, String>,
     role_config: Option<RuntimeRoleConfig>,
-    code_agent: Option<code_agent::Config>,
+    subagents: Option<subagent::Config>,
     side_prompt_policy: bool,
-    code_agent_controller: code_agent::Controller,
+    subagent_controller: subagent::Controller,
     context_usage: Arc<ContextUsageTracker>,
     advertised_commands: Arc<std::sync::Mutex<HashMap<String, HashSet<String>>>>,
     control_in_flight: Arc<AtomicBool>,
@@ -1826,30 +1827,30 @@ async fn drive_session(
         emit_fatal(ui_tx, &fatal_emitted, text.clone());
         return Err(anyhow::anyhow!(text));
     }
-    let code_agent_http = if let Some(config) = code_agent {
+    let subagent_http = if let Some(config) = subagents {
         if !init_resp.agent_capabilities.mcp_capabilities.http {
-            let launch_err = LaunchError::CodeAgentHttpUnsupported;
+            let launch_err = LaunchError::SubagentHttpUnsupported;
             let text = launch_err.to_string();
             emit_fatal(ui_tx, &fatal_emitted, text.clone());
             return Err(anyhow::anyhow!(text));
         }
-        let context = code_agent::RunContext {
+        let context = subagent::RunContext {
             cwd: cwd.clone(),
             additional_directories: additional_directories.clone(),
             fs_max_text_bytes,
             access_mode,
         };
-        match code_agent::HttpServer::start(
+        match subagent::HttpServer::start(
             config,
             context,
             ui_tx.clone(),
-            code_agent_controller.clone(),
+            subagent_controller.clone(),
         )
         .await
         {
             Ok(server) => Some(server),
             Err(error) => {
-                let text = format!("could not start code-agent HTTP MCP server: {error:#}");
+                let text = format!("could not start subagent HTTP MCP server: {error:#}");
                 emit_fatal(ui_tx, &fatal_emitted, text.clone());
                 return Err(anyhow::anyhow!(text));
             }
@@ -1857,7 +1858,7 @@ async fn drive_session(
     } else {
         None
     };
-    if let Some(server) = code_agent_http.as_ref() {
+    if let Some(server) = subagent_http.as_ref() {
         mcp_servers.push(server.advertised().clone());
     }
     let side_session_unsupported_reason =
@@ -1993,15 +1994,15 @@ async fn drive_session(
             }
         }
     }
-    // Do not require the primary agent to eagerly list Eitri's injected MCP
+    // Do not require the primary agent to eagerly list the injected subagent MCP
     // tools before the first prompt. Some ACP agents, including Anvil, accept
     // lifecycle `mcpServers` during `session/new` but intentionally construct
     // their tool registry lazily when handling `session/prompt`. Waiting here
     // deadlocks those agents: Mjolnir waits for `tools/list` while the agent
     // waits for the first prompt before it lists tools.
     //
-    // The code-agent MCP server stays advertised for the session, and the
-    // first substantive prompt below still has the code-agent MCP server
+    // The subagent MCP server stays advertised for the session, and the
+    // first substantive prompt below still has the subagent MCP server
     // available when delegation is needed.
     context_usage.reset_for_session();
     if !resumed && !saved_session_config.is_empty() {
@@ -2019,17 +2020,17 @@ async fn drive_session(
         resumed,
     });
     if let Some(role) = role_config.as_ref()
-        && let Some(council_session) = role.council_session.as_deref()
+        && let Some(session_tag) = role.session_tag.as_deref()
     {
         tracing::info!(
             event = "agent_session_started",
-            council_session,
+            session_tag,
             god = %role.label,
             model = %role.model_id,
             adapter = %role.adapter_source_id,
             acp_session = %session_id,
             resumed,
-            "Council ACP session started"
+            "ACP session started"
         );
     }
     let hidden_config_ids = role_config
@@ -2050,8 +2051,21 @@ async fn drive_session(
     workspace_roots.extend(additional_directories.iter().cloned());
     let mut next_turn_diff_id = 1_u64;
     let mut session_has_history = resumed;
+    // Prompts that arrived while another operation owned `ui_rx` (a turn, a
+    // config update, a session fork). They are replayed here, ahead of any
+    // command still sitting in the channel, instead of being dropped: an
+    // orchestrator-injected subagent report that loses a microsecond race
+    // against a user prompt must still reach the agent.
+    let mut deferred_prompts: VecDeque<(String, Vec<PromptImage>)> = VecDeque::new();
 
-    while let Some(cmd) = ui_rx.recv().await {
+    loop {
+        let cmd = match deferred_prompts.pop_front() {
+            Some((text, images)) => UiCommand::SendPrompt { text, images },
+            None => match ui_rx.recv().await {
+                Some(cmd) => cmd,
+                None => break,
+            },
+        };
         match cmd {
             UiCommand::SendPrompt { text, images } => {
                 // A manual compact that did not reduce reported usage must not
@@ -2060,18 +2074,18 @@ async fn drive_session(
                 // the next ordinary prompt on the ACP session.
                 manual_compact_suppression.store(false, Ordering::Release);
                 if let Some(role) = role_config.as_ref()
-                    && let Some(council_session) = role.council_session.as_deref()
+                    && let Some(session_tag) = role.session_tag.as_deref()
                 {
                     tracing::info!(
                         event = "prompt_sent",
-                        council_session,
+                        session_tag,
                         god = %role.label,
                         model = %role.model_id,
                         adapter = %role.adapter_source_id,
                         acp_session = %session_id,
                         prompt = %text,
                         image_count = images.len(),
-                        "Prompt sent to Council agent"
+                        "prompt sent to agent"
                     );
                 }
                 session_state.clear_permissions_cancelled(&session_id).await;
@@ -2089,8 +2103,9 @@ async fn drive_session(
                         max_text_bytes: fs_max_text_bytes,
                         turn_id: next_turn_diff_id,
                     },
-                    &code_agent_controller,
+                    &subagent_controller,
                     session_has_history,
+                    &mut deferred_prompts,
                 )
                 .await?;
                 session_has_history = true;
@@ -2109,6 +2124,7 @@ async fn drive_session(
                     &hidden_config_ids,
                     ui_tx,
                     ui_rx,
+                    &mut deferred_prompts,
                 )
                 .await?
                 {
@@ -2136,6 +2152,7 @@ async fn drive_session(
                     &hidden_config_ids,
                     ui_tx,
                     ui_rx,
+                    &mut deferred_prompts,
                 )
                 .await?
                 {
@@ -2239,10 +2256,10 @@ async fn drive_session(
                     }
                 }
             }
-            UiCommand::SetThorReviewPolicy { .. } | UiCommand::RunReview { .. } => {}
-            UiCommand::CompactCouncil => {
+            UiCommand::SetReviewPolicy { .. } | UiCommand::RunReview { .. } => {}
+            UiCommand::CompactPrimary => {
                 let _ = ui_tx.send(UiEvent::Warning(
-                    "Council compact command bypassed its coordinator".to_string(),
+                    "compact command bypassed its coordinator".to_string(),
                 ));
             }
             UiCommand::RunAdvertisedCommand {
@@ -2302,13 +2319,13 @@ fn log_control_event(
     error: Option<&str>,
 ) {
     tracing::info!(
-        event = "council_control",
-        god = role.map_or("Thor", |role| role.label.as_str()),
+        event = "seat_control",
+        seat = role.map_or("primary", |role| role.label.as_str()),
         command,
         trigger = trigger.label(),
         action,
         error,
-        "Council role control command"
+        "seat control command"
     );
 }
 
@@ -2478,6 +2495,7 @@ async fn drive_fork_session(
     hidden_config_ids: &[String],
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
+    deferred_prompts: &mut VecDeque<(String, Vec<PromptImage>)>,
 ) -> Result<bool> {
     let source_session_id = session_id.clone();
     let fork = fork_session(
@@ -2531,10 +2549,12 @@ async fn drive_fork_session(
                     Some(UiCommand::Shutdown) | None => {
                         return Ok(false);
                     }
-                    Some(UiCommand::SendPrompt { .. }) => {
-                        let _ = ui_tx.send(UiEvent::PromptFailed {
-                            message: "prompt failed: session fork already in flight".to_string(),
-                        });
+                    Some(UiCommand::SendPrompt { text, images }) => {
+                        deferred_prompts.push_back((text, images));
+                        let _ = ui_tx.send(UiEvent::Info(
+                            "prompt queued; it will be sent when the session fork completes"
+                                .to_string(),
+                        ));
                     }
                     Some(UiCommand::SetSessionConfigOption { .. }) => {
                         let _ = ui_tx.send(UiEvent::Warning(
@@ -2558,8 +2578,8 @@ async fn drive_fork_session(
                         });
                     }
                     Some(UiCommand::CancelPrompt) => {}
-                    Some(UiCommand::SetThorReviewPolicy { .. } | UiCommand::RunReview { .. }) => {}
-                    Some(UiCommand::CompactCouncil) => {}
+                    Some(UiCommand::SetReviewPolicy { .. } | UiCommand::RunReview { .. }) => {}
+                    Some(UiCommand::CompactPrimary) => {}
                     Some(UiCommand::RunAdvertisedCommand { responder, .. }) => {
                         let _ = responder.send(AgentCommandOutcome::Failed(
                             "session fork already in flight".to_string(),
@@ -2818,7 +2838,7 @@ pub(crate) async fn kill_agent_tree(child: &mut Child, agent_pid: Option<u32>) -
         // waiter never reaps them (common in minimal container inits), as
         // well as for D-state stragglers under I/O load. Failing fatally
         // here voided otherwise-completed headless runs whose retained
-        // Eitri workers were killed at session end (observed in benchmark
+        // subagent workers were killed at session end (observed in benchmark
         // fleets); the container/OS teardown collects the residue anyway.
         if unix_process_group_exists(pid) {
             tracing::warn!(
@@ -4187,7 +4207,7 @@ fn session_config_option_contains_value(
 
 fn select_runtime_permission_value(
     option: &SessionConfigOption,
-    permission: &crate::council::RuntimePermissionConfig,
+    permission: &crate::roster::RuntimePermissionConfig,
 ) -> Result<(SessionConfigValueId, bool)> {
     let desired = SessionConfigValueId::from(permission.value.clone());
     if session_config_option_contains_value(option, &desired) {
@@ -4499,6 +4519,7 @@ async fn drive_config_update(
     hidden_config_ids: &[String],
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
+    deferred_prompts: &mut VecDeque<(String, Vec<PromptImage>)>,
 ) -> Result<bool> {
     let update = send_config_update(conn, session_id, target.clone(), value.clone());
     tokio::pin!(update);
@@ -4542,10 +4563,12 @@ async fn drive_config_update(
                     Some(UiCommand::Shutdown) | None => {
                         return Ok(false);
                     }
-                    Some(UiCommand::SendPrompt { .. }) => {
-                        let _ = ui_tx.send(UiEvent::PromptFailed {
-                            message: "prompt failed: config update already in flight".to_string(),
-                        });
+                    Some(UiCommand::SendPrompt { text, images }) => {
+                        deferred_prompts.push_back((text, images));
+                        let _ = ui_tx.send(UiEvent::Info(
+                            "prompt queued; it will be sent when the config update completes"
+                                .to_string(),
+                        ));
                     }
                     Some(UiCommand::SetSessionConfigOption { .. }) => {
                         let _ = ui_tx.send(UiEvent::Warning(
@@ -4568,8 +4591,8 @@ async fn drive_config_update(
                         });
                     }
                     Some(UiCommand::CancelPrompt) => {}
-                    Some(UiCommand::SetThorReviewPolicy { .. } | UiCommand::RunReview { .. }) => {}
-                    Some(UiCommand::CompactCouncil) => {}
+                    Some(UiCommand::SetReviewPolicy { .. } | UiCommand::RunReview { .. }) => {}
+                    Some(UiCommand::CompactPrimary) => {}
                     Some(UiCommand::RunAdvertisedCommand { responder, .. }) => {
                         let _ = responder.send(AgentCommandOutcome::Failed(
                             "session config update already in flight".to_string(),
@@ -4644,8 +4667,9 @@ async fn drive_prompt_turn(
     ui_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
     session_state: &RuntimeSessionState,
     diff_config: PromptTurnDiffConfig<'_>,
-    code_agent_controller: &code_agent::Controller,
+    subagent_controller: &subagent::Controller,
     side_source_has_history: bool,
+    deferred_prompts: &mut VecDeque<(String, Vec<PromptImage>)>,
 ) -> Result<bool> {
     let turn_diff_tracker =
         TurnDiffTracker::snapshot(diff_config.workspace_roots, diff_config.max_text_bytes).await;
@@ -4684,10 +4708,10 @@ async fn drive_prompt_turn(
             maybe_cmd = ui_rx.recv() => {
                 match maybe_cmd {
                     Some(UiCommand::CancelPrompt) => {
-                        // Cancel both lanes. Stopping only Eitri returns a tool
-                        // error to the still-running Thor turn, which can then
-                        // immediately delegate the same work again.
-                        code_agent_controller.cancel().await;
+                        // Cancel both lanes. Stopping only the subagents returns
+                        // a tool error to the still-running primary turn, which
+                        // can then immediately delegate the same work again.
+                        subagent_controller.cancel().await;
                         if !cancel_sent {
                             session_state.mark_permissions_cancelled(session_id).await;
                             let _ = ui_tx.send(UiEvent::CancelPendingPermissions);
@@ -4698,12 +4722,18 @@ async fn drive_prompt_turn(
                         }
                     }
                     Some(UiCommand::Shutdown) | None => {
-                        code_agent_controller.shutdown().await;
+                        subagent_controller.shutdown().await;
                         return Ok(false);
                     }
-                    Some(UiCommand::SendPrompt { .. }) => {
-                        let _ = ui_tx.send(UiEvent::Warning(
-                            "prompt already in flight".to_string(),
+                    Some(UiCommand::SendPrompt { text, images }) => {
+                        // Queue rather than drop. A subagent report injected at
+                        // a turn boundary can lose a microsecond race against a
+                        // user prompt; dropping it loses the report text for
+                        // good, since the report bus is already closed.
+                        deferred_prompts.push_back((text, images));
+                        let _ = ui_tx.send(UiEvent::Info(
+                            "prompt queued; it will be sent when the current turn completes"
+                                .to_string(),
                         ));
                     }
                     Some(UiCommand::SetSessionConfigOption { .. }) => {
@@ -4727,8 +4757,8 @@ async fn drive_prompt_turn(
                             message: "prompt already in flight".to_string(),
                         });
                     }
-                    Some(UiCommand::SetThorReviewPolicy { .. } | UiCommand::RunReview { .. }) => {}
-                    Some(UiCommand::CompactCouncil) => {}
+                    Some(UiCommand::SetReviewPolicy { .. } | UiCommand::RunReview { .. }) => {}
+                    Some(UiCommand::CompactPrimary) => {}
                     Some(UiCommand::RunAdvertisedCommand { responder, .. }) => {
                         let _ = responder.send(AgentCommandOutcome::Failed(
                             "prompt already in flight".to_string(),
@@ -5029,8 +5059,8 @@ mod tests {
         SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
         SessionConfigId, SessionConfigValueId, SessionDeleteCapabilities, SessionForkCapabilities,
         SessionId, SessionNotification, SessionResumeCapabilities, SessionUpdate,
-        SetSessionConfigOptionRequest, StopReason, TextContent, ToolCallUpdate,
-        ToolCallUpdateFields,
+        SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
+        ToolCallUpdate, ToolCallUpdateFields,
     };
     use std::sync::{
         Arc,
@@ -5260,7 +5290,7 @@ mod tests {
                 panic!("expected text block");
             };
             assert_eq!(text.text, expected);
-            assert!(!text.text.contains("<mj-code-agent-policy>"));
+            assert!(!text.text.contains("<mj-subagent-policy>"));
         }
     }
 
@@ -5275,7 +5305,7 @@ mod tests {
             panic!("expected text block");
         };
         assert_eq!(text.text, "continue work");
-        assert!(!text.text.contains("<mj-code-agent-policy>"));
+        assert!(!text.text.contains("<mj-subagent-policy>"));
     }
 
     #[test]
@@ -6301,12 +6331,12 @@ mod tests {
         )
         .category(SessionConfigOptionCategory::Model);
         let claude_role = RuntimeRoleConfig {
-            label: "Thor".to_string(),
+            label: "primary".to_string(),
             model_id: "claude-sonnet-5".to_string(),
             model_value: "claude-sonnet-5".to_string(),
             adapter_source_id: "claude-acp".to_string(),
             permission: None,
-            council_session: None,
+            session_tag: None,
             reasoning_effort: None,
         };
         assert_eq!(
@@ -6325,12 +6355,12 @@ mod tests {
         )
         .category(SessionConfigOptionCategory::Model);
         let codex_role = RuntimeRoleConfig {
-            label: "Eitri".to_string(),
+            label: "subagent".to_string(),
             model_id: "gpt-5-6-sol".to_string(),
             model_value: "gpt-5-6-sol".to_string(),
             adapter_source_id: "codex-acp".to_string(),
             permission: None,
-            council_session: None,
+            session_tag: None,
             reasoning_effort: None,
         };
         assert_eq!(
@@ -6418,21 +6448,21 @@ mod tests {
             vec![SessionConfigSelectOption::new("default", "Manual")],
         )
         .category(SessionConfigOptionCategory::Mode);
-        let auto = crate::council::RuntimePermissionConfig {
+        let auto = crate::roster::RuntimePermissionConfig {
             config_id: "mode".to_string(),
             value: "auto".to_string(),
             manual_fallback: Some("default".to_string()),
-            mode: crate::config::CouncilPermissionMode::Auto,
+            mode: crate::config::PermissionPreset::Auto,
         };
         let (value, fallback) = select_runtime_permission_value(&option, &auto).unwrap();
         assert_eq!(value.to_string(), "default");
         assert!(fallback);
 
-        let yolo = crate::council::RuntimePermissionConfig {
+        let yolo = crate::roster::RuntimePermissionConfig {
             config_id: "mode".to_string(),
             value: "bypassPermissions".to_string(),
             manual_fallback: None,
-            mode: crate::config::CouncilPermissionMode::Yolo,
+            mode: crate::config::PermissionPreset::Yolo,
         };
         assert!(select_runtime_permission_value(&option, &yolo).is_err());
     }
@@ -6906,6 +6936,126 @@ mod tests {
                 async move |_req: ForkSessionRequest, _responder, _cx| {
                     futures::future::pending::<()>().await;
                     Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(transport, |_cx| async move {
+                futures::future::pending::<()>().await;
+                Ok(())
+            })
+            .await;
+    }
+
+    /// Records every prompt it receives (in arrival order) and answers each
+    /// one only after a delay, so a second `SendPrompt` sent by the test is
+    /// guaranteed to land while the first turn is still in flight.
+    async fn run_mock_agent_recording_slow_prompts(
+        stream: tokio::io::DuplexStream,
+        prompts: Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let (r, w) = split(stream);
+        let transport = ByteStreams::new(w.compat_write(), r.compat());
+        let _ = AgentRole
+            .builder()
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::v1::InitializeRequest,
+                            responder,
+                            _cx| {
+                    responder.respond(InitializeResponse::new(
+                        agent_client_protocol::schema::ProtocolVersion::V1,
+                    ))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::v1::NewSessionRequest,
+                            responder,
+                            _cx| {
+                    responder.respond(NewSessionResponse::new(SessionId::new("test-session")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: agent_client_protocol::schema::v1::PromptRequest,
+                            responder,
+                            cx: ConnectionTo<agent_client_protocol::Client>| {
+                    let prompts = prompts.clone();
+                    let text = req
+                        .prompt
+                        .iter()
+                        .map(content_block_text)
+                        .collect::<Vec<_>>()
+                        .join("");
+                    prompts.lock().expect("prompt log").push(text);
+                    // Stream a chunk immediately so the test knows the turn is
+                    // in flight before it sends the racing prompt.
+                    let _ = cx.send_notification(SessionNotification::new(
+                        req.session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                            TextContent::new("ack"),
+                        ))),
+                    ));
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    });
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(transport, |_cx| async move {
+                futures::future::pending::<()>().await;
+                Ok(())
+            })
+            .await;
+    }
+
+    /// Answers a session config update only after a delay, then serves
+    /// prompts normally -- the rig for "a prompt raced a config update".
+    async fn run_mock_agent_with_slow_config(stream: tokio::io::DuplexStream) {
+        let (r, w) = split(stream);
+        let transport = ByteStreams::new(w.compat_write(), r.compat());
+        let _ = AgentRole
+            .builder()
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::v1::InitializeRequest,
+                            responder,
+                            _cx| {
+                    responder.respond(InitializeResponse::new(
+                        agent_client_protocol::schema::ProtocolVersion::V1,
+                    ))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::v1::NewSessionRequest,
+                            responder,
+                            _cx| {
+                    responder.respond(NewSessionResponse::new(SessionId::new("test-session")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: SetSessionConfigOptionRequest, responder, _cx| {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        let _ = responder.respond(SetSessionConfigOptionResponse::new(Vec::new()));
+                    });
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: agent_client_protocol::schema::v1::PromptRequest,
+                            responder,
+                            cx: ConnectionTo<agent_client_protocol::Client>| {
+                    let _ = cx.send_notification(SessionNotification::new(
+                        req.session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                            TextContent::new("ack"),
+                        ))),
+                    ));
+                    responder.respond(PromptResponse::new(StopReason::EndTurn))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -8872,8 +9022,105 @@ mod tests {
         agent_task.abort();
     }
 
+    /// A prompt that arrives while a turn is in flight is queued, not
+    /// dropped: it runs as its own turn once the first one finishes, and the
+    /// agent sees both prompts in order. This is what keeps an
+    /// orchestrator-injected subagent report alive when it loses the race
+    /// against a user prompt.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn prompt_during_fork_emits_prompt_failed() {
+    async fn prompt_during_turn_is_deferred_and_runs_after() {
+        let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = split(client_side);
+        let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
+
+        let seen_prompts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let agent_task = tokio::spawn(run_mock_agent_recording_slow_prompts(
+            agent_side,
+            seen_prompts.clone(),
+        ));
+
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+        let client_task = tokio::spawn(drive_client(
+            client_transport,
+            std::env::temp_dir(),
+            None,
+            ui_tx,
+            cmd_rx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        wait_for_session_started(&mut ui_rx, "test-session").await;
+
+        cmd_tx
+            .send(UiCommand::SendPrompt {
+                text: "first".to_string(),
+                images: Vec::new(),
+            })
+            .expect("send first prompt");
+
+        // The agent streams "ack" as soon as it receives a prompt, so this
+        // guarantees the first turn is in flight before the racing prompt.
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+                .await
+                .expect("timeout waiting for first turn to start")
+                .expect("channel closed");
+            match ev {
+                UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(_)) => break,
+                UiEvent::Fatal(_) | UiEvent::PromptDone { .. } | UiEvent::PromptFailed { .. } => {
+                    panic!("unexpected: {ev:?}")
+                }
+                _ => {}
+            }
+        }
+
+        cmd_tx
+            .send(UiCommand::SendPrompt {
+                text: "second".to_string(),
+                images: Vec::new(),
+            })
+            .expect("send racing prompt");
+
+        let mut done = 0usize;
+        let mut saw_queued_info = false;
+        while done < 2 {
+            let ev = tokio::time::timeout(Duration::from_secs(10), ui_rx.recv())
+                .await
+                .expect("timeout waiting for both turns")
+                .expect("channel closed");
+            match ev {
+                UiEvent::PromptDone { stop_reason, .. } => {
+                    assert!(matches!(stop_reason, StopReason::EndTurn));
+                    done += 1;
+                }
+                UiEvent::Info(message) => {
+                    if message.contains("queued") {
+                        saw_queued_info = true;
+                    }
+                }
+                UiEvent::Warning(message) => {
+                    assert!(
+                        !message.contains("prompt already in flight"),
+                        "racing prompt was dropped instead of deferred"
+                    );
+                }
+                UiEvent::Fatal(_) | UiEvent::PromptFailed { .. } => panic!("unexpected: {ev:?}"),
+                _ => {}
+            }
+        }
+        assert!(saw_queued_info, "no Info event announced the queued prompt");
+
+        let prompts = seen_prompts.lock().expect("prompt log").clone();
+        assert_eq!(prompts, vec!["first".to_string(), "second".to_string()]);
+
+        cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
+        let _ = tokio::time::timeout(Duration::from_secs(2), client_task).await;
+        agent_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_during_fork_is_deferred() {
         let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
         let (cr, cw) = split(client_side);
         let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
@@ -8911,17 +9158,24 @@ mod tests {
             })
             .expect("send prompt");
 
+        // The fork never resolves in this rig, so the queued prompt cannot run;
+        // what matters is that it was queued rather than rejected.
         loop {
             let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
                 .await
-                .expect("timeout waiting for prompt rejection")
+                .expect("timeout waiting for queued prompt notice")
                 .expect("channel closed");
             match ev {
-                UiEvent::PromptFailed { message } => {
-                    assert_eq!(message, "prompt failed: session fork already in flight");
+                UiEvent::Info(message) if message.contains("queued") => {
+                    assert_eq!(
+                        message,
+                        "prompt queued; it will be sent when the session fork completes"
+                    );
                     break;
                 }
-                UiEvent::Fatal(_) | UiEvent::PromptDone { .. } => panic!("unexpected: {ev:?}"),
+                UiEvent::Fatal(_) | UiEvent::PromptDone { .. } | UiEvent::PromptFailed { .. } => {
+                    panic!("unexpected: {ev:?}")
+                }
                 _ => {}
             }
         }
@@ -8936,12 +9190,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn prompt_during_config_update_emits_prompt_failed() {
+    async fn prompt_during_config_update_is_deferred_and_runs_after() {
         let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
         let (cr, cw) = split(client_side);
         let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
 
-        let agent_task = tokio::spawn(run_mock_agent_with_hanging_config(agent_side));
+        let agent_task = tokio::spawn(run_mock_agent_with_slow_config(agent_side));
 
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
@@ -8981,17 +9235,26 @@ mod tests {
             })
             .expect("send prompt");
 
+        let mut saw_queued_info = false;
         loop {
-            let ev = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+            let ev = tokio::time::timeout(Duration::from_secs(10), ui_rx.recv())
                 .await
-                .expect("timeout waiting for prompt rejection")
+                .expect("timeout waiting for deferred prompt")
                 .expect("channel closed");
             match ev {
-                UiEvent::PromptFailed { message } => {
-                    assert_eq!(message, "prompt failed: config update already in flight");
+                UiEvent::Info(message) if message.contains("queued") => {
+                    assert_eq!(
+                        message,
+                        "prompt queued; it will be sent when the config update completes"
+                    );
+                    saw_queued_info = true;
+                }
+                UiEvent::PromptDone { stop_reason, .. } => {
+                    assert!(saw_queued_info, "prompt ran without being queued first");
+                    assert!(matches!(stop_reason, StopReason::EndTurn));
                     break;
                 }
-                UiEvent::Fatal(_) | UiEvent::PromptDone { .. } => panic!("unexpected: {ev:?}"),
+                UiEvent::Fatal(_) | UiEvent::PromptFailed { .. } => panic!("unexpected: {ev:?}"),
                 _ => {}
             }
         }
@@ -9071,7 +9334,7 @@ mod tests {
             config_path: None,
             saved_session_config: HashMap::new(),
             role_config: None,
-            code_agent: None,
+            subagents: None,
             side_prompt_policy: false,
             termination: None,
         };
@@ -9132,7 +9395,7 @@ mod tests {
             config_path: None,
             saved_session_config: HashMap::new(),
             role_config: None,
-            code_agent: None,
+            subagents: None,
             side_prompt_policy: false,
             termination: None,
         };
@@ -9272,7 +9535,7 @@ mod tests {
             config_path: None,
             saved_session_config: HashMap::new(),
             role_config: None,
-            code_agent: None,
+            subagents: None,
             side_prompt_policy: false,
             termination: None,
         };
@@ -9302,7 +9565,7 @@ mod tests {
             config_path: None,
             saved_session_config: HashMap::new(),
             role_config: None,
-            code_agent: None,
+            subagents: None,
             side_prompt_policy: false,
             termination: None,
         };
@@ -9328,7 +9591,7 @@ mod tests {
             config_path: None,
             saved_session_config: HashMap::new(),
             role_config: None,
-            code_agent: None,
+            subagents: None,
             side_prompt_policy: false,
             termination: Some(termination.clone()),
         };
@@ -10013,7 +10276,7 @@ mod tests {
         use agent_client_protocol::schema::v1::McpServerHttp;
 
         let server = McpServer::Http(McpServerHttp::new(
-            code_agent::MCP_SERVER_NAME,
+            subagent::MCP_SERVER_NAME,
             "http://127.0.0.1:1234/mcp",
         ));
         let servers = vec![server.clone()];
@@ -10043,8 +10306,8 @@ mod tests {
 
     #[test]
     fn missing_http_mcp_capability_has_actionable_error() {
-        let message = LaunchError::CodeAgentHttpUnsupported.to_string();
+        let message = LaunchError::SubagentHttpUnsupported.to_string();
         assert!(message.contains("mcpCapabilities.http"));
-        assert!(message.contains("code-agent delegation"));
+        assert!(message.contains("subagent delegation"));
     }
 }

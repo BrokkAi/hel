@@ -2,15 +2,21 @@
 
 <p align="center">
   <a href="https://mjolnir.brokk.ai/">
-    <img src="docs/public/og.png" alt="Mjolnir — one terminal and a council of coding agents" width="720">
+    <img src="docs/public/og.png" alt="Mjolnir — one terminal, one coding agent, and its subagents" width="720">
   </a>
 </p>
 
-Mjolnir (`mj`) is a native Rust ACP client with a model-first coding Council:
+Mjolnir (`mj`) is a native Rust ACP client that runs one **primary agent** and
+the **subagents** it launches:
 
-- **Thor** coordinates the user turn.
-- **Eitri** implements delegated coding tasks or explores the codebase.
-- **Loki** reviews work asynchronously and returns advice at useful boundaries.
+- the primary agent owns every user turn — planning, delegating, reviewing, and
+  answering;
+- `create_subagent` launches background subagents (up to 16 in parallel, all
+  write-capable, each in a fresh session) and returns immediately;
+- live status rows show every subagent's model, current activity, and elapsed
+  time while it runs;
+- each finished subagent's report, activity log, and diff are pushed back into
+  the primary session as a new user message — nothing polls.
 
 Mjolnir selects models first, then routes them through locally available Agent
 Client Protocol adapters. The active adapter remains an implementation detail,
@@ -61,9 +67,9 @@ session.
 ## Try it
 
 The [10-minute evaluation](https://mjolnir.brokk.ai/evaluate/) uses a
-checked-in disposable fixture to exercise Thor, an Eitri implementation
-handoff, explicit review, session resume, and headless output without risking a
-real repository.
+checked-in disposable fixture to exercise a delegated subagent change, its
+pushed-back report, explicit review, session resume, and headless output without
+risking a real repository.
 
 For a quick read-only headless check:
 
@@ -82,7 +88,7 @@ mj --worktree
 - [Overview](https://mjolnir.brokk.ai/overview/)
 - [Install and run](https://mjolnir.brokk.ai/install/)
 - [10-minute evaluation](https://mjolnir.brokk.ai/evaluate/)
-- [Thor, Eitri, and Loki](https://mjolnir.brokk.ai/council/)
+- [Subagents](https://mjolnir.brokk.ai/subagents/)
 - [Permissions and workspace scope](https://mjolnir.brokk.ai/permissions/)
 - [Sessions, worktrees, and resume](https://mjolnir.brokk.ai/sessions-worktrees/)
 - [Headless automation](https://mjolnir.brokk.ai/headless/)

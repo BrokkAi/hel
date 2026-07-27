@@ -1,10 +1,10 @@
 ---
 title: Remote control
-description: Expose the same Council to a browser with explicit network and session boundaries.
+description: Expose the same session to a browser with explicit network and session boundaries.
 ---
 
-`mj server` starts Mjolnir's remote-control server with the same resolved
-Council as the terminal client.
+`mj server` starts Mjolnir's remote-control server with the same resolved models
+and subagent configuration as the terminal client.
 
 ## Default local server
 
@@ -19,6 +19,16 @@ machine and does not print a device-login QR code.
 The viewer uses a bearer login token or short viewer code, then stores a signed
 session cookie. Treat QR codes, login URLs, tokens, cookies, certificate keys,
 and downloaded transcripts as secrets.
+
+## Subagents in the viewer
+
+The viewer mirrors the terminal's subagent status area: one row per background
+subagent, running rows first in spawn order, each showing its id, label, latest
+activity, and elapsed time, and finished rows marked `✔`, `✘`, or `⊘`.
+Permission requests raised by a subagent carry its id, so a remote user answers
+the right nested request while several run at once. MCP approvals for
+`mcp__mj_subagents__create_subagent` and `mcp__mj_subagents__subagent_cancel`
+are recognized as Mjolnir's own tools rather than third-party ones.
 
 ## Tailscale
 

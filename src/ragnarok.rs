@@ -3,7 +3,7 @@
 //! `/ragnarok <task>` summons THOR, a router agent running on the
 //! strongest DeepSWE-ranked model available. Thor sizes up the task and decrees
 //! how many champions battle (2–10). Each champion is a distinct model —
-//! ideally from distinct providers — chosen by Pass@1 from the shared Council
+//! ideally from distinct providers — chosen by Pass@1 from the shared model
 //! catalog. Unranked models are not eligible. Every champion implements the task in
 //! parallel inside its own git worktree with permissions bypassed, then each
 //! is assigned a rival's implementation to adversarially review (never their
@@ -24,7 +24,7 @@ use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
-    SessionConfigOption, SessionUpdate, StopReason, ToolCallStatus, ToolKind, Usage, UsageUpdate,
+    SessionConfigOption, SessionUpdate, StopReason, ToolCallStatus, ToolKind,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -33,13 +33,13 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::acp;
-use crate::council;
 use crate::event::{
     AgentCommandOutcome, CompactTrigger, ElicitationOutcome, PermissionDecision,
     SessionConfigTarget, UiCommand, UiEvent, content_block_text,
 };
 use crate::headless::choose_allow_option;
 use crate::labels::stop_reason_label;
+use crate::roster;
 use crate::worktree;
 
 /// Thor may field at most this many champions.
@@ -155,10 +155,11 @@ const CONFIG_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Defense in depth: how many times one turn re-sends a prompt the runtime
 /// rejected with "config update already in flight" (250ms apart).
 const PROMPT_RESEND_LIMIT: usize = 20;
-/// Hard ceiling on an advertised session command (e.g. Loki's `/compact`).
+/// Hard ceiling on an advertised session command (e.g. `/compact`).
 /// This does not race the per-turn abort watch (see `run_advertised_command`
 /// doc comment), so this timeout is the only thing standing between a hung
 /// agent and a permanently wedged worker loop.
+#[allow(dead_code)]
 const ADVERTISED_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Straggler judgment never begins before this much combat time has passed…
@@ -395,8 +396,8 @@ pub struct BattleConfig {
     pub task: String,
     /// The current session cwd; worktrees are forged off its git project.
     pub cwd: PathBuf,
-    /// Ranked launchable models from the session's unified Council catalog.
-    pub available_models: Vec<council::ResolvedRole>,
+    /// Ranked launchable models from the session's unified model catalog.
+    pub available_models: Vec<roster::ResolvedAgent>,
     /// Active session agent/model used for Thor. Competitors are selected from
     /// the scored pool; Thor follows the user's current session config.
     pub thor_host: Option<ThorHost>,
@@ -1007,7 +1008,7 @@ pub(crate) async fn muster(
                 args: role.launch.args.clone(),
                 env: role.launch.env.clone(),
             },
-            vendor: Some(council_provider(&role.model.model)),
+            vendor: Some(catalog_provider(&role.model.model)),
             match_key: role.model.model.clone(),
         })
         .collect::<Vec<_>>();
@@ -1027,7 +1028,7 @@ pub(crate) async fn muster(
     Ok(pool)
 }
 
-fn council_provider(model: &str) -> String {
+fn catalog_provider(model: &str) -> String {
     let provider = crate::deepswe::model_provider(model);
     if provider.is_empty() {
         model
@@ -1248,8 +1249,6 @@ pub(crate) enum TurnEvent {
 pub(crate) struct TurnOutcome {
     pub text: String,
     pub stop: StopReason,
-    pub usage: Option<Usage>,
-    pub usage_update: Option<UsageUpdate>,
 }
 
 /// A live agent subprocess + session, driven over the same channel pair the
@@ -1262,7 +1261,6 @@ pub(crate) struct AgentHandle {
     config_targets: Vec<SessionConfigTarget>,
     abort: watch::Receiver<bool>,
     access_mode: acp::RuntimeAccessMode,
-    session_started: Option<(String, bool)>,
     /// The role-configured model selected during ACP setup, which may use an
     /// adapter-specific alias that `arm_model` cannot resolve.
     role_armed_model_value: Option<String>,
@@ -1270,13 +1268,12 @@ pub(crate) struct AgentHandle {
 }
 
 impl AgentHandle {
-    /// Run an advertised session command (currently only Loki's `/compact`)
-    /// and wait for its outcome.
+    /// Run an advertised session command (e.g. `/compact`) and wait for its
+    /// outcome.
     ///
     /// This deliberately does **not** race `self.abort`: `abort` means "the
-    /// target turn ended, stop reviewing" (see `Handle::cancel_turn` in
-    /// `loki.rs`, fired on `UiCommand::CancelPrompt`), which is a review-work
-    /// cancellation signal. Compaction is session maintenance, not review
+    /// target turn ended, stop working" (fired on `UiCommand::CancelPrompt`),
+    /// which is a work-cancellation signal. Compaction is session maintenance, not review
     /// work, and must survive a turn ending mid-compact -- racing abort here
     /// previously made a perfectly healthy compact report as
     /// `Failed("agent command aborted")` whenever the user's turn happened to
@@ -1285,6 +1282,7 @@ impl AgentHandle {
     /// command to completion once dispatched, so the fix is confined to not
     /// giving up early here. A generous hard timeout still bounds how long a
     /// hung agent can wedge the worker.
+    #[allow(dead_code)]
     pub(crate) async fn run_advertised_command(
         &mut self,
         name: &str,
@@ -1294,6 +1292,7 @@ impl AgentHandle {
             .await
     }
 
+    #[allow(dead_code)]
     async fn run_advertised_command_with_timeout(
         &mut self,
         name: &str,
@@ -1475,7 +1474,6 @@ impl AgentHandle {
             config_targets: Vec::new(),
             abort,
             access_mode,
-            session_started: None,
             role_armed_model_value,
             termination,
         };
@@ -1528,28 +1526,9 @@ impl AgentHandle {
         }
     }
 
-    fn record_session_started(&mut self, session_id: String, resumed: bool) {
-        self.session_started = Some((session_id, resumed));
-    }
-
-    /// Records the ACP session identity from the production event stream.
     /// Returns true once the connection handshake is complete.
     fn capture_session_started(&mut self, event: &UiEvent) -> bool {
-        let UiEvent::SessionStarted {
-            session_id,
-            resumed,
-        } = event
-        else {
-            return false;
-        };
-        self.record_session_started(session_id.clone(), *resumed);
-        true
-    }
-
-    pub(crate) fn session_started(&self) -> Option<(&str, bool)> {
-        self.session_started
-            .as_ref()
-            .map(|(session_id, resumed)| (session_id.as_str(), *resumed))
+        matches!(event, UiEvent::SessionStarted { .. })
     }
 
     fn store_config(
@@ -1726,8 +1705,7 @@ impl AgentHandle {
         let mut truncated = false;
         let mut known_tools: HashMap<String, (String, Option<ToolKind>)> = HashMap::new();
         let mut tool_lifecycle = PromptToolLifecycle::default();
-        let mut deferred_completion: Option<(StopReason, Option<Usage>)> = None;
-        let mut latest_usage_update = None;
+        let mut deferred_completion: Option<StopReason> = None;
         loop {
             let ev = tokio::select! {
                 ev = self.events.recv() => ev,
@@ -1785,11 +1763,10 @@ impl AgentHandle {
                                 started: false,
                             });
                         }
-                        SessionUpdate::UsageUpdate(update) => latest_usage_update = Some(update),
                         _ => {}
                     }
                     if !tool_lifecycle.has_active_tools()
-                        && let Some((stop_reason, usage)) = deferred_completion.take()
+                        && let Some(stop_reason) = deferred_completion.take()
                     {
                         if truncated {
                             acc.push_str("\n…[output truncated]");
@@ -1797,8 +1774,6 @@ impl AgentHandle {
                         return Ok(TurnOutcome {
                             text: acc,
                             stop: stop_reason,
-                            usage,
-                            usage_update: latest_usage_update,
                         });
                     }
                 }
@@ -1814,9 +1789,9 @@ impl AgentHandle {
                 UiEvent::ElicitationRequest(e) => {
                     let _ = e.responder.send(ElicitationOutcome::Decline);
                 }
-                UiEvent::PromptDone { stop_reason, usage } => {
+                UiEvent::PromptDone { stop_reason, .. } => {
                     if tool_lifecycle.has_active_tools() && stop_reason != StopReason::Cancelled {
-                        deferred_completion.get_or_insert((stop_reason, usage));
+                        deferred_completion.get_or_insert(stop_reason);
                     } else {
                         if truncated {
                             acc.push_str("\n…[output truncated]");
@@ -1824,8 +1799,6 @@ impl AgentHandle {
                         return Ok(TurnOutcome {
                             text: acc,
                             stop: stop_reason,
-                            usage,
-                            usage_update: latest_usage_update,
                         });
                     }
                 }
@@ -1921,7 +1894,7 @@ fn runtime_config(
         config_path: None,
         saved_session_config,
         role_config,
-        code_agent: None,
+        subagents: None,
         side_prompt_policy: false,
         termination,
     }
@@ -3840,7 +3813,7 @@ mod tests {
                 args: vec![],
                 env: HashMap::new(),
             },
-            vendor: Some(council_provider(model)),
+            vendor: Some(catalog_provider(model)),
             match_key: key.to_string(),
         }
     }
@@ -4552,7 +4525,6 @@ mod tests {
             config_targets: Vec::new(),
             abort,
             access_mode,
-            session_started: None,
             role_armed_model_value: None,
             termination: CancellationToken::new(),
         };
@@ -4599,7 +4571,6 @@ mod tests {
             config_targets: Vec::new(),
             abort,
             access_mode: acp::RuntimeAccessMode::ReadOnly,
-            session_started: None,
             role_armed_model_value: None,
             termination,
         };
@@ -4619,7 +4590,7 @@ mod tests {
 
         let run = tokio::spawn(async move {
             handle
-                .run_advertised_command("compact", CompactTrigger::Loki128k)
+                .run_advertised_command("compact", CompactTrigger::Manual)
                 .await
         });
 
@@ -4657,7 +4628,7 @@ mod tests {
             handle
                 .run_advertised_command_with_timeout(
                     "compact",
-                    CompactTrigger::Loki128k,
+                    CompactTrigger::Manual,
                     Duration::from_millis(20),
                 )
                 .await
@@ -4715,10 +4686,6 @@ mod tests {
         // a real turn to its deadline rather than building the error by hand,
         // so swapping the typed error back for a bare `bail!` fails here.
         let mut rig = test_rig();
-        rig.handle
-            .session_started
-            .replace(("session".to_string(), false));
-
         let error = rig
             .handle
             .prompt("anything".to_string(), Duration::from_millis(1), |_| {})
@@ -4738,11 +4705,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_started_event_captures_identity_and_resume_status() {
+    async fn session_started_event_completes_handshake() {
         let mut rig = test_rig();
         rig.event_tx
             .send(UiEvent::SessionStarted {
-                session_id: "loki-acp-session".to_string(),
+                session_id: "side-acp-session".to_string(),
                 resumed: true,
             })
             .expect("send session start");
@@ -4751,10 +4718,6 @@ mod tests {
             .wait_session_started()
             .await
             .expect("session started");
-        assert_eq!(
-            rig.handle.session_started(),
-            Some(("loki-acp-session", true))
-        );
     }
 
     #[test]
@@ -4772,11 +4735,11 @@ mod tests {
             HashMap::new(),
             None,
             Vec::new(),
-            Some("loki-acp-session".to_string()),
+            Some("side-acp-session".to_string()),
             None,
         );
 
-        assert_eq!(config.resume_session.as_deref(), Some("loki-acp-session"));
+        assert_eq!(config.resume_session.as_deref(), Some("side-acp-session"));
     }
 
     #[tokio::test]

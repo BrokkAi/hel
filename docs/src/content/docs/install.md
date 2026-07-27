@@ -76,7 +76,7 @@ Run `mj`, then open `/mjconfig`:
 
 1. In **Accounts**, sign in or verify an existing provider credential.
 2. In **ACP Servers**, confirm at least one adapter is available.
-3. In **Council**, keep the three roles on Auto or select explicit models.
+3. In **Agents**, keep the primary and subagent models on Auto or select explicit models.
 4. Start a new session after changing models or adapters.
 
 Existing Codex or Claude credentials can be detected without launching their
@@ -85,8 +85,9 @@ corresponding PATH-visible vendor CLI. The official `codex` or `claude` CLI is
 also used when you choose Mjolnir's sign-in action for that vendor.
 Mjolnir can install Kimi and supported binary agents from the ACP registry.
 
-Adapters used by the Council must advertise ACP Streamable HTTP MCP support;
-Mjolnir uses that capability to expose its authenticated Eitri tools to Thor.
+Adapters must advertise ACP Streamable HTTP MCP support; Mjolnir uses that
+capability to expose its authenticated `mj-subagents` tools to the primary
+agent.
 
 ## Verify the installation
 
@@ -96,7 +97,7 @@ mj --version
 
 Then run the [10-minute evaluation](/evaluate/). A successful `mj --version`
 only proves the binary starts; it does not prove that a provider route can
-launch or that the Council can delegate.
+launch or that delegation works end to end.
 
 ## Update and uninstall
 

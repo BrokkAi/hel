@@ -1,71 +1,75 @@
 ---
 title: Mjolnir
-description: A forge-grade terminal client for a council of coding agents.
+description: A forge-grade terminal client for a coding agent and its subagents.
 template: splash
 hero:
-  title: One terminal. A council of agents.
-  tagline: Mjolnir gives coding agents distinct roles, a shared terminal, and one consistent way to work.
+  title: One terminal. A swarm of subagents.
+  tagline: Mjolnir gives one coding agent a workshop of background subagents, a shared terminal, and one consistent way to work.
   actions:
     - text: Install mj
       link: install/
       icon: right-arrow
       variant: primary
-    - text: View on GitHub
+    - text: Overview
       link: https://github.com/BrokkAi/mjolnir
       icon: external
       variant: secondary
 ---
 
 <section class="home-section">
-  <p class="section-label">The Council</p>
-  <h2>Different jobs deserve different agents.</h2>
-  <p>Mjolnir turns a single coding session into a small, deliberate team. Each role has a clear responsibility, its own model strategy, and a place in the transcript.</p>
+  <p class="section-label">Primary and subagents</p>
+  <h2>One agent owns the outcome. Many do the work.</h2>
+  <p>Mjolnir turns a single coding session into a small, deliberate crew. The primary agent plans, delegates, and reviews; each subagent runs in a fresh session and pushes its report back into the conversation.</p>
   <div class="role-grid">
-    <article>
-      <small>01 / COORDINATE</small>
-      <h3>Thor directs</h3>
-      <p>Owns the user turn, plans the work, and decides when a focused handoff will improve the result.</p>
-      <code>role://thor</code>
-    </article>
-    <article>
-      <small>02 / IMPLEMENT</small>
-      <h3>Eitri forges</h3>
-      <p>Receives bounded coding tasks in a fresh context, then streams the implementation back through the same UI.</p>
-      <code>role://eitri</code>
-    </article>
-    <article>
-      <small>03 / REVIEW</small>
-      <h3>Loki challenges</h3>
-      <p>Reviews checkpoints asynchronously and returns useful dissent at natural boundaries without stopping the work.</p>
-      <code>role://loki</code>
-    </article>
+    <div class="role-grid__inner">
+      <article>
+        <small>01 / COORDINATE</small>
+        <h3>The primary directs</h3>
+        <p>Owns every user turn, writes the standalone briefs, reviews what comes back, and delivers the answer.</p>
+        <code>agent://primary</code>
+      </article>
+      <article>
+        <small>02 / DELEGATE</small>
+        <h3>Subagents forge</h3>
+        <p>Background sessions, all write-capable, each reporting its result, activity log, and diff when it finishes.</p>
+        <code>tool://create_subagent</code>
+      </article>
+      <article>
+        <small>03 / REVIEW</small>
+        <h3>Review challenges</h3>
+        <p>Once the delegated work lands, specialist lanes re-read the diff and an adversarial supervisor vets their findings before the turn completes.</p>
+        <code>agent://review</code>
+      </article>
+    </div>
   </div>
 </section>
 
 <section class="home-section">
   <p class="section-label">A terminal, not a compromise</p>
   <h2>Agent work that feels native to the command line.</h2>
-  <p>Inline rendering keeps the shell in view while Mjolnir handles streaming, permissions, tools, sessions, worktrees, and model-specific controls.</p>
+  <p>Inline rendering keeps the shell in view while Mjolnir handles streaming, permissions, tools, live subagent status, sessions, worktrees, and model-specific controls.</p>
   <div class="capability-grid">
-    <a href="council/">
-      <span>01 / ORCHESTRATE</span><h3>Model-first Council</h3><p>Select strong models first, then route them through available ACP adapters.</p>
-    </a>
-    <a href="configuration/">
-      <span>02 / CONTROL</span><h3>Explicit permissions</h3><p>Keep agent choices readable and interactive without leaving the terminal.</p>
-    </a>
-    <a href="overview/#sessions-and-worktrees">
-      <span>03 / RESUME</span><h3>Durable sessions</h3><p>Resume the original route and isolate work in linked Git worktrees.</p>
-    </a>
-    <a href="remote/">
-      <span>04 / AUTOMATE</span><h3>Headless + remote</h3><p>Use the same Council from scripts, JSON streams, or a remote client.</p>
-    </a>
+    <div class="capability-grid__inner">
+      <a href="subagents/">
+        <span>01 / ORCHESTRATE</span><h3>Parallel subagents</h3><p>Launch background work, watch it live, and get each report pushed back into the turn.</p>
+      </a>
+      <a href="configuration/">
+        <span>02 / CONTROL</span><h3>Explicit permissions</h3><p>Keep agent choices readable and interactive without leaving the terminal.</p>
+      </a>
+      <a href="sessions-worktrees/">
+        <span>03 / RESUME</span><h3>Durable sessions</h3><p>Resume the original route and isolate work in linked Git worktrees.</p>
+      </a>
+      <a href="remote/">
+        <span>04 / AUTOMATE</span><h3>Headless + remote</h3><p>Drive the same session from scripts, JSON streams, or a remote client.</p>
+      </a>
+    </div>
   </div>
 </section>
 
 <section class="home-section">
   <p class="section-label">Short by design</p>
   <h2>Install it. Open a repository. Type two letters.</h2>
-  <div class="command-strip" aria-label="Run Mjolnir"><span>❯</span><code>mj</code><small>COUNCIL READY</small></div>
+  <div class="command-strip" aria-label="Run Mjolnir"><span>❯</span><code>mj</code><small>AGENT READY</small></div>
 </section>
 
 <section class="home-section">
@@ -73,7 +77,7 @@ hero:
     <div>
       <p class="section-label">Documentation preview</p>
       <h2>Start with the shape of the system.</h2>
-      <p>Install Mjolnir, run the checked evaluation, understand the Council, and inspect the permission, data, and licensing boundaries before putting it to work.</p>
+      <p>Install Mjolnir, run the checked evaluation, understand how subagents are launched and reported, and inspect the permission, data, and licensing boundaries before putting it to work.</p>
     </div>
     <a href="evaluate/">Run the evaluation <span aria-hidden="true">→</span></a>
   </div>

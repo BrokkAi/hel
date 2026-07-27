@@ -1,38 +1,65 @@
 ---
 title: Configuration
-description: Configure Council roles, permissions, ACP servers, review, and appearance.
+description: Configure the primary agent, subagents, ACP servers, review, and appearance.
 ---
 
 Open `/mjconfig` to edit settings from the TUI. `/models` opens the same editor
-on the Council tab. Model and ACP-server changes apply to the next session.
+on the Agents tab. Model and ACP-server changes apply to the next session.
 
-The config schema is versioned. A missing or incompatible `version` starts from
+The config schema is versioned. The current schema is `version = 3`; a
+`version = 2` file is migrated in place on load. Any other version starts from
 fresh defaults rather than guessing a field-by-field migration.
 
 ## Minimal config
 
 ```toml
-version = 2
+version = 3
 
-[thor]
+[agent]
 model = "auto"
 discrete_review = true
 
-[loki]
+[subagents]
 model = "auto"
-
-[eitri]
-model = "auto"
-max_parallel_explores = 6
-
-[council]
+max_parallel = 6
 auto_failover = true
-permission_mode = "auto"
 ```
 
-Set Loki or Eitri to `disabled` to turn off that optional role. Thor cannot be
-disabled. Explicit model IDs can come from `/models`; availability is checked
-when the next session starts.
+`[agent]` is the primary agent: the session that owns every user turn. It cannot
+be disabled. `[subagents]` configures the default backing for `create_subagent`;
+set `model = "disabled"` (or `"none"`) to turn subagents off entirely.
+
+| Key | Meaning |
+| --- | --- |
+| `agent.model` | Primary model, or `auto` |
+| `agent.reasoning_effort` | Optional per-seat ACP reasoning effort |
+| `agent.discrete_review` | Run the end-of-turn discrete review |
+| `subagents.model` | Default subagent model, `auto`, or `disabled` |
+| `subagents.reasoning_effort` | Optional per-seat ACP reasoning effort |
+| `subagents.max_parallel` | Concurrent subagents, default 6, maximum 16 |
+| `subagents.auto_failover` | Move the default pool to another roster model when the current provider's quota runs low |
+
+Explicit model IDs can come from `/models`; availability is checked when the
+next session starts. A `max_parallel` above 16 is a configuration error, not a
+silently clamped value.
+
+## Migrating from version 2
+
+A `version = 2` file (`[thor]`, `[eitri]`, `[loki]`, `[council]`) is mapped onto
+the current schema the first time this build loads it, and the migrated result
+is written back to the same path:
+
+| v2 | v3 |
+| --- | --- |
+| `thor.model`, `thor.reasoning_effort`, `thor.discrete_review` | `agent.*` |
+| `eitri.model`, `eitri.reasoning_effort` | `subagents.*` |
+| `eitri.max_parallel_explores` | `subagents.max_parallel` |
+| `council.auto_failover` | `subagents.auto_failover` |
+| `[loki]`, `council.permission_mode` | dropped |
+
+`theme`, `spinner`, `[acp]`, and `[ragnarok]` carry over unchanged. If the
+migrated file cannot be written back, the session still runs on the migrated
+values in memory.
 
 ## ACP policy
 
@@ -42,7 +69,7 @@ servers accept a command, arguments, environment values, origin, and policy.
 ```toml
 [acp.policies]
 codex-acp = "auto"
-claude-agent-acp = "disabled"
+claude-acp = "disabled"
 
 [[acp.servers]]
 id = "custom:company"
@@ -58,24 +85,26 @@ working directory. See [Data and trust boundaries](/data-boundaries/).
 
 ## One-shot overrides
 
-Headless runs can override roles without changing the saved file:
+Headless runs can override models without changing the saved file:
 
 ```bash
 mj --print \
-  --thor provider/model-id \
-  --loki disabled \
-  --eitri disabled \
+  --model provider/model-id \
+  --subagent-model disabled \
   "summarize this repository"
 ```
 
-Role overrides require explicit model IDs; `auto` is not accepted as a one-shot
-override. The saved configuration remains unchanged.
+Overrides require explicit model IDs; `auto` is not accepted. Each accepts an
+optional `+<effort>` suffix (`--model provider/model-id+high`). The saved
+configuration remains unchanged.
 
 ## Appearance and session controls
 
-Theme and spinner preferences are persistent. Thor's ACP session controls are
-available on F1–F9, but model and thought-level selection belong to the Council
-and are edited through `/mjconfig` rather than those session controls.
+Theme and spinner preferences are persistent. The primary agent's ACP session
+controls are available on F1–F9, but model and thought-level selection belong to
+Mjolnir's own configuration and are edited through `/mjconfig` rather than those
+session controls.
 
 Platform config locations come from the operating system rather than a literal
-cross-platform `~/.config` contract. See [Storage and network activity](/storage-network/).
+cross-platform `~/.config` contract. See [Storage and network
+activity](/storage-network/).

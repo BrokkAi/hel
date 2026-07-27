@@ -43,27 +43,7 @@ pub struct WorkspaceDiffEvent {
     pub truncated: bool,
 }
 
-/// Loki identity attached to reviewer activity rendered in the transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LokiIdentity {
-    pub role: String,
-    pub connection_id: String,
-    pub source_id: Option<String>,
-    pub model_name: Option<String>,
-    pub model_value: Option<String>,
-}
-
-/// Explicit reviewer activity. Eitri uses the foreground ACP lane instead of
-/// projecting through these events.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LokiActivity {
-    Warning {
-        actor: LokiIdentity,
-        message: String,
-    },
-}
-
-/// A council coordination prompt shown as ordinary transcript prose while
+/// An orchestration prompt shown as ordinary transcript prose while
 /// retaining its complete text for expansion and export.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InternalMessage {
@@ -76,12 +56,7 @@ pub struct InternalMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InternalMessageKind {
     Delegation,
-    Exploration,
     DiscreteReview,
-    Continuation,
-    /// Loki finished reviewing after the turn already completed; the council
-    /// starts a fresh Thor turn to surface the late advice to the user.
-    Interjection,
     /// A specialist review lane's report from the discrete-review fan-out.
     ReviewLane,
     /// Progress from the tool-using review supervisor while the held turn is
@@ -89,21 +64,6 @@ pub enum InternalMessageKind {
     ReviewProgress,
     /// The review supervisor's synthesis of all lane reports.
     ReviewSynthesis,
-}
-
-impl InternalMessageKind {
-    pub(crate) fn wire_name(self) -> &'static str {
-        match self {
-            Self::Delegation => "delegation",
-            Self::Exploration => "exploration",
-            Self::DiscreteReview => "discrete_review",
-            Self::Continuation => "continuation",
-            Self::Interjection => "interjection",
-            Self::ReviewLane => "review_lane",
-            Self::ReviewProgress => "review_progress",
-            Self::ReviewSynthesis => "review_synthesis",
-        }
-    }
 }
 
 /// Events flowing from the ACP runtime into the UI task.
@@ -142,28 +102,23 @@ pub enum UiEvent {
     SessionConfigOptions {
         options: Vec<SessionConfigOption>,
         targets: Vec<SessionConfigTarget>,
-        /// Provider permission controls owned by the Council setting rather
+        /// Provider permission controls owned by the ACP harness rather
         /// than the active-session config picker.
         hidden_config_ids: Vec<String>,
     },
     /// A background ACP adapter probe finished after startup: refreshed model
     /// choices and server inventory for the /models and /mjconfig editors.
-    /// Never rebinds the running session's Council roles.
-    CouncilUpdate {
-        choices: Vec<crate::council::ModelChoice>,
-        inventory: crate::council::AcpInventory,
+    /// Never rebinds the running session's bound seats.
+    RosterUpdate {
+        choices: Vec<crate::roster::ModelChoice>,
+        inventory: crate::roster::AcpInventory,
     },
-    /// Structured nested-agent activity projected from an MCP tool result.
-    LokiActivity(LokiActivity),
-    /// Hidden council coordination made inspectable in the shared transcript.
+    /// Hidden orchestration made inspectable in the shared transcript.
     InternalMessage(InternalMessage),
-    /// Completed prompt usage attributed to one Council role.
-    CouncilUsage(crate::council_usage::Record),
-    /// A background Council role moved to a fallback model for this session.
-    CouncilRoleChanged {
-        role: crate::council_usage::Role,
-        model: String,
-    },
+    /// Completed prompt usage attributed to one agent seat.
+    AgentUsage(crate::agent_usage::Record),
+    /// The default subagent pool moved to a fallback model for this session.
+    SubagentPoolModelChanged { model: String },
     /// `session/request_permission` from the agent. The UI is expected to
     /// render a modal and answer through `responder` exactly once.
     PermissionRequest(PermissionPrompt),
@@ -175,10 +130,10 @@ pub enum UiEvent {
     /// by agent-driven `/setup` menus, which are global (not per-session) and
     /// therefore must NOT be routed through `session/set_config_option`.
     ElicitationRequest(ElicitationPrompt),
-    /// Activity from a temporary ACP agent launched through the injected MCP tool.
-    /// Kept under one wrapper so nested lifecycle/config state cannot be
+    /// Activity from a background subagent launched through the injected MCP
+    /// tool. Kept under one wrapper so nested lifecycle/config state cannot be
     /// mistaken for the primary session's state.
-    CodeAgent(CodeAgentEvent),
+    Subagent(SubagentEvent),
     /// The runtime sent `session/cancel`; queued permission prompts for the
     /// cancelled turn must answer with `cancelled` and disappear.
     CancelPendingPermissions,
@@ -217,39 +172,67 @@ pub enum UiEvent {
     Fatal(String),
 }
 
+/// Lifecycle and activity of one background subagent. Every variant carries
+/// `subagent_id` so concurrent subagents stay distinguishable in the TUI,
+/// headless stream, and remote viewer.
 #[derive(Debug)]
-pub enum CodeAgentEvent {
+pub enum SubagentEvent {
     Started {
+        subagent_id: u64,
         label: String,
+        model: Option<String>,
+        agent: String,
+        objective: String,
     },
-    ExplorationStarted {
-        run_id: u64,
-        label: String,
-    },
-    ExplorationProgress {
-        run_id: u64,
+    /// Distilled one-liner describing what the subagent is doing right now.
+    Activity {
+        subagent_id: u64,
         activity: String,
     },
-    ExplorationFinished {
-        run_id: u64,
-        outcome: CodeAgentOutcome,
+    SessionUpdate {
+        subagent_id: u64,
+        update: SessionUpdate,
     },
-    SessionUpdate(SessionUpdate),
-    TerminalOutput(TerminalOutputSnapshot),
-    PermissionRequest(PermissionPrompt),
-    ElicitationRequest(ElicitationPrompt),
-    CancelPendingPermissions,
-    Status(String),
+    TerminalOutput {
+        subagent_id: u64,
+        snapshot: TerminalOutputSnapshot,
+    },
+    PermissionRequest {
+        subagent_id: u64,
+        prompt: PermissionPrompt,
+    },
+    ElicitationRequest {
+        subagent_id: u64,
+        prompt: ElicitationPrompt,
+    },
+    CancelPendingPermissions {
+        subagent_id: u64,
+    },
+    Status {
+        subagent_id: u64,
+        message: String,
+    },
     Finished {
-        outcome: CodeAgentOutcome,
+        subagent_id: u64,
+        outcome: SubagentOutcome,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CodeAgentOutcome {
+pub enum SubagentOutcome {
     Completed,
     Cancelled,
     Failed(String),
+}
+
+impl SubagentOutcome {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed(_) => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,16 +299,12 @@ pub enum SessionConfigTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactTrigger {
     Manual,
-    ThorCompacted,
-    Loki128k,
 }
 
 impl CompactTrigger {
     pub fn label(self) -> &'static str {
         match self {
             Self::Manual => "manual",
-            Self::ThorCompacted => "thor_compacted",
-            Self::Loki128k => "loki_128k",
         }
     }
 }
@@ -363,13 +342,14 @@ pub enum UiCommand {
         target: SessionConfigTarget,
         value: SessionConfigValueId,
     },
-    /// Change Thor's discrete review policy without replacing its ACP session.
-    SetThorReviewPolicy { enabled: bool },
-    /// Run one Mjolnir-owned findings-only review while Thor is idle.
+    /// Change the discrete review policy without replacing the primary ACP
+    /// session.
+    SetReviewPolicy { enabled: bool },
+    /// Run one Mjolnir-owned findings-only review while the primary is idle.
     RunReview { target: ReviewTarget },
-    /// Compact Thor and the persistent Loki session where each role advertises
-    /// the exact portable command.
-    CompactCouncil,
+    /// Compact the primary session using the exact portable command it
+    /// advertises.
+    CompactPrimary,
     /// Execute one exact advertised command in the foreground ACP session.
     RunAdvertisedCommand {
         name: String,

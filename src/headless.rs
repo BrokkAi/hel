@@ -21,11 +21,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::acp::{self, AcpRuntimeConfig};
 use crate::event::{
-    CodeAgentEvent, ElicitationOutcome, PermissionDecision, UiCommand, UiEvent, content_block_text,
+    ElicitationOutcome, PermissionDecision, SubagentEvent, SubagentOutcome, UiCommand, UiEvent,
+    content_block_text,
 };
 use crate::labels::{stop_reason_label, tool_kind_label, tool_status_label};
 use crate::remote;
-use crate::{code_agent, config, council, loki};
+use crate::{config, roster, subagent};
 
 #[derive(Debug, Clone, Copy)]
 pub enum OutputFormat {
@@ -41,7 +42,7 @@ pub enum PermissionMode {
     Yolo,
 }
 
-impl From<PermissionMode> for config::CouncilPermissionMode {
+impl From<PermissionMode> for config::PermissionPreset {
     fn from(value: PermissionMode) -> Self {
         match value {
             PermissionMode::Manual => Self::Manual,
@@ -60,9 +61,9 @@ pub struct RunConfig {
     pub fs_max_text_bytes: u64,
     pub output_format: OutputFormat,
     pub permission_mode: PermissionMode,
-    pub role_overrides: config::RoleModelOverrides,
+    pub role_overrides: config::ModelOverrides,
     /// Process-wide graceful termination.  Headless owns its shutdown so it
-    /// can stop the ACP runtime and council workers before returning.
+    /// can stop the ACP runtime and subagent workers before returning.
     pub termination: CancellationToken,
 }
 
@@ -110,6 +111,17 @@ enum StreamRecord<'a> {
         kind: &'a str,
         text: &'a str,
     },
+    /// Lifecycle of one background subagent. `kind` is `started` (text = the
+    /// objective), `activity` (text = the distilled activity line) or
+    /// `finished` (text = the outcome summary, `elapsed_ms` set).
+    Subagent {
+        id: u64,
+        label: &'a str,
+        kind: &'a str,
+        text: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
+    },
     Warning {
         #[serde(skip_serializing_if = "Option::is_none")]
         actor: Option<&'a str>,
@@ -124,7 +136,7 @@ enum StreamRecord<'a> {
         resumed: bool,
         text: &'a str,
         usage: Option<&'a Usage>,
-        council_usage: &'a crate::council_usage::Snapshot,
+        agent_usage: &'a crate::agent_usage::Snapshot,
         error: Option<&'a str>,
     },
 }
@@ -136,7 +148,7 @@ struct JsonResult<'a> {
     result: &'a str,
     stop_reason: String,
     usage: Option<&'a Usage>,
-    council_usage: &'a crate::council_usage::Snapshot,
+    agent_usage: &'a crate::agent_usage::Snapshot,
     error: Option<&'a str>,
 }
 
@@ -144,6 +156,16 @@ struct JsonResult<'a> {
 struct HeadlessState {
     final_text: String,
     tool_calls: HashMap<String, ToolCall>,
+    /// `Activity`/`Finished` subagent events carry only the id, so the label
+    /// (and the start instant behind `elapsed_ms`) is remembered from
+    /// `Started`.
+    subagents: HashMap<u64, SubagentTrace>,
+}
+
+#[derive(Debug)]
+struct SubagentTrace {
+    label: String,
+    started: std::time::Instant,
 }
 
 pub async fn run(cfg: RunConfig) -> Result<()> {
@@ -154,12 +176,12 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let config_path = config::default_config_path();
     let mut app_config = config::Config::load(&config_path)
         .with_context(|| format!("load {}", config_path.display()))?;
-    app_config.apply_role_model_overrides(&cfg.role_overrides);
-    let mut resolved = council::resolve(&app_config, &cfg.cwd).await?;
+    app_config.apply_model_overrides(&cfg.role_overrides);
+    let mut resolved = roster::resolve(&app_config, &cfg.cwd).await?;
     if let Some(session_id) = cfg.resume_session.as_deref()
         && let Some(record) = crate::session_provenance::find(session_id, &cfg.cwd)
     {
-        resolved.thor = resolved
+        resolved.primary = resolved
             .available
             .iter()
             .find(|role| {
@@ -176,98 +198,82 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 )
             })?;
     }
-    let thor = resolved.thor.clone();
-    let provenance_thor = thor.clone();
+    let primary = resolved.primary.clone();
+    let provenance_primary = primary.clone();
     let provenance_cwd = cfg.cwd.clone();
 
     let project_label = crate::paths::project_label_from_cwd(&cfg.cwd);
     let worktree_label = crate::paths::worktree_name_from_cwd(&cfg.cwd);
-    let agent_label = format!("Thor · {}", thor.model.model);
+    let agent_label = primary.model.model.clone();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     for warning in &resolved.warnings {
         let _ = event_tx.send(UiEvent::Warning(warning.clone()));
     }
-    let (loki_roles, _loki_codex_home) =
-        crate::isolated_council_roles(resolved.loki_failover_roles(), "loki")?;
     let quota_gate = crate::quota::Gate::new(cfg.cwd.clone(), event_tx.clone());
-    let loki_pool = (!loki_roles.is_empty()).then(|| {
+    let (subagent_roles, _subagent_codex_home) =
+        crate::isolated_subagent_roles(resolved.subagent_failover_roles(), "subagent")?;
+    let headless_quota_gate = quota_gate.clone();
+    let subagent_pool = (!subagent_roles.is_empty()).then(|| {
         crate::quota::RolePool::new(
-            loki_roles,
-            quota_gate.clone(),
-            app_config.council.auto_failover,
-            crate::council_usage::Role::Loki,
-            event_tx.clone(),
-        )
-    });
-    let loki_handle = loki_pool.map(|pool| {
-        loki::Handle::start(
-            pool,
-            cfg.cwd.clone(),
-            cfg.additional_directories.clone(),
-            event_tx.clone(),
-            format!("headless-{}", std::process::id()),
-        )
-    });
-    let thor_pull_server = match loki_handle.as_ref() {
-        Some(reviewer) => Some(loki::PullServer::start(
-            reviewer.clone(),
-            loki::Consumer::Thor,
-        )?),
-        None => None,
-    };
-    let (eitri_roles, _eitri_codex_home) =
-        crate::isolated_council_roles(resolved.eitri_failover_roles(), "eitri")?;
-    let eitri_pool = (!eitri_roles.is_empty()).then(|| {
-        crate::quota::RolePool::new(
-            eitri_roles,
+            subagent_roles,
             quota_gate,
-            app_config.council.auto_failover,
-            crate::council_usage::Role::Eitri,
+            app_config.subagents.auto_failover,
+            "subagents",
             event_tx.clone(),
         )
     });
-    // The discrete review's specialist lanes run on Eitri's seat, so they need
-    // the pool that is about to move into the code-agent config.
-    let review_workers = eitri_pool.clone();
-    let implementation_handoffs = Arc::new(AtomicUsize::new(0));
-    let active_implementation_workers = code_agent::ActiveCodeWorkers::default();
-    let mut thor_env = thor.launch.env.clone();
-    let thor_permission =
-        council::configure_permissions(thor.launch.kind, cfg.permission_mode.into(), &mut thor_env);
+    // The discrete review's specialist lanes run on the subagent seat, so they
+    // need the pool that is about to move into the subagent config.
+    let review_workers = subagent_pool.clone();
+    let subagent_handoffs = Arc::new(AtomicUsize::new(0));
+    // Shared with the review fan-out so lane ids never collide with pool ids.
+    let subagent_ids = subagent::SubagentIdAllocator::default();
+    let active_implementation_workers = subagent::ActiveSubagentWorkers::default();
+    let (subagent_reports, subagent_report_rx) = subagent::SubagentReportBus::channel();
+    let subagent_inventory = Arc::new(std::sync::RwLock::new(
+        subagent::SubagentInventory::from_roster(&resolved),
+    ));
+    let mut primary_env = primary.launch.env.clone();
+    let primary_permission = roster::configure_permissions(
+        primary.launch.kind,
+        cfg.permission_mode.into(),
+        &mut primary_env,
+    );
     let runtime_cfg = AcpRuntimeConfig {
-        command: thor.launch.command.clone(),
-        args: thor.launch.args.clone(),
+        command: primary.launch.command.clone(),
+        args: primary.launch.args.clone(),
         cwd: cfg.cwd.clone(),
         additional_directories: cfg.additional_directories.clone(),
-        mcp_servers: thor_pull_server
-            .as_ref()
-            .map(|server| vec![server.advertised().clone()])
-            .unwrap_or_default(),
+        mcp_servers: Vec::new(),
         resume_session: cfg.resume_session.clone(),
-        env: thor_env,
+        env: primary_env,
         agent_stderr: cfg.agent_stderr.clone(),
         fs_max_text_bytes: cfg.fs_max_text_bytes,
         access_mode: acp::RuntimeAccessMode::Full,
-        agent_source_id: Some(format!("council:{}", thor.model.model)),
+        agent_source_id: Some(format!("roster:{}", primary.model.model)),
         config_path: Some(config_path),
         saved_session_config: HashMap::new(),
         role_config: Some(acp::RuntimeRoleConfig {
-            label: "Thor".to_string(),
-            model_id: thor.model.model.clone(),
-            model_value: thor.model_value.clone(),
-            adapter_source_id: thor.launch.source_id.clone(),
-            permission: thor_permission,
-            council_session: None,
-            reasoning_effort: thor.reasoning_effort.clone(),
+            label: "primary".to_string(),
+            model_id: primary.model.model.clone(),
+            model_value: primary.model_value.clone(),
+            adapter_source_id: primary.launch.source_id.clone(),
+            permission: primary_permission,
+            session_tag: None,
+            reasoning_effort: primary.reasoning_effort.clone(),
         }),
-        code_agent: eitri_pool.map(|eitri_pool| {
-            code_agent::Config::council(eitri_pool, cfg.agent_stderr.clone(), loki_handle.clone())
-                .with_implementation_handoff_counter(implementation_handoffs.clone())
+        subagents: subagent_pool.map(|subagent_pool| {
+            subagent::Config::new(subagent_pool, cfg.agent_stderr.clone())
+                .with_subagent_handoff_counter(subagent_handoffs.clone())
+                .with_id_allocator(subagent_ids.clone())
                 .with_active_implementation_workers(active_implementation_workers.clone())
-                .with_max_parallel_explores(app_config.eitri.max_parallel_explores)
+                .with_max_parallel(app_config.subagents.max_parallel)
                 .with_headless_permission_mode(cfg.permission_mode.into())
-                .with_prewarm(code_agent::RunContext {
+                .with_quota_gate(headless_quota_gate)
+                .with_inventory(subagent_inventory)
+                .with_reports(subagent_reports.clone())
+                .with_prewarm(subagent::RunContext {
                     cwd: cfg.cwd.clone(),
                     additional_directories: cfg.additional_directories.clone(),
                     fs_max_text_bytes: cfg.fs_max_text_bytes,
@@ -288,33 +294,32 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         Some(cmd_tx.clone()),
         None,
     );
-    let orchestrated = crate::council_orchestrator::spawn(
+    let orchestrated = crate::orchestrator::spawn(
         event_rx,
-        crate::council_orchestrator::Config {
-            reviewer: loki_handle.clone(),
+        crate::orchestrator::Config {
             runtime_commands: cmd_tx.clone(),
-            implementation_handoffs: implementation_handoffs.clone(),
-            active_implementation_workers: active_implementation_workers.clone(),
-            discrete_review: app_config.thor.discrete_review,
+            subagent_handoffs: subagent_handoffs.clone(),
+            active_subagent_workers: active_implementation_workers.clone(),
+            subagent_reports: subagent_report_rx,
+            subagent_report_bus: subagent_reports.clone(),
+            discrete_review: app_config.agent.discrete_review,
+            primary_model: Some(primary.model.model.clone()),
             review_root: cfg.cwd.clone(),
-            log_context: Some(crate::council_orchestrator::LogContext {
-                council_session: format!("headless-{}", std::process::id()),
-                model: thor.model.model.clone(),
-                adapter: thor.launch.source_id.clone(),
-            }),
-            held_completion_max_wait: None,
             review_fanout: review_workers.map(|workers| {
                 crate::discrete_review::Spawner::live(crate::discrete_review::FanoutConfig {
                     workers,
-                    supervisor: thor.clone(),
+                    supervisor: primary.clone(),
                     cwd: cfg.cwd.clone(),
                     additional_directories: cfg.additional_directories.clone(),
-                    council_session: Some(format!("headless-{}", std::process::id())),
+                    session_tag: Some(format!("headless-{}", std::process::id())),
+                    agent_stderr: cfg.agent_stderr.clone(),
+                    fs_max_text_bytes: cfg.fs_max_text_bytes,
+                    id_allocator: subagent_ids.clone(),
                 })
             }),
         },
     );
-    let thor_orchestrator = orchestrated.handle.clone();
+    let primary_orchestrator = orchestrated.handle.clone();
     let mut event_rx = orchestrated.events;
     let orchestrator_task = orchestrated.task;
 
@@ -323,7 +328,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let mut saw_terminal_event = false;
     let mut stop_reason = None;
     let mut usage = None;
-    let mut council_usage = crate::council_usage::Snapshot::default();
+    let mut agent_usage = crate::agent_usage::Snapshot::default();
     let mut session_id = None;
     let mut resumed = false;
     let mut terminal_error = None;
@@ -335,6 +340,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         let event = tokio::select! {
             _ = cfg.termination.cancelled() => {
                 terminated = true;
+                let _ = cmd_tx.send(UiCommand::Shutdown);
                 break;
             }
             event = event_rx.recv() => event,
@@ -371,9 +377,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 crate::session_provenance::record(crate::session_provenance::Record {
                     session_id: started_session_id.clone(),
                     cwd: provenance_cwd.clone(),
-                    adapter_source_id: provenance_thor.launch.source_id.clone(),
-                    model: provenance_thor.model.model.clone(),
-                    model_value: provenance_thor.model_value.clone(),
+                    adapter_source_id: provenance_primary.launch.source_id.clone(),
+                    model: provenance_primary.model.model.clone(),
+                    model_value: provenance_primary.model_value.clone(),
                 });
                 if matches!(cfg.output_format, OutputFormat::StreamJson) {
                     emit_json(&StreamRecord::SessionStarted {
@@ -384,23 +390,21 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 if !sent_prompt {
                     sent_prompt = true;
                     if cfg.prompt == "/compact" {
-                        state.final_text = thor_orchestrator.compact_manual().await;
+                        state.final_text = primary_orchestrator.compact_manual().await;
                         stop_reason = Some(StopReason::EndTurn);
                         saw_terminal_event = true;
+                        let _ = cmd_tx.send(UiCommand::Shutdown);
                         break;
                     }
                     prompt_sent = true;
-                    implementation_handoffs.store(0, Ordering::Release);
+                    subagent_handoffs.store(0, Ordering::Release);
                     let mut roots = Vec::with_capacity(1 + cfg.additional_directories.len());
                     roots.push(cfg.cwd.clone());
                     roots.extend(cfg.additional_directories.iter().cloned());
                     let snapshot =
                         crate::workspace_snapshot::WorkspaceSnapshot::capture(&roots).await;
-                    let review_epoch = loki_handle
-                        .as_ref()
-                        .map_or(1, |reviewer| reviewer.begin_turn(cfg.prompt.clone()));
-                    thor_orchestrator
-                        .begin_turn(review_epoch, cfg.prompt.clone(), Vec::new(), snapshot)
+                    primary_orchestrator
+                        .begin_turn(1, cfg.prompt.clone(), Vec::new(), snapshot)
                         .await;
                     let command = UiCommand::SendPrompt {
                         text: cfg.prompt.clone(),
@@ -417,7 +421,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             UiEvent::WorkspaceDiff(_) => {}
             UiEvent::TerminalOutput(_) => {}
             UiEvent::SessionConfigOptions { .. } => {}
-            UiEvent::CouncilUpdate { .. } => {}
+            UiEvent::RosterUpdate { .. } => {}
             UiEvent::PermissionRequest(prompt) => {
                 let decision =
                     permission_decision(cfg.permission_mode, &prompt.tool_call, &prompt.options);
@@ -427,7 +431,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 };
                 if matches!(cfg.output_format, OutputFormat::StreamJson) {
                     emit_json(&StreamRecord::Permission {
-                        actor: "thor",
+                        actor: "primary",
                         tool_call_id: &prompt.tool_call.tool_call_id.to_string(),
                         decision: decision_label,
                     })?;
@@ -441,18 +445,35 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 stop_reason: reason,
                 usage: prompt_usage,
             } => {
-                // Headless has no further turn boundary after this point --
-                // the process is about to shut down and abort Loki's
-                // reviewer. Give any Thor advice already routed but never
-                // delivered (no ordinary boundary fired in time) one last
-                // chance before treating this completion as terminal. Bounded
-                // to at most one extra turn per prompt by the orchestrator.
-                if thor_orchestrator.drain_advice_before_shutdown().await {
-                    continue;
-                }
                 stop_reason = Some(reason);
                 usage = prompt_usage;
+                // Under the push model a completed turn is not the end of the
+                // run: every subagent still owes a report, and the orchestrator
+                // injects each one as a fresh turn. `pending()` is incremented
+                // synchronously inside `create_subagent`, so any subagent this
+                // turn launched is already counted here; keep draining until
+                // every report has been injected and answered.
+                //
+                // The counter spans admission -> injection: `open()` runs
+                // synchronously in `create_subagent`/`resume`, every terminal
+                // worker path delivers exactly one report for the admitted turn,
+                // and the orchestrator only `close()`s when it injects the batch
+                // (or when it drops a cancelled report, whose story already went
+                // back through the `subagent_cancel` tool result). The window
+                // between a worker finishing and its report being injected is
+                // therefore covered. Discrete-review lanes never touch the bus,
+                // so they cannot hold the drain open; a review instead withholds
+                // this very `PromptDone` inside the orchestrator until its
+                // verdict lands.
+                if subagent_reports.pending() > 0 {
+                    // The answer the user sees is the last turn's, so drop the
+                    // text collected before the injection.
+                    state.final_text.clear();
+                    collecting_turn_output = false;
+                    continue;
+                }
                 saw_terminal_event = true;
+                let _ = cmd_tx.send(UiCommand::Shutdown);
                 break;
             }
             UiEvent::PromptFailed { message } => {
@@ -461,6 +482,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 }
                 terminal_error = Some(message);
                 saw_terminal_event = true;
+                let _ = cmd_tx.send(UiCommand::Shutdown);
                 break;
             }
             UiEvent::SessionForkFailed { message } | UiEvent::Fatal(message) => {
@@ -469,6 +491,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 }
                 terminal_error = Some(message);
                 saw_terminal_event = true;
+                let _ = cmd_tx.send(UiCommand::Shutdown);
                 break;
             }
             UiEvent::Warning(message) => {
@@ -484,59 +507,88 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             UiEvent::Info(_) => {}
             UiEvent::CancelPendingPermissions => {}
             UiEvent::ClaudeUsage(_) | UiEvent::CodexUsage(_) => {}
-            UiEvent::CouncilUsage(record) => council_usage.observe(record),
-            UiEvent::CouncilRoleChanged { .. } => {}
+            UiEvent::AgentUsage(record) => agent_usage.observe(record),
+            UiEvent::SubagentPoolModelChanged { .. } => {}
             // Headless runs never receive remote decisions (no UI event
             // channel is registered with the tracker).
             UiEvent::RemotePermissionDecision { .. } => {}
-            UiEvent::CodeAgent(event) => match event {
-                CodeAgentEvent::ExplorationStarted { run_id, label } => {
+            UiEvent::Subagent(event) => match event {
+                SubagentEvent::Started {
+                    subagent_id,
+                    label,
+                    objective,
+                    ..
+                } => {
+                    state.subagents.insert(
+                        subagent_id,
+                        SubagentTrace {
+                            label: label.clone(),
+                            started: std::time::Instant::now(),
+                        },
+                    );
+                    emit_subagent(
+                        cfg.output_format,
+                        subagent_id,
+                        &label,
+                        SUBAGENT_KIND_STARTED,
+                        &objective,
+                        None,
+                    )?;
+                }
+                SubagentEvent::Activity {
+                    subagent_id,
+                    activity,
+                } => {
+                    let label = state.subagent_label(subagent_id);
+                    emit_subagent(
+                        cfg.output_format,
+                        subagent_id,
+                        &label,
+                        SUBAGENT_KIND_ACTIVITY,
+                        &activity,
+                        None,
+                    )?;
+                }
+                SubagentEvent::Finished {
+                    subagent_id,
+                    outcome,
+                } => {
+                    let trace = state.subagents.remove(&subagent_id);
+                    let label = trace
+                        .as_ref()
+                        .map_or_else(|| SUBAGENT_UNKNOWN_LABEL.to_string(), |t| t.label.clone());
+                    let elapsed = trace.as_ref().map(|trace| trace.started.elapsed());
+                    emit_subagent(
+                        cfg.output_format,
+                        subagent_id,
+                        &label,
+                        SUBAGENT_KIND_FINISHED,
+                        &subagent_outcome_text(&outcome),
+                        elapsed,
+                    )?;
+                }
+                SubagentEvent::SessionUpdate {
+                    subagent_id,
+                    update,
+                } => {
                     if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                        let text = format!("explore #{run_id} started · {label}");
-                        emit_json(&StreamRecord::Review {
-                            actor: "eitri",
-                            target: "thor",
-                            kind: "exploration_status",
-                            text: &text,
-                        })?;
+                        let actor = subagent_actor(subagent_id);
+                        emit_stream_update(&update, &state, &actor)?;
                     }
                 }
-                CodeAgentEvent::ExplorationProgress { run_id, activity } => {
-                    if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                        let text = format!("explore #{run_id} · {activity}");
-                        emit_json(&StreamRecord::Review {
-                            actor: "eitri",
-                            target: "thor",
-                            kind: "exploration_status",
-                            text: &text,
-                        })?;
-                    }
-                }
-                CodeAgentEvent::ExplorationFinished { run_id, outcome } => {
-                    if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                        let text = format!("explore #{run_id} · {outcome:?}");
-                        emit_json(&StreamRecord::Review {
-                            actor: "eitri",
-                            target: "thor",
-                            kind: "exploration_status",
-                            text: &text,
-                        })?;
-                    }
-                }
-                CodeAgentEvent::SessionUpdate(update) => {
-                    if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                        emit_stream_update(&update, &state, "eitri")?;
-                    }
-                }
-                CodeAgentEvent::PermissionRequest(prompt) => {
+                SubagentEvent::PermissionRequest {
+                    subagent_id,
+                    prompt,
+                } => {
                     let decision = permission_decision(
                         cfg.permission_mode,
                         &prompt.tool_call,
                         &prompt.options,
                     );
                     if matches!(cfg.output_format, OutputFormat::StreamJson) {
+                        let actor = subagent_actor(subagent_id);
                         emit_json(&StreamRecord::Permission {
-                            actor: "eitri",
+                            actor: &actor,
                             tool_call_id: &prompt.tool_call.tool_call_id.to_string(),
                             decision: if decision.is_some() {
                                 "selected"
@@ -550,33 +602,26 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                         None => PermissionDecision::Cancelled,
                     });
                 }
-                CodeAgentEvent::ElicitationRequest(prompt) => {
+                SubagentEvent::ElicitationRequest { prompt, .. } => {
                     let _ = prompt.responder.send(ElicitationOutcome::Decline);
                 }
-                CodeAgentEvent::Started { .. }
-                | CodeAgentEvent::TerminalOutput(_)
-                | CodeAgentEvent::CancelPendingPermissions
-                | CodeAgentEvent::Status(_)
-                | CodeAgentEvent::Finished { .. } => {}
+                SubagentEvent::TerminalOutput { .. }
+                | SubagentEvent::CancelPendingPermissions { .. }
+                | SubagentEvent::Status { .. } => {}
             },
-            UiEvent::LokiActivity(activity) => {
-                if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                    match &activity {
-                        crate::event::LokiActivity::Warning { message, .. } => {
-                            emit_json(&StreamRecord::Warning {
-                                actor: Some("loki"),
-                                message,
-                            })?;
-                        }
-                    }
-                }
-            }
             UiEvent::InternalMessage(message) => {
                 if matches!(cfg.output_format, OutputFormat::StreamJson) {
+                    let kind = match message.kind {
+                        crate::event::InternalMessageKind::Delegation => "delegation",
+                        crate::event::InternalMessageKind::DiscreteReview => "discrete_review",
+                        crate::event::InternalMessageKind::ReviewLane => "review_lane",
+                        crate::event::InternalMessageKind::ReviewProgress => "review_progress",
+                        crate::event::InternalMessageKind::ReviewSynthesis => "review_synthesis",
+                    };
                     emit_json(&StreamRecord::Review {
                         actor: &message.source.to_ascii_lowercase(),
                         target: &message.target.to_ascii_lowercase(),
-                        kind: message.kind.wire_name(),
+                        kind,
                         text: &message.text,
                     })?;
                 }
@@ -590,7 +635,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         }
     }
 
-    finish_runtime_shutdown(&cmd_tx, &cfg.termination, saw_terminal_event);
+    if !saw_terminal_event {
+        let _ = cmd_tx.send(UiCommand::Shutdown);
+    }
     let abort_handle = runtime.abort_handle();
     match tokio::time::timeout(std::time::Duration::from_secs(2), runtime).await {
         Ok(joined) => {
@@ -599,9 +646,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         Err(_) => {
             abort_handle.abort();
         }
-    }
-    if let Some(reviewer) = loki_handle.as_ref() {
-        reviewer.shutdown_and_wait().await;
     }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), orchestrator_task).await;
     remote_tracker.shutdown().await;
@@ -627,7 +671,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 result: &state.final_text,
                 stop_reason: stop_reason_label.to_string(),
                 usage: usage.as_ref(),
-                council_usage: &council_usage,
+                agent_usage: &agent_usage,
                 error: terminal_error.as_deref(),
             })?;
         }
@@ -638,7 +682,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 resumed,
                 text: &state.final_text,
                 usage: usage.as_ref(),
-                council_usage: &council_usage,
+                agent_usage: &agent_usage,
                 error: terminal_error.as_deref(),
             })?;
         }
@@ -655,23 +699,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("prompt stopped with {}", stop_reason_label))
-    }
-}
-
-/// Queue the protocol-level shutdown in every exit path. Once headless has
-/// received a terminal event it also marks process teardown as expected, so a
-/// clean adapter exit racing the queued command cannot be misreported by the
-/// ACP child-wait guard as a crash. If the event channel merely closed, leave
-/// termination untouched: the runtime result still needs to surface a real
-/// unexpected agent exit.
-fn finish_runtime_shutdown(
-    commands: &mpsc::UnboundedSender<UiCommand>,
-    termination: &CancellationToken,
-    saw_terminal_event: bool,
-) {
-    let _ = commands.send(UiCommand::Shutdown);
-    if saw_terminal_event {
-        termination.cancel();
     }
 }
 
@@ -716,9 +743,79 @@ fn apply_session_update(
     }
 }
 
+const SUBAGENT_KIND_STARTED: &str = "started";
+const SUBAGENT_KIND_ACTIVITY: &str = "activity";
+const SUBAGENT_KIND_FINISHED: &str = "finished";
+/// Label for a subagent whose `Started` event was never seen (a late attach or
+/// a dropped event); the id still identifies the run.
+const SUBAGENT_UNKNOWN_LABEL: &str = "subagent";
+
+impl HeadlessState {
+    fn subagent_label(&self, subagent_id: u64) -> String {
+        self.subagents
+            .get(&subagent_id)
+            .map_or_else(|| SUBAGENT_UNKNOWN_LABEL.to_string(), |t| t.label.clone())
+    }
+}
+
+fn subagent_actor(subagent_id: u64) -> String {
+    format!("subagent-{subagent_id}")
+}
+
+fn subagent_outcome_text(outcome: &SubagentOutcome) -> String {
+    match outcome {
+        SubagentOutcome::Failed(message) => format!("failed: {message}"),
+        other => other.label().to_string(),
+    }
+}
+
+/// One subagent lifecycle line. `stream-json` gets a structured record;
+/// `--print` text mode gets the one-line equivalent on **stderr**, so progress
+/// can never interleave with the answer text (or the single JSON object)
+/// written to stdout. `--output-format json` stays silent: its contract is
+/// exactly one object.
+fn emit_subagent(
+    format: OutputFormat,
+    id: u64,
+    label: &str,
+    kind: &str,
+    text: &str,
+    elapsed: Option<std::time::Duration>,
+) -> Result<()> {
+    match format {
+        OutputFormat::StreamJson => emit_json(&StreamRecord::Subagent {
+            id,
+            label,
+            kind,
+            text,
+            elapsed_ms: elapsed.map(|elapsed| elapsed.as_millis() as u64),
+        }),
+        OutputFormat::Text => {
+            eprintln!("{}", subagent_text_line(id, label, kind, text, elapsed));
+            Ok(())
+        }
+        OutputFormat::Json => Ok(()),
+    }
+}
+
+fn subagent_text_line(
+    id: u64,
+    label: &str,
+    kind: &str,
+    text: &str,
+    elapsed: Option<std::time::Duration>,
+) -> String {
+    let mut line = format!("subagent #{id} · {label} · {kind} · {text}");
+    if let Some(elapsed) = elapsed {
+        line.push_str(" · ");
+        line.push_str(&crate::ui::format_duration(elapsed));
+    }
+    line
+}
+
 fn emit_stream_event(event: &UiEvent, state: &HeadlessState) -> Result<()> {
     if let UiEvent::SessionUpdate(update) = event {
-        emit_stream_update(update, state, "thor")?;
+        emit_stream_update(update, state, "primary")?;
     }
     Ok(())
 }
@@ -734,7 +831,7 @@ fn emit_stream_update(update: &SessionUpdate, state: &HeadlessState, actor: &str
             emit_json(&StreamRecord::AgentThought { actor, text: &text })?;
         }
         SessionUpdate::ToolCall(tool_call) => {
-            if actor == "thor" && crate::app::is_code_agent_transport_call(tool_call) {
+            if actor == "primary" && crate::app::is_subagent_transport_call(tool_call) {
                 return Ok(());
             }
             emit_json(&StreamRecord::ToolCall {
@@ -746,7 +843,7 @@ fn emit_stream_update(update: &SessionUpdate, state: &HeadlessState, actor: &str
             })?;
         }
         SessionUpdate::ToolCallUpdate(update) => {
-            if actor == "thor" && crate::app::is_code_agent_transport_update(update) {
+            if actor == "primary" && crate::app::is_subagent_transport_update(update) {
                 return Ok(());
             }
             let existing = state.tool_calls.get(&update.tool_call_id.to_string());
@@ -817,25 +914,129 @@ fn emit_json<T: Serialize>(value: &T) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn terminal_headless_shutdown_marks_adapter_exit_as_expected() {
-        let (commands, mut receiver) = mpsc::unbounded_channel();
-        let termination = CancellationToken::new();
-
-        finish_runtime_shutdown(&commands, &termination, true);
-
-        assert!(termination.is_cancelled());
-        assert!(matches!(receiver.try_recv(), Ok(UiCommand::Shutdown)));
+    fn record_json(record: &StreamRecord<'_>) -> serde_json::Value {
+        serde_json::to_value(record).expect("stream record serializes")
     }
 
     #[test]
-    fn closed_event_channel_does_not_mask_unexpected_adapter_exit() {
-        let (commands, mut receiver) = mpsc::unbounded_channel();
-        let termination = CancellationToken::new();
+    fn subagent_stream_records_carry_id_label_kind_and_text() {
+        let started = record_json(&StreamRecord::Subagent {
+            id: 3,
+            label: "fix-tests",
+            kind: SUBAGENT_KIND_STARTED,
+            text: "make the failing suite green",
+            elapsed_ms: None,
+        });
+        assert_eq!(
+            started,
+            serde_json::json!({
+                "type": "subagent",
+                "id": 3,
+                "label": "fix-tests",
+                "kind": "started",
+                "text": "make the failing suite green",
+            }),
+            "started records omit elapsed entirely"
+        );
 
-        finish_runtime_shutdown(&commands, &termination, false);
+        let finished = record_json(&StreamRecord::Subagent {
+            id: 3,
+            label: "fix-tests",
+            kind: SUBAGENT_KIND_FINISHED,
+            text: "completed",
+            elapsed_ms: Some(252_000),
+        });
+        assert_eq!(
+            finished,
+            serde_json::json!({
+                "type": "subagent",
+                "id": 3,
+                "label": "fix-tests",
+                "kind": "finished",
+                "text": "completed",
+                "elapsed_ms": 252_000,
+            })
+        );
+    }
 
-        assert!(!termination.is_cancelled());
-        assert!(matches!(receiver.try_recv(), Ok(UiCommand::Shutdown)));
+    #[test]
+    fn subagent_stream_actors_distinguish_interleaved_updates_and_permissions() {
+        let mimir = subagent_actor(4);
+        let heimdall = subagent_actor(7);
+        let records = [
+            record_json(&StreamRecord::AgentMessage {
+                actor: &mimir,
+                text: "first report",
+            }),
+            record_json(&StreamRecord::AgentThought {
+                actor: &heimdall,
+                text: "checking boundary",
+            }),
+            record_json(&StreamRecord::Permission {
+                actor: &mimir,
+                tool_call_id: "call-1",
+                decision: "selected",
+            }),
+        ];
+
+        assert_eq!(records[0]["actor"], "subagent-4");
+        assert_eq!(records[1]["actor"], "subagent-7");
+        assert_eq!(records[2]["actor"], "subagent-4");
+    }
+
+    #[test]
+    fn failed_outcomes_keep_their_message_in_the_record_text() {
+        assert_eq!(
+            subagent_outcome_text(&SubagentOutcome::Failed("adapter exited".to_string())),
+            "failed: adapter exited"
+        );
+        assert_eq!(
+            subagent_outcome_text(&SubagentOutcome::Completed),
+            "completed"
+        );
+        assert_eq!(
+            subagent_outcome_text(&SubagentOutcome::Cancelled),
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn text_mode_lines_mirror_the_stream_records() {
+        assert_eq!(
+            subagent_text_line(
+                3,
+                "fix-tests",
+                SUBAGENT_KIND_STARTED,
+                "green the suite",
+                None
+            ),
+            "subagent #3 · fix-tests · started · green the suite"
+        );
+        assert_eq!(
+            subagent_text_line(
+                3,
+                "fix-tests",
+                SUBAGENT_KIND_FINISHED,
+                "completed",
+                Some(std::time::Duration::from_secs(252)),
+            ),
+            "subagent #3 · fix-tests · finished · completed · 4m12s"
+        );
+    }
+
+    #[test]
+    fn labels_survive_events_that_only_carry_the_id() {
+        let mut state = HeadlessState::default();
+        state.subagents.insert(
+            7,
+            SubagentTrace {
+                label: "audit-config".to_string(),
+                started: std::time::Instant::now(),
+            },
+        );
+        assert_eq!(state.subagent_label(7), "audit-config");
+        // A subagent whose `Started` was never observed still streams under a
+        // stable placeholder rather than an empty label.
+        assert_eq!(state.subagent_label(9), SUBAGENT_UNKNOWN_LABEL);
     }
 }

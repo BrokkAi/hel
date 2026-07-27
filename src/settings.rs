@@ -11,35 +11,31 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::config::{AcpServerOrigin, AcpServerPolicy, Config, ConfiguredAcpServer, ModelsConfig};
-use crate::council::{AcpInventory, ModelChoice};
 use crate::install::Progress;
 use crate::palette::TerminalTheme;
 use crate::registry::{Agent, DistributionKind, Registry};
+use crate::roster::{AcpInventory, ModelChoice};
 use crate::spinner::SpinnerStyle;
 use crate::theme::TerminalThemeKind;
 
-pub const ROLE_DESCRIPTIONS: [(&str, &str); 3] = [
-    ("Thor", "primary model; plans and reviews work"),
-    (
-        "Eitri",
-        "fast/cheap model; handles delegated implementation and exploration",
-    ),
-    ("Loki", "secondary model; advises Thor and Eitri"),
+pub const ROLE_DESCRIPTIONS: [(&str, &str); 2] = [
+    ("Agent", "primary model; plans, implements, and answers"),
+    ("Subagents", "default model for create_subagent delegations"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
-    Council,
+    Agents,
     AcpServers,
     Appearance,
 }
 
 impl SettingsTab {
-    const ALL: [Self; 3] = [Self::Council, Self::AcpServers, Self::Appearance];
+    const ALL: [Self; 3] = [Self::Agents, Self::AcpServers, Self::Appearance];
 
     fn label(self) -> &'static str {
         match self {
-            Self::Council => "Council",
+            Self::Agents => "Agents",
             Self::AcpServers => "ACP Servers",
             Self::Appearance => "Appearance",
         }
@@ -107,10 +103,10 @@ pub struct SettingsEditor {
 
 impl SettingsEditor {
     pub fn new(config: Config, choices: Vec<ModelChoice>, notice: Option<String>) -> Self {
-        let inventory = crate::council::discover_inventory(&config);
+        let inventory = crate::roster::discover_inventory(&config);
         Self {
             config,
-            tab: SettingsTab::Council,
+            tab: SettingsTab::Agents,
             selected: 0,
             notice,
             choices,
@@ -202,7 +198,7 @@ impl SettingsEditor {
 
     fn row_count(&self) -> usize {
         match self.tab {
-            SettingsTab::Council => 6,
+            SettingsTab::Agents => 5,
             SettingsTab::AcpServers => self.inventory.servers.len() + 4,
             SettingsTab::Appearance => 2,
         }
@@ -217,11 +213,10 @@ impl SettingsEditor {
 
     fn change_selected(&mut self, delta: i32) -> SettingsAction {
         match self.tab {
-            SettingsTab::Council if self.selected < 3 => self.cycle_model(self.selected, delta),
-            SettingsTab::Council if self.selected == 4 => {
-                self.config.eitri.max_parallel_explores =
-                    (self.config.eitri.max_parallel_explores as i32 + delta).rem_euclid(17)
-                        as usize;
+            SettingsTab::Agents if self.selected < 2 => self.cycle_model(self.selected, delta),
+            SettingsTab::Agents if self.selected == 3 => {
+                self.config.subagents.max_parallel =
+                    (self.config.subagents.max_parallel as i32 + delta).rem_euclid(17) as usize;
             }
             SettingsTab::AcpServers => {
                 let Some(index) = self.selected.checked_sub(4) else {
@@ -249,7 +244,7 @@ impl SettingsEditor {
                 if id == "anvil" && choices[next] == AcpServerPolicy::Enabled {
                     crate::anvil::retry_background_install();
                 }
-                self.inventory = crate::council::discover_inventory(&self.config);
+                self.inventory = crate::roster::discover_inventory(&self.config);
             }
             SettingsTab::Appearance if self.selected == 0 => {
                 let current = TerminalThemeKind::ALL
@@ -277,11 +272,11 @@ impl SettingsEditor {
 
     fn toggle_selected(&mut self) -> SettingsAction {
         match self.tab {
-            SettingsTab::Council if self.selected == 3 => {
-                self.config.thor.discrete_review = !self.config.thor.discrete_review;
+            SettingsTab::Agents if self.selected == 2 => {
+                self.config.agent.discrete_review = !self.config.agent.discrete_review;
             }
-            SettingsTab::Council if self.selected == 5 => {
-                self.config.council.auto_failover = !self.config.council.auto_failover;
+            SettingsTab::Agents if self.selected == 4 => {
+                self.config.subagents.auto_failover = !self.config.subagents.auto_failover;
             }
             SettingsTab::AcpServers => {
                 let Some(index) = self.selected.checked_sub(4) else {
@@ -308,7 +303,7 @@ impl SettingsEditor {
                 if id == "anvil" && policy == AcpServerPolicy::Enabled {
                     crate::anvil::retry_background_install();
                 }
-                self.inventory = crate::council::discover_inventory(&self.config);
+                self.inventory = crate::roster::discover_inventory(&self.config);
             }
             _ => return SettingsAction::None,
         }
@@ -319,9 +314,8 @@ impl SettingsEditor {
     fn cycle_model(&mut self, role: usize, delta: i32) {
         let choices = self.model_choices(role);
         let current = match role {
-            0 => &self.config.thor.model,
-            1 => &self.config.eitri.model,
-            2 => &self.config.loki.model,
+            0 => &self.config.agent.model,
+            1 => &self.config.subagents.model,
             _ => return,
         };
         let index = choices
@@ -330,9 +324,8 @@ impl SettingsEditor {
             .unwrap_or(0);
         let next = (index as i32 + delta).rem_euclid(choices.len() as i32) as usize;
         match role {
-            0 => self.config.thor.model.clone_from(&choices[next]),
-            1 => self.config.eitri.model.clone_from(&choices[next]),
-            2 => self.config.loki.model.clone_from(&choices[next]),
+            0 => self.config.agent.model.clone_from(&choices[next]),
+            1 => self.config.subagents.model.clone_from(&choices[next]),
             _ => {}
         }
     }
@@ -389,9 +382,8 @@ impl SettingsEditor {
             return "not running".to_string();
         };
         let model = match role {
-            0 => &models.thor,
-            1 => &models.eitri,
-            _ => &models.loki,
+            0 => &models.primary,
+            _ => &models.subagent,
         };
         let adapter = self
             .choices
@@ -470,7 +462,7 @@ impl SettingsEditor {
                 Err(error) => self.notice = Some(format!("Install failed: {error}")),
             }
         }
-        let mut refreshed = crate::council::discover_inventory(&self.config);
+        let mut refreshed = crate::roster::discover_inventory(&self.config);
         for server in &mut refreshed.servers {
             if let Some(previous) = self
                 .inventory
@@ -488,7 +480,7 @@ impl SettingsEditor {
     }
 
     pub(crate) fn refresh_after_auth(&mut self, notice: String) {
-        self.inventory = crate::council::discover_inventory(&self.config);
+        self.inventory = crate::roster::discover_inventory(&self.config);
         self.notice = Some(notice);
     }
 
@@ -666,7 +658,7 @@ impl SettingsEditor {
             .retain(|existing| existing.id != server.id);
         self.config.acp.policies.remove(&server.id);
         self.config.acp.servers.push(server);
-        self.inventory = crate::council::discover_inventory(&self.config);
+        self.inventory = crate::roster::discover_inventory(&self.config);
         self.acp_view = AcpView::Servers;
         self.selected = self.inventory.servers.len().saturating_sub(1) + 4;
         self.notice = None;
@@ -789,7 +781,7 @@ pub fn draw_settings_panel(
         .split(inner);
     draw_tabs(frame, rows[0], editor, theme);
     match editor.tab {
-        SettingsTab::Council => draw_council(frame, rows[1], editor, theme),
+        SettingsTab::Agents => draw_agents(frame, rows[1], editor, theme),
         SettingsTab::AcpServers => draw_servers(frame, rows[1], editor, theme),
         SettingsTab::Appearance => draw_appearance(frame, rows[1], editor, theme),
     }
@@ -845,7 +837,7 @@ fn draw_tabs(
     frame.render_widget(Paragraph::new(Line::from(tabs.collect::<Vec<_>>())), area);
 }
 
-fn draw_council(
+fn draw_agents(
     frame: &mut ratatui::Frame,
     area: Rect,
     editor: &SettingsEditor,
@@ -853,29 +845,28 @@ fn draw_council(
 ) {
     let mut lines = vec![
         Line::styled(
-            "Thor and Loki stay active until /new or /clear reloads the saved Council.",
+            "The running session keeps its models until /new or /clear reloads the saved selection.",
             Style::default().fg(theme.muted),
         ),
         Line::raw(""),
     ];
     for (index, (role, description)) in ROLE_DESCRIPTIONS.iter().enumerate() {
         let model = match index {
-            0 => &editor.config.thor.model,
-            1 => &editor.config.eitri.model,
-            _ => &editor.config.loki.model,
+            0 => &editor.config.agent.model,
+            _ => &editor.config.subagents.model,
         };
         lines.push(selected_line(
             editor.selected == index,
-            format!("{role:<6} < {model} >"),
+            format!("{role:<9} < {model} >"),
             theme,
         ));
         lines.push(Line::from(vec![
-            Span::raw("         "),
+            Span::raw("            "),
             Span::styled(*description, Style::default().fg(theme.muted)),
         ]));
         lines.push(Line::from(Span::styled(
             format!(
-                "         saved: {} · active: {}",
+                "            saved: {} · active: {}",
                 editor.staged_model_detail(model),
                 editor.active_model_detail(index)
             ),
@@ -884,26 +875,26 @@ fn draw_council(
     }
     lines.push(Line::raw(""));
     lines.push(selected_line(
+        editor.selected == 2,
+        format!(
+            "Discrete review [{}]",
+            on_off(editor.config.agent.discrete_review)
+        ),
+        theme,
+    ));
+    lines.push(selected_line(
         editor.selected == 3,
         format!(
-            "Thor review     [{}]",
-            on_off(editor.config.thor.discrete_review)
+            "Parallel subagents < {} >",
+            editor.config.subagents.max_parallel
         ),
         theme,
     ));
     lines.push(selected_line(
         editor.selected == 4,
         format!(
-            "Parallel explores < {} >",
-            editor.config.eitri.max_parallel_explores
-        ),
-        theme,
-    ));
-    lines.push(selected_line(
-        editor.selected == 5,
-        format!(
             "Automatic quota failover [{}]",
-            on_off(editor.config.council.auto_failover)
+            on_off(editor.config.subagents.auto_failover)
         ),
         theme,
     ));
@@ -1231,15 +1222,11 @@ mod tests {
     fn role_descriptions_match_product_language() {
         assert_eq!(
             ROLE_DESCRIPTIONS[0].1,
-            "primary model; plans and reviews work"
+            "primary model; plans, implements, and answers"
         );
         assert_eq!(
             ROLE_DESCRIPTIONS[1].1,
-            "fast/cheap model; handles delegated implementation and exploration"
-        );
-        assert_eq!(
-            ROLE_DESCRIPTIONS[2].1,
-            "secondary model; advises Thor and Eitri"
+            "default model for create_subagent delegations"
         );
     }
 
@@ -1248,12 +1235,12 @@ mod tests {
         let mut config = Config::default();
         config.set_acp_server_policy("codex-acp", AcpServerPolicy::Enabled);
         let mut editor = SettingsEditor::new(config, Vec::new(), None);
-        editor.selected = 3;
+        editor.selected = 2;
         assert_eq!(
             editor.handle_key(KeyCode::Char(' ')),
             SettingsAction::Changed
         );
-        assert!(!editor.config.thor.discrete_review);
+        assert!(!editor.config.agent.discrete_review);
         editor.handle_key(KeyCode::Tab);
         assert_eq!(editor.tab, SettingsTab::AcpServers);
         editor.selected = editor
@@ -1274,14 +1261,14 @@ mod tests {
     }
 
     #[test]
-    fn council_quota_failover_can_be_disabled() {
+    fn quota_failover_can_be_disabled() {
         let mut editor = SettingsEditor::new(Config::default(), Vec::new(), None);
-        editor.selected = 5;
+        editor.selected = 4;
         assert_eq!(
             editor.handle_key(KeyCode::Char(' ')),
             SettingsAction::Changed
         );
-        assert!(!editor.config.council.auto_failover);
+        assert!(!editor.config.subagents.auto_failover);
     }
 
     #[test]
@@ -1299,24 +1286,14 @@ mod tests {
                 .iter()
                 .any(|choice| choice == "disabled")
         );
-        assert!(
-            editor
-                .model_choices(2)
-                .iter()
-                .any(|choice| choice == "disabled")
-        );
     }
 
     #[test]
-    fn optional_role_model_selection_can_disable_both_roles() {
+    fn optional_model_selection_can_disable_subagents() {
         let mut editor = SettingsEditor::new(Config::default(), Vec::new(), None);
         editor.selected = 1;
         assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
-        assert_eq!(editor.config.eitri.model, crate::config::DISABLED_MODEL);
-
-        editor.selected = 2;
-        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
-        assert_eq!(editor.config.loki.model, crate::config::DISABLED_MODEL);
+        assert_eq!(editor.config.subagents.model, crate::config::DISABLED_MODEL);
     }
 
     #[test]

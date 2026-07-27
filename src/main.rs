@@ -1,10 +1,11 @@
 //! mjolnir: an interactive terminal client for any ACP-speaking agent.
 //!
-//! Resolves a model-first Thor/Loki/Eitri Council from DeepSWE and locally
+//! Resolves a model-first agent roster from DeepSWE and locally
 //! launchable ACP adapters, then renders the active foreground ACP session in
 //! a ratatui chat UI.
 
 mod acp;
+mod agent_usage;
 mod anvil;
 mod app;
 mod archive;
@@ -12,12 +13,8 @@ mod auth;
 mod bedrock_credits;
 mod claude_usage;
 mod clipboard;
-mod code_agent;
 mod codex_usage;
 mod config;
-mod council;
-mod council_orchestrator;
-mod council_usage;
 mod deepseek_balance;
 mod deepswe;
 mod discrete_review;
@@ -26,12 +23,12 @@ mod headless;
 mod install;
 mod kimi;
 mod labels;
-mod loki;
 mod menu;
 mod model_resolve;
 mod notifications;
 mod onboarding;
 mod openrouter_balance;
+mod orchestrator;
 mod palette;
 mod paths;
 mod probe;
@@ -42,17 +39,20 @@ mod ragnarok;
 mod ragnarok_sprites;
 mod registry;
 mod remote;
+mod roster;
 mod self_update;
 mod session;
 mod session_provenance;
 mod settings;
 mod speech;
 mod spinner;
+mod subagent;
 mod tailscale;
 mod term;
 mod termination;
 mod text;
 mod theme;
+mod trajectory;
 mod ui;
 mod usage_format;
 mod version;
@@ -100,26 +100,21 @@ struct Cli {
     )]
     print: Option<String>,
 
-    /// Override Thor's model for this non-interactive invocation.
+    /// Override the primary agent's model for this non-interactive invocation.
     ///
     /// Accepts an optional trailing `+<effort>` (off, none, minimal, low,
     /// medium, high, xhigh) to set this seat's ACP reasoning effort
     /// independent of the shared Anvil server default, e.g.
     /// `custom/bpr-agent/bedrock::openai.gpt-5.6-sol+high`.
-    #[arg(long, value_name = "MODEL[+EFFORT]", requires = "print", value_parser = parse_thor_override)]
-    thor: Option<(String, Option<String>)>,
+    #[arg(long, value_name = "MODEL[+EFFORT]", requires = "print", value_parser = parse_model_override)]
+    model: Option<(String, Option<String>)>,
 
-    /// Override Loki's model, or disable Loki, for this non-interactive invocation.
+    /// Override the default subagent model, or disable subagents, for this
+    /// non-interactive invocation.
     ///
-    /// Accepts an optional trailing `+<effort>` on the model, same as `--thor`.
+    /// Accepts an optional trailing `+<effort>` on the model, same as `--model`.
     #[arg(long, value_name = "MODEL[+EFFORT]|disabled|none", requires = "print", value_parser = parse_optional_role_override)]
-    loki: Option<(String, Option<String>)>,
-
-    /// Override Eitri's model, or disable Eitri, for this non-interactive invocation.
-    ///
-    /// Accepts an optional trailing `+<effort>` on the model, same as `--thor`.
-    #[arg(long, value_name = "MODEL[+EFFORT]|disabled|none", requires = "print", value_parser = parse_optional_role_override)]
-    eitri: Option<(String, Option<String>)>,
+    subagent_model: Option<(String, Option<String>)>,
 
     /// Output format for `--print`.
     #[arg(long, value_enum, default_value_t = HeadlessOutputFormat::Text)]
@@ -258,18 +253,20 @@ fn split_role_effort(value: &str) -> (&str, Option<String>) {
     (model, Some(effort))
 }
 
-fn parse_thor_override(value: &str) -> std::result::Result<(String, Option<String>), String> {
+fn parse_model_override(value: &str) -> std::result::Result<(String, Option<String>), String> {
     match value.to_ascii_lowercase().as_str() {
-        "auto" => return Err("--thor requires an explicit model, not 'auto'".to_string()),
-        "disabled" | "none" => return Err("Thor cannot be disabled".to_string()),
+        "auto" => return Err("--model requires an explicit model, not 'auto'".to_string()),
+        "disabled" | "none" => {
+            return Err("the primary agent cannot be disabled".to_string());
+        }
         _ => {}
     }
     if value.trim().is_empty() {
-        return Err("--thor requires a model".to_string());
+        return Err("--model requires a model".to_string());
     }
     let (model, effort) = split_role_effort(value);
     if model.trim().is_empty() {
-        return Err("--thor requires a model".to_string());
+        return Err("--model requires a model".to_string());
     }
     Ok((model.to_string(), effort))
 }
@@ -495,13 +492,11 @@ async fn main() -> Result<()> {
             fs_max_text_bytes,
             output_format: cli.output_format.into(),
             permission_mode: cli.permission_mode.into(),
-            role_overrides: config::RoleModelOverrides {
-                thor: cli.thor.as_ref().map(|(model, _)| model.clone()),
-                thor_reasoning_effort: cli.thor.and_then(|(_, effort)| effort),
-                loki: cli.loki.as_ref().map(|(model, _)| model.clone()),
-                loki_reasoning_effort: cli.loki.and_then(|(_, effort)| effort),
-                eitri: cli.eitri.as_ref().map(|(model, _)| model.clone()),
-                eitri_reasoning_effort: cli.eitri.and_then(|(_, effort)| effort),
+            role_overrides: config::ModelOverrides {
+                primary: cli.model.as_ref().map(|(model, _)| model.clone()),
+                primary_effort: cli.model.and_then(|(_, effort)| effort),
+                subagent: cli.subagent_model.as_ref().map(|(model, _)| model.clone()),
+                subagent_effort: cli.subagent_model.and_then(|(_, effort)| effort),
             },
             termination: termination.token(),
         })
@@ -638,10 +633,10 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn primary_session_routes(council: &council::ResolvedCouncil) -> Vec<council::ResolvedRole> {
+fn primary_session_routes(roster: &roster::Roster) -> Vec<roster::ResolvedAgent> {
     let mut routes = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for role in std::iter::once(&council.thor).chain(council.available.iter()) {
+    for role in std::iter::once(&roster.primary).chain(roster.available.iter()) {
         if role.ranked && seen.insert(role.launch.source_id.clone()) {
             routes.push(role.clone());
         }
@@ -649,26 +644,25 @@ fn primary_session_routes(council: &council::ResolvedCouncil) -> Vec<council::Re
     routes
 }
 
-fn council_reload_message(council: &council::ResolvedCouncil) -> String {
-    let role = |role: Option<&council::ResolvedRole>| {
+fn models_reload_message(roster: &roster::Roster) -> String {
+    let role = |role: Option<&roster::ResolvedAgent>| {
         role.map(|role| format!("{} via {}", role.model.model, role.launch.source_id))
             .unwrap_or_else(|| "off".to_string())
     };
     format!(
-        "Council reloaded after /clear: Thor {}; Loki {}; Eitri {}",
-        role(Some(&council.thor)),
-        role(council.loki.as_ref()),
-        role(council.eitri.as_ref()),
+        "Models reloaded after /clear: primary {}; subagents {}",
+        role(Some(&roster.primary)),
+        role(roster.subagent_default.as_ref()),
     )
 }
 
-async fn list_council_sessions(
-    council: &council::ResolvedCouncil,
+async fn list_agent_sessions(
+    roster: &roster::Roster,
     cwd: &Path,
     agent_stderr: Option<&Path>,
 ) -> Vec<session::SessionEntry> {
     let mut sessions = Vec::new();
-    for role in primary_session_routes(council) {
+    for role in primary_session_routes(roster) {
         let agent = selected_agent_for_role(&role);
         match session::list_sessions_with_capabilities(&agent, cwd.to_path_buf(), agent_stderr)
             .await
@@ -689,7 +683,7 @@ async fn list_council_sessions(
             }
             Err(error) => tracing::warn!(
                 adapter = %role.launch.source_id,
-                "list Council sessions: {error:#}"
+                "list agent sessions: {error:#}"
             ),
         }
     }
@@ -703,21 +697,21 @@ async fn list_council_sessions(
 }
 
 fn role_for_session_entry<'a>(
-    council: &'a council::ResolvedCouncil,
+    roster: &'a roster::Roster,
     entry: &session::SessionEntry,
-) -> Option<&'a council::ResolvedRole> {
+) -> Option<&'a roster::ResolvedAgent> {
     let adapter = entry.adapter_source_id.as_deref()?;
     entry
         .model
         .as_deref()
         .and_then(|model| {
-            council
+            roster
                 .available
                 .iter()
                 .find(|role| role.launch.source_id == adapter && role.model.model == model)
         })
         .or_else(|| {
-            council
+            roster
                 .available
                 .iter()
                 .find(|role| role.launch.source_id == adapter && role.ranked)
@@ -745,16 +739,16 @@ async fn run_resume(
     let worktree_label = worktree_label(worktree.as_ref());
     let project_label = project_label(&cwd);
     let cfg = Config::load(&config::default_config_path())?;
-    let mut resume_council = if args.list {
-        council::resolve(&cfg, &cwd).await?
+    let mut resume_roster = if args.list {
+        roster::resolve(&cfg, &cwd).await?
     } else {
-        resolve_council_for_tui(&cfg, &cwd, false).await?
+        resolve_roster_for_tui(&cfg, &cwd, false).await?
     };
-    let mut agent = selected_agent_for_role(&resume_council.thor);
+    let mut agent = selected_agent_for_role(&resume_roster.primary);
     if let Some(session_id) = args.session_id.as_deref()
         && let Some(record) = session_provenance::find(session_id, &cwd)
     {
-        let pinned = resume_council
+        let pinned = resume_roster
             .available
             .iter()
             .find(|role| {
@@ -769,17 +763,17 @@ async fn run_resume(
                     record.adapter_source_id
                 )
             })?;
-        resume_council.thor = pinned.clone();
+        resume_roster.primary = pinned.clone();
         agent = selected_agent_for_role(pinned);
     } else if let Some(session_id) = args.session_id.as_deref() {
-        let matches = list_council_sessions(&resume_council, &cwd, args.agent_stderr.as_deref())
+        let matches = list_agent_sessions(&resume_roster, &cwd, args.agent_stderr.as_deref())
             .await
             .into_iter()
             .filter(|entry| entry.session_id == session_id)
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [entry] => {
-                let role = role_for_session_entry(&resume_council, entry)
+                let role = role_for_session_entry(&resume_roster, entry)
                     .ok_or_else(|| anyhow::anyhow!("session {session_id} has no launchable route"))?
                     .clone();
                 session_provenance::record(session_provenance::Record {
@@ -790,11 +784,11 @@ async fn run_resume(
                     model_value: role.model_value.clone(),
                 });
                 agent = selected_agent_for_role(&role);
-                resume_council.thor = role;
+                resume_roster.primary = role;
             }
             [] => {}
             _ => anyhow::bail!(
-                "legacy session ID {session_id} is ambiguous across Council adapters; select it with `mj resume` first"
+                "legacy session ID {session_id} is ambiguous across ACP adapters; select it with `mj resume` first"
             ),
         }
     }
@@ -802,7 +796,7 @@ async fn run_resume(
     // `--list`: headless listing, print and exit.
     if args.list {
         let sessions =
-            list_council_sessions(&resume_council, &cwd, args.agent_stderr.as_deref()).await;
+            list_agent_sessions(&resume_roster, &cwd, args.agent_stderr.as_deref()).await;
         match args.format {
             HeadlessOutputFormat::Json | HeadlessOutputFormat::StreamJson => {
                 let json: Vec<SessionEntryJson> =
@@ -885,7 +879,7 @@ async fn run_resume(
         // then launch the chosen session with a fresh process for the same agent.
         eprintln!("Fetching sessions from agent...");
         let sessions =
-            list_council_sessions(&resume_council, &cwd, args.agent_stderr.as_deref()).await;
+            list_agent_sessions(&resume_roster, &cwd, args.agent_stderr.as_deref()).await;
         if sessions.is_empty() {
             eprintln!("No sessions available.");
             let _ = handle_worktree_after_tui(worktree.as_ref(), Some(mode));
@@ -910,7 +904,7 @@ async fn run_resume(
             }
             session::ResumeOutcome::DeleteRequested(entry) => {
                 notice = if entry.delete_supported {
-                    match role_for_session_entry(&resume_council, &entry) {
+                    match role_for_session_entry(&resume_roster, &entry) {
                         Some(role) => {
                             let route = selected_agent_for_role(role);
                             Some(
@@ -927,11 +921,11 @@ async fn run_resume(
             session::ResumeOutcome::Selected(entry) => {
                 eprintln!("Resuming session: {}", entry.session_id);
                 let session_title = entry.title.clone();
-                let role = role_for_session_entry(&resume_council, &entry)
+                let role = role_for_session_entry(&resume_roster, &entry)
                     .ok_or_else(|| anyhow::anyhow!("selected session route is unavailable"))?
                     .clone();
                 agent = selected_agent_for_role(&role);
-                resume_council.thor = role;
+                resume_roster.primary = role;
                 let result = run_app(
                     cwd,
                     RuntimeOptions {
@@ -1141,7 +1135,7 @@ fn isolated_side_runtime_config(
         config_path: None,
         saved_session_config: std::collections::HashMap::new(),
         role_config: None,
-        code_agent: None,
+        subagents: None,
         side_prompt_policy: true,
         termination: None,
     }
@@ -1198,29 +1192,29 @@ fn apply_session_result_to_config(cfg: &mut Config, result: &RunSessionResult) {
     cfg.spinner = result.spinner_style;
 }
 
-async fn resolve_council_for_tui(
+async fn resolve_roster_for_tui(
     cfg: &Config,
     cwd: &Path,
     wait_for_installs: bool,
-) -> Result<council::ResolvedCouncil> {
+) -> Result<roster::Roster> {
     with_startup_spinner(async {
         if wait_for_installs {
-            council::resolve_waiting_for_installs(cfg, cwd).await
+            roster::resolve_waiting_for_installs(cfg, cwd).await
         } else {
-            council::resolve(cfg, cwd).await
+            roster::resolve(cfg, cwd).await
         }
     })
     .await
 }
 
-/// Resolve the Council for interactive startup without blocking on adapter
+/// Resolve the roster for interactive startup without blocking on adapter
 /// probes; the spinner only appears in the rare case where the instantly
 /// known adapters cannot bind the configured roles.
-async fn resolve_council_streaming_for_tui(
+async fn resolve_roster_streaming_for_tui(
     cfg: &Config,
     cwd: &Path,
-) -> Result<council::StreamingResolution> {
-    with_startup_spinner(council::resolve_streaming(cfg, cwd)).await
+) -> Result<roster::StreamingResolution> {
+    with_startup_spinner(roster::resolve_streaming(cfg, cwd)).await
 }
 
 async fn with_startup_spinner<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
@@ -1265,7 +1259,7 @@ fn write_startup_status(
     const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
     write!(
         output,
-        "\r\x1b[2K{} Discovering Council models... {}s",
+        "\r\x1b[2K{} Discovering models... {}s",
         FRAMES[frame % FRAMES.len()],
         elapsed.as_secs()
     )?;
@@ -1301,13 +1295,13 @@ async fn run_app(
     {
         kimi::start_background_install();
     }
-    let mut council_updates = None;
+    let mut roster_updates = None;
     let mut pending_probe_servers = Vec::new();
-    let mut council = if first_startup {
+    let mut roster = if first_startup {
         // Onboarding wants a fully settled catalog to preview, so first
         // startup keeps the blocking resolution.
-        let initial_resolution = resolve_council_for_tui(&cfg, &cwd, false).await;
-        let Some((accepted_config, accepted_council)) = run_first_startup(
+        let initial_resolution = resolve_roster_for_tui(&cfg, &cwd, false).await;
+        let Some((accepted_config, accepted_roster)) = run_first_startup(
             cfg,
             initial_resolution.ok(),
             &config_path,
@@ -1319,37 +1313,37 @@ async fn run_app(
             return Ok(None);
         };
         cfg = accepted_config;
-        accepted_council
+        accepted_roster
     } else {
-        let resolution = resolve_council_streaming_for_tui(&cfg, &cwd).await?;
-        council_updates = resolution.updates;
+        let resolution = resolve_roster_streaming_for_tui(&cfg, &cwd).await?;
+        roster_updates = resolution.updates;
         pending_probe_servers = resolution.pending_servers;
-        resolution.council
+        resolution.roster
     };
     if let Some(agent) = initial_agent.as_ref()
-        && let Some(pinned) = council.available.iter().find(|role| {
+        && let Some(pinned) = roster.available.iter().find(|role| {
             role.launch.command == agent.program
                 && role.launch.args == agent.args
-                && role.model.model == agent.source_id.trim_start_matches("council:")
+                && role.model.model == agent.source_id.trim_start_matches("roster:")
         })
     {
-        council.thor = pinned.clone();
+        roster.primary = pinned.clone();
     }
-    let mut council_agent = selected_agent_for_role(&council.thor);
+    let mut primary_agent = selected_agent_for_role(&roster.primary);
 
     // Consume resume_session and any pinned resume launch on the first
-    // iteration only. Fresh sessions always use the resolved Thor role.
+    // iteration only. Fresh sessions always use the resolved primary agent.
     let mut initial_resume = resume_target;
-    let mut initial_agent = initial_agent.or_else(|| Some(council_agent.clone()));
+    let mut initial_agent = initial_agent.or_else(|| Some(primary_agent.clone()));
     let mut pending_new_session_boundary = false;
-    let mut pending_council_boundary = None;
+    let mut pending_models_boundary = None;
     loop {
         let resume = initial_resume.take();
         let agent = initial_agent
             .take()
-            .unwrap_or_else(|| council_agent.clone());
+            .unwrap_or_else(|| primary_agent.clone());
 
-        let session_boundary = pending_council_boundary.take().or_else(|| {
+        let session_boundary = pending_models_boundary.take().or_else(|| {
             new_session_boundary_for_agent(
                 std::mem::take(&mut pending_new_session_boundary),
                 &agent,
@@ -1371,11 +1365,10 @@ async fn run_app(
             cfg.theme,
             cfg.spinner,
             session_boundary,
-            council.clone(),
-            cfg.thor.clone(),
-            cfg.eitri.clone(),
-            cfg.council.clone(),
-            council_updates.take(),
+            roster.clone(),
+            cfg.agent.clone(),
+            cfg.subagents.clone(),
+            roster_updates.take(),
             std::mem::take(&mut pending_probe_servers),
             termination.clone(),
         )
@@ -1386,15 +1379,15 @@ async fn run_app(
             UiExitReason::NewSession | UiExitReason::ClearSession => {
                 let show_new_session_boundary = session_result.reason == UiExitReason::NewSession;
                 cfg = Config::load(&config_path)?;
-                let resolution = resolve_council_streaming_for_tui(&cfg, &cwd).await?;
-                council = resolution.council;
-                council_updates = resolution.updates;
+                let resolution = resolve_roster_streaming_for_tui(&cfg, &cwd).await?;
+                roster = resolution.roster;
+                roster_updates = resolution.updates;
                 pending_probe_servers = resolution.pending_servers;
-                council_agent = selected_agent_for_role(&council.thor);
-                initial_agent = Some(council_agent.clone());
+                primary_agent = selected_agent_for_role(&roster.primary);
+                initial_agent = Some(primary_agent.clone());
                 pending_new_session_boundary = show_new_session_boundary;
                 if session_result.reason == UiExitReason::ClearSession {
-                    pending_council_boundary = Some(council_reload_message(&council));
+                    pending_models_boundary = Some(models_reload_message(&roster));
                 }
                 continue;
             }
@@ -1402,7 +1395,7 @@ async fn run_app(
                 if let Some(session_id) = session_result.session_id {
                     let resume_agent = session_provenance::find(&session_id, &cwd)
                         .and_then(|record| {
-                            council.available.iter().find(|role| {
+                            roster.available.iter().find(|role| {
                                 role.model.model == record.model
                                     && role.model_value == record.model_value
                                     && role.launch.source_id == record.adapter_source_id
@@ -1453,11 +1446,11 @@ fn should_open_first_startup(
 
 async fn run_first_startup(
     mut candidate: Config,
-    mut preview: Option<council::ResolvedCouncil>,
+    mut preview: Option<roster::Roster>,
     config_path: &Path,
     cwd: &Path,
     termination: CancellationToken,
-) -> Result<Option<(Config, council::ResolvedCouncil)>> {
+) -> Result<Option<(Config, roster::Roster)>> {
     let mut notice = None;
     loop {
         let outcome = run_onboarding_once(
@@ -1471,7 +1464,7 @@ async fn run_first_startup(
             return Ok(None);
         };
         let next = *next;
-        match resolve_council_for_tui(&next, cwd, true).await {
+        match resolve_roster_for_tui(&next, cwd, true).await {
             Ok(resolved) => {
                 next.save(config_path)
                     .with_context(|| format!("save {}", config_path.display()))?;
@@ -1488,19 +1481,13 @@ async fn run_first_startup(
 
 async fn run_onboarding_once(
     config: Config,
-    council: Option<council::ResolvedCouncil>,
+    roster: Option<roster::Roster>,
     notice: Option<String>,
     termination: CancellationToken,
 ) -> Result<onboarding::Outcome> {
     let mut terminal = FullscreenTerminal::fresh().context("setup onboarding terminal")?;
-    let outcome = onboarding::run(
-        terminal.terminal_mut(),
-        config,
-        council,
-        notice,
-        termination,
-    )
-    .await;
+    let outcome =
+        onboarding::run(terminal.terminal_mut(), config, roster, notice, termination).await;
     terminal.restore_once();
     settle_after_fullscreen_picker_restore().await;
     outcome
@@ -1554,18 +1541,18 @@ async fn run_session_picker_action_for_agent(
     }
 }
 
-async fn run_session_picker_action_for_council(
-    council: &council::ResolvedCouncil,
+async fn run_session_picker_action_for_roster(
+    roster: &roster::Roster,
     cwd: PathBuf,
     agent_stderr: Option<&Path>,
     current_session_id: Option<String>,
     current_session_title: Option<String>,
     theme: palette::TerminalTheme,
     termination: CancellationToken,
-) -> Result<(SessionPickerAction, Option<council::ResolvedRole>)> {
+) -> Result<(SessionPickerAction, Option<roster::ResolvedAgent>)> {
     let mut notice = None;
     loop {
-        let sessions = list_council_sessions(council, &cwd, agent_stderr).await;
+        let sessions = list_agent_sessions(roster, &cwd, agent_stderr).await;
         if sessions.is_empty() {
             return Ok((
                 session_picker_empty_action(current_session_id, current_session_title),
@@ -1594,7 +1581,7 @@ async fn run_session_picker_action_for_council(
                     );
                     continue;
                 }
-                notice = match role_for_session_entry(council, &entry) {
+                notice = match role_for_session_entry(roster, &entry) {
                     Some(role) if entry.delete_supported => {
                         let route = selected_agent_for_role(role);
                         Some(delete_session_notice(&route, entry, agent_stderr).await)
@@ -1606,7 +1593,7 @@ async fn run_session_picker_action_for_council(
                 };
             }
             session::ResumeOutcome::Selected(entry) => {
-                let role = role_for_session_entry(council, &entry)
+                let role = role_for_session_entry(roster, &entry)
                     .ok_or_else(|| anyhow::anyhow!("selected session route is unavailable"))?
                     .clone();
                 session_provenance::record(session_provenance::Record {
@@ -1766,9 +1753,9 @@ fn agent_header_label(agent: &SelectedAgent) -> String {
     remote::agent_display_label(agent)
 }
 
-fn selected_agent_for_role(role: &council::ResolvedRole) -> SelectedAgent {
+fn selected_agent_for_role(role: &roster::ResolvedAgent) -> SelectedAgent {
     SelectedAgent {
-        source_id: format!("council:{}", role.model.model),
+        source_id: format!("roster:{}", role.model.model),
         program: role.launch.command.clone(),
         args: role.launch.args.clone(),
         env: role.launch.env.clone(),
@@ -1786,16 +1773,15 @@ async fn run_session(
     mut theme_kind: theme::TerminalThemeKind,
     mut spinner_style: spinner::SpinnerStyle,
     mut session_boundary: Option<String>,
-    council: council::ResolvedCouncil,
-    thor_config: config::ThorConfig,
-    eitri_config: config::EitriConfig,
-    council_config: config::CouncilConfig,
-    council_updates: Option<tokio::sync::watch::Receiver<council::ResolvedCouncil>>,
+    roster: roster::Roster,
+    agent_config: config::AgentConfig,
+    subagents_config: config::SubagentsConfig,
+    roster_updates: Option<tokio::sync::watch::Receiver<roster::Roster>>,
     pending_probe_servers: Vec<String>,
     termination: CancellationToken,
 ) -> Result<RunSessionResult> {
     let mut terminal = SessionTerminal::fresh(mode)?;
-    let council_session = format!(
+    let session_tag = format!(
         "{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -1803,109 +1789,87 @@ async fn run_session(
             .unwrap_or_default()
             .as_millis()
     );
-    let (eitri_roles, _eitri_codex_home) =
-        isolated_council_roles(council.eitri_failover_roles(), "eitri")?;
-    let (loki_roles, _loki_codex_home) =
-        isolated_council_roles(council.loki_failover_roles(), "loki")?;
+    let (subagent_roles, _subagent_codex_home) =
+        isolated_subagent_roles(roster.subagent_failover_roles(), "subagent")?;
 
     let (event_tx, runtime_event_rx) = mpsc::unbounded_channel();
     let (ui_event_tx, ui_event_rx) = mpsc::unbounded_channel();
     let (runtime_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel();
     let quota_gate = quota::Gate::new(cwd.clone(), ui_event_tx.clone());
-    let loki_pool = (!loki_roles.is_empty()).then(|| {
+    let subagent_pool = (!subagent_roles.is_empty()).then(|| {
         quota::RolePool::new(
-            loki_roles.clone(),
+            subagent_roles.clone(),
             quota_gate.clone(),
-            council_config.auto_failover,
-            council_usage::Role::Loki,
+            subagents_config.auto_failover,
+            "subagents",
             ui_event_tx.clone(),
         )
     });
-    let eitri_pool = (!eitri_roles.is_empty()).then(|| {
-        quota::RolePool::new(
-            eitri_roles.clone(),
-            quota_gate.clone(),
-            council_config.auto_failover,
-            council_usage::Role::Eitri,
-            ui_event_tx.clone(),
-        )
-    });
-    let implementation_handoffs_this_turn = Arc::new(AtomicUsize::new(0));
-    let active_implementation_workers = code_agent::ActiveCodeWorkers::default();
+    let subagent_handoffs_this_turn = Arc::new(AtomicUsize::new(0));
+    // One id sequence for pool subagents and review lanes alike: both render as
+    // rows in the same status area.
+    let subagent_ids = subagent::SubagentIdAllocator::default();
+    let active_implementation_workers = subagent::ActiveSubagentWorkers::default();
+    let (subagent_reports, subagent_report_rx) = subagent::SubagentReportBus::channel();
+    let subagent_inventory = Arc::new(std::sync::RwLock::new(
+        subagent::SubagentInventory::from_roster(&roster),
+    ));
     tracing::info!(
-        event = "council_setup",
-        council_session = %council_session,
-        god = "Thor",
-        model = %council.thor.model.model,
-        model_value = %council.thor.model_value,
-        adapter = %council.thor.launch.source_id,
-        "Council role configured"
+        event = "roster_setup",
+        session_tag = %session_tag,
+        seat = "primary",
+        model = %roster.primary.model.model,
+        model_value = %roster.primary.model_value,
+        adapter = %roster.primary.launch.source_id,
+        "seat configured"
     );
-    if let Some(role) = council.eitri.as_ref() {
+    if let Some(role) = roster.subagent_default.as_ref() {
         tracing::info!(
-            event = "council_setup",
-            council_session = %council_session,
-            god = "Eitri",
+            event = "roster_setup",
+            session_tag = %session_tag,
+            seat = "subagents",
             model = %role.model.model,
             model_value = %role.model_value,
             adapter = %role.launch.source_id,
-            "Council role configured"
+            "seat configured"
         );
     } else {
         tracing::info!(
-            event = "council_setup",
-            council_session = %council_session,
-            god = "Eitri",
+            event = "roster_setup",
+            session_tag = %session_tag,
+            seat = "subagents",
             model = "disabled",
-            "Council role disabled"
-        );
-    }
-    if let Some(role) = council.loki.as_ref() {
-        tracing::info!(
-            event = "council_setup",
-            council_session = %council_session,
-            god = "Loki",
-            model = %role.model.model,
-            model_value = %role.model_value,
-            adapter = %role.launch.source_id,
-            "Council role configured"
-        );
-    } else {
-        tracing::info!(
-            event = "council_setup",
-            council_session = %council_session,
-            god = "Loki",
-            model = "disabled",
-            "Council role disabled"
+            "seat disabled"
         );
     }
     let _ = ui_event_tx.send(crate::event::UiEvent::Info(format!(
-        "Council · Thor {} · Loki {} · Eitri {} · {} launchable models",
-        council.thor.model.model,
-        council
-            .loki
+        "Agents · primary {} · subagents {} · {} launchable models",
+        roster.primary.model.model,
+        roster
+            .subagent_default
             .as_ref()
             .map(|role| role.model.model.as_str())
             .unwrap_or("off"),
-        council
-            .eitri
-            .as_ref()
-            .map(|role| role.model.model.as_str())
-            .unwrap_or("off"),
-        council.available.len(),
+        roster.available.len(),
     )));
-    for warning in &council.warnings {
+    for warning in &roster.warnings {
         let _ = ui_event_tx.send(crate::event::UiEvent::Warning(warning.clone()));
     }
     let _ = pending_probe_servers;
-    let council_update_task = council_updates.map(|mut updates| {
+    let roster_update_task = roster_updates.map(|mut updates| {
         let tx = ui_event_tx.clone();
+        let inventory = subagent_inventory.clone();
         let mut surfaced: std::collections::HashSet<String> =
-            council.warnings.iter().cloned().collect();
+            roster.warnings.iter().cloned().collect();
         tokio::spawn(async move {
             while updates.changed().await.is_ok() {
                 let snapshot = updates.borrow_and_update().clone();
+                // Late adapter probes widen the agent/model inventory the
+                // create_subagent description advertises.
+                if let Ok(mut inventory) = inventory.write() {
+                    *inventory = subagent::SubagentInventory::from_roster(&snapshot);
+                }
                 for warning in &snapshot.warnings {
                     if surfaced.insert(warning.clone())
                         && tx
@@ -1916,7 +1880,7 @@ async fn run_session(
                     }
                 }
                 if tx
-                    .send(crate::event::UiEvent::CouncilUpdate {
+                    .send(crate::event::UiEvent::RosterUpdate {
                         choices: snapshot.choices,
                         inventory: snapshot.inventory,
                     })
@@ -1927,9 +1891,7 @@ async fn run_session(
             }
         })
     });
-    let usage_roles = std::iter::once(&council.thor)
-        .chain(eitri_roles.iter())
-        .chain(loki_roles.iter());
+    let usage_roles = std::iter::once(&roster.primary).chain(subagent_roles.iter());
     let mut claude_usage_env = None;
     let mut codex_usage_env = None;
     for role in usage_roles {
@@ -1943,22 +1905,6 @@ async fn run_session(
             _ => {}
         }
     }
-    let loki_handle = loki_pool.map(|pool| {
-        loki::Handle::start(
-            pool,
-            cwd.clone(),
-            runtime_options.additional_directories.clone(),
-            ui_event_tx.clone(),
-            council_session.clone(),
-        )
-    });
-    let thor_pull_server = match loki_handle.as_ref() {
-        Some(reviewer) => Some(loki::PullServer::start(
-            reviewer.clone(),
-            loki::Consumer::Thor,
-        )?),
-        None => None,
-    };
     let has_usage_poller = claude_usage_env.is_some() || codex_usage_env.is_some();
     let (usage_turn_tx, usage_shutdown_tx, usage_task) = if has_usage_poller {
         let (tx, mut rx) = mpsc::unbounded_channel::<()>();
@@ -2019,19 +1965,16 @@ async fn run_session(
     };
     let mut ui_event_rx = ui_event_rx;
 
-    // The discrete review's specialist lanes run on Eitri's seat, so they need
-    // the pool that is about to move into the code-agent config.
-    let review_workers = eitri_pool.clone();
+    // The discrete review's specialist lanes run on the subagent seat, so they
+    // need the pool that is about to move into the subagent config.
+    let review_workers = subagent_pool.clone();
 
     let runtime_cfg = acp::AcpRuntimeConfig {
         command: agent.program.clone(),
         args: agent.args.clone(),
         cwd: cwd.clone(),
         additional_directories: runtime_options.additional_directories.clone(),
-        mcp_servers: thor_pull_server
-            .as_ref()
-            .map(|server| vec![server.advertised().clone()])
-            .unwrap_or_default(),
+        mcp_servers: Vec::new(),
         resume_session,
         env: agent.env.clone(),
         agent_stderr: runtime_options.agent_stderr.clone(),
@@ -2041,28 +1984,29 @@ async fn run_session(
         config_path: Some(config::default_config_path()),
         saved_session_config: std::collections::HashMap::new(),
         role_config: Some(acp::RuntimeRoleConfig {
-            label: "Thor".to_string(),
-            model_id: council.thor.model.model.clone(),
-            model_value: council.thor.model_value.clone(),
-            adapter_source_id: council.thor.launch.source_id.clone(),
+            label: "primary".to_string(),
+            model_id: roster.primary.model.model.clone(),
+            model_value: roster.primary.model_value.clone(),
+            adapter_source_id: roster.primary.launch.source_id.clone(),
             permission: None,
-            council_session: Some(council_session.clone()),
-            reasoning_effort: council.thor.reasoning_effort.clone(),
+            session_tag: Some(session_tag.clone()),
+            reasoning_effort: roster.primary.reasoning_effort.clone(),
         }),
-        code_agent: eitri_pool.map(|eitri_pool| {
-            let mut config = code_agent::Config::council(
-                eitri_pool,
-                runtime_options.agent_stderr.clone(),
-                loki_handle.clone(),
-            );
+        subagents: subagent_pool.map(|subagent_pool| {
+            let mut config =
+                subagent::Config::new(subagent_pool, runtime_options.agent_stderr.clone());
             if let Some(role) = config.role_config.as_mut() {
-                role.council_session = Some(council_session.clone());
+                role.session_tag = Some(session_tag.clone());
             }
             config
-                .with_implementation_handoff_counter(implementation_handoffs_this_turn.clone())
+                .with_subagent_handoff_counter(subagent_handoffs_this_turn.clone())
+                .with_id_allocator(subagent_ids.clone())
                 .with_active_implementation_workers(active_implementation_workers.clone())
-                .with_max_parallel_explores(eitri_config.max_parallel_explores)
-                .with_prewarm(code_agent::RunContext {
+                .with_max_parallel(subagents_config.max_parallel)
+                .with_quota_gate(quota_gate.clone())
+                .with_inventory(subagent_inventory.clone())
+                .with_reports(subagent_reports.clone())
+                .with_prewarm(subagent::RunContext {
                     cwd: cwd.clone(),
                     additional_directories: runtime_options.additional_directories.clone(),
                     fs_max_text_bytes: runtime_options.fs_max_text_bytes,
@@ -2087,7 +2031,7 @@ async fn run_session(
     let export_dir = transcript_export_dir();
     let config_path = config::default_config_path();
     // Pre-fill the UI header with the immutable model selected for this session.
-    let agent_display_name = Some(format!("Thor · {}", council.thor.model.model));
+    let agent_display_name = Some(roster.primary.model.model.clone());
     // Stable runtime route identifier used by remote session state.
     let agent_source_id = Some(agent.source_id.clone());
     let tracker_project_label = header_labels.project.clone();
@@ -2101,41 +2045,40 @@ async fn run_session(
     let remote_tracker = remote::RemoteSessionTracker::new(
         tracker_project_label,
         tracker_worktree_label,
-        format!("Thor · {}", council.thor.model.model),
+        roster.primary.model.model.clone(),
         Some(cmd_tx.clone()),
         Some(ui_event_tx.clone()),
     );
-    let orchestrated = council_orchestrator::spawn(
+    let orchestrated = orchestrator::spawn(
         runtime_event_rx,
-        council_orchestrator::Config {
-            reviewer: loki_handle.clone(),
+        orchestrator::Config {
             runtime_commands: runtime_cmd_tx.clone(),
-            implementation_handoffs: implementation_handoffs_this_turn.clone(),
-            active_implementation_workers: active_implementation_workers.clone(),
-            discrete_review: thor_config.discrete_review,
+            subagent_handoffs: subagent_handoffs_this_turn.clone(),
+            active_subagent_workers: active_implementation_workers.clone(),
+            subagent_reports: subagent_report_rx,
+            subagent_report_bus: subagent_reports.clone(),
+            discrete_review: agent_config.discrete_review,
+            primary_model: Some(roster.primary.model.model.clone()),
             review_root: cwd.clone(),
-            log_context: Some(council_orchestrator::LogContext {
-                council_session: council_session.clone(),
-                model: council.thor.model.model.clone(),
-                adapter: council.thor.launch.source_id.clone(),
-            }),
-            held_completion_max_wait: None,
             review_fanout: review_workers.map(|workers| {
                 discrete_review::Spawner::live(discrete_review::FanoutConfig {
                     workers,
-                    supervisor: council.thor.clone(),
+                    supervisor: roster.primary.clone(),
                     cwd: cwd.clone(),
                     additional_directories: runtime_options.additional_directories.clone(),
-                    council_session: Some(council_session.clone()),
+                    session_tag: Some(session_tag.clone()),
+                    agent_stderr: runtime_options.agent_stderr.clone(),
+                    fs_max_text_bytes: runtime_options.fs_max_text_bytes,
+                    id_allocator: subagent_ids.clone(),
                 })
             }),
         },
     );
-    let thor_orchestrator = orchestrated.handle.clone();
-    let refresh_usage_on_failure = council.thor.launch.source_id == "codex-acp";
+    let primary_orchestrator = orchestrated.handle.clone();
+    let refresh_usage_on_failure = roster.primary.launch.source_id == "codex-acp";
     let event_usage_turn_tx = usage_turn_tx.clone();
     let event_tracker = remote_tracker.clone();
-    let event_thor = council.thor.clone();
+    let event_primary = roster.primary.clone();
     let event_cwd = cwd.clone();
     let side_ui_event_tx = ui_event_tx.clone();
     let event_proxy = tokio::spawn(async move {
@@ -2145,9 +2088,9 @@ async fn run_session(
                 session_provenance::record(session_provenance::Record {
                     session_id: session_id.clone(),
                     cwd: event_cwd.clone(),
-                    adapter_source_id: event_thor.launch.source_id.clone(),
-                    model: event_thor.model.model.clone(),
-                    model_value: event_thor.model_value.clone(),
+                    adapter_source_id: event_primary.launch.source_id.clone(),
+                    model: event_primary.model.model.clone(),
+                    model_value: event_primary.model_value.clone(),
                 });
             }
             let event = event_tracker.intercept_event(event);
@@ -2170,9 +2113,7 @@ async fn run_session(
     });
 
     let cmd_tracker = remote_tracker.clone();
-    let cmd_loki = loki_handle.clone();
-    let cmd_orchestrator = thor_orchestrator.clone();
-    let cmd_active_implementation_workers = active_implementation_workers.clone();
+    let cmd_orchestrator = primary_orchestrator.clone();
     let mut cmd_workspace_roots =
         Vec::with_capacity(1 + runtime_options.additional_directories.len());
     cmd_workspace_roots.push(cwd.clone());
@@ -2343,7 +2284,7 @@ async fn run_session(
                 }
             }
             cmd_tracker.observe_command(&command);
-            if let UiCommand::SetThorReviewPolicy { enabled } = &command {
+            if let UiCommand::SetReviewPolicy { enabled } = &command {
                 cmd_orchestrator.set_review_enabled(*enabled);
                 continue;
             }
@@ -2351,34 +2292,21 @@ async fn run_session(
                 cmd_orchestrator.request_review(target);
                 continue;
             }
-            if matches!(command, UiCommand::CompactCouncil) {
+            if matches!(command, UiCommand::CompactPrimary) {
                 cmd_orchestrator.compact_manual().await;
                 continue;
             }
             if let UiCommand::SendPrompt { text, images } = &command {
                 local_epoch = local_epoch.saturating_add(1);
-                implementation_handoffs_this_turn.store(0, Ordering::Release);
-                let snapshot = if cmd_active_implementation_workers.count() == 0 {
-                    workspace_snapshot::WorkspaceSnapshot::capture(&cmd_workspace_roots).await
-                } else {
-                    let _ = side_ui_event_tx.send(UiEvent::Warning(
-                        "exact turn snapshot unavailable: a prior implementation worker is still active; discrete review will be skipped for this turn"
-                            .to_string(),
-                    ));
-                    workspace_snapshot::WorkspaceSnapshot::capture(&[]).await
-                };
-                let epoch = cmd_loki
-                    .as_ref()
-                    .map_or(local_epoch, |reviewer| reviewer.begin_turn(text.clone()));
+                subagent_handoffs_this_turn.store(0, Ordering::Release);
+                let snapshot =
+                    workspace_snapshot::WorkspaceSnapshot::capture(&cmd_workspace_roots).await;
                 cmd_orchestrator
-                    .begin_turn(epoch, text.clone(), images.clone(), snapshot)
+                    .begin_turn(local_epoch, text.clone(), images.clone(), snapshot)
                     .await;
             }
             if matches!(command, UiCommand::CancelPrompt) {
                 cmd_orchestrator.cancel_review();
-                if let Some(reviewer) = cmd_loki.as_ref() {
-                    reviewer.cancel_turn();
-                }
             }
             let shutdown = matches!(command, UiCommand::Shutdown);
             if runtime_cmd_tx.send(command).is_err() || shutdown {
@@ -2418,27 +2346,22 @@ async fn run_session(
                 }),
                 session_boundary: session_boundary.take(),
                 session_cwd: cwd.clone(),
-                council_choices: council.choices.clone(),
-                council_inventory: council.inventory.clone(),
-                council_models: config::Config::load(&config_path)
-                    .map(|config| config.role_models())
+                model_choices: roster.choices.clone(),
+                acp_inventory: roster.inventory.clone(),
+                configured_models: config::Config::load(&config_path)
+                    .map(|config| config.model_names())
                     .unwrap_or_default(),
-                active_council_models: config::ModelsConfig {
-                    thor: council.thor.model.model.clone(),
-                    loki: council
-                        .loki
-                        .as_ref()
-                        .map(|role| role.model.model.clone())
-                        .unwrap_or_else(|| "off".to_string()),
-                    eitri: council
-                        .eitri
+                active_models: config::ModelsConfig {
+                    primary: roster.primary.model.model.clone(),
+                    subagent: roster
+                        .subagent_default
                         .as_ref()
                         .map(|role| role.model.model.clone())
                         .unwrap_or_else(|| "off".to_string()),
                 },
-                thor_review_enabled: thor_config.discrete_review,
-                ragnarok_models: council.available.clone(),
-                primary_acp_name: council.thor.launch.kind.display_name().to_string(),
+                review_enabled: agent_config.discrete_review,
+                ragnarok_models: roster.available.clone(),
+                primary_acp_name: roster.primary.launch.kind.display_name().to_string(),
                 termination: termination.clone(),
             },
         )
@@ -2469,8 +2392,8 @@ async fn run_session(
         let current_session_id = result.session_id;
         let current_session_title = result.session_title;
 
-        let (action, selected_role) = match run_session_picker_action_for_council(
-            &council,
+        let (action, selected_role) = match run_session_picker_action_for_roster(
+            &roster,
             cwd.clone(),
             runtime_options.agent_stderr.as_deref(),
             current_session_id.clone(),
@@ -2502,8 +2425,8 @@ async fn run_session(
         };
 
         if selected_role.as_ref().is_some_and(|role| {
-            role.launch.source_id != council.thor.launch.source_id
-                || role.model.model != council.thor.model.model
+            role.launch.source_id != roster.primary.launch.source_id
+                || role.model.model != roster.primary.model.model
         }) {
             let _ = cmd_tx.send(UiCommand::Shutdown);
             break Ok(RunSessionResult {
@@ -2525,7 +2448,7 @@ async fn run_session(
         {
             LoadSessionResult::Switched => {
                 header_labels.session_title = target_title;
-                if council.thor.launch.source_id == "codex-acp"
+                if roster.primary.launch.source_id == "codex-acp"
                     && let Some(tx) = usage_turn_tx.as_ref()
                 {
                     let _ = tx.send(());
@@ -2578,9 +2501,6 @@ async fn run_session(
     //    task. `kill_on_drop(true)` on the `Command` then signals the
     //    child when the `Child` value is dropped during unwind.
     remote_tracker.shutdown().await;
-    if let Some(reviewer) = loki_handle.as_ref() {
-        reviewer.shutdown_and_wait().await;
-    }
 
     let abort_handle = acp_handle.abort_handle();
     match tokio::time::timeout(Duration::from_secs(2), acp_handle).await {
@@ -2612,7 +2532,7 @@ async fn run_session(
     } else {
         tokio::join!(event_proxy_wait, cmd_proxy_wait);
     }
-    if let Some(task) = council_update_task {
+    if let Some(task) = roster_update_task {
         task.abort();
     }
 
@@ -2633,11 +2553,11 @@ async fn run_session(
     ui_result
 }
 
-fn isolated_council_role(
-    mut role: council::ResolvedRole,
+fn isolated_subagent_role(
+    mut role: roster::ResolvedAgent,
     label: &str,
-) -> Result<(council::ResolvedRole, Option<tempfile::TempDir>)> {
-    if role.launch.kind != council::AdapterKind::Codex {
+) -> Result<(roster::ResolvedAgent, Option<tempfile::TempDir>)> {
+    if role.launch.kind != roster::AdapterKind::Codex {
         return Ok((role, None));
     }
     let source = std::env::var_os("CODEX_HOME")
@@ -2674,17 +2594,17 @@ fn isolated_council_role(
     Ok((role, Some(isolated)))
 }
 
-fn isolated_council_roles(
-    mut roles: Vec<council::ResolvedRole>,
+fn isolated_subagent_roles(
+    mut roles: Vec<roster::ResolvedAgent>,
     label: &str,
-) -> Result<(Vec<council::ResolvedRole>, Option<tempfile::TempDir>)> {
+) -> Result<(Vec<roster::ResolvedAgent>, Option<tempfile::TempDir>)> {
     let Some(index) = roles
         .iter()
-        .position(|role| role.launch.kind == council::AdapterKind::Codex)
+        .position(|role| role.launch.kind == roster::AdapterKind::Codex)
     else {
         return Ok((roles, None));
     };
-    let (prepared, guard) = isolated_council_role(roles[index].clone(), label)?;
+    let (prepared, guard) = isolated_subagent_role(roles[index].clone(), label)?;
     let codex_home = prepared
         .launch
         .env
@@ -2693,7 +2613,7 @@ fn isolated_council_roles(
         .expect("isolated Codex role has CODEX_HOME");
     roles[index] = prepared;
     for role in &mut roles {
-        if role.launch.kind == council::AdapterKind::Codex {
+        if role.launch.kind == roster::AdapterKind::Codex {
             role.launch
                 .env
                 .insert("CODEX_HOME".to_string(), codex_home.clone());
@@ -2980,7 +2900,7 @@ mod tests {
     }
 
     #[test]
-    fn side_runtime_config_has_no_council_services_or_persistence() {
+    fn side_runtime_config_has_no_agent_services_or_persistence() {
         let agent = SelectedAgent {
             source_id: "test-agent".to_string(),
             program: PathBuf::from("agent"),
@@ -2997,7 +2917,7 @@ mod tests {
         );
 
         assert!(cfg.mcp_servers.is_empty());
-        assert!(cfg.code_agent.is_none());
+        assert!(cfg.subagents.is_none());
         assert!(cfg.role_config.is_none());
         assert!(cfg.agent_source_id.is_none());
         assert!(cfg.config_path.is_none());
@@ -3110,7 +3030,7 @@ mod tests {
         clear_startup_status(&mut output).expect("clear");
 
         let rendered = String::from_utf8(output).expect("utf8");
-        assert!(rendered.contains("/ Discovering Council models... 12s"));
+        assert!(rendered.contains("/ Discovering models... 12s"));
         assert!(!rendered.contains("\x1b[6n"), "must not issue CPR");
         assert!(
             !rendered.contains("\x1b[?1049h"),
@@ -3119,8 +3039,8 @@ mod tests {
         assert!(rendered.ends_with("\r\x1b[2K"));
     }
 
-    fn test_council_role(model: &str, agent: &str) -> council::ResolvedRole {
-        council::ResolvedRole {
+    fn test_roster_agent(model: &str, agent: &str) -> roster::ResolvedAgent {
+        roster::ResolvedAgent {
             model: deepswe::Row {
                 model: model.to_string(),
                 reasoning_effort: None,
@@ -3128,8 +3048,8 @@ mod tests {
                 mean_cost_usd: 1.0,
             },
             model_value: model.to_string(),
-            launch: council::AdapterLaunch {
-                kind: council::AdapterKind::Custom,
+            launch: roster::AdapterLaunch {
+                kind: roster::AdapterKind::Custom,
                 source_id: agent.to_string(),
                 command: PathBuf::from(agent),
                 args: Vec::new(),
@@ -3141,29 +3061,28 @@ mod tests {
     }
 
     #[test]
-    fn clear_boundary_reports_each_reloaded_council_role() {
-        let codex = test_council_role("gpt-test", "codex-acp");
-        let claude = test_council_role("claude-test", "claude-acp");
-        let council = council::ResolvedCouncil {
-            thor: codex.clone(),
-            loki: Some(claude.clone()),
-            eitri: None,
+    fn clear_boundary_reports_each_reloaded_seat() {
+        let codex = test_roster_agent("gpt-test", "codex-acp");
+        let claude = test_roster_agent("claude-test", "claude-acp");
+        let roster = roster::Roster {
+            primary: codex.clone(),
+            subagent_default: Some(claude.clone()),
             available: vec![codex, claude],
             choices: Vec::new(),
             warnings: Vec::new(),
-            inventory: council::AcpInventory::default(),
+            inventory: roster::AcpInventory::default(),
         };
 
         assert_eq!(
-            council_reload_message(&council),
-            "Council reloaded after /clear: Thor gpt-test via codex-acp; Loki claude-test via claude-acp; Eitri off"
+            models_reload_message(&roster),
+            "Models reloaded after /clear: primary gpt-test via codex-acp; subagents claude-test via claude-acp"
         );
     }
 
     #[test]
     fn first_startup_only_opens_for_a_fresh_unpinned_session() {
         let agent = SelectedAgent {
-            source_id: "council:test".to_string(),
+            source_id: "roster:test".to_string(),
             program: PathBuf::from("test-acp"),
             args: Vec::new(),
             env: Default::default(),
@@ -3333,45 +3252,62 @@ mod tests {
     #[test]
     fn parse_accepts_headless_role_overrides_and_normalizes_none() {
         let cli = Cli::try_parse_from([
-            "mj", "--print", "hello", "--thor", "gpt-test", "--loki", "none", "--eitri", "disabled",
+            "mj",
+            "--print",
+            "hello",
+            "--model",
+            "gpt-test",
+            "--subagent-model",
+            "disabled",
         ])
         .expect("parse role overrides");
 
-        assert_eq!(cli.thor, Some(("gpt-test".to_string(), None)));
-        assert_eq!(cli.loki, Some((config::DISABLED_MODEL.to_string(), None)));
-        assert_eq!(cli.eitri, Some((config::DISABLED_MODEL.to_string(), None)));
+        assert_eq!(cli.model, Some(("gpt-test".to_string(), None)));
+        assert_eq!(
+            cli.subagent_model,
+            Some((config::DISABLED_MODEL.to_string(), None))
+        );
     }
 
     #[test]
     fn parse_accepts_role_overrides_after_stdin_print_sentinel() {
         let cli = Cli::try_parse_from([
-            "mj", "--print", "-", "--thor", "gpt-test", "--loki", "disabled",
+            "mj",
+            "--print",
+            "-",
+            "--model",
+            "gpt-test",
+            "--subagent-model",
+            "disabled",
         ])
         .expect("parse role overrides after stdin sentinel");
 
         assert_eq!(cli.print.as_deref(), Some("-"));
-        assert_eq!(cli.thor, Some(("gpt-test".to_string(), None)));
-        assert_eq!(cli.loki, Some((config::DISABLED_MODEL.to_string(), None)));
+        assert_eq!(cli.model, Some(("gpt-test".to_string(), None)));
+        assert_eq!(
+            cli.subagent_model,
+            Some((config::DISABLED_MODEL.to_string(), None))
+        );
     }
 
     #[test]
     fn parse_rejects_role_overrides_without_print() {
-        let error = Cli::try_parse_from(["mj", "--thor", "gpt-test"])
-            .expect_err("--thor must require --print");
+        let error = Cli::try_parse_from(["mj", "--model", "gpt-test"])
+            .expect_err("--model must require --print");
         assert!(error.to_string().contains("--print"), "{error}");
     }
 
     #[test]
-    fn parse_thor_override_splits_trailing_effort() {
+    fn parse_model_override_splits_trailing_effort() {
         assert_eq!(
-            parse_thor_override("custom/bpr-agent/bedrock::openai.gpt-5.6-sol+high"),
+            parse_model_override("custom/bpr-agent/bedrock::openai.gpt-5.6-sol+high"),
             Ok((
                 "custom/bpr-agent/bedrock::openai.gpt-5.6-sol".to_string(),
                 Some("high".to_string())
             ))
         );
         assert_eq!(
-            parse_thor_override("custom/bpr-agent/bedrock::us.anthropic.claude-opus-4-8+high"),
+            parse_model_override("custom/bpr-agent/bedrock::us.anthropic.claude-opus-4-8+high"),
             Ok((
                 "custom/bpr-agent/bedrock::us.anthropic.claude-opus-4-8".to_string(),
                 Some("high".to_string())
@@ -3380,9 +3316,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_thor_override_leaves_effort_less_selectors_unchanged() {
+    fn parse_model_override_leaves_effort_less_selectors_unchanged() {
         assert_eq!(
-            parse_thor_override("custom/bpr-agent/deepseek::deepseek-v4-pro"),
+            parse_model_override("custom/bpr-agent/deepseek::deepseek-v4-pro"),
             Ok((
                 "custom/bpr-agent/deepseek::deepseek-v4-pro".to_string(),
                 None
@@ -3391,10 +3327,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_thor_override_still_rejects_disabled_and_auto() {
-        assert!(parse_thor_override("disabled").is_err());
-        assert!(parse_thor_override("none").is_err());
-        assert!(parse_thor_override("auto").is_err());
+    fn parse_model_override_still_rejects_disabled_and_auto() {
+        assert!(parse_model_override("disabled").is_err());
+        assert!(parse_model_override("none").is_err());
+        assert!(parse_model_override("auto").is_err());
     }
 
     #[test]
@@ -3469,14 +3405,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_auto_and_disabled_thor_overrides() {
+    fn parse_rejects_auto_and_disabled_primary_overrides() {
         for value in ["auto", "disabled", "none"] {
             assert!(
-                Cli::try_parse_from(["mj", "--print", "hello", "--thor", value]).is_err(),
-                "accepted invalid Thor override {value}"
+                Cli::try_parse_from(["mj", "--print", "hello", "--model", value]).is_err(),
+                "accepted invalid --model override {value}"
             );
         }
-        assert!(Cli::try_parse_from(["mj", "--print", "hello", "--loki", "auto"]).is_err());
     }
 
     #[test]
