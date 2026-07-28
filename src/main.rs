@@ -1157,6 +1157,50 @@ struct RunSessionResult {
     spinner_style: spinner::SpinnerStyle,
 }
 
+async fn start_new_session_loading() -> Option<(CancellationToken, tokio::task::JoinHandle<()>)> {
+    let mut stdout = std::io::stdout();
+    if !stdout.is_terminal() {
+        return None;
+    }
+    if write!(stdout, "\r\x1b[2Kloading.")
+        .and_then(|()| stdout.flush())
+        .is_err()
+    {
+        return None;
+    }
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        let mut dots = 2;
+        loop {
+            tokio::select! {
+                _ = task_cancel.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_millis(350)) => {}
+            }
+            if write!(stdout, "\r\x1b[2Kloading{}", ".".repeat(dots))
+                .and_then(|()| stdout.flush())
+                .is_err()
+            {
+                return;
+            }
+            dots = dots % 3 + 1;
+        }
+    });
+    Some((cancel, task))
+}
+
+async fn stop_new_session_loading(
+    loading: Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
+) {
+    let Some((cancel, task)) = loading else {
+        return;
+    };
+    cancel.cancel();
+    let _ = task.await;
+    let mut stdout = std::io::stdout();
+    let _ = write!(stdout, "\r\x1b[2K").and_then(|()| stdout.flush());
+}
+
 struct ActiveSideRuntime {
     session_id: String,
     commands: mpsc::UnboundedSender<UiCommand>,
@@ -2541,6 +2585,16 @@ async fn run_session(
         }
     };
 
+    let new_session_loading = if matches!(
+        ui_result.as_ref().map(|result| result.reason),
+        Ok(UiExitReason::NewSession)
+    ) {
+        terminal.restore_once();
+        start_new_session_loading().await
+    } else {
+        None
+    };
+
     // Shutdown paths reaching this point:
     //
     // 1. User quit while idle (Ctrl-C/Ctrl-D/Esc with empty input):
@@ -2600,11 +2654,11 @@ async fn run_session(
     }
 
     // Restore the terminal only now, after the runtime has finished tearing
-    // down, so the session UI stayed on screen through shutdown and is torn
-    // down moments before the process exits (or the next session draws) instead
-    // of leaving a blank gap during teardown. No-op if the LoadSession path
-    // already restored before showing the session picker.
+    // down, so the session UI stays on screen through shutdown. `/new` restores
+    // earlier to show its standalone loading line, and LoadSession restores
+    // before showing the session picker; this is a no-op for both paths.
     terminal.restore_once();
+    stop_new_session_loading(new_session_loading).await;
     if matches!(
         ui_result.as_ref().map(|result| result.reason),
         Ok(UiExitReason::ClearSession)
