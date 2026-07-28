@@ -5,6 +5,9 @@ description: Configure the primary agent, subagents, ACP servers, review, and ap
 
 Open `/mjconfig` to edit settings from the TUI. `/models` opens the same editor
 on the Agents tab. Model and ACP-server changes apply to the next session.
+Use `/models refresh` when credentials or adapter capabilities changed and you
+need the next `/new` or `/clear` to probe every enabled adapter again. The
+equivalent non-interactive command is `mj models refresh`.
 
 The config schema is versioned. The current schema is `version = 3`; a
 `version = 2` file is migrated in place on load. Any other version starts from

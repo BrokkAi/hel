@@ -36,6 +36,11 @@ Probe results and the live DeepSWE ranking are cached for 24 hours. A bundled
 snapshot is available when the ranking endpoint cannot be refreshed. Read
 [Storage and network activity](/storage-network/) for paths and endpoints.
 
+`mj models refresh` clears the persisted ACP capability cache. In an active
+session, `/models refresh` also clears Mjolnir's process-local probe results;
+run `/new` or `/clear` afterward to resolve models and reprobe every enabled
+adapter. The current session keeps its already-bound models.
+
 ## Auto selection
 
 - The primary prefers the strongest launchable eligible row.

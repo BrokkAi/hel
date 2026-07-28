@@ -63,7 +63,9 @@ mj
 
 Use `/mjconfig` to choose models, sign in, configure ACP servers, set the review
 policy, and change appearance. Model and adapter changes apply to the next
-session.
+session. If adapter capabilities or credentials changed underneath a running
+Mjolnir process, use `/models refresh` before `/new` or `/clear`; the standalone
+equivalent is `mj models refresh`.
 
 ## Try it
 

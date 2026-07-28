@@ -195,6 +195,8 @@ struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Commands {
+    /// Inspect or refresh model discovery state.
+    Models(ModelsArgs),
     /// Resume an existing ACP session.
     ///
     /// Uses saved provenance to route the session back to its original ACP
@@ -205,6 +207,18 @@ enum Commands {
     Resume(ResumeArgs),
     /// Start the local remote-control server.
     Server(ServerArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ModelsArgs {
+    #[command(subcommand)]
+    command: ModelsCommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum ModelsCommand {
+    /// Clear cached ACP capabilities so enabled adapters are probed again.
+    Refresh,
 }
 
 fn parse_fs_max_text_bytes(value: &str) -> std::result::Result<u64, String> {
@@ -427,6 +441,7 @@ fn should_run_startup_update_check(cli: &Cli) -> bool {
         return false;
     }
     match &cli.command {
+        Some(Commands::Models(_)) => false,
         Some(Commands::Resume(args)) => !args.list,
         Some(Commands::Server(_)) => false,
         None => true,
@@ -465,6 +480,15 @@ async fn main() -> Result<()> {
 
     if let Some(command) = cli.command {
         return match command {
+            Commands::Models(args) => match args.command {
+                ModelsCommand::Refresh => {
+                    roster::invalidate_model_cache()?;
+                    println!(
+                        "Model cache cleared; the next model resolution will reprobe enabled ACP adapters."
+                    );
+                    Ok(())
+                }
+            },
             Commands::Resume(mut args) => {
                 args.fullscreen_tui |= fullscreen_tui;
                 run_resume(
@@ -3612,6 +3636,9 @@ mod tests {
 
         let cli = Cli::try_parse_from(["mj", "server"]).expect("parse");
         assert!(!should_run_startup_update_check(&cli));
+
+        let cli = Cli::try_parse_from(["mj", "models", "refresh"]).expect("parse");
+        assert!(!should_run_startup_update_check(&cli));
     }
 
     #[test]
@@ -3700,6 +3727,23 @@ mod tests {
             assert!(args.cwd.is_none());
             assert!(args.agent_stderr.is_none());
         }
+    }
+
+    #[test]
+    fn parse_models_refresh_subcommand() {
+        let cli = Cli::try_parse_from(["mj", "models", "refresh"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Models(ModelsArgs {
+                command: ModelsCommand::Refresh
+            }))
+        ));
+
+        let error = Cli::try_parse_from(["mj", "models"]).expect_err("refresh is required");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
     }
 
     #[test]

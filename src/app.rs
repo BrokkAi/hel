@@ -199,7 +199,10 @@ fn builtin_mjconfig_command() -> AvailableCommand {
 }
 
 fn builtin_models_command() -> AvailableCommand {
-    AvailableCommand::new(BUILTIN_MODELS_COMMAND, "open model settings")
+    AvailableCommand::new(
+        BUILTIN_MODELS_COMMAND,
+        "open model settings; add refresh to clear cached discovery",
+    )
 }
 
 fn builtin_agents_command() -> AvailableCommand {
@@ -8473,7 +8476,10 @@ mod tests {
             s.available_commands[4].description,
             "export primary transcript; add full for nested agents"
         );
-        assert_eq!(s.available_commands[5].description, "open model settings");
+        assert_eq!(
+            s.available_commands[5].description,
+            "open model settings; add refresh to clear cached discovery"
+        );
         assert_eq!(
             s.available_commands[6].description,
             "show active model selections and usage"

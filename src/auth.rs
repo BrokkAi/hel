@@ -244,18 +244,12 @@ pub async fn run_login(vendor: AuthVendor) -> Result<String> {
             vendor.label()
         );
     }
-    let cache = crate::probe_cache::default_cache_path();
-    match vendor {
-        AuthVendor::OpenAi => {
-            crate::probe_cache::remove(&cache, "codex-acp");
-            crate::probe_cache::remove(&cache, "anvil");
-        }
-        AuthVendor::Anthropic => crate::probe_cache::remove(&cache, "claude-acp"),
-        AuthVendor::Kimi => {
-            crate::probe_cache::remove(&cache, "kimi");
-            crate::probe_cache::remove(&cache, "anvil");
-        }
-    }
+    // Credentials can change the models advertised by both the vendor-native
+    // bridge and shared routes such as Anvil. Clear every composite launch key
+    // plus the process-local OnceCells instead of trying to remove simple
+    // source IDs that do not match the persisted cache keys.
+    crate::roster::invalidate_model_cache()
+        .context("signed in, but failed to clear the model capability cache")?;
     Ok(format!(
         "Signed in to {}; models refresh on /new or /clear",
         vendor.label()

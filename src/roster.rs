@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -473,10 +473,50 @@ fn inventory_server_is_visible(server: &AcpServerInfo) -> bool {
 type ProbeResult = std::result::Result<probe::AdapterCapabilities, String>;
 type ProbeCell = Arc<tokio::sync::OnceCell<ProbeResult>>;
 
-static PROBE_CACHE: LazyLock<tokio::sync::Mutex<HashMap<String, ProbeCell>>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+#[derive(Default)]
+struct ProbeCacheState {
+    generation: u64,
+    entries: HashMap<String, ProbeCell>,
+}
+
+impl ProbeCacheState {
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.entries.clear();
+    }
+}
+
+static PROBE_CACHE: LazyLock<Mutex<ProbeCacheState>> =
+    LazyLock::new(|| Mutex::new(ProbeCacheState::default()));
 static WARNED_ADAPTERS: LazyLock<std::sync::Mutex<HashSet<String>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+fn probe_cache_state() -> MutexGuard<'static, ProbeCacheState> {
+    PROBE_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// Clear both layers of ACP capability caching.
+///
+/// Existing sessions keep their bound models. The next roster resolution has
+/// no completed `OnceCell` or disk entry to reuse, so every enabled adapter is
+/// probed again. The generation also prevents an older in-flight probe from
+/// repopulating the disk cache after this function returns.
+pub fn invalidate_model_cache() -> Result<()> {
+    invalidate_model_cache_at(&crate::probe_cache::default_cache_path())
+}
+
+fn invalidate_model_cache_at(path: &Path) -> Result<()> {
+    // Keep the lock through the disk removal. Successful probe writers take
+    // the same lock, so an older in-flight result cannot race the clear and
+    // restore stale capabilities afterward.
+    let mut state = probe_cache_state();
+    state.invalidate();
+    crate::probe_cache::clear(path)
+        .with_context(|| format!("clear ACP probe cache {}", path.display()))?;
+    Ok(())
+}
 
 fn probe_key(launch: &AdapterLaunch) -> String {
     format!(
@@ -492,9 +532,11 @@ async fn probe_launch(
     cwd: &Path,
 ) -> std::result::Result<probe::AdapterCapabilities, String> {
     let key = probe_key(launch);
-    let cell = {
-        let mut cache = PROBE_CACHE.lock().await;
-        cache.entry(key.clone()).or_default().clone()
+    let (cell, generation) = {
+        let mut state = probe_cache_state();
+        let generation = state.generation;
+        let cell = state.entries.entry(key.clone()).or_default().clone();
+        (cell, generation)
     };
     cell.get_or_init(|| async {
         let result = probe::adapter_capabilities(
@@ -506,12 +548,15 @@ async fn probe_launch(
         )
         .await;
         if let Ok(capabilities) = &result {
-            crate::probe_cache::store(
-                &crate::probe_cache::default_cache_path(),
-                &key,
-                &launch.command,
-                capabilities,
-            );
+            let state = probe_cache_state();
+            if state.generation == generation {
+                crate::probe_cache::store(
+                    &crate::probe_cache::default_cache_path(),
+                    &key,
+                    &launch.command,
+                    capabilities,
+                );
+            }
         }
         result
     })
@@ -525,8 +570,8 @@ async fn probe_launch(
 async fn cached_probe_result(launch: &AdapterLaunch) -> Option<ProbeResult> {
     let key = probe_key(launch);
     let cell = {
-        let mut cache = PROBE_CACHE.lock().await;
-        cache.entry(key.clone()).or_default().clone()
+        let mut state = probe_cache_state();
+        state.entries.entry(key.clone()).or_default().clone()
     };
     if let Some(result) = cell.get() {
         return Some(result.clone());
@@ -1160,6 +1205,48 @@ fn assemble_roster(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalidation_clears_process_and_disk_probe_caches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path().join("probes.json");
+        let command = dir.path().join("agent");
+        std::fs::write(&command, b"binary").expect("command");
+        let capabilities = probe::AdapterCapabilities {
+            http_mcp: true,
+            models: vec![probe::ModelOption {
+                value: "model-before-refresh".to_string(),
+                name: "model-before-refresh".to_string(),
+                description: None,
+            }],
+        };
+        crate::probe_cache::store(&cache, "launch-key", &command, &capabilities);
+
+        let generation = {
+            let mut state = probe_cache_state();
+            state.entries.insert(
+                "launch-key".to_string(),
+                Arc::new(tokio::sync::OnceCell::new()),
+            );
+            state.generation
+        };
+
+        invalidate_model_cache_at(&cache).expect("invalidate both cache layers");
+
+        let state = probe_cache_state();
+        assert!(state.entries.is_empty());
+        assert_eq!(state.generation, generation.wrapping_add(1));
+        drop(state);
+        assert!(
+            crate::probe_cache::load(
+                &cache,
+                "launch-key",
+                &command,
+                crate::probe_cache::CACHE_TTL,
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn permission_presets_map_to_provider_controls() {

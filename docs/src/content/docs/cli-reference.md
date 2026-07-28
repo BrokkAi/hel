@@ -30,6 +30,7 @@ optional `+EFFORT` suffix (`off`, `none`, `minimal`, `low`, `medium`, `high`,
 ```bash
 mj resume [SESSION_ID]
 mj resume --list --format json --cwd /work/project
+mj models refresh
 mj server [--hostname HOST | --tailscale]
 ```
 
@@ -42,6 +43,7 @@ control](/remote/) for behavioral boundaries.
 | --- | --- |
 | `/mjconfig` | Configure agents, ACP servers, and appearance |
 | `/models` | Open configuration on the Agents tab |
+| `/models refresh` | Clear model discovery caches; `/new` or `/clear` then reprobes enabled adapters |
 | `/agents` | Show the active model selections and per-seat usage |
 | `/review` | Choose a recent, uncommitted, or HEAD findings-only review |
 | `/review recent` | Review the latest change-producing turn |

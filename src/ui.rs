@@ -4216,12 +4216,27 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && text == "/models" {
+    if images.is_empty()
+        && let Some(argument) = models_slash_argument(&text)
+    {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
         state.scroll_input_to_bottom();
-        state.open_mjconfig_menu();
+        match argument {
+            "" => state.open_mjconfig_menu(),
+            "refresh" => match crate::roster::invalidate_model_cache() {
+                Ok(()) => state.record_status_message(
+                    StatusKind::Info,
+                    "model cache cleared; /new or /clear will reprobe enabled ACP adapters",
+                ),
+                Err(error) => state.record_status_message(
+                    StatusKind::Warning,
+                    format!("failed to clear model cache: {error:#}"),
+                ),
+            },
+            _ => state.record_status_message(StatusKind::Warning, "usage: /models [refresh]"),
+        }
         return;
     }
 
@@ -4466,6 +4481,14 @@ fn parse_review_target(value: &str) -> Option<ReviewTarget> {
         "head" => Some(ReviewTarget::Head),
         _ => None,
     }
+}
+
+fn models_slash_argument(value: &str) -> Option<&str> {
+    let rest = value.strip_prefix("/models")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(rest.trim())
 }
 
 fn handle_mjconfig_menu_key(
@@ -15826,6 +15849,18 @@ mod tests {
         let menu = state.mjconfig_menu.as_ref().expect("menu should be open");
         assert_eq!(menu.editor.tab, crate::settings::SettingsTab::Agents);
         assert!(state.input.is_empty(), "input should be consumed");
+    }
+
+    #[test]
+    fn models_slash_argument_accepts_refresh_without_matching_prefixes() {
+        assert_eq!(models_slash_argument("/models"), Some(""));
+        assert_eq!(models_slash_argument("/models refresh"), Some("refresh"));
+        assert_eq!(
+            models_slash_argument("/models   refresh  "),
+            Some("refresh")
+        );
+        assert_eq!(models_slash_argument("/models other"), Some("other"));
+        assert_eq!(models_slash_argument("/models-refresh"), None);
     }
 
     #[test]
