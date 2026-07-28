@@ -67,11 +67,15 @@ before releasing it:
    navigation tools and an immutable change packet. Changes under 200 lines
    include the complete captured diff; larger changes include the complete
    diffstat plus `analyze_diff` results for the captured base and target trees.
-3. The supervisor may launch any useful subset of six read-only Norse reviewers
-   with one asynchronous call: Mímir (complexity), Völundr (duplication), Týr
-   (error handling), Hel (dead code), Heimdall (tests), and Bragi (comments and
-   contracts). Reports arrive as later turns in the same supervisor session,
-   where the supervisor verifies them and returns one adversarial verdict.
+3. The supervisor forms a risk map from the change packet and targeted source
+   inspection. It launches a read-only Norse reviewer only for a concrete
+   unresolved hypothesis that the lane can investigate: Mímir (complexity),
+   Völundr (duplication), Týr (error handling), Hel (dead code), Heimdall
+   (tests), and Bragi (comments and contracts). Zero reviewers is a normal
+   outcome; patch size does not determine the roster, while several independent
+   risks can justify several lanes even in a small patch. Reports arrive as
+   later turns in the same supervisor session, where the supervisor verifies
+   them and returns one adversarial verdict.
 4. Surviving findings are injected as a corrective turn on the primary, framed
    as strong leads to verify rather than instructions to obey. Nothing survives
    vetting means the turn is released as it stands.
