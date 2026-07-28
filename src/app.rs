@@ -38,19 +38,13 @@ use crate::theme::TerminalThemeKind;
 /// Beyond this we truncate with an ellipsis.
 pub const QUEUED_PROMPT_PREVIEW_WIDTH: usize = 40;
 
-/// How long a finished subagent's status row stays on screen before it is
-/// pruned. Long enough to read the outcome, short enough that the status area
-/// tracks what is actually running.
-pub const SUBAGENT_DONE_TTL: Duration = Duration::from_secs(5);
-
 /// Longest excerpt of an objective or failure message kept in a subagent's
 /// permanent transcript record.
 const SUBAGENT_RECORD_LINE_CHARS: usize = 160;
 
-/// Durable UI state for one nested ACP actor. The live status area reads the
-/// lifecycle fields while the on-demand viewer reads `transcript`; completed
-/// actors stay here for the whole primary session even after their five-second
-/// status row expires.
+/// Durable UI state for one nested ACP actor. The on-demand viewer reads its
+/// lifecycle and `transcript`; completed actors stay here for the whole
+/// primary session.
 #[derive(Debug, Clone)]
 pub struct SubagentStatus {
     pub label: String,
@@ -111,12 +105,6 @@ impl SubagentStatus {
     pub fn outcome(&self) -> Option<&SubagentOutcome> {
         self.finished.as_ref().map(|(outcome, _)| outcome)
     }
-
-    fn expired_at(&self, now: Instant) -> bool {
-        self.finished
-            .as_ref()
-            .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= SUBAGENT_DONE_TTL)
-    }
 }
 
 pub fn nested_role_label(role: &crate::workflow::WorkflowActorRole) -> String {
@@ -130,6 +118,12 @@ pub fn nested_role_label(role: &crate::workflow::WorkflowActorRole) -> String {
         crate::workflow::WorkflowActorRole::PrimaryCorrection => "primary correction".to_string(),
         crate::workflow::WorkflowActorRole::FallbackReviewer => "fallback reviewer".to_string(),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkflowClock {
+    started_at: Instant,
+    finished_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -932,12 +926,15 @@ pub struct AppState {
     pub subagent_label: Option<String>,
     /// Number of subagents currently running in the background.
     pub active_subagents: usize,
-    /// Durable nested-agent state keyed by stable subagent id. Rendering
-    /// filters expired live rows without deleting their inspectable history.
+    /// Durable nested-agent state keyed by stable subagent id.
     subagents: BTreeMap<u64, SubagentStatus>,
     /// Canonical runtime-owned workflow state. Transcript prose and display
     /// labels never mutate this store.
     pub workflows: crate::workflow::WorkflowStore,
+    /// UI-side clocks for visible workflow progress rows. Lifecycle and counts
+    /// remain reducer-owned; terminal rows keep their frozen clock until the
+    /// next user turn starts.
+    workflow_clocks: BTreeMap<crate::workflow::WorkflowId, WorkflowClock>,
     pub agent_usage: crate::agent_usage::Snapshot,
     /// Transient status line with severity.
     pub status_line: Option<StatusMessage>,
@@ -1295,6 +1292,7 @@ impl AppState {
             active_subagents: 0,
             subagents: BTreeMap::new(),
             workflows: crate::workflow::WorkflowStore::default(),
+            workflow_clocks: BTreeMap::new(),
             agent_usage: crate::agent_usage::Snapshot::default(),
             status_line: None,
             voice_input_active: false,
@@ -1825,10 +1823,9 @@ impl AppState {
     }
 
     pub fn open_nested_agent_viewer(&mut self) -> bool {
-        let selected = self
-            .nested_agent_selected
-            .filter(|id| self.subagents.contains_key(id))
-            .or_else(|| self.subagents.keys().next().copied());
+        // Opening the viewer should land on work the user can act on, not the
+        // oldest completed actor retained for session history.
+        let selected = self.nested_agent_viewer_ids().into_iter().next();
         let Some(selected) = selected else {
             return false;
         };
@@ -1846,7 +1843,7 @@ impl AppState {
     }
 
     pub fn select_nested_agent(&mut self, next: bool) {
-        let ids = self.subagents.keys().copied().collect::<Vec<_>>();
+        let ids = self.nested_agent_viewer_ids();
         if ids.is_empty() {
             self.nested_agent_selected = None;
             self.nested_agent_scroll_offset = 0;
@@ -1864,11 +1861,24 @@ impl AppState {
             current - 1
         };
         self.nested_agent_selected = Some(ids[selected]);
-        self.nested_agent_scroll_offset = 0;
+        self.nested_agent_scroll_offset = usize::MAX;
     }
 
     pub fn nested_agents(&self) -> impl Iterator<Item = (u64, &SubagentStatus)> {
         self.subagents.iter().map(|(id, state)| (*id, state))
+    }
+
+    pub fn nested_agent_viewer_ids(&self) -> Vec<u64> {
+        let mut ids = self.subagents.keys().copied().collect::<Vec<_>>();
+        ids.sort_by(|left_id, right_id| {
+            let left = &self.subagents[left_id];
+            let right = &self.subagents[right_id];
+            left.finished
+                .is_some()
+                .cmp(&right.finished.is_some())
+                .then_with(|| right_id.cmp(left_id))
+        });
+        ids
     }
 
     pub fn nested_agent(&self, id: u64) -> Option<&SubagentStatus> {
@@ -2331,6 +2341,11 @@ impl AppState {
     /// Push a user prompt into the transcript immediately, before the
     /// command reaches the runtime. Keeps the UI responsive.
     pub fn record_user_prompt(&mut self, text: String) {
+        self.workflow_clocks.retain(|workflow_id, _| {
+            self.workflows
+                .get(*workflow_id)
+                .is_some_and(|workflow| workflow.outcome.is_none())
+        });
         self.pending_workspace_diff_total = None;
         self.agent_open_message_index = None;
         let prompt_index = self.transcript.len();
@@ -2645,6 +2660,7 @@ impl AppState {
                     self.subagent_active = false;
                     self.subagent_label = None;
                     self.active_subagents = 0;
+                    self.workflow_clocks.clear();
                     if !self.tool_detail_overrides.is_empty() {
                         self.tool_detail_overrides.clear();
                         self.bump_transcript_revision();
@@ -2874,6 +2890,12 @@ impl AppState {
 
         match &event.transition {
             WorkflowTransition::Started { kind, .. } => {
+                self.workflow_clocks
+                    .entry(event.workflow_id)
+                    .or_insert_with(|| WorkflowClock {
+                        started_at: Instant::now(),
+                        finished_at: None,
+                    });
                 if *kind == WorkflowKind::Review {
                     self.push_system_message("review started");
                 }
@@ -2961,19 +2983,51 @@ impl AppState {
                 }
             }
             WorkflowTransition::Terminal { outcome, .. } => {
-                let summary = self.workflows.get(event.workflow_id).and_then(|state| {
-                    (state.kind == WorkflowKind::Review).then(|| match outcome {
-                        WorkflowOutcome::Clean => {
-                            "review complete · no material findings".to_string()
+                let summary = self
+                    .workflows
+                    .get(event.workflow_id)
+                    .map(|state| match state.kind {
+                        WorkflowKind::Review => match outcome {
+                            WorkflowOutcome::Clean => {
+                                "review complete · no material findings".to_string()
+                            }
+                            WorkflowOutcome::Completed => "review complete".to_string(),
+                            WorkflowOutcome::Degraded => {
+                                "review complete · degraded coverage".to_string()
+                            }
+                            WorkflowOutcome::Failed => "review failed".to_string(),
+                            WorkflowOutcome::Cancelled => "review cancelled".to_string(),
+                        },
+                        WorkflowKind::Delegation => {
+                            let completed = state.completed_count();
+                            let failed = state.failed_count();
+                            let cancelled = state.cancelled_count();
+                            let head = match outcome {
+                                WorkflowOutcome::Completed
+                                | WorkflowOutcome::Clean
+                                | WorkflowOutcome::Degraded => "subagents complete",
+                                WorkflowOutcome::Failed => "subagents failed",
+                                WorkflowOutcome::Cancelled => "subagents cancelled",
+                            };
+                            let mut parts = vec![head.to_string()];
+                            if completed > 0 {
+                                parts.push(format!("{completed} completed"));
+                            }
+                            if failed > 0 {
+                                parts.push(format!("{failed} failed"));
+                            }
+                            if cancelled > 0 {
+                                parts.push(format!("{cancelled} cancelled"));
+                            }
+                            if state.coverage == crate::workflow::WorkflowCoverage::Degraded {
+                                parts.push("degraded coverage".to_string());
+                            }
+                            parts.join(" · ")
                         }
-                        WorkflowOutcome::Completed => "review complete".to_string(),
-                        WorkflowOutcome::Degraded => {
-                            "review complete · degraded coverage".to_string()
-                        }
-                        WorkflowOutcome::Failed => "review failed".to_string(),
-                        WorkflowOutcome::Cancelled => "review cancelled".to_string(),
-                    })
-                });
+                    });
+                if let Some(clock) = self.workflow_clocks.get_mut(&event.workflow_id) {
+                    clock.finished_at = Some(Instant::now());
+                }
                 if let Some(summary) = summary {
                     self.push_system_message(summary);
                 }
@@ -3043,8 +3097,8 @@ impl AppState {
                 };
                 if !resumed {
                     // A retained actor has one identity across ACP turns. Its
-                    // later resumes update the live row without manufacturing
-                    // another permanent "started" record.
+                    // later resumes update the durable detail without
+                    // manufacturing another permanent "started" record.
                     let headline = ragnarok::first_line(&objective, SUBAGENT_RECORD_LINE_CHARS);
                     let actor = role
                         .as_ref()
@@ -3069,10 +3123,10 @@ impl AppState {
                     StatusKind::Info,
                     if resumed {
                         format!(
-                            "subagent #{subagent_id} · {label} resumed ({backend}) · F11 inspect"
+                            "subagent #{subagent_id} · {label} resumed ({backend}) · /subagents"
                         )
                     } else {
-                        format!("subagent #{subagent_id} · {label} ({backend}) · F11 inspect")
+                        format!("subagent #{subagent_id} · {label} ({backend}) · /subagents")
                     },
                 );
             }
@@ -3180,13 +3234,13 @@ impl AppState {
                 match outcome {
                     SubagentOutcome::Completed => self.set_status_line(
                         StatusKind::Info,
-                        format!("subagent #{subagent_id} complete · F11 inspect"),
+                        format!("subagent #{subagent_id} complete · /subagents"),
                     ),
                     SubagentOutcome::Cancelled => {
                         self.mark_subagent_tools_failed(subagent_id, "tool call cancelled");
                         self.set_status_line(
                             StatusKind::Info,
-                            format!("subagent #{subagent_id} cancelled · F11 inspect"),
+                            format!("subagent #{subagent_id} cancelled · /subagents"),
                         );
                     }
                     SubagentOutcome::Failed(message) => {
@@ -3195,7 +3249,7 @@ impl AppState {
                         // this subagent's permanent transcript entry.
                         self.set_status_line(
                             StatusKind::Warning,
-                            format!("subagent #{subagent_id} failed · {message} · F11 inspect"),
+                            format!("subagent #{subagent_id} failed · {message} · /subagents"),
                         );
                     }
                 }
@@ -3203,9 +3257,9 @@ impl AppState {
         }
     }
 
-    /// Closes out a subagent's live row, retains its private transcript for the
-    /// session, and appends only a compact lifecycle summary to the primary
-    /// transcript.
+    /// Closes out a subagent's durable state, retains its private transcript
+    /// for the session, and appends only a compact lifecycle summary to the
+    /// primary transcript.
     fn finish_subagent_row(&mut self, subagent_id: u64, outcome: &SubagentOutcome) {
         let now = Instant::now();
         let status = match outcome {
@@ -3266,33 +3320,31 @@ impl AppState {
         self.push_system_message(record);
     }
 
-    /// Status rows in render order: everything still running first (in spawn
-    /// order), then rows that finished recently enough to still be shown.
-    pub fn subagent_status_rows_at(
+    pub fn visible_workflows(&self) -> impl Iterator<Item = &crate::workflow::WorkflowState> {
+        self.workflows
+            .iter()
+            .filter(|workflow| self.workflow_clocks.contains_key(&workflow.id))
+    }
+
+    pub fn has_active_workflows(&self) -> bool {
+        self.visible_workflows()
+            .any(|workflow| workflow.outcome.is_none())
+    }
+
+    pub fn workflow_elapsed_at(
         &self,
+        workflow_id: crate::workflow::WorkflowId,
         now: Instant,
-    ) -> impl Iterator<Item = (u64, &SubagentStatus)> {
-        let running = self
-            .subagents
-            .iter()
-            .filter(|(_, row)| row.finished.is_none());
-        let done = self
-            .subagents
-            .iter()
-            .filter(move |(_, row)| row.finished.is_some() && !row.expired_at(now));
-        running.chain(done).map(|(id, row)| (*id, row))
-    }
-
-    pub fn subagent_status_rows(&self) -> impl Iterator<Item = (u64, &SubagentStatus)> {
-        self.subagent_status_rows_at(Instant::now())
-    }
-
-    /// True while the status area has anything to animate or expire, which is
-    /// what keeps timer-driven redraws running with an idle primary agent.
-    pub fn has_live_subagent_rows(&self) -> bool {
-        self.subagent_status_rows_at(Instant::now())
-            .next()
-            .is_some()
+    ) -> Duration {
+        self.workflow_clocks
+            .get(&workflow_id)
+            .map(|clock| {
+                clock
+                    .finished_at
+                    .unwrap_or(now)
+                    .saturating_duration_since(clock.started_at)
+            })
+            .unwrap_or_default()
     }
 
     pub fn running_subagent_count(&self) -> usize {
@@ -4633,6 +4685,17 @@ mod tests {
         })
     }
 
+    fn apply_workflow(
+        state: &mut AppState,
+        workflow_id: crate::workflow::WorkflowId,
+        transition: crate::workflow::WorkflowTransition,
+    ) {
+        state.apply_event(UiEvent::Workflow(crate::workflow::WorkflowEvent::new(
+            workflow_id,
+            transition,
+        )));
+    }
+
     fn subagent_started(subagent_id: u64, label: &str, objective: &str) -> UiEvent {
         UiEvent::Subagent(SubagentEvent::Started {
             subagent_id,
@@ -5054,6 +5117,24 @@ mod tests {
     }
 
     #[test]
+    fn nested_viewer_orders_every_actor_with_newest_running_first() {
+        let mut state = AppState::new();
+        state.apply_event(subagent_started(1, "old-complete", "done"));
+        state.apply_event(subagent_started(2, "older-running", "work"));
+        state.apply_event(finished_subagent(1, SubagentOutcome::Completed));
+        state.apply_event(subagent_started(3, "newest-running", "work"));
+
+        assert_eq!(state.nested_agent_viewer_ids(), vec![3, 2, 1]);
+        assert!(state.open_nested_agent_viewer());
+        assert_eq!(state.nested_agent_selected, Some(3));
+        state.select_nested_agent(true);
+        assert_eq!(state.nested_agent_selected, Some(2));
+        assert_eq!(state.nested_agent_scroll_offset, usize::MAX);
+        state.select_nested_agent(true);
+        assert_eq!(state.nested_agent_selected, Some(1));
+    }
+
+    #[test]
     fn concurrent_subagent_message_and_thought_streams_never_merge() {
         let mut state = AppState::new();
         state.apply_event(subagent_started(1, "one", ""));
@@ -5329,7 +5410,7 @@ mod tests {
     }
 
     #[test]
-    fn a_started_subagent_opens_a_status_row_and_one_transcript_record() {
+    fn a_started_subagent_populates_durable_state_and_one_transcript_record() {
         let mut state = AppState::new();
         state.apply_event(subagent_started(
             3,
@@ -5337,18 +5418,19 @@ mod tests {
             "Fix the failing parser tests\ndetail",
         ));
 
-        let rows: Vec<(u64, &SubagentStatus)> = state.subagent_status_rows().collect();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, 3);
-        assert_eq!(rows[0].1.label, "fix-tests");
-        assert_eq!(rows[0].1.model.as_deref(), Some("gpt-y"));
+        let actor = state.nested_agent(3).expect("durable actor");
+        assert_eq!(actor.label, "fix-tests");
+        assert_eq!(actor.model.as_deref(), Some("gpt-y"));
         assert_eq!(
-            rows[0].1.activity, "Fix the failing parser tests\ndetail",
-            "the objective seeds the row's activity until the first update"
+            actor.activity, "Fix the failing parser tests\ndetail",
+            "the objective seeds the actor's activity until the first update"
         );
-        assert!(rows[0].1.finished.is_none());
-        assert!(state.has_live_subagent_rows());
+        assert!(actor.finished.is_none());
         assert_eq!(state.running_subagent_count(), 1);
+        assert!(
+            !state.has_active_workflows(),
+            "actor prose alone does not mint workflow progress"
+        );
 
         assert!(matches!(
             state.transcript.as_slice(),
@@ -5358,7 +5440,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_subagent_resume_reuses_its_row_and_start_record() {
+    fn retained_subagent_resume_reuses_its_state_and_start_record() {
         let mut state = AppState::new();
         state.apply_event(subagent_started(3, "review · supervisor", "review"));
         let transcript_len = state.transcript.len();
@@ -5373,11 +5455,9 @@ mod tests {
         }));
 
         assert_eq!(state.transcript.len(), transcript_len);
-        let rows = state.subagent_status_rows().collect::<Vec<_>>();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, 3);
-        assert_eq!(rows[0].1.activity, "vet two automatic reviewer reports");
-        assert!(rows[0].1.finished.is_none());
+        let actor = state.nested_agent(3).expect("retained actor");
+        assert_eq!(actor.activity, "vet two automatic reviewer reports");
+        assert!(actor.finished.is_none());
         assert!(
             state
                 .status_line
@@ -5387,7 +5467,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_activity_updates_the_row_without_touching_the_transcript() {
+    fn subagent_activity_updates_durable_state_without_touching_the_transcript() {
         let mut state = AppState::new();
         state.apply_event(subagent_started(1, "explore", "look around"));
         let entries = state.transcript.len();
@@ -5397,7 +5477,7 @@ mod tests {
         state.apply_event(subagent_activity(1, "running cargo test"));
 
         assert_eq!(
-            state.subagent_status_rows().next().expect("row").1.activity,
+            state.nested_agent(1).expect("actor").activity,
             "running cargo test"
         );
         assert_eq!(
@@ -5413,11 +5493,11 @@ mod tests {
 
         // An activity for an unknown id is dropped rather than resurrecting a row.
         state.apply_event(subagent_activity(99, "ghost"));
-        assert_eq!(state.subagent_status_rows().count(), 1);
+        assert!(state.nested_agent(99).is_none());
     }
 
     #[test]
-    fn a_finished_subagent_records_its_outcome_and_expires_after_the_ttl() {
+    fn a_finished_subagent_records_and_retains_its_outcome() {
         let mut state = AppState::new();
         state.apply_event(subagent_started(1, "fix-tests", "fix them"));
         state.apply_event(finished_subagent(1, SubagentOutcome::Completed));
@@ -5431,28 +5511,11 @@ mod tests {
             "{record}"
         );
 
-        let now = Instant::now();
-        assert_eq!(
-            state.subagent_status_rows_at(now).count(),
-            1,
-            "a done row stays readable inside its TTL"
-        );
         assert_eq!(state.running_subagent_count(), 0);
-
-        // Age the finish stamp past the TTL: the row filters itself out, which
-        // is what a timer-driven redraw observes.
-        let expired = now
-            .checked_sub(SUBAGENT_DONE_TTL + Duration::from_secs(1))
-            .expect("an instant before the TTL window");
-        if let Some((_, at)) = state.subagents.get_mut(&1).expect("row").finished.as_mut() {
-            *at = expired;
-        }
-        assert_eq!(state.subagent_status_rows_at(now).count(), 0);
-        assert!(!state.has_live_subagent_rows());
-        assert!(
-            state.nested_agent(1).is_some(),
-            "the five-second TTL hides only the compact status row"
-        );
+        assert!(matches!(
+            state.nested_agent(1).and_then(SubagentStatus::outcome),
+            Some(SubagentOutcome::Completed)
+        ));
     }
 
     #[test]
@@ -5471,31 +5534,24 @@ mod tests {
         assert!(record.contains("failed: adapter exited"), "{record}");
         assert!(!record.contains("stack trace"), "{record}");
         assert!(matches!(
-            state
-                .subagent_status_rows()
-                .next()
-                .expect("row")
-                .1
-                .outcome(),
+            state.nested_agent(2).expect("actor").outcome(),
             Some(SubagentOutcome::Failed(_))
         ));
     }
 
     #[test]
-    fn status_rows_list_running_subagents_in_spawn_order_before_finished_ones() {
+    fn running_subagent_count_excludes_finished_actors() {
         let mut state = AppState::new();
         for id in [1, 2, 3] {
             state.apply_event(subagent_started(id, &format!("lane-{id}"), "work"));
         }
         state.apply_event(finished_subagent(1, SubagentOutcome::Completed));
 
-        let order: Vec<u64> = state.subagent_status_rows().map(|(id, _)| id).collect();
-        assert_eq!(
-            order,
-            vec![2, 3, 1],
-            "running rows come first in spawn order, then recently finished ones"
-        );
         assert_eq!(state.running_subagent_count(), 2);
+        assert!(matches!(
+            state.nested_agent(1).and_then(SubagentStatus::outcome),
+            Some(SubagentOutcome::Completed)
+        ));
     }
 
     #[test]
@@ -5646,6 +5702,186 @@ mod tests {
                 kind: StatusKind::Warning,
                 ref text,
             }) if text == "subagent #7 · adapter authentication expires soon"
+        ));
+    }
+
+    #[test]
+    fn delegation_terminal_summary_matches_the_authoritative_outcome() {
+        use crate::workflow::{
+            WorkflowCoverage, WorkflowId, WorkflowKind, WorkflowOutcome, WorkflowPhase,
+            WorkflowStage, WorkflowTransition,
+        };
+
+        for (turn_id, outcome, coverage, expected) in [
+            (
+                1,
+                WorkflowOutcome::Completed,
+                WorkflowCoverage::Complete,
+                "subagents complete",
+            ),
+            (
+                2,
+                WorkflowOutcome::Failed,
+                WorkflowCoverage::Degraded,
+                "subagents failed · degraded coverage",
+            ),
+            (
+                3,
+                WorkflowOutcome::Cancelled,
+                WorkflowCoverage::Degraded,
+                "subagents cancelled · degraded coverage",
+            ),
+        ] {
+            let mut state = AppState::new();
+            let workflow_id = WorkflowId::delegation(turn_id);
+            apply_workflow(
+                &mut state,
+                workflow_id,
+                WorkflowTransition::Started {
+                    kind: WorkflowKind::Delegation,
+                    stage: WorkflowStage::new(0, WorkflowPhase::Delegating),
+                },
+            );
+            apply_workflow(
+                &mut state,
+                workflow_id,
+                WorkflowTransition::Terminal { outcome, coverage },
+            );
+
+            assert!(matches!(
+                state.transcript.last(),
+                Some(Entry::System(summary)) if summary == expected
+            ));
+            assert!(
+                !state.transcript.iter().any(
+                    |entry| matches!(entry, Entry::System(summary) if summary.contains("F11"))
+                ),
+                "permanent scrollback must not bake in a keybinding hint"
+            );
+        }
+    }
+
+    #[test]
+    fn next_prompt_retires_only_terminal_workflow_rows_and_clock_stays_frozen() {
+        use crate::workflow::{
+            WorkflowCoverage, WorkflowId, WorkflowKind, WorkflowOutcome, WorkflowPhase,
+            WorkflowStage, WorkflowTransition,
+        };
+
+        let mut state = AppState::new();
+        let unfinished = WorkflowId::delegation(10);
+        let terminal = WorkflowId::review(10);
+        for (workflow_id, kind, phase) in [
+            (
+                unfinished,
+                WorkflowKind::Delegation,
+                WorkflowPhase::Delegating,
+            ),
+            (terminal, WorkflowKind::Review, WorkflowPhase::Supervision),
+        ] {
+            apply_workflow(
+                &mut state,
+                workflow_id,
+                WorkflowTransition::Started {
+                    kind,
+                    stage: WorkflowStage::new(0, phase),
+                },
+            );
+        }
+        apply_workflow(
+            &mut state,
+            terminal,
+            WorkflowTransition::Terminal {
+                outcome: WorkflowOutcome::Clean,
+                coverage: WorkflowCoverage::Complete,
+            },
+        );
+
+        let now = Instant::now();
+        assert_eq!(
+            state.workflow_elapsed_at(terminal, now),
+            state.workflow_elapsed_at(terminal, now + Duration::from_secs(60)),
+            "terminal elapsed time must stay frozen"
+        );
+
+        state.record_user_prompt("next turn".to_string());
+        let visible = state
+            .visible_workflows()
+            .map(|workflow| workflow.id)
+            .collect::<Vec<_>>();
+        assert_eq!(visible, vec![unfinished]);
+        assert!(state.workflows.get(terminal).is_some());
+    }
+
+    #[test]
+    fn session_switch_hides_progress_without_clearing_in_flight_reducer_state() {
+        use crate::workflow::{
+            WorkflowActorId, WorkflowActorRole, WorkflowCoverage, WorkflowId, WorkflowKind,
+            WorkflowOutcome, WorkflowPhase, WorkflowStage, WorkflowTransition,
+        };
+
+        let mut state = AppState::new();
+        state.apply_event(UiEvent::SessionStarted {
+            session_id: "one".to_string(),
+            resumed: false,
+        });
+        let workflow_id = WorkflowId::delegation(20);
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::Started {
+                kind: WorkflowKind::Delegation,
+                stage: WorkflowStage::new(0, WorkflowPhase::Delegating),
+            },
+        );
+
+        state.apply_event(UiEvent::SessionStarted {
+            session_id: "two".to_string(),
+            resumed: false,
+        });
+        assert!(state.visible_workflows().next().is_none());
+        assert!(state.workflows.get(workflow_id).is_some());
+
+        let actor_id = WorkflowActorId::Subagent(77);
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::ActorStarted {
+                actor_id: actor_id.clone(),
+                role: WorkflowActorRole::Implementation,
+            },
+        );
+        assert_eq!(
+            state.nested_agent(77).and_then(|actor| actor.role.clone()),
+            Some(WorkflowActorRole::Implementation)
+        );
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::ActorFinished {
+                actor_id,
+                outcome: SubagentOutcome::Completed,
+            },
+        );
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                coverage: WorkflowCoverage::Complete,
+            },
+        );
+
+        assert_eq!(
+            state
+                .workflows
+                .get(workflow_id)
+                .and_then(|workflow| workflow.outcome),
+            Some(WorkflowOutcome::Completed)
+        );
+        assert!(matches!(
+            state.transcript.last(),
+            Some(Entry::System(summary)) if summary == "subagents complete · 1 completed"
         ));
     }
 

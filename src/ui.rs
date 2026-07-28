@@ -79,8 +79,9 @@ const HELP_SCROLL_PAGE_STEP: u16 = 10;
 /// Inline viewport height for the `/mjconfig` overlay (border + two sections).
 const INLINE_MJCONFIG_HEIGHT: u16 = 24;
 const QUEUED_PROMPT_VISIBLE_ROWS: usize = 3;
-/// Subagent status rows rendered before the area folds into a "… N more" line.
-const SUBAGENT_VISIBLE_ROWS: usize = 4;
+/// Workflow progress rows rendered before the area folds into a "… N more"
+/// line. Normal orchestration has at most delegation and review active.
+const WORKFLOW_PROGRESS_VISIBLE_ROWS: usize = 2;
 const CURSOR_POSITION_TIMEOUT_MESSAGE: &str =
     "The cursor position could not be read within a normal duration";
 const INLINE_SETUP_RETRY_DELAY: Duration = Duration::from_millis(75);
@@ -412,6 +413,10 @@ fn inline_reader_accepts_input(state: &AppState) -> bool {
         || (state.workspace_diff_viewer
             && !state.has_pending_permission()
             && !state.has_pending_elicitation())
+}
+
+fn inline_reader_is_open(state: &AppState) -> bool {
+    state.transcript_viewer || state.nested_agent_viewer || state.workspace_diff_viewer
 }
 
 #[derive(Debug)]
@@ -1019,9 +1024,9 @@ fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
         UiEvent::Side(event) => ui_event_redraw_cause(event),
         UiEvent::SideStartFailed { .. } => RedrawCause::Interactive,
         UiEvent::SessionUpdate(_) | UiEvent::TerminalOutput(_) => RedrawCause::Stream,
-        // Activity only rewrites one status row's text, so it coalesces with
-        // streaming output. Started/Finished change the status area's height
-        // and fall through to the interactive arm below.
+        // Nested activity only rewrites private actor detail, so it coalesces
+        // with streaming output. Lifecycle events also update transcript and
+        // viewer structure, so they remain interactive below.
         UiEvent::Subagent(
             crate::event::SubagentEvent::SessionUpdate { .. }
             | crate::event::SubagentEvent::TerminalOutput { .. }
@@ -1150,6 +1155,7 @@ async fn ui_loop(
     let mut last_draw = Instant::now();
     let mut force_inline_repair = false;
     let mut force_soft_inline_repair = false;
+    let mut restore_inline_after_reader = false;
 
     loop {
         tokio::select! {
@@ -1181,6 +1187,8 @@ async fn ui_loop(
                         }
                         let inline_reader_was_active =
                             mode == UiMode::InlineChat && inline_reader_accepts_input(&state);
+                        let inline_reader_was_open =
+                            mode == UiMode::InlineChat && inline_reader_is_open(&state);
                         let request = handle_crossterm(&mut state, cmd_tx, ev, mode);
                         if mode == UiMode::InlineChat
                             && inline_reader_was_active != inline_reader_accepts_input(&state)
@@ -1194,6 +1202,10 @@ async fn ui_loop(
                             && terminal_request_forces_inline_repair(&request)
                         {
                             force_soft_inline_repair = true;
+                        }
+                        if inline_reader_was_open && !inline_reader_is_open(&state) {
+                            restore_inline_after_reader = true;
+                            force_soft_inline_repair = false;
                         }
                         apply_terminal_request(
                             terminal,
@@ -1300,6 +1312,8 @@ async fn ui_loop(
                         };
                         let inline_reader_was_active =
                             mode == UiMode::InlineChat && inline_reader_accepts_input(&state);
+                        let inline_reader_was_open =
+                            mode == UiMode::InlineChat && inline_reader_is_open(&state);
                         let redraw_cause = ui_event_redraw_cause(&ev);
                         let force_repair_for_event =
                             should_force_inline_repair_for_ui_event(mode, &ev);
@@ -1338,6 +1352,9 @@ async fn ui_loop(
                                 terminal,
                                 inline_reader_accepts_input(&state),
                             )?;
+                        }
+                        if inline_reader_was_open && !inline_reader_is_open(&state) {
+                            restore_inline_after_reader = true;
                         }
                         if force_repair_for_event {
                             force_inline_repair = true;
@@ -1462,6 +1479,21 @@ async fn ui_loop(
             &state,
             &mut inline_height,
         )? {
+            restore_inline_after_reader = false;
+            pending_redraw.mark_interactive();
+        }
+
+        if mode == UiMode::InlineChat
+            && restore_inline_after_reader
+            && !inline_resize_reflow.is_pending()
+        {
+            force_soft_inline_repair = false;
+            restore_inline_after_reader = !restore_inline_viewport_after_reader(
+                terminal,
+                &mut transcript_sink,
+                &state,
+                &mut inline_height,
+            )?;
             pending_redraw.mark_interactive();
         }
 
@@ -1797,9 +1829,9 @@ fn timer_driven_live_redraw(mode: UiMode, state: &AppState) -> bool {
         return true;
     }
     if mode == UiMode::InlineChat && state.is_busy() {
-        // Subagent rows animate and expire on wall-clock time, so they need the
-        // timer even in the inline mode that otherwise suppresses it.
-        return should_show_spinner(state) || state.has_live_subagent_rows();
+        // Workflow progress animates on wall-clock time, so it needs the timer
+        // even in the inline mode that otherwise suppresses it.
+        return should_show_spinner(state) || state.has_active_workflows();
     }
 
     needs_live_redraw(state)
@@ -1824,10 +1856,8 @@ fn needs_live_redraw(state: &AppState) -> bool {
         || state.config_picker.is_some()
         // Keep redrawing so the menu's live spinner previews keep animating.
         || state.mjconfig_menu.is_some()
-        // Background subagents outlive the primary's turn: without this their
-        // spinners freeze and finished rows never reach their TTL, because no
-        // event fires when a row expires.
-        || state.has_live_subagent_rows()
+        // Background workflows can outlive the primary's turn.
+        || state.has_active_workflows()
         || should_show_spinner(state)
 }
 
@@ -2044,6 +2074,128 @@ fn insert_lines_before_inline_viewport(
     Ok(())
 }
 
+fn insert_stable_transcript_tail_before_inline_viewport<B>(
+    terminal: &mut Terminal<B>,
+    state: &AppState,
+    width: u16,
+    max_rows: u16,
+) -> Result<bool>
+where
+    B: Backend,
+    B::Error: Error + Send + Sync + 'static,
+{
+    if width == 0 || max_rows == 0 {
+        return Ok(false);
+    }
+    let stable_entries = stable_transcript_entry_count(state);
+    let lines = render_transcript_entry_range(
+        state,
+        width,
+        0..stable_entries,
+        transcript_collapse_limit(state),
+        state.theme,
+        false,
+    );
+    if lines.is_empty() {
+        return Ok(true);
+    }
+    let total = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width);
+    let height = total.min(usize::from(max_rows)).min(usize::from(u16::MAX)) as u16;
+    if height == 0 {
+        return Ok(true);
+    }
+    let top = total
+        .saturating_sub(usize::from(height))
+        .min(usize::from(u16::MAX)) as u16;
+    match terminal.insert_before(height, |buf| {
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((top, 0))
+            .render(buf.area, buf);
+    }) {
+        Ok(()) => Ok(true),
+        Err(e) if is_cursor_position_timeout_error(&e) => {
+            trace_inline_cursor_position_timeout("reader transcript restore", &e);
+            Ok(false)
+        }
+        Err(e) => Err(e).context("restore transcript after inline reader"),
+    }
+}
+
+/// A full-height inline reader temporarily paints over transcript rows on the
+/// visible screen. Restore the stable transcript tail into those rows before
+/// returning to the compact viewport; older terminal scrollback is left
+/// untouched.
+fn restore_inline_viewport_after_reader(
+    terminal: &mut Terminal<TrackedBackend<Stdout>>,
+    sink: &mut TranscriptSink,
+    state: &AppState,
+    current_height: &mut u16,
+) -> Result<bool> {
+    let size = match terminal.size() {
+        Ok(size) => size,
+        Err(e) if is_cursor_position_timeout_io(&e) => {
+            trace_inline_cursor_position_timeout("reader restore size query", &e);
+            return Ok(false);
+        }
+        Err(e) => {
+            tracing::warn!("skip inline reader restore: size query failed: {e}");
+            return Ok(false);
+        }
+    };
+    let height = clamped_inline_height(desired_inline_height(state, size), size);
+    let origin = Position::new(0, size.height.saturating_sub(height));
+
+    if let Err(e) = terminal.backend_mut().write_all(b"\x1b[r\x1b[0m") {
+        tracing::warn!("skip inline reader restore: reset failed: {e}");
+        return Ok(false);
+    }
+    if let Err(e) = terminal.backend_mut().clear_region(ClearType::All) {
+        tracing::warn!("skip inline reader restore: clear failed: {e}");
+        return Ok(false);
+    }
+    if let Err(e) = terminal.backend_mut().set_cursor_position(origin) {
+        if is_cursor_position_timeout_io(&e) {
+            trace_inline_cursor_position_timeout("reader restore cursor move", &e);
+        } else {
+            tracing::warn!("skip inline reader restore: cursor move failed: {e}");
+        }
+        return Ok(false);
+    }
+    if let Err(e) = Write::flush(terminal.backend_mut()) {
+        tracing::warn!("skip inline reader restore: flush failed: {e}");
+        return Ok(false);
+    }
+
+    let backend = TrackedBackend::with_cursor_position(io::stdout(), origin);
+    let next = match Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(height),
+        },
+    ) {
+        Ok(next) => next,
+        Err(e) => {
+            tracing::warn!("skip inline reader restore: recreate failed: {e:#}");
+            return Ok(false);
+        }
+    };
+    *terminal = next;
+    *current_height = height;
+    let restored = insert_stable_transcript_tail_before_inline_viewport(
+        terminal,
+        state,
+        size.width,
+        size.height.saturating_sub(height),
+    )?;
+    if restored {
+        sink.mark_emitted(stable_transcript_entry_count(state));
+    }
+    Ok(restored)
+}
+
 fn sync_inline_terminal_height(
     terminal: &mut Terminal<TrackedBackend<Stdout>>,
     state: &AppState,
@@ -2144,10 +2296,8 @@ fn inline_viewport_resize_plan(
 }
 
 fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
-    // The full-transcript reader takes the whole terminal (minus one row) so
-    // long histories are calm to page through. It outranks the compact
-    // overlays below but yields to a pending permission prompt, which must
-    // stay visible and actionable.
+    // Full-history readers take the whole terminal (minus one row) so long
+    // documents and complete nested-actor rosters are calm to page through.
     if (state.transcript_viewer || state.nested_agent_viewer || state.workspace_diff_viewer)
         && !state.has_pending_permission()
         && !state.has_pending_elicitation()
@@ -2214,7 +2364,7 @@ fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
         // the input box keeps its full height while the queue is visible.
         usize::from(INLINE_CHAT_HEIGHT)
             + usize::from(queued_prompt_row_count(state))
-            + usize::from(subagent_status_row_count(state))
+            + usize::from(workflow_progress_row_count(state))
             + usage_quota_row_count(state, width)
             + inline_transcript_tail_row_count(state, width)
     };
@@ -5558,14 +5708,14 @@ fn draw(
     let input_height = input_height.clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT);
 
     let queued_row = queued_prompt_row_count(state);
-    let subagent_rows = subagent_status_row_count(state);
+    let workflow_rows = workflow_progress_row_count(state);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
             Constraint::Length(1),
-            Constraint::Length(subagent_rows),
+            Constraint::Length(workflow_rows),
             Constraint::Length(queued_row),
             Constraint::Length(input_height),
             Constraint::Length(usage_quota_rows),
@@ -5581,7 +5731,7 @@ fn draw(
         draw_transcript(f, chunks[0], state, transcript_scroll);
     }
     draw_header(f, chunks[1], state);
-    draw_subagent_status_rows(f, chunks[2], state);
+    draw_workflow_progress_rows(f, chunks[2], state);
     draw_queued_prompt_row(f, chunks[3], state);
     draw_input(f, chunks[4], state, mode);
     draw_usage_quota_row(f, chunks[5], state);
@@ -5750,7 +5900,7 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
     let has_config_options = !state.selectable_config_options().is_empty();
     let usage_quota_rows = usage_quota_row_count(state, f.area().width) as u16;
     let queued_row = queued_prompt_row_count(state);
-    let subagent_rows = subagent_status_row_count(state);
+    let workflow_rows = workflow_progress_row_count(state);
     let live_rows = inline_transcript_tail_row_count(state, f.area().width)
         .min(usize::from(f.area().height)) as u16;
     let chunks = Layout::default()
@@ -5758,7 +5908,7 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
         .constraints([
             Constraint::Length(live_rows),
             Constraint::Length(1),
-            Constraint::Length(subagent_rows),
+            Constraint::Length(workflow_rows),
             Constraint::Length(queued_row),
             Constraint::Min(MIN_INPUT_HEIGHT),
             Constraint::Length(usage_quota_rows),
@@ -5768,7 +5918,7 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
 
     draw_inline_transcript_tail(f, chunks[0], state);
     draw_header(f, chunks[1], state);
-    draw_subagent_status_rows(f, chunks[2], state);
+    draw_workflow_progress_rows(f, chunks[2], state);
     draw_queued_prompt_row(f, chunks[3], state);
     draw_input(f, chunks[4], state, UiMode::InlineChat);
     draw_usage_quota_row(f, chunks[5], state);
@@ -6314,14 +6464,19 @@ fn draw_nested_agent_viewer(
         return;
     }
 
+    #[cfg(target_os = "macos")]
     let footer =
-        "F11/Esc close · Left/Right agent · Up/Down PgUp/PgDn Home/End scroll · Alt-T tool";
+        "Esc close · Left/Right agent · Up/Down scroll · Fn+Up/Down page · Home/End · Alt-T tool";
+    #[cfg(not(target_os = "macos"))]
+    let footer =
+        "Esc close · Left/Right agent · Up/Down scroll · PgUp/PgDn page · Home/End · Alt-T tool";
     let footer_height = Paragraph::new(footer)
         .wrap(Wrap { trim: false })
         .line_count(area.width)
         .max(1)
         .min(usize::from(u16::MAX)) as u16;
-    let roster_rows = state.nested_agents().count().clamp(1, 5) as u16;
+    let actor_ids = state.nested_agent_viewer_ids();
+    let roster_rows = actor_ids.len().clamp(1, usize::from(u16::MAX)) as u16;
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -6339,22 +6494,23 @@ fn draw_nested_agent_viewer(
     let roster_inner = roster_block.inner(layout[0]);
     f.render_widget(roster_block, layout[0]);
     if roster_inner.width > 0 && roster_inner.height > 0 {
-        let roster = state
-            .nested_agents()
-            .map(|(id, actor)| {
-                nested_agent_roster_line(
-                    id,
+        let roster = actor_ids
+            .iter()
+            .filter_map(|id| {
+                let actor = state.nested_agent(*id)?;
+                Some(nested_agent_roster_line(
+                    *id,
                     actor,
-                    state.nested_agent_selected == Some(id),
+                    state.nested_agent_selected == Some(*id),
                     now,
                     usize::from(roster_inner.width),
                     state.theme,
-                )
+                ))
             })
             .collect::<Vec<_>>();
         let selected = state
             .nested_agent_selected
-            .and_then(|selected| state.nested_agents().position(|(id, _)| id == selected))
+            .and_then(|selected| actor_ids.iter().position(|id| *id == selected))
             .unwrap_or(0);
         let visible = usize::from(roster_inner.height);
         let start = selected
@@ -9465,48 +9621,70 @@ fn queued_prompt_row_count(state: &AppState) -> u16 {
     (visible + overflow).min(u16::MAX as usize) as u16
 }
 
-/// Height of the dedicated subagent status area: zero when nothing is running
-/// (so every existing layout is untouched), otherwise one line per visible
-/// subagent plus an overflow line when there are more than fit.
-fn subagent_status_row_count(state: &AppState) -> u16 {
-    let count = state.subagent_status_rows().count();
+/// Height of the dedicated workflow progress area. Actor launch and finish
+/// events cannot change it: one row is allocated at workflow start, shows the
+/// terminal outcome, and is retired when the next user turn begins.
+fn workflow_progress_row_count(state: &AppState) -> u16 {
+    let count = state.visible_workflows().count();
     if count == 0 {
         return 0;
     }
-    let visible = count.min(SUBAGENT_VISIBLE_ROWS);
-    let overflow = usize::from(count > SUBAGENT_VISIBLE_ROWS);
+    let visible = count.min(WORKFLOW_PROGRESS_VISIBLE_ROWS);
+    let overflow = usize::from(count > WORKFLOW_PROGRESS_VISIBLE_ROWS);
     (visible + overflow).min(u16::MAX as usize) as u16
 }
 
-/// One line per background subagent, between the header and the input box.
-/// Running rows animate (shared wall-clock spinner, ticking elapsed time);
-/// finished rows linger for [`app::SUBAGENT_DONE_TTL`] with their outcome and
-/// are dropped by the next redraw after that.
-fn draw_subagent_status_rows(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+/// One stable line per visible delegation or review workflow, shared by inline
+/// and fullscreen layouts. `/subagents` opens the actor-level transcripts.
+fn draw_workflow_progress_rows(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let now = Instant::now();
-    let rows: Vec<(u64, &crate::app::SubagentStatus)> =
-        state.subagent_status_rows_at(now).collect();
-    if rows.is_empty() {
+    let mut workflows = state.visible_workflows().collect::<Vec<_>>();
+    if workflows.is_empty() {
         return;
     }
-    let total = rows.len();
-    // Rows arrive running-first, so truncating the tail folds finished rows
-    // before it ever hides live work.
+    // Keep live work ahead of terminal history, then prefer the newest turn.
+    // Actor churn cannot affect this ordering.
+    workflows.sort_by(|left, right| {
+        left.outcome
+            .is_some()
+            .cmp(&right.outcome.is_some())
+            .then_with(|| right.id.turn_id.cmp(&left.id.turn_id))
+            .then_with(|| left.id.operation.cmp(&right.id.operation))
+    });
+    let total = workflows.len();
     let capacity = usize::from(area.height);
     let visible = if total > capacity {
         capacity.saturating_sub(1)
     } else {
-        total.min(SUBAGENT_VISIBLE_ROWS)
+        total.min(WORKFLOW_PROGRESS_VISIBLE_ROWS)
     };
-    let spinner = state.spinner_style.current_frame();
+    let spinner = state.spinner_style.compact_frame();
     let width = usize::from(area.width);
-    let mut lines: Vec<Line<'static>> = rows
+    let mut lines: Vec<Line<'static>> = workflows
         .iter()
         .take(visible)
-        .map(|(_, row)| subagent_status_line(row, spinner, now, width, state.theme))
+        .map(|workflow| {
+            // `/subagents` opens a session-wide roster rather than a
+            // workflow-scoped drill-down. Advertise it only on rows that
+            // contribute at least one retained nested actor to that roster.
+            let show_details = workflow.actors.keys().any(|actor_id| {
+                let crate::workflow::WorkflowActorId::Subagent(subagent_id) = actor_id else {
+                    return false;
+                };
+                state.nested_agent(*subagent_id).is_some()
+            });
+            workflow_progress_line(
+                workflow,
+                spinner,
+                state.workflow_elapsed_at(workflow.id, now),
+                width,
+                state.theme,
+                show_details,
+            )
+        })
         .collect();
     if total > visible && lines.len() < capacity {
         lines.push(Line::from(Span::styled(
@@ -9517,51 +9695,144 @@ fn draw_subagent_status_rows(f: &mut ratatui::Frame, area: Rect, state: &AppStat
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn subagent_status_line(
-    row: &crate::app::SubagentStatus,
+fn workflow_progress_line(
+    workflow: &crate::workflow::WorkflowState,
     spinner: &str,
-    now: Instant,
+    elapsed: Duration,
     width: usize,
     theme: TerminalTheme,
+    show_details: bool,
 ) -> Line<'static> {
-    let model = row
-        .model
-        .as_deref()
-        .map(|model| format!(" ({model})"))
-        .unwrap_or_default();
-    let elapsed = format_duration(row.elapsed_at(now));
-    let (mark, detail, detail_color) = match row.outcome() {
-        None => {
-            let activity = row.activity.trim();
-            let detail = if activity.is_empty() {
-                format!("· {elapsed}")
-            } else {
-                format!("· {activity} · {elapsed}")
-            };
-            (spinner.to_string(), detail, theme.tool)
-        }
-        Some(SubagentOutcome::Completed) => (
-            "✔".to_string(),
-            format!("· done · {elapsed}"),
-            theme.success,
-        ),
-        Some(SubagentOutcome::Cancelled) => {
-            ("⊘".to_string(), "· cancelled".to_string(), theme.muted)
-        }
-        Some(SubagentOutcome::Failed(message)) => (
-            "✘".to_string(),
-            format!("· failed · {}", crate::ragnarok::first_line(message, 120)),
-            theme.error,
-        ),
+    use crate::workflow::{
+        WorkflowActorLifecycle, WorkflowActorRole, WorkflowCoverage, WorkflowKind, WorkflowOutcome,
+        WorkflowPhase,
     };
-    // Truncate the assembled line as one unit so a long activity string can
-    // never push the row past the pane.
-    let head = format!(" {mark} {}{model} ", row.label);
+
+    let title = match workflow.kind {
+        WorkflowKind::Delegation => "Subagents",
+        WorkflowKind::Review => "Review",
+    };
+    let mark = match workflow.outcome {
+        Some(WorkflowOutcome::Completed | WorkflowOutcome::Clean) => "✔".to_string(),
+        Some(WorkflowOutcome::Degraded) => "⚠".to_string(),
+        Some(WorkflowOutcome::Failed) => "✘".to_string(),
+        Some(WorkflowOutcome::Cancelled) => "⊘".to_string(),
+        None => spinner.to_string(),
+    };
+    let phase = match workflow.outcome {
+        Some(WorkflowOutcome::Completed | WorkflowOutcome::Clean | WorkflowOutcome::Degraded) => {
+            "complete"
+        }
+        Some(WorkflowOutcome::Failed) => "failed",
+        Some(WorkflowOutcome::Cancelled) => "cancelled",
+        None => match workflow.stage.phase {
+            WorkflowPhase::Delegating => "delegating",
+            WorkflowPhase::IntentAnalysis => "analyzing intent",
+            WorkflowPhase::Supervision => "supervising",
+            WorkflowPhase::SpecialistReview => "specialist review",
+            WorkflowPhase::Synthesis => "synthesizing",
+            WorkflowPhase::Correction => "correcting",
+            WorkflowPhase::Fallback => "fallback review",
+            WorkflowPhase::Terminal => "finishing",
+        },
+    };
+    let elapsed = format_duration(elapsed);
+    let details_hint =
+        if show_details && format!(" {mark} {title} [/subagents] · {elapsed} ").width() <= width {
+            " [/subagents]"
+        } else {
+            ""
+        };
+    let head = format!(" {mark} {title}{details_hint} · {elapsed} ");
     let head = fit_width(head, width);
     let head_width = head.width();
-    let detail = fit_width(detail, width.saturating_sub(head_width));
+    let mut details = vec![phase.to_string()];
+    if let Some(waiting) = workflow.waiting.as_ref() {
+        if waiting.requires_user_action {
+            details.push("waiting for user action".to_string());
+        } else {
+            details.push(match waiting.remaining {
+                Some(1) => "waiting for 1 automatic result".to_string(),
+                Some(remaining) => format!("waiting for {remaining} automatic results"),
+                None => format!(
+                    "waiting · {}",
+                    crate::ragnarok::first_line(&waiting.dependency, 48)
+                ),
+            });
+        }
+    }
+
+    let running = workflow.running_count();
+    let waiting_actors = workflow.waiting_count();
+    let completed = workflow.completed_count();
+    let failed = workflow.failed_count();
+    let cancelled = workflow.cancelled_count();
+    if workflow.coverage == WorkflowCoverage::Degraded {
+        details.push("degraded coverage".to_string());
+    }
+    if failed > 0 {
+        details.push(format!("{failed} failed"));
+    }
+    if cancelled > 0 {
+        details.push(format!("{cancelled} cancelled"));
+    }
+    let selected = workflow.selected_count();
+    if selected > 0 {
+        let reported = workflow
+            .actors
+            .values()
+            .filter(|actor| {
+                matches!(actor.role, WorkflowActorRole::SpecialistReviewer { .. })
+                    && matches!(
+                        actor.lifecycle,
+                        WorkflowActorLifecycle::Completed
+                            | WorkflowActorLifecycle::Failed(_)
+                            | WorkflowActorLifecycle::Cancelled
+                    )
+            })
+            .count();
+        details.push(format!("reviewers {reported}/{selected}"));
+    }
+    if running > 0 {
+        details.push(format!("{running} running"));
+    }
+    if waiting_actors > 0 {
+        details.push(format!("{waiting_actors} waiting"));
+    }
+    if completed > 0 {
+        details.push(format!("{completed} done"));
+    }
+
+    let requires_user_action = workflow
+        .waiting
+        .as_ref()
+        .is_some_and(|waiting| waiting.requires_user_action);
+    let detail_color = if failed > 0 || workflow.outcome == Some(WorkflowOutcome::Failed) {
+        theme.error
+    } else if cancelled > 0
+        || requires_user_action
+        || workflow.coverage == WorkflowCoverage::Degraded
+        || matches!(
+            workflow.outcome,
+            Some(WorkflowOutcome::Degraded | WorkflowOutcome::Cancelled)
+        )
+    {
+        theme.warning
+    } else {
+        theme.tool
+    };
+    let head_color = match workflow.outcome {
+        Some(WorkflowOutcome::Completed | WorkflowOutcome::Clean) => theme.success,
+        Some(WorkflowOutcome::Degraded | WorkflowOutcome::Cancelled) => theme.warning,
+        Some(WorkflowOutcome::Failed) => theme.error,
+        None => theme.accent,
+    };
+    let detail = fit_width(
+        format!("· {}", details.join(" · ")),
+        width.saturating_sub(head_width),
+    );
     Line::from(vec![
-        Span::styled(head, Style::default().fg(theme.accent)),
+        Span::styled(head, Style::default().fg(head_color)),
         Span::styled(detail, Style::default().fg(detail_color)),
     ])
 }
@@ -10657,7 +10928,7 @@ fn help_modal_lines(
     lines.extend([
         help_section_line("Overlays", theme),
         help_binding_line(
-            "F11 / /subagents",
+            "/subagents",
             "inspect retained implementation and review agent transcripts",
             theme,
         ),
@@ -12609,6 +12880,10 @@ mod tests {
         ElicitationPrompt, InternalMessage, SessionConfigTarget, SubagentEvent,
         TerminalOutputSnapshot,
     };
+    use crate::workflow::{
+        WorkflowActorId, WorkflowActorRole, WorkflowCoverage, WorkflowEvent, WorkflowId,
+        WorkflowKind, WorkflowOutcome, WorkflowPhase, WorkflowStage, WorkflowTransition,
+    };
 
     use super::*;
 
@@ -12637,11 +12912,31 @@ mod tests {
         }));
     }
 
-    fn finish_subagent(state: &mut AppState, subagent_id: u64, outcome: SubagentOutcome) {
-        state.apply_event(UiEvent::Subagent(SubagentEvent::Finished {
-            subagent_id,
-            outcome,
-        }));
+    fn apply_workflow(
+        state: &mut AppState,
+        workflow_id: WorkflowId,
+        transition: WorkflowTransition,
+    ) {
+        state.apply_event(UiEvent::Workflow(WorkflowEvent::new(
+            workflow_id,
+            transition,
+        )));
+    }
+
+    fn start_workflow(
+        state: &mut AppState,
+        workflow_id: WorkflowId,
+        kind: WorkflowKind,
+        phase: WorkflowPhase,
+    ) {
+        apply_workflow(
+            state,
+            workflow_id,
+            WorkflowTransition::Started {
+                kind,
+                stage: WorkflowStage::new(0, phase),
+            },
+        );
     }
 
     #[test]
@@ -13995,61 +14290,246 @@ mod tests {
     }
 
     #[test]
-    fn subagent_status_area_appears_only_while_subagents_exist() {
+    fn workflow_progress_row_is_stable_across_rapid_out_of_order_actor_churn() {
         let mut state = AppState::new();
+        let workflow_id = WorkflowId::delegation(7);
         assert_eq!(
-            subagent_status_row_count(&state),
+            workflow_progress_row_count(&state),
             0,
-            "no subagents means no layout change at all"
+            "no workflow means no layout change"
         );
+        start_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowKind::Delegation,
+            WorkflowPhase::Delegating,
+        );
+        assert_eq!(workflow_progress_row_count(&state), 1);
 
-        for id in 1..=SUBAGENT_VISIBLE_ROWS as u64 {
-            start_subagent(&mut state, id, &format!("lane-{id}"), "work");
-            assert_eq!(subagent_status_row_count(&state), id as u16);
+        for id in 1..=6 {
+            apply_workflow(
+                &mut state,
+                workflow_id,
+                WorkflowTransition::ActorStarted {
+                    actor_id: WorkflowActorId::Subagent(id),
+                    role: WorkflowActorRole::Implementation,
+                },
+            );
+            assert_eq!(
+                workflow_progress_row_count(&state),
+                1,
+                "actor launch must not move the input"
+            );
+        }
+        for id in [4, 1] {
+            apply_workflow(
+                &mut state,
+                workflow_id,
+                WorkflowTransition::ActorFinished {
+                    actor_id: WorkflowActorId::Subagent(id),
+                    outcome: SubagentOutcome::Completed,
+                },
+            );
+            assert_eq!(
+                workflow_progress_row_count(&state),
+                1,
+                "actor finish must not move the input"
+            );
         }
 
-        // Past the visible limit the area stops growing and spends one line on
-        // the overflow summary instead.
-        start_subagent(&mut state, 5, "lane-5", "work");
+        let backend = TestBackend::new(100, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_workflow_progress_rows(frame, frame.area(), &state))
+            .expect("draw workflow progress");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Subagents [/subagents]"), "{rendered}");
+        assert!(rendered.contains("delegating"), "{rendered}");
+        assert!(rendered.contains("4 running"), "{rendered}");
+        assert!(rendered.contains("2 done"), "{rendered}");
+
+        for id in [2, 3, 5, 6] {
+            apply_workflow(
+                &mut state,
+                workflow_id,
+                WorkflowTransition::ActorFinished {
+                    actor_id: WorkflowActorId::Subagent(id),
+                    outcome: SubagentOutcome::Completed,
+                },
+            );
+        }
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                coverage: WorkflowCoverage::Complete,
+            },
+        );
         assert_eq!(
-            subagent_status_row_count(&state),
-            SUBAGENT_VISIBLE_ROWS as u16 + 1
+            workflow_progress_row_count(&state),
+            1,
+            "the terminal outcome remains visible without a TTL"
+        );
+        terminal
+            .draw(|frame| draw_workflow_progress_rows(frame, frame.area(), &state))
+            .expect("draw terminal workflow outcome");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("✔ Subagents [/subagents]"), "{rendered}");
+        assert!(rendered.contains("complete"), "{rendered}");
+
+        state.record_user_prompt("next task".to_string());
+        assert_eq!(
+            workflow_progress_row_count(&state),
+            0,
+            "the next user turn retires the prior outcome"
         );
     }
 
     #[test]
-    fn subagent_status_rows_show_activity_elapsed_and_outcome() {
+    fn review_progress_shows_wait_failure_cancel_coverage_and_narrow_details_hint() {
         let mut state = AppState::new();
-        start_subagent(&mut state, 1, "fix-tests", "fix the parser tests");
-        state.apply_event(UiEvent::Subagent(SubagentEvent::Activity {
-            subagent_id: 1,
-            activity: "running cargo test".to_string(),
-        }));
-        start_subagent(&mut state, 2, "docs", "update the docs");
-        finish_subagent(&mut state, 2, SubagentOutcome::Completed);
-        start_subagent(&mut state, 3, "build", "build it");
-        finish_subagent(
+        let workflow_id = WorkflowId::review(9);
+        start_workflow(
             &mut state,
-            3,
-            SubagentOutcome::Failed("adapter exited".to_string()),
+            workflow_id,
+            WorkflowKind::Review,
+            WorkflowPhase::SpecialistReview,
+        );
+        for (id, lane) in [(11, "Týr"), (12, "Heimdall"), (13, "Freya")] {
+            apply_workflow(
+                &mut state,
+                workflow_id,
+                WorkflowTransition::ActorStarted {
+                    actor_id: WorkflowActorId::Subagent(id),
+                    role: WorkflowActorRole::SpecialistReviewer {
+                        lane: lane.to_string(),
+                    },
+                },
+            );
+        }
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::ActorFinished {
+                actor_id: WorkflowActorId::Subagent(12),
+                outcome: SubagentOutcome::Completed,
+            },
+        );
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::ActorFinished {
+                actor_id: WorkflowActorId::Subagent(11),
+                outcome: SubagentOutcome::Failed("adapter exited".to_string()),
+            },
+        );
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::ActorWaiting {
+                actor_id: WorkflowActorId::Subagent(13),
+                dependency: "automatic specialist reviewer reports".to_string(),
+                remaining: Some(1),
+                requires_user_action: false,
+            },
+        );
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::Waiting {
+                dependency: "automatic specialist reviewer reports".to_string(),
+                remaining: Some(1),
+                requires_user_action: false,
+            },
+        );
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::CoverageChanged {
+                coverage: WorkflowCoverage::Degraded,
+            },
         );
 
-        let rows = subagent_status_row_count(&state);
-        assert_eq!(rows, 3);
-        let backend = TestBackend::new(80, rows);
+        let backend = TestBackend::new(180, 1);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| draw_subagent_status_rows(frame, frame.area(), &state))
-            .expect("draw status rows");
-        let rendered = buffer_lines(terminal.backend().buffer());
+            .draw(|frame| draw_workflow_progress_rows(frame, frame.area(), &state))
+            .expect("draw review progress");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Review [/subagents]"), "{rendered}");
+        assert!(rendered.contains("waiting for 1"), "{rendered}");
+        assert!(rendered.contains("reviewers 2/3"), "{rendered}");
+        assert!(rendered.contains("1 waiting"), "{rendered}");
+        assert!(rendered.contains("1 failed"), "{rendered}");
+        assert!(rendered.contains("degraded coverage"), "{rendered}");
 
-        assert!(rendered[0].contains("fix-tests (gpt-y)"), "{rendered:?}");
-        assert!(rendered[0].contains("running cargo test"), "{rendered:?}");
-        assert!(rendered[0].contains("0s"), "{rendered:?}");
-        assert!(rendered[1].contains("✔ docs"), "{rendered:?}");
-        assert!(rendered[1].contains("done"), "{rendered:?}");
-        assert!(rendered[2].contains("✘ build"), "{rendered:?}");
-        assert!(rendered[2].contains("adapter exited"), "{rendered:?}");
+        let backend = TestBackend::new(22, 1);
+        let mut narrow = Terminal::new(backend).expect("terminal");
+        narrow
+            .draw(|frame| draw_workflow_progress_rows(frame, frame.area(), &state))
+            .expect("draw narrow progress");
+        let rendered = buffer_lines(narrow.backend().buffer()).join("\n");
+        assert!(rendered.contains("Review"), "{rendered}");
+        assert!(!rendered.contains("/subagents"), "{rendered}");
+
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::ActorResumed {
+                actor_id: WorkflowActorId::Subagent(13),
+            },
+        );
+        assert_eq!(workflow_progress_row_count(&state), 1);
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::ActorFinished {
+                actor_id: WorkflowActorId::Subagent(13),
+                outcome: SubagentOutcome::Cancelled,
+            },
+        );
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::Waiting {
+                dependency: "approval".to_string(),
+                remaining: None,
+                requires_user_action: true,
+            },
+        );
+        let line = workflow_progress_line(
+            state.visible_workflows().next().expect("workflow"),
+            "⠋",
+            Duration::ZERO,
+            120,
+            state.theme,
+            true,
+        );
+        assert!(line_text(&line).contains("waiting for user action"));
+
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::Terminal {
+                outcome: WorkflowOutcome::Degraded,
+                coverage: WorkflowCoverage::Degraded,
+            },
+        );
+        let line = workflow_progress_line(
+            state.visible_workflows().next().expect("terminal workflow"),
+            "⠋",
+            Duration::ZERO,
+            120,
+            state.theme,
+            true,
+        );
+        let line = line_text(&line);
+        assert!(line.contains("⚠ Review [/subagents]"), "{line}");
+        assert!(line.contains("complete"), "{line}");
+        assert!(line.contains("1 failed"), "{line}");
+        assert!(line.contains("1 cancelled"), "{line}");
+        assert!(!state.has_active_workflows());
     }
 
     #[test]
@@ -14064,6 +14544,10 @@ mod tests {
         state.apply_event(UiEvent::Subagent(SubagentEvent::SessionUpdate {
             subagent_id: 1,
             update: SessionUpdate::AgentMessageChunk(text_chunk("IMPLEMENTATION_ONLY")),
+        }));
+        state.apply_event(UiEvent::Subagent(SubagentEvent::Finished {
+            subagent_id: 1,
+            outcome: SubagentOutcome::Completed,
         }));
 
         let workflow_id = WorkflowId::review(3);
@@ -14090,9 +14574,24 @@ mod tests {
         }));
 
         assert!(state.open_nested_agent_viewer());
-        assert_eq!(state.nested_agent_selected, Some(1));
+        assert_eq!(
+            state.nested_agent_selected,
+            Some(2),
+            "opening must select the newest in-progress actor"
+        );
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_nested_agent_viewer(frame, frame.area(), &mut state, false))
+            .expect("draw reviewer");
+        let reviewer = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(reviewer.contains("reviewer Týr"), "{reviewer}");
+        assert!(reviewer.contains("REVIEW_ONLY"), "{reviewer}");
+        assert!(!reviewer.contains("IMPLEMENTATION_ONLY"), "{reviewer}");
+
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Right));
+        assert_eq!(state.nested_agent_selected, Some(1));
         terminal
             .draw(|frame| draw_nested_agent_viewer(frame, frame.area(), &mut state, false))
             .expect("draw implementation");
@@ -14102,30 +14601,25 @@ mod tests {
             "{implementation}"
         );
         assert!(!implementation.contains("REVIEW_ONLY"), "{implementation}");
-
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-        handle_crossterm(&mut state, &cmd_tx, key(KeyCode::Right));
-        assert_eq!(state.nested_agent_selected, Some(2));
-        terminal
-            .draw(|frame| draw_nested_agent_viewer(frame, frame.area(), &mut state, false))
-            .expect("draw reviewer");
-        let reviewer = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(reviewer.contains("reviewer Týr"), "{reviewer}");
-        assert!(reviewer.contains("REVIEW_ONLY"), "{reviewer}");
-        assert!(!reviewer.contains("IMPLEMENTATION_ONLY"), "{reviewer}");
     }
 
     #[test]
-    fn nested_agent_viewer_is_inline_safe_when_narrow_and_permissions_keep_attribution() {
+    fn nested_agent_viewer_shows_all_actors_when_narrow_and_keeps_attribution() {
         let mut state = AppState::new();
-        for id in 1..=7 {
+        for id in 1..=8 {
             start_subagent(&mut state, id, &format!("actor-{id}"), "work");
         }
+        let terminal_size = Size {
+            width: 100,
+            height: 40,
+        };
         assert!(state.open_nested_agent_viewer());
-        for _ in 1..7 {
-            state.select_nested_agent(true);
-        }
-        assert_eq!(state.nested_agent_selected, Some(7));
+        assert_eq!(
+            desired_inline_height(&state, terminal_size),
+            terminal_size.height - 1,
+            "the nested viewer needs enough height for every retained actor"
+        );
+        assert_eq!(state.nested_agent_selected, Some(8));
         state.close_nested_agent_viewer();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         let ctrl_l = handle_inline_crossterm(
@@ -14138,59 +14632,116 @@ mod tests {
         let request = handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::F(11)));
         assert!(state.nested_agent_viewer);
         assert_ne!(request, TerminalRequest::None);
+        state.nested_agent_scroll_offset = 100;
+        handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::PageUp));
+        assert_eq!(
+            state.nested_agent_scroll_offset,
+            100 - TRANSCRIPT_SCROLL_PAGE_STEP
+        );
+        handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::PageDown));
+        assert_eq!(state.nested_agent_scroll_offset, 100);
 
-        let backend = TestBackend::new(24, 9);
+        let backend = TestBackend::new(24, 20);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| draw_nested_agent_viewer(frame, frame.area(), &mut state, true))
             .expect("narrow inline viewer");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(rendered.contains("#7"), "{rendered}");
+        for id in 1..=8 {
+            assert!(
+                rendered.contains(&format!("#{id}")),
+                "actor #{id} must remain visible:\n{rendered}"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        assert!(rendered.contains("Fn+Up/Down"), "{rendered}");
         handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::F(11)));
         assert!(!state.nested_agent_viewer, "F11 closes the viewer");
 
         let mut pending =
             permission_pending_with_options("run a long command", &["Allow", "Reject"], 0);
-        pending.subagent_id = Some(7);
+        pending.subagent_id = Some(8);
         let permission = permission_view_lines(&pending, 1, 24, state.theme)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            permission.contains("subagent #7 permission"),
+            permission.contains("subagent #8 permission"),
             "{permission}"
         );
     }
 
     #[test]
-    fn overflowing_status_rows_fold_finished_work_before_running_work() {
+    fn simultaneous_workflows_are_distinct_and_pathological_overflow_is_bounded() {
         let mut state = AppState::new();
-        for id in 1..=5 {
-            start_subagent(&mut state, id, &format!("lane-{id}"), "work");
-        }
-        finish_subagent(&mut state, 1, SubagentOutcome::Completed);
+        start_workflow(
+            &mut state,
+            WorkflowId::delegation(1),
+            WorkflowKind::Delegation,
+            WorkflowPhase::Delegating,
+        );
+        start_workflow(
+            &mut state,
+            WorkflowId::delegation(2),
+            WorkflowKind::Delegation,
+            WorkflowPhase::Delegating,
+        );
+        start_workflow(
+            &mut state,
+            WorkflowId::review(2),
+            WorkflowKind::Review,
+            WorkflowPhase::Supervision,
+        );
 
-        let rows = subagent_status_row_count(&state);
-        let backend = TestBackend::new(60, rows);
+        let rows = workflow_progress_row_count(&state);
+        assert_eq!(rows, WORKFLOW_PROGRESS_VISIBLE_ROWS as u16 + 1);
+        let backend = TestBackend::new(80, rows);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| draw_subagent_status_rows(frame, frame.area(), &state))
-            .expect("draw status rows");
+            .draw(|frame| draw_workflow_progress_rows(frame, frame.area(), &state))
+            .expect("draw workflow progress");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
 
-        for id in 2..=5 {
-            assert!(rendered.contains(&format!("lane-{id}")), "{rendered}");
-        }
+        assert!(rendered.contains("Subagents"), "{rendered}");
         assert!(
-            !rendered.contains("lane-1 "),
-            "the finished row is what folds away: {rendered}"
+            rendered.contains("Review"),
+            "the current turn's review must not fold behind prior work: {rendered}"
         );
         assert!(rendered.contains("… 1 more"), "{rendered}");
     }
 
     #[test]
-    fn live_subagent_rows_force_timer_redraws_while_the_primary_is_idle() {
+    fn named_only_workflow_does_not_advertise_unavailable_nested_details() {
+        let mut state = AppState::new();
+        let workflow_id = WorkflowId::review(4);
+        start_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowKind::Review,
+            WorkflowPhase::Fallback,
+        );
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::ActorStarted {
+                actor_id: WorkflowActorId::Named("primary-single-review".to_string()),
+                role: WorkflowActorRole::FallbackReviewer,
+            },
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 1)).expect("terminal");
+        terminal
+            .draw(|frame| draw_workflow_progress_rows(frame, frame.area(), &state))
+            .expect("draw named workflow");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Review"), "{rendered}");
+        assert!(!rendered.contains("F11"), "{rendered}");
+        assert!(!state.open_nested_agent_viewer());
+    }
+
+    #[test]
+    fn active_workflow_forces_timer_redraws_until_terminal() {
         let mut state = AppState::new();
         state.set_connection_state(ConnectionState::Ready);
         assert!(!should_show_spinner(&state));
@@ -14198,7 +14749,13 @@ mod tests {
         assert!(!timer_driven_live_redraw(UiMode::InlineChat, &state));
         assert!(!timer_driven_live_redraw(UiMode::FullscreenTui, &state));
 
-        start_subagent(&mut state, 1, "fix-tests", "fix the parser tests");
+        let workflow_id = WorkflowId::delegation(1);
+        start_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowKind::Delegation,
+            WorkflowPhase::Delegating,
+        );
         assert!(
             needs_live_redraw(&state),
             "elapsed time must keep ticking with an idle primary"
@@ -14206,14 +14763,26 @@ mod tests {
         assert!(timer_driven_live_redraw(UiMode::InlineChat, &state));
         assert!(timer_driven_live_redraw(UiMode::FullscreenTui, &state));
 
-        // A finished row still needs redraws: nothing but a timer removes it
-        // when its TTL runs out.
-        finish_subagent(&mut state, 1, SubagentOutcome::Completed);
-        assert!(needs_live_redraw(&state));
+        apply_workflow(
+            &mut state,
+            workflow_id,
+            WorkflowTransition::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                coverage: WorkflowCoverage::Complete,
+            },
+        );
+        assert_eq!(
+            workflow_progress_row_count(&state),
+            1,
+            "the frozen terminal outcome remains visible"
+        );
+        assert!(!needs_live_redraw(&state));
+        assert!(!timer_driven_live_redraw(UiMode::InlineChat, &state));
+        assert!(!timer_driven_live_redraw(UiMode::FullscreenTui, &state));
     }
 
     #[test]
-    fn subagent_status_events_pick_their_redraw_cause() {
+    fn subagent_events_pick_their_redraw_cause() {
         assert_eq!(
             ui_event_redraw_cause(&UiEvent::Subagent(SubagentEvent::Activity {
                 subagent_id: 1,
@@ -14239,7 +14808,7 @@ mod tests {
             assert_eq!(
                 ui_event_redraw_cause(&event),
                 RedrawCause::Interactive,
-                "start and finish change the status area's height"
+                "start and finish update transcript and viewer structure"
             );
         }
     }
@@ -14735,6 +15304,39 @@ mod tests {
 
         let other = std::io::Error::other("terminal unavailable");
         assert!(!is_cursor_position_timeout_io(&other));
+    }
+
+    #[test]
+    fn inline_reader_restore_replays_the_stable_transcript_tail() {
+        let mut state = AppState::new();
+        for id in 0..12 {
+            state.push_system_message(format!("stable transcript marker {id}"));
+        }
+        let mut backend = TestBackend::new(80, 24);
+        backend
+            .set_cursor_position(Position::new(0, 20))
+            .expect("cursor position");
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(4),
+            },
+        )
+        .expect("terminal");
+
+        assert!(
+            insert_stable_transcript_tail_before_inline_viewport(&mut terminal, &state, 80, 4,)
+                .expect("restore transcript tail")
+        );
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(
+            rendered.contains("stable transcript marker 11"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("stable transcript marker 0"),
+            "restore must replay the tail rather than the oldest rows: {rendered}"
+        );
     }
 
     #[test]
@@ -17496,7 +18098,7 @@ mod tests {
     }
 
     #[test]
-    fn both_ui_modes_reserve_the_subagent_status_area_between_header_and_input() {
+    fn both_ui_modes_reserve_the_same_workflow_progress_area_below_the_header() {
         let mut state = AppState::new();
         let baseline = desired_inline_height(
             &state,
@@ -17505,7 +18107,12 @@ mod tests {
                 height: 40,
             },
         );
-        start_subagent(&mut state, 1, "fix-tests", "fix the parser tests");
+        start_workflow(
+            &mut state,
+            WorkflowId::delegation(3),
+            WorkflowKind::Delegation,
+            WorkflowPhase::Delegating,
+        );
         assert_eq!(
             desired_inline_height(
                 &state,
@@ -17515,7 +18122,7 @@ mod tests {
                 }
             ),
             baseline + 1,
-            "the inline viewport grows by exactly the status area"
+            "the inline viewport grows by exactly one workflow row"
         );
 
         let mut inline = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
@@ -17525,8 +18132,8 @@ mod tests {
         assert!(
             buffer_lines(inline.backend().buffer())
                 .join("\n")
-                .contains("fix-tests (gpt-y)"),
-            "inline mode must render the status row"
+                .contains("Subagents"),
+            "inline mode must render workflow progress"
         );
 
         let mut fullscreen = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
@@ -17537,15 +18144,15 @@ mod tests {
         let rendered = buffer_lines(fullscreen.backend().buffer());
         let row = rendered
             .iter()
-            .position(|line| line.contains("fix-tests (gpt-y)"))
-            .expect("fullscreen mode must render the status row");
+            .position(|line| line.contains("Subagents"))
+            .expect("fullscreen mode must render workflow progress");
         let header = rendered
             .iter()
             .position(|line| line.contains(&mjolnir_version_label()))
             .expect("header row");
         assert!(
             row > header,
-            "the status area sits below the header: {rendered:?}"
+            "the workflow area sits below the header: {rendered:?}"
         );
     }
 
