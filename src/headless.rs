@@ -63,6 +63,7 @@ pub struct RunConfig {
     pub fs_max_text_bytes: u64,
     pub output_format: OutputFormat,
     pub permission_mode: PermissionMode,
+    pub permission_config_mode: Option<config::PermissionPreset>,
     pub role_overrides: config::ModelOverrides,
     /// Process-wide graceful termination.  Headless owns its shutdown so it
     /// can stop the ACP runtime and subagent workers before returning.
@@ -275,11 +276,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
         subagent::SubagentInventory::from_roster(&resolved),
     ));
     let mut primary_env = primary.launch.env.clone();
-    let primary_permission = roster::configure_permissions(
-        primary.launch.kind,
-        cfg.permission_mode.into(),
-        &mut primary_env,
-    );
+    let primary_permission = cfg.permission_config_mode.and_then(|mode| {
+        roster::configure_permissions(primary.launch.kind, mode, &mut primary_env)
+    });
     let runtime_cfg = AcpRuntimeConfig {
         command: primary.launch.command.clone(),
         args: primary.launch.args.clone(),
