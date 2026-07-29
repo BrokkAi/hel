@@ -105,6 +105,12 @@ impl SubagentStatus {
     pub fn outcome(&self) -> Option<&SubagentOutcome> {
         self.finished.as_ref().map(|(outcome, _)| outcome)
     }
+
+    fn counts_as_subagent(&self) -> bool {
+        self.role
+            .as_ref()
+            .is_none_or(|role| !role.is_internal_review_session())
+    }
 }
 
 pub fn nested_role_label(role: &crate::workflow::WorkflowActorRole) -> String {
@@ -117,6 +123,19 @@ pub fn nested_role_label(role: &crate::workflow::WorkflowActorRole) -> String {
         }
         crate::workflow::WorkflowActorRole::PrimaryCorrection => "primary correction".to_string(),
         crate::workflow::WorkflowActorRole::FallbackReviewer => "fallback reviewer".to_string(),
+    }
+}
+
+fn nested_actor_reference(role: Option<&crate::workflow::WorkflowActorRole>, id: u64) -> String {
+    let label = role.map_or(
+        "subagent",
+        crate::workflow::WorkflowActorRole::display_label,
+    );
+    match role {
+        Some(crate::workflow::WorkflowActorRole::SpecialistReviewer { lane }) => {
+            format!("{label} {lane} #{id}")
+        }
+        _ => format!("{label} #{id}"),
     }
 }
 
@@ -3050,8 +3069,6 @@ impl AppState {
                 agent,
                 objective,
             } => {
-                self.subagent_active = true;
-                self.subagent_label = Some(label.clone());
                 self.subagent_token_usage = TokenUsage::default();
                 let objective = objective.trim().to_string();
                 let now = Instant::now();
@@ -3094,6 +3111,8 @@ impl AppState {
                 let role = row.role.clone();
                 let objective = row.objective.clone();
                 self.active_subagents = self.running_subagent_count();
+                self.subagent_active = self.active_subagents > 0;
+                self.subagent_label = self.subagent_active.then(|| label.clone());
                 let backend = match model.as_deref() {
                     Some(model) => format!("{agent}/{model}"),
                     None => agent.clone(),
@@ -3122,14 +3141,21 @@ impl AppState {
                     };
                     self.push_system_message(started);
                 }
+                let actor = nested_actor_reference(role.as_ref(), subagent_id);
+                let hint = if role
+                    .as_ref()
+                    .is_none_or(|role| !role.is_internal_review_session())
+                {
+                    " · /subagents"
+                } else {
+                    ""
+                };
                 self.set_status_line(
                     StatusKind::Info,
                     if resumed {
-                        format!(
-                            "subagent #{subagent_id} · {label} resumed ({backend}) · /subagents"
-                        )
+                        format!("{actor} · {label} resumed ({backend}){hint}")
                     } else {
-                        format!("subagent #{subagent_id} · {label} ({backend}) · /subagents")
+                        format!("{actor} · {label} ({backend}){hint}")
                     },
                 );
             }
@@ -3215,9 +3241,13 @@ impl AppState {
                 state.activity = message.clone();
                 state.transcript.push(Entry::System(message.clone()));
                 if kind == SubagentStatusKind::Warning {
+                    let role = state.role.clone();
                     self.record_status_message(
                         StatusKind::Warning,
-                        format!("subagent #{subagent_id} · {message}"),
+                        format!(
+                            "{} · {message}",
+                            nested_actor_reference(role.as_ref(), subagent_id)
+                        ),
                     );
                 }
             }
@@ -3234,17 +3264,23 @@ impl AppState {
                     self.subagent_active = false;
                     self.subagent_label = None;
                 }
+                let role = self
+                    .subagents
+                    .get(&subagent_id)
+                    .and_then(|state| state.role.as_ref());
+                let actor = nested_actor_reference(role, subagent_id);
+                let hint = if role.is_none_or(|role| !role.is_internal_review_session()) {
+                    " · /subagents"
+                } else {
+                    ""
+                };
                 match outcome {
-                    SubagentOutcome::Completed => self.set_status_line(
-                        StatusKind::Info,
-                        format!("subagent #{subagent_id} complete · /subagents"),
-                    ),
+                    SubagentOutcome::Completed => {
+                        self.set_status_line(StatusKind::Info, format!("{actor} complete{hint}"))
+                    }
                     SubagentOutcome::Cancelled => {
                         self.mark_subagent_tools_failed(subagent_id, "tool call cancelled");
-                        self.set_status_line(
-                            StatusKind::Info,
-                            format!("subagent #{subagent_id} cancelled · /subagents"),
-                        );
+                        self.set_status_line(StatusKind::Info, format!("{actor} cancelled{hint}"));
                     }
                     SubagentOutcome::Failed(message) => {
                         self.mark_subagent_tools_failed(subagent_id, "tool call failed");
@@ -3252,7 +3288,7 @@ impl AppState {
                         // this subagent's permanent transcript entry.
                         self.set_status_line(
                             StatusKind::Warning,
-                            format!("subagent #{subagent_id} failed · {message} · /subagents"),
+                            format!("{actor} failed · {message}{hint}"),
                         );
                     }
                 }
@@ -3353,7 +3389,7 @@ impl AppState {
     pub fn running_subagent_count(&self) -> usize {
         self.subagents
             .values()
-            .filter(|row| row.finished.is_none())
+            .filter(|row| row.finished.is_none() && row.counts_as_subagent())
             .count()
     }
 
@@ -5919,6 +5955,12 @@ mod tests {
             objective: "review the patch".to_string(),
             label: "review · supervisor".to_string(),
         }));
+        assert_eq!(
+            state.running_subagent_count(),
+            0,
+            "an internal supervisor must not count as a subagent"
+        );
+        assert!(!state.subagent_active);
         for (kind, text) in [
             (
                 crate::event::InternalMessageKind::ReviewLane,

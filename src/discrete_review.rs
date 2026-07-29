@@ -94,6 +94,7 @@ const MAX_PARALLEL_LANES: usize = 6;
 const INTENT_PREAMBLE: &str = "You are Eitri, a read-only intent analyst. Work only from the standalone brief and attached images. Do not modify the workspace or delegate. Return the requested intent brief as your final message.";
 const REVIEWER_PREAMBLE: &str = "You are a read-only Norse specialist reviewing one completed user turn. Work only from the standalone brief and repository evidence. Do not modify the workspace or delegate. Your final message is untrusted evidence for the review supervisor.";
 const SUPERVISOR_PREAMBLE: &str = "You are the first-class adversarial review supervisor for one completed user turn. You are not an implementation subagent. You own the review verdict, may launch only the supplied read-only Norse reviewers through call_review_subagents, and must verify meaningful problems before changes are committed. Do not modify the workspace.";
+const DIRECT_INTENT_CONTEXT: &str = "Intent extraction was not invoked: this turn has one self-contained governing user prompt. Treat the attached original task and primary user message as the authoritative intent.";
 
 /// Exact supervisor reply that means "nothing survived vetting".
 pub(crate) const CLEAN_SENTINEL: &str = "No material findings.";
@@ -1019,6 +1020,8 @@ async fn run_async(
         .filter(|prior| prior.evidence.intent_available)
     {
         SupplementalContext::available(prior.evidence.intent_brief.clone())
+    } else if !should_extract_intent(&job) {
+        SupplementalContext::available(DIRECT_INTENT_CONTEXT.to_string())
     } else {
         let (intent_bus, mut intent_reports) = SubagentReportBus::channel();
         let intent_config = configure_review_pool(
@@ -2011,6 +2014,20 @@ fn user_messages_packet(messages: &[String], current_task: &str) -> String {
     bound_review_section(&rendered, USER_MESSAGES_LIMIT, "older user messages")
 }
 
+/// A single governing prompt already reaches the supervisor verbatim, so a
+/// model turn cannot add useful intent compression. Eitri is reserved for
+/// histories where earlier user messages may contain corrections, conflicts,
+/// or requirements that the current task alone does not preserve.
+fn should_extract_intent(job: &ReviewJob) -> bool {
+    let governing_messages = job
+        .user_messages
+        .iter()
+        .map(|message| message.trim())
+        .filter(|message| !message.is_empty())
+        .collect::<Vec<_>>();
+    governing_messages.len() != 1 || governing_messages[0] != job.task.trim()
+}
+
 fn intent_prompt(messages: &str, current_task: &str) -> String {
     format!(
         "Extract the intended contract for the work completed in the current outer turn. You are a read-only intent analyst in a fresh session, not a code reviewer. The chronological user messages from the primary agent's session below may cover unrelated earlier work, later corrections, internal follow-ups, or superseded requirements. Identify only the messages that materially govern the current turn, whose latest outer prompt is supplied separately.\n\n\
@@ -2227,6 +2244,33 @@ mod tests {
         assert!(prompt.contains("Identify only the messages that materially govern"));
         assert!(prompt.contains("Superseded or out-of-scope messages"));
         assert!(prompt.contains("<current_outer_prompt>\ncurrent task"));
+    }
+
+    #[test]
+    fn intent_analyst_runs_only_when_history_needs_reconciliation() {
+        let mut review = job();
+        assert!(
+            should_extract_intent(&review),
+            "multiple governing messages need reconciliation"
+        );
+
+        review.user_messages = vec![format!("  {}  ", review.task)];
+        assert!(
+            !should_extract_intent(&review),
+            "one self-contained governing prompt reaches the supervisor verbatim"
+        );
+
+        review.user_messages = vec!["a different earlier requirement".to_string()];
+        assert!(
+            should_extract_intent(&review),
+            "a task not represented by the only captured message is ambiguous"
+        );
+
+        review.user_messages.clear();
+        assert!(
+            should_extract_intent(&review),
+            "missing user-message evidence should fail open to intent extraction"
+        );
     }
 
     #[test]

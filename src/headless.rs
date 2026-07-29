@@ -125,6 +125,18 @@ enum StreamRecord<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         elapsed_ms: Option<u64>,
     },
+    /// Lifecycle of an internal, detached review coordinator. These sessions
+    /// share the nested runtime machinery but are not user-delegated
+    /// subagents.
+    ReviewSession {
+        id: u64,
+        role: &'static str,
+        label: &'a str,
+        kind: &'a str,
+        text: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
+    },
     /// Runtime-authoritative workflow transition plus its resulting state.
     Workflow(Box<WorkflowStreamRecord>),
     Warning {
@@ -206,6 +218,7 @@ struct HeadlessState {
 #[derive(Debug)]
 struct SubagentTrace {
     label: String,
+    role: Option<crate::workflow::WorkflowActorRole>,
     started: std::time::Instant,
 }
 
@@ -563,16 +576,19 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     objective,
                     ..
                 } => {
+                    let role = workflow_role_for_subagent(&state.workflows, subagent_id);
                     state.subagents.insert(
                         subagent_id,
                         SubagentTrace {
                             label: label.clone(),
+                            role: role.clone(),
                             started: std::time::Instant::now(),
                         },
                     );
-                    emit_subagent(
+                    emit_nested_session(
                         cfg.output_format,
                         subagent_id,
+                        role.as_ref(),
                         &label,
                         if resumed {
                             SUBAGENT_KIND_RESUMED
@@ -588,9 +604,11 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     activity,
                 } => {
                     let label = state.subagent_label(subagent_id);
-                    emit_subagent(
+                    let role = state.subagent_role(subagent_id);
+                    emit_nested_session(
                         cfg.output_format,
                         subagent_id,
+                        role.as_ref(),
                         &label,
                         SUBAGENT_KIND_ACTIVITY,
                         &activity,
@@ -605,10 +623,12 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     let label = trace
                         .as_ref()
                         .map_or_else(|| SUBAGENT_UNKNOWN_LABEL.to_string(), |t| t.label.clone());
+                    let role = trace.as_ref().and_then(|trace| trace.role.clone());
                     let elapsed = trace.as_ref().map(|trace| trace.started.elapsed());
-                    emit_subagent(
+                    emit_nested_session(
                         cfg.output_format,
                         subagent_id,
+                        role.as_ref(),
                         &label,
                         SUBAGENT_KIND_FINISHED,
                         &subagent_outcome_text(&outcome),
@@ -620,7 +640,8 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     update,
                 } => {
                     if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                        let actor = subagent_actor(subagent_id);
+                        let role = state.subagent_role(subagent_id);
+                        let actor = nested_actor(subagent_id, role.as_ref());
                         emit_stream_update(&update, &state, &actor)?;
                     }
                 }
@@ -634,7 +655,8 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                         &prompt.options,
                     );
                     if matches!(cfg.output_format, OutputFormat::StreamJson) {
-                        let actor = subagent_actor(subagent_id);
+                        let role = state.subagent_role(subagent_id);
+                        let actor = nested_actor(subagent_id, role.as_ref());
                         emit_json(&StreamRecord::Permission {
                             actor: &actor,
                             tool_call_id: &prompt.tool_call.tool_call_id.to_string(),
@@ -873,10 +895,29 @@ impl HeadlessState {
             .get(&subagent_id)
             .map_or_else(|| SUBAGENT_UNKNOWN_LABEL.to_string(), |t| t.label.clone())
     }
+
+    fn subagent_role(&self, subagent_id: u64) -> Option<crate::workflow::WorkflowActorRole> {
+        self.subagents
+            .get(&subagent_id)
+            .and_then(|trace| trace.role.clone())
+            .or_else(|| workflow_role_for_subagent(&self.workflows, subagent_id))
+    }
 }
 
-fn subagent_actor(subagent_id: u64) -> String {
-    format!("subagent-{subagent_id}")
+fn workflow_role_for_subagent(
+    workflows: &crate::workflow::WorkflowStore,
+    subagent_id: u64,
+) -> Option<crate::workflow::WorkflowActorRole> {
+    let actor_id = crate::workflow::WorkflowActorId::Subagent(subagent_id);
+    workflows
+        .iter()
+        .find_map(|workflow| workflow.actors.get(&actor_id))
+        .map(|actor| actor.role.clone())
+}
+
+fn nested_actor(subagent_id: u64, role: Option<&crate::workflow::WorkflowActorRole>) -> String {
+    let prefix = role.map_or("subagent", crate::workflow::WorkflowActorRole::actor_prefix);
+    format!("{prefix}-{subagent_id}")
 }
 
 fn subagent_outcome_text(outcome: &SubagentOutcome) -> String {
@@ -910,7 +951,7 @@ fn workflow_stream_record(
         WorkflowTransition::PhaseChanged { .. } => ("phase_changed", None, None, None, None),
         WorkflowTransition::ActorStarted { actor_id, role } => (
             "actor_started",
-            Some(actor_id.as_display()),
+            Some(workflow_actor_display(actor_id, Some(role))),
             Some(role.as_str()),
             Some("running"),
             None,
@@ -920,7 +961,10 @@ fn workflow_stream_record(
             retained_session_id,
         } => (
             "actor_session_bound",
-            Some(actor_id.as_display()),
+            Some(workflow_actor_display(
+                actor_id,
+                state.actors.get(actor_id).map(|actor| &actor.role),
+            )),
             state.actors.get(actor_id).map(|actor| actor.role.as_str()),
             state
                 .actors
@@ -930,7 +974,10 @@ fn workflow_stream_record(
         ),
         WorkflowTransition::ActorWaiting { actor_id, .. } => (
             "actor_waiting",
-            Some(actor_id.as_display()),
+            Some(workflow_actor_display(
+                actor_id,
+                state.actors.get(actor_id).map(|actor| &actor.role),
+            )),
             state.actors.get(actor_id).map(|actor| actor.role.as_str()),
             Some("waiting"),
             state
@@ -940,7 +987,10 @@ fn workflow_stream_record(
         ),
         WorkflowTransition::ActorResumed { actor_id } => (
             "actor_resumed",
-            Some(actor_id.as_display()),
+            Some(workflow_actor_display(
+                actor_id,
+                state.actors.get(actor_id).map(|actor| &actor.role),
+            )),
             state.actors.get(actor_id).map(|actor| actor.role.as_str()),
             Some("running"),
             state
@@ -950,7 +1000,10 @@ fn workflow_stream_record(
         ),
         WorkflowTransition::ActorFinished { actor_id, .. } => (
             "actor_finished",
-            Some(actor_id.as_display()),
+            Some(workflow_actor_display(
+                actor_id,
+                state.actors.get(actor_id).map(|actor| &actor.role),
+            )),
             state.actors.get(actor_id).map(|actor| actor.role.as_str()),
             state
                 .actors
@@ -987,7 +1040,7 @@ fn workflow_stream_record(
         state
             .actors
             .iter()
-            .find(|(id, _)| id.as_display() == *actor_id)
+            .find(|(id, actor)| workflow_actor_display(id, Some(&actor.role)) == *actor_id)
             .and_then(|(_, actor)| match &actor.lifecycle {
                 WorkflowActorLifecycle::Failed(error) => Some(error.clone()),
                 _ => None,
@@ -1020,43 +1073,73 @@ fn workflow_stream_record(
     })))
 }
 
+fn workflow_actor_display(
+    actor_id: &crate::workflow::WorkflowActorId,
+    role: Option<&crate::workflow::WorkflowActorRole>,
+) -> String {
+    match actor_id {
+        crate::workflow::WorkflowActorId::Subagent(id) => nested_actor(*id, role),
+        crate::workflow::WorkflowActorId::Named(name) => name.clone(),
+    }
+}
+
 /// One subagent lifecycle line. `stream-json` gets a structured record;
 /// `--print` text mode gets the one-line equivalent on **stderr**, so progress
 /// can never interleave with the answer text (or the single JSON object)
 /// written to stdout. `--output-format json` stays silent: its contract is
 /// exactly one object.
-fn emit_subagent(
+fn emit_nested_session(
     format: OutputFormat,
     id: u64,
+    role: Option<&crate::workflow::WorkflowActorRole>,
     label: &str,
     kind: &str,
     text: &str,
     elapsed: Option<std::time::Duration>,
 ) -> Result<()> {
+    let internal_role = role.filter(|role| role.is_internal_review_session());
     match format {
-        OutputFormat::StreamJson => emit_json(&StreamRecord::Subagent {
-            id,
-            label,
-            kind,
-            text,
-            elapsed_ms: elapsed.map(|elapsed| elapsed.as_millis() as u64),
-        }),
+        OutputFormat::StreamJson => match internal_role {
+            Some(role) => emit_json(&StreamRecord::ReviewSession {
+                id,
+                role: role.as_str(),
+                label,
+                kind,
+                text,
+                elapsed_ms: elapsed.map(|elapsed| elapsed.as_millis() as u64),
+            }),
+            None => emit_json(&StreamRecord::Subagent {
+                id,
+                label,
+                kind,
+                text,
+                elapsed_ms: elapsed.map(|elapsed| elapsed.as_millis() as u64),
+            }),
+        },
         OutputFormat::Text => {
-            eprintln!("{}", subagent_text_line(id, label, kind, text, elapsed));
+            eprintln!(
+                "{}",
+                nested_session_text_line(id, internal_role, label, kind, text, elapsed)
+            );
             Ok(())
         }
         OutputFormat::Json => Ok(()),
     }
 }
 
-fn subagent_text_line(
+fn nested_session_text_line(
     id: u64,
+    role: Option<&crate::workflow::WorkflowActorRole>,
     label: &str,
     kind: &str,
     text: &str,
     elapsed: Option<std::time::Duration>,
 ) -> String {
-    let mut line = format!("subagent #{id} · {label} · {kind} · {text}");
+    let actor = role.map_or(
+        "subagent",
+        crate::workflow::WorkflowActorRole::display_label,
+    );
+    let mut line = format!("{actor} #{id} · {label} · {kind} · {text}");
     if let Some(elapsed) = elapsed {
         line.push_str(" · ");
         line.push_str(&crate::ui::format_duration(elapsed));
@@ -1543,7 +1626,7 @@ mod tests {
         let resumed_record = record_json(
             &workflow_stream_record(&resumed, &workflows).expect("workflow state exists"),
         );
-        assert_eq!(resumed_record["actor_id"], "subagent-4");
+        assert_eq!(resumed_record["actor_id"], "review-supervisor-4");
         assert_eq!(resumed_record["actor_lifecycle"], "running");
         assert_eq!(resumed_record["retained_session_id"], "supervisor-session");
         assert_eq!(resumed_record["running"], 1);
@@ -1587,8 +1670,8 @@ mod tests {
 
     #[test]
     fn subagent_stream_actors_distinguish_interleaved_updates_and_permissions() {
-        let mimir = subagent_actor(4);
-        let heimdall = subagent_actor(7);
+        let mimir = nested_actor(4, None);
+        let heimdall = nested_actor(7, None);
         let records = [
             record_json(&StreamRecord::AgentMessage {
                 actor: &mimir,
@@ -1629,8 +1712,9 @@ mod tests {
     #[test]
     fn text_mode_lines_mirror_the_stream_records() {
         assert_eq!(
-            subagent_text_line(
+            nested_session_text_line(
                 3,
+                None,
                 "fix-tests",
                 SUBAGENT_KIND_STARTED,
                 "green the suite",
@@ -1639,8 +1723,9 @@ mod tests {
             "subagent #3 · fix-tests · started · green the suite"
         );
         assert_eq!(
-            subagent_text_line(
+            nested_session_text_line(
                 3,
+                None,
                 "fix-tests",
                 SUBAGENT_KIND_FINISHED,
                 "completed",
@@ -1657,6 +1742,7 @@ mod tests {
             7,
             SubagentTrace {
                 label: "audit-config".to_string(),
+                role: None,
                 started: std::time::Instant::now(),
             },
         );
@@ -1664,5 +1750,34 @@ mod tests {
         // A subagent whose `Started` was never observed still streams under a
         // stable placeholder rather than an empty label.
         assert_eq!(state.subagent_label(9), SUBAGENT_UNKNOWN_LABEL);
+    }
+
+    #[test]
+    fn internal_review_sessions_have_distinct_actors_and_lifecycle_records() {
+        use crate::workflow::WorkflowActorRole;
+
+        let role = WorkflowActorRole::ReviewSupervisor;
+        assert_eq!(nested_actor(4, Some(&role)), "review-supervisor-4");
+        let record = record_json(&StreamRecord::ReviewSession {
+            id: 4,
+            role: role.as_str(),
+            label: "review · supervisor",
+            kind: SUBAGENT_KIND_STARTED,
+            text: "review · supervisor",
+            elapsed_ms: None,
+        });
+        assert_eq!(record["type"], "review_session");
+        assert_eq!(record["role"], "review_supervisor");
+        assert_eq!(
+            nested_session_text_line(
+                4,
+                Some(&role),
+                "review · supervisor",
+                SUBAGENT_KIND_STARTED,
+                "review · supervisor",
+                None,
+            ),
+            "review supervisor #4 · review · supervisor · started · review · supervisor"
+        );
     }
 }

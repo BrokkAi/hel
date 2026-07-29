@@ -768,6 +768,9 @@ struct TrackerState {
     /// Live per-subagent status rows, keyed by `subagent_id` and ordered by it
     /// (ids are monotonic in spawn order).
     subagents: BTreeMap<u64, SubagentStatusRecord>,
+    /// Runtime roles for nested review actors. Internal coordinators share the
+    /// runner but stay out of the user-facing subagent roster.
+    nested_roles: HashMap<u64, crate::workflow::WorkflowActorRole>,
     pending_permissions: Vec<PendingPermissionRecord>,
     session_config: Vec<SessionConfigOptionRecord>,
     native_mode: Option<NativeModeRecord>,
@@ -927,6 +930,7 @@ impl TrackerState {
             terminal_outputs: HashMap::new(),
             tool_transcript_entries: HashMap::new(),
             subagents: BTreeMap::new(),
+            nested_roles: HashMap::new(),
             pending_permissions: Vec::new(),
             session_config: Vec::new(),
             native_mode: None,
@@ -1042,9 +1046,8 @@ impl TrackerState {
             UiEvent::AgentUsage(record) => {
                 let actor = match record.seat {
                     crate::agent_usage::Seat::Primary => "primary",
-                    crate::agent_usage::Seat::Subagent | crate::agent_usage::Seat::Review => {
-                        "subagent"
-                    }
+                    crate::agent_usage::Seat::Subagent => "subagent",
+                    crate::agent_usage::Seat::Review => "review",
                 };
                 let tokens = record.usage.as_ref().map_or(0, |usage| usage.total_tokens);
                 let seat = match record.seat {
@@ -1081,7 +1084,15 @@ impl TrackerState {
             | UiEvent::RemotePermissionDecision { .. }
             | UiEvent::RosterUpdate { .. } => {}
             UiEvent::Subagent(subagent_event) => self.observe_subagent_event(subagent_event),
-            UiEvent::Workflow(_) => {}
+            UiEvent::Workflow(event) => {
+                if let crate::workflow::WorkflowTransition::ActorStarted {
+                    actor_id: crate::workflow::WorkflowActorId::Subagent(id),
+                    role,
+                } = &event.transition
+                {
+                    self.nested_roles.insert(*id, role.clone());
+                }
+            }
             UiEvent::Info(message) => {
                 if message.starts_with("compact: primary") {
                     self.record_system_notice(message.clone());
@@ -1115,25 +1126,42 @@ impl TrackerState {
                 ..
             } => {
                 let now = now_rfc3339();
-                self.subagents.insert(
-                    *subagent_id,
-                    SubagentStatusRecord {
-                        subagent_id: *subagent_id,
-                        label: label.clone(),
-                        model: model.clone(),
-                        activity: objective.clone(),
-                        started_at: now,
-                        finished_at: None,
-                        outcome: None,
-                    },
-                );
-                self.prune_finished_subagents();
+                let role = self.nested_roles.get(subagent_id).cloned();
+                let internal = role
+                    .as_ref()
+                    .is_some_and(|role| role.is_internal_review_session());
+                if !internal {
+                    self.subagents.insert(
+                        *subagent_id,
+                        SubagentStatusRecord {
+                            subagent_id: *subagent_id,
+                            label: label.clone(),
+                            model: model.clone(),
+                            activity: objective.clone(),
+                            started_at: now,
+                            finished_at: None,
+                            outcome: None,
+                        },
+                    );
+                    self.prune_finished_subagents();
+                }
                 if !resumed {
+                    let actor = remote_nested_actor(*subagent_id, role.as_ref());
+                    let display = role
+                        .as_ref()
+                        .map_or("subagent", |role| role.display_label());
                     self.push_actor_transcript_entry(
                         "system",
-                        "subagent",
-                        format!("subagent #{subagent_id} · {label} · started · {objective}"),
+                        if internal { "review" } else { "subagent" },
+                        format!("{display} #{subagent_id} · {label} · started · {objective}"),
                     );
+                    if internal {
+                        self.push_actor_transcript_entry(
+                            "system",
+                            &actor,
+                            format!("{display} session started"),
+                        );
+                    }
                 }
                 self.touch();
             }
@@ -1151,29 +1179,44 @@ impl TrackerState {
                 subagent_id,
                 outcome,
             } => {
+                let role = self.nested_roles.get(subagent_id).cloned();
+                let internal = role
+                    .as_ref()
+                    .is_some_and(|role| role.is_internal_review_session());
                 let summary = match outcome {
                     SubagentOutcome::Failed(message) => format!("failed: {message}"),
                     other => other.label().to_string(),
                 };
-                let label = self
-                    .subagents
-                    .get(subagent_id)
-                    .map(|record| record.label.clone());
-                if let Some(record) = self.subagents.get_mut(subagent_id) {
-                    record.finished_at = Some(now_rfc3339());
-                    record.outcome = Some(outcome.label().to_string());
-                    // A failure message is the only outcome detail the row
-                    // itself can carry; otherwise the last activity stands.
-                    if matches!(outcome, SubagentOutcome::Failed(_)) {
-                        record.activity = summary.clone();
+                let label = if internal {
+                    role.as_ref().map(|role| role.display_label().to_string())
+                } else {
+                    let label = self
+                        .subagents
+                        .get(subagent_id)
+                        .map(|record| record.label.clone());
+                    if let Some(record) = self.subagents.get_mut(subagent_id) {
+                        record.finished_at = Some(now_rfc3339());
+                        record.outcome = Some(outcome.label().to_string());
+                        // A failure message is the only outcome detail the row
+                        // itself can carry; otherwise the last activity stands.
+                        if matches!(outcome, SubagentOutcome::Failed(_)) {
+                            record.activity = summary.clone();
+                        }
                     }
-                }
-                self.prune_finished_subagents();
-                let label = label.unwrap_or_else(|| "subagent".to_string());
+                    self.prune_finished_subagents();
+                    label
+                };
+                let text = if internal {
+                    let display = label.unwrap_or_else(|| "review session".to_string());
+                    format!("{display} #{subagent_id} · {summary}")
+                } else {
+                    let label = label.unwrap_or_else(|| "subagent".to_string());
+                    format!("subagent #{subagent_id} · {label} · {summary}")
+                };
                 self.push_actor_transcript_entry(
                     "system",
-                    "subagent",
-                    format!("subagent #{subagent_id} · {label} · {summary}"),
+                    if internal { "review" } else { "subagent" },
+                    text,
                 );
                 self.touch();
             }
@@ -1181,14 +1224,14 @@ impl TrackerState {
                 subagent_id,
                 update,
             } => {
-                let actor = remote_subagent_actor(*subagent_id);
+                let actor = remote_nested_actor(*subagent_id, self.nested_roles.get(subagent_id));
                 self.observe_session_update_as(update, &actor, Some(&actor));
             }
             SubagentEvent::TerminalOutput {
                 subagent_id,
                 snapshot,
             } => {
-                let actor = remote_subagent_actor(*subagent_id);
+                let actor = remote_nested_actor(*subagent_id, self.nested_roles.get(subagent_id));
                 let mut snapshot = snapshot.clone();
                 snapshot.terminal_id = namespace_remote_id(Some(&actor), &snapshot.terminal_id);
                 self.observe_terminal_output(&snapshot);
@@ -2933,6 +2976,13 @@ fn namespace_remote_id(prefix: Option<&str>, id: &str) -> String {
 
 fn remote_subagent_actor(subagent_id: u64) -> String {
     format!("subagent-{subagent_id}")
+}
+
+fn remote_nested_actor(id: u64, role: Option<&crate::workflow::WorkflowActorRole>) -> String {
+    role.map_or_else(
+        || remote_subagent_actor(id),
+        |role| format!("{}-{id}", role.actor_prefix()),
+    )
 }
 
 fn namespace_remote_terminals(content: &mut [ToolCallContent], prefix: Option<&str>) {

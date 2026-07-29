@@ -9693,7 +9693,10 @@ fn draw_workflow_progress_rows(f: &mut ratatui::Frame, area: Rect, state: &AppSt
             // `/subagents` opens a session-wide roster rather than a
             // workflow-scoped drill-down. Advertise it only on rows that
             // contribute at least one retained nested actor to that roster.
-            let show_details = workflow.actors.keys().any(|actor_id| {
+            let show_details = workflow.actors.iter().any(|(actor_id, actor)| {
+                if actor.role.is_internal_review_session() {
+                    return false;
+                }
                 let crate::workflow::WorkflowActorId::Subagent(subagent_id) = actor_id else {
                     return false;
                 };

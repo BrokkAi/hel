@@ -61,10 +61,12 @@ When a turn that launched at least one subagent completes with the pool drained
 and the workspace changed, Mjolnir holds the completion and reviews the work
 before releasing it:
 
-1. A visible read-only intent analyst extracts the governing contract from the
-   chronological user messages for that primary session.
-2. A first-class review supervisor on the primary model receives Bifrost core
-   navigation tools and an immutable change packet. Changes under 200 lines
+1. A single self-contained user prompt goes directly to review without another
+   model call. For multi-message histories, a read-only intent analyst extracts
+   the governing contract and reconciles earlier corrections or requirements.
+2. A first-class internal review supervisor on the primary model receives
+   Bifrost core navigation tools and an immutable change packet. It runs in a
+   detached read-only session but is not a subagent. Changes under 200 lines
    include the complete captured diff; larger changes include the complete
    diffstat plus `analyze_diff` results for the captured base and target trees.
 3. The supervisor forms a risk map from the change packet and targeted source
@@ -80,10 +82,10 @@ before releasing it:
    as strong leads to verify rather than instructions to obey. Nothing survives
    vetting means the turn is released as it stands.
 
-The supervisor and reviewers have no model-turn deadline. They remain visible
-as `review · supervisor` and `review · {name}` rows, with streamed activity in
-the terminal, headless output, and remote viewer. The normal Stop action
-cancels the supervisor and all of its reviewers and reaps their processes.
+The supervisor and reviewers have no model-turn deadline. The supervisor is
+reported as an internal `review_session`, while selected specialists remain
+visible as `review · {name}` subagent rows. The normal Stop action cancels the
+supervisor and all of its reviewers and reaps their processes.
 Reviewers cannot delegate further or write to the workspace. Model usage is
 accounted to the review seat. Discrete review is toggled on the Agents tab of
 `/mjconfig`.

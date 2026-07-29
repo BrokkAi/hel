@@ -2589,33 +2589,72 @@ async fn run(
     let agent_id = config.current_agent();
     let model_id = config.current_model();
     let log_role = config.role_config.clone();
-    tracing::info!(
-        event = "subagent_worker_started",
-        subagent_id,
-        agent = %agent_id,
-        model = %model_id,
-        "subagent worker started"
-    );
+    let workflow_role = policy
+        .workflow
+        .as_ref()
+        .map(|workflow| workflow.role.clone());
+    if let Some(role) = workflow_role
+        .as_ref()
+        .filter(|role| role.is_internal_review_session())
+    {
+        tracing::info!(
+            event = "internal_review_session_started",
+            session_id = subagent_id,
+            role = role.as_str(),
+            agent = %agent_id,
+            model = %model_id,
+            "internal review session started"
+        );
+    } else {
+        tracing::info!(
+            event = "subagent_worker_started",
+            subagent_id,
+            agent = %agent_id,
+            model = %model_id,
+            "subagent worker started"
+        );
+    }
     if let Some(role) = log_role.as_ref()
         && let Some(session_tag) = role.session_tag.as_deref()
     {
-        tracing::info!(
-            event = "subagent_started",
-            session_tag,
-            model = %role.model_id,
-            adapter = %role.adapter_source_id,
-            subagent_id,
-            task = %task,
-            "the primary agent launched a subagent"
-        );
+        if let Some(workflow_role) = workflow_role
+            .as_ref()
+            .filter(|role| role.is_internal_review_session())
+        {
+            tracing::info!(
+                event = "internal_review_session_launched",
+                session_tag,
+                model = %role.model_id,
+                adapter = %role.adapter_source_id,
+                session_id = subagent_id,
+                role = workflow_role.as_str(),
+                task = %task,
+                "Mjolnir launched an internal review session"
+            );
+        } else {
+            tracing::info!(
+                event = "subagent_started",
+                session_tag,
+                model = %role.model_id,
+                adapter = %role.adapter_source_id,
+                subagent_id,
+                task = %task,
+                "the primary agent launched a subagent"
+            );
+        }
     }
-    let _ = ui_tx.send(UiEvent::InternalMessage(InternalMessage {
-        source: "primary".to_string(),
-        target: format!("subagent #{subagent_id}"),
-        kind: InternalMessageKind::Delegation,
-        text: task.clone(),
-        owner_subagent_id: Some(subagent_id),
-    }));
+    if workflow_role
+        .as_ref()
+        .is_none_or(|role| !role.is_internal_review_session())
+    {
+        let _ = ui_tx.send(UiEvent::InternalMessage(InternalMessage {
+            source: "primary".to_string(),
+            target: format!("subagent #{subagent_id}"),
+            kind: InternalMessageKind::Delegation,
+            text: task.clone(),
+            owner_subagent_id: Some(subagent_id),
+        }));
+    }
     let _ = ui_tx.send(UiEvent::Subagent(SubagentEvent::Started {
         subagent_id,
         resumed: false,

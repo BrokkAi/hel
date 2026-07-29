@@ -104,15 +104,6 @@ pub enum WorkflowActorId {
     Named(String),
 }
 
-impl WorkflowActorId {
-    pub fn as_display(&self) -> String {
-        match self {
-            Self::Subagent(id) => format!("subagent-{id}"),
-            Self::Named(name) => name.clone(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowActorRole {
     Implementation,
@@ -132,6 +123,35 @@ impl WorkflowActorRole {
             Self::SpecialistReviewer { .. } => "specialist_reviewer",
             Self::PrimaryCorrection => "primary_correction",
             Self::FallbackReviewer => "fallback_reviewer",
+        }
+    }
+
+    /// Internal review coordinators use the nested-agent runtime for process
+    /// isolation, but they are not user-delegated subagents and must not be
+    /// presented or counted as such.
+    pub const fn is_internal_review_session(&self) -> bool {
+        matches!(self, Self::IntentAnalyst | Self::ReviewSupervisor)
+    }
+
+    pub const fn display_label(&self) -> &'static str {
+        match self {
+            Self::Implementation => "subagent",
+            Self::IntentAnalyst => "review intent",
+            Self::ReviewSupervisor => "review supervisor",
+            Self::SpecialistReviewer { .. } => "reviewer",
+            Self::PrimaryCorrection => "primary correction",
+            Self::FallbackReviewer => "fallback reviewer",
+        }
+    }
+
+    pub const fn actor_prefix(&self) -> &'static str {
+        match self {
+            Self::IntentAnalyst => "review-intent",
+            Self::ReviewSupervisor => "review-supervisor",
+            Self::Implementation
+            | Self::SpecialistReviewer { .. }
+            | Self::PrimaryCorrection
+            | Self::FallbackReviewer => "subagent",
         }
     }
 }
