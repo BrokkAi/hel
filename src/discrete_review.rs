@@ -1954,7 +1954,14 @@ pub(crate) fn synthesis_verdict(text: &str) -> ReviewVerdict {
             .iter()
             .any(|marker| lower.contains(marker))
     });
-    let ends_with_clean_sentinel = lines
+    // Anvil appends a transport recap after the model's reply. Treat that
+    // known wrapper as out-of-band when locating the final verdict, while
+    // still scanning the entire response for contradictory priority findings.
+    let verdict_lines = lines
+        .iter()
+        .position(|line| line.eq_ignore_ascii_case("**Anvil Recap**"))
+        .map_or(lines.as_slice(), |index| &lines[..index]);
+    let ends_with_clean_sentinel = verdict_lines
         .last()
         .is_some_and(|line| line.eq_ignore_ascii_case(CLEAN_SENTINEL));
     if ends_with_clean_sentinel && !has_priority_finding {
@@ -2701,6 +2708,25 @@ mod tests {
         ));
         assert!(matches!(
             synthesis_verdict("No material findings.\n\nAdditional rationale after the verdict."),
+            ReviewVerdict::Findings { .. }
+        ));
+        assert_eq!(
+            synthesis_verdict(
+                "Inspected the changed paths.\n\nNo material findings.\n\n**Anvil Recap**\nNo material findings.\n\n- *Stop: completed*."
+            ),
+            ReviewVerdict::Clean,
+            "Anvil's appended transport recap must not turn a clean verdict into correction"
+        );
+        assert!(matches!(
+            synthesis_verdict(
+                "No material findings.\n\nAdditional rationale after the verdict.\n\n**Anvil Recap**\nNo material findings."
+            ),
+            ReviewVerdict::Findings { .. }
+        ));
+        assert!(matches!(
+            synthesis_verdict(
+                "No material findings.\n\n**Anvil Recap**\n[P2] src/a.rs:2 -- contradictory recap finding"
+            ),
             ReviewVerdict::Findings { .. }
         ));
         assert!(matches!(
