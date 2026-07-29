@@ -12,6 +12,7 @@ use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,17 +37,18 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Widget, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    AppState, ArenaPane, ConfigValueChoice, ConnectionState, ElicitationView, Entry,
-    PastedAttachment, PastedImageAttachment, PendingElicitation, PendingPermission,
-    QUEUED_PROMPT_PREVIEW_WIDTH, QueuedPrompt, RagnarokDraftPrStatus, RagnarokFighterUi,
-    RagnarokUi, StatusKind, StatusMessage, SubagentStatus, ToolCallOutput, UiExitReason,
-    classify_elicitation, config_option_choices, config_option_current_value_label,
+    AppState, ArenaPane, ConfigValueChoice, ConnectionState, CurrentBranchPullRequest,
+    ElicitationView, Entry, PastedAttachment, PastedImageAttachment, PendingElicitation,
+    PendingPermission, QUEUED_PROMPT_PREVIEW_WIDTH, QueuedPrompt, RagnarokDraftPrStatus,
+    RagnarokFighterUi, RagnarokUi, StatusKind, StatusMessage, SubagentStatus, ToolCallOutput,
+    UiExitReason, classify_elicitation, config_option_choices, config_option_current_value_label,
 };
 use crate::clipboard::{
     ClipboardImage, copy_to_clipboard, load_image_path_as_png, read_clipboard_image_as_png,
@@ -82,6 +84,7 @@ const QUEUED_PROMPT_VISIBLE_ROWS: usize = 3;
 /// Workflow progress rows rendered before the area folds into a "… N more"
 /// line. Normal orchestration has at most delegation and review active.
 const WORKFLOW_PROGRESS_VISIBLE_ROWS: usize = 2;
+const CURRENT_BRANCH_PR_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const CURSOR_POSITION_TIMEOUT_MESSAGE: &str =
     "The cursor position could not be read within a normal duration";
 const INLINE_SETUP_RETRY_DELAY: Duration = Duration::from_millis(75);
@@ -96,6 +99,85 @@ const INLINE_RESIZE_REFLOW_DEBOUNCE: Duration = Duration::from_millis(75);
 const STREAM_COMMIT_INTERVAL: Duration = Duration::from_nanos(8_333_334);
 const STREAM_CATCH_UP_LINES: usize = 8;
 const STREAM_CATCH_UP_AGE: Duration = Duration::from_millis(120);
+
+#[derive(Debug)]
+struct CurrentBranchPrProbe {
+    cwd: PathBuf,
+    branch: Option<String>,
+    gh_succeeded: bool,
+    pull_request: Option<CurrentBranchPullRequest>,
+}
+
+#[derive(Deserialize)]
+struct GhPullRequestView {
+    number: u64,
+    url: String,
+    state: String,
+}
+
+async fn probe_current_branch_pull_request(cwd: PathBuf) -> CurrentBranchPrProbe {
+    let branch = tokio::process::Command::new("git")
+        .current_dir(&cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["branch", "--show-current"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|branch| branch.trim().to_string())
+        .filter(|branch| !branch.is_empty());
+
+    let gh_output = tokio::process::Command::new("gh")
+        .current_dir(&cwd)
+        .env("GH_PROMPT_DISABLED", "1")
+        .args(["pr", "view", "--json", "number,url,state"])
+        .stdin(Stdio::null())
+        .output()
+        .await;
+    let (gh_succeeded, pull_request) = match gh_output {
+        Ok(output) if output.status.success() => {
+            let pull_request = String::from_utf8(output.stdout)
+                .ok()
+                .and_then(|output| serde_json::from_str::<GhPullRequestView>(&output).ok())
+                .filter(|pull_request| pull_request.state.eq_ignore_ascii_case("open"))
+                .map(|pull_request| CurrentBranchPullRequest {
+                    number: pull_request.number,
+                    url: pull_request.url,
+                });
+            (true, pull_request)
+        }
+        _ => (false, None),
+    };
+
+    CurrentBranchPrProbe {
+        cwd,
+        branch,
+        gh_succeeded,
+        pull_request,
+    }
+}
+
+fn apply_current_branch_pr_probe(state: &mut AppState, probe: CurrentBranchPrProbe) -> bool {
+    if probe.cwd != state.session_cwd {
+        return false;
+    }
+
+    let previous_branch = state.current_branch_pull_request_branch.clone();
+    let previous_pull_request = state.current_branch_pull_request.clone();
+    if previous_branch != probe.branch {
+        state.current_branch_pull_request_branch = probe.branch;
+        state.current_branch_pull_request = None;
+    }
+    if probe.gh_succeeded {
+        state.current_branch_pull_request = probe.pull_request;
+    }
+
+    previous_branch != state.current_branch_pull_request_branch
+        || previous_pull_request != state.current_branch_pull_request
+}
+
 /// Do not wait for a source newline forever. ACP prose chunks are arbitrary
 /// text deltas, so a normal single-paragraph response may never contain one.
 const STREAM_PARTIAL_COMMIT_AGE: Duration = Duration::from_millis(40);
@@ -1133,6 +1215,8 @@ async fn ui_loop(
     let mut crossterm_events = EventStream::new();
     let (dictation_tx, mut dictation_rx) = mpsc::unbounded_channel::<DictationEvent>();
     let mut dictation_cancel_tx: Option<std_mpsc::Sender<()>> = None;
+    let (current_pr_tx, mut current_pr_rx) = mpsc::unbounded_channel::<CurrentBranchPrProbe>();
+    let mut current_pr_probe_in_flight = false;
     // Ragnarok battles report through their own channel (the sender stays
     // alive here for the whole loop, so `recv` pends rather than closing).
     let (ragnarok_tx, mut ragnarok_rx) = mpsc::unbounded_channel::<ragnarok::RagnarokEvent>();
@@ -1146,6 +1230,8 @@ async fn ui_loop(
     animation_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut stream_commit_tick = tokio::time::interval(STREAM_COMMIT_INTERVAL);
     stream_commit_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut current_pr_tick = tokio::time::interval(CURRENT_BRANCH_PR_POLL_INTERVAL);
+    current_pr_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     if mode == UiMode::InlineChat {
         sync_inline_terminal_height(terminal, &state, &mut inline_height)?;
@@ -1268,6 +1354,22 @@ async fn ui_loop(
                     drain_ragnarok_draft_pr_publish(&mut state, &ragnarok_tx);
                     pending_redraw.mark(cause);
                 }
+            }
+            maybe_probe = current_pr_rx.recv() => {
+                current_pr_probe_in_flight = false;
+                if let Some(probe) = maybe_probe
+                    && apply_current_branch_pr_probe(&mut state, probe)
+                {
+                    pending_redraw.mark_interactive();
+                }
+            }
+            _ = current_pr_tick.tick(), if !current_pr_probe_in_flight => {
+                current_pr_probe_in_flight = true;
+                let cwd = state.session_cwd.clone();
+                let tx = current_pr_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(probe_current_branch_pull_request(cwd).await);
+                });
             }
             // Use the unconditional form (no `Some(ev) = ...`) so the
             // None case (runtime dropped the sender) reaches the match
@@ -2365,6 +2467,7 @@ fn desired_inline_height(state: &AppState, terminal_size: Size) -> u16 {
         usize::from(INLINE_CHAT_HEIGHT)
             + usize::from(queued_prompt_row_count(state))
             + usize::from(workflow_progress_row_count(state))
+            + usize::from(current_branch_pr_row_count(state))
             + usage_quota_row_count(state, width)
             + inline_transcript_tail_row_count(state, width)
     };
@@ -4521,10 +4624,8 @@ fn handle_mjconfig_menu_key(
                         Some("Wait for the current turn or prompt before signing in".to_string());
                 }
                 TerminalRequest::None
-            } else if matches!(
-                vendor,
-                crate::auth::AuthVendor::OpenAi | crate::auth::AuthVendor::Anthropic
-            ) && crate::auth::executable(vendor).is_none()
+            } else if vendor == crate::auth::AuthVendor::OpenAi
+                && crate::auth::executable(vendor).is_none()
             {
                 if let Some(menu) = state.mjconfig_menu.as_mut() {
                     menu.editor.notice = Some(format!(
@@ -5732,6 +5833,7 @@ fn draw(
 
     let queued_row = queued_prompt_row_count(state);
     let workflow_rows = workflow_progress_row_count(state);
+    let current_pr_rows = current_branch_pr_row_count(state);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -5739,6 +5841,7 @@ fn draw(
             Constraint::Min(3),
             Constraint::Length(1),
             Constraint::Length(workflow_rows),
+            Constraint::Length(current_pr_rows),
             Constraint::Length(queued_row),
             Constraint::Length(input_height),
             Constraint::Length(usage_quota_rows),
@@ -5755,10 +5858,11 @@ fn draw(
     }
     draw_header(f, chunks[1], state);
     draw_workflow_progress_rows(f, chunks[2], state);
-    draw_queued_prompt_row(f, chunks[3], state);
-    draw_input(f, chunks[4], state, mode);
-    draw_usage_quota_row(f, chunks[5], state);
-    draw_config_shortcuts_row(f, chunks[6], state);
+    draw_current_branch_pr_row(f, chunks[3], state);
+    draw_queued_prompt_row(f, chunks[4], state);
+    draw_input(f, chunks[5], state, mode);
+    draw_usage_quota_row(f, chunks[6], state);
+    draw_config_shortcuts_row(f, chunks[7], state);
 
     // Autocomplete sits above the input box (so it doesn't collide with
     // the cursor) and is rendered last among the input-area widgets so
@@ -5924,6 +6028,7 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
     let usage_quota_rows = usage_quota_row_count(state, f.area().width) as u16;
     let queued_row = queued_prompt_row_count(state);
     let workflow_rows = workflow_progress_row_count(state);
+    let current_pr_rows = current_branch_pr_row_count(state);
     let live_rows = inline_transcript_tail_row_count(state, f.area().width)
         .min(usize::from(f.area().height)) as u16;
     let chunks = Layout::default()
@@ -5932,6 +6037,7 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
             Constraint::Length(live_rows),
             Constraint::Length(1),
             Constraint::Length(workflow_rows),
+            Constraint::Length(current_pr_rows),
             Constraint::Length(queued_row),
             Constraint::Min(MIN_INPUT_HEIGHT),
             Constraint::Length(usage_quota_rows),
@@ -5942,10 +6048,11 @@ fn draw_inline_chat(f: &mut ratatui::Frame, state: &mut AppState) {
     draw_inline_transcript_tail(f, chunks[0], state);
     draw_header(f, chunks[1], state);
     draw_workflow_progress_rows(f, chunks[2], state);
-    draw_queued_prompt_row(f, chunks[3], state);
-    draw_input(f, chunks[4], state, UiMode::InlineChat);
-    draw_usage_quota_row(f, chunks[5], state);
-    draw_config_shortcuts_row(f, chunks[6], state);
+    draw_current_branch_pr_row(f, chunks[3], state);
+    draw_queued_prompt_row(f, chunks[4], state);
+    draw_input(f, chunks[5], state, UiMode::InlineChat);
+    draw_usage_quota_row(f, chunks[6], state);
+    draw_config_shortcuts_row(f, chunks[7], state);
 
     if state.autocomplete.visible
         && !state.has_pending_permission()
@@ -6499,6 +6606,7 @@ fn draw_nested_agent_viewer(
         .max(1)
         .min(usize::from(u16::MAX)) as u16;
     let actor_ids = state.nested_agent_viewer_ids();
+    let actor_count = state.nested_agents().count();
     let roster_rows = actor_ids.len().clamp(1, usize::from(u16::MAX)) as u16;
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -6510,9 +6618,17 @@ fn draw_nested_agent_viewer(
         .split(area);
 
     let now = Instant::now();
+    let roster_title = if actor_count > actor_ids.len() {
+        format!(
+            " nested agents — {} newest of {actor_count} retained ",
+            actor_ids.len()
+        )
+    } else {
+        " nested agents — retained for this session ".to_string()
+    };
     let roster_block = Block::default()
         .borders(Borders::ALL)
-        .title(" nested agents — retained for this session ")
+        .title(roster_title)
         .style(Style::default().fg(state.theme.agent));
     let roster_inner = roster_block.inner(layout[0]);
     f.render_widget(roster_block, layout[0]);
@@ -9657,6 +9773,34 @@ fn workflow_progress_row_count(state: &AppState) -> u16 {
     (visible + overflow).min(u16::MAX as usize) as u16
 }
 
+fn current_branch_pr_row_count(state: &AppState) -> u16 {
+    u16::from(state.current_branch_pull_request.is_some())
+}
+
+fn draw_current_branch_pr_row(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    let Some(pull_request) = state.current_branch_pull_request.as_ref() else {
+        return;
+    };
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let width = usize::from(area.width);
+    let label = fit_width(
+        format!(" PR #{} · {}", pull_request.number, pull_request.url),
+        width,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(state.theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        area,
+    );
+}
+
 /// One stable line per visible delegation or review workflow, shared by inline
 /// and fullscreen layouts. `/subagents` opens the actor-level transcripts.
 fn draw_workflow_progress_rows(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
@@ -9937,7 +10081,9 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &AppState, mode: UiMode
     } else {
         Style::default()
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .title(title);
 
     // Build lines with attachment chips interleaved with input text.
     let mut lines: Vec<Line> = Vec::new();
@@ -9945,9 +10091,9 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &AppState, mode: UiMode
     f.render_widget(block, area);
 
     let inner = Rect::new(
-        area.x.saturating_add(1),
+        area.x,
         area.y.saturating_add(1),
-        area.width.saturating_sub(2),
+        area.width,
         area.height.saturating_sub(2),
     );
     if inner.width == 0 || inner.height == 0 {
@@ -14316,6 +14462,62 @@ mod tests {
     }
 
     #[test]
+    fn current_branch_pr_probe_surfaces_open_pr_and_retires_it_on_branch_change() {
+        let mut state = AppState::new();
+        state.session_cwd = PathBuf::from("/repo");
+
+        assert!(apply_current_branch_pr_probe(
+            &mut state,
+            CurrentBranchPrProbe {
+                cwd: PathBuf::from("/repo"),
+                branch: Some("feature".to_string()),
+                gh_succeeded: true,
+                pull_request: Some(CurrentBranchPullRequest {
+                    number: 487,
+                    url: "https://github.com/BrokkAi/mjolnir/pull/487".to_string(),
+                }),
+            },
+        ));
+        assert_eq!(
+            state.current_branch_pull_request,
+            Some(CurrentBranchPullRequest {
+                number: 487,
+                url: "https://github.com/BrokkAi/mjolnir/pull/487".to_string(),
+            })
+        );
+
+        assert!(apply_current_branch_pr_probe(
+            &mut state,
+            CurrentBranchPrProbe {
+                cwd: PathBuf::from("/repo"),
+                branch: Some("other".to_string()),
+                gh_succeeded: false,
+                pull_request: None,
+            },
+        ));
+        assert!(state.current_branch_pull_request.is_none());
+    }
+
+    #[test]
+    fn current_branch_pr_row_is_compact_at_narrow_widths() {
+        let mut state = AppState::new();
+        state.current_branch_pull_request = Some(CurrentBranchPullRequest {
+            number: 487,
+            url: "https://github.com/BrokkAi/mjolnir/pull/487".to_string(),
+        });
+        let backend = TestBackend::new(24, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_current_branch_pr_row(frame, frame.area(), &state))
+            .expect("draw PR row");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("PR #487"));
+        assert_eq!(current_branch_pr_row_count(&state), 1);
+    }
+
+    #[test]
     fn workflow_progress_row_is_stable_across_rapid_out_of_order_actor_churn() {
         let mut state = AppState::new();
         let workflow_id = WorkflowId::delegation(7);
@@ -14630,9 +14832,9 @@ mod tests {
     }
 
     #[test]
-    fn nested_agent_viewer_shows_all_actors_when_narrow_and_keeps_attribution() {
+    fn nested_agent_viewer_shows_ten_newest_actors_and_keeps_attribution() {
         let mut state = AppState::new();
-        for id in 1..=8 {
+        for id in 1..=15 {
             start_subagent(&mut state, id, &format!("actor-{id}"), "work");
         }
         let terminal_size = Size {
@@ -14645,7 +14847,7 @@ mod tests {
             terminal_size.height - 1,
             "the nested viewer needs enough height for every retained actor"
         );
-        assert_eq!(state.nested_agent_selected, Some(8));
+        assert_eq!(state.nested_agent_selected, Some(15));
         state.close_nested_agent_viewer();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         let ctrl_l = handle_inline_crossterm(
@@ -14673,12 +14875,19 @@ mod tests {
             .draw(|frame| draw_nested_agent_viewer(frame, frame.area(), &mut state, true))
             .expect("narrow inline viewer");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-        for id in 1..=8 {
+        for id in 6..=15 {
             assert!(
                 rendered.contains(&format!("#{id}")),
                 "actor #{id} must remain visible:\n{rendered}"
             );
         }
+        for id in 1..=5 {
+            assert!(
+                !rendered.contains(&format!("#{id} ")),
+                "older actor #{id} must not displace a recent actor:\n{rendered}"
+            );
+        }
+        assert!(rendered.contains("nested agents — 10 ne"), "{rendered}");
         #[cfg(target_os = "macos")]
         assert!(rendered.contains("Fn+Up/Down"), "{rendered}");
         handle_inline_crossterm(&mut state, &cmd_tx, key(KeyCode::F(11)));
@@ -15926,7 +16135,8 @@ mod tests {
 
         // ACP Servers tab: toggle Codex off.
         state.mjconfig_menu_key(KeyCode::Tab);
-        state.mjconfig_menu.as_mut().expect("menu").editor.selected = 4;
+        state.mjconfig_menu.as_mut().expect("menu").editor.selected =
+            crate::settings::SERVER_ROW_OFFSET;
         handle_mjconfig_menu_key(
             &mut state,
             &cmd_tx,
@@ -18813,7 +19023,7 @@ mod tests {
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(
-            rendered.contains("············ (Enter send"),
+            rendered.contains("──────────── (Enter send"),
             "rendered:\n{rendered}"
         );
         assert!(rendered.contains("Ctrl-C quit"), "rendered:\n{rendered}");
@@ -18839,6 +19049,34 @@ mod tests {
     }
 
     #[test]
+    fn input_box_omits_side_borders() {
+        let mut state = AppState::new();
+        state.set_connection_state(ConnectionState::Ready);
+        let backend = TestBackend::new(80, 5);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw_input(frame, frame.area(), &state, UiMode::InlineChat))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer());
+        assert!(
+            rendered.first().is_some_and(|line| line.contains('─')),
+            "top border missing:\n{}",
+            rendered.join("\n")
+        );
+        assert!(
+            rendered.last().is_some_and(|line| line.contains('─')),
+            "bottom border missing:\n{}",
+            rendered.join("\n")
+        );
+        for line in &rendered[1..rendered.len() - 1] {
+            assert!(!line.starts_with('│'), "left border rendered: {line:?}");
+            assert!(!line.ends_with('│'), "right border rendered: {line:?}");
+        }
+    }
+
+    #[test]
     fn inline_input_title_omits_text_selection_shortcut() {
         let mut state = AppState::new();
         state.set_connection_state(ConnectionState::Ready);
@@ -18851,7 +19089,7 @@ mod tests {
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(
-            rendered.contains("············ (Enter send"),
+            rendered.contains("──────────── (Enter send"),
             "rendered:\n{rendered}"
         );
         assert!(rendered.contains("Ctrl-C quit"), "rendered:\n{rendered}");
@@ -18873,7 +19111,7 @@ mod tests {
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(
-            rendered.contains("············ 0s (Enter send"),
+            rendered.contains("──────────── 0s (Enter send"),
             "rendered:\n{rendered}"
         );
         assert!(!rendered.contains("prompt"), "rendered:\n{rendered}");
@@ -21660,7 +21898,7 @@ mod tests {
         state.input = "hello abcdef".to_string();
         state.input_cursor = state.input.chars().count();
 
-        let mut terminal = Terminal::new(TestBackend::new(16, 6)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(14, 6)).expect("terminal");
         terminal
             .draw(|frame| draw_input(frame, frame.area(), &state, UiMode::FullscreenTui))
             .expect("draw");
@@ -21678,7 +21916,7 @@ mod tests {
         );
         terminal
             .backend_mut()
-            .assert_cursor_position(Position::new(10, 3));
+            .assert_cursor_position(Position::new(9, 3));
     }
 
     #[test]

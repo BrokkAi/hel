@@ -41,6 +41,7 @@ pub const QUEUED_PROMPT_PREVIEW_WIDTH: usize = 40;
 /// Longest excerpt of an objective or failure message kept in a subagent's
 /// permanent transcript record.
 const SUBAGENT_RECORD_LINE_CHARS: usize = 160;
+const NESTED_AGENT_VIEWER_LIMIT: usize = 10;
 
 /// Durable UI state for one nested ACP actor. The on-demand viewer reads its
 /// lifecycle and `transcript`; completed actors stay here for the whole
@@ -373,6 +374,12 @@ pub struct ToolCallView {
     pub kind: ToolKind,
     pub status: ToolCallStatus,
     pub body: Vec<ToolCallOutput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentBranchPullRequest {
+    pub number: u64,
+    pub url: String,
 }
 
 /// Durable facts about one locally submitted prompt turn.  Entries remain the
@@ -960,6 +967,11 @@ pub struct AppState {
     pub agent_usage: crate::agent_usage::Snapshot,
     /// Transient status line with severity.
     pub status_line: Option<StatusMessage>,
+    /// Open pull request resolved by `gh pr view` for the checked-out branch.
+    pub current_branch_pull_request: Option<CurrentBranchPullRequest>,
+    /// Branch used for the latest pull-request probe. Kept separately so a
+    /// branch switch immediately retires the previous branch's result.
+    pub(crate) current_branch_pull_request_branch: Option<String>,
     /// True while the local microphone dictation helper is running.
     pub voice_input_active: bool,
     /// Prompt buffer range currently owned by live voice dictation.
@@ -1317,6 +1329,8 @@ impl AppState {
             workflow_clocks: BTreeMap::new(),
             agent_usage: crate::agent_usage::Snapshot::default(),
             status_line: None,
+            current_branch_pull_request: None,
+            current_branch_pull_request_branch: None,
             voice_input_active: false,
             voice_input_range: None,
             voice_input_level: None,
@@ -1369,6 +1383,8 @@ impl AppState {
         side.primary_acp_name = self.primary_acp_name.clone();
         side.agent_source_id = self.agent_source_id.clone();
         side.active_agent_launch = self.active_agent_launch.clone();
+        side.current_branch_pull_request = self.current_branch_pull_request.clone();
+        side.current_branch_pull_request_branch = self.current_branch_pull_request_branch.clone();
         side.transcript_export_dir = self.transcript_export_dir.clone();
         side.prompt_images_supported = self.prompt_images_supported;
         side.side_main_notice = Some(
@@ -1900,6 +1916,7 @@ impl AppState {
                 .cmp(&right.finished.is_some())
                 .then_with(|| right_id.cmp(left_id))
         });
+        ids.truncate(NESTED_AGENT_VIEWER_LIMIT);
         ids
     }
 
@@ -5476,6 +5493,20 @@ mod tests {
             [Entry::System(record)]
                 if record == "subagent #3 · fix-tests · started · Fix the failing parser tests"
         ));
+    }
+
+    #[test]
+    fn nested_agent_viewer_keeps_the_ten_most_recent_actors() {
+        let mut state = AppState::new();
+        for id in 1..=15 {
+            state.apply_event(subagent_started(id, &format!("actor-{id}"), "work"));
+        }
+
+        assert_eq!(
+            state.nested_agent_viewer_ids(),
+            (6..=15).rev().collect::<Vec<_>>()
+        );
+        assert_eq!(state.nested_agents().count(), 15);
     }
 
     #[test]
