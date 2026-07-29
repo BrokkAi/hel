@@ -1220,9 +1220,14 @@ async fn run_async(
 
     let verdict = match supervisor_started {
         Ok(started) => {
+            let intent_source = if intent.body == DIRECT_INTENT_CONTEXT {
+                "primary"
+            } else {
+                "Eitri"
+            };
             emit_internal(
                 events,
-                "Eitri",
+                intent_source,
                 "review supervisor",
                 InternalMessageKind::ReviewLane,
                 &intent.body,
@@ -1961,9 +1966,11 @@ pub(crate) fn synthesis_verdict(text: &str) -> ReviewVerdict {
         .iter()
         .position(|line| line.eq_ignore_ascii_case("**Anvil Recap**"))
         .map_or(lines.as_slice(), |index| &lines[..index]);
-    let ends_with_clean_sentinel = verdict_lines
-        .last()
-        .is_some_and(|line| line.eq_ignore_ascii_case(CLEAN_SENTINEL));
+    let ends_with_clean_sentinel = verdict_lines.last().is_some_and(|line| {
+        line.trim_matches('*')
+            .trim()
+            .eq_ignore_ascii_case(CLEAN_SENTINEL)
+    });
     if ends_with_clean_sentinel && !has_priority_finding {
         return ReviewVerdict::Clean;
     }
@@ -2716,6 +2723,13 @@ mod tests {
             ),
             ReviewVerdict::Clean,
             "Anvil's appended transport recap must not turn a clean verdict into correction"
+        );
+        assert_eq!(
+            synthesis_verdict(
+                "Inspected the changed paths.\n\n**No material findings.**\n\n**Anvil Recap**\nNo material findings."
+            ),
+            ReviewVerdict::Clean,
+            "Markdown emphasis around the final sentinel must not trigger correction"
         );
         assert!(matches!(
             synthesis_verdict(
