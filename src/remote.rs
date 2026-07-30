@@ -2642,11 +2642,15 @@ fn start_server_agent_session(
                 .map(|resolved| resolved.primary.model.model.clone()),
             review_root: provenance_cwd.clone(),
             review_fanout: review_workers
-                .zip(roster.as_ref())
-                .map(|(workers, resolved)| {
+                .zip(
+                    roster
+                        .as_ref()
+                        .and_then(|resolved| resolved.review_supervisor.clone()),
+                )
+                .map(|(workers, supervisor)| {
                     crate::discrete_review::Spawner::live(crate::discrete_review::FanoutConfig {
                         workers,
-                        supervisor: resolved.primary.clone(),
+                        supervisor,
                         cwd: provenance_cwd.clone(),
                         additional_directories: review_additional_directories,
                         session_tag: Some(format!("remote-{}", std::process::id())),

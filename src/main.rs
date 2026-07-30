@@ -110,6 +110,15 @@ struct Cli {
     #[arg(long, value_name = "MODEL[+EFFORT]", requires = "print", value_parser = parse_model_override)]
     model: Option<(String, Option<String>)>,
 
+    /// Override the discrete review supervisor's model for this
+    /// non-interactive invocation.
+    ///
+    /// Accepts an optional trailing `+<effort>` on the model, same as
+    /// `--model`. The review supervisor cannot be disabled independently;
+    /// use the saved review toggle for that.
+    #[arg(long, value_name = "MODEL[+EFFORT]", requires = "print", value_parser = parse_model_override)]
+    review_model: Option<(String, Option<String>)>,
+
     /// Override the default subagent model, or disable subagents, for this
     /// non-interactive invocation.
     ///
@@ -541,6 +550,8 @@ async fn main() -> Result<()> {
             role_overrides: config::ModelOverrides {
                 primary: cli.model.as_ref().map(|(model, _)| model.clone()),
                 primary_effort: cli.model.and_then(|(_, effort)| effort),
+                review: cli.review_model.as_ref().map(|(model, _)| model.clone()),
+                review_effort: cli.review_model.and_then(|(_, effort)| effort),
                 subagent: cli.subagent_model.as_ref().map(|(model, _)| model.clone()),
                 subagent_effort: cli.subagent_model.and_then(|(_, effort)| effort),
             },
@@ -812,9 +823,11 @@ async fn run_resume(
                     record.model,
                     record.adapter_source_id
                 )
-            })?;
+            })?
+            .clone();
         resume_roster.primary = pinned.clone();
-        agent = selected_agent_for_role(pinned);
+        resume_roster.rebind_auto_review_for_primary(&cfg);
+        agent = selected_agent_for_role(&pinned);
     } else if let Some(session_id) = args.session_id.as_deref() {
         let matches = list_agent_sessions(&resume_roster, &cwd, args.agent_stderr.as_deref())
             .await
@@ -835,6 +848,7 @@ async fn run_resume(
                 });
                 agent = selected_agent_for_role(&role);
                 resume_roster.primary = role;
+                resume_roster.rebind_auto_review_for_primary(&cfg);
             }
             [] => {}
             _ => anyhow::bail!(
@@ -981,6 +995,7 @@ async fn run_resume(
                     .clone();
                 agent = selected_agent_for_role(&role);
                 resume_roster.primary = role;
+                resume_roster.rebind_auto_review_for_primary(&cfg);
                 let result = run_app(
                     cwd,
                     RuntimeOptions {
@@ -1449,6 +1464,7 @@ async fn run_app(
         })
     {
         roster.primary = pinned.clone();
+        roster.rebind_auto_review_for_primary(&cfg);
     }
     let mut primary_agent = selected_agent_for_role(&roster.primary);
 
@@ -2189,19 +2205,21 @@ async fn run_session(
             discrete_review: agent_config.discrete_review,
             primary_model: Some(roster.primary.model.model.clone()),
             review_root: cwd.clone(),
-            review_fanout: review_workers.map(|workers| {
-                discrete_review::Spawner::live(discrete_review::FanoutConfig {
-                    workers,
-                    supervisor: roster.primary.clone(),
-                    cwd: cwd.clone(),
-                    additional_directories: runtime_options.additional_directories.clone(),
-                    session_tag: Some(session_tag.clone()),
-                    agent_stderr: runtime_options.agent_stderr.clone(),
-                    snapshot_exclusions: runtime_options.snapshot_exclusions.clone(),
-                    fs_max_text_bytes: runtime_options.fs_max_text_bytes,
-                    id_allocator: subagent_ids.clone(),
-                })
-            }),
+            review_fanout: review_workers.zip(roster.review_supervisor.clone()).map(
+                |(workers, supervisor)| {
+                    discrete_review::Spawner::live(discrete_review::FanoutConfig {
+                        workers,
+                        supervisor,
+                        cwd: cwd.clone(),
+                        additional_directories: runtime_options.additional_directories.clone(),
+                        session_tag: Some(session_tag.clone()),
+                        agent_stderr: runtime_options.agent_stderr.clone(),
+                        snapshot_exclusions: runtime_options.snapshot_exclusions.clone(),
+                        fs_max_text_bytes: runtime_options.fs_max_text_bytes,
+                        id_allocator: subagent_ids.clone(),
+                    })
+                },
+            ),
         },
     );
     let primary_orchestrator = orchestrated.handle.clone();
@@ -2488,6 +2506,15 @@ async fn run_session(
                 active_models: config::ModelsConfig {
                     primary: roster.primary.model.model.clone(),
                     primary_source: Some(roster.primary.launch.source_id.clone()),
+                    review: roster
+                        .review_supervisor
+                        .as_ref()
+                        .map(|role| role.model.model.clone())
+                        .unwrap_or_else(|| "off".to_string()),
+                    review_source: roster
+                        .review_supervisor
+                        .as_ref()
+                        .map(|role| role.launch.source_id.clone()),
                     subagent: roster
                         .subagent_default
                         .as_ref()
@@ -3215,6 +3242,7 @@ mod tests {
         let claude = test_roster_agent("claude-test", "claude-acp");
         let roster = roster::Roster {
             primary: codex.clone(),
+            review_supervisor: None,
             subagent_default: Some(claude.clone()),
             available: vec![codex, claude],
             choices: Vec::new(),
@@ -3407,12 +3435,18 @@ mod tests {
             "hello",
             "--model",
             "gpt-test",
+            "--review-model",
+            "claude-review+high",
             "--subagent-model",
             "disabled",
         ])
         .expect("parse role overrides");
 
         assert_eq!(cli.model, Some(("gpt-test".to_string(), None)));
+        assert_eq!(
+            cli.review_model,
+            Some(("claude-review".to_string(), Some("high".to_string())))
+        );
         assert_eq!(
             cli.subagent_model,
             Some((config::DISABLED_MODEL.to_string(), None))
@@ -3427,6 +3461,8 @@ mod tests {
             "-",
             "--model",
             "gpt-test",
+            "--review-model",
+            "claude-review",
             "--subagent-model",
             "disabled",
         ])
@@ -3434,6 +3470,7 @@ mod tests {
 
         assert_eq!(cli.print.as_deref(), Some("-"));
         assert_eq!(cli.model, Some(("gpt-test".to_string(), None)));
+        assert_eq!(cli.review_model, Some(("claude-review".to_string(), None)));
         assert_eq!(
             cli.subagent_model,
             Some((config::DISABLED_MODEL.to_string(), None))
@@ -3560,6 +3597,10 @@ mod tests {
             assert!(
                 Cli::try_parse_from(["mj", "--print", "hello", "--model", value]).is_err(),
                 "accepted invalid --model override {value}"
+            );
+            assert!(
+                Cli::try_parse_from(["mj", "--print", "hello", "--review-model", value]).is_err(),
+                "accepted invalid --review-model override {value}"
             );
         }
     }

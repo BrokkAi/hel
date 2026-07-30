@@ -3524,6 +3524,7 @@ mod tests {
         let default = role("gpt-y", "codex-acp", true);
         Roster {
             primary: role("gpt-x", "codex-acp", true),
+            review_supervisor: None,
             subagent_default: Some(default.clone()),
             available: vec![
                 role("gpt-x", "codex-acp", true),

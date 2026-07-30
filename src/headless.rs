@@ -251,8 +251,10 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                     record.adapter_source_id
                 )
             })?;
+        resolved.rebind_auto_review_for_primary(&app_config);
     }
     let primary = resolved.primary.clone();
+    let review_supervisor = resolved.review_supervisor.clone();
     let provenance_primary = primary.clone();
     let provenance_cwd = cfg.cwd.clone();
 
@@ -358,19 +360,21 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             discrete_review: app_config.agent.discrete_review,
             primary_model: Some(primary.model.model.clone()),
             review_root: cfg.cwd.clone(),
-            review_fanout: review_workers.map(|workers| {
-                crate::discrete_review::Spawner::live(crate::discrete_review::FanoutConfig {
-                    workers,
-                    supervisor: primary.clone(),
-                    cwd: cfg.cwd.clone(),
-                    additional_directories: cfg.additional_directories.clone(),
-                    session_tag: Some(format!("headless-{}", std::process::id())),
-                    agent_stderr: cfg.agent_stderr.clone(),
-                    snapshot_exclusions: cfg.snapshot_exclusions.clone(),
-                    fs_max_text_bytes: cfg.fs_max_text_bytes,
-                    id_allocator: subagent_ids.clone(),
-                })
-            }),
+            review_fanout: review_workers
+                .zip(review_supervisor)
+                .map(|(workers, supervisor)| {
+                    crate::discrete_review::Spawner::live(crate::discrete_review::FanoutConfig {
+                        workers,
+                        supervisor,
+                        cwd: cfg.cwd.clone(),
+                        additional_directories: cfg.additional_directories.clone(),
+                        session_tag: Some(format!("headless-{}", std::process::id())),
+                        agent_stderr: cfg.agent_stderr.clone(),
+                        snapshot_exclusions: cfg.snapshot_exclusions.clone(),
+                        fs_max_text_bytes: cfg.fs_max_text_bytes,
+                        id_allocator: subagent_ids.clone(),
+                    })
+                }),
         },
     );
     let primary_orchestrator = orchestrated.handle.clone();

@@ -171,7 +171,7 @@ so primary scrollback and terminal geometry are not rewritten.
 
 When a turn that used at least one subagent completes with the pool drained and
 the workspace changed, Mjolnir reviews the finished work before releasing the
-turn. A visible supervisor on the primary model investigates the immutable
+turn. A visible supervisor on the configured review model investigates the immutable
 change packet and asynchronously launches only the useful read-only Norse
 reviewers. Their reports return to the same supervisor session for vetting, and
 surviving findings come back as a corrective turn. The supervisor and reviewers

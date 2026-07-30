@@ -64,7 +64,7 @@ before releasing it:
 1. A single self-contained user prompt goes directly to review without another
    model call. For multi-message histories, a read-only intent analyst extracts
    the governing contract and reconciles earlier corrections or requirements.
-2. A first-class internal review supervisor on the primary model receives
+2. A first-class internal review supervisor on the configured review model receives
    Bifrost core navigation tools and an immutable change packet. It runs in a
    detached read-only session but is not a subagent. Changes under 200 lines
    include the complete captured diff; larger changes include the complete
