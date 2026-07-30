@@ -269,7 +269,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let quota_gate = crate::quota::Gate::new(cfg.cwd.clone(), event_tx.clone());
     let (subagent_roles, _subagent_codex_home) =
         crate::isolated_subagent_roles(resolved.subagent_failover_roles(), "subagent")?;
-    let headless_quota_gate = quota_gate.clone();
     let subagent_pool = (!subagent_roles.is_empty()).then(|| {
         crate::quota::RolePool::new(
             subagent_roles,
@@ -287,9 +286,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let subagent_ids = subagent::SubagentIdAllocator::default();
     let active_implementation_workers = subagent::ActiveSubagentWorkers::default();
     let (subagent_reports, subagent_report_rx) = subagent::SubagentReportBus::channel();
-    let subagent_inventory = Arc::new(std::sync::RwLock::new(
-        subagent::SubagentInventory::from_roster(&resolved),
-    ));
     let mut primary_env = primary.launch.env.clone();
     let primary_permission = cfg.permission_config_mode.and_then(|mode| {
         roster::configure_permissions(primary.launch.kind, mode, &mut primary_env)
@@ -325,8 +321,6 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 .with_active_implementation_workers(active_implementation_workers.clone())
                 .with_max_parallel(app_config.subagents.max_parallel)
                 .with_headless_permission_mode(cfg.permission_mode.into())
-                .with_quota_gate(headless_quota_gate)
-                .with_inventory(subagent_inventory)
                 .with_reports(subagent_reports.clone())
                 .with_prewarm(subagent::RunContext {
                     cwd: cfg.cwd.clone(),

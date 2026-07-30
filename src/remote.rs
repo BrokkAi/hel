@@ -2575,12 +2575,6 @@ fn start_server_agent_session(
     let subagent_ids = subagent::SubagentIdAllocator::default();
     let active_implementation_workers = subagent::ActiveSubagentWorkers::default();
     let (subagent_reports, subagent_report_rx) = subagent::SubagentReportBus::channel();
-    let subagent_inventory = std::sync::Arc::new(std::sync::RwLock::new(
-        roster
-            .as_ref()
-            .map(subagent::SubagentInventory::from_roster)
-            .unwrap_or_default(),
-    ));
     // The discrete review's specialist lanes run on the subagent pool and share
     // the primary's workspace roots, so both have to be cloned before they move
     // into the subagent config and the runtime config respectively.
@@ -2592,7 +2586,6 @@ fn start_server_agent_session(
             .with_id_allocator(subagent_ids.clone())
             .with_active_implementation_workers(active_implementation_workers.clone())
             .with_max_parallel(app_config.subagents.max_parallel)
-            .with_inventory(subagent_inventory)
             .with_reports(subagent_reports.clone())
             .with_prewarm(subagent::RunContext {
                 cwd: cwd.clone(),

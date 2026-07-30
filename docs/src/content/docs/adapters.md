@@ -52,9 +52,6 @@ adapter. The current session keeps its already-bound models.
 - When several adapters offer the selected model, the primary, review, and
   subagent seats apply their independent ACP priority lists. All lists default
   to Codex, Claude, Kimi, then Anvil.
-- Every launchable model stays individually addressable: `create_subagent`
-  advertises the whole inventory so one call can pick a different agent or
-  model than the default.
 - Unranked custom models are selectable explicitly but do not participate in
   Auto or Ragnarok.
 

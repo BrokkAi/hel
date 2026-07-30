@@ -40,10 +40,9 @@ When two share a workspace, neither report can show an isolated diff and you are
 told to inspect `git diff` yourself — treat that note as a sign the split was
 too coarse.
 
-Ask for a specific `agent` or `model` when a task deserves a different backend
-than the default pool; the available combinations are listed in the
-`create_subagent` tool description. Use `resume` for a follow-up on work a
-subagent already did, so its context is not rebuilt from scratch.
+Subagents use the model and ACP routing selected in Mjolnir's `[subagents]`
+configuration. Use `resume` for a follow-up on work a subagent already did, so
+its context is not rebuilt from scratch.
 
 ## Cancellation and permissions
 

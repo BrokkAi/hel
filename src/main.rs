@@ -1949,9 +1949,6 @@ async fn run_session(
     let subagent_ids = subagent::SubagentIdAllocator::default();
     let active_implementation_workers = subagent::ActiveSubagentWorkers::default();
     let (subagent_reports, subagent_report_rx) = subagent::SubagentReportBus::channel();
-    let subagent_inventory = Arc::new(std::sync::RwLock::new(
-        subagent::SubagentInventory::from_roster(&roster),
-    ));
     tracing::info!(
         event = "roster_setup",
         session_tag = %session_tag,
@@ -1996,17 +1993,11 @@ async fn run_session(
     let _ = pending_probe_servers;
     let roster_update_task = roster_updates.map(|mut updates| {
         let tx = ui_event_tx.clone();
-        let inventory = subagent_inventory.clone();
         let mut surfaced: std::collections::HashSet<String> =
             roster.warnings.iter().cloned().collect();
         tokio::spawn(async move {
             while updates.changed().await.is_ok() {
                 let snapshot = updates.borrow_and_update().clone();
-                // Late adapter probes widen the agent/model inventory the
-                // create_subagent description advertises.
-                if let Ok(mut inventory) = inventory.write() {
-                    *inventory = subagent::SubagentInventory::from_roster(&snapshot);
-                }
                 for warning in &snapshot.warnings {
                     if surfaced.insert(warning.clone())
                         && tx
@@ -2145,8 +2136,6 @@ async fn run_session(
                 .with_id_allocator(subagent_ids.clone())
                 .with_active_implementation_workers(active_implementation_workers.clone())
                 .with_max_parallel(subagents_config.max_parallel)
-                .with_quota_gate(quota_gate.clone())
-                .with_inventory(subagent_inventory.clone())
                 .with_reports(subagent_reports.clone())
                 .with_prewarm(subagent::RunContext {
                     cwd: cwd.clone(),
