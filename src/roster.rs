@@ -12,6 +12,7 @@ use futures::{StreamExt, stream};
 
 use crate::config::{AcpServerOrigin, AcpServerPolicy, Config, PermissionPreset};
 use crate::deepswe::{self, Row};
+use crate::subscription::Subscriptions;
 use crate::{model_resolve, probe};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -238,6 +239,8 @@ pub struct AcpServerInfo {
     pub installing: bool,
     pub origin: Option<AcpServerOrigin>,
     pub session_config: Vec<agent_client_protocol::schema::v1::SessionConfigOption>,
+    /// Subscription tier behind this server's account, when it has one.
+    pub subscription: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +261,9 @@ pub struct Availability {
     pub kimi_credentials: bool,
     pub kimi: Option<PathBuf>,
     pub anvil: Option<PathBuf>,
+    /// Subscription tier behind each vendor-native account, which decides
+    /// which provider `auto` routes the primary seat through.
+    pub subscriptions: Subscriptions,
 }
 
 impl Availability {
@@ -268,6 +274,7 @@ impl Availability {
             kimi_credentials: kimi_credentials_available(),
             kimi: crate::kimi::detect().path,
             anvil: crate::anvil::detect().path,
+            subscriptions: Subscriptions::detect(),
         }
     }
 
@@ -498,6 +505,10 @@ pub fn discover_inventory(config: &Config) -> AcpInventory {
                     || (kind == AdapterKind::Kimi && kimi.installing),
                 origin: None,
                 session_config: Vec::new(),
+                subscription: availability
+                    .subscriptions
+                    .for_adapter(kind)
+                    .map(|plan| plan.label.clone()),
             }
         })
         .collect::<Vec<_>>();
@@ -532,6 +543,7 @@ pub fn discover_inventory(config: &Config) -> AcpInventory {
             installing: false,
             origin: Some(server.origin),
             session_config: Vec::new(),
+            subscription: None,
         }
     }));
     if let Some(server) = servers.iter_mut().find(|server| server.id == "anvil") {
@@ -941,6 +953,41 @@ fn preferred_route<'a>(
                 .iter()
                 .find(|candidate| candidate.model.model == model)
         })
+}
+
+/// `auto` takes the best-ranked launchable model, except that a strictly
+/// larger subscription on the other vendor wins the seat. Quality is worth
+/// less than being able to finish: the marginally better model on an entry
+/// plan runs the account dry, while the larger plan carries the whole day.
+/// Only the vendor-native adapters count - an Anthropic model routed through
+/// Anvil bills somewhere else entirely, so it never stands in for the Claude
+/// subscription.
+fn choose_primary_auto<'a>(
+    available: &'a [ResolvedAgent],
+    subscriptions: &Subscriptions,
+    acp_priority: &[String],
+) -> Option<&'a ResolvedAgent> {
+    let best_model = available.iter().find(|candidate| candidate.ranked)?;
+    let best = preferred_route(&best_model.model.model, available, acp_priority)
+        .expect("ranked model has a launchable route");
+    let Some(favored) = subscriptions.favored() else {
+        return Some(best);
+    };
+    let Some(preferred) = available
+        .iter()
+        .find(|candidate| candidate.ranked && candidate.launch.kind == favored)
+    else {
+        return Some(best);
+    };
+    if best.model.model != preferred.model.model || best.launch.kind != preferred.launch.kind {
+        tracing::info!(
+            model = %preferred.model.model,
+            adapter = %preferred.launch.source_id,
+            subscription = ?subscriptions.for_adapter(favored).map(|plan| &plan.label),
+            "auto primary routed to the larger subscription instead of the highest-ranked model"
+        );
+    }
+    Some(preferred)
 }
 
 fn choose_subagent_default(
@@ -1359,14 +1406,12 @@ fn assemble_roster(
         bail!("the primary agent cannot be disabled");
     }
     let primary = if config.agent.model == "auto" {
-        let model = &available
-            .iter()
-            .find(|candidate| candidate.ranked)
-            .ok_or_else(|| anyhow!("Agent Auto requires at least one ranked DeepSWE model"))?
-            .model
-            .model;
-        preferred_route(model, &available, &config.agent.acp_priority)
-            .expect("auto-selected model has a launchable route")
+        choose_primary_auto(
+            &available,
+            &availability.subscriptions,
+            &config.agent.acp_priority,
+        )
+        .ok_or_else(|| anyhow!("Agent Auto requires at least one ranked DeepSWE model"))?
     } else {
         explicit(
             "Agent",
@@ -1682,6 +1727,112 @@ mod tests {
         }
     }
 
+    fn plans(claude: &str, codex: &str) -> Subscriptions {
+        Subscriptions {
+            claude: Some(crate::subscription::Subscription {
+                label: claude.to_string(),
+                capacity: match claude {
+                    "max20" => 20.0,
+                    "max5" => 5.0,
+                    _ => 1.0,
+                },
+            }),
+            codex: Some(crate::subscription::Subscription {
+                label: codex.to_string(),
+                capacity: if codex == "pro" { 20.0 } else { 1.0 },
+            }),
+        }
+    }
+
+    #[test]
+    fn auto_primary_takes_the_top_ranked_model_without_a_subscription_gap() {
+        let available = vec![
+            role("claude-fable-5", 0.70),
+            role("gpt-5-6-sol", 0.68),
+            role("gpt-5-5", 0.65),
+        ];
+
+        assert_eq!(
+            choose_primary_auto(&available, &plans("pro", "plus"), &[])
+                .expect("ranked model")
+                .model
+                .model,
+            "claude-fable-5"
+        );
+        assert_eq!(
+            choose_primary_auto(&available, &Subscriptions::default(), &[])
+                .expect("ranked model")
+                .model
+                .model,
+            "claude-fable-5"
+        );
+    }
+
+    #[test]
+    fn auto_primary_moves_to_the_larger_subscription() {
+        let available = vec![
+            role("claude-fable-5", 0.70),
+            role("gpt-5-6-sol", 0.68),
+            role("gpt-5-5", 0.65),
+        ];
+
+        // Claude Pro against ChatGPT Pro: the best Codex model wins the seat
+        // even though the Claude model ranks higher.
+        let chosen =
+            choose_primary_auto(&available, &plans("pro", "pro"), &[]).expect("favored model");
+        assert_eq!(chosen.model.model, "gpt-5-6-sol");
+        assert_eq!(chosen.launch.kind, AdapterKind::Codex);
+
+        let chosen =
+            choose_primary_auto(&available, &plans("max20", "plus"), &[]).expect("favored model");
+        assert_eq!(chosen.model.model, "claude-fable-5");
+    }
+
+    #[test]
+    fn auto_primary_falls_back_when_the_larger_subscription_has_no_model() {
+        let available = vec![role("claude-fable-5", 0.70), role("claude-sonnet-5", 0.60)];
+
+        assert_eq!(
+            choose_primary_auto(&available, &plans("pro", "pro"), &[])
+                .expect("ranked fallback")
+                .model
+                .model,
+            "claude-fable-5"
+        );
+    }
+
+    #[test]
+    fn auto_primary_ignores_third_party_routes_for_a_favored_vendor() {
+        // An Anthropic model served through Anvil bills Anvil, not the Claude
+        // subscription, so it cannot satisfy a Claude preference.
+        let mut anvil_claude = role("claude-fable-5", 0.70);
+        anvil_claude.launch = launch_for(AdapterKind::Anvil);
+        let available = vec![anvil_claude, role("gpt-5-6-sol", 0.68)];
+
+        let chosen =
+            choose_primary_auto(&available, &plans("max20", "plus"), &[]).expect("ranked fallback");
+        assert_eq!(chosen.launch.kind, AdapterKind::Anvil);
+        assert_eq!(chosen.model.model, "claude-fable-5");
+    }
+
+    #[test]
+    fn auto_primary_keeps_the_favored_vendor_route_over_custom_priority() {
+        let mut anvil_gpt = role("gpt-5-6-sol", 0.68);
+        anvil_gpt.launch = launch_for(AdapterKind::Anvil);
+        let available = vec![
+            role("claude-fable-5", 0.70),
+            anvil_gpt,
+            role("gpt-5-6-sol", 0.68),
+        ];
+        let priority = vec!["anvil".to_string(), "codex-acp".to_string()];
+
+        let chosen = choose_primary_auto(&available, &plans("pro", "pro"), &priority)
+            .expect("favored native route");
+
+        assert_eq!(chosen.model.model, "gpt-5-6-sol");
+        assert_eq!(chosen.launch.kind, AdapterKind::Codex);
+    }
+
     #[test]
     fn auto_review_chooses_best_model_from_another_provider() {
         let available = vec![
@@ -1946,6 +2097,7 @@ mod tests {
             installing: false,
             origin: None,
             session_config: Vec::new(),
+            subscription: None,
         };
 
         assert!(inventory_server_is_visible(&server));
@@ -2052,6 +2204,7 @@ mod tests {
             kimi_credentials: false,
             kimi: None,
             anvil: Some(PathBuf::from("anvil")),
+            subscriptions: Subscriptions::default(),
         };
         let roster = assemble_roster(
             &config,
@@ -2158,6 +2311,7 @@ mod tests {
             kimi_credentials: false,
             kimi: None,
             anvil: None,
+            subscriptions: Subscriptions::default(),
         };
         assert_eq!(
             availability.missing_reason("gpt-5-6-sol"),
@@ -2183,6 +2337,7 @@ mod tests {
             kimi_credentials: false,
             kimi: None,
             anvil: None,
+            subscriptions: Subscriptions::default(),
         };
         let error = explicit("Agent", "gpt-5-6-sol", &rows, &[], &[])
             .expect_err("must reject unavailable explicit model");
@@ -2263,6 +2418,7 @@ mod tests {
             kimi_credentials: false,
             kimi: None,
             anvil: None,
+            subscriptions: Subscriptions::default(),
         };
 
         let mut config = Config::default();
