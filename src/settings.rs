@@ -4,6 +4,9 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use agent_client_protocol::schema::v1::{
+    SessionConfigKind, SessionConfigOption, SessionConfigSelectOptions,
+};
 use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -11,6 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::config::{AcpServerOrigin, AcpServerPolicy, Config, ConfiguredAcpServer, ModelsConfig};
+use crate::event::SessionConfigTarget;
 use crate::install::Progress;
 use crate::palette::TerminalTheme;
 use crate::registry::{Agent, DistributionKind, Registry};
@@ -32,13 +36,15 @@ pub enum SettingsTab {
     Agents,
     AcpPriority,
     AcpServers,
+    AcpSessions,
     Appearance,
 }
 
 impl SettingsTab {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Agents,
         Self::AcpServers,
+        Self::AcpSessions,
         Self::AcpPriority,
         Self::Appearance,
     ];
@@ -48,6 +54,7 @@ impl SettingsTab {
             Self::Agents => "Agents",
             Self::AcpPriority => "ACP Priority",
             Self::AcpServers => "ACP Servers",
+            Self::AcpSessions => "ACP Sessions",
             Self::Appearance => "Appearance",
         }
     }
@@ -242,6 +249,7 @@ impl SettingsEditor {
             SettingsTab::Agents => 6,
             SettingsTab::AcpPriority => 3,
             SettingsTab::AcpServers => self.inventory.servers.len() + SERVER_ROW_OFFSET,
+            SettingsTab::AcpSessions => self.session_option_rows().len(),
             SettingsTab::Appearance => 2,
         }
     }
@@ -287,7 +295,40 @@ impl SettingsEditor {
                 if id == "anvil" && choices[next] == AcpServerPolicy::Enabled {
                     crate::anvil::retry_background_install();
                 }
-                self.inventory = crate::roster::discover_inventory(&self.config);
+                self.refresh_inventory();
+            }
+            SettingsTab::AcpSessions => {
+                let Some((server_id, option)) = self.selected_session_option() else {
+                    return SettingsAction::None;
+                };
+                let option_key = crate::acp::session_config_option_key(&option.id);
+                let choices = session_option_choices(option);
+                if choices.is_empty() {
+                    return SettingsAction::None;
+                }
+                let current = self
+                    .config
+                    .session_config
+                    .get(&server_id)
+                    .and_then(|saved| saved.defaults.get(&option_key))
+                    .cloned()
+                    .unwrap_or_else(|| session_option_current_value(option));
+                let index = choices
+                    .iter()
+                    .position(|(value, _)| value == &current)
+                    .unwrap_or(0);
+                let next = (index as i32 + delta).rem_euclid(choices.len() as i32) as usize;
+                self.config
+                    .session_config
+                    .entry(server_id.clone())
+                    .or_default()
+                    .defaults
+                    .insert(option_key.clone(), choices[next].0.clone());
+                if let Some(saved) = self.config.session_config.get_mut(&server_id) {
+                    for route in saved.models.values_mut() {
+                        route.remove(&option_key);
+                    }
+                }
             }
             SettingsTab::Appearance if self.selected == 0 => {
                 let current = TerminalThemeKind::ALL
@@ -322,6 +363,7 @@ impl SettingsEditor {
                 self.config.subagents.auto_failover = !self.config.subagents.auto_failover;
             }
             SettingsTab::AcpPriority => return SettingsAction::None,
+            SettingsTab::AcpSessions => return SettingsAction::None,
             SettingsTab::AcpServers => {
                 let Some(index) = self.selected.checked_sub(SERVER_ROW_OFFSET) else {
                     return SettingsAction::None;
@@ -347,12 +389,34 @@ impl SettingsEditor {
                 if id == "anvil" && policy == AcpServerPolicy::Enabled {
                     crate::anvil::retry_background_install();
                 }
-                self.inventory = crate::roster::discover_inventory(&self.config);
+                self.refresh_inventory();
             }
             _ => return SettingsAction::None,
         }
         self.notice = None;
         SettingsAction::Changed
+    }
+
+    fn session_option_rows(&self) -> Vec<(usize, usize)> {
+        self.inventory
+            .servers
+            .iter()
+            .enumerate()
+            .flat_map(|(server_index, server)| {
+                server
+                    .session_config
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, option)| session_option_is_user_owned(server, option))
+                    .map(move |(option_index, _)| (server_index, option_index))
+            })
+            .collect()
+    }
+
+    fn selected_session_option(&self) -> Option<(String, &SessionConfigOption)> {
+        let (server_index, option_index) = *self.session_option_rows().get(self.selected)?;
+        let server = self.inventory.servers.get(server_index)?;
+        Some((server.id.clone(), server.session_config.get(option_index)?))
     }
 
     fn cycle_model(&mut self, role: usize, delta: i32) {
@@ -612,26 +676,17 @@ impl SettingsEditor {
                 Err(error) => self.notice = Some(format!("Install failed: {error}")),
             }
         }
-        let mut refreshed = crate::roster::discover_inventory(&self.config);
-        for server in &mut refreshed.servers {
-            if let Some(previous) = self
-                .inventory
-                .servers
-                .iter()
-                .find(|previous| previous.id == server.id)
-            {
-                server.model_count = previous.model_count;
-                if server.id != "anvil" {
-                    server.error.clone_from(&previous.error);
-                }
-            }
-        }
-        self.inventory = refreshed;
+        self.refresh_inventory();
     }
 
     pub(crate) fn refresh_after_auth(&mut self, notice: String) {
-        self.inventory = crate::roster::discover_inventory(&self.config);
+        self.refresh_inventory();
         self.notice = Some(notice);
+    }
+
+    fn refresh_inventory(&mut self) {
+        self.inventory = crate::roster::rediscover_inventory(&self.config, &self.inventory);
+        self.selected = self.selected.min(self.row_count().saturating_sub(1));
     }
 
     fn filtered_agents(&self) -> Vec<&Agent> {
@@ -808,7 +863,7 @@ impl SettingsEditor {
             .retain(|existing| existing.id != server.id);
         self.config.acp.policies.remove(&server.id);
         self.config.acp.servers.push(server);
-        self.inventory = crate::roster::discover_inventory(&self.config);
+        self.refresh_inventory();
         self.acp_view = AcpView::Servers;
         self.selected = self.inventory.servers.len().saturating_sub(1) + SERVER_ROW_OFFSET;
         self.notice = None;
@@ -934,6 +989,7 @@ pub fn draw_settings_panel(
         SettingsTab::Agents => draw_agents(frame, rows[1], editor, theme),
         SettingsTab::AcpPriority => draw_acp_priority(frame, rows[1], editor, theme),
         SettingsTab::AcpServers => draw_servers(frame, rows[1], editor, theme),
+        SettingsTab::AcpSessions => draw_acp_sessions(frame, rows[1], editor, theme),
         SettingsTab::Appearance => draw_appearance(frame, rows[1], editor, theme),
     }
     if let Some(notice) = &editor.notice {
@@ -969,6 +1025,122 @@ pub fn draw_settings_panel(
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(theme.muted)),
         rows[3],
+    );
+}
+
+fn session_option_is_user_owned(
+    server: &crate::roster::AcpServerInfo,
+    option: &SessionConfigOption,
+) -> bool {
+    let hidden = crate::roster::runtime_permission_config_id(server.launch.kind)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let target = SessionConfigTarget::ConfigOption {
+        config_id: option.id.clone(),
+    };
+    crate::acp::session_config_option_is_agent_owned(option, &target, &hidden)
+}
+
+fn session_option_choices(option: &SessionConfigOption) -> Vec<(String, String)> {
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return Vec::new();
+    };
+    match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => options
+            .iter()
+            .map(|choice| (choice.value.to_string(), choice.name.clone()))
+            .collect(),
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter())
+            .map(|choice| (choice.value.to_string(), choice.name.clone()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn session_option_current_value(option: &SessionConfigOption) -> String {
+    match &option.kind {
+        SessionConfigKind::Select(select) => select.current_value.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn draw_acp_sessions(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    editor: &SettingsEditor,
+    theme: TerminalTheme,
+) {
+    let rows = editor.session_option_rows();
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(
+                "No agent-owned session options were reported by configured ACP servers.",
+            )
+            .style(Style::default().fg(theme.muted))
+            .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
+
+    let mut lines = Vec::new();
+    let mut last_server = None;
+    let mut selected_line_index = 0;
+    for (row_index, (server_index, option_index)) in rows.into_iter().enumerate() {
+        let server = &editor.inventory.servers[server_index];
+        let option = &server.session_config[option_index];
+        if last_server != Some(server_index) {
+            if !lines.is_empty() {
+                lines.push(Line::raw(""));
+            }
+            lines.push(Line::styled(
+                server.label.clone(),
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            last_server = Some(server_index);
+        }
+        let value = editor
+            .config
+            .session_config
+            .get(&server.id)
+            .and_then(|saved| {
+                saved
+                    .defaults
+                    .get(&crate::acp::session_config_option_key(&option.id))
+            })
+            .cloned()
+            .unwrap_or_else(|| session_option_current_value(option));
+        let label = session_option_choices(option)
+            .into_iter()
+            .find_map(|(candidate, label)| (candidate == value).then_some(label))
+            .unwrap_or(value);
+        let selected = editor.selected == row_index;
+        if selected {
+            selected_line_index = lines.len();
+        }
+        lines.push(selected_line(
+            selected,
+            format!("  {}: {label}", option.name),
+            theme,
+        ));
+    }
+    let visible = usize::from(area.height);
+    let start = selected_line_index.saturating_sub(visible.saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(start)
+                .take(visible)
+                .collect::<Vec<_>>(),
+        )
+        .wrap(Wrap { trim: false }),
+        area,
     );
 }
 
@@ -1456,6 +1628,93 @@ fn on_off(enabled: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::{
+        SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    };
+
+    #[test]
+    fn acp_session_tab_saves_agent_owned_option_per_server() {
+        let mut editor = SettingsEditor::new(Config::default(), Vec::new(), None);
+        let server = editor
+            .inventory
+            .servers
+            .first_mut()
+            .expect("visible ACP server");
+        let server_id = server.id.clone();
+        server.session_config = vec![SessionConfigOption::select(
+            "service_tier",
+            "Service tier",
+            "default",
+            vec![
+                SessionConfigSelectOption::new("default", "Default"),
+                SessionConfigSelectOption::new("priority", "Priority"),
+            ],
+        )];
+        editor
+            .config
+            .session_config
+            .entry(server_id.clone())
+            .or_default()
+            .models
+            .entry("model-a".to_string())
+            .or_default()
+            .insert("config:service_tier".to_string(), "default".to_string());
+        editor.tab = SettingsTab::AcpSessions;
+
+        assert_eq!(editor.session_option_rows().len(), 1);
+        assert_eq!(
+            session_option_choices(&editor.inventory.servers[0].session_config[0]).len(),
+            2
+        );
+        assert_eq!(editor.handle_key(KeyCode::Right), SettingsAction::Changed);
+        assert_eq!(
+            editor.config.session_config[&server_id].defaults["config:service_tier"],
+            "priority"
+        );
+        assert!(
+            !editor.config.session_config[&server_id].models["model-a"]
+                .contains_key("config:service_tier")
+        );
+    }
+
+    #[test]
+    fn acp_session_tab_excludes_mjolnir_owned_options() {
+        let editor = SettingsEditor::new(Config::default(), Vec::new(), None);
+        let mut server = editor
+            .inventory
+            .servers
+            .first()
+            .expect("visible ACP server")
+            .clone();
+        server.launch.kind = crate::roster::AdapterKind::Codex;
+        let choice = || vec![SessionConfigSelectOption::new("value", "Value")];
+        let model = SessionConfigOption::select("model", "Model", "value", choice())
+            .category(SessionConfigOptionCategory::Model);
+        let thought =
+            SessionConfigOption::select("thought_level", "Thought level", "value", choice())
+                .category(SessionConfigOptionCategory::ThoughtLevel);
+        let permission = SessionConfigOption::select(
+            crate::roster::runtime_permission_config_id(server.launch.kind)
+                .unwrap_or("permission_mode"),
+            "Permission",
+            "value",
+            choice(),
+        );
+        let reasoning = SessionConfigOption::select(
+            crate::acp::REASONING_EFFORT_CONFIG_ID,
+            "Reasoning effort",
+            "value",
+            choice(),
+        );
+        let service =
+            SessionConfigOption::select("service_tier", "Service tier", "value", choice());
+
+        assert!(!session_option_is_user_owned(&server, &model));
+        assert!(!session_option_is_user_owned(&server, &thought));
+        assert!(!session_option_is_user_owned(&server, &permission));
+        assert!(!session_option_is_user_owned(&server, &reasoning));
+        assert!(session_option_is_user_owned(&server, &service));
+    }
 
     #[test]
     fn role_descriptions_match_product_language() {

@@ -95,6 +95,14 @@ pub fn configure_permissions(
     })
 }
 
+pub(crate) fn runtime_permission_config_id(kind: AdapterKind) -> Option<&'static str> {
+    match kind {
+        AdapterKind::Codex | AdapterKind::Claude => Some("mode"),
+        AdapterKind::Kimi => None,
+        AdapterKind::Anvil | AdapterKind::Custom => Some("permission_mode"),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedAgent {
     pub model: Row,
@@ -237,6 +245,7 @@ pub struct AcpServerInfo {
     pub error: Option<String>,
     pub installing: bool,
     pub origin: Option<AcpServerOrigin>,
+    pub session_config: Vec<agent_client_protocol::schema::v1::SessionConfigOption>,
 }
 
 #[derive(Debug, Clone)]
@@ -496,6 +505,7 @@ pub fn discover_inventory(config: &Config) -> AcpInventory {
                 installing: (kind == AdapterKind::Anvil && anvil.installing)
                     || (kind == AdapterKind::Kimi && kimi.installing),
                 origin: None,
+                session_config: Vec::new(),
             }
         })
         .collect::<Vec<_>>();
@@ -529,6 +539,7 @@ pub fn discover_inventory(config: &Config) -> AcpInventory {
             error: None,
             installing: false,
             origin: Some(server.origin),
+            session_config: Vec::new(),
         }
     }));
     if let Some(server) = servers.iter_mut().find(|server| server.id == "anvil") {
@@ -547,6 +558,26 @@ pub fn discover_inventory(config: &Config) -> AcpInventory {
     }
     servers.retain(inventory_server_is_visible);
     AcpInventory { servers }
+}
+
+/// Re-run local ACP discovery without discarding capabilities learned from
+/// background probes during this process.
+pub fn rediscover_inventory(config: &Config, previous: &AcpInventory) -> AcpInventory {
+    let mut refreshed = discover_inventory(config);
+    for server in &mut refreshed.servers {
+        if let Some(previous) = previous
+            .servers
+            .iter()
+            .find(|previous| previous.id == server.id)
+        {
+            server.model_count = previous.model_count;
+            server.session_config.clone_from(&previous.session_config);
+            if server.id != "anvil" {
+                server.error.clone_from(&previous.error);
+            }
+        }
+    }
+    refreshed
 }
 
 fn inventory_server_is_visible(server: &AcpServerInfo) -> bool {
@@ -699,13 +730,33 @@ fn option_matches(launch: &AdapterLaunch, option: &probe::ModelOption, row: &Row
 struct Discovery {
     available: Vec<ResolvedAgent>,
     adapter_errors: HashMap<String, String>,
+    session_config: HashMap<String, Vec<agent_client_protocol::schema::v1::SessionConfigOption>>,
 }
 
 fn resolve_probes(rows: &[Row], mut probes: Vec<(usize, AdapterLaunch, ProbeResult)>) -> Discovery {
     probes.sort_by_key(|(priority, _, _)| *priority);
+    let mut merged: Vec<(usize, AdapterLaunch, ProbeResult)> = Vec::new();
+    for (priority, launch, result) in probes {
+        let Some((_, _, existing)) = merged
+            .iter_mut()
+            .find(|(_, prior, _)| prior.source_id == launch.source_id)
+        else {
+            merged.push((priority, launch, result));
+            continue;
+        };
+        match (existing.as_mut(), result) {
+            (Ok(base), Ok(enrichment)) if enrichment.session_config_known => {
+                base.session_config = enrichment.session_config;
+                base.session_config_known = true;
+            }
+            (Err(_), replacement) => *existing = replacement,
+            _ => {}
+        }
+    }
     let mut resolved = Vec::new();
     let mut adapter_errors = HashMap::new();
-    for (_, launch, capabilities) in probes {
+    let mut session_config = HashMap::new();
+    for (_, launch, capabilities) in merged {
         let capabilities = match capabilities {
             Ok(capabilities) => capabilities,
             Err(reason) => {
@@ -725,6 +776,10 @@ fn resolve_probes(rows: &[Row], mut probes: Vec<(usize, AdapterLaunch, ProbeResu
             );
             continue;
         }
+        session_config.insert(
+            launch.source_id.clone(),
+            capabilities.session_config.clone(),
+        );
         let options = capabilities.models;
         let matched_values = options
             .iter()
@@ -784,6 +839,7 @@ fn resolve_probes(rows: &[Row], mut probes: Vec<(usize, AdapterLaunch, ProbeResu
     Discovery {
         available: resolved,
         adapter_errors,
+        session_config,
     }
 }
 
@@ -820,6 +876,8 @@ fn credentialed_provider_capabilities(
                 description: None,
             })
             .collect(),
+        session_config: Vec::new(),
+        session_config_known: false,
     })
 }
 
@@ -1099,12 +1157,29 @@ pub async fn resolve_streaming(config: &Config, cwd: &Path) -> Result<StreamingR
     let mut results: Vec<(usize, AdapterLaunch, ProbeResult)> = Vec::new();
     let mut pending: Vec<(usize, AdapterLaunch)> = Vec::new();
     for (priority, launch) in configured_launches(&inventory).into_iter().enumerate() {
+        let cached = cached_probe_result(&launch).await;
         let instant = match credentialed_provider_capabilities(&launch, &rows) {
-            Some(capabilities) => Some(Ok(capabilities)),
-            None => cached_probe_result(&launch).await,
+            Some(mut base) => {
+                if let Some(Ok(cached)) = cached.as_ref()
+                    && cached.session_config_known
+                {
+                    base.session_config.clone_from(&cached.session_config);
+                    base.session_config_known = true;
+                }
+                Some(Ok(base))
+            }
+            None => cached,
         };
         match instant {
-            Some(result) => results.push((priority, launch, result)),
+            Some(result) => {
+                let needs_session_config = result
+                    .as_ref()
+                    .is_ok_and(|capabilities| !capabilities.session_config_known);
+                results.push((priority, launch.clone(), result));
+                if needs_session_config {
+                    pending.push((priority, launch));
+                }
+            }
             None => pending.push((priority, launch)),
         }
     }
@@ -1232,6 +1307,11 @@ fn assemble_roster(
             .filter(|role| role.launch.source_id == server.id)
             .count();
         server.error = discovery.adapter_errors.get(&server.id).cloned();
+        server.session_config = discovery
+            .session_config
+            .get(&server.id)
+            .cloned()
+            .unwrap_or_default();
     }
     let available = discovery.available;
     let mut choices = rows
@@ -1381,6 +1461,81 @@ fn assemble_roster(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::{SessionConfigOption, SessionConfigSelectOption};
+
+    fn synthetic_capabilities() -> probe::AdapterCapabilities {
+        probe::AdapterCapabilities {
+            http_mcp: true,
+            models: Vec::new(),
+            session_config: Vec::new(),
+            session_config_known: false,
+        }
+    }
+
+    #[test]
+    fn fresh_probe_enriches_session_config_without_replacing_base_capabilities() {
+        let launch = launch_for(AdapterKind::Codex);
+        let mut enrichment = synthetic_capabilities();
+        enrichment.session_config_known = true;
+        enrichment.session_config = vec![SessionConfigOption::select(
+            "service_tier",
+            "Service tier",
+            "default",
+            vec![SessionConfigSelectOption::new("default", "Default")],
+        )];
+
+        let discovery = resolve_probes(
+            &[],
+            vec![
+                (0, launch.clone(), Ok(synthetic_capabilities())),
+                (0, launch, Ok(enrichment)),
+            ],
+        );
+
+        assert!(discovery.adapter_errors.is_empty());
+        assert_eq!(
+            discovery.session_config["codex-acp"][0].id.to_string(),
+            "service_tier"
+        );
+    }
+
+    #[test]
+    fn failed_enrichment_does_not_demote_a_working_adapter() {
+        let launch = launch_for(AdapterKind::Codex);
+        let discovery = resolve_probes(
+            &[],
+            vec![
+                (0, launch.clone(), Ok(synthetic_capabilities())),
+                (0, launch, Err("transient failure".to_string())),
+            ],
+        );
+
+        assert!(discovery.adapter_errors.is_empty());
+    }
+
+    #[test]
+    fn rediscovery_preserves_probe_only_inventory_fields() {
+        let config = Config::default();
+        let mut previous = discover_inventory(&config);
+        let server = previous.servers.first_mut().expect("visible ACP server");
+        let server_id = server.id.clone();
+        server.model_count = 3;
+        server.session_config = vec![SessionConfigOption::select(
+            "service_tier",
+            "Service tier",
+            "default",
+            vec![SessionConfigSelectOption::new("default", "Default")],
+        )];
+
+        let refreshed = rediscover_inventory(&config, &previous);
+        let server = refreshed
+            .servers
+            .iter()
+            .find(|server| server.id == server_id)
+            .expect("same server");
+        assert_eq!(server.model_count, 3);
+        assert_eq!(server.session_config[0].id.to_string(), "service_tier");
+    }
 
     #[test]
     fn invalidation_clears_process_and_disk_probe_caches() {
@@ -1395,6 +1550,8 @@ mod tests {
                 name: "model-before-refresh".to_string(),
                 description: None,
             }],
+            session_config: Vec::new(),
+            session_config_known: true,
         };
         crate::probe_cache::store(&cache, "launch-key", &command, &capabilities);
 
@@ -1499,6 +1656,8 @@ mod tests {
         Ok(probe::AdapterCapabilities {
             http_mcp,
             models: values.iter().map(|value| option(value)).collect(),
+            session_config: Vec::new(),
+            session_config_known: true,
         })
     }
 
@@ -1794,6 +1953,7 @@ mod tests {
             error: None,
             installing: false,
             origin: None,
+            session_config: Vec::new(),
         };
 
         assert!(inventory_server_is_visible(&server));
@@ -2103,6 +2263,7 @@ mod tests {
         let discovery = Discovery {
             available,
             adapter_errors: HashMap::new(),
+            session_config: HashMap::new(),
         };
         let availability = Availability {
             codex_credentials: false,
