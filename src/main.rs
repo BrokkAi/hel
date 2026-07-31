@@ -2139,6 +2139,7 @@ async fn run_session(
                 .with_id_allocator(subagent_ids.clone())
                 .with_active_implementation_workers(active_implementation_workers.clone())
                 .with_max_parallel(subagents_config.max_parallel)
+                .with_debrief(subagents_config.debrief)
                 .with_reports(subagent_reports.clone())
                 .with_prewarm(subagent::RunContext {
                     cwd: cwd.clone(),

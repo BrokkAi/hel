@@ -439,7 +439,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                 let count = batch.len();
                 let prompt = format_report_injection(
                     &batch,
-                    "Review this report critically against the repository before relying on it.",
+                    "Review this report critically against the repository before relying on it. Where a <debrief> is present, treat its UNVERIFIED lines as your re-check list and its ANOMALIES lines as blockers to resolve before integrating.",
                 );
                 for _ in 0..count {
                     config.subagent_report_bus.close();
@@ -1813,6 +1813,7 @@ mod tests {
             final_message: format!("{label} done"),
             slim_activity: format!("{label} looked around"),
             workspace_diff: Some(format!("diff for {label}")),
+            debrief: None,
             elapsed: Duration::from_secs(252),
         }
     }

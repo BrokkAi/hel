@@ -232,6 +232,9 @@ pub struct SubagentsConfig {
     /// Move the pool to the next route when an ACP source nears its quota.
     #[serde(default = "default_true")]
     pub auto_failover: bool,
+    /// Ask completed pool subagents for a terse exit interview before report delivery.
+    #[serde(default = "default_true")]
+    pub debrief: bool,
 }
 
 impl Default for SubagentsConfig {
@@ -242,6 +245,7 @@ impl Default for SubagentsConfig {
             reasoning_effort: None,
             max_parallel: default_max_parallel(),
             auto_failover: true,
+            debrief: true,
         }
     }
 }
@@ -611,6 +615,8 @@ struct EitriV2 {
     reasoning_effort: Option<String>,
     #[serde(default = "default_max_parallel")]
     max_parallel_explores: usize,
+    #[serde(default = "default_true")]
+    debrief: bool,
 }
 
 impl Default for EitriV2 {
@@ -619,6 +625,7 @@ impl Default for EitriV2 {
             model: default_auto(),
             reasoning_effort: None,
             max_parallel_explores: default_max_parallel(),
+            debrief: true,
         }
     }
 }
@@ -663,6 +670,7 @@ fn migrate_v2(body: &str) -> Result<Config> {
             reasoning_effort: old.eitri.reasoning_effort,
             max_parallel: old.eitri.max_parallel_explores,
             auto_failover: old.council.auto_failover,
+            debrief: old.eitri.debrief,
         },
         acp: old.acp,
         ragnarok: old.ragnarok,
@@ -906,6 +914,7 @@ discrete_review = false
 [eitri]
 model = "gpt-5-6-terra"
 max_parallel_explores = 9
+debrief = false
 
 [loki]
 model = "claude-fable-5"
@@ -943,6 +952,7 @@ origin = "custom"
         assert_eq!(cfg.subagents.model, "gpt-5-6-terra");
         assert_eq!(cfg.subagents.max_parallel, 9);
         assert!(!cfg.subagents.auto_failover);
+        assert!(!cfg.subagents.debrief);
         assert_eq!(cfg.ragnarok.max_competitors, 4);
         assert_eq!(cfg.acp.policy("codex-acp"), AcpServerPolicy::Disabled);
         assert_eq!(cfg.acp.servers[0].id, "custom:company");

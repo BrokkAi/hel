@@ -924,6 +924,7 @@ fn configure_review_pool(
         .with_mcp_servers(Vec::new())
         .with_usage_seat(Seat::Review)
         .with_retain_after_completion(retain)
+        .with_debrief(false)
 }
 
 async fn receive_report(

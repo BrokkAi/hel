@@ -320,6 +320,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 .with_id_allocator(subagent_ids.clone())
                 .with_active_implementation_workers(active_implementation_workers.clone())
                 .with_max_parallel(app_config.subagents.max_parallel)
+                .with_debrief(app_config.subagents.debrief)
                 .with_headless_permission_mode(cfg.permission_mode.into())
                 .with_reports(subagent_reports.clone())
                 .with_prewarm(subagent::RunContext {

@@ -88,6 +88,22 @@ const SUBAGENT_ACTIVITY_LOG_HEAD: usize = 2_500;
 const SUBAGENT_ACTIVITY_LOG_TAIL: usize = 5_000;
 const SUBAGENT_ACTIVITY_LOG_ELISION: &str = "\n[... earlier activity elided ...]\n";
 const SUBAGENT_REVIEW_TEXT: &str = "This is the subagent's own account of its work, with its activity log and diff. You own the result: review it as you would a capable colleague's submission — the log shows where it struggled or made judgment calls, which is where scrutiny earns the most. Its claims, including any test results it reports, are its claims and not verified facts.";
+const SUBAGENT_DEBRIEF_TIMEOUT: Duration = Duration::from_secs(180);
+const SUBAGENT_DEBRIEF_PROMPT: &str =
+    "Your task turn is complete. Before your report is delivered to the primary
+agent that will integrate your work, answer this exit interview. Be terse
+and specific. Do not use any tools. Use exactly these five headings, each
+followed by 1-4 short lines:
+VERIFIED: each build/test command you ran that supports your result, with
+its selection scope (targeted test names vs full package or suite).
+UNVERIFIED: surfaces your changes could plausibly affect that you did NOT
+run (packages, suites, integrations). Say \"none\" only if you ran the full
+suite of every package you changed.
+COMMITMENTS: interpretation or API decisions you made that constrain other
+work (signatures, behaviors, formats), each with the file where it lives.
+ANOMALIES: anything that behaved unexpectedly - lost or overwritten edits,
+files changed by others, flaky tests, environment problems. \"none\" if none.
+NEXT: what you would do next with more time, in priority order.";
 
 /// Longest excerpt of a prompt used as a subagent's default display label.
 const DEFAULT_LABEL_CHARS: usize = 48;
@@ -114,6 +130,7 @@ pub struct Config {
     mcp_servers: Vec<McpServer>,
     usage_seat: Seat,
     retain_after_completion: bool,
+    debrief: bool,
     warm: Arc<WarmPool>,
 }
 
@@ -188,6 +205,7 @@ impl Config {
             mcp_servers: Vec::new(),
             usage_seat: Seat::Subagent,
             retain_after_completion: true,
+            debrief: true,
             warm: Arc::default(),
         }
     }
@@ -246,6 +264,11 @@ impl Config {
 
     pub(crate) fn with_retain_after_completion(mut self, retain: bool) -> Self {
         self.retain_after_completion = retain;
+        self
+    }
+
+    pub(crate) fn with_debrief(mut self, debrief: bool) -> Self {
+        self.debrief = debrief;
         self
     }
 
@@ -403,6 +426,7 @@ pub struct SubagentReport {
     /// `None` when no snapshot was available; `Some` carries either the diff or
     /// the note explaining why it was omitted.
     pub workspace_diff: Option<String>,
+    pub debrief: Option<String>,
     pub elapsed: Duration,
 }
 
@@ -466,8 +490,15 @@ pub(crate) fn format_report_injection(
             .workspace_diff
             .as_deref()
             .unwrap_or("[workspace snapshot unavailable for this subagent]");
+        let debrief = report
+            .debrief
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| format!("<debrief>\n{text}\n</debrief>\n"))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "<subagent_result id=\"{id}\" label=\"{label}\" agent=\"{agent}\" model=\"{model}\" outcome=\"{outcome}\" elapsed=\"{elapsed}\">\n<report>\n{report_text}\n</report>\n<activity_summary>\n{activity}\n</activity_summary>\n<workspace_diff>\n{diff}\n</workspace_diff>\n</subagent_result>\n\n",
+            "<subagent_result id=\"{id}\" label=\"{label}\" agent=\"{agent}\" model=\"{model}\" outcome=\"{outcome}\" elapsed=\"{elapsed}\">\n<report>\n{report_text}\n</report>\n{debrief}<activity_summary>\n{activity}\n</activity_summary>\n<workspace_diff>\n{diff}\n</workspace_diff>\n</subagent_result>\n\n",
             id = report.subagent_id,
             label = escape_report_attribute(&report.label),
             agent = escape_report_attribute(&report.agent),
@@ -537,6 +568,7 @@ struct RunPolicy {
     mcp_servers: Vec<McpServer>,
     usage_seat: Seat,
     retain_after_completion: bool,
+    debrief: bool,
     allow_warm_runtime: bool,
     /// Programmatic retained agents are coordinators whose identity should
     /// remain visible while they wait for another injected turn. Public MCP
@@ -552,6 +584,7 @@ impl RunPolicy {
             mcp_servers: config.mcp_servers.clone(),
             usage_seat: config.usage_seat,
             retain_after_completion: config.retain_after_completion,
+            debrief: config.debrief,
             allow_warm_runtime: true,
             defer_finished_while_retained: false,
             workflow: None,
@@ -564,6 +597,7 @@ impl RunPolicy {
             mcp_servers: job.mcp_servers.clone(),
             usage_seat: config.usage_seat,
             retain_after_completion: job.retain_after_completion,
+            debrief: false,
             // A prewarmed process has already completed session/new with its
             // MCP list, so a job-specific list always requires a fresh runtime.
             allow_warm_runtime: false,
@@ -2150,6 +2184,96 @@ fn map_runtime_join(
     }
 }
 
+struct DebriefTurnResult {
+    text: Option<String>,
+    session_alive: bool,
+}
+
+async fn collect_debrief_turn(
+    nested_cmd_tx: &mpsc::UnboundedSender<UiCommand>,
+    nested_event_rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+    runtime: &mut JoinHandle<Result<()>>,
+    termination: &RunTermination,
+    joined_runtime_result: &mut Option<Result<()>>,
+) -> DebriefTurnResult {
+    if nested_cmd_tx
+        .send(UiCommand::SendPrompt {
+            text: SUBAGENT_DEBRIEF_PROMPT.to_string(),
+            images: Vec::new(),
+        })
+        .is_err()
+    {
+        return DebriefTurnResult {
+            text: None,
+            session_alive: false,
+        };
+    }
+
+    match tokio::time::timeout(SUBAGENT_DEBRIEF_TIMEOUT, async {
+        let mut collector = AgentMessageCollector::new();
+        loop {
+            tokio::select! {
+                biased;
+                () = termination.cancelled() => {
+                    return DebriefTurnResult {
+                        text: None,
+                        session_alive: false,
+                    };
+                }
+                joined = &mut *runtime => {
+                    let (runtime_result, _run_result) = map_runtime_join(joined);
+                    *joined_runtime_result = Some(runtime_result);
+                    return DebriefTurnResult {
+                        text: None,
+                        session_alive: false,
+                    };
+                }
+                event = nested_event_rx.recv() => {
+                    let Some(event) = event else {
+                        return DebriefTurnResult {
+                            text: None,
+                            session_alive: false,
+                        };
+                    };
+                    match event {
+                        UiEvent::SessionUpdate(update) => {
+                            collector.observe(&update);
+                        }
+                        UiEvent::PromptDone { stop_reason, .. } => {
+                            let text = if matches!(stop_reason, StopReason::Cancelled) {
+                                None
+                            } else {
+                                collector.finish().ok()
+                            };
+                            return DebriefTurnResult {
+                                text,
+                                session_alive: true,
+                            };
+                        }
+                        UiEvent::PromptFailed { .. }
+                        | UiEvent::SessionForkFailed { .. }
+                        | UiEvent::Fatal(_) => {
+                            return DebriefTurnResult {
+                                text: None,
+                                session_alive: true,
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => DebriefTurnResult {
+            text: None,
+            session_alive: true,
+        },
+    }
+}
+
 fn outcome_for(result: &Result<String>) -> SubagentOutcome {
     match result {
         Ok(_) => SubagentOutcome::Completed,
@@ -2227,6 +2351,7 @@ async fn run(
                         ),
                         slim_activity: render_activity_log(&[]),
                         workspace_diff: None,
+                        debrief: None,
                         elapsed: Duration::ZERO,
                     },
                 );
@@ -2591,6 +2716,21 @@ async fn run(
                 Ok(message) => message.clone(),
                 Err(error) => format!("{error:#}"),
             };
+            let mut session_alive = true;
+            let debrief = if policy.debrief && turn_result.is_ok() {
+                let result = collect_debrief_turn(
+                    &nested_cmd_tx,
+                    &mut nested_event_rx,
+                    &mut runtime,
+                    &termination,
+                    &mut joined_runtime_result,
+                )
+                .await;
+                session_alive = result.session_alive;
+                result.text
+            } else {
+                None
+            };
             let report = SubagentReport {
                 subagent_id,
                 label: label.clone(),
@@ -2603,9 +2743,10 @@ async fn run(
                     delta.as_ref(),
                     overlap.load(Ordering::Acquire),
                 ),
+                debrief,
                 elapsed: turn_started.elapsed(),
             };
-            if turn_result.is_ok() && policy.retain_after_completion {
+            if turn_result.is_ok() && policy.retain_after_completion && session_alive {
                 // Publish the report only after resume can observe the retained
                 // state. A coordinator is allowed to resume as soon as it
                 // receives the report, so report-before-retain is a real race.
@@ -2616,7 +2757,8 @@ async fn run(
                     let _ = reaped.send(WorkerRequest::Supersede);
                 }
             }
-            let remains_retained = turn_result.is_ok() && policy.retain_after_completion;
+            let remains_retained =
+                turn_result.is_ok() && policy.retain_after_completion && session_alive;
             deliver_report(&config, report);
             turn_reported = true;
             if remains_retained && policy.defer_finished_while_retained {
@@ -2636,7 +2778,7 @@ async fn run(
                 registry.take(subagent_id);
                 break 'session turn_result;
             }
-            if !policy.retain_after_completion {
+            if !policy.retain_after_completion || !session_alive {
                 registry.take(subagent_id);
                 break 'session turn_result;
             }
@@ -2827,6 +2969,7 @@ async fn run(
                         workspace_delta.as_ref(),
                         overlap.load(Ordering::Acquire),
                     ),
+                    debrief: None,
                     elapsed: turn_started.elapsed(),
                 },
             );
@@ -2873,6 +3016,7 @@ async fn run(
                     workspace_delta.as_ref(),
                     overlap.load(Ordering::Acquire),
                 ),
+                debrief: None,
                 elapsed: turn_started.elapsed(),
             },
         );
@@ -3203,6 +3347,7 @@ mod tests {
             mcp_servers: Vec::new(),
             usage_seat: Seat::Subagent,
             retain_after_completion: true,
+            debrief: true,
             warm: Arc::default(),
         }
     }
@@ -3230,6 +3375,7 @@ mod tests {
         assert_eq!(config.preamble, "review preamble");
         assert_eq!(config.usage_seat, Seat::Review);
         assert!(config.retain_after_completion);
+        assert!(config.debrief);
     }
 
     #[test]
@@ -3243,6 +3389,7 @@ mod tests {
             final_message: "one finding".to_string(),
             slim_activity: "read the caller".to_string(),
             workspace_diff: None,
+            debrief: None,
             elapsed: Duration::from_secs(61),
         };
         let rendered = format_report_injection(&[report], "Vet this report.");
@@ -3252,6 +3399,53 @@ mod tests {
         assert!(rendered.contains("elapsed=\"1m01s\""));
         assert!(rendered.contains("[workspace snapshot unavailable"));
         assert!(rendered.ends_with("Vet this report."));
+    }
+
+    #[test]
+    fn report_injection_renders_debrief_between_report_and_activity() {
+        let report = SubagentReport {
+            subagent_id: 7,
+            label: "review".to_string(),
+            agent: "codex-acp".to_string(),
+            model: "gpt-y".to_string(),
+            outcome: SubagentOutcome::Completed,
+            final_message: "one finding".to_string(),
+            slim_activity: "read the caller".to_string(),
+            workspace_diff: Some("diff body".to_string()),
+            debrief: Some("VERIFIED: cargo test\nUNVERIFIED: integration".to_string()),
+            elapsed: Duration::from_secs(1),
+        };
+
+        let rendered = format_report_injection(&[report], "Vet this report.");
+
+        assert_eq!(
+            rendered,
+            "<subagent_result id=\"7\" label=\"review\" agent=\"codex-acp\" model=\"gpt-y\" outcome=\"completed\" elapsed=\"1s\">\n<report>\none finding\n</report>\n<debrief>\nVERIFIED: cargo test\nUNVERIFIED: integration\n</debrief>\n<activity_summary>\nread the caller\n</activity_summary>\n<workspace_diff>\ndiff body\n</workspace_diff>\n</subagent_result>\n\nVet this report."
+        );
+    }
+
+    #[test]
+    fn report_injection_omits_debrief_when_absent() {
+        let report = SubagentReport {
+            subagent_id: 8,
+            label: "review".to_string(),
+            agent: "codex-acp".to_string(),
+            model: "gpt-y".to_string(),
+            outcome: SubagentOutcome::Completed,
+            final_message: "done".to_string(),
+            slim_activity: "activity".to_string(),
+            workspace_diff: Some("diff".to_string()),
+            debrief: None,
+            elapsed: Duration::from_secs(2),
+        };
+
+        let rendered = format_report_injection(&[report], "Vet this report.");
+
+        assert_eq!(
+            rendered,
+            "<subagent_result id=\"8\" label=\"review\" agent=\"codex-acp\" model=\"gpt-y\" outcome=\"completed\" elapsed=\"2s\">\n<report>\ndone\n</report>\n<activity_summary>\nactivity\n</activity_summary>\n<workspace_diff>\ndiff\n</workspace_diff>\n</subagent_result>\n\nVet this report."
+        );
+        assert!(!rendered.contains("<debrief>"));
     }
 
     fn test_mcp_handler(controller: Controller) -> McpHandler {
@@ -3917,6 +4111,7 @@ mod tests {
             final_message: "done".to_string(),
             slim_activity: String::new(),
             workspace_diff: None,
+            debrief: None,
             elapsed: Duration::ZERO,
         });
         assert_eq!(
@@ -4114,6 +4309,21 @@ mod tests {
         retain_after_completion: bool,
         defer_finished_while_retained: bool,
     ) -> FakeRun {
+        spawn_fake_run_with_options(
+            images,
+            retain_after_completion,
+            defer_finished_while_retained,
+            false,
+        )
+        .await
+    }
+
+    async fn spawn_fake_run_with_options(
+        images: Vec<PromptImage>,
+        retain_after_completion: bool,
+        defer_finished_while_retained: bool,
+        debrief: bool,
+    ) -> FakeRun {
         let workspace = tempfile::tempdir().expect("workspace");
         init_repo(workspace.path());
         let cwd = std::fs::canonicalize(workspace.path()).expect("canonical cwd");
@@ -4138,6 +4348,7 @@ mod tests {
         let mut config = test_config();
         config.reports = Some(bus.clone());
         config.retain_after_completion = retain_after_completion;
+        config.debrief = debrief;
 
         let (commands, nested_commands) = mpsc::unbounded_channel();
         let (nested_events, events) = mpsc::unbounded_channel();
@@ -4323,6 +4534,117 @@ mod tests {
             .expect("cancel result");
         assert!(!result.cancelled_while_running);
         assert!(result.outcome.is_ok());
+    }
+
+    #[tokio::test]
+    async fn completed_run_with_debrief_sends_one_extra_prompt_and_reports_answer() {
+        let mut run = spawn_fake_run_with_options(Vec::new(), true, false, true).await;
+        run.nested_events
+            .send(UiEvent::SessionStarted {
+                session_id: "s1".to_string(),
+                resumed: false,
+            })
+            .expect("session started");
+        let UiCommand::SendPrompt { text, .. } = run.nested_commands.recv().await.expect("prompt")
+        else {
+            panic!("expected the standalone brief");
+        };
+        assert!(text.ends_with("do the thing"));
+
+        run.nested_events
+            .send(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new("all green"))),
+            )))
+            .expect("final message");
+        run.nested_events
+            .send(UiEvent::PromptDone {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            })
+            .expect("turn done");
+
+        let UiCommand::SendPrompt { text, images } =
+            tokio::time::timeout(Duration::from_secs(5), run.nested_commands.recv())
+                .await
+                .expect("debrief prompt sent")
+                .expect("debrief prompt")
+        else {
+            panic!("expected the debrief prompt");
+        };
+        assert_eq!(text, SUBAGENT_DEBRIEF_PROMPT);
+        assert!(images.is_empty());
+
+        let debrief = "VERIFIED: cargo test (full crate)\nUNVERIFIED: none\nCOMMITMENTS: none\nANOMALIES: none\nNEXT: none";
+        run.nested_events
+            .send(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new(debrief))),
+            )))
+            .expect("debrief message");
+        run.nested_events
+            .send(UiEvent::PromptDone {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            })
+            .expect("debrief done");
+
+        let report = tokio::time::timeout(Duration::from_secs(5), run.reports.recv())
+            .await
+            .expect("report after debrief")
+            .expect("report");
+        assert_eq!(report.final_message, "all green");
+        assert_eq!(report.debrief.as_deref(), Some(debrief));
+        assert_eq!(
+            run.registry.retained_ids(),
+            vec![run.subagent_id],
+            "debrief runs before retention is reported"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), run.nested_commands.recv())
+                .await
+                .is_err(),
+            "only one extra prompt is sent"
+        );
+
+        assert!(run.controller.cancel_and_wait().await);
+    }
+
+    #[tokio::test]
+    async fn debrief_error_still_delivers_completed_report_without_debrief() {
+        let mut run = spawn_fake_run_with_options(Vec::new(), true, false, true).await;
+        run.nested_events
+            .send(UiEvent::SessionStarted {
+                session_id: "s1".to_string(),
+                resumed: false,
+            })
+            .expect("session started");
+        let _ = run.nested_commands.recv().await.expect("task prompt");
+        run.nested_events
+            .send(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new("all green"))),
+            )))
+            .expect("final message");
+        run.nested_events
+            .send(UiEvent::PromptDone {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            })
+            .expect("turn done");
+        let _ = run.nested_commands.recv().await.expect("debrief prompt");
+        run.nested_events
+            .send(UiEvent::PromptFailed {
+                message: "provider rejected the interview".to_string(),
+            })
+            .expect("debrief failed");
+
+        let report = tokio::time::timeout(Duration::from_secs(5), run.reports.recv())
+            .await
+            .expect("report after failed debrief")
+            .expect("report");
+        assert_eq!(report.outcome, SubagentOutcome::Completed);
+        assert_eq!(report.final_message, "all green");
+        assert_eq!(report.debrief, None);
+
+        assert!(run.controller.cancel_and_wait().await);
     }
 
     #[tokio::test]
