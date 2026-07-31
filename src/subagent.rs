@@ -504,10 +504,7 @@ pub(crate) fn format_report_injection(
         // said the session was still warm.
         let session_note = match &report.outcome {
             SubagentOutcome::Completed => format!(
-                "<session>\nThis subagent's session is retained with its full working context. \
-                 For follow-up work in the same area, create_subagent with resume={id} \
-                 continues it and is far cheaper than a fresh subagent, which starts from \
-                 zero and must re-orient. subagent_cancel with subagent_id {id} releases it.\n</session>\n",
+                "<session>\nThis subagent's session is retained with its full working context. For follow-up work that needs the same context, create_subagent with resume={id} continues it and is far cheaper than a new subagent loading that context from scratch. Work needing different context is better served by a fresh subagent. subagent_cancel with subagent_id {id} releases it.\n</session>\n",
                 id = report.subagent_id
             ),
             _ => String::new(),
@@ -3448,7 +3445,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "<subagent_result id=\"7\" label=\"review\" agent=\"codex-acp\" model=\"gpt-y\" outcome=\"completed\" elapsed=\"1s\">\n<report>\none finding\n</report>\n<debrief>\nVERIFIED: cargo test\nUNVERIFIED: integration\n</debrief>\n<activity_summary>\nread the caller\n</activity_summary>\n<workspace_diff>\ndiff body\n</workspace_diff>\n<session>\nThis subagent's session is retained with its full working context. For follow-up work in the same area, create_subagent with resume=7 continues it and is far cheaper than a fresh subagent, which starts from zero and must re-orient. subagent_cancel with subagent_id 7 releases it.\n</session>\n</subagent_result>\n\nVet this report."
+            "<subagent_result id=\"7\" label=\"review\" agent=\"codex-acp\" model=\"gpt-y\" outcome=\"completed\" elapsed=\"1s\">\n<report>\none finding\n</report>\n<debrief>\nVERIFIED: cargo test\nUNVERIFIED: integration\n</debrief>\n<activity_summary>\nread the caller\n</activity_summary>\n<workspace_diff>\ndiff body\n</workspace_diff>\n<session>\nThis subagent's session is retained with its full working context. For follow-up work that needs the same context, create_subagent with resume=7 continues it and is far cheaper than a new subagent loading that context from scratch. Work needing different context is better served by a fresh subagent. subagent_cancel with subagent_id 7 releases it.\n</session>\n</subagent_result>\n\nVet this report."
         );
     }
 
@@ -3471,7 +3468,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "<subagent_result id=\"8\" label=\"review\" agent=\"codex-acp\" model=\"gpt-y\" outcome=\"completed\" elapsed=\"2s\">\n<report>\ndone\n</report>\n<activity_summary>\nactivity\n</activity_summary>\n<workspace_diff>\ndiff\n</workspace_diff>\n<session>\nThis subagent's session is retained with its full working context. For follow-up work in the same area, create_subagent with resume=8 continues it and is far cheaper than a fresh subagent, which starts from zero and must re-orient. subagent_cancel with subagent_id 8 releases it.\n</session>\n</subagent_result>\n\nVet this report."
+            "<subagent_result id=\"8\" label=\"review\" agent=\"codex-acp\" model=\"gpt-y\" outcome=\"completed\" elapsed=\"2s\">\n<report>\ndone\n</report>\n<activity_summary>\nactivity\n</activity_summary>\n<workspace_diff>\ndiff\n</workspace_diff>\n<session>\nThis subagent's session is retained with its full working context. For follow-up work that needs the same context, create_subagent with resume=8 continues it and is far cheaper than a new subagent loading that context from scratch. Work needing different context is better served by a fresh subagent. subagent_cancel with subagent_id 8 releases it.\n</session>\n</subagent_result>\n\nVet this report."
         );
         assert!(!rendered.contains("<debrief>"));
     }
