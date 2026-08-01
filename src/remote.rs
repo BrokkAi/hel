@@ -2575,6 +2575,9 @@ fn start_server_agent_session(
     let subagent_ids = subagent::SubagentIdAllocator::default();
     let active_implementation_workers = subagent::ActiveSubagentWorkers::default();
     let (subagent_reports, subagent_report_rx) = subagent::SubagentReportBus::channel();
+    // Shared with the orchestrator so every wake can ask the still-running
+    // subagents for progress.
+    let subagent_runs = subagent::SubagentRegistry::default();
     // The discrete review's specialist lanes run on the subagent pool and share
     // the primary's workspace roots, so both have to be cloned before they move
     // into the subagent config and the runtime config respectively.
@@ -2588,6 +2591,7 @@ fn start_server_agent_session(
             .with_max_parallel(app_config.subagents.max_parallel)
             .with_debrief(app_config.subagents.debrief)
             .with_reports(subagent_reports.clone())
+            .with_run_registry(subagent_runs.clone())
             .with_prewarm(subagent::RunContext {
                 cwd: cwd.clone(),
                 additional_directories: additional_directories.clone(),
@@ -2630,6 +2634,10 @@ fn start_server_agent_session(
             active_subagent_workers: active_implementation_workers.clone(),
             subagent_reports: subagent_report_rx,
             subagent_report_bus: subagent_reports,
+            subagent_runs,
+            progress_wake: crate::orchestrator::progress_wake_interval(
+                app_config.subagents.progress_wake_minutes,
+            ),
             discrete_review: app_config.agent.discrete_review,
             primary_model: roster
                 .as_ref()

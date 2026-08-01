@@ -51,6 +51,7 @@ configures the default backing for `create_subagent`; set `model = "disabled"`
 | `subagents.reasoning_effort` | Optional per-seat ACP reasoning effort |
 | `subagents.max_parallel` | Concurrent subagents, default 6, maximum 16 |
 | `subagents.auto_failover` | Move the default pool to the next roster route when the current ACP source's quota runs low; the model may stay the same |
+| `subagents.progress_wake_minutes` | Minutes a primary parked on running subagents may go without a report before it is woken with their progress alone; default 20, `0` disables. Config file only |
 
 Explicit model IDs can come from `/models`; availability is checked when the
 next session starts. A `max_parallel` above 16 is a configuration error, not a

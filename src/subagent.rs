@@ -5,7 +5,7 @@
 //! finishes, its report is pushed onto a channel the orchestrator drains and
 //! injects back into the primary session as a user message.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -59,20 +59,20 @@ pub const MCP_SERVER_NAME: &str = "mj-subagents";
 pub const DEFAULT_MAX_PARALLEL: usize = 6;
 pub const MAX_PARALLEL_CAP: usize = 16;
 
-const SERVER_DELEGATION_GUIDANCE: &str = "SUBAGENT POLICY: create_subagent launches one background subagent on a fresh ACP session with no memory of this conversation, and returns immediately. Its report arrives on its own as a user message when it finishes — never poll and never idle waiting for it. Several subagents run concurrently and all of them can write to the workspace, so give each one non-overlapping work. subagent_cancel stops one in flight or releases a finished session. You keep planning, coordination, review, verification, and the final answer.";
+const SERVER_DELEGATION_GUIDANCE: &str = "SUBAGENT POLICY: create_subagent launches one background subagent on a fresh ACP session with no memory of this conversation, and returns immediately. Reports are delivered only between your turns: ending your turn while subagents run is how you wait, and you are woken with each finished subagent's full report plus progress on everything still running. Never poll. Several subagents run concurrently and all of them can write to the workspace, so give each one non-overlapping work. subagent_cancel stops or releases a subagent and returns its full report; use it to abandon or conclude work, not to collect results. You keep planning, coordination, review, verification, and the final answer.";
 
 pub const PRIMARY_SESSION_DIRECTIVE: &str = r#"<mj-subagent-policy>
 You are the primary agent and the owner of the user's outcome. You understand the request, gather the context you need, form the plan, decide what to delegate, review what comes back, verify it, and deliver the final answer. This policy applies to every subsequent user request in this ACP session.
 
 create_subagent starts a background subagent. Every subagent runs in a brand-new ACP process and session with zero memory of this conversation, of the user's request, and of any earlier subagent — including one you launched a moment ago. Its prompt must therefore be a complete standalone brief: the task, the context and decisions it needs to begin immediately, the constraints, and the report you expect back. Quote original requirements verbatim rather than paraphrasing them.
 
-create_subagent returns as soon as the subagent starts; it does not carry the result. When the subagent finishes, its report is delivered to you automatically as a new user message containing a <subagent_result> block. Never poll, never call a tool to check on it, and never sit idle waiting for it: after launching, either continue with other work or end your turn. Ending your turn is the normal, correct thing to do when you have nothing else to work on.
+create_subagent returns as soon as the subagent starts; it does not carry the result. Reports are delivered only between your turns, so ending your turn while subagents run is how you WAIT: you will be woken the moment a report is ready, with that subagent's full <subagent_result> block plus a <subagent_progress> block covering everything still running, and woken again as the rest finish. Never poll and never call a tool to check on a running subagent. After launching, either continue with other work or end your turn; ending it is the normal, correct way to wait.
 
 Several subagents run concurrently and every one of them has full write access to the workspace. Assign non-overlapping work, do not edit files a running subagent owns, and expect two subagents editing the same files to conflict. When several subagents share one workspace at the same time, the per-subagent diff in the report is suppressed and you must inspect the repository yourself.
 
 Review every report critically against the actual repository. A report is the subagent's own account of its work; its claims, including any test results it states, are claims and not verified facts. Fix what you find yourself, or launch a follow-up.
 
-resume continues a finished subagent's retained session with a new prompt, preserving its context; use it for targeted follow-up on work that subagent already did. subagent_cancel interrupts a running subagent or releases a finished one; it never reverts edits.
+resume continues a finished subagent's retained session with a new prompt, preserving its context; use it for targeted follow-up on work that subagent already did. subagent_cancel stops a running subagent or releases a finished one and returns its full report either way; use it to abandon or conclude work, not to collect results. It never reverts edits.
 
 Subagents use the model and ACP routing configured by Mjolnir.
 
@@ -87,6 +87,19 @@ const SUBAGENT_ACTIVITY_LOG_LIMIT: usize = 8_000;
 const SUBAGENT_ACTIVITY_LOG_HEAD: usize = 2_500;
 const SUBAGENT_ACTIVITY_LOG_TAIL: usize = 5_000;
 const SUBAGENT_ACTIVITY_LOG_ELISION: &str = "\n[... earlier activity elided ...]\n";
+/// A progress block carries every running subagent at once, so each one gets a
+/// much tighter activity budget than a finished subagent's report.
+const SUBAGENT_PROGRESS_ACTIVITY_LIMIT: usize = 2_000;
+const SUBAGENT_PROGRESS_ACTIVITY_HEAD: usize = 500;
+const SUBAGENT_PROGRESS_ACTIVITY_TAIL: usize = 1_500;
+/// Longest a wake waits for the running workers to answer. Requests are
+/// dispatched together, so this bounds the whole block, not one subagent.
+const SUBAGENT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Files named individually in one progress line before the rest are counted.
+const SUBAGENT_PROGRESS_FILES: usize = 10;
+/// Closing line of a progress-only wake: the primary is being asked to decide,
+/// not merely informed.
+pub(crate) const PROGRESS_WAKE_INSTRUCTION: &str = "No subagent has finished yet. Decide: keep waiting (end your turn again), redirect or take over the work yourself, or cancel a subagent.";
 const SUBAGENT_REVIEW_TEXT: &str = "This is the subagent's own account of its work, with its activity log and diff. You own the result: review it as you would a capable colleague's submission — the log shows where it struggled or made judgment calls, which is where scrutiny earns the most. Its claims, including any test results it reports, are its claims and not verified facts.";
 const SUBAGENT_DEBRIEF_TIMEOUT: Duration = Duration::from_secs(180);
 const SUBAGENT_DEBRIEF_PROMPT: &str =
@@ -126,6 +139,9 @@ pub struct Config {
     headless_permission_mode: Option<crate::config::PermissionPreset>,
     role_pool: Option<crate::quota::RolePool>,
     reports: Option<SubagentReportBus>,
+    /// Live runs, shared with the orchestrator so every wake can ask the
+    /// still-running subagents for progress.
+    runs: SubagentRegistry,
     preamble: String,
     mcp_servers: Vec<McpServer>,
     usage_seat: Seat,
@@ -201,6 +217,7 @@ impl Config {
             headless_permission_mode: None,
             role_pool,
             reports: None,
+            runs: SubagentRegistry::default(),
             preamble: SUBAGENT_PREAMBLE.to_string(),
             mcp_servers: Vec::new(),
             usage_seat: Seat::Subagent,
@@ -239,6 +256,13 @@ impl Config {
 
     pub fn with_reports(mut self, reports: SubagentReportBus) -> Self {
         self.reports = Some(reports);
+        self
+    }
+
+    /// Share the run registry with the orchestrator, which asks every still
+    /// running subagent for progress whenever it wakes the primary.
+    pub fn with_run_registry(mut self, runs: SubagentRegistry) -> Self {
+        self.runs = runs;
         self
     }
 
@@ -439,6 +463,7 @@ pub struct SubagentReport {
 pub struct SubagentReportBus {
     tx: mpsc::UnboundedSender<SubagentReport>,
     pending: Arc<AtomicUsize>,
+    claimed: Arc<StdMutex<HashSet<u64>>>,
 }
 
 impl SubagentReportBus {
@@ -448,6 +473,7 @@ impl SubagentReportBus {
             Self {
                 tx,
                 pending: Arc::new(AtomicUsize::new(0)),
+                claimed: Arc::default(),
             },
             rx,
         )
@@ -455,6 +481,26 @@ impl SubagentReportBus {
 
     pub fn pending(&self) -> usize {
         self.pending.load(Ordering::Acquire)
+    }
+
+    /// Record that a `subagent_cancel` result already carried this run's report
+    /// back to the primary. A report can be in flight to the orchestrator (or
+    /// queued for the next turn boundary) when the cancel lands, and the primary
+    /// must not receive the same content twice.
+    pub(crate) fn claim(&self, subagent_id: u64) {
+        self.lock_claimed().insert(subagent_id);
+    }
+
+    /// Consumes a claim, if any. The orchestrator accounts a claimed report the
+    /// same way it accounts an injected one and drops it.
+    pub(crate) fn take_claim(&self, subagent_id: u64) -> bool {
+        self.lock_claimed().remove(&subagent_id)
+    }
+
+    fn lock_claimed(&self) -> std::sync::MutexGuard<'_, HashSet<u64>> {
+        self.claimed
+            .lock()
+            .expect("subagent report claim lock poisoned")
     }
 
     pub(crate) fn open(&self) {
@@ -478,51 +524,69 @@ impl SubagentReportBus {
     }
 }
 
-/// Format a batch of completed runs for injection into their coordinator's
-/// next turn.
+/// Format a batch of completed runs, plus the progress of everything still
+/// running, for injection into their coordinator's next turn.
 pub(crate) fn format_report_injection(
     reports: &[SubagentReport],
+    progress: Option<&str>,
     trailing_instruction: &str,
 ) -> String {
     let mut out = String::new();
     for report in reports {
-        let diff = report
-            .workspace_diff
-            .as_deref()
-            .unwrap_or("[workspace snapshot unavailable for this subagent]");
-        let debrief = report
-            .debrief
-            .as_deref()
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(|text| format!("<debrief>\n{text}\n</debrief>\n"))
-            .unwrap_or_default();
-        // The resume affordance must live here, at the decision point: the
-        // tool description's one-clause mention produced zero resume uptake
-        // across 63 delegations in a 20-task sweep (2026-07-31) because the
-        // report the coordinator reads when planning follow-up work never
-        // said the session was still warm.
-        let session_note = match &report.outcome {
-            SubagentOutcome::Completed => format!(
-                "<session>\nThis subagent's session is retained with its full working context. For follow-up work that needs the same context, create_subagent with resume={id} continues it and is far cheaper than a new subagent loading that context from scratch. Work needing different context is better served by a fresh subagent. subagent_cancel with subagent_id {id} releases it.\n</session>\n",
-                id = report.subagent_id
-            ),
-            _ => String::new(),
-        };
-        out.push_str(&format!(
-            "<subagent_result id=\"{id}\" label=\"{label}\" agent=\"{agent}\" model=\"{model}\" outcome=\"{outcome}\" elapsed=\"{elapsed}\">\n<report>\n{report_text}\n</report>\n{debrief}<activity_summary>\n{activity}\n</activity_summary>\n<workspace_diff>\n{diff}\n</workspace_diff>\n{session_note}</subagent_result>\n\n",
-            id = report.subagent_id,
-            label = escape_report_attribute(&report.label),
-            agent = escape_report_attribute(&report.agent),
-            model = escape_report_attribute(&report.model),
-            outcome = report.outcome.label(),
-            elapsed = format_report_elapsed(report.elapsed),
-            report_text = report.final_message.trim(),
-            activity = report.slim_activity.trim(),
-        ));
+        out.push_str(&format_report_block(report, true));
+        out.push_str("\n\n");
+    }
+    if let Some(progress) = progress.map(str::trim).filter(|block| !block.is_empty()) {
+        out.push_str(progress);
+        out.push_str("\n\n");
     }
     out.push_str(trailing_instruction);
     out
+}
+
+/// One report in the shape the coordinator reads it. `session_note` is off for
+/// a run whose session is being released, which has nothing left to resume.
+fn format_report_block(report: &SubagentReport, session_note: bool) -> String {
+    let diff = report
+        .workspace_diff
+        .as_deref()
+        .unwrap_or("[workspace snapshot unavailable for this subagent]");
+    let debrief = report
+        .debrief
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| format!("<debrief>\n{text}\n</debrief>\n"))
+        .unwrap_or_default();
+    // The resume affordance must live here, at the decision point: the
+    // tool description's one-clause mention produced zero resume uptake
+    // across 63 delegations in a 20-task sweep (2026-07-31) because the
+    // report the coordinator reads when planning follow-up work never
+    // said the session was still warm.
+    let session_note = match &report.outcome {
+        SubagentOutcome::Completed if session_note => format!(
+            "<session>\nThis subagent's session is retained with its full working context. For follow-up work that needs the same context, create_subagent with resume={id} continues it and is far cheaper than a new subagent loading that context from scratch. Work needing different context is better served by a fresh subagent. subagent_cancel with subagent_id {id} releases it.\n</session>\n",
+            id = report.subagent_id
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "<subagent_result id=\"{id}\" label=\"{label}\" agent=\"{agent}\" model=\"{model}\" outcome=\"{outcome}\" elapsed=\"{elapsed}\">\n<report>\n{report_text}\n</report>\n{debrief}<activity_summary>\n{activity}\n</activity_summary>\n<workspace_diff>\n{diff}\n</workspace_diff>\n{session_note}</subagent_result>",
+        id = report.subagent_id,
+        label = escape_report_attribute(&report.label),
+        agent = escape_report_attribute(&report.agent),
+        model = escape_report_attribute(&report.model),
+        outcome = report.outcome.label(),
+        elapsed = format_report_elapsed(report.elapsed),
+        report_text = report.final_message.trim(),
+        activity = report.slim_activity.trim(),
+    )
+}
+
+/// The whole prompt for a progress-only wake: no subagent has finished, so the
+/// primary is woken with the running picture and one decision to make.
+pub(crate) fn format_progress_wake(progress: &str) -> String {
+    format!("{}\n\n{PROGRESS_WAKE_INSTRUCTION}", progress.trim())
 }
 
 fn escape_report_attribute(value: &str) -> String {
@@ -661,18 +725,18 @@ impl McpHandler {
         controller: Controller,
     ) -> Self {
         Self {
+            runs: config.runs.clone(),
             config,
             context,
             ui_tx,
             controller,
-            runs: SubagentRegistry::default(),
             tool_router: Self::tool_router(),
         }
     }
 
     #[tool(
         name = "create_subagent",
-        description = "LAUNCH A BACKGROUND SUBAGENT. Starts one subagent on a fresh ACP process and session using Mjolnir's configured subagent model and RETURNS IMMEDIATELY with its subagentId; it does not carry the result. The subagent's report arrives on its own as a new user message containing a <subagent_result> block when it finishes. Never poll, never wait idle, never call another tool to check on it: after launching, do other work or end your turn. The subagent has zero memory of this conversation, so `prompt` must be a complete standalone brief: the task, the context and decisions needed to start immediately, the constraints, and the report you expect. Several subagents run concurrently and ALL of them can write to the workspace, so give each one non-overlapping work and do not edit files a running subagent owns. Optional `label` is a short display name. Optional `cwd` must be an absolute directory inside the authorized workspace roots. Optional `resume` continues a finished subagent's retained session with this prompt instead of starting a fresh one. Prefer your own tools for small edits and quick lookups."
+        description = "LAUNCH A BACKGROUND SUBAGENT. Starts one subagent on a fresh ACP process and session using Mjolnir's configured subagent model and RETURNS IMMEDIATELY with its subagentId; it does not carry the result. Reports are delivered only between your turns, so ending your turn while subagents run is how you WAIT: you will be woken the moment a report is ready, with that subagent's full <subagent_result> block plus progress on everything still running, and woken again as the rest finish. Never poll and never call another tool to check on a running subagent. The subagent has zero memory of this conversation, so `prompt` must be a complete standalone brief: the task, the context and decisions needed to start immediately, the constraints, and the report you expect. Several subagents run concurrently and ALL of them can write to the workspace, so give each one non-overlapping work and do not edit files a running subagent owns. Optional `label` is a short display name. Optional `cwd` must be an absolute directory inside the authorized workspace roots. Optional `resume` continues a finished subagent's retained session with this prompt instead of starting a fresh one. Prefer your own tools for small edits and quick lookups."
     )]
     async fn create_subagent(
         &self,
@@ -768,7 +832,7 @@ impl McpHandler {
 
     #[tool(
         name = "subagent_cancel",
-        description = "STOP OR RELEASE A SUBAGENT (subagent_id from create_subagent). On a running subagent this interrupts its in-flight turn and returns what it did, plus the workspace diff as it left it. On a finished, retained subagent it releases the idle session. Either way it does NOT revert changes the subagent already made: its edits remain in the workspace exactly as it left them, so you can review or finish the work yourself. No report is injected for a cancelled subagent; this tool result is the whole story. Calling this with an unknown or already-released subagent_id fails."
+        description = "STOP OR RELEASE A SUBAGENT AND GET ITS FULL REPORT (subagent_id from create_subagent). Use it to abandon or conclude work, NOT to collect results: a subagent left to finish reports on its own between your turns. On a running subagent this interrupts its in-flight turn and returns a report of what it did, with its activity and the workspace diff as it left it. On a finished, retained subagent it returns that subagent's complete report — final message, debrief, activity, diff — and releases the idle session. Either way it does NOT revert changes the subagent already made: its edits remain in the workspace exactly as it left them. This tool result is the whole story; nothing further is injected for that subagent. Calling this with an unknown or already-released subagent_id fails."
     )]
     async fn subagent_cancel(
         &self,
@@ -787,7 +851,19 @@ impl McpHandler {
             )]));
         }
         Ok(match respond_rx.await {
-            Ok(result) => cancelled_tool_result(&result),
+            Ok(result) => {
+                // Releasing a finished subagent hands its already-delivered
+                // report back here. Claim it so the orchestrator accounts and
+                // drops the copy still travelling to the next turn boundary
+                // instead of injecting the same content twice.
+                if !result.cancelled_while_running
+                    && result.report.is_some()
+                    && let Some(reports) = self.config.reports.as_ref()
+                {
+                    reports.claim(args.subagent_id);
+                }
+                cancelled_tool_result(&result)
+            }
             Err(_) => CallToolResult::error(vec![Content::text(format!(
                 "subagent #{} was cancelled, but its worker ended before confirming teardown. Any partial edits remain in the workspace exactly as it left them.",
                 args.subagent_id
@@ -811,7 +887,7 @@ fn default_label(prompt: &str) -> String {
 
 fn started_tool_result(subagent_id: u64, label: &str, agent: &str, model: &str) -> CallToolResult {
     let text = format!(
-        "subagent #{subagent_id} ({label}) started on {agent}/{model}. It is running in the background and this call carries no result. Its report arrives on its own as a user message containing a <subagent_result id=\"{subagent_id}\"> block when it finishes. Do not poll and do not wait idle for it: continue with other work or end your turn. subagent_cancel with subagent_id {subagent_id} stops it."
+        "subagent #{subagent_id} ({label}) started on {agent}/{model}. It is running in the background and this call carries no result. Reports are delivered only between your turns, so ending your turn while it runs is how you wait for it: you will be woken with its full <subagent_result id=\"{subagent_id}\"> block plus progress on everything still running, and woken again as the rest finish. Do not poll. Continue with other work or end your turn. subagent_cancel with subagent_id {subagent_id} stops it and returns its full report."
     );
     let mut result = CallToolResult::success(vec![Content::text(text)]);
     result.structured_content = Some(serde_json::json!({
@@ -1806,10 +1882,26 @@ struct SubagentRunResult {
     /// Determined by the worker at the moment it processes the request, not by
     /// the MCP layer's registry snapshot at dispatch time.
     cancelled_while_running: bool,
+    /// The run's report: the one it delivered for its completed turn when a
+    /// retained session is released, or the cancellation report when a live
+    /// turn is interrupted. Nothing a subagent produced is ever unobtainable.
+    report: Option<SubagentReport>,
 }
 
-/// Sent by `create_subagent`(resume) / `subagent_cancel`, and by retention
-/// reaping, to a run's persistent worker task.
+/// One running subagent's answer to a progress request, rendered into the
+/// `<subagent_progress>` block of the primary's next wake.
+struct SubagentProgress {
+    subagent_id: u64,
+    label: String,
+    elapsed: Duration,
+    /// Files touched with their diffstat, or why that is unavailable.
+    workspace: String,
+    /// Activity the primary has not seen yet, already watermark-advanced.
+    activity: String,
+}
+
+/// Sent by `create_subagent`(resume) / `subagent_cancel`, by a wake gathering
+/// progress, and by retention reaping, to a run's persistent worker task.
 enum WorkerRequest {
     /// Continue a retained (finished, idle) session with a new prompt.
     Continue { prompt: String },
@@ -1819,6 +1911,12 @@ enum WorkerRequest {
     /// reverts workspace edits.
     Cancel {
         respond: oneshot::Sender<SubagentRunResult>,
+    },
+    /// Describe the turn in flight for the primary's next wake. The worker
+    /// answers between its own polls, so nothing reads the transcript or the
+    /// workspace snapshot concurrently with the turn producing them.
+    Progress {
+        respond: oneshot::Sender<SubagentProgress>,
     },
     /// Reap an idle retained worker because retention is over capacity.
     Supersede,
@@ -1833,13 +1931,18 @@ enum SubagentRunState {
 #[derive(Clone)]
 struct RegisteredRun {
     state: SubagentRunState,
+    label: String,
     control: mpsc::UnboundedSender<WorkerRequest>,
 }
 
-/// Routes `resume`/`subagent_cancel` to a run's worker, and bounds how many
-/// finished sessions stay warm.
+/// Routes `resume`/`subagent_cancel`/progress requests to a run's worker, and
+/// bounds how many finished sessions stay warm.
+///
+/// The MCP handler that owns the workers and the orchestrator that wakes the
+/// primary share one of these, which is how a wake can reach every still
+/// running subagent without any agent-specific mechanism.
 #[derive(Clone, Default)]
-struct SubagentRegistry {
+pub struct SubagentRegistry {
     runs: Arc<StdMutex<HashMap<u64, RegisteredRun>>>,
     /// Insertion order of retained runs, oldest first, so retention reaping is
     /// deterministic.
@@ -1847,11 +1950,17 @@ struct SubagentRegistry {
 }
 
 impl SubagentRegistry {
-    fn insert_running(&self, subagent_id: u64, control: mpsc::UnboundedSender<WorkerRequest>) {
+    fn insert_running(
+        &self,
+        subagent_id: u64,
+        label: String,
+        control: mpsc::UnboundedSender<WorkerRequest>,
+    ) {
         self.lock_runs().insert(
             subagent_id,
             RegisteredRun {
                 state: SubagentRunState::Running,
+                label,
                 control,
             },
         );
@@ -1863,6 +1972,7 @@ impl SubagentRegistry {
     fn insert_retained(
         &self,
         subagent_id: u64,
+        label: String,
         control: mpsc::UnboundedSender<WorkerRequest>,
         retain_limit: usize,
     ) -> Vec<mpsc::UnboundedSender<WorkerRequest>> {
@@ -1871,6 +1981,7 @@ impl SubagentRegistry {
             subagent_id,
             RegisteredRun {
                 state: SubagentRunState::Retained,
+                label,
                 control,
             },
         );
@@ -1892,12 +2003,97 @@ impl SubagentRegistry {
     fn reinstate_retained(
         &self,
         subagent_id: u64,
+        label: String,
         control: mpsc::UnboundedSender<WorkerRequest>,
         retain_limit: usize,
     ) {
-        for reaped in self.insert_retained(subagent_id, control, retain_limit) {
+        for reaped in self.insert_retained(subagent_id, label, control, retain_limit) {
             let _ = reaped.send(WorkerRequest::Supersede);
         }
+    }
+
+    /// The `<subagent_progress>` block for every still-running subagent, or
+    /// `None` when none is running.
+    ///
+    /// Requests go out together and are then collected against one deadline, so
+    /// the whole block costs one timeout at worst. Serving progress advances a
+    /// run's activity watermark, so its eventual report carries only what
+    /// happened after this snapshot rather than repeating the trajectory.
+    pub(crate) async fn progress_block(&self) -> Option<String> {
+        let running = self.running_runs();
+        if running.is_empty() {
+            return None;
+        }
+        let mut awaiting = Vec::with_capacity(running.len());
+        for (subagent_id, label, control) in running {
+            let (respond, response) = oneshot::channel();
+            if control.send(WorkerRequest::Progress { respond }).is_ok() {
+                awaiting.push((subagent_id, label, response));
+            }
+        }
+        let deadline = tokio::time::Instant::now() + SUBAGENT_PROGRESS_TIMEOUT;
+        let mut entries = Vec::with_capacity(awaiting.len());
+        for (subagent_id, label, response) in awaiting {
+            match tokio::time::timeout_at(deadline, response).await {
+                Ok(Ok(progress)) => entries.push(render_progress_entry(&progress)),
+                // The worker finished or was released between the registry
+                // snapshot and its request: it is not running any more, so it
+                // has no place in a progress block. Its report speaks for it.
+                Ok(Err(_)) => {}
+                Err(_) => entries.push(format!(
+                    "#{subagent_id} {label}: running, progress unavailable."
+                )),
+            }
+        }
+        (!entries.is_empty()).then(|| {
+            format!(
+                "<subagent_progress>\n{}\n</subagent_progress>",
+                entries.join("\n\n")
+            )
+        })
+    }
+
+    /// Registers a running subagent whose worker answers every progress request
+    /// with a numbered snapshot, so a wake can be exercised without a real ACP
+    /// process. The returned task ends when the registry entry is dropped.
+    #[cfg(test)]
+    pub(crate) fn stub_running(
+        &self,
+        subagent_id: u64,
+        label: &str,
+        activity: &str,
+    ) -> JoinHandle<()> {
+        let (control, mut requests) = mpsc::unbounded_channel();
+        self.insert_running(subagent_id, label.to_string(), control);
+        let label = label.to_string();
+        let activity = activity.to_string();
+        tokio::spawn(async move {
+            let mut snapshots = 0_usize;
+            while let Some(request) = requests.recv().await {
+                if let WorkerRequest::Progress { respond } = request {
+                    snapshots += 1;
+                    let _ = respond.send(SubagentProgress {
+                        subagent_id,
+                        label: label.clone(),
+                        elapsed: Duration::from_secs(72),
+                        workspace: "Files touched: src/a.rs (1 file changed, 2 insertions(+))."
+                            .to_string(),
+                        activity: format!("{activity} #{snapshots}"),
+                    });
+                }
+            }
+        })
+    }
+
+    fn running_runs(&self) -> Vec<(u64, String, mpsc::UnboundedSender<WorkerRequest>)> {
+        let mut running = self
+            .lock_runs()
+            .iter()
+            .filter(|(_, run)| run.state == SubagentRunState::Running)
+            .map(|(id, run)| (*id, run.label.clone(), run.control.clone()))
+            .collect::<Vec<_>>();
+        running.sort_by_key(|(id, _, _)| *id);
+        running
     }
 
     /// Atomically removes and returns the control sender for a run, so at most
@@ -2020,16 +2216,16 @@ async fn resume_retained_run(
         return Err(ResumeFailure::Unknown);
     };
     if run.state == SubagentRunState::Running {
-        registry.insert_running(subagent_id, run.control);
+        registry.insert_running(subagent_id, run.label, run.control);
         return Err(ResumeFailure::Running);
     }
     if let Err(full) = controller.resume_retained(subagent_id).await {
-        registry.reinstate_retained(subagent_id, run.control, config.max_parallel);
+        registry.reinstate_retained(subagent_id, run.label, run.control, config.max_parallel);
         return Err(ResumeFailure::PoolFull(full));
     }
     // Register before handing the worker the prompt: the worker can finish and
     // mark itself retained on the very next poll.
-    registry.insert_running(subagent_id, run.control.clone());
+    registry.insert_running(subagent_id, run.label.clone(), run.control.clone());
     if let Some(reports) = config.reports.as_ref() {
         reports.open();
     }
@@ -2052,19 +2248,37 @@ async fn resume_retained_run(
 /// genuinely in-flight turn from releasing an idle retained run. The worker
 /// sets that field itself at the moment it processes the cancel, so it stays
 /// correct even if the cancel crosses in flight with the run finishing.
+///
+/// Either way the tool result carries the run's full report when one exists:
+/// a released session hands back the report it already produced, debrief
+/// included, and an interrupted turn hands back the same shape built from what
+/// it managed to do. Nothing a subagent produced is unobtainable.
 fn cancelled_tool_result(result: &SubagentRunResult) -> CallToolResult {
     let message = if result.cancelled_while_running {
-        "The subagent was cancelled while still working. It did not revert any changes: its edits remain in the workspace exactly as it left them. No report will be injected for it. Activity so far:"
+        "The subagent was cancelled while still working. It did not revert any changes: its edits remain in the workspace exactly as it left them. Nothing further will be injected for it; its report of the interrupted turn follows."
     } else if result.outcome.is_ok() {
-        "The subagent's retained session was released. It did not revert any changes: its edits remain in the workspace exactly as it left them."
+        "The subagent's retained session was released. It did not revert any changes: its edits remain in the workspace exactly as it left them. Its full report follows."
     } else {
         "The subagent was cancelled before finishing. It did not revert any changes: partial edits remain in the workspace exactly as it left them."
     };
-    CallToolResult::success(vec![Content::text(with_workspace_diff(
-        message,
-        &result.activity_log,
-        result.workspace_delta.as_ref(),
-    ))])
+    let Some(report) = result.report.as_ref() else {
+        return CallToolResult::success(vec![Content::text(with_workspace_diff(
+            message,
+            &result.activity_log,
+            result.workspace_delta.as_ref(),
+        ))]);
+    };
+    // No `<session>` note: the session this report came from is being released.
+    let mut text = format!("{message}\n\n{}", format_report_block(report, false));
+    if result
+        .workspace_delta
+        .as_ref()
+        .is_some_and(WorkspaceDelta::changed)
+    {
+        text.push_str("\n\n");
+        text.push_str(SUBAGENT_REVIEW_TEXT);
+    }
+    CallToolResult::success(vec![Content::text(text)])
 }
 
 /// Spawns the persistent worker and registers it. The tool call returns without
@@ -2087,7 +2301,7 @@ fn launch_subagent_worker(
     let subagent_id = admission.subagent_id;
     // Register before spawning: the worker can reach its retained state on the
     // very next poll, and must not be overwritten by a late `insert_running`.
-    registry.insert_running(subagent_id, control_tx.clone());
+    registry.insert_running(subagent_id, label.clone(), control_tx.clone());
     let worker = run_boxed(
         config,
         context,
@@ -2325,6 +2539,82 @@ fn report_workspace_diff(delta: Option<&WorkspaceDelta>, overlap: usize) -> Opti
     )
 }
 
+/// One line of workspace evidence for a running subagent, read from the same
+/// per-run snapshot the report's diff comes from: the delta receipt is already
+/// a `--stat --summary` diffstat, so the files and their totals come from it
+/// rather than from a second, per-progress snapshot.
+fn progress_workspace_summary(delta: Option<&WorkspaceDelta>, overlap: usize) -> String {
+    if overlap > 0 {
+        return format!(
+            "Files touched: not attributable ({overlap} subagent{} shared this workspace) — inspect git diff yourself.",
+            if overlap == 1 { "" } else { "s" }
+        );
+    }
+    let Some(delta) = delta else {
+        return "Files touched: unknown (workspace snapshot unavailable).".to_string();
+    };
+    if !delta.changed() {
+        return "Files touched: none yet.".to_string();
+    }
+    let (files, totals) = summarize_diffstat(delta.receipt());
+    let files = if files.is_empty() {
+        "see the diff".to_string()
+    } else {
+        let listed = files
+            .iter()
+            .take(SUBAGENT_PROGRESS_FILES)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        match files.len().saturating_sub(SUBAGENT_PROGRESS_FILES) {
+            0 => listed,
+            more => format!("{listed}, and {more} more"),
+        }
+    };
+    match totals {
+        Some(totals) => format!("Files touched: {files} ({totals})."),
+        None => format!("Files touched: {files}."),
+    }
+}
+
+/// Split a `git diff --stat --summary` receipt into its file names and its
+/// "N files changed" totals. Repository headers and `--summary` mode lines are
+/// neither, and are skipped.
+fn summarize_diffstat(receipt: &str) -> (Vec<String>, Option<String>) {
+    let mut files = Vec::new();
+    let mut totals = Vec::new();
+    for line in receipt.lines() {
+        let line = line.trim();
+        if line.starts_with(|character: char| character.is_ascii_digit())
+            && line.contains("changed")
+        {
+            totals.push(line.to_string());
+        } else if let Some((path, _)) = line.rsplit_once('|') {
+            let path = path.trim();
+            if !path.is_empty() {
+                files.push(path.to_string());
+            }
+        }
+    }
+    (files, (!totals.is_empty()).then(|| totals.join("; ")))
+}
+
+fn render_progress_entry(progress: &SubagentProgress) -> String {
+    format!(
+        "#{id} {label}: running {elapsed}. {workspace}\nRecent activity:\n{activity}",
+        id = progress.subagent_id,
+        label = progress.label,
+        elapsed = format_report_elapsed(progress.elapsed),
+        workspace = progress.workspace,
+        activity = elide_middle_with(
+            progress.activity.trim(),
+            SUBAGENT_PROGRESS_ACTIVITY_LIMIT,
+            SUBAGENT_PROGRESS_ACTIVITY_HEAD,
+            SUBAGENT_PROGRESS_ACTIVITY_TAIL,
+        ),
+    )
+}
+
 /// Runs one subagent end to end. The tool call that started it has already
 /// returned, so every result leaves through the report bus (ordinary
 /// completions) or a `Cancel` responder (caller-initiated cancels). After each
@@ -2496,8 +2786,9 @@ async fn run(
     let mut session_id = None;
     let mut joined_runtime_result = None;
     let mut activity = SubagentTranscript::default();
-    // Entry count in `activity` as of the last report delivered; a cancel that
-    // interrupts a running turn reports only the tail past this mark.
+    // Entry count in `activity` as of the last trajectory the coordinator saw --
+    // a delivered report or a progress snapshot. Every later delivery reports
+    // only the tail past this mark, so no trajectory is injected twice.
     let mut watermark: usize = 0;
     let mut cancelled_while_running = false;
     let mut turn_started = Instant::now();
@@ -2507,6 +2798,9 @@ async fn run(
     // even when the turn ends through external termination instead of on its
     // own.
     let mut turn_reported = false;
+    // The last report this run delivered, replayed to a `subagent_cancel` that
+    // releases the retained session so no report content is ever unobtainable.
+    let mut last_report: Option<SubagentReport> = None;
     // A retained programmatic coordinator remains one live UI identity between
     // turns. Its terminal event is deferred until the worker itself is reaped.
     let mut terminal_finished_pending = false;
@@ -2543,6 +2837,29 @@ async fn run(
                                 message: "cancellation requested; stopping the in-flight turn".to_string(),
                             }));
                             let _ = nested_cmd_tx.send(UiCommand::CancelPrompt);
+                        }
+                        Some(WorkerRequest::Progress { respond }) => {
+                            // Answered here, between polls of this turn's own
+                            // events: the snapshot and the transcript are never
+                            // read concurrently with the turn writing them. The
+                            // diff runs Git, so the turn's events queue for that
+                            // moment rather than being lost.
+                            let delta = match invocation_snapshot.as_ref() {
+                                Some(snapshot) => Some(snapshot.delta().await),
+                                None => None,
+                            };
+                            let unseen = activity.render_since(watermark);
+                            watermark = activity.len();
+                            let _ = respond.send(SubagentProgress {
+                                subagent_id,
+                                label: label.clone(),
+                                elapsed: turn_started.elapsed(),
+                                workspace: progress_workspace_summary(
+                                    delta.as_ref(),
+                                    overlap.load(Ordering::Acquire),
+                                ),
+                                activity: unseen,
+                            });
                         }
                         Some(WorkerRequest::Continue { .. }) => {
                             tracing::warn!(
@@ -2776,14 +3093,21 @@ async fn run(
                 // state. A coordinator is allowed to resume as soon as it
                 // receives the report, so report-before-retain is a real race.
                 controller.retain_complete(subagent_id).await;
-                for reaped in
-                    registry.insert_retained(subagent_id, control_tx.clone(), config.max_parallel)
-                {
+                for reaped in registry.insert_retained(
+                    subagent_id,
+                    label.clone(),
+                    control_tx.clone(),
+                    config.max_parallel,
+                ) {
                     let _ = reaped.send(WorkerRequest::Supersede);
                 }
             }
             let remains_retained =
                 turn_result.is_ok() && policy.retain_after_completion && session_alive;
+            // Kept so releasing this session through `subagent_cancel` can hand
+            // the same report back instead of dropping its final message and
+            // debrief on the floor.
+            last_report = Some(report.clone());
             deliver_report(&config, report);
             turn_reported = true;
             if remains_retained && policy.defer_finished_while_retained {
@@ -2897,6 +3221,14 @@ async fn run(
                                 "the retained subagent session was released".to_string()
                             );
                         }
+                        Some(WorkerRequest::Progress { respond }) => {
+                            // This run finished between the wake's registry
+                            // snapshot and its request. Dropping the responder
+                            // leaves it out of the progress block, which is
+                            // correct: it is not running, and its report is
+                            // already on its way to the same wake.
+                            drop(respond);
+                        }
                         Some(WorkerRequest::Supersede) => {
                             tracing::info!(
                                 event = "subagent_superseded",
@@ -2976,28 +3308,29 @@ async fn run(
             None => None,
         };
         let activity_log = activity.render_since(watermark);
+        let mut report = last_report;
         if cancelled_while_running {
             // A cancel that interrupted a live turn still emits a report so the
             // outstanding-report accounting balances; the orchestrator drops it
             // because this tool result already carried the whole story.
-            deliver_report(
-                &config,
-                SubagentReport {
-                    subagent_id,
-                    label: label.clone(),
-                    agent: agent_id.clone(),
-                    model: model_id.clone(),
-                    outcome: SubagentOutcome::Cancelled,
-                    final_message: "cancelled by the primary agent".to_string(),
-                    slim_activity: activity_log.clone(),
-                    workspace_diff: report_workspace_diff(
-                        workspace_delta.as_ref(),
-                        overlap.load(Ordering::Acquire),
-                    ),
-                    debrief: None,
-                    elapsed: turn_started.elapsed(),
-                },
-            );
+            let cancelled = SubagentReport {
+                subagent_id,
+                label: label.clone(),
+                agent: agent_id.clone(),
+                model: model_id.clone(),
+                outcome: SubagentOutcome::Cancelled,
+                final_message: "cancelled by the primary agent while the turn was in flight"
+                    .to_string(),
+                slim_activity: activity_log.clone(),
+                workspace_diff: report_workspace_diff(
+                    workspace_delta.as_ref(),
+                    overlap.load(Ordering::Acquire),
+                ),
+                debrief: None,
+                elapsed: turn_started.elapsed(),
+            };
+            report = Some(cancelled.clone());
+            deliver_report(&config, cancelled);
             let _ = ui_tx.send(UiEvent::Subagent(SubagentEvent::Finished {
                 subagent_id,
                 outcome: SubagentOutcome::Cancelled,
@@ -3011,6 +3344,7 @@ async fn run(
             workspace_delta,
             activity_log,
             cancelled_while_running,
+            report,
         });
         return;
     }
@@ -3207,8 +3541,9 @@ impl SubagentTranscript {
         render_activity_log(&self.entries)
     }
 
-    /// Number of entries captured so far; used as a watermark so a resumed run
-    /// or a cancel reports only what happened since the last delivered report.
+    /// Number of entries captured so far; used as a watermark so a resumed run,
+    /// a progress snapshot, or a cancel carries only what happened since the
+    /// coordinator last saw this run's trajectory.
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -3222,7 +3557,7 @@ impl SubagentTranscript {
             return self.render();
         }
         let body = if self.entries[start..].is_empty() {
-            "[no subagent activity since the last report]".to_string()
+            "[no new subagent activity]".to_string()
         } else {
             self.entries[start..].join("\n\n")
         };
@@ -3259,14 +3594,20 @@ fn render_activity_log(entries: &[String]) -> String {
 }
 
 fn elide_middle(text: &str, limit: usize) -> String {
+    elide_middle_with(
+        text,
+        limit,
+        SUBAGENT_ACTIVITY_LOG_HEAD,
+        SUBAGENT_ACTIVITY_LOG_TAIL,
+    )
+}
+
+fn elide_middle_with(text: &str, limit: usize, head: usize, tail: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_string();
     }
-    let head: String = text.chars().take(SUBAGENT_ACTIVITY_LOG_HEAD).collect();
-    let tail_start = text
-        .chars()
-        .count()
-        .saturating_sub(SUBAGENT_ACTIVITY_LOG_TAIL);
+    let head: String = text.chars().take(head).collect();
+    let tail_start = text.chars().count().saturating_sub(tail);
     let tail: String = text.chars().skip(tail_start).collect();
     format!("{head}{SUBAGENT_ACTIVITY_LOG_ELISION}{tail}")
 }
@@ -3368,6 +3709,7 @@ mod tests {
             headless_permission_mode: None,
             role_pool: None,
             reports: None,
+            runs: SubagentRegistry::default(),
             preamble: SUBAGENT_PREAMBLE.to_string(),
             mcp_servers: Vec::new(),
             usage_seat: Seat::Subagent,
@@ -3417,7 +3759,7 @@ mod tests {
             debrief: None,
             elapsed: Duration::from_secs(61),
         };
-        let rendered = format_report_injection(&[report], "Vet this report.");
+        let rendered = format_report_injection(&[report], None, "Vet this report.");
         assert!(rendered.contains("label=\"mimir &quot;core&quot;\""));
         assert!(rendered.contains("agent=\"codex&lt;acp&gt;\""));
         assert!(rendered.contains("model=\"gpt&amp;review\""));
@@ -3441,7 +3783,7 @@ mod tests {
             elapsed: Duration::from_secs(1),
         };
 
-        let rendered = format_report_injection(&[report], "Vet this report.");
+        let rendered = format_report_injection(&[report], None, "Vet this report.");
 
         assert_eq!(
             rendered,
@@ -3464,7 +3806,7 @@ mod tests {
             elapsed: Duration::from_secs(2),
         };
 
-        let rendered = format_report_injection(&[report], "Vet this report.");
+        let rendered = format_report_injection(&[report], None, "Vet this report.");
 
         assert_eq!(
             rendered,
@@ -3491,7 +3833,7 @@ mod tests {
                 debrief: None,
                 elapsed: Duration::from_secs(2),
             };
-            let rendered = format_report_injection(&[report], "Vet this report.");
+            let rendered = format_report_injection(&[report], None, "Vet this report.");
             assert!(
                 !rendered.contains("<session>"),
                 "only completed subagents may advertise a resumable session: {rendered}"
@@ -3751,12 +4093,16 @@ mod tests {
         for id in 1..=2 {
             let (tx, rx) = mpsc::unbounded_channel::<WorkerRequest>();
             receivers.push((id, rx));
-            assert!(registry.insert_retained(id, tx, 2).is_empty());
+            assert!(
+                registry
+                    .insert_retained(id, format!("run-{id}"), tx, 2)
+                    .is_empty()
+            );
         }
         assert_eq!(registry.retained_ids(), vec![1, 2]);
 
         let (tx, _rx) = mpsc::unbounded_channel::<WorkerRequest>();
-        let reaped = registry.insert_retained(3, tx, 2);
+        let reaped = registry.insert_retained(3, "run-3".to_string(), tx, 2);
         assert_eq!(reaped.len(), 1, "the oldest retained session is reaped");
         let _ = reaped[0].send(WorkerRequest::Supersede);
         assert!(matches!(
@@ -3794,7 +4140,9 @@ mod tests {
         );
 
         let (control_tx, _control_rx) = mpsc::unbounded_channel::<WorkerRequest>();
-        handler.runs.insert_running(4, control_tx);
+        handler
+            .runs
+            .insert_running(4, "running".to_string(), control_tx);
         let running = handler
             .resume_subagent(4, "keep going".to_string(), "label", &spec)
             .await
@@ -3889,7 +4237,9 @@ mod tests {
 
         // A resume re-admits a retained session: still a delegation.
         let (control_tx, mut control_rx) = mpsc::unbounded_channel::<WorkerRequest>();
-        let _ = handler.runs.insert_retained(7, control_tx, 2);
+        let _ = handler
+            .runs
+            .insert_retained(7, "retained".to_string(), control_tx, 2);
         let resumed = handler
             .resume_subagent(7, "keep going".to_string(), "follow-up", &spec)
             .await
@@ -4093,7 +4443,7 @@ mod tests {
         assert_eq!(transcript.render_since(0), transcript.render());
         assert_eq!(
             transcript.render_since(transcript.len()),
-            "[no subagent activity since the last report]"
+            "[no new subagent activity]"
         );
     }
 
@@ -4117,26 +4467,79 @@ mod tests {
         let released = SubagentRunResult {
             outcome: Ok("released".to_string()),
             workspace_delta: Some(delta.clone()),
-            activity_log: "cancel activity".to_string(),
+            activity_log: "[no new subagent activity]".to_string(),
             cancelled_while_running: false,
+            report: Some(SubagentReport {
+                subagent_id: 3,
+                label: "fix-tests".to_string(),
+                agent: "codex-acp".to_string(),
+                model: "gpt-y".to_string(),
+                outcome: SubagentOutcome::Completed,
+                final_message: "the retry now backs off".to_string(),
+                slim_activity: "edited the client".to_string(),
+                workspace_diff: Some("diff --git a/x b/x\n+partial\n".to_string()),
+                debrief: Some("VERIFIED: cargo test\nUNVERIFIED: none".to_string()),
+                elapsed: Duration::from_secs(30),
+            }),
         };
         let text = tool_result_text(&cancelled_tool_result(&released));
         assert!(text.contains("retained session was released"));
         assert!(text.contains("did not revert"));
         assert!(text.contains("+partial"));
+        // A release is not a silent drop: the report the primary may never have
+        // been injected is right here, debrief included.
+        assert!(text.contains("<subagent_result id=\"3\" label=\"fix-tests\""));
+        assert!(text.contains("the retry now backs off"));
+        assert!(text.contains("VERIFIED: cargo test"));
+        assert!(
+            !text.contains("<session>"),
+            "a released session has nothing left to resume: {text}"
+        );
 
         let interrupted = SubagentRunResult {
             outcome: Err(anyhow!("the subagent was cancelled while still working")),
             workspace_delta: Some(delta),
             activity_log: "activity since it started".to_string(),
             cancelled_while_running: true,
+            report: Some(SubagentReport {
+                subagent_id: 4,
+                label: "half-done".to_string(),
+                agent: "codex-acp".to_string(),
+                model: "gpt-y".to_string(),
+                outcome: SubagentOutcome::Cancelled,
+                final_message: "cancelled by the primary agent while the turn was in flight"
+                    .to_string(),
+                slim_activity: "activity since it started".to_string(),
+                workspace_diff: Some("diff --git a/x b/x\n+partial\n".to_string()),
+                debrief: None,
+                elapsed: Duration::from_secs(12),
+            }),
         };
         let rendered = cancelled_tool_result(&interrupted);
         assert_eq!(rendered.is_error, Some(false));
         let text = tool_result_text(&rendered);
         assert!(text.contains("cancelled while still working"));
-        assert!(text.contains("No report will be injected"));
+        assert!(text.contains("Nothing further will be injected"));
+        assert!(text.contains("outcome=\"cancelled\""));
         assert!(text.contains("activity since it started"));
+    }
+
+    /// A worker that never produced a report at all still explains itself.
+    #[test]
+    fn cancelled_tool_result_without_a_report_still_carries_activity_and_diff() {
+        let result = SubagentRunResult {
+            outcome: Err(anyhow!("the subagent was cancelled")),
+            workspace_delta: Some(WorkspaceDelta::changed_for_test(
+                "diff --git a/x b/x\n+partial\n".to_string(),
+            )),
+            activity_log: "read two files".to_string(),
+            cancelled_while_running: false,
+            report: None,
+        };
+        let text = tool_result_text(&cancelled_tool_result(&result));
+        assert!(text.contains("cancelled before finishing"));
+        assert!(text.contains("read two files"));
+        assert!(text.contains("+partial"));
     }
 
     #[test]
@@ -4341,7 +4744,7 @@ mod tests {
         nested_events: mpsc::UnboundedSender<UiEvent>,
         nested_commands: mpsc::UnboundedReceiver<UiCommand>,
         ui_events: mpsc::UnboundedReceiver<UiEvent>,
-        _workspace: tempfile::TempDir,
+        workspace: tempfile::TempDir,
     }
 
     async fn spawn_fake_run() -> FakeRun {
@@ -4452,7 +4855,7 @@ mod tests {
             nested_events,
             nested_commands,
             ui_events,
-            _workspace: workspace,
+            workspace,
         }
     }
 
@@ -4468,6 +4871,259 @@ mod tests {
         })
         .await
         .expect("visible subagent event")
+    }
+
+    /// The worker serves progress before it drains its event queue, so a test
+    /// that wants an event reflected in the next snapshot has to see the worker
+    /// forward it first.
+    async fn await_forwarded_session_update(events: &mut mpsc::UnboundedReceiver<UiEvent>) {
+        loop {
+            if let SubagentEvent::SessionUpdate { .. } = next_visible_subagent_event(events).await {
+                return;
+            }
+        }
+    }
+
+    fn completed_tool_call(id: &'static str, title: &'static str) -> UiEvent {
+        UiEvent::SessionUpdate(SessionUpdate::ToolCall(
+            agent_client_protocol::schema::v1::ToolCall::new(id, title)
+                .status(ToolCallStatus::Completed),
+        ))
+    }
+
+    #[tokio::test]
+    async fn progress_describes_the_running_turn_and_advances_the_activity_watermark() {
+        let mut run = spawn_fake_run().await;
+        run.nested_events
+            .send(UiEvent::SessionStarted {
+                session_id: "s1".to_string(),
+                resumed: false,
+            })
+            .expect("session started");
+        let _ = run.nested_commands.recv().await.expect("prompt");
+        run.nested_events
+            .send(completed_tool_call("t1", "Explore the code"))
+            .expect("tool call");
+        await_forwarded_session_update(&mut run.ui_events).await;
+        std::fs::write(run.workspace.path().join("touched.rs"), "fn main() {}\n")
+            .expect("subagent edit");
+
+        let first = run
+            .registry
+            .progress_block()
+            .await
+            .expect("a running subagent has progress");
+        assert!(first.starts_with("<subagent_progress>"));
+        assert!(first.contains(&format!("#{} fix-tests: running", run.subagent_id)));
+        assert!(first.contains("Files touched: touched.rs (1 file changed"));
+        assert!(first.contains("Explore the code"));
+
+        run.nested_events
+            .send(completed_tool_call("t2", "Run `cargo test`"))
+            .expect("second tool call");
+        await_forwarded_session_update(&mut run.ui_events).await;
+        let second = run
+            .registry
+            .progress_block()
+            .await
+            .expect("still running progress");
+        assert!(second.contains("Run `cargo test`"));
+        assert!(
+            !second.contains("Explore the code"),
+            "showing progress advances the watermark: {second}"
+        );
+
+        run.nested_events
+            .send(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new("all green"))),
+            )))
+            .expect("final message");
+        run.nested_events
+            .send(UiEvent::PromptDone {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            })
+            .expect("turn done");
+        let report = tokio::time::timeout(Duration::from_secs(5), run.reports.recv())
+            .await
+            .expect("report")
+            .expect("report value");
+        assert_eq!(report.final_message, "all green");
+        assert!(
+            !report.slim_activity.contains("Run `cargo test`"),
+            "the report must not repeat trajectory already shown as progress: {}",
+            report.slim_activity
+        );
+        assert!(
+            run.registry.progress_block().await.is_none(),
+            "a retained subagent is not running and has no progress"
+        );
+
+        let released = run.registry.take(run.subagent_id).expect("retained run");
+        let (respond, response) = oneshot::channel();
+        released
+            .control
+            .send(WorkerRequest::Cancel { respond })
+            .expect("release");
+        let _ = response.await;
+    }
+
+    #[tokio::test]
+    async fn releasing_a_retained_subagent_returns_its_full_report() {
+        let mut run = spawn_fake_run_with_options(Vec::new(), true, false, true).await;
+        run.nested_events
+            .send(UiEvent::SessionStarted {
+                session_id: "s1".to_string(),
+                resumed: false,
+            })
+            .expect("session started");
+        let _ = run.nested_commands.recv().await.expect("task prompt");
+        run.nested_events
+            .send(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new(
+                    "the retry now backs off",
+                ))),
+            )))
+            .expect("final message");
+        run.nested_events
+            .send(UiEvent::PromptDone {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            })
+            .expect("turn done");
+        let _ = tokio::time::timeout(Duration::from_secs(5), run.nested_commands.recv())
+            .await
+            .expect("debrief prompt sent");
+        let debrief = "VERIFIED: cargo test\nUNVERIFIED: none\nCOMMITMENTS: none\nANOMALIES: none\nNEXT: none";
+        run.nested_events
+            .send(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new(debrief))),
+            )))
+            .expect("debrief message");
+        run.nested_events
+            .send(UiEvent::PromptDone {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            })
+            .expect("debrief done");
+        let _ = tokio::time::timeout(Duration::from_secs(5), run.reports.recv())
+            .await
+            .expect("report")
+            .expect("report value");
+
+        let released = run.registry.take(run.subagent_id).expect("retained run");
+        let (respond, response) = oneshot::channel();
+        released
+            .control
+            .send(WorkerRequest::Cancel { respond })
+            .expect("release the retained session");
+        let result = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .expect("release settles")
+            .expect("cancel result");
+        assert!(!result.cancelled_while_running);
+        let report = result.report.as_ref().expect("the released report");
+        assert_eq!(report.final_message, "the retry now backs off");
+        assert_eq!(report.debrief.as_deref(), Some(debrief));
+        let text = tool_result_text(&cancelled_tool_result(&result));
+        assert!(text.contains("the retry now backs off"));
+        assert!(text.contains("VERIFIED: cargo test"));
+    }
+
+    /// The MCP layer has to tell the orchestrator that this report already
+    /// reached the primary, or the queued copy is injected right after it.
+    #[tokio::test]
+    async fn releasing_a_finished_subagent_claims_its_undelivered_report() {
+        let (bus, _reports) = SubagentReportBus::channel();
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        let mut config = test_config();
+        config.reports = Some(bus.clone());
+        let handler = McpHandler::new(config, test_context(), ui_tx, Controller::default());
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<WorkerRequest>();
+        let _ = handler
+            .runs
+            .insert_retained(7, "fix-tests".to_string(), control_tx, 2);
+        let worker = tokio::spawn(async move {
+            let Some(WorkerRequest::Cancel { respond }) = control_rx.recv().await else {
+                panic!("expected a cancel request");
+            };
+            let _ = respond.send(SubagentRunResult {
+                outcome: Ok("the retained subagent session was released".to_string()),
+                workspace_delta: None,
+                activity_log: "[no new subagent activity]".to_string(),
+                cancelled_while_running: false,
+                report: Some(SubagentReport {
+                    subagent_id: 7,
+                    label: "fix-tests".to_string(),
+                    agent: "codex-acp".to_string(),
+                    model: "gpt-y".to_string(),
+                    outcome: SubagentOutcome::Completed,
+                    final_message: "the retry now backs off".to_string(),
+                    slim_activity: "edited the client".to_string(),
+                    workspace_diff: Some("diff body".to_string()),
+                    debrief: Some("VERIFIED: cargo test".to_string()),
+                    elapsed: Duration::from_secs(9),
+                }),
+            });
+        });
+        bus.open();
+
+        let result = handler
+            .subagent_cancel(Parameters(SubagentCancelArgs { subagent_id: 7 }))
+            .await
+            .expect("release");
+        let text = tool_result_text(&result);
+        assert!(text.contains("the retry now backs off"));
+        assert!(text.contains("VERIFIED: cargo test"));
+        assert!(
+            bus.take_claim(7),
+            "the returned report must be claimed so it is not injected again"
+        );
+        assert_eq!(
+            bus.pending(),
+            1,
+            "the orchestrator still owes the accounting"
+        );
+        worker.await.expect("stub worker");
+    }
+
+    #[test]
+    fn progress_workspace_summary_reads_the_snapshot_receipt() {
+        let receipt = "Repository: /workspace\n src/a.rs | 3 ++-\n src/b.rs | 1 +\n 2 files changed, 3 insertions(+), 1 deletion(-)\n create mode 100644 src/b.rs";
+        let delta = WorkspaceDelta::changed_with_receipt_for_test(receipt.to_string());
+        assert_eq!(
+            progress_workspace_summary(Some(&delta), 0),
+            "Files touched: src/a.rs, src/b.rs (2 files changed, 3 insertions(+), 1 deletion(-))."
+        );
+        assert!(
+            progress_workspace_summary(Some(&delta), 2)
+                .contains("2 subagents shared this workspace")
+        );
+        assert_eq!(
+            progress_workspace_summary(None, 0),
+            "Files touched: unknown (workspace snapshot unavailable)."
+        );
+    }
+
+    #[test]
+    fn progress_entries_bound_the_activity_they_carry() {
+        let progress = SubagentProgress {
+            subagent_id: 3,
+            label: "fix-tests".to_string(),
+            elapsed: Duration::from_secs(125),
+            workspace: "Files touched: none yet.".to_string(),
+            activity: format!(
+                "{}MIDDLE{}",
+                "a".repeat(SUBAGENT_PROGRESS_ACTIVITY_HEAD + 200),
+                "z".repeat(SUBAGENT_PROGRESS_ACTIVITY_TAIL + 200)
+            ),
+        };
+        let rendered = render_progress_entry(&progress);
+        assert!(rendered.starts_with("#3 fix-tests: running 2m05s. Files touched: none yet."));
+        assert!(rendered.contains("Recent activity:"));
+        assert!(rendered.contains(SUBAGENT_ACTIVITY_LOG_ELISION.trim()));
+        assert!(!rendered.contains("MIDDLE"));
+        assert!(rendered.chars().count() < SUBAGENT_PROGRESS_ACTIVITY_LIMIT + 200);
     }
 
     #[tokio::test]

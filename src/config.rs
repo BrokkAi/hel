@@ -249,6 +249,10 @@ pub struct SubagentsConfig {
     /// Ask completed pool subagents for a terse exit interview before report delivery.
     #[serde(default = "default_true")]
     pub debrief: bool,
+    /// Minutes a primary parked on running subagents may go without a report
+    /// before it is woken with their progress alone. `0` disables the wake.
+    #[serde(default = "default_progress_wake_minutes")]
+    pub progress_wake_minutes: u64,
 }
 
 impl Default for SubagentsConfig {
@@ -260,12 +264,17 @@ impl Default for SubagentsConfig {
             max_parallel: default_max_parallel(),
             auto_failover: true,
             debrief: true,
+            progress_wake_minutes: default_progress_wake_minutes(),
         }
     }
 }
 
 fn default_max_parallel() -> usize {
     6
+}
+
+fn default_progress_wake_minutes() -> u64 {
+    20
 }
 
 impl SubagentsConfig {
@@ -635,6 +644,8 @@ struct EitriV2 {
     max_parallel_explores: usize,
     #[serde(default = "default_true")]
     debrief: bool,
+    #[serde(default = "default_progress_wake_minutes")]
+    progress_wake_minutes: u64,
 }
 
 impl Default for EitriV2 {
@@ -644,6 +655,7 @@ impl Default for EitriV2 {
             reasoning_effort: None,
             max_parallel_explores: default_max_parallel(),
             debrief: true,
+            progress_wake_minutes: default_progress_wake_minutes(),
         }
     }
 }
@@ -689,6 +701,7 @@ fn migrate_v2(body: &str) -> Result<Config> {
             max_parallel: old.eitri.max_parallel_explores,
             auto_failover: old.council.auto_failover,
             debrief: old.eitri.debrief,
+            progress_wake_minutes: old.eitri.progress_wake_minutes,
         },
         acp: old.acp,
         session_config: BTreeMap::new(),
@@ -1016,6 +1029,7 @@ discrete_review = false
 model = "gpt-5-6-terra"
 max_parallel_explores = 9
 debrief = false
+progress_wake_minutes = 5
 
 [loki]
 model = "claude-fable-5"
@@ -1054,6 +1068,7 @@ origin = "custom"
         assert_eq!(cfg.subagents.max_parallel, 9);
         assert!(!cfg.subagents.auto_failover);
         assert!(!cfg.subagents.debrief);
+        assert_eq!(cfg.subagents.progress_wake_minutes, 5);
         assert_eq!(cfg.ragnarok.max_competitors, 4);
         assert_eq!(cfg.acp.policy("codex-acp"), AcpServerPolicy::Disabled);
         assert_eq!(cfg.acp.servers[0].id, "custom:company");
@@ -1083,6 +1098,35 @@ origin = "custom"
                 version: CONFIG_VERSION,
                 ..Config::default()
             }
+        );
+    }
+
+    /// The progress heartbeat is config-file only, so absent means the default
+    /// and `0` is the documented way to switch it off.
+    #[test]
+    fn progress_wake_minutes_defaults_to_twenty_and_accepts_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, format!("version = {CONFIG_VERSION}\n")).expect("write");
+        assert_eq!(
+            Config::load(&path)
+                .expect("load")
+                .subagents
+                .progress_wake_minutes,
+            20
+        );
+
+        std::fs::write(
+            &path,
+            format!("version = {CONFIG_VERSION}\n[subagents]\nprogress_wake_minutes = 0\n"),
+        )
+        .expect("write");
+        assert_eq!(
+            Config::load(&path)
+                .expect("load")
+                .subagents
+                .progress_wake_minutes,
+            0
         );
     }
 

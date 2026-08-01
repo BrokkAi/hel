@@ -254,6 +254,19 @@ impl WorkspaceDelta {
             review_snapshot: None,
         }
     }
+
+    /// A changed delta whose receipt is the `--stat --summary` evidence, which
+    /// is what compact per-run summaries are read from.
+    #[cfg(test)]
+    pub(crate) fn changed_with_receipt_for_test(receipt: String) -> Self {
+        Self {
+            changed: true,
+            receipt,
+            review_patch: Some("diff --git a/x b/x".to_string()),
+            review_fingerprint: Some("test-workspace".to_string()),
+            review_snapshot: None,
+        }
+    }
 }
 
 struct RootDelta {

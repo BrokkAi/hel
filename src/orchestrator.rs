@@ -7,6 +7,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{SessionUpdate, StopReason, UsageUpdate};
 use tokio::sync::{Mutex, mpsc};
@@ -19,7 +20,10 @@ use crate::{
         AgentCommandOutcome, CompactTrigger, InternalMessage, InternalMessageKind, PromptImage,
         ReviewTarget, SubagentOutcome, UiCommand, UiEvent, content_block_text,
     },
-    subagent::{ActiveSubagentWorkers, SubagentReport, SubagentReportBus, format_report_injection},
+    subagent::{
+        ActiveSubagentWorkers, SubagentRegistry, SubagentReport, SubagentReportBus,
+        format_progress_wake, format_report_injection,
+    },
     trajectory::BoundaryTracker,
     workflow::{
         WorkflowActorId, WorkflowActorRole, WorkflowCoverage, WorkflowEmitter, WorkflowEvent,
@@ -179,6 +183,25 @@ fn outcome_label(outcome: &AgentCommandOutcome) -> String {
 
 const MAX_RETAINED_DELEGATION_SESSIONS: usize = 128;
 
+/// Trailing instruction on a wake that carries finished reports. It also has to
+/// teach the async contract, because this prompt is the only place the primary
+/// reads about delivery timing while it is actually deciding what to do next.
+const REPORT_INJECTION_INSTRUCTION: &str = "Review this report critically against the repository before relying on it. Where a <debrief> is present, treat its UNVERIFIED lines as your re-check list and its ANOMALIES lines as blockers to resolve before integrating. A <subagent_progress> block is a status snapshot, not a report: those subagents are still working and will be delivered the same way when they finish. Reports arrive only between your turns, so ending your turn while subagents run is how you wait for the rest.";
+
+/// `0` minutes disables the progress heartbeat.
+pub fn progress_wake_interval(minutes: u64) -> Option<Duration> {
+    (minutes > 0).then(|| Duration::from_secs(minutes * 60))
+}
+
+/// Resolves when the armed heartbeat deadline elapses, and never when the
+/// primary is not parked with running subagents.
+async fn heartbeat_tick(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 fn ensure_delegation_workflow(workflow: &WorkflowEmitter, workflow_id: WorkflowId) {
     if workflow.state(workflow_id).is_some() {
         return;
@@ -326,6 +349,12 @@ pub struct Config {
     /// The sending half's outstanding-report counter, closed once each report
     /// has been injected or deliberately dropped.
     pub subagent_report_bus: SubagentReportBus,
+    /// The live subagent pool, asked for a progress snapshot every time the
+    /// primary is woken. Empty when no subagent pool is configured.
+    pub subagent_runs: SubagentRegistry,
+    /// How long a parked primary may go without a report before it is woken
+    /// with progress alone. `None` disables the heartbeat.
+    pub progress_wake: Option<Duration>,
     pub discrete_review: bool,
     /// The primary agent's model id, attached to its usage records so the
     /// per-model usage breakdown can attribute them.
@@ -422,6 +451,11 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
         // boundary, but that is only a safety net for a lost race -- it does
         // not batch, so the gate below stays.
         let mut pending_reports: Vec<SubagentReport> = Vec::new();
+        // Armed only while the primary is parked with subagents still running,
+        // and cleared the moment it stops being parked, so the interval always
+        // measures uninterrupted silence: a report injection, a heartbeat wake
+        // and a new user turn all leave the parked state and restart it.
+        let mut heartbeat_deadline: Option<tokio::time::Instant> = None;
 
         loop {
             // Every arm and every `continue` below returns here, so this is the
@@ -430,23 +464,51 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
             // it released this turn's completion; epoch 0 means no turn has
             // ever started.
             let active_epoch = turn.lock().await.epoch;
-            if !pending_reports.is_empty()
-                && (active_epoch == 0 || idle_epoch == Some(active_epoch))
+            let parked = (active_epoch == 0 || idle_epoch == Some(active_epoch))
                 && held_completion.is_none()
-                && review_in_flight.is_none()
-            {
+                && review_in_flight.is_none();
+            if !pending_reports.is_empty() && parked {
+                // Gathered before the batch is taken: every wake carries the
+                // finished reports plus the running picture, so the primary
+                // never has to ask what the rest are doing.
+                let progress = config.subagent_runs.progress_block().await;
                 let batch = std::mem::take(&mut pending_reports);
-                let count = batch.len();
-                let prompt = format_report_injection(
-                    &batch,
-                    "Review this report critically against the repository before relying on it. Where a <debrief> is present, treat its UNVERIFIED lines as your re-check list and its ANOMALIES lines as blockers to resolve before integrating.",
-                );
-                for _ in 0..count {
+                // Every report in the batch is accounted, injected or not.
+                for _ in 0..batch.len() {
                     config.subagent_report_bus.close();
                 }
+                let injected = batch
+                    .into_iter()
+                    .filter(|report| {
+                        // A `subagent_cancel` that released this run already
+                        // handed its report to the primary; drop the copy.
+                        let claimed = config.subagent_report_bus.take_claim(report.subagent_id);
+                        if claimed {
+                            tracing::info!(
+                                event = "subagent_report_claimed",
+                                subagent_id = report.subagent_id,
+                                "dropping a report already returned by subagent_cancel"
+                            );
+                        }
+                        !claimed
+                    })
+                    .collect::<Vec<_>>();
+                let prompt = if injected.is_empty() {
+                    // Every report in the batch was already returned by a
+                    // cancel; the wake is still worth making if anything is
+                    // running, and is skipped entirely otherwise.
+                    let Some(progress) = progress else { continue };
+                    format_progress_wake(&progress)
+                } else {
+                    format_report_injection(
+                        &injected,
+                        progress.as_deref(),
+                        REPORT_INJECTION_INSTRUCTION,
+                    )
+                };
                 tracing::info!(
                     event = "subagent_reports_injected",
-                    reports = count,
+                    reports = injected.len(),
                     "injecting finished subagent reports into the primary session"
                 );
                 emit_internal(
@@ -461,6 +523,20 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                     images: Vec::new(),
                 });
                 idle_epoch = None;
+                heartbeat_deadline = None;
+                continue;
+            }
+            // The heartbeat only exists for a primary that is parked waiting on
+            // subagents, so it is armed under exactly the report-injection
+            // conditions plus "something is still running".
+            match config.progress_wake.filter(|_| {
+                parked && pending_reports.is_empty() && *active_worker_updates.borrow() > 0
+            }) {
+                Some(interval) => {
+                    heartbeat_deadline
+                        .get_or_insert_with(|| tokio::time::Instant::now() + interval);
+                }
+                None => heartbeat_deadline = None,
             }
             tokio::select! {
                 event = runtime_events.recv() => {
@@ -654,6 +730,45 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                     if changed.is_err() {
                         break;
                     }
+                }
+                // Nothing has finished for a whole interval. Wake the parked
+                // primary with the running picture alone so it can redirect,
+                // take over, or deliberately keep waiting.
+                () = heartbeat_tick(heartbeat_deadline) => {
+                    // Re-armed by the loop head; clearing it here is what keeps
+                    // an elapsed deadline from firing again immediately.
+                    heartbeat_deadline = None;
+                    // The parked guard was evaluated at the top of this
+                    // iteration and no other arm can have run since, but a user
+                    // can begin a turn without the orchestrator having observed
+                    // any event for it yet.
+                    if turn.lock().await.epoch != active_epoch {
+                        continue;
+                    }
+                    let Some(progress) = config.subagent_runs.progress_block().await else {
+                        continue;
+                    };
+                    let prompt = format_progress_wake(&progress);
+                    tracing::info!(
+                        event = "subagent_progress_wake",
+                        "waking the primary with subagent progress after a quiet interval"
+                    );
+                    emit_internal(
+                        &events_tx,
+                        "subagents",
+                        "primary",
+                        InternalMessageKind::Delegation,
+                        &prompt,
+                    );
+                    // Deliberately no report-bus bookkeeping: nothing finished,
+                    // so every outstanding report is still outstanding and the
+                    // headless drain is untouched.
+                    let _ = config.runtime_commands.send(UiCommand::SendPrompt {
+                        text: prompt,
+                        images: Vec::new(),
+                    });
+                    idle_epoch = None;
+                    continue;
                 }
                 // A subagent finished. Cancelled reports are dropped: the
                 // caller already received the whole story in the
@@ -1606,7 +1721,6 @@ fn emit_internal(
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
-    use std::time::Duration;
 
     fn text_chunk(text: &str) -> ContentChunk {
         ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
@@ -1847,6 +1961,8 @@ mod tests {
             active_subagent_workers: ActiveSubagentWorkers::default(),
             subagent_reports: reports,
             subagent_report_bus: bus,
+            subagent_runs: SubagentRegistry::default(),
+            progress_wake: None,
             discrete_review: true,
             primary_model: None,
             review_root: PathBuf::from("."),
@@ -2784,6 +2900,8 @@ mod tests {
                 active_subagent_workers: workers.clone(),
                 subagent_reports: reports,
                 subagent_report_bus: bus,
+                subagent_runs: SubagentRegistry::default(),
+                progress_wake: None,
                 discrete_review: false,
                 primary_model: None,
                 review_root: PathBuf::from("."),
@@ -2816,11 +2934,33 @@ mod tests {
         bus: SubagentReportBus,
         reports: mpsc::UnboundedReceiver<SubagentReport>,
     ) -> Config {
+        wake_config(
+            command_tx,
+            bus,
+            reports,
+            SubagentRegistry::default(),
+            ActiveSubagentWorkers::default(),
+            None,
+        )
+    }
+
+    /// An injection config that also has a live pool to ask for progress and,
+    /// optionally, a heartbeat interval.
+    fn wake_config(
+        command_tx: mpsc::UnboundedSender<UiCommand>,
+        bus: SubagentReportBus,
+        reports: mpsc::UnboundedReceiver<SubagentReport>,
+        subagent_runs: SubagentRegistry,
+        active_subagent_workers: ActiveSubagentWorkers,
+        progress_wake: Option<Duration>,
+    ) -> Config {
         Config {
             runtime_commands: command_tx,
-            active_subagent_workers: ActiveSubagentWorkers::default(),
+            active_subagent_workers,
             subagent_reports: reports,
             subagent_report_bus: bus,
+            subagent_runs,
+            progress_wake,
             discrete_review: false,
             primary_model: None,
             review_root: PathBuf::from("."),
@@ -2916,6 +3056,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_wake_carries_finished_reports_and_progress_on_what_is_still_running() {
+        let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (bus, reports) = SubagentReportBus::channel();
+        let runs = SubagentRegistry::default();
+        let workers = ActiveSubagentWorkers::default();
+        workers.set(1);
+        let _running = runs.stub_running(9, "docs", "reading the spec");
+        let running = spawn(
+            runtime_rx,
+            wake_config(
+                command_tx,
+                bus.clone(),
+                reports,
+                runs,
+                workers,
+                Some(Duration::from_secs(600)),
+            ),
+        );
+
+        bus.open();
+        bus.deliver(report(3, "fix-tests", SubagentOutcome::Completed));
+
+        let prompt = next_prompt(&mut command_rx).await;
+        let report_at = prompt
+            .find("<subagent_result id=\"3\" label=\"fix-tests\"")
+            .expect("the finished report is injected in full");
+        let progress_at = prompt
+            .find("<subagent_progress>")
+            .expect("the running subagent is described in the same wake");
+        let instruction_at = prompt
+            .find(REPORT_INJECTION_INSTRUCTION)
+            .expect("the trailing instruction closes the wake");
+        assert!(report_at < progress_at && progress_at < instruction_at);
+        assert!(prompt.contains("#9 docs: running 1m12s."));
+        assert!(prompt.contains("Files touched: src/a.rs"));
+        assert!(prompt.contains("reading the spec #1"));
+        assert_eq!(bus.pending(), 0, "an injected report is accounted closed");
+
+        drop(runtime_tx);
+        running.task.await.expect("orchestrator task");
+    }
+
+    #[tokio::test]
+    async fn a_parked_primary_with_no_report_is_woken_with_progress_alone() {
+        let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (bus, reports) = SubagentReportBus::channel();
+        let runs = SubagentRegistry::default();
+        let workers = ActiveSubagentWorkers::default();
+        workers.set(1);
+        let _running = runs.stub_running(4, "port-the-parser", "still editing");
+        let running = spawn(
+            runtime_rx,
+            wake_config(
+                command_tx,
+                bus.clone(),
+                reports,
+                runs,
+                workers,
+                Some(Duration::from_millis(50)),
+            ),
+        );
+        // The subagent is admitted and owes a report: the heartbeat must not
+        // disturb that accounting, which is what headless drains on.
+        bus.open();
+
+        let prompt = next_prompt(&mut command_rx).await;
+        assert!(prompt.starts_with("<subagent_progress>"));
+        assert!(prompt.contains("#4 port-the-parser: running 1m12s."));
+        assert!(prompt.contains("still editing #1"));
+        assert!(prompt.ends_with(crate::subagent::PROGRESS_WAKE_INSTRUCTION));
+        assert!(!prompt.contains("<subagent_result"));
+        assert_eq!(bus.pending(), 1, "a heartbeat closes no report slot");
+
+        drop(runtime_tx);
+        running.task.await.expect("orchestrator task");
+    }
+
+    #[tokio::test]
+    async fn a_zero_progress_wake_interval_never_wakes_the_primary() {
+        let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (bus, reports) = SubagentReportBus::channel();
+        let runs = SubagentRegistry::default();
+        let workers = ActiveSubagentWorkers::default();
+        workers.set(1);
+        let _running = runs.stub_running(4, "port-the-parser", "still editing");
+        let running = spawn(
+            runtime_rx,
+            wake_config(
+                command_tx,
+                bus.clone(),
+                reports,
+                runs,
+                workers,
+                progress_wake_interval(0),
+            ),
+        );
+        bus.open();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), command_rx.recv())
+                .await
+                .is_err(),
+            "a disabled heartbeat must never wake the primary"
+        );
+
+        drop(runtime_tx);
+        running.task.await.expect("orchestrator task");
+    }
+
+    #[tokio::test]
+    async fn a_report_injection_restarts_the_progress_wake_interval() {
+        let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (bus, reports) = SubagentReportBus::channel();
+        let runs = SubagentRegistry::default();
+        let workers = ActiveSubagentWorkers::default();
+        workers.set(1);
+        let _running = runs.stub_running(9, "docs", "reading the spec");
+        let running = spawn(
+            runtime_rx,
+            wake_config(
+                command_tx,
+                bus.clone(),
+                reports,
+                runs,
+                workers,
+                Some(Duration::from_millis(400)),
+            ),
+        );
+
+        bus.open();
+        bus.deliver(report(3, "fix-tests", SubagentOutcome::Completed));
+        let injected = next_prompt(&mut command_rx).await;
+        assert!(injected.contains("<subagent_result id=\"3\""));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), command_rx.recv())
+                .await
+                .is_err(),
+            "the interval restarts at the injection instead of firing straight after it"
+        );
+        let heartbeat = next_prompt(&mut command_rx).await;
+        assert!(heartbeat.starts_with("<subagent_progress>"));
+        // The wake that carried the report already advanced the watermark, so
+        // this one is a fresh snapshot rather than a repeat.
+        assert!(heartbeat.contains("reading the spec #2"));
+
+        drop(runtime_tx);
+        running.task.await.expect("orchestrator task");
+    }
+
+    #[tokio::test]
+    async fn a_report_already_returned_by_cancel_is_accounted_and_dropped() {
+        let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (bus, reports) = SubagentReportBus::channel();
+        let running = spawn(
+            runtime_rx,
+            injection_config(command_tx, bus.clone(), reports),
+        );
+
+        bus.open();
+        bus.claim(3);
+        bus.deliver(report(3, "fix-tests", SubagentOutcome::Completed));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), command_rx.recv())
+                .await
+                .is_err(),
+            "subagent_cancel already handed this report to the primary"
+        );
+        assert_eq!(bus.pending(), 0, "a dropped report is still accounted");
+
+        drop(runtime_tx);
+        running.task.await.expect("orchestrator task");
+    }
+
+    #[tokio::test]
     async fn cancelled_reports_are_dropped_instead_of_injected() {
         let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
@@ -2948,7 +3268,7 @@ mod tests {
         );
         suppressed.workspace_diff =
             Some("omitted: 2 subagents shared this workspace during the run".to_string());
-        let rendered = format_report_injection(&[suppressed], "Vet this report.");
+        let rendered = format_report_injection(&[suppressed], None, "Vet this report.");
         assert!(rendered.contains("label=\"fix &quot;quoted&quot; &lt;tag&gt;\""));
         assert!(rendered.contains("outcome=\"failed\""));
         assert!(rendered.contains("omitted: 2 subagents shared this workspace"));
@@ -2956,7 +3276,7 @@ mod tests {
         let mut missing = report(5, "no-snapshot", SubagentOutcome::Completed);
         missing.workspace_diff = None;
         assert!(
-            format_report_injection(&[missing], "Vet this report.")
+            format_report_injection(&[missing], None, "Vet this report.")
                 .contains("workspace snapshot unavailable")
         );
     }

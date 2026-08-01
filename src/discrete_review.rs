@@ -1434,7 +1434,9 @@ async fn drive_supervisor(driver: SupervisorDriver<'_>) -> Result<SupervisorResu
             } else {
                 "Vet these reports against source and the user's intent. Other selected reviewers are still running, so do not issue the final verdict yet. You may continue useful investigation, then end this turn; remaining reports will arrive automatically."
             };
-            let prompt = crate::subagent::format_report_injection(&queued, instruction);
+            // Review lanes are not pool subagents and are not asked for
+            // progress: the supervisor's wake carries reports alone.
+            let prompt = crate::subagent::format_report_injection(&queued, None, instruction);
             queued.clear();
             emit_internal(
                 events,

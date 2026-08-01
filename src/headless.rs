@@ -286,6 +286,9 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
     let subagent_ids = subagent::SubagentIdAllocator::default();
     let active_implementation_workers = subagent::ActiveSubagentWorkers::default();
     let (subagent_reports, subagent_report_rx) = subagent::SubagentReportBus::channel();
+    // Shared with the orchestrator so every wake can ask the still-running
+    // subagents for progress.
+    let subagent_runs = subagent::SubagentRegistry::default();
     let mut primary_env = primary.launch.env.clone();
     let primary_permission = cfg.permission_config_mode.and_then(|mode| {
         roster::configure_permissions(primary.launch.kind, mode, &mut primary_env)
@@ -323,6 +326,7 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
                 .with_debrief(app_config.subagents.debrief)
                 .with_headless_permission_mode(cfg.permission_mode.into())
                 .with_reports(subagent_reports.clone())
+                .with_run_registry(subagent_runs.clone())
                 .with_prewarm(subagent::RunContext {
                     cwd: cfg.cwd.clone(),
                     additional_directories: cfg.additional_directories.clone(),
@@ -352,6 +356,10 @@ pub async fn run(cfg: RunConfig) -> Result<()> {
             active_subagent_workers: active_implementation_workers.clone(),
             subagent_reports: subagent_report_rx,
             subagent_report_bus: subagent_reports.clone(),
+            subagent_runs,
+            progress_wake: crate::orchestrator::progress_wake_interval(
+                app_config.subagents.progress_wake_minutes,
+            ),
             discrete_review: app_config.agent.discrete_review,
             primary_model: Some(primary.model.model.clone()),
             review_root: cfg.cwd.clone(),

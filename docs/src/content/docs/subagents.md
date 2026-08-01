@@ -32,10 +32,15 @@ the main failure mode of a push-delivered design.
    returns the id immediately. The stable `Subagents` workflow row reflects the
    run, and `/subagents` opens its retained actor transcript.
 3. The primary keeps working or ends its turn. The turn is not held open.
+   Ending the turn is how the primary waits: reports are delivered only between
+   turns.
 4. When the subagent finishes, Mjolnir **injects its report into the primary
-   session as a new user message**, which starts a normal turn.
+   session as a new user message**, which starts a normal turn. The same message
+   also carries progress on every subagent still running, so each wake is a
+   complete picture.
 
-Nothing polls. There is no wait tool, and the primary is told not to invent one.
+Nothing polls. There is no wait tool and no progress tool, and the primary is
+told not to invent one.
 
 ### The injected report
 
@@ -63,6 +68,27 @@ than several.
 The report is the subagent's own account of its work. Mjolnir does not verify
 it, and the injected message says so.
 
+### Progress on what is still running
+
+Every wake ends with one block covering the subagents that have not finished:
+
+```text
+<subagent_progress>
+#4 port-the-parser: running 6m30s. Files touched: src/lex.rs, src/parse.rs (2 files changed, 84 insertions(+), 5 deletions(-)).
+Recent activity:
+…what it has done since the last wake…
+</subagent_progress>
+```
+
+Each running worker answers this itself, between polls of its own turn, so the
+snapshot never races the work it describes. Activity already shown as progress
+is not repeated in that subagent's eventual report.
+
+If nothing finishes for `subagents.progress_wake_minutes` (default 20, `0`
+disables) while the primary is parked, Mjolnir wakes it with that block alone
+and one instruction: keep waiting, redirect or take over the work, or cancel a
+subagent. A progress wake carries no report and changes no bookkeeping.
+
 ### Shared workspaces suppress the diff
 
 Each run is snapshotted independently, so its `workspace_diff` is that
@@ -76,10 +102,14 @@ omitted: 2 subagents shared this workspace during the run — inspect git diff y
 
 ### Cancelling
 
-`subagent_cancel` interrupts a running subagent's turn and returns everything it
-did up to that point — its activity log and workspace diff — in the tool result
-itself. A cancelled subagent injects no report: the tool result is the whole
-story. On a finished subagent, cancel releases the retained session instead.
+`subagent_cancel` is for abandoning or concluding work, not for collecting
+results: a subagent left to finish reports on its own. Either way the tool
+result carries that subagent's full report. Cancelling a running subagent
+interrupts its turn and returns a report of what it did, with its activity and
+workspace diff. Cancelling a finished, retained subagent returns the complete
+report it already produced — final message, debrief, activity, diff — and
+releases the session. Nothing further is injected for that subagent; the tool
+result is the whole story.
 
 Cancel never reverts edits. Whatever the subagent already wrote stays in the
 workspace exactly as it left it.

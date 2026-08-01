@@ -1950,6 +1950,9 @@ async fn run_session(
     let subagent_ids = subagent::SubagentIdAllocator::default();
     let active_implementation_workers = subagent::ActiveSubagentWorkers::default();
     let (subagent_reports, subagent_report_rx) = subagent::SubagentReportBus::channel();
+    // Shared with the orchestrator so every wake can ask the still-running
+    // subagents for progress.
+    let subagent_runs = subagent::SubagentRegistry::default();
     tracing::info!(
         event = "roster_setup",
         session_tag = %session_tag,
@@ -2146,6 +2149,7 @@ async fn run_session(
                 .with_max_parallel(subagents_config.max_parallel)
                 .with_debrief(subagents_config.debrief)
                 .with_reports(subagent_reports.clone())
+                .with_run_registry(subagent_runs.clone())
                 .with_prewarm(subagent::RunContext {
                     cwd: cwd.clone(),
                     additional_directories: runtime_options.additional_directories.clone(),
@@ -2200,6 +2204,10 @@ async fn run_session(
             active_subagent_workers: active_implementation_workers.clone(),
             subagent_reports: subagent_report_rx,
             subagent_report_bus: subagent_reports.clone(),
+            subagent_runs,
+            progress_wake: orchestrator::progress_wake_interval(
+                subagents_config.progress_wake_minutes,
+            ),
             discrete_review: agent_config.discrete_review,
             primary_model: Some(roster.primary.model.model.clone()),
             review_root: cwd.clone(),
