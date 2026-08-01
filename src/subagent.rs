@@ -1060,9 +1060,19 @@ fn spawn_subagent_runtime(
     }
 }
 
+/// Appended to the MCP server instructions in non-interactive (headless)
+/// runs only. Interactive sessions have a human present, so deferring to
+/// them on approvals is correct there and this text must not appear.
+const HEADLESS_AUTONOMY_DIRECTIVE: &str = "<mj-noninteractive>\nThis is a non-interactive run: no human can respond until it ends, and anything you ask will go unanswered. Never stop to request permission, approval, or clarification. Where repository policy requires sign-offs you cannot obtain here (maintainer agreement, DCO attestation, issue references), do the work anyway and record the unmet requirement prominently in your final answer. State your assumptions instead of blocking on them.\n</mj-noninteractive>";
+
 impl McpHandler {
     fn server_info(&self) -> ServerInfo {
-        let instructions = format!("{SERVER_DELEGATION_GUIDANCE}\n\n{PRIMARY_SESSION_DIRECTIVE}");
+        let mut instructions =
+            format!("{SERVER_DELEGATION_GUIDANCE}\n\n{PRIMARY_SESSION_DIRECTIVE}");
+        if self.config.headless_permission_mode.is_some() {
+            instructions.push_str("\n\n");
+            instructions.push_str(HEADLESS_AUTONOMY_DIRECTIVE);
+        }
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 MCP_SERVER_NAME,
@@ -3839,6 +3849,31 @@ mod tests {
                 "only completed subagents may advertise a resumable session: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn headless_runs_get_the_autonomy_directive_and_interactive_runs_do_not() {
+        let interactive = test_config();
+        let headless =
+            test_config().with_headless_permission_mode(crate::config::PermissionPreset::Yolo);
+        let (ui_tx, _rx) = mpsc::unbounded_channel();
+        let a = McpHandler::new(
+            interactive,
+            test_context(),
+            ui_tx.clone(),
+            Controller::default(),
+        )
+        .server_info();
+        let b =
+            McpHandler::new(headless, test_context(), ui_tx, Controller::default()).server_info();
+        let ai = a.instructions.unwrap_or_default();
+        let bi = b.instructions.unwrap_or_default();
+        assert!(!ai.contains("<mj-noninteractive>"), "{ai}");
+        assert!(
+            bi.contains("never stop to request permission")
+                || bi.contains("Never stop to request permission"),
+            "{bi}"
+        );
     }
 
     fn test_mcp_handler(controller: Controller) -> McpHandler {
