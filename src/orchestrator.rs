@@ -186,7 +186,7 @@ const MAX_RETAINED_DELEGATION_SESSIONS: usize = 128;
 /// Trailing instruction on a wake that carries finished reports. It also has to
 /// teach the async contract, because this prompt is the only place the primary
 /// reads about delivery timing while it is actually deciding what to do next.
-const REPORT_INJECTION_INSTRUCTION: &str = "Review this report critically against the repository before relying on it. Where a <debrief> is present, treat its UNVERIFIED lines as your re-check list and its ANOMALIES lines as blockers to resolve before integrating. A <subagent_progress> block is a status snapshot, not a report: those subagents are still working and will be delivered the same way when they finish. Reports arrive only between your turns, so ending your turn while subagents run is how you wait for the rest.";
+const REPORT_INJECTION_INSTRUCTION: &str = "Spot-check this report's claims against the repository only where they gate your next decision; full verification happens once, at the end of the turn. Where a <debrief> is present, treat its UNVERIFIED lines as your re-check list and its ANOMALIES lines as blockers to resolve before integrating. A <subagent_progress> block is a status snapshot, not a report: those subagents are still working and will be delivered the same way when they finish. Reports arrive only between your turns, so ending your turn while subagents run is how you wait for the rest.";
 
 /// `0` minutes disables the progress heartbeat.
 pub fn progress_wake_interval(minutes: u64) -> Option<Duration> {
@@ -3273,7 +3273,7 @@ mod tests {
         assert!(prompt.contains("<report>\nfix-tests done"));
         assert!(prompt.contains("<activity_summary>\nfix-tests looked around"));
         assert!(prompt.contains("<workspace_diff>\ndiff for fix-tests"));
-        assert!(prompt.contains("Review this report critically"));
+        assert!(prompt.contains("Spot-check this report's claims"));
         assert_eq!(bus.pending(), 0, "an injected report is accounted closed");
 
         drop(runtime_tx);
@@ -3330,7 +3330,7 @@ mod tests {
         assert!(prompt.contains("<subagent_result id=\"1\""));
         assert!(prompt.contains("<subagent_result id=\"2\""));
         assert_eq!(
-            prompt.matches("Review this report critically").count(),
+            prompt.matches("Spot-check this report's claims").count(),
             1,
             "a batch is one message with one trailing instruction"
         );

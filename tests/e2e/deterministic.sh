@@ -156,7 +156,7 @@ run_case() {
     grep -a 'outcome="completed"' "$root/primary.log" >/dev/null
     grep -a '<activity_summary>' "$root/primary.log" >/dev/null
     grep -a '<workspace_diff>' "$root/primary.log" >/dev/null
-    grep -a 'Review this report critically' "$root/primary.log" >/dev/null
+    grep -a "Spot-check this report's claims" "$root/primary.log" >/dev/null
     if [ "$mode" = details ]; then
       grep -a "details hidden" "$root/transcript.log" >/dev/null
       grep -a "USER_LONG_SUFFIX" "$root/transcript.log" >/dev/null
