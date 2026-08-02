@@ -169,6 +169,12 @@ pub struct AgentConfig {
     pub reasoning_effort: Option<String>,
     #[serde(default = "default_true")]
     pub discrete_review: bool,
+    /// How many corrective re-review passes one user turn may dispatch after
+    /// its initial discrete review. `0` accepts the first correction without
+    /// re-reviewing it; the default spends exactly one bounded verification
+    /// pass, which is what stops findings-correction from re-arming forever.
+    #[serde(default = "default_max_correction_rounds")]
+    pub max_correction_rounds: u32,
 }
 
 impl Default for AgentConfig {
@@ -178,6 +184,7 @@ impl Default for AgentConfig {
             acp_priority: default_acp_priority(),
             reasoning_effort: None,
             discrete_review: true,
+            max_correction_rounds: default_max_correction_rounds(),
         }
     }
 }
@@ -271,6 +278,10 @@ impl Default for SubagentsConfig {
 
 fn default_max_parallel() -> usize {
     6
+}
+
+fn default_max_correction_rounds() -> u32 {
+    1
 }
 
 fn default_progress_wake_minutes() -> u64 {
@@ -605,6 +616,8 @@ struct ThorV2 {
     reasoning_effort: Option<String>,
     #[serde(default = "default_true")]
     discrete_review: bool,
+    #[serde(default = "default_max_correction_rounds")]
+    max_correction_rounds: u32,
 }
 
 impl Default for ThorV2 {
@@ -613,6 +626,7 @@ impl Default for ThorV2 {
             model: default_auto(),
             reasoning_effort: None,
             discrete_review: true,
+            max_correction_rounds: default_max_correction_rounds(),
         }
     }
 }
@@ -688,6 +702,7 @@ fn migrate_v2(body: &str) -> Result<Config> {
             acp_priority: default_acp_priority(),
             reasoning_effort: old.thor.reasoning_effort,
             discrete_review: old.thor.discrete_review,
+            max_correction_rounds: old.thor.max_correction_rounds,
         },
         review: ReviewConfig {
             model: old.loki.model,
@@ -956,6 +971,7 @@ mod tests {
         assert_eq!(cfg.theme, TerminalThemeKind::Dark);
         assert_eq!(cfg.model_names(), ModelsConfig::default());
         assert!(cfg.agent.discrete_review);
+        assert_eq!(cfg.agent.max_correction_rounds, 1);
         assert_eq!(cfg.subagents.model, "auto");
         assert_eq!(
             cfg.agent.acp_priority,
@@ -1024,6 +1040,7 @@ spinner = "bars"
 model = "gpt-5-6-sol"
 reasoning_effort = "high"
 discrete_review = false
+max_correction_rounds = 3
 
 [eitri]
 model = "gpt-5-6-terra"
@@ -1062,6 +1079,7 @@ origin = "custom"
         assert_eq!(cfg.agent.model, "gpt-5-6-sol");
         assert_eq!(cfg.agent.reasoning_effort.as_deref(), Some("high"));
         assert!(!cfg.agent.discrete_review);
+        assert_eq!(cfg.agent.max_correction_rounds, 3);
         assert_eq!(cfg.review.model, "claude-fable-5");
         assert_eq!(cfg.review.reasoning_effort.as_deref(), Some("xhigh"));
         assert_eq!(cfg.subagents.model, "gpt-5-6-terra");
@@ -1202,6 +1220,7 @@ origin = "custom"
                 acp_priority: default_acp_priority(),
                 reasoning_effort: None,
                 discrete_review: false,
+                max_correction_rounds: default_max_correction_rounds(),
             },
             subagents: SubagentsConfig {
                 auto_failover: false,

@@ -2639,6 +2639,7 @@ fn start_server_agent_session(
                 app_config.subagents.progress_wake_minutes,
             ),
             discrete_review: app_config.agent.discrete_review,
+            max_correction_rounds: app_config.agent.max_correction_rounds,
             primary_model: roster
                 .as_ref()
                 .map(|resolved| resolved.primary.model.model.clone()),

@@ -2209,6 +2209,7 @@ async fn run_session(
                 subagents_config.progress_wake_minutes,
             ),
             discrete_review: agent_config.discrete_review,
+            max_correction_rounds: agent_config.max_correction_rounds,
             primary_model: Some(roster.primary.model.model.clone()),
             review_root: cwd.clone(),
             review_fanout: review_workers.zip(roster.review_supervisor.clone()).map(
