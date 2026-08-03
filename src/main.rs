@@ -105,7 +105,7 @@ struct Cli {
     /// Override the primary agent's model for this non-interactive invocation.
     ///
     /// Accepts an optional trailing `+<effort>` (off, none, minimal, low,
-    /// medium, high, xhigh) to set this seat's ACP reasoning effort
+    /// medium, high, xhigh, max) to set this seat's ACP reasoning effort
     /// independent of the shared Anvil server default, e.g.
     /// `custom/bpr-agent/bedrock::openai.gpt-5.6-sol+high`.
     #[arg(long, value_name = "MODEL[+EFFORT]", requires = "print", value_parser = parse_model_override)]
@@ -249,8 +249,9 @@ fn parse_fs_max_text_bytes(value: &str) -> std::result::Result<u64, String> {
 /// Case-insensitive; `none` canonicalizes to `off` (matches Anvil's
 /// `REASONING_EFFORT_OFF_VALUE`, which explicitly turns reasoning off
 /// rather than leaving the adapter's default effort untouched).
-const KNOWN_REASONING_EFFORTS: &[&str] =
-    &["off", "none", "minimal", "low", "medium", "high", "xhigh"];
+const KNOWN_REASONING_EFFORTS: &[&str] = &[
+    "off", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+];
 
 /// Splits a trailing `+<effort>` suffix off a role-override selector.
 ///
@@ -3598,6 +3599,10 @@ mod tests {
         assert_eq!(
             parse_optional_role_override("some-model+XHIGH"),
             Ok(("some-model".to_string(), Some("xhigh".to_string())))
+        );
+        assert_eq!(
+            parse_optional_role_override("some-model+MAX"),
+            Ok(("some-model".to_string(), Some("max".to_string())))
         );
     }
 
