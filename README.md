@@ -6,18 +6,17 @@
   </a>
 </p>
 
-Mjolnir (`mj`) is the self-hosted power frontend for **Codex**. It adds a fast
-native terminal, authenticated remote control, local voice dictation, parallel
-subagents, durable sessions, worktrees, and adversarial review around your
-existing Codex account.
+Mjolnir (`mj`) is the self-hosted power frontend for **Codex**. It wraps your
+existing Codex account in self-hosted remote control, a worktree-first workflow,
+cross-platform voice input, and integrated adversarial review.
 
 Codex remains in charge of the turn while Mjolnir provides the operating
 environment around it:
 
 - Codex owns every user turn — planning, delegating, implementing, and
   answering;
-- `create_subagent` launches background subagents (up to 16 in parallel, all
-  write-capable, each in a fresh session) and returns immediately;
+- Codex can launch background subagents (up to 16 in parallel, all
+  write-capable, each in a fresh session) while Mjolnir tracks them;
 - stable workflow progress rows summarize delegation and review phases,
   aggregate actor outcomes, and elapsed time; `/subagents` opens retained
   nested detail;
@@ -35,14 +34,15 @@ and remote workflow stay consistent across those routes.
 
 - **Self-hosted remote control:** keep the workspace and control plane on your
   machine and drive the session from another browser or device.
+- **Worktree-first workflow:** start Codex in a linked Git worktree so agent
+  changes stay separate from your current checkout and remain easy to inspect.
 - **Cross-platform desktop voice:** dictate prompts locally on macOS, Linux,
   and Windows with Ctrl-R.
-- **Parallel subagents:** let Codex launch focused background sessions and
-  receive their reports without polling.
-- **Adversarial review:** challenge workspace changes with a separate review
-  supervisor and targeted specialist lanes before a delegated turn completes.
-- **Operational control:** readable permissions, isolated worktrees, resumable
-  sessions, headless JSON output, and Codex quota visibility.
+- **Integrated adversarial review:** challenge workspace changes with a
+  separate review supervisor and targeted specialist lanes before a delegated
+  turn completes.
+- **Optional agent routes:** add Claude, Kimi, Anvil, or a custom ACP server
+  without replacing the Codex-first workflow.
 
 Mjolnir itself, its remote-control server, transcripts, and workspace tools run
 on infrastructure you control. Codex model requests still use OpenAI under the
