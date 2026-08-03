@@ -67,7 +67,8 @@ before releasing it:
    Bifrost core navigation tools and an immutable change packet. It runs in a
    detached read-only session but is not a subagent. Changes under 200 lines
    include the complete captured diff; larger changes include the complete
-   diffstat plus `analyze_diff` results for the captured base and target trees.
+   semantic file totals and `patch_symbols` from `analyze_diff` for the
+   captured base and target trees.
 3. The supervisor forms a risk map from the change packet and targeted source
    inspection. It launches a read-only Norse reviewer only for a concrete
    unresolved hypothesis that the lane can investigate: Mímir (complexity),

@@ -1005,20 +1005,23 @@ async fn run_async(
         Ok(diff) => diff,
         Err(reason) => return ReviewVerdict::Failed { reason },
     };
-    let changed_line_count = focus_snapshot.changed_line_count();
-    let include_full_diff = changed_line_count < SMALL_DIFF_CHANGED_LINES;
-    let diffstat = focus_snapshot.diffstat().to_string();
     let Some(bifrost) = detect_bifrost() else {
         return ReviewVerdict::Failed {
             reason: "bifrost is unavailable, so the supervisor cannot receive its required core MCP tools".to_string(),
         };
     };
 
-    let changed_functions_task = (!include_full_diff).then(|| {
+    let mut focus_analysis_task = {
         let bifrost = bifrost.clone();
         let snapshot = focus_snapshot.clone();
-        tokio::spawn(async move { analyze_changed_functions(&bifrost, &snapshot).await })
-    });
+        tokio::spawn(async move { analyze_diff_at_root(&bifrost, &snapshot).await })
+    };
+    let mut cumulative_analysis_task =
+        (!same_snapshot_endpoints(&focus_snapshot, &snapshot)).then(|| {
+            let bifrost = bifrost.clone();
+            let snapshot = snapshot.clone();
+            tokio::spawn(async move { analyze_diff_at_root(&bifrost, &snapshot).await })
+        });
 
     let intent = if let Some(prior) = job
         .prior_review
@@ -1104,18 +1107,61 @@ async fn run_async(
         intent
     };
     if cancel.is_cancelled() {
-        if let Some(task) = changed_functions_task {
+        focus_analysis_task.abort();
+        if let Some(task) = cumulative_analysis_task {
             task.abort();
         }
         return ReviewVerdict::Failed {
             reason: "the review was cancelled".to_string(),
         };
     }
-    let changed_functions = match changed_functions_task {
-        None => SupplementalContext::available(
+    let focus_analysis = match tokio::select! {
+        _ = cancel.cancelled() => {
+            focus_analysis_task.abort();
+            if let Some(task) = cumulative_analysis_task {
+                task.abort();
+            }
+            return ReviewVerdict::Failed {
+                reason: "the review was cancelled".to_string(),
+            };
+        }
+        result = &mut focus_analysis_task => result,
+    } {
+        Ok(Ok(analysis)) => analysis,
+        Ok(Err(reason)) => {
+            if let Some(task) = cumulative_analysis_task.take() {
+                task.abort();
+            }
+            return ReviewVerdict::Failed {
+                reason: format!("bifrost analyze_diff failed: {reason}"),
+            };
+        }
+        Err(error) => {
+            if let Some(task) = cumulative_analysis_task.take() {
+                task.abort();
+            }
+            return ReviewVerdict::Failed {
+                reason: format!("bifrost analyze_diff task failed: {error}"),
+            };
+        }
+    };
+    let changed_line_count = focus_analysis.changed_line_count();
+    let include_full_diff = changed_line_count < SMALL_DIFF_CHANGED_LINES;
+    let diffstat = focus_analysis.diffstat();
+    let changed_functions = if include_full_diff {
+        SupplementalContext::available(
             "Not invoked: the complete captured turn diff is included because this turn changed fewer than 200 lines."
                 .to_string(),
-        ),
+        )
+    } else {
+        SupplementalContext::available(bound_complete_lines(
+            &format_changed_functions(&focus_analysis),
+            CHANGED_FUNCTIONS_LIMIT,
+            "changed functions",
+        ))
+    };
+    let cumulative_diffstat = match cumulative_analysis_task {
+        None => diffstat.clone(),
         Some(mut task) => {
             let result = tokio::select! {
                 _ = cancel.cancelled() => {
@@ -1127,7 +1173,7 @@ async fn run_async(
                 result = &mut task => result,
             };
             match result {
-                Ok(Ok(functions)) => SupplementalContext::available(functions),
+                Ok(Ok(analysis)) => analysis.diffstat(),
                 Ok(Err(reason)) => {
                     return ReviewVerdict::Failed {
                         reason: format!("bifrost analyze_diff failed: {reason}"),
@@ -1164,7 +1210,7 @@ async fn run_async(
         ProgrammaticPool::start(reviewer_config, review_run_context(config), events.clone()).await;
     let dispatch = ReviewDispatch {
         pool: reviewer_pool.clone(),
-        shared_context: Arc::new(lane_context(&job)),
+        shared_context: Arc::new(lane_context(&job, &cumulative_diffstat)),
         bifrost: bifrost.clone(),
         repository_root: repository_root.clone(),
         started: Arc::new(Mutex::new(HashMap::new())),
@@ -1205,6 +1251,7 @@ async fn run_async(
                 &intent,
                 &changed_functions,
                 &diffstat,
+                &cumulative_diffstat,
                 include_full_diff,
                 changed_line_count,
                 &repository_root,
@@ -1596,7 +1643,7 @@ fn review_diff_scope(job: &ReviewJob) -> &'static str {
     }
 }
 
-fn review_pass_context(job: &ReviewJob) -> String {
+fn review_pass_context(job: &ReviewJob, cumulative_diffstat: &str) -> String {
     let Some(prior) = job.prior_review.as_ref() else {
         return "This is the initial review pass. Build a risk map for the cumulative turn patch, then dispatch only lanes tied to concrete unresolved hypotheses. It is normal to dispatch none.".to_string();
     };
@@ -1629,24 +1676,23 @@ fn review_pass_context(job: &ReviewJob) -> String {
          <prior_review_findings trust=\"previous supervisor synthesis\">\n{}\n</prior_review_findings>\n\n\
          <prior_reviewer_coverage trust=\"deterministic runtime outcomes\">\n{lanes}\n</prior_reviewer_coverage>\n\n\
          <cumulative_turn_diffstat trust=\"deterministic\">\n{}\n</cumulative_turn_diffstat>",
-        prior.synthesis,
-        job.snapshot
-            .as_ref()
-            .map_or("Unavailable", ReviewSnapshot::diffstat),
+        prior.synthesis, cumulative_diffstat,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn supervisor_prompt(
     job: &ReviewJob,
     intent: &SupplementalContext,
     changed_functions: &SupplementalContext,
     diffstat: &str,
+    cumulative_diffstat: &str,
     include_full_diff: bool,
     changed_line_count: usize,
     repository_root: &Path,
 ) -> String {
     let roster = review_agent_roster();
-    let pass_context = review_pass_context(job);
+    let pass_context = review_pass_context(job, cumulative_diffstat);
     // The full stated-contract sweep belongs to the pass that first reads the
     // turn. A verification pass re-runs it only over the requirement spans the
     // prior pass already quoted, so corrections cannot keep discovering new
@@ -1707,43 +1753,82 @@ struct AnalyzeDiffEnvelope {
     structured_content: AnalyzeDiffResult,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct AnalyzeDiffResult {
     #[serde(default)]
-    patch_symbols: PatchSymbols,
+    file_changes: Vec<FileChange>,
     #[serde(default)]
-    moved_symbols: Vec<MovedSymbol>,
+    patch_symbols: PatchSymbols,
+}
+
+#[derive(Default, Deserialize)]
+struct FileChange {
+    #[serde(default)]
+    old_path: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    insertions: usize,
+    #[serde(default)]
+    deletions: usize,
+    #[serde(default)]
+    is_binary: bool,
+    #[serde(default)]
+    is_test: bool,
+    #[serde(default)]
+    is_parseable: bool,
 }
 
 #[derive(Default, Deserialize)]
 struct PatchSymbols {
     #[serde(default)]
-    preimage: PreimagePatchSymbols,
+    edited: Vec<EditedSymbol>,
     #[serde(default)]
-    postimage: PostimagePatchSymbols,
+    introduced: Vec<IntroducedSymbol>,
+    #[serde(default)]
+    deleted: Vec<DeletedSymbol>,
+    #[serde(default)]
+    moved: Vec<SymbolPair>,
+    #[serde(default)]
+    signature_changes: Vec<SymbolPair>,
 }
 
-#[derive(Default, Deserialize)]
-struct PreimagePatchSymbols {
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct EditedSymbol {
+    before: PatchSymbol,
+    after: PatchSymbol,
     #[serde(default)]
-    deleted: Vec<PatchSymbol>,
+    touched_old_lines: Vec<usize>,
+    #[serde(default)]
+    touched_new_lines: Vec<usize>,
 }
 
-#[derive(Default, Deserialize)]
-struct PostimagePatchSymbols {
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct IntroducedSymbol {
+    after: PatchSymbol,
     #[serde(default)]
-    edited: Vec<PatchSymbol>,
+    touched_new_lines: Vec<usize>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct DeletedSymbol {
+    before: PatchSymbol,
     #[serde(default)]
-    introduced: Vec<PatchSymbol>,
+    touched_old_lines: Vec<usize>,
 }
 
 #[derive(Deserialize)]
-struct MovedSymbol {
+struct SymbolPair {
     before: PatchSymbol,
     after: PatchSymbol,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct PatchSymbol {
     #[serde(default)]
     fqn: String,
@@ -1753,6 +1838,7 @@ struct PatchSymbol {
     kind: String,
     #[serde(default)]
     signature: String,
+    #[serde(default)]
     path: String,
     #[serde(default)]
     start_line: usize,
@@ -1762,16 +1848,78 @@ struct PatchSymbol {
     change_reason: String,
 }
 
-async fn analyze_changed_functions(
-    bifrost: &Path,
-    snapshot: &ReviewSnapshot,
-) -> Result<String, String> {
-    let section = analyze_diff_at_root(bifrost, snapshot).await?;
-    Ok(bound_complete_lines(
-        section.trim(),
-        CHANGED_FUNCTIONS_LIMIT,
-        "changed functions",
-    ))
+impl AnalyzeDiffResult {
+    fn changed_line_count(&self) -> usize {
+        self.file_changes.iter().fold(0, |total, change| {
+            total.saturating_add(change.insertions.saturating_add(change.deletions))
+        })
+    }
+
+    fn diffstat(&self) -> String {
+        let mut lines = self
+            .file_changes
+            .iter()
+            .map(format_file_change)
+            .collect::<Vec<_>>();
+        let insertions = self.file_changes.iter().fold(0usize, |total, change| {
+            total.saturating_add(change.insertions)
+        });
+        let deletions = self.file_changes.iter().fold(0usize, |total, change| {
+            total.saturating_add(change.deletions)
+        });
+        let file_count = self.file_changes.len();
+        let mut summary = format!(
+            "{file_count} {} changed",
+            if file_count == 1 { "file" } else { "files" }
+        );
+        if insertions > 0 {
+            summary.push_str(&format!(
+                ", {insertions} {}(+)",
+                if insertions == 1 {
+                    "insertion"
+                } else {
+                    "insertions"
+                }
+            ));
+        }
+        if deletions > 0 {
+            summary.push_str(&format!(
+                ", {deletions} {}(-)",
+                if deletions == 1 {
+                    "deletion"
+                } else {
+                    "deletions"
+                }
+            ));
+        }
+        lines.push(summary);
+        lines.join("\n")
+    }
+}
+
+fn format_file_change(change: &FileChange) -> String {
+    // These semantic flags are intentionally retained in the decoded schema;
+    // the review packet's stat rendering only needs the path and line totals.
+    let _semantic_metadata = (change.status.as_str(), change.is_test, change.is_parseable);
+    let path = match (&change.old_path, &change.path) {
+        (Some(old), Some(new)) if old != new => format!("{old} => {new}"),
+        (Some(old), _) => old.clone(),
+        (_, Some(new)) => new.clone(),
+        (None, None) => "<unknown path>".to_string(),
+    };
+    let detail = if change.is_binary {
+        "binary".to_string()
+    } else {
+        let changed = change.insertions.saturating_add(change.deletions);
+        format!(
+            "{changed} changed ({} insertion{}, {} deletion{})",
+            change.insertions,
+            if change.insertions == 1 { "" } else { "s" },
+            change.deletions,
+            if change.deletions == 1 { "" } else { "s" },
+        )
+    };
+    format!(" {path} | {detail}")
 }
 
 #[cfg(test)]
@@ -1815,7 +1963,17 @@ async fn reviewed_repository_root(cwd: &Path) -> Option<PathBuf> {
     (!root.as_os_str().is_empty()).then_some(root)
 }
 
-async fn analyze_diff_at_root(bifrost: &Path, snapshot: &ReviewSnapshot) -> Result<String, String> {
+fn same_snapshot_endpoints(left: &ReviewSnapshot, right: &ReviewSnapshot) -> bool {
+    left.repo_root() == right.repo_root()
+        && left.object_dir() == right.object_dir()
+        && left.base_tree() == right.base_tree()
+        && left.target_tree() == right.target_tree()
+}
+
+async fn analyze_diff_at_root(
+    bifrost: &Path,
+    snapshot: &ReviewSnapshot,
+) -> Result<AnalyzeDiffResult, String> {
     tracing::info!(
         event = "review_analyze_diff_started",
         bifrost = %bifrost.display(),
@@ -1861,7 +2019,7 @@ async fn analyze_diff_at_root(bifrost: &Path, snapshot: &ReviewSnapshot) -> Resu
     }
     let envelope: AnalyzeDiffEnvelope = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("invalid analyze_diff JSON: {error}"))?;
-    Ok(format_changed_functions(envelope.structured_content))
+    Ok(envelope.structured_content)
 }
 
 async fn command_output_retry(command: &mut Command) -> std::io::Result<std::process::Output> {
@@ -1877,15 +2035,15 @@ async fn command_output_retry(command: &mut Command) -> std::io::Result<std::pro
     unreachable!("the bounded retry loop always returns on its final attempt")
 }
 
-fn format_changed_functions(analysis: AnalyzeDiffResult) -> String {
+fn format_changed_functions(analysis: &AnalyzeDiffResult) -> String {
     let mut entries = Vec::new();
-    for symbol in analysis.patch_symbols.postimage.introduced {
-        push_changed_function(&mut entries, "introduced", symbol);
+    for symbol in &analysis.patch_symbols.introduced {
+        push_changed_function(&mut entries, "introduced", &symbol.after);
     }
-    for symbol in analysis.patch_symbols.postimage.edited {
-        push_changed_function(&mut entries, "edited", symbol);
+    for symbol in &analysis.patch_symbols.edited {
+        push_changed_function(&mut entries, "edited", &symbol.after);
     }
-    for moved in analysis.moved_symbols {
+    for moved in &analysis.patch_symbols.moved {
         // Bifrost reports ordinary line shifts as moves. Only a path change is
         // strong evidence that the turn actually moved a callable rather than
         // inserting text above it.
@@ -1897,8 +2055,17 @@ fn format_changed_functions(analysis: AnalyzeDiffResult) -> String {
             ));
         }
     }
-    for symbol in analysis.patch_symbols.preimage.deleted {
-        push_changed_function(&mut entries, "deleted", symbol);
+    for signature_change in &analysis.patch_symbols.signature_changes {
+        if is_callable(&signature_change.after.kind) {
+            entries.push(format!(
+                "- signature changed {} -> {}",
+                display_symbol(&signature_change.before),
+                display_symbol(&signature_change.after)
+            ));
+        }
+    }
+    for symbol in &analysis.patch_symbols.deleted {
+        push_changed_function(&mut entries, "deleted", &symbol.before);
     }
     entries.sort();
     entries.dedup();
@@ -1909,14 +2076,14 @@ fn format_changed_functions(analysis: AnalyzeDiffResult) -> String {
     }
 }
 
-fn push_changed_function(entries: &mut Vec<String>, change: &str, symbol: PatchSymbol) {
+fn push_changed_function(entries: &mut Vec<String>, change: &str, symbol: &PatchSymbol) {
     if is_callable(&symbol.kind) {
         let reason = if symbol.change_reason.trim().is_empty() {
             String::new()
         } else {
             format!("; {}", symbol.change_reason.trim())
         };
-        entries.push(format!("- {change}: {}{reason}", display_symbol(&symbol)));
+        entries.push(format!("- {change}: {}{reason}", display_symbol(symbol)));
     }
 }
 
@@ -2029,7 +2196,7 @@ fn synthesis_severity(lines: &[&str]) -> SynthesisSeverity {
 
 /// Shared evidence every lane sees. Built once per dispatch: six copies of an
 /// unbounded diff is the one place this design can blow up a context window.
-fn lane_context(job: &ReviewJob) -> String {
+fn lane_context(job: &ReviewJob, cumulative_diffstat: &str) -> String {
     let diff = bound_review_section(&job.diff, LANE_DIFF_LIMIT, "workspace diff");
     let trajectory = bound_review_section(&job.trajectory, LANE_TRAJECTORY_LIMIT, "trajectory");
     let (scope, prior) = if job.prior_review.is_some() {
@@ -2037,7 +2204,7 @@ fn lane_context(job: &ReviewJob) -> String {
             review_diff_scope(job),
             format!(
                 "\n\n<corrective_pass_context>\n{}\n</corrective_pass_context>",
-                review_pass_context(job)
+                review_pass_context(job, cumulative_diffstat)
             ),
         )
     } else {
@@ -2373,6 +2540,7 @@ mod tests {
             &intent,
             &changed,
             "src/upload.rs | 1 +\n",
+            "src/upload.rs | 1 +\n",
             true,
             1,
             Path::new("/repo"),
@@ -2440,8 +2608,6 @@ mod tests {
             PathBuf::from("/repo"),
             "turn-base",
             "corrected-target",
-            " src/upload.rs | 240 +++++++++++++++++++++\n",
-            240,
             "cumulative patch",
         ));
         job.prior_review = Some(PriorReviewContext {
@@ -2469,6 +2635,7 @@ mod tests {
             &intent,
             &changed,
             " tests/upload.rs | 4 ++++\n",
+            "src/upload.rs | 240 +++++++++++++++++++++\n",
             true,
             4,
             Path::new("/repo"),
@@ -2493,7 +2660,7 @@ mod tests {
         assert!(prompt.contains("Zero lanes is the expected outcome"));
         assert!(prompt.contains("Do not mechanically restart the roster."));
 
-        let lane = lane_context(&job);
+        let lane = lane_context(&job, "src/upload.rs | 240 +++++++++++++++++++++\n");
         assert!(lane.contains("scope=\"since-previous-review; corrective-delta\""));
         assert!(lane.contains("<prior_reviewer_coverage"));
         assert!(lane.contains("Derive expected behavior -- especially exact literals"));
@@ -2512,6 +2679,7 @@ mod tests {
                 &SupplementalContext::available("Goal: preserve retries".to_string()),
                 &SupplementalContext::available("not invoked".to_string()),
                 " tests/upload.rs | 4 ++++\n",
+                "tests/upload.rs | 4 ++++\n",
                 true,
                 4,
                 Path::new("/repo"),
@@ -2651,21 +2819,33 @@ mod tests {
     #[test]
     fn changed_function_context_filters_non_callables() {
         let analysis = AnalyzeDiffResult {
+            file_changes: Vec::new(),
             patch_symbols: PatchSymbols {
-                preimage: PreimagePatchSymbols {
-                    deleted: vec![patch_symbol("src/old.rs", "removed", "Method")],
-                },
-                postimage: PostimagePatchSymbols {
-                    introduced: vec![
-                        patch_symbol("src/reviewed.rs", "new_work", "Function"),
-                        patch_symbol("src/reviewed.rs", "State", "Struct"),
-                    ],
-                    edited: vec![patch_symbol("src/unrelated.rs", "preexisting", "Function")],
-                },
+                introduced: vec![
+                    IntroducedSymbol {
+                        after: patch_symbol("src/reviewed.rs", "new_work", "Function"),
+                        touched_new_lines: vec![10],
+                    },
+                    IntroducedSymbol {
+                        after: patch_symbol("src/reviewed.rs", "State", "Struct"),
+                        touched_new_lines: vec![10],
+                    },
+                ],
+                edited: vec![EditedSymbol {
+                    before: patch_symbol("src/unrelated.rs", "preexisting", "Function"),
+                    after: patch_symbol("src/unrelated.rs", "preexisting", "Function"),
+                    touched_old_lines: vec![10],
+                    touched_new_lines: vec![10],
+                }],
+                deleted: vec![DeletedSymbol {
+                    before: patch_symbol("src/old.rs", "removed", "Method"),
+                    touched_old_lines: vec![10],
+                }],
+                moved: Vec::new(),
+                signature_changes: Vec::new(),
             },
-            moved_symbols: Vec::new(),
         };
-        let context = format_changed_functions(analysis);
+        let context = format_changed_functions(&analysis);
         assert!(context.contains("introduced: src/reviewed.rs:10-20"));
         assert!(context.contains("deleted: src/old.rs:10-20"));
         assert!(!context.contains("State"));
@@ -2675,22 +2855,61 @@ mod tests {
     #[test]
     fn changed_function_context_only_reports_cross_path_moves() {
         let analysis = AnalyzeDiffResult {
-            patch_symbols: PatchSymbols::default(),
-            moved_symbols: vec![
-                MovedSymbol {
-                    before: patch_symbol("src/work.rs", "shifted", "Function"),
-                    after: patch_symbol("src/work.rs", "shifted", "Function"),
-                },
-                MovedSymbol {
-                    before: patch_symbol("src/old.rs", "moved", "Function"),
-                    after: patch_symbol("src/new.rs", "moved", "Function"),
-                },
-            ],
+            file_changes: Vec::new(),
+            patch_symbols: PatchSymbols {
+                moved: vec![
+                    SymbolPair {
+                        before: patch_symbol("src/work.rs", "shifted", "Function"),
+                        after: patch_symbol("src/work.rs", "shifted", "Function"),
+                    },
+                    SymbolPair {
+                        before: patch_symbol("src/old.rs", "moved", "Function"),
+                        after: patch_symbol("src/new.rs", "moved", "Function"),
+                    },
+                ],
+                ..Default::default()
+            },
         };
-        let context = format_changed_functions(analysis);
+        let context = format_changed_functions(&analysis);
         assert!(context.contains("src/old.rs"));
         assert!(context.contains("src/new.rs"));
         assert!(!context.contains("shifted"));
+    }
+
+    #[test]
+    fn analyze_diff_derives_review_totals_from_file_changes() {
+        let analysis = AnalyzeDiffResult {
+            file_changes: vec![
+                FileChange {
+                    path: Some("src/lib.rs".to_string()),
+                    insertions: 4,
+                    deletions: 2,
+                    is_test: false,
+                    is_parseable: true,
+                    ..Default::default()
+                },
+                FileChange {
+                    path: Some("tests/lib.rs".to_string()),
+                    insertions: 1,
+                    is_test: true,
+                    is_parseable: true,
+                    ..Default::default()
+                },
+                FileChange {
+                    old_path: Some("assets/old.bin".to_string()),
+                    path: Some("assets/new.bin".to_string()),
+                    is_binary: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(analysis.changed_line_count(), 7);
+        let diffstat = analysis.diffstat();
+        assert!(diffstat.contains("src/lib.rs"));
+        assert!(diffstat.contains("assets/old.bin => assets/new.bin | binary"));
+        assert!(diffstat.contains("3 files changed, 5 insertions(+), 2 deletions(-)"));
     }
 
     #[test]
@@ -2726,7 +2945,7 @@ mod tests {
         let script = format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nprintf '%s\\n' '{}'\n",
             invocation.display(),
-            r#"{"structuredContent":{"patch_symbols":{"preimage":{"deleted":[]},"postimage":{"edited":[],"introduced":[{"fqn":"work","name":"work","kind":"Function","signature":"fn work()","path":"src/work.rs","start_line":1,"end_line":3,"change_reason":"introduced"}]}},"moved_symbols":[]},"isError":false}"#
+            r#"{"structuredContent":{"file_changes":[{"path":"src/work.rs","status":"modified","insertions":3,"deletions":1,"is_binary":false,"is_test":false,"is_parseable":true}],"patch_symbols":{"edited":[],"introduced":[{"after":{"fqn":"work","name":"work","kind":"Function","signature":"fn work()","path":"src/work.rs","start_line":1,"end_line":3,"change_reason":"introduced"},"touched_new_lines":[1,2,3]}],"deleted":[],"moved":[],"signature_changes":[]}},"isError":false}"#
         );
         std::fs::write(&executable, script).expect("write fake bifrost");
         let mut permissions = std::fs::metadata(&executable)
@@ -2739,14 +2958,13 @@ mod tests {
             temp.path().to_path_buf(),
             "base-tree",
             "target-tree",
-            "src/work.rs | 1 +\n",
-            200,
             "diff",
         );
         let output = analyze_diff_at_root(&executable, &snapshot)
             .await
             .expect("analyze diff");
-        assert!(output.contains("introduced: src/work.rs:1-3"));
+        assert_eq!(output.changed_line_count(), 4);
+        assert!(format_changed_functions(&output).contains("introduced: src/work.rs:1-3"));
         let args = std::fs::read_to_string(invocation).expect("read invocation");
         assert!(args.contains("--tool analyze_diff"));
         assert!(args.contains("--root"));
@@ -2779,7 +2997,7 @@ mod tests {
     #[test]
     fn lane_prompt_scopes_to_one_lane_and_the_diff() {
         let lane = &REVIEW_LANES[0];
-        let context = lane_context(&job());
+        let context = lane_context(&job(), "");
         let roots = vec![PathBuf::from("/repo")];
         let with_tools = lane_prompt(lane, &context, true, &roots);
         assert!(with_tools.contains("Bifrost analyzer tools are attached"));
@@ -2911,7 +3129,7 @@ mod tests {
             focus_snapshot: None,
             prior_review: None,
         };
-        let context = lane_context(&job);
+        let context = lane_context(&job, "");
         assert!(context.len() <= LANE_DIFF_LIMIT + LANE_TRAJECTORY_LIMIT + 3072);
         assert!(context.contains("diff-head"));
         assert!(context.contains("diff-tail"));

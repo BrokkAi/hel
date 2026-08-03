@@ -66,8 +66,6 @@ pub(crate) struct ReviewSnapshot {
     alternate_object_dir: PathBuf,
     base_tree: String,
     target_tree: String,
-    diffstat: String,
-    changed_line_count: usize,
     full_patch_path: PathBuf,
     _lease: Arc<tempfile::TempDir>,
 }
@@ -87,14 +85,6 @@ impl ReviewSnapshot {
 
     pub(crate) fn target_tree(&self) -> &str {
         &self.target_tree
-    }
-
-    pub(crate) fn diffstat(&self) -> &str {
-        &self.diffstat
-    }
-
-    pub(crate) fn changed_line_count(&self) -> usize {
-        self.changed_line_count
     }
 
     pub(crate) async fn full_patch(&self) -> Result<String, String> {
@@ -126,13 +116,6 @@ impl ReviewSnapshot {
         let patch = self
             .diff_trees(&previous.target_tree, &self.target_tree, &[])
             .await?;
-        let diffstat = self
-            .diff_trees(
-                &previous.target_tree,
-                &self.target_tree,
-                &["--stat", "--summary"],
-            )
-            .await?;
         let full_patch_path = self._lease.path().join(format!(
             "review-interval-{}-{}.patch",
             previous.target_tree, self.target_tree
@@ -147,8 +130,6 @@ impl ReviewSnapshot {
             alternate_object_dir: self.alternate_object_dir.clone(),
             base_tree: previous.target_tree.clone(),
             target_tree: self.target_tree.clone(),
-            diffstat,
-            changed_line_count: changed_line_count(&patch),
             full_patch_path,
             _lease: Arc::clone(&self._lease),
         })
@@ -195,8 +176,6 @@ impl ReviewSnapshot {
         repo_root: PathBuf,
         base_tree: &str,
         target_tree: &str,
-        diffstat: &str,
-        changed_line_count: usize,
         patch: &str,
     ) -> Self {
         let scratch = Arc::new(tempfile::tempdir().expect("review snapshot tempdir"));
@@ -212,8 +191,6 @@ impl ReviewSnapshot {
             alternate_object_dir,
             base_tree: base_tree.to_string(),
             target_tree: target_tree.to_string(),
-            diffstat: diffstat.to_string(),
-            changed_line_count,
             full_patch_path,
             _lease: scratch,
         }
@@ -255,8 +232,8 @@ impl WorkspaceDelta {
         }
     }
 
-    /// A changed delta whose receipt is the `--stat --summary` evidence, which
-    /// is what compact per-run summaries are read from.
+    /// A changed delta whose receipt is the `--stat --summary` evidence used by
+    /// compact per-run subagent progress summaries.
     #[cfg(test)]
     pub(crate) fn changed_with_receipt_for_test(receipt: String) -> Self {
         Self {
@@ -648,8 +625,6 @@ impl GitTreeSnapshot {
             alternate_object_dir: self.alternate_object_dir.clone(),
             base_tree: self.baseline_tree.clone(),
             target_tree: after_tree,
-            diffstat: receipt.clone(),
-            changed_line_count: changed_line_count(&patch),
             full_patch_path,
             _lease: Arc::clone(&self.scratch),
         };
@@ -847,21 +822,6 @@ fn bound_text(text: String, limit: usize) -> String {
     let head_end = text.floor_char_boundary(head_len);
     let tail_start = text.ceil_char_boundary(text.len().saturating_sub(tail_len));
     format!("{}{}{}", &text[..head_end], MARKER, &text[tail_start..])
-}
-
-fn changed_line_count(diff: &str) -> usize {
-    let mut in_hunk = false;
-    let mut count = 0usize;
-    for line in diff.lines() {
-        if line.starts_with("diff --git ") {
-            in_hunk = false;
-        } else if line.starts_with("@@ ") {
-            in_hunk = true;
-        } else if in_hunk && (line.starts_with('+') || line.starts_with('-')) {
-            count = count.saturating_add(1);
-        }
-    }
-    count
 }
 
 fn truncate_chars(text: &str, limit: usize) -> String {
@@ -1107,8 +1067,6 @@ mod tests {
             std::fs::canonicalize(root).expect("canonical repository root")
         );
         assert_ne!(review.base_tree(), review.target_tree());
-        assert_eq!(review.changed_line_count(), 2);
-        assert!(review.diffstat().contains("state.txt"));
         let patch = review.full_patch().await.expect("full patch");
         assert!(patch.contains("-dirty before turn"));
         assert!(patch.contains("+head"));
@@ -1165,9 +1123,6 @@ mod tests {
         assert_eq!(interval.object_dir(), current.object_dir());
         assert_eq!(interval.base_tree(), previous.target_tree());
         assert_eq!(interval.target_tree(), current.target_tree());
-        assert_eq!(interval.changed_line_count(), 3);
-        assert!(interval.diffstat().contains("state.txt"));
-        assert!(interval.diffstat().contains("added.txt"));
         let patch = interval.full_patch().await.expect("corrective patch");
         assert!(patch.contains("-first review state"), "{patch}");
         assert!(patch.contains("+corrected state"), "{patch}");
@@ -1219,8 +1174,6 @@ mod tests {
             .expect("revert interval");
         let patch = interval.full_patch().await.expect("revert patch");
         assert!(!patch.trim().is_empty());
-        assert!(!interval.diffstat().trim().is_empty());
-        assert_eq!(interval.changed_line_count(), 2);
         assert!(patch.contains("-reviewed change"), "{patch}");
         assert!(patch.contains("+baseline"), "{patch}");
     }
@@ -1390,8 +1343,6 @@ mod tests {
         let review = delta.review_snapshot().expect("exact review snapshot");
         let full = review.full_patch().await.expect("full patch");
         assert!(full.len() > REVIEW_PATCH_LIMIT);
-        assert_eq!(review.changed_line_count(), 201);
-        assert!(review.diffstat().contains("large.txt"));
     }
 
     #[tokio::test]
