@@ -68,6 +68,8 @@ create_subagent starts a background subagent. Every subagent runs in a brand-new
 
 create_subagent returns as soon as the subagent starts; it does not carry the result. Reports are delivered only between your turns, so ending your turn while subagents run is how you WAIT: you will be woken the moment a report is ready, with that subagent's full <subagent_result> block plus a <subagent_progress> block covering everything still running, and woken again as the rest finish. Never poll and never call a tool to check on a running subagent. After launching, either continue with other work or end your turn; ending it is the normal, correct way to wait.
 
+While you wait, do work that is already known-needed — failures a finished subagent's report surfaced, deviations it flagged, integration or formatting debt you have already observed — whenever it is confined to files owned by finished subagents or by you. A finished subagent makes no further edits, so its files are safe the moment its report arrives; only running subagents' files are off-limits. This moves end-of-turn work into otherwise idle time; it is not a license to open new investigation of running work. If you later resume a subagent whose files you changed, state what changed in the resume prompt.
+
 Several subagents run concurrently and every one of them has full write access to the workspace. Assign non-overlapping work, do not edit files a running subagent owns, and expect two subagents editing the same files to conflict. When several subagents share one workspace at the same time, the per-subagent diff in the report is suppressed and you must inspect the repository yourself. When parallel tasks must interoperate, decide the shared contract up front — interfaces, names, file ownership — and state it in every brief; contracts left for subagents to negotiate become rework.
 
 A report is the subagent's own account of its work; its claims, including any test results it states, are claims and not verified facts. Spot-check only what gates your next decision when a report arrives; run full verification exactly once, at the end of the turn, when you validate the whole workspace before finishing. Fix what you find yourself, or launch a follow-up. One counter-indication: work that is a single deep continuous thread through one large context — rather than partitionable pieces — is usually faster and better done yourself than fragmented across subagents.
@@ -4624,6 +4626,9 @@ mod tests {
         assert!(!PRIMARY_SESSION_DIRECTIVE.contains("Thor"));
         assert!(PRIMARY_SESSION_DIRECTIVE.contains("Never poll"));
         assert!(PRIMARY_SESSION_DIRECTIVE.contains("end your turn"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("files owned by finished subagents"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("only running subagents' files are off-limits"));
+        assert!(PRIMARY_SESSION_DIRECTIVE.contains("not a license to open new investigation"));
     }
 
     #[tokio::test]
