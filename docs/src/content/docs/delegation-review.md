@@ -1,9 +1,9 @@
 ---
-title: Delegation and review
-description: Shape standalone subagent briefs and interpret Mjolnir's discrete review.
+title: Delegation and adversarial review
+description: Give Codex bounded subagent work and interpret Mjolnir's independent review pass.
 ---
 
-Delegation works best when the task has a clear seam, concrete inputs, and an
+Codex delegation works best when the task has a clear seam, concrete inputs, and an
 observable finish condition. A subagent runs in a brand-new session with no
 memory of the conversation, so the brief has to carry everything.
 
@@ -56,9 +56,11 @@ review the requested command, path, workspace root, and side effects first.
 
 ## Discrete review
 
-When a turn that launched at least one subagent completes with the pool drained
-and the workspace changed, Mjolnir holds the completion and reviews the work
-before releasing it:
+When automatic review is enabled, any completed turn that changed the workspace
+is reviewable once write-capable implementation subagents have drained. This is
+independent from delegation: a turn implemented entirely by the primary follows
+the same review gate. Mjolnir holds the completion and reviews the work before
+releasing it:
 
 1. A single self-contained user prompt goes directly to review without another
    model call. For multi-message histories, a read-only intent analyst extracts
@@ -81,6 +83,9 @@ before releasing it:
 4. Surviving findings are injected as a corrective turn on the primary, framed
    as strong leads to verify rather than instructions to obey. Nothing survives
    vetting means the turn is released as it stands.
+5. If correction changes the workspace, one bounded, delta-scoped verification
+   pass checks the corrections while reusing prior evidence instead of blindly
+   relaunching every specialist.
 
 The supervisor and reviewers have no model-turn deadline. The supervisor is
 reported as an internal `review_session`, while selected specialists remain
@@ -94,7 +99,7 @@ accounted to the review seat. Discrete review is toggled on the Agents tab of
 
 | Surface | Behavior |
 | --- | --- |
-| Discrete review | Automatic end-of-turn lane review after subagent work changed the workspace |
+| Discrete review | Automatic end-of-turn review whenever the completed turn changed the workspace |
 | `/review recent` | Findings-only review of the latest change-producing turn |
 | `/review uncommitted` | Findings-only review of all current worktree changes |
 | `/review head` | Findings-only review of `HEAD` |
@@ -108,4 +113,4 @@ When comparing setups, record the exact primary and subagent models and
 adapters, how many subagents ran and whether they overlapped, permission
 decisions, elapsed time, token and cost telemetry, validation result, review
 findings, and whether the requested delegation actually occurred. The checked
-[10-minute evaluation](/evaluate/) provides a small common task.
+[10-minute Codex evaluation](/evaluate/) provides a small common task.
