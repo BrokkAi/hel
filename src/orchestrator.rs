@@ -901,6 +901,63 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                                 });
                             primary_review_prompt_active = true;
                         }
+                        discrete_review::ReviewVerdict::Advisory {
+                            synthesis,
+                            evidence: _,
+                        } => {
+                            emit_workflow(
+                                &workflow,
+                                WorkflowEvent::new(
+                                    workflow_id,
+                                    WorkflowTransition::IssuesValidated {
+                                        pass: completed_pass,
+                                        summaries: review_issue_summaries(&synthesis),
+                                    },
+                                ),
+                            );
+                            let coverage = workflow_coverage(&workflow, workflow_id);
+                            let workflow_outcome = if coverage == WorkflowCoverage::Complete {
+                                WorkflowOutcome::Clean
+                            } else {
+                                WorkflowOutcome::Degraded
+                            };
+                            emit_workflow(
+                                &workflow,
+                                WorkflowEvent::new(
+                                    workflow_id,
+                                    WorkflowTransition::Terminal {
+                                        outcome: workflow_outcome,
+                                        coverage,
+                                    },
+                                ),
+                            );
+                            let _ = events_tx.send(UiEvent::Info(if matches!(
+                                workflow_outcome,
+                                WorkflowOutcome::Clean
+                            ) {
+                                "discrete review · advisory findings only".to_string()
+                            } else {
+                                "discrete review · advisory findings with degraded coverage"
+                                    .to_string()
+                            }));
+                            if let Some(saved_turn) = saved_turn {
+                                last_changed_turn = Some(saved_turn);
+                            }
+                            let _ = events_tx.send(completion);
+                            reset_turn_state(
+                                &workflow,
+                                &mut trajectory,
+                                &mut held_completion,
+                                &mut discrete_review_started,
+                                &mut review_in_flight,
+                                &mut correction_review_base,
+                                &mut correction_rounds,
+                                &mut primary_review_prompt_active,
+                                &mut review_cancel_pending,
+                            )
+                            .await;
+                            idle_epoch = Some(epoch);
+                        }
                         discrete_review::ReviewVerdict::Clean => {
                             let coverage = workflow_coverage(&workflow, workflow_id);
                             let workflow_outcome = if coverage == WorkflowCoverage::Complete {
@@ -2150,6 +2207,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advisory_only_findings_release_completion_without_correction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let snapshot = changed_workspace(temp.path()).await;
+        let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawned_passes = Arc::clone(&passes);
+        let spawner = discrete_review::Spawner::stub(move |job, _events, _cancel, outcomes| {
+            spawned_passes.fetch_add(1, Ordering::SeqCst);
+            let _ = outcomes.send(discrete_review::ReviewOutcome {
+                epoch: job.epoch,
+                verdict: discrete_review::ReviewVerdict::Advisory {
+                    synthesis: "[P2] src/header.rs:1 -- license header could be normalized"
+                        .to_string(),
+                    evidence: discrete_review::ReviewPassEvidence::default(),
+                },
+            });
+        });
+        let mut running = spawn(runtime_rx, fanout_config(command_tx, spawner));
+        running
+            .handle
+            .begin_turn(1, "normalize a header".to_string(), Vec::new(), snapshot)
+            .await;
+        runtime_tx.send(completion()).expect("send completion");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_advisory_summary = false;
+        let mut saw_advisory_info = false;
+        loop {
+            let event = tokio::time::timeout_at(deadline, running.events.recv())
+                .await
+                .expect("advisory verdict released completion")
+                .expect("orchestrated event");
+            if matches!(
+                &event,
+                UiEvent::Workflow(WorkflowEvent {
+                    transition: WorkflowTransition::IssuesValidated { summaries, .. },
+                    ..
+                }) if summaries.iter().any(|summary| summary.contains("[P2] src/header.rs:1"))
+            ) {
+                saw_advisory_summary = true;
+            }
+            if matches!(&event, UiEvent::Info(text) if text.contains("advisory findings only")) {
+                saw_advisory_info = true;
+            }
+            if matches!(event, UiEvent::PromptDone { .. }) {
+                break;
+            }
+        }
+
+        assert_eq!(1, passes.load(Ordering::SeqCst));
+        assert!(saw_advisory_summary, "advisory findings must be reported");
+        assert!(saw_advisory_info, "advisory-only outcome must be visible");
+        assert!(
+            command_rx.try_recv().is_err(),
+            "advisory-only findings must not dispatch a corrective prompt"
+        );
+
+        drop(runtime_tx);
+        running.task.await.expect("orchestrator task");
+    }
+
+    #[tokio::test]
     async fn changed_findings_correction_gets_another_specialist_pass() {
         let temp = tempfile::tempdir().expect("tempdir");
         let snapshot = changed_workspace(temp.path()).await;
@@ -2259,7 +2379,7 @@ mod tests {
                             .collect::<Vec<_>>()
                     );
                     discrete_review::ReviewVerdict::Findings {
-                        synthesis: "[P2] tracked.txt:1 -- second finding".to_string(),
+                        synthesis: "[P1] tracked.txt:1 -- second finding".to_string(),
                         // `run_async` merges the inherited Mímir outcome with
                         // the newly selected Týr outcome before returning.
                         evidence: discrete_review::ReviewPassEvidence {
@@ -2405,7 +2525,7 @@ mod tests {
             let _ = outcomes.send(discrete_review::ReviewOutcome {
                 epoch: job.epoch,
                 verdict: discrete_review::ReviewVerdict::Findings {
-                    synthesis: "[P2] src/upload.rs:12 -- suspected issue".to_string(),
+                    synthesis: "[P1] src/upload.rs:12 -- suspected issue".to_string(),
                     evidence: discrete_review::ReviewPassEvidence::default(),
                 },
             });
@@ -2473,7 +2593,7 @@ mod tests {
             let _ = outcomes.send(discrete_review::ReviewOutcome {
                 epoch: job.epoch,
                 verdict: discrete_review::ReviewVerdict::Findings {
-                    synthesis: format!("[P2] tracked.txt:1 -- finding from pass {pass}"),
+                    synthesis: format!("[P1] tracked.txt:1 -- finding from pass {pass}"),
                     evidence: discrete_review::ReviewPassEvidence::default(),
                 },
             });
@@ -2571,7 +2691,7 @@ mod tests {
             let _ = outcomes.send(discrete_review::ReviewOutcome {
                 epoch: job.epoch,
                 verdict: discrete_review::ReviewVerdict::Findings {
-                    synthesis: "[P2] tracked.txt:1 -- persistent finding".to_string(),
+                    synthesis: "[P1] tracked.txt:1 -- persistent finding".to_string(),
                     evidence: discrete_review::ReviewPassEvidence::default(),
                 },
             });
