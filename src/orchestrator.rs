@@ -486,10 +486,6 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                 // never has to ask what the rest are doing.
                 let progress = config.subagent_runs.progress_block().await;
                 let batch = std::mem::take(&mut pending_reports);
-                // Every report in the batch is accounted, injected or not.
-                for _ in 0..batch.len() {
-                    config.subagent_report_bus.close();
-                }
                 let injected = batch
                     .into_iter()
                     .filter(|report| {
@@ -502,6 +498,10 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                                 subagent_id = report.subagent_id,
                                 "dropping a report already returned by subagent_cancel"
                             );
+                        } else {
+                            // Claims settle their matching report by id. Every
+                            // other report is settled when this batch handles it.
+                            config.subagent_report_bus.close(report.subagent_id);
                         }
                         !claimed
                     })
@@ -801,7 +801,7 @@ pub fn spawn(mut runtime_events: mpsc::UnboundedReceiver<UiEvent>, mut config: C
                 report = config.subagent_reports.recv() => {
                     let Some(report) = report else { continue; };
                     if matches!(report.outcome, SubagentOutcome::Cancelled) {
-                        config.subagent_report_bus.close();
+                        config.subagent_report_bus.close(report.subagent_id);
                         if config.subagent_report_bus.pending() == 0
                             && pending_reports.is_empty()
                         {
@@ -3569,7 +3569,7 @@ mod tests {
             injection_config(command_tx, bus.clone(), reports),
         );
 
-        bus.open();
+        bus.open(3);
         bus.deliver(report(3, "fix-tests", SubagentOutcome::Completed));
 
         let prompt = next_prompt(&mut command_rx).await;
@@ -3611,7 +3611,7 @@ mod tests {
             .expect("send an in-turn event");
 
         for id in [1, 2] {
-            bus.open();
+            bus.open(id);
             bus.deliver(report(
                 id,
                 &format!("lane-{id}"),
@@ -3667,7 +3667,7 @@ mod tests {
             ),
         );
 
-        bus.open();
+        bus.open(3);
         bus.deliver(report(3, "fix-tests", SubagentOutcome::Completed));
 
         let prompt = next_prompt(&mut command_rx).await;
@@ -3712,7 +3712,7 @@ mod tests {
         );
         // The subagent is admitted and owes a report: the heartbeat must not
         // disturb that accounting, which is what headless drains on.
-        bus.open();
+        bus.open(4);
 
         let prompt = next_prompt(&mut command_rx).await;
         assert!(prompt.starts_with("<subagent_progress>"));
@@ -3746,7 +3746,7 @@ mod tests {
                 progress_wake_interval(0),
             ),
         );
-        bus.open();
+        bus.open(4);
 
         assert!(
             tokio::time::timeout(Duration::from_millis(200), command_rx.recv())
@@ -3780,7 +3780,7 @@ mod tests {
             ),
         );
 
-        bus.open();
+        bus.open(3);
         bus.deliver(report(3, "fix-tests", SubagentOutcome::Completed));
         let injected = next_prompt(&mut command_rx).await;
         assert!(injected.contains("<subagent_result id=\"3\""));
@@ -3811,7 +3811,7 @@ mod tests {
             injection_config(command_tx, bus.clone(), reports),
         );
 
-        bus.open();
+        bus.open(3);
         bus.claim(3);
         bus.deliver(report(3, "fix-tests", SubagentOutcome::Completed));
         assert!(
@@ -3827,6 +3827,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claiming_an_already_injected_report_does_not_close_another_report() {
+        let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (bus, reports) = SubagentReportBus::channel();
+        let running = spawn(
+            runtime_rx,
+            injection_config(command_tx, bus.clone(), reports),
+        );
+
+        bus.open(3);
+        bus.open(4);
+        bus.deliver(report(3, "finished", SubagentOutcome::Completed));
+        let injected = next_prompt(&mut command_rx).await;
+        assert!(injected.contains("<subagent_result id=\"3\""));
+        assert_eq!(bus.pending(), 1, "subagent 4 still owes its report");
+
+        bus.claim(3);
+        assert_eq!(
+            bus.pending(),
+            1,
+            "releasing an already injected report must not account subagent 4"
+        );
+
+        bus.deliver(report(4, "still-running", SubagentOutcome::Completed));
+        let injected = next_prompt(&mut command_rx).await;
+        assert!(injected.contains("<subagent_result id=\"4\""));
+        assert_eq!(bus.pending(), 0);
+
+        drop(runtime_tx);
+        running.task.await.expect("orchestrator task");
+    }
+
+    #[tokio::test]
     async fn cancelled_reports_are_dropped_instead_of_injected() {
         let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
@@ -3836,7 +3869,7 @@ mod tests {
             injection_config(command_tx, bus.clone(), reports),
         );
 
-        bus.open();
+        bus.open(7);
         bus.deliver(report(7, "abandoned", SubagentOutcome::Cancelled));
         assert!(
             tokio::time::timeout(Duration::from_millis(200), command_rx.recv())
