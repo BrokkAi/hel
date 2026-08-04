@@ -315,7 +315,7 @@ fn remote_builtin_command_records(include_fork: bool) -> Vec<CommandRecord> {
         ),
         command_record(
             REMOTE_BUILTIN_MJCONFIG_COMMAND,
-            "focus session configuration controls",
+            "open the configuration editor",
             None,
             "mjolnir",
         ),
@@ -961,6 +961,7 @@ struct ServerState {
     code_guard: Arc<Mutex<CodeAuthGuard>>,
     workspace_roots: Arc<Vec<PathBuf>>,
     session_manager: Arc<ServerSessionManager>,
+    mjconfig: Arc<MjConfigRuntime>,
 }
 
 #[derive(Debug)]
@@ -969,14 +970,70 @@ struct ServerAgentSession {
     task: JoinHandle<()>,
 }
 
-#[derive(Debug)]
-struct ServerSessionManager {
+/// The agent binding new server-owned sessions launch with, plus the hash of
+/// the config file it was resolved from so a `/mjconfig` save (or any other
+/// config edit) triggers a re-resolve before the next session starts.
+#[derive(Debug, Clone)]
+struct ServerSessionLaunch {
     agent: SelectedAgent,
     roster: Option<roster::Roster>,
+    config_hash: Option<u64>,
+}
+
+#[derive(Debug)]
+struct ServerSessionManager {
+    launch: RwLock<ServerSessionLaunch>,
+    /// Directory the startup roster was resolved against; config-change
+    /// re-resolves reuse it. `None` disables re-resolving (tests).
+    resolve_cwd: Option<PathBuf>,
     additional_directories: Vec<PathBuf>,
     snapshot_exclusions: Vec<PathBuf>,
     fs_max_text_bytes: u64,
     sessions: Mutex<Vec<ServerAgentSession>>,
+}
+
+fn selected_agent_for_roster(roster: &roster::Roster) -> SelectedAgent {
+    let primary = &roster.primary;
+    SelectedAgent {
+        source_id: format!("roster:{}", primary.model.model),
+        program: primary.launch.command.clone(),
+        args: primary.launch.args.clone(),
+        env: primary.launch.env.clone(),
+    }
+}
+
+/// Display-only seat bindings for the `/mjconfig` Agents panel, mirroring what
+/// the roster bound for each seat.
+fn models_config_from_roster(roster: &roster::Roster) -> config::ModelsConfig {
+    config::ModelsConfig {
+        primary: roster.primary.model.model.clone(),
+        review: roster.review_supervisor.as_ref().map_or_else(
+            || config::DISABLED_MODEL.to_string(),
+            |agent| agent.model.model.clone(),
+        ),
+        subagent: roster.subagent_default.as_ref().map_or_else(
+            || config::DISABLED_MODEL.to_string(),
+            |agent| agent.model.model.clone(),
+        ),
+        primary_source: Some(roster.primary.launch.source_id.clone()),
+        review_source: roster
+            .review_supervisor
+            .as_ref()
+            .map(|agent| agent.launch.source_id.clone()),
+        subagent_source: roster
+            .subagent_default
+            .as_ref()
+            .map(|agent| agent.launch.source_id.clone()),
+    }
+}
+
+/// Content hash of the saved config file; `None` when it cannot be read.
+fn config_file_hash(config_path: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let contents = std::fs::read(config_path).ok()?;
+    let mut hasher = std::hash::DefaultHasher::new();
+    contents.hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 impl ServerSessionManager {
@@ -987,8 +1044,12 @@ impl ServerSessionManager {
         fs_max_text_bytes: u64,
     ) -> Self {
         Self {
-            agent,
-            roster: None,
+            launch: RwLock::new(ServerSessionLaunch {
+                agent,
+                roster: None,
+                config_hash: None,
+            }),
+            resolve_cwd: None,
             additional_directories,
             snapshot_exclusions: Vec::new(),
             fs_max_text_bytes,
@@ -998,19 +1059,19 @@ impl ServerSessionManager {
 
     fn new_roster(
         roster: roster::Roster,
+        config_hash: Option<u64>,
+        resolve_cwd: PathBuf,
         additional_directories: Vec<PathBuf>,
         snapshot_exclusions: Vec<PathBuf>,
         fs_max_text_bytes: u64,
     ) -> Self {
-        let primary = &roster.primary;
         Self {
-            agent: SelectedAgent {
-                source_id: format!("roster:{}", primary.model.model),
-                program: primary.launch.command.clone(),
-                args: primary.launch.args.clone(),
-                env: primary.launch.env.clone(),
-            },
-            roster: Some(roster),
+            launch: RwLock::new(ServerSessionLaunch {
+                agent: selected_agent_for_roster(&roster),
+                roster: Some(roster),
+                config_hash,
+            }),
+            resolve_cwd: Some(resolve_cwd),
             additional_directories,
             snapshot_exclusions,
             fs_max_text_bytes,
@@ -1018,10 +1079,49 @@ impl ServerSessionManager {
         }
     }
 
+    /// Re-resolve the roster when the saved config changed since the last
+    /// resolution, so a new session launches what `/mjconfig` (or any other
+    /// config edit) saved instead of the binding frozen at server startup.
+    /// Returns the fresh roster when a re-resolve happened, and an error when
+    /// the saved config cannot bind a roster at all — callers must refuse to
+    /// start the session rather than silently launching the stale binding.
+    async fn refresh_for_config(
+        &self,
+        config_path: &Path,
+    ) -> std::result::Result<Option<roster::Roster>, String> {
+        let Some(resolve_cwd) = self.resolve_cwd.clone() else {
+            return Ok(None);
+        };
+        let hash = config_file_hash(config_path);
+        {
+            let launch = self.launch.read().expect("server launch lock");
+            if launch.config_hash == hash {
+                return Ok(None);
+            }
+        }
+        let Ok(config) = config::Config::load(config_path) else {
+            return Ok(None);
+        };
+        match roster::resolve(&config, &resolve_cwd).await {
+            Ok(roster) => {
+                let mut launch = self.launch.write().expect("server launch lock");
+                launch.agent = selected_agent_for_roster(&roster);
+                launch.roster = Some(roster.clone());
+                launch.config_hash = hash;
+                Ok(Some(roster))
+            }
+            Err(error) => {
+                warn!("config changed but roster re-resolve failed: {error:#}");
+                Err(format!("{error:#}"))
+            }
+        }
+    }
+
     fn start_session(&self, cwd: PathBuf) {
+        let launch = self.launch.read().expect("server launch lock").clone();
         let session = start_server_agent_session(
-            self.agent.clone(),
-            self.roster.clone(),
+            launch.agent,
+            launch.roster,
             cwd,
             self.additional_directories.clone(),
             self.snapshot_exclusions.clone(),
@@ -2638,8 +2738,16 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     };
     let workspace_roots =
         crate::paths::WorkspaceRoots::new(&cwd, &additional_directories)?.active_roots();
+    let mjconfig = Arc::new(MjConfigRuntime::new(
+        config_path.clone(),
+        resolved.choices.clone(),
+        Some(models_config_from_roster(&resolved)),
+        resolved.inventory.clone(),
+    ));
     let session_manager = Arc::new(ServerSessionManager::new_roster(
         resolved,
+        config_file_hash(&config_path),
+        cwd.clone(),
         additional_directories,
         snapshot_exclusions,
         fs_max_text_bytes,
@@ -2656,6 +2764,7 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
         session_ttl,
         workspace_roots,
         session_manager: Arc::clone(&session_manager),
+        mjconfig,
     });
 
     let tls_config = match &tailscale_tls {
@@ -2788,9 +2897,23 @@ fn start_server_agent_session(
     let (runtime_cmd_tx, runtime_cmd_rx) = mpsc::unbounded_channel();
     let (server_cmd_tx, mut server_cmd_rx) = mpsc::unbounded_channel();
     let (remote_event_tx, mut remote_event_rx) = mpsc::unbounded_channel();
-    let agent_source_id = agent.source_id.clone();
+    // The adapter source id ("codex-acp", ...) — not the synthetic
+    // `roster:{model}` launch id — so saved session options load from and
+    // accepted live values persist to the same buckets the TUI uses.
+    let agent_source_id = roster.as_ref().map_or_else(
+        || agent.source_id.clone(),
+        |resolved| resolved.primary.launch.source_id.clone(),
+    );
     let config_path = config::default_config_path();
     let app_config = config::Config::load(&config_path).unwrap_or_default();
+    let saved_session_config = roster.as_ref().map_or_else(HashMap::new, |resolved| {
+        config::load_saved_session_config(
+            &config_path,
+            &resolved.primary.launch.source_id,
+            &resolved.primary.model.model,
+            config::SessionConfigSeat::Primary,
+        )
+    });
     let project_label = crate::paths::project_label_from_cwd(&cwd);
     let worktree_label = crate::paths::worktree_name_from_cwd(&cwd);
     // With a roster the session has a real primary model; align the published
@@ -2905,7 +3028,7 @@ fn start_server_agent_session(
         access_mode: crate::acp::RuntimeAccessMode::Full,
         agent_source_id: Some(agent_source_id),
         config_path: Some(config_path),
-        saved_session_config: HashMap::new(),
+        saved_session_config,
         role_config,
         subagents,
         side_prompt_policy: false,
@@ -3698,6 +3821,1141 @@ fn spawn_tailscale_cert_renewer(ts: TailscaleTls, resolver: Arc<SniCertResolver>
     });
 }
 
+/// Server-side runtime for the web `/mjconfig` editor: where the config file
+/// lives, the model choices and active seat bindings resolved at server start,
+/// and the at-most-one background login/install job the panel may run.
+#[derive(Debug)]
+struct MjConfigRuntime {
+    config_path: PathBuf,
+    choices: Mutex<Vec<roster::ModelChoice>>,
+    active_models: Mutex<Option<config::ModelsConfig>>,
+    /// Probed ACP inventory from the last roster resolution. Carries the
+    /// agent-advertised session options; rebuilding inventory from config
+    /// alone would lose them (`discover_inventory` starts them empty).
+    inventory: Mutex<roster::AcpInventory>,
+    login: Mutex<Option<MjLoginJob>>,
+    install: Mutex<Option<MjInstallJob>>,
+    registry: tokio::sync::Mutex<Option<crate::registry::Registry>>,
+}
+
+impl MjConfigRuntime {
+    fn new(
+        config_path: PathBuf,
+        choices: Vec<roster::ModelChoice>,
+        active_models: Option<config::ModelsConfig>,
+        inventory: roster::AcpInventory,
+    ) -> Self {
+        Self {
+            config_path,
+            choices: Mutex::new(choices),
+            active_models: Mutex::new(active_models),
+            inventory: Mutex::new(inventory),
+            login: Mutex::new(None),
+            install: Mutex::new(None),
+            registry: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Sync the editor's model choices and active seat details after a
+    /// config-change re-resolve, so the panel reports the new bindings.
+    fn update_from_roster(&self, roster: &roster::Roster) {
+        *self.choices.lock().expect("mjconfig choices lock") = roster.choices.clone();
+        *self.active_models.lock().expect("mjconfig models lock") =
+            Some(models_config_from_roster(roster));
+        *self.inventory.lock().expect("mjconfig inventory lock") = roster.inventory.clone();
+    }
+}
+
+/// A vendor sign-in running server-side. The child's combined output streams
+/// into `output` so the browser can show the device-auth URL and code; the
+/// spawned child uses `kill_on_drop`, so aborting the task also kills it.
+#[derive(Debug)]
+struct MjLoginJob {
+    vendor: crate::auth::AuthVendor,
+    output: Arc<Mutex<String>>,
+    result: Arc<Mutex<Option<std::result::Result<String, String>>>>,
+    abort: tokio::task::AbortHandle,
+}
+
+#[derive(Debug, Default)]
+struct MjInstallProgress {
+    total_bytes: Option<u64>,
+    downloaded_bytes: u64,
+    extracting: bool,
+    result: Option<std::result::Result<(PathBuf, Vec<String>), String>>,
+}
+
+#[derive(Debug)]
+struct MjInstallJob {
+    agent: crate::registry::Agent,
+    progress: Arc<Mutex<MjInstallProgress>>,
+    abort: tokio::task::AbortHandle,
+}
+
+#[derive(Debug, Serialize)]
+struct MjConfigSnapshot {
+    agents: MjAgentsPanel,
+    acp_servers: MjServersPanel,
+    /// Session options for the primary seat's bound ACP source, mirroring the
+    /// TUI's role-scoped Agents panel rows. `None` when no source has options.
+    primary_options: Option<MjSessionOptionsGroup>,
+    /// Session options for the subagent seat, mirroring the Subagents panel.
+    subagent_options: Option<MjSessionOptionsGroup>,
+    acp_priority: MjPriorityPanel,
+    appearance: MjAppearancePanel,
+    login: Option<MjLoginStatus>,
+    install: Option<MjInstallStatus>,
+    /// One-shot message produced while folding finished background jobs into
+    /// the config (e.g. "installed X" or an install failure).
+    notice: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MjAgentsPanel {
+    roles: Vec<MjRoleEntry>,
+    discrete_review: bool,
+    max_parallel: usize,
+    max_parallel_limit: usize,
+    auto_failover: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MjRoleEntry {
+    role: String,
+    label: String,
+    description: String,
+    model: String,
+    saved_detail: String,
+    active_detail: String,
+    choices: Vec<MjModelChoiceEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct MjModelChoiceEntry {
+    model: String,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MjServersPanel {
+    accounts: Vec<MjAccountEntry>,
+    servers: Vec<MjServerEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct MjAccountEntry {
+    vendor: String,
+    label: String,
+    status: String,
+    enables: String,
+    signed_in: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MjServerEntry {
+    id: String,
+    label: String,
+    policy: String,
+    allowed_policies: Vec<String>,
+    status: String,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MjSessionOptionsGroup {
+    server_id: String,
+    server_label: String,
+    options: Vec<MjSessionOptionEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct MjSessionOptionEntry {
+    key: String,
+    name: String,
+    value: String,
+    choices: Vec<MjSessionOptionChoice>,
+}
+
+#[derive(Debug, Serialize)]
+struct MjSessionOptionChoice {
+    value: String,
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MjPriorityPanel {
+    seats: Vec<MjPrioritySeatEntry>,
+    default_priority: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MjPrioritySeatEntry {
+    seat: String,
+    label: String,
+    /// `None` means "any enabled source".
+    source: Option<String>,
+    priority: Vec<MjPriorityServerEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct MjPriorityServerEntry {
+    id: String,
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MjAppearancePanel {
+    theme: String,
+    themes: Vec<String>,
+    spinner: String,
+    spinners: Vec<MjSpinnerEntry>,
+    feature_hints: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MjSpinnerEntry {
+    name: String,
+    frames: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MjLoginStatus {
+    vendor: String,
+    label: String,
+    running: bool,
+    output: String,
+    ok: Option<bool>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MjInstallStatus {
+    agent_id: String,
+    agent_name: String,
+    running: bool,
+    total_bytes: Option<u64>,
+    downloaded_bytes: u64,
+    extracting: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MjConfigApplyRequest {
+    primary_model: Option<String>,
+    review_model: Option<String>,
+    subagents_model: Option<String>,
+    discrete_review: Option<bool>,
+    max_parallel: Option<usize>,
+    auto_failover: Option<bool>,
+    theme: Option<String>,
+    spinner: Option<String>,
+    feature_hints: Option<bool>,
+    /// Server id → `auto` | `enabled` | `disabled`.
+    server_policies: Option<BTreeMap<String, String>>,
+    /// Server id → option key → value written to the primary seat's
+    /// role-scoped defaults (`agent.session_defaults`), like the TUI's
+    /// Agents panel.
+    primary_session_defaults: Option<BTreeMap<String, BTreeMap<String, String>>>,
+    /// Server id → option key → value for the subagent seat
+    /// (`subagents.session_defaults`).
+    subagent_session_defaults: Option<BTreeMap<String, BTreeMap<String, String>>>,
+    /// Seat (`primary` | `review` | `subagents`) → source/order edit.
+    priority: Option<BTreeMap<String, MjSeatPriorityEdit>>,
+    add_custom_server: Option<MjCustomServerRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MjSeatPriorityEdit {
+    /// `Some("")` clears the constraint back to "any enabled source".
+    source: Option<String>,
+    order: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MjCustomServerRequest {
+    name: String,
+    command: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MjLoginRequest {
+    vendor: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MjInstallRequest {
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MjRegistryEntry {
+    id: String,
+    name: String,
+    description: String,
+    version: String,
+    kind: String,
+}
+
+fn mjconfig_load(state: &ServerState) -> config::Config {
+    config::Config::load(&state.mjconfig.config_path).unwrap_or_default()
+}
+
+fn mjconfig_editor(state: &ServerState, config: config::Config) -> crate::settings::SettingsEditor {
+    let choices = state
+        .mjconfig
+        .choices
+        .lock()
+        .expect("mjconfig choices lock")
+        .clone();
+    // Rediscover on top of the cached probe inventory: policy and detection
+    // re-derive from the *current* config (a just-saved policy shows
+    // immediately) while probe-only fields like session options survive.
+    let cached = state
+        .mjconfig
+        .inventory
+        .lock()
+        .expect("mjconfig inventory lock")
+        .clone();
+    let inventory = roster::rediscover_inventory(&config, &cached);
+    let mut editor =
+        crate::settings::SettingsEditor::new(config, choices, None).with_inventory(inventory);
+    let active_models = state
+        .mjconfig
+        .active_models
+        .lock()
+        .expect("mjconfig models lock")
+        .clone();
+    if let Some(models) = active_models {
+        editor = editor.with_active_models(models);
+    }
+    editor
+}
+
+/// Mirror of the TUI's server-row status line in `settings::draw_servers`.
+fn mjconfig_server_status(server: &roster::AcpServerInfo) -> String {
+    let status = if server.installing {
+        "installing".to_string()
+    } else if server.policy == config::AcpServerPolicy::Disabled {
+        "disabled".to_string()
+    } else if let Some(error) = &server.error {
+        format!("error: {error}")
+    } else if server.model_count > 0 {
+        format!(
+            "ready; {} model{}",
+            server.model_count,
+            if server.model_count == 1 { "" } else { "s" }
+        )
+    } else if server.detected {
+        "ready".to_string()
+    } else {
+        "not ready".to_string()
+    };
+    match &server.subscription {
+        Some(subscription) => format!("{status} · {subscription}"),
+        None => status,
+    }
+}
+
+fn mjconfig_server_detail(server: &roster::AcpServerInfo) -> String {
+    if server.id == "anvil" {
+        return server.evidence.clone();
+    }
+    let args = server.launch.args.join(" ");
+    let command = if args.is_empty() {
+        server.launch.command.display().to_string()
+    } else {
+        format!("{} {args}", server.launch.command.display())
+    };
+    format!("{} · {command}", server.evidence)
+}
+
+fn policy_wire_name(policy: config::AcpServerPolicy) -> &'static str {
+    match policy {
+        config::AcpServerPolicy::Auto => "auto",
+        config::AcpServerPolicy::Enabled => "enabled",
+        config::AcpServerPolicy::Disabled => "disabled",
+    }
+}
+
+fn policy_from_wire(name: &str) -> Option<config::AcpServerPolicy> {
+    match name {
+        "auto" => Some(config::AcpServerPolicy::Auto),
+        "enabled" => Some(config::AcpServerPolicy::Enabled),
+        "disabled" => Some(config::AcpServerPolicy::Disabled),
+        _ => None,
+    }
+}
+
+const MJ_SEATS: [(crate::settings::PrioritySeat, &str, &str); 3] = [
+    (crate::settings::PrioritySeat::Primary, "primary", "Primary"),
+    (crate::settings::PrioritySeat::Review, "review", "Review"),
+    (
+        crate::settings::PrioritySeat::Subagents,
+        "subagents",
+        "Subagents",
+    ),
+];
+
+/// Fold a finished background install into the config, mirroring the TUI's
+/// `poll_background`: success registers the server enabled, failure surfaces
+/// as a notice. Returns the notice to show, if any.
+fn mjconfig_absorb_finished_install(state: &ServerState) -> Option<String> {
+    let mut guard = state
+        .mjconfig
+        .install
+        .lock()
+        .expect("mjconfig install lock");
+    let finished = {
+        let job = guard.as_ref()?;
+        let mut progress = job.progress.lock().expect("mjconfig install progress");
+        progress.result.take()
+    };
+    let result = finished?;
+    let job = guard.take().expect("job present");
+    match result {
+        Ok((command, args)) => {
+            let platform = crate::registry::current_platform();
+            let env = job
+                .agent
+                .distribution
+                .binary
+                .as_ref()
+                .and_then(|targets| targets.get(&platform))
+                .map(|target| target.env.clone())
+                .unwrap_or_default();
+            let mut config = mjconfig_load(state);
+            let server = config::ConfiguredAcpServer {
+                id: job.agent.id.clone(),
+                label: job.agent.name.clone(),
+                command,
+                args,
+                env,
+                origin: config::AcpServerOrigin::Registry,
+                policy: config::AcpServerPolicy::Enabled,
+            };
+            config
+                .acp
+                .servers
+                .retain(|existing| existing.id != server.id);
+            config.acp.policies.remove(&server.id);
+            config.acp.servers.push(server);
+            match config::save_user_config_preserving_session_routes(
+                &state.mjconfig.config_path,
+                &mut config,
+            ) {
+                Ok(()) => Some(format!("Installed {}", job.agent.name)),
+                Err(error) => Some(format!("Install saved settings failed: {error:#}")),
+            }
+        }
+        Err(error) => Some(format!("Install failed: {error}")),
+    }
+}
+
+fn mjconfig_login_status(state: &ServerState) -> Option<MjLoginStatus> {
+    let mut guard = state.mjconfig.login.lock().expect("mjconfig login lock");
+    let job = guard.as_ref()?;
+    let output = job.output.lock().expect("login output").clone();
+    let result = job.result.lock().expect("login result").clone();
+    let status = MjLoginStatus {
+        vendor: job.vendor.id().to_string(),
+        label: job.vendor.label().to_string(),
+        running: result.is_none(),
+        output,
+        ok: result.as_ref().map(|result| result.is_ok()),
+        message: result
+            .as_ref()
+            .map(|result| result.clone().unwrap_or_else(|error| error)),
+    };
+    if result.is_some() {
+        // Finished: report once, then clear so the next poll shows plain
+        // account status (which now reflects the new credentials).
+        *guard = None;
+    }
+    Some(status)
+}
+
+fn mjconfig_install_status(state: &ServerState) -> Option<MjInstallStatus> {
+    let guard = state
+        .mjconfig
+        .install
+        .lock()
+        .expect("mjconfig install lock");
+    let job = guard.as_ref()?;
+    let progress = job.progress.lock().expect("mjconfig install progress");
+    Some(MjInstallStatus {
+        agent_id: job.agent.id.clone(),
+        agent_name: job.agent.name.clone(),
+        running: progress.result.is_none(),
+        total_bytes: progress.total_bytes,
+        downloaded_bytes: progress.downloaded_bytes,
+        extracting: progress.extracting,
+    })
+}
+
+fn mjconfig_snapshot_response(state: &ServerState, notice: Option<String>) -> MjConfigSnapshot {
+    let install_notice = mjconfig_absorb_finished_install(state);
+    let config = mjconfig_load(state);
+    let editor = mjconfig_editor(state, config);
+    let config = &editor.config;
+    let inventory = editor.inventory();
+
+    // Mirrors the TUI's seat labels; settings.rs no longer exports them
+    // since #590 split its Agents/Subagents panels.
+    const ROLE_DESCRIPTIONS: [(&str, &str); 3] = [
+        ("Agent", "primary model; plans, implements, and answers"),
+        ("Review", "supervisor model for discrete review"),
+        ("Subagents", "default model for create_subagent delegations"),
+    ];
+    let roles = ROLE_DESCRIPTIONS
+        .iter()
+        .enumerate()
+        .map(|(index, (label, description))| {
+            let model = match index {
+                0 => &config.agent.model,
+                1 => &config.review.model,
+                _ => &config.subagents.model,
+            };
+            MjRoleEntry {
+                role: MJ_SEATS[index].1.to_string(),
+                label: (*label).to_string(),
+                description: (*description).to_string(),
+                model: model.clone(),
+                saved_detail: editor.staged_model_detail(model),
+                active_detail: editor.active_model_detail(index),
+                choices: editor
+                    .model_choices(index)
+                    .into_iter()
+                    .map(|choice| MjModelChoiceEntry {
+                        detail: editor.staged_model_detail(&choice),
+                        model: choice,
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+
+    let accounts = crate::auth::AuthVendor::ALL
+        .into_iter()
+        .map(|vendor| {
+            let credentials = crate::auth::detect(vendor);
+            MjAccountEntry {
+                vendor: vendor.id().to_string(),
+                label: vendor.label().to_string(),
+                status: credentials.status(),
+                enables: vendor.enables().to_string(),
+                signed_in: credentials.available(),
+            }
+        })
+        .collect();
+
+    let servers = inventory
+        .servers
+        .iter()
+        .map(|server| {
+            let allowed: &[config::AcpServerPolicy] = if server.origin.is_some() {
+                &[
+                    config::AcpServerPolicy::Enabled,
+                    config::AcpServerPolicy::Disabled,
+                ]
+            } else {
+                &[
+                    config::AcpServerPolicy::Auto,
+                    config::AcpServerPolicy::Enabled,
+                    config::AcpServerPolicy::Disabled,
+                ]
+            };
+            MjServerEntry {
+                id: server.id.clone(),
+                label: server.label.clone(),
+                policy: policy_wire_name(server.policy).to_string(),
+                allowed_policies: allowed
+                    .iter()
+                    .map(|policy| policy_wire_name(*policy).to_string())
+                    .collect(),
+                status: mjconfig_server_status(server),
+                detail: mjconfig_server_detail(server),
+            }
+        })
+        .collect();
+
+    let seat_options = |seat: crate::settings::SessionDefaultsSeat| {
+        let rows = editor.session_option_rows(seat);
+        let (server_index, _) = *rows.first()?;
+        let server = inventory.servers.get(server_index)?;
+        let options = rows
+            .iter()
+            .filter_map(|(_, option_index)| server.session_config.get(*option_index))
+            .map(|option| MjSessionOptionEntry {
+                key: acp::session_config_option_key(&option.id),
+                name: option.name.clone(),
+                value: editor.saved_session_value(seat, &server.id, option),
+                choices: crate::settings::session_option_choices(option)
+                    .into_iter()
+                    .map(|(value, label)| MjSessionOptionChoice { value, label })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        (!options.is_empty()).then(|| MjSessionOptionsGroup {
+            server_id: server.id.clone(),
+            server_label: server.label.clone(),
+            options,
+        })
+    };
+    let primary_options = seat_options(crate::settings::SessionDefaultsSeat::Primary);
+    let subagent_options = seat_options(crate::settings::SessionDefaultsSeat::Subagents);
+
+    let seats = MJ_SEATS
+        .into_iter()
+        .map(|(seat, wire, label)| MjPrioritySeatEntry {
+            seat: wire.to_string(),
+            label: label.to_string(),
+            source: editor.source(seat).clone(),
+            priority: editor
+                .effective_priority(seat)
+                .into_iter()
+                .map(|id| MjPriorityServerEntry {
+                    label: inventory
+                        .servers
+                        .iter()
+                        .find(|server| server.id == id)
+                        .map_or_else(|| id.clone(), |server| server.label.clone()),
+                    id,
+                })
+                .collect(),
+        })
+        .collect();
+
+    let appearance = MjAppearancePanel {
+        theme: config.theme.to_string(),
+        themes: crate::theme::TerminalThemeKind::ALL
+            .into_iter()
+            .map(|kind| kind.to_string())
+            .collect(),
+        spinner: config.spinner.to_string(),
+        spinners: crate::spinner::SpinnerStyle::ALL
+            .into_iter()
+            .map(|style| MjSpinnerEntry {
+                name: style.to_string(),
+                frames: style.frames().to_vec(),
+            })
+            .collect(),
+        feature_hints: config.feature_hints,
+    };
+
+    MjConfigSnapshot {
+        agents: MjAgentsPanel {
+            roles,
+            discrete_review: config.agent.discrete_review,
+            max_parallel: config.subagents.max_parallel,
+            max_parallel_limit: 16,
+            auto_failover: config.subagents.auto_failover,
+        },
+        acp_servers: MjServersPanel { accounts, servers },
+        primary_options,
+        subagent_options,
+        acp_priority: MjPriorityPanel {
+            seats,
+            default_priority: config::DEFAULT_ACP_PRIORITY
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        },
+        appearance,
+        login: mjconfig_login_status(state),
+        install: mjconfig_install_status(state),
+        notice: notice.or(install_notice),
+    }
+}
+
+async fn mjconfig_snapshot(State(state): State<ServerState>) -> Json<MjConfigSnapshot> {
+    Json(mjconfig_snapshot_response(&state, None))
+}
+
+fn mjconfig_apply_edits(
+    config: &mut config::Config,
+    request: MjConfigApplyRequest,
+) -> std::result::Result<(), (StatusCode, String)> {
+    let bad_request = |message: String| (StatusCode::UNPROCESSABLE_ENTITY, message);
+    if let Some(model) = request.primary_model {
+        config.agent.model = model;
+    }
+    if let Some(model) = request.review_model {
+        config.review.model = model;
+    }
+    if let Some(model) = request.subagents_model {
+        config.subagents.model = model;
+    }
+    if let Some(enabled) = request.discrete_review {
+        config.agent.discrete_review = enabled;
+    }
+    if let Some(max_parallel) = request.max_parallel {
+        if max_parallel > 16 {
+            return Err(bad_request("max_parallel must be 0..=16".to_string()));
+        }
+        config.subagents.max_parallel = max_parallel;
+    }
+    if let Some(enabled) = request.auto_failover {
+        config.subagents.auto_failover = enabled;
+    }
+    if let Some(theme) = request.theme {
+        config.theme = theme
+            .parse()
+            .map_err(|_| bad_request(format!("unknown theme: {theme}")))?;
+    }
+    if let Some(spinner) = request.spinner {
+        config.spinner = spinner
+            .parse()
+            .map_err(|_| bad_request(format!("unknown spinner: {spinner}")))?;
+    }
+    if let Some(enabled) = request.feature_hints {
+        config.feature_hints = enabled;
+    }
+    if let Some(policies) = request.server_policies {
+        for (id, policy) in policies {
+            let policy = policy_from_wire(&policy)
+                .ok_or_else(|| bad_request(format!("unknown policy: {policy}")))?;
+            config.set_acp_server_policy(&id, policy);
+            if id == "anvil" && policy == config::AcpServerPolicy::Enabled {
+                crate::anvil::retry_background_install();
+            }
+        }
+    }
+    let reasoning_effort_key = format!("config:{}", acp::REASONING_EFFORT_CONFIG_ID);
+    for (defaults, seat_is_primary) in [
+        (request.primary_session_defaults, true),
+        (request.subagent_session_defaults, false),
+    ] {
+        let Some(defaults) = defaults else { continue };
+        for (server_id, options) in defaults {
+            for (option_key, value) in options {
+                // Mirror the TUI's Agents/Subagents panels: a thought-level
+                // option also updates the seat's reasoning-effort default.
+                if option_key == reasoning_effort_key {
+                    if seat_is_primary {
+                        config.agent.reasoning_effort = Some(value.clone());
+                    } else {
+                        config.subagents.reasoning_effort = Some(value.clone());
+                    }
+                }
+                let scoped = if seat_is_primary {
+                    &mut config.agent.session_defaults
+                } else {
+                    &mut config.subagents.session_defaults
+                };
+                scoped
+                    .entry(server_id.clone())
+                    .or_default()
+                    .insert(option_key, value);
+            }
+        }
+    }
+    if let Some(priority) = request.priority {
+        for (seat, edit) in priority {
+            let (source_slot, priority_slot) = match seat.as_str() {
+                "primary" => (&mut config.agent.acp_source, &mut config.agent.acp_priority),
+                "review" => (
+                    &mut config.review.acp_source,
+                    &mut config.review.acp_priority,
+                ),
+                "subagents" => (
+                    &mut config.subagents.acp_source,
+                    &mut config.subagents.acp_priority,
+                ),
+                other => return Err(bad_request(format!("unknown seat: {other}"))),
+            };
+            if let Some(source) = edit.source {
+                *source_slot = (!source.is_empty()).then_some(source);
+            }
+            if let Some(order) = edit.order {
+                if order.is_empty() {
+                    return Err(bad_request("priority order cannot be empty".to_string()));
+                }
+                *priority_slot = order;
+            }
+        }
+    }
+    if let Some(custom) = request.add_custom_server {
+        let name = custom.name.trim();
+        let parts = match shell_words::split(&custom.command) {
+            Ok(parts) if !parts.is_empty() => parts,
+            Ok(_) => return Err(bad_request("Command is required".to_string())),
+            Err(error) => return Err(bad_request(format!("Invalid command: {error}"))),
+        };
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(bad_request(
+                "Name must contain only letters, digits, '-' or '_'".to_string(),
+            ));
+        }
+        let server = config::ConfiguredAcpServer {
+            id: format!("custom:{name}"),
+            label: name.to_string(),
+            command: PathBuf::from(&parts[0]),
+            args: parts[1..].to_vec(),
+            env: Default::default(),
+            origin: config::AcpServerOrigin::Custom,
+            policy: config::AcpServerPolicy::Enabled,
+        };
+        config
+            .acp
+            .servers
+            .retain(|existing| existing.id != server.id);
+        config.acp.policies.remove(&server.id);
+        config.acp.servers.push(server);
+    }
+    Ok(())
+}
+
+async fn mjconfig_apply(
+    State(state): State<ServerState>,
+    Json(request): Json<MjConfigApplyRequest>,
+) -> std::result::Result<Json<MjConfigSnapshot>, (StatusCode, String)> {
+    let mut config = mjconfig_load(&state);
+    mjconfig_apply_edits(&mut config, request)?;
+    // Same guard as the TUI's save: a policy edit that strands a pinned seat
+    // model flips that seat to auto, with a notice instead of a later failure.
+    let choices = state
+        .mjconfig
+        .choices
+        .lock()
+        .expect("mjconfig choices lock")
+        .clone();
+    let reroute_notices = crate::settings::reset_unroutable_models(&mut config, &choices);
+    config::save_user_config_preserving_session_routes(&state.mjconfig.config_path, &mut config)
+        .map_err(|error| internal_error(format!("save config: {error:#}")))?;
+    let notice = if reroute_notices.is_empty() {
+        "Saved".to_string()
+    } else {
+        format!("Saved. {}", reroute_notices.join("; "))
+    };
+    Ok(Json(mjconfig_snapshot_response(&state, Some(notice))))
+}
+
+async fn mjconfig_registry(
+    State(state): State<ServerState>,
+) -> std::result::Result<Json<Vec<MjRegistryEntry>>, (StatusCode, String)> {
+    let mut cached = state.mjconfig.registry.lock().await;
+    if cached.is_none() {
+        *cached = Some(
+            crate::registry::load()
+                .await
+                .map_err(|error| internal_error(format!("load ACP registry: {error:#}")))?,
+        );
+    }
+    let registry = cached.as_ref().expect("registry cached");
+    let config = mjconfig_load(&state);
+    let configured: HashSet<String> = roster::discover_inventory(&config)
+        .servers
+        .into_iter()
+        .map(|server| server.id)
+        .collect();
+    let platform = crate::registry::current_platform();
+    let mut agents: Vec<&crate::registry::Agent> = registry
+        .agents
+        .iter()
+        .filter(|agent| !configured.contains(&agent.id))
+        .filter(|agent| agent.preferred_kind(&platform).is_some())
+        .collect();
+    agents.sort_by_key(|agent| agent.name.to_ascii_lowercase());
+    Ok(Json(
+        agents
+            .into_iter()
+            .map(|agent| MjRegistryEntry {
+                id: agent.id.clone(),
+                name: agent.name.clone(),
+                description: agent.description.clone(),
+                version: agent.version.clone(),
+                kind: agent
+                    .preferred_kind(&platform)
+                    .map(crate::registry::DistributionKind::label)
+                    .unwrap_or("unsupported")
+                    .to_string(),
+            })
+            .collect(),
+    ))
+}
+
+async fn mjconfig_install_start(
+    State(state): State<ServerState>,
+    Json(request): Json<MjInstallRequest>,
+) -> std::result::Result<Json<MjConfigSnapshot>, (StatusCode, String)> {
+    let agent = {
+        let cached = state.mjconfig.registry.lock().await;
+        cached
+            .as_ref()
+            .and_then(|registry| {
+                registry
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id == request.id)
+                    .cloned()
+            })
+            .ok_or((
+                StatusCode::NOT_FOUND,
+                "unknown registry agent; refresh the catalog".to_string(),
+            ))?
+    };
+    let platform = crate::registry::current_platform();
+    match agent.preferred_kind(&platform) {
+        Some(crate::registry::DistributionKind::Npx) => {
+            let package = agent.distribution.npx.as_ref().expect("npx selected");
+            let mut args = vec!["-y".to_string(), package.package.clone()];
+            args.extend(package.args.clone());
+            mjconfig_add_registry_server(&state, &agent, PathBuf::from("npx"), args)?;
+            Ok(Json(mjconfig_snapshot_response(
+                &state,
+                Some(format!("Added {}", agent.name)),
+            )))
+        }
+        Some(crate::registry::DistributionKind::Uvx) => {
+            let package = agent.distribution.uvx.as_ref().expect("uvx selected");
+            let mut args = vec![package.package.clone()];
+            args.extend(package.args.clone());
+            mjconfig_add_registry_server(&state, &agent, PathBuf::from("uvx"), args)?;
+            Ok(Json(mjconfig_snapshot_response(
+                &state,
+                Some(format!("Added {}", agent.name)),
+            )))
+        }
+        Some(crate::registry::DistributionKind::Binary) => {
+            let mut guard = state
+                .mjconfig
+                .install
+                .lock()
+                .expect("mjconfig install lock");
+            if guard
+                .as_ref()
+                .is_some_and(|job| job.progress.lock().expect("progress").result.is_none())
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "another install is already running".to_string(),
+                ));
+            }
+            let target = agent
+                .distribution
+                .binary
+                .as_ref()
+                .and_then(|targets| targets.get(&platform))
+                .cloned()
+                .ok_or_else(|| {
+                    internal_error("no binary distribution for this platform".to_string())
+                })?;
+            let progress = Arc::new(Mutex::new(MjInstallProgress::default()));
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+            let progress_sink = Arc::clone(&progress);
+            tokio::spawn(async move {
+                while let Some(event) = progress_rx.recv().await {
+                    let Ok(mut state) = progress_sink.lock() else {
+                        break;
+                    };
+                    match event {
+                        crate::install::Progress::Started { total_bytes } => {
+                            state.total_bytes = total_bytes;
+                        }
+                        crate::install::Progress::Downloaded { downloaded_bytes } => {
+                            state.downloaded_bytes = downloaded_bytes;
+                        }
+                        crate::install::Progress::Extracting => state.extracting = true,
+                        crate::install::Progress::Done => {}
+                    }
+                }
+            });
+            let output = Arc::clone(&progress);
+            let id = agent.id.clone();
+            let version = agent.version.clone();
+            let task = tokio::spawn(async move {
+                let result =
+                    crate::install::install_or_resolve(&id, &version, &target, progress_tx)
+                        .await
+                        .map_err(|error| format!("{error:#}"));
+                if let Ok(mut progress) = output.lock() {
+                    progress.result = Some(result);
+                }
+            });
+            *guard = Some(MjInstallJob {
+                agent,
+                progress,
+                abort: task.abort_handle(),
+            });
+            drop(guard);
+            Ok(Json(mjconfig_snapshot_response(&state, None)))
+        }
+        None => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "No supported distribution for this platform".to_string(),
+        )),
+    }
+}
+
+fn mjconfig_add_registry_server(
+    state: &ServerState,
+    agent: &crate::registry::Agent,
+    command: PathBuf,
+    args: Vec<String>,
+) -> std::result::Result<(), (StatusCode, String)> {
+    let env = match agent.preferred_kind(&crate::registry::current_platform()) {
+        Some(crate::registry::DistributionKind::Npx) => {
+            agent.distribution.npx.as_ref().map(|p| p.env.clone())
+        }
+        Some(crate::registry::DistributionKind::Uvx) => {
+            agent.distribution.uvx.as_ref().map(|p| p.env.clone())
+        }
+        _ => None,
+    }
+    .unwrap_or_default();
+    let mut config = mjconfig_load(state);
+    let server = config::ConfiguredAcpServer {
+        id: agent.id.clone(),
+        label: agent.name.clone(),
+        command,
+        args,
+        env,
+        origin: config::AcpServerOrigin::Registry,
+        policy: config::AcpServerPolicy::Enabled,
+    };
+    config
+        .acp
+        .servers
+        .retain(|existing| existing.id != server.id);
+    config.acp.policies.remove(&server.id);
+    config.acp.servers.push(server);
+    config::save_user_config_preserving_session_routes(&state.mjconfig.config_path, &mut config)
+        .map_err(|error| internal_error(format!("save config: {error:#}")))?;
+    Ok(())
+}
+
+async fn mjconfig_install_cancel(State(state): State<ServerState>) -> Json<MjConfigSnapshot> {
+    if let Some(job) = state
+        .mjconfig
+        .install
+        .lock()
+        .expect("mjconfig install lock")
+        .take()
+    {
+        job.abort.abort();
+    }
+    Json(mjconfig_snapshot_response(&state, None))
+}
+
+async fn mjconfig_login_start(
+    State(state): State<ServerState>,
+    Json(request): Json<MjLoginRequest>,
+) -> std::result::Result<Json<MjConfigSnapshot>, (StatusCode, String)> {
+    let vendor = crate::auth::AuthVendor::from_id(&request.vendor).ok_or((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        format!("unknown vendor: {}", request.vendor),
+    ))?;
+    {
+        let guard = state.mjconfig.login.lock().expect("mjconfig login lock");
+        if guard
+            .as_ref()
+            .is_some_and(|job| job.result.lock().expect("login result").is_none())
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "another sign-in is already running".to_string(),
+            ));
+        }
+    }
+    let output = Arc::new(Mutex::new(String::new()));
+    let result: Arc<Mutex<Option<std::result::Result<String, String>>>> =
+        Arc::new(Mutex::new(None));
+    let task_output = Arc::clone(&output);
+    let task_result = Arc::clone(&result);
+    let task = tokio::spawn(async move {
+        let outcome = mjconfig_run_login(vendor, task_output).await;
+        *task_result.lock().expect("login result") =
+            Some(outcome.map_err(|error| format!("{error:#}")));
+    });
+    *state.mjconfig.login.lock().expect("mjconfig login lock") = Some(MjLoginJob {
+        vendor,
+        output,
+        result,
+        abort: task.abort_handle(),
+    });
+    Ok(Json(mjconfig_snapshot_response(&state, None)))
+}
+
+/// Run a vendor login with output captured for the browser. Mirrors
+/// `auth::run_login` minus the terminal menu: the web flow always prefers the
+/// device-auth variant because the server may not have a usable browser.
+async fn mjconfig_run_login(
+    vendor: crate::auth::AuthVendor,
+    output: Arc<Mutex<String>>,
+) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    let (command, args) = crate::auth::headless_login_invocation(vendor).await?;
+    let mut child = tokio::process::Command::new(&command)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("run {} login", vendor.label()))?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let stdout_sink = Arc::clone(&output);
+    let stdout_task = tokio::spawn(async move {
+        let mut buffer = [0u8; 4096];
+        while let Ok(read) = stdout.read(&mut buffer).await {
+            if read == 0 {
+                break;
+            }
+            if let Ok(mut sink) = stdout_sink.lock() {
+                sink.push_str(&String::from_utf8_lossy(&buffer[..read]));
+            }
+        }
+    });
+    let stderr_sink = Arc::clone(&output);
+    let stderr_task = tokio::spawn(async move {
+        let mut buffer = [0u8; 4096];
+        while let Ok(read) = stderr.read(&mut buffer).await {
+            if read == 0 {
+                break;
+            }
+            if let Ok(mut sink) = stderr_sink.lock() {
+                sink.push_str(&String::from_utf8_lossy(&buffer[..read]));
+            }
+        }
+    });
+    let status = child.wait().await?;
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+    if !status.success() {
+        anyhow::bail!("{} login exited with {status}", vendor.label());
+    }
+    if !crate::auth::detect(vendor).available() {
+        anyhow::bail!(
+            "{} login finished but no supported credential was found",
+            vendor.label()
+        );
+    }
+    crate::roster::invalidate_model_cache()
+        .context("signed in, but failed to clear the model capability cache")?;
+    Ok(format!(
+        "Signed in to {}; models refresh on new sessions",
+        vendor.label()
+    ))
+}
+
+async fn mjconfig_login_cancel(State(state): State<ServerState>) -> Json<MjConfigSnapshot> {
+    if let Some(job) = state
+        .mjconfig
+        .login
+        .lock()
+        .expect("mjconfig login lock")
+        .take()
+    {
+        job.abort.abort();
+    }
+    Json(mjconfig_snapshot_response(&state, None))
+}
+
 /// Inputs needed to build the remote-control router. Grouping these into named
 /// fields (rather than four bare positional `String`s) prevents transposing the
 /// bearer `token` and the cookie signing `cookie_key` — a swap that would
@@ -3710,6 +4968,7 @@ struct RouterConfig {
     session_ttl: Duration,
     workspace_roots: Vec<PathBuf>,
     session_manager: Arc<ServerSessionManager>,
+    mjconfig: Arc<MjConfigRuntime>,
 }
 
 fn build_router(config: RouterConfig) -> Router {
@@ -3723,6 +4982,7 @@ fn build_router(config: RouterConfig) -> Router {
         code_guard: Arc::new(Mutex::new(CodeAuthGuard::default())),
         workspace_roots: Arc::new(config.workspace_roots),
         session_manager: config.session_manager,
+        mjconfig: config.mjconfig,
     };
 
     let protected = Router::new()
@@ -3756,6 +5016,16 @@ fn build_router(config: RouterConfig) -> Router {
         )
         .route("/api/config-changes", post(queue_config_change))
         .route("/api/config-changes/claim", post(claim_config_change))
+        .route("/api/mjconfig", get(mjconfig_snapshot).post(mjconfig_apply))
+        .route("/api/mjconfig/registry", get(mjconfig_registry))
+        .route(
+            "/api/mjconfig/install",
+            post(mjconfig_install_start).delete(mjconfig_install_cancel),
+        )
+        .route(
+            "/api/mjconfig/login",
+            post(mjconfig_login_start).delete(mjconfig_login_cancel),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_token,
@@ -4297,6 +5567,24 @@ async fn create_server_owned_session(
     })
     .await
     .map_err(internal_error)??;
+    // A /mjconfig save (or any config edit) since the last resolve re-binds
+    // the seats now, so this session launches the saved selection. A config
+    // that cannot bind a roster fails the request instead of silently
+    // launching the previous binding.
+    match state
+        .session_manager
+        .refresh_for_config(&state.mjconfig.config_path)
+        .await
+    {
+        Ok(Some(roster)) => state.mjconfig.update_from_roster(&roster),
+        Ok(None) => {}
+        Err(error) => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("saved configuration cannot start a session: {error}"),
+            ));
+        }
+    }
     state.session_manager.start_session(cwd.clone());
     Ok((
         StatusCode::ACCEPTED,
@@ -6206,6 +7494,358 @@ mod tests {
         vec![std::fs::canonicalize(root).expect("canonical test root")]
     }
 
+    /// A per-call isolated mjconfig runtime: each gets its own config file so
+    /// apply tests never touch the user's real configuration.
+    fn test_mjconfig_runtime() -> Arc<MjConfigRuntime> {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = DIR.get_or_init(|| tempfile::tempdir().expect("mjconfig tempdir"));
+        let config_path = dir.path().join(format!(
+            "config-{}.toml",
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        Arc::new(MjConfigRuntime::new(
+            config_path,
+            Vec::new(),
+            None,
+            roster::AcpInventory::default(),
+        ))
+    }
+
+    fn mjconfig_request(
+        method: &str,
+        token: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .uri("/api/mjconfig");
+        if let Some(token) = token {
+            builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if body.is_some() {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+        }
+        builder
+            .body(match body {
+                Some(body) => axum::body::Body::from(body.to_string()),
+                None => axum::body::Body::empty(),
+            })
+            .expect("request")
+    }
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    fn mjconfig_test_router(mjconfig: Arc<MjConfigRuntime>, token: &str) -> Router {
+        let dir = tempfile::tempdir().expect("tempdir");
+        build_router(RouterConfig {
+            db_path: dir.path().join("sessions.sqlite3"),
+            token: token.to_string(),
+            viewer_code: "123456".to_string(),
+            cookie_key: "test-cookie-key".to_string(),
+            session_ttl: DEFAULT_SESSION_TTL,
+            workspace_roots: test_workspace_roots(dir.path()),
+            session_manager: test_session_manager(),
+            mjconfig,
+        })
+    }
+
+    #[test]
+    fn config_file_hash_tracks_content_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        assert_eq!(config_file_hash(&path), None);
+        std::fs::write(&path, "theme = \"dark\"\n").expect("write config");
+        let first = config_file_hash(&path).expect("hash");
+        std::fs::write(&path, "theme = \"light\"\n").expect("write config");
+        let second = config_file_hash(&path).expect("hash");
+        assert_ne!(first, second);
+        std::fs::write(&path, "theme = \"dark\"\n").expect("write config");
+        assert_eq!(config_file_hash(&path), Some(first));
+    }
+
+    #[tokio::test]
+    async fn refresh_for_config_is_disabled_without_resolve_cwd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "theme = \"dark\"\n").expect("write config");
+        // Managers without a startup roster (tests, degraded startup) never
+        // re-resolve; they keep launching their fixed agent.
+        let manager = test_session_manager();
+        assert!(matches!(manager.refresh_for_config(&path).await, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn mjconfig_snapshot_reports_every_panel() {
+        let token = "mjconfig-token";
+        let app = mjconfig_test_router(test_mjconfig_runtime(), token);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(mjconfig_request("GET", None, None))
+            .await
+            .expect("response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(mjconfig_request("GET", Some(token), None))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot = json_body(response).await;
+
+        let roles = snapshot["agents"]["roles"].as_array().expect("roles");
+        assert_eq!(roles.len(), 3);
+        assert_eq!(roles[0]["role"], "primary");
+        assert!(!roles[0]["choices"].as_array().expect("choices").is_empty());
+        assert_eq!(snapshot["agents"]["max_parallel_limit"], 16);
+
+        let seats = snapshot["acp_priority"]["seats"].as_array().expect("seats");
+        assert_eq!(seats.len(), 3);
+        assert!(
+            !snapshot["acp_priority"]["default_priority"]
+                .as_array()
+                .expect("default priority")
+                .is_empty()
+        );
+
+        let accounts = snapshot["acp_servers"]["accounts"]
+            .as_array()
+            .expect("accounts");
+        assert_eq!(accounts.len(), crate::auth::AuthVendor::ALL.len());
+
+        let themes = snapshot["appearance"]["themes"].as_array().expect("themes");
+        assert_eq!(themes.len(), 4);
+        let spinners = snapshot["appearance"]["spinners"]
+            .as_array()
+            .expect("spinners");
+        assert_eq!(spinners.len(), 4);
+        for spinner in spinners {
+            assert!(!spinner["frames"].as_array().expect("frames").is_empty());
+        }
+
+        assert!(
+            snapshot.get("primary_options").is_some(),
+            "primary_options key present"
+        );
+        assert!(
+            snapshot.get("subagent_options").is_some(),
+            "subagent_options key present"
+        );
+        assert!(snapshot["login"].is_null());
+        assert!(snapshot["install"].is_null());
+    }
+
+    #[tokio::test]
+    async fn mjconfig_snapshot_reports_probed_session_options() {
+        use agent_client_protocol::schema::v1::{SessionConfigOption, SessionConfigSelectOption};
+        let runtime = test_mjconfig_runtime();
+        let mut inventory = roster::discover_inventory(&config::Config::default());
+        let server = inventory.servers.first_mut().expect("visible ACP server");
+        let server_id = server.id.clone();
+        server.session_config = vec![SessionConfigOption::select(
+            "service_tier",
+            "Service tier",
+            "default",
+            vec![
+                SessionConfigSelectOption::new("default", "Default"),
+                SessionConfigSelectOption::new("flex", "Flex"),
+            ],
+        )];
+        *runtime.inventory.lock().expect("inventory lock") = inventory;
+
+        let token = "mjconfig-token";
+        let app = mjconfig_test_router(runtime, token);
+        let response = app
+            .oneshot(mjconfig_request("GET", Some(token), None))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot = json_body(response).await;
+        // With the default "auto" models, both seats fall back to the first
+        // priority source advertising options — the server we seeded.
+        for seat in ["primary_options", "subagent_options"] {
+            let group = &snapshot[seat];
+            assert_eq!(group["server_id"], server_id.as_str(), "{seat} server");
+            let option = &group["options"][0];
+            assert_eq!(option["key"], "config:service_tier");
+            assert_eq!(option["name"], "Service tier");
+            assert_eq!(option["value"], "default");
+            assert_eq!(option["choices"].as_array().expect("choices").len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn mjconfig_apply_persists_edits_and_round_trips() {
+        let runtime = test_mjconfig_runtime();
+        let config_path = runtime.config_path.clone();
+        let token = "mjconfig-token";
+        let app = mjconfig_test_router(runtime, token);
+
+        let response = app
+            .clone()
+            .oneshot(mjconfig_request(
+                "POST",
+                Some(token),
+                Some(serde_json::json!({
+                    "primary_model": "gpt-5-6-terra",
+                    "discrete_review": false,
+                    "max_parallel": 4,
+                    "theme": "ansi-dark",
+                    "spinner": "wave",
+                    "feature_hints": false,
+                    "primary_session_defaults": {
+                        "codex-acp": { "config:collaboration_mode": "yolo" }
+                    },
+                    "subagent_session_defaults": {
+                        "codex-acp": { "config:reasoning_effort": "low" }
+                    },
+                    "priority": {
+                        "review": { "source": "codex-acp", "order": ["codex-acp", "anvil"] }
+                    },
+                    "add_custom_server": { "name": "my-agent", "command": "npx -y my-agent --acp" }
+                })),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot = json_body(response).await;
+        assert_eq!(snapshot["agents"]["roles"][0]["model"], "gpt-5-6-terra");
+        assert_eq!(snapshot["agents"]["discrete_review"], false);
+        assert_eq!(snapshot["agents"]["max_parallel"], 4);
+        assert_eq!(snapshot["appearance"]["theme"], "ansi-dark");
+        assert_eq!(snapshot["appearance"]["spinner"], "wave");
+        assert_eq!(snapshot["appearance"]["feature_hints"], false);
+
+        let saved = config::Config::load(&config_path).expect("reload saved config");
+        assert_eq!(saved.agent.model, "gpt-5-6-terra");
+        assert!(!saved.agent.discrete_review);
+        assert_eq!(saved.subagents.max_parallel, 4);
+        assert_eq!(saved.theme, crate::theme::TerminalThemeKind::AnsiDark);
+        assert_eq!(saved.spinner, crate::spinner::SpinnerStyle::Wave);
+        assert!(!saved.feature_hints);
+        assert_eq!(
+            saved
+                .agent
+                .session_defaults
+                .get("codex-acp")
+                .and_then(|entry| entry.get("config:collaboration_mode"))
+                .map(String::as_str),
+            Some("yolo")
+        );
+        assert_eq!(
+            saved
+                .subagents
+                .session_defaults
+                .get("codex-acp")
+                .and_then(|entry| entry.get("config:reasoning_effort"))
+                .map(String::as_str),
+            Some("low")
+        );
+        // A thought-level default also updates the seat's reasoning effort.
+        assert_eq!(saved.subagents.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(saved.review.acp_source.as_deref(), Some("codex-acp"));
+        assert_eq!(saved.review.acp_priority, vec!["codex-acp", "anvil"]);
+        let custom = saved
+            .acp
+            .servers
+            .iter()
+            .find(|server| server.id == "custom:my-agent")
+            .expect("custom server saved");
+        // Windows resolves the launcher to npx.cmd on load.
+        assert_eq!(
+            custom.command.file_stem().and_then(|stem| stem.to_str()),
+            Some("npx")
+        );
+        assert_eq!(custom.args, vec!["-y", "my-agent", "--acp"]);
+
+        // Clearing the source constraint round-trips back to "any".
+        let response = app
+            .oneshot(mjconfig_request(
+                "POST",
+                Some(token),
+                Some(serde_json::json!({ "priority": { "review": { "source": "" } } })),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = config::Config::load(&config_path).expect("reload saved config");
+        assert_eq!(saved.review.acp_source, None);
+    }
+
+    #[tokio::test]
+    async fn mjconfig_apply_flips_stranded_models_to_auto_with_notice() {
+        let runtime = test_mjconfig_runtime();
+        *runtime.choices.lock().expect("choices lock") = vec![roster::ModelChoice {
+            model: "model-a".to_string(),
+            pass_at_1: 0.5,
+            mean_cost_usd: 1.0,
+            available: true,
+            disabled_reason: None,
+            adapter: Some("codex-acp".to_string()),
+            ranked: true,
+        }];
+        let token = "mjconfig-token";
+        let app = mjconfig_test_router(runtime, token);
+
+        // Pin the primary to the codex-routed model, then disable codex in the
+        // same save: the seat flips back to auto and the notice says why.
+        let response = app
+            .oneshot(mjconfig_request(
+                "POST",
+                Some(token),
+                Some(serde_json::json!({
+                    "primary_model": "model-a",
+                    "server_policies": { "codex-acp": "disabled" }
+                })),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot = json_body(response).await;
+        assert_eq!(snapshot["agents"]["roles"][0]["model"], "auto");
+        let notice = snapshot["notice"].as_str().expect("notice");
+        assert!(notice.contains("Agent model model-a"), "{notice}");
+        assert!(
+            notice.contains("switched to automatic selection"),
+            "{notice}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mjconfig_apply_rejects_invalid_edits() {
+        let token = "mjconfig-token";
+        let app = mjconfig_test_router(test_mjconfig_runtime(), token);
+        let cases = [
+            serde_json::json!({ "max_parallel": 40 }),
+            serde_json::json!({ "theme": "solarized" }),
+            serde_json::json!({ "spinner": "cube" }),
+            serde_json::json!({ "priority": { "sidekick": { "source": "x" } } }),
+            serde_json::json!({ "add_custom_server": { "name": "bad name!", "command": "x" } }),
+            serde_json::json!({ "add_custom_server": { "name": "ok", "command": "" } }),
+        ];
+        for body in cases {
+            let response = app
+                .clone()
+                .oneshot(mjconfig_request("POST", Some(token), Some(body.clone())))
+                .await
+                .expect("response");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "expected 422 for {body}"
+            );
+        }
+    }
+
     /// Build a `PermissionPrompt` and keep the original responder receiver
     /// so tests can assert what decision was forwarded to the runtime.
     fn permission_prompt(
@@ -7753,6 +9393,7 @@ mod tests {
             session_ttl: DEFAULT_SESSION_TTL,
             workspace_roots: test_workspace_roots(dir.path()),
             session_manager: test_session_manager(),
+            mjconfig: test_mjconfig_runtime(),
         });
 
         let response = app
@@ -7795,6 +9436,7 @@ mod tests {
             session_ttl: DEFAULT_SESSION_TTL,
             workspace_roots: test_workspace_roots(dir.path()),
             session_manager: test_session_manager(),
+            mjconfig: test_mjconfig_runtime(),
         });
 
         let response = app
@@ -8182,6 +9824,7 @@ mod tests {
             session_ttl: DEFAULT_SESSION_TTL,
             workspace_roots: test_workspace_roots(dir.path()),
             session_manager: test_session_manager(),
+            mjconfig: test_mjconfig_runtime(),
         });
 
         let unauthorized = app
@@ -9077,6 +10720,7 @@ mod tests {
             session_ttl: DEFAULT_SESSION_TTL,
             workspace_roots: test_workspace_roots(dir.path()),
             session_manager: test_session_manager(),
+            mjconfig: test_mjconfig_runtime(),
         });
 
         let decision_body = |request_id: &str, option_id: &str| {
@@ -9307,6 +10951,7 @@ mod tests {
             session_ttl: DEFAULT_SESSION_TTL,
             workspace_roots: test_workspace_roots(dir.path()),
             session_manager: test_session_manager(),
+            mjconfig: test_mjconfig_runtime(),
         });
 
         let change_body = |target_kind: &str, config_id: Option<&str>, value: &str| {
@@ -9622,6 +11267,7 @@ mod tests {
             code_guard: Arc::new(Mutex::new(CodeAuthGuard::default())),
             workspace_roots: Arc::new(vec![std::env::temp_dir()]),
             session_manager: test_session_manager(),
+            mjconfig: test_mjconfig_runtime(),
         }
     }
 
@@ -9719,6 +11365,7 @@ mod tests {
             session_ttl: DEFAULT_SESSION_TTL,
             workspace_roots: test_workspace_roots(dir.path()),
             session_manager: test_session_manager(),
+            mjconfig: test_mjconfig_runtime(),
         });
 
         // (path, expected content-type prefix). The shell assets must be reachable
@@ -10027,6 +11674,7 @@ mod tests {
             session_ttl: DEFAULT_SESSION_TTL,
             workspace_roots: test_workspace_roots(dir.path()),
             session_manager: test_session_manager(),
+            mjconfig: test_mjconfig_runtime(),
         });
 
         let _client = build_client(&cert_path).expect("pinned client");

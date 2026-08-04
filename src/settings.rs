@@ -100,14 +100,14 @@ struct InstallingServer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrioritySeat {
+pub(crate) enum PrioritySeat {
     Primary,
     Review,
     Subagents,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionDefaultsSeat {
+pub(crate) enum SessionDefaultsSeat {
     Primary,
     Subagents,
 }
@@ -179,6 +179,13 @@ impl SettingsEditor {
     pub fn with_active_session_config(mut self, options: Vec<SessionConfigOption>) -> Self {
         self.active_session_config = options;
         self
+    }
+
+    /// Discovered ACP inventory backing the editor's server and session rows.
+    /// The remote-control server projects it into the web `/mjconfig` panel so
+    /// both UIs describe the same servers with the same status strings.
+    pub(crate) fn inventory(&self) -> &AcpInventory {
+        &self.inventory
     }
 
     pub fn handle_key(&mut self, code: KeyCode) -> SettingsAction {
@@ -464,7 +471,7 @@ impl SettingsEditor {
         }
     }
 
-    fn selected_session_source(&self, seat: SessionDefaultsSeat) -> Option<String> {
+    pub(crate) fn selected_session_source(&self, seat: SessionDefaultsSeat) -> Option<String> {
         let (model, configured_source, priority, active_model, active_source) = match seat {
             SessionDefaultsSeat::Primary => (
                 self.config.agent.model.as_str(),
@@ -553,7 +560,7 @@ impl SettingsEditor {
             .cloned()
     }
 
-    fn session_option_rows(&self, seat: SessionDefaultsSeat) -> Vec<(usize, usize)> {
+    pub(crate) fn session_option_rows(&self, seat: SessionDefaultsSeat) -> Vec<(usize, usize)> {
         let Some(source) = self.selected_session_source(seat) else {
             return Vec::new();
         };
@@ -601,7 +608,7 @@ impl SettingsEditor {
         }
     }
 
-    fn saved_session_value(
+    pub(crate) fn saved_session_value(
         &self,
         seat: SessionDefaultsSeat,
         server_id: &str,
@@ -703,7 +710,7 @@ impl SettingsEditor {
         }
     }
 
-    fn model_choices(&self, role: usize) -> Vec<String> {
+    pub(crate) fn model_choices(&self, role: usize) -> Vec<String> {
         let mut seen = HashSet::new();
         let mut choices = vec!["auto".to_string()];
         seen.insert("auto".to_string());
@@ -727,7 +734,7 @@ impl SettingsEditor {
         }
     }
 
-    fn source(&self, seat: PrioritySeat) -> &Option<String> {
+    pub(crate) fn source(&self, seat: PrioritySeat) -> &Option<String> {
         match seat {
             PrioritySeat::Primary => &self.config.agent.acp_source,
             PrioritySeat::Review => &self.config.review.acp_source,
@@ -767,7 +774,7 @@ impl SettingsEditor {
         }
     }
 
-    fn effective_priority(&self, seat: PrioritySeat) -> Vec<String> {
+    pub(crate) fn effective_priority(&self, seat: PrioritySeat) -> Vec<String> {
         let mut priority = self.priority(seat).clone();
         for server in &self.inventory.servers {
             if !priority.contains(&server.id) {
@@ -865,7 +872,7 @@ impl SettingsEditor {
         )
     }
 
-    fn staged_model_detail(&self, model: &str) -> String {
+    pub(crate) fn staged_model_detail(&self, model: &str) -> String {
         if model == "auto" {
             return "automatic selection".to_string();
         }
@@ -895,7 +902,7 @@ impl SettingsEditor {
         }
     }
 
-    fn active_model_detail(&self, role: usize) -> String {
+    pub(crate) fn active_model_detail(&self, role: usize) -> String {
         let Some(models) = self.active_models.as_ref() else {
             return "not running".to_string();
         };
@@ -1336,7 +1343,74 @@ pub fn draw_settings_panel(
     );
 }
 
-fn session_option_choices(option: &SessionConfigOption) -> Vec<(String, String)> {
+/// After a save disables an ACP server, a pinned seat model can lose its only
+/// known route. Rather than letting the next session (or server restart) fail
+/// to resolve, flip that seat back to automatic selection and explain why.
+/// The inventory must already reflect the edited config's policies. Returns
+/// one human-readable notice per changed seat.
+pub fn reset_unroutable_models(config: &mut Config, choices: &[ModelChoice]) -> Vec<String> {
+    // Only an explicit `disabled` policy strands a route. Absence from the
+    // discovered inventory is not proof: an undetected server (not signed in,
+    // not probed yet) may still serve the model once it comes back.
+    let source_disabled = |config: &Config, source: &str| {
+        config
+            .acp
+            .servers
+            .iter()
+            .find(|server| server.id == source)
+            .map_or_else(|| config.acp.policy(source), |server| server.policy)
+            == AcpServerPolicy::Disabled
+    };
+    let mut notices = Vec::new();
+    enum Seat {
+        Agent,
+        Review,
+        Subagents,
+    }
+    for (label, seat) in [
+        ("Agent", Seat::Agent),
+        ("Review", Seat::Review),
+        ("Subagents", Seat::Subagents),
+    ] {
+        let model = match seat {
+            Seat::Agent => config.agent.model.clone(),
+            Seat::Review => config.review.model.clone(),
+            Seat::Subagents => config.subagents.model.clone(),
+        };
+        if model == "auto"
+            || model == crate::config::DISABLED_MODEL
+            // Custom-selector models have no native built-in adapter; only
+            // their catalog entry (when present) can judge them.
+            || (model.starts_with("custom/")
+                && !choices.iter().any(|choice| choice.model == model))
+        {
+            continue;
+        }
+        // Judge the route from the model catalog when it knows the model,
+        // falling back to the provider's native adapter — the catalog may
+        // have been resolved while that vendor was disabled and lack the
+        // entry entirely. Custom-server models resolve to their own id.
+        let route = choices
+            .iter()
+            .find(|choice| choice.model == model)
+            .and_then(|choice| choice.adapter.clone())
+            .unwrap_or_else(|| crate::roster::native_source_id(&model));
+        if source_disabled(config, &route) {
+            let slot = match seat {
+                Seat::Agent => &mut config.agent.model,
+                Seat::Review => &mut config.review.model,
+                Seat::Subagents => &mut config.subagents.model,
+            };
+            "auto".clone_into(slot);
+            notices.push(format!(
+                "{label} model {model} is not provided by any enabled ACP server; switched to automatic selection"
+            ));
+        }
+    }
+    notices
+}
+
+pub(crate) fn session_option_choices(option: &SessionConfigOption) -> Vec<(String, String)> {
     let SessionConfigKind::Select(select) = &option.kind else {
         return Vec::new();
     };
@@ -1354,7 +1428,7 @@ fn session_option_choices(option: &SessionConfigOption) -> Vec<(String, String)>
     }
 }
 
-fn session_option_current_value(option: &SessionConfigOption) -> String {
+pub(crate) fn session_option_current_value(option: &SessionConfigOption) -> String {
     match &option.kind {
         SessionConfigKind::Select(select) => select.current_value.to_string(),
         _ => String::new(),
@@ -2040,6 +2114,63 @@ fn on_off(enabled: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_unroutable_models_flips_seats_whose_route_is_disabled() {
+        let mut config = Config::default();
+        config.agent.model = "model-a".to_string();
+        config.review.model = "model-b".to_string();
+        config.subagents.model = crate::config::DISABLED_MODEL.to_string();
+        config.set_acp_server_policy("codex-acp", AcpServerPolicy::Disabled);
+        let choices = vec![
+            ModelChoice {
+                model: "model-a".to_string(),
+                pass_at_1: 0.5,
+                mean_cost_usd: 1.0,
+                available: true,
+                disabled_reason: None,
+                adapter: Some("codex-acp".to_string()),
+                ranked: true,
+            },
+            ModelChoice {
+                model: "model-b".to_string(),
+                pass_at_1: 0.5,
+                mean_cost_usd: 1.0,
+                available: true,
+                disabled_reason: None,
+                adapter: Some("claude-acp".to_string()),
+                ranked: true,
+            },
+        ];
+
+        let notices = reset_unroutable_models(&mut config, &choices);
+
+        // model-a lost its only route; model-b's adapter is still enabled and
+        // the disabled subagent sentinel is never touched.
+        assert_eq!(config.agent.model, "auto");
+        assert_eq!(config.review.model, "model-b");
+        assert_eq!(config.subagents.model, crate::config::DISABLED_MODEL);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("Agent model model-a"), "{}", notices[0]);
+    }
+
+    #[test]
+    fn reset_unroutable_models_uses_native_adapter_when_catalog_lacks_the_model() {
+        let mut config = Config::default();
+        config.agent.model = "claude-opus-5".to_string();
+        config.set_acp_server_policy("claude-acp", AcpServerPolicy::Disabled);
+
+        // No catalog entry at all: the provider's native adapter decides.
+        let notices = reset_unroutable_models(&mut config, &[]);
+
+        assert_eq!(config.agent.model, "auto");
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].contains("Agent model claude-opus-5"),
+            "{}",
+            notices[0]
+        );
+    }
     use agent_client_protocol::schema::v1::{
         SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     };
