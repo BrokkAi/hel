@@ -1349,7 +1349,9 @@ fn streaming_redraw_budget(mode: UiMode) -> Duration {
 fn ui_event_redraw_cause(event: &UiEvent) -> RedrawCause {
     match event {
         UiEvent::Side(event) => ui_event_redraw_cause(event),
-        UiEvent::SideStartFailed { .. } => RedrawCause::Interactive,
+        UiEvent::SideStartFailed { .. }
+        | UiEvent::RemoteSideStartRequested { .. }
+        | UiEvent::RemoteSideExitRequested => RedrawCause::Interactive,
         UiEvent::SessionUpdate(_) | UiEvent::TerminalOutput(_) => RedrawCause::Stream,
         // Nested activity only rewrites private actor detail, so it coalesces
         // with streaming output. Lifecycle events also update transcript and
@@ -1391,6 +1393,44 @@ fn side_main_notice(event: &UiEvent) -> Option<&'static str> {
         UiEvent::PromptDone { .. } => Some("Main complete"),
         UiEvent::PromptFailed { .. } | UiEvent::Fatal(_) => Some("Main failed"),
         _ => None,
+    }
+}
+
+fn is_side_remote_decision(event: &UiEvent) -> bool {
+    matches!(
+        event,
+        UiEvent::RemotePermissionDecision { request_id, .. }
+            if request_id.starts_with("side:")
+                || request_id.starts_with("elicitation:side:")
+    )
+}
+
+fn apply_remote_side_lifecycle(state: &mut AppState, side_visible: bool, event: &UiEvent) -> bool {
+    match event {
+        UiEvent::RemoteSideStartRequested { initial_prompt } => {
+            if side_visible || state.side_start_requested {
+                state.record_status_message(
+                    StatusKind::Warning,
+                    "a side conversation is already active".to_string(),
+                );
+            } else {
+                state.side_start_requested = true;
+                state.side_initial_question = initial_prompt.clone();
+            }
+            true
+        }
+        UiEvent::RemoteSideExitRequested => {
+            if side_visible {
+                state.side_exit_requested = true;
+            } else {
+                state.record_status_message(
+                    StatusKind::Warning,
+                    "no side conversation is active".to_string(),
+                );
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1626,6 +1666,10 @@ async fn ui_loop(
             maybe_ev = event_rx.recv(), if !state.runtime_closed || main_state.is_some() => {
                 match maybe_ev {
                     Some(ev) => {
+                        if apply_remote_side_lifecycle(&mut state, main_state.is_some(), &ev) {
+                            pending_redraw.mark_interactive();
+                            continue;
+                        }
                         let ev = match ev {
                             UiEvent::Side(event) if main_state.is_some() => *event,
                             UiEvent::Side(_) => continue,
@@ -1645,6 +1689,11 @@ async fn ui_loop(
                                 }
                                 pending_redraw.mark_interactive();
                                 continue;
+                            }
+                            side_decision
+                                if main_state.is_some()
+                                    && is_side_remote_decision(&side_decision) => {
+                                side_decision
                             }
                             main_event if main_state.is_some() => {
                                 if let Some(notice) = side_main_notice(&main_event) {
@@ -1695,11 +1744,7 @@ async fn ui_loop(
                             && state.session_id.is_some()
                             && let Some(question) = state.side_initial_question.take()
                         {
-                            state.record_user_prompt(question.clone());
-                            let _ = cmd_tx.send(UiCommand::SendPrompt {
-                                text: question,
-                                images: Vec::new(),
-                            });
+                            state.record_user_prompt(question);
                         }
                         if state.runtime_closed
                             && std::env::var_os("MJ_E2E_EXIT_ON_RUNTIME_CLOSE").is_some()
@@ -1785,8 +1830,9 @@ async fn ui_loop(
             let side_state = state.side_conversation(question.clone());
             let main = std::mem::replace(&mut state, side_state);
             main_state = Some(main);
-            let _ = question;
-            let _ = cmd_tx.send(UiCommand::StartSide);
+            let _ = cmd_tx.send(UiCommand::StartSide {
+                initial_prompt: question,
+            });
             main_transcript_scroll = Some(std::mem::take(&mut transcript_scroll));
             main_transcript_sink = Some(std::mem::take(&mut transcript_sink));
             stream_reveal = StreamRevealController::resume(&mut state);
@@ -18872,6 +18918,45 @@ mod tests {
         );
         assert!(state.transcript.is_empty());
         assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn remote_side_permission_decisions_stay_in_the_side_view() {
+        assert!(is_side_remote_decision(
+            &UiEvent::RemotePermissionDecision {
+                request_id: "side:call-1".to_string(),
+                option_id: "allow".to_string(),
+            }
+        ));
+        assert!(!is_side_remote_decision(
+            &UiEvent::RemotePermissionDecision {
+                request_id: "call-1".to_string(),
+                option_id: "allow".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn remote_side_lifecycle_drives_the_attached_ui_state() {
+        let mut state = AppState::new();
+
+        assert!(apply_remote_side_lifecycle(
+            &mut state,
+            false,
+            &UiEvent::RemoteSideStartRequested {
+                initial_prompt: Some("explain this".to_string()),
+            },
+        ));
+        assert!(state.side_start_requested);
+        assert_eq!(state.side_initial_question.as_deref(), Some("explain this"));
+
+        state.side_start_requested = false;
+        assert!(apply_remote_side_lifecycle(
+            &mut state,
+            true,
+            &UiEvent::RemoteSideExitRequested,
+        ));
+        assert!(state.side_exit_requested);
     }
 
     #[test]
