@@ -1058,6 +1058,35 @@
         animation: launch-scan 1.35s ease-in-out infinite;
       }
 
+      /* A launch that failed is no longer in progress: stop the scanning bar
+         so a dead card cannot be mistaken for a working one. */
+      .launch-session-card.is-failed .launch-card-bar {
+        display: none;
+      }
+
+      .launch-session-card.is-failed .launch-card-detail {
+        color: var(--red-hot);
+        white-space: pre-wrap;
+      }
+
+      .launch-card-dismiss {
+        flex: 0 0 auto;
+        padding: 2px 8px;
+        border: 1px solid var(--line-control);
+        border-radius: 2px;
+        background: var(--surface-control);
+        color: var(--muted);
+        cursor: pointer;
+        font: 700 9px/1.5 var(--font-mono);
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .launch-card-dismiss:hover {
+        border-color: var(--button-edge-hover);
+        color: var(--button-hover-text);
+      }
+
       @keyframes launch-scan {
         from { transform: translateX(-110%); }
         to { transform: translateX(240%); }
@@ -3137,7 +3166,13 @@
       // dies with the session) server-side.
       const CONFIG_APPLY_TIMEOUT_MS = 60000;
       const STOP_REQUEST_TIMEOUT_MS = 15000;
-      const SESSION_LAUNCH_INDICATOR_TTL_MS = 120000;
+      /* How long a session launch may take before the viewer calls it failed.
+         Generous on purpose: a host already running other agents can take a
+         long time to spawn one, and declaring failure early is how a launch
+         that was merely slow ends up looking broken. */
+      const SESSION_LAUNCH_TIMEOUT_MS = 120000;
+      const SESSION_LAUNCH_TIMEOUT_DETAIL =
+        "Timed out waiting for the session to start. It may still be starting on a busy host — refresh to check before retrying.";
       const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
       const narrowScreen = window.matchMedia("(max-width: 800px)");
 
@@ -3153,6 +3188,11 @@
       let filesystemLoading = false;
       let creatingSession = false;
       let pendingSessionLaunch = null;
+      /* Identifies which launch the list slot currently belongs to. Waiting on
+         a launch outlives the dialog that started it, so a second launch can
+         begin while the first is still outstanding; its watcher retires
+         quietly instead of writing over the newer card. */
+      let sessionLaunchSeq = 0;
       let launchSessionCard = null;
       let commandMatches = [];
       let commandSelected = 0;
@@ -4357,7 +4397,10 @@
           return;
         }
         creatingSession = true;
+        sessionLaunchSeq += 1;
+        const launchId = sessionLaunchSeq;
         pendingSessionLaunch = {
+          id: launchId,
           cwd: current.display_path || current.path,
           detail: "Creating ACP session…",
           startedAt: Date.now(),
@@ -4391,42 +4434,75 @@
           renderSessions();
           newSessionModalEl.hidden = true;
           statusEl.textContent = "Starting session…";
-          await selectNewlyStartedSession(knownSessionIds);
         } catch (error) {
-          pendingSessionLaunch = null;
-          renderSessions();
-          if (error.message !== "HTTP 401") {
+          if (error.message === "HTTP 401") {
+            /* Re-authentication clears the launch itself; there is no failure
+               to report and no session to keep waiting for. */
+            if (pendingSessionLaunch?.id === launchId) {
+              pendingSessionLaunch = null;
+              renderSessions();
+            }
+          } else {
+            failSessionLaunch(`Start failed: ${error.message}`, launchId);
             setNewSessionStatus(`Start failed: ${error.message}`, true);
           }
+          return;
         } finally {
           creatingSession = false;
           setSessionCreationUi(false);
           setFilesystemBusy(false);
         }
+
+        /* Waiting for the agent to publish happens outside the creating-UI
+           lock. The wait can legitimately run for minutes on a loaded host,
+           and holding the dialog hostage for it would be its own bug — the
+           launch card tracks this phase now. */
+        try {
+          await selectNewlyStartedSession(knownSessionIds, launchId);
+        } catch (error) {
+          /* The modal is hidden by this point, so its status line is a
+             surface nobody can see. The card carries the failure instead,
+             and stays until dismissed. */
+          failSessionLaunch(`Start failed: ${error.message}`, launchId);
+        }
       }
 
-      async function selectNewlyStartedSession(knownSessionIds) {
-        for (let attempt = 0; attempt < 12; attempt += 1) {
-          await sleep(attempt === 0 ? 300 : 1000);
+      /* Poll until the session shows up or the launch deadline passes.
+         Watching for only a few seconds and then giving up is what left a slow
+         launch with nothing tracking it: the card sat on a stale message until
+         its timer quietly deleted it. */
+      async function selectNewlyStartedSession(knownSessionIds, launchId) {
+        const deadline = (pendingSessionLaunch?.startedAt ?? Date.now()) + SESSION_LAUNCH_TIMEOUT_MS;
+        for (let attempt = 0; Date.now() < deadline; attempt += 1) {
+          /* Back off once the fast path has clearly missed, so a two-minute
+             wait does not mean two minutes of once-a-second requests. */
+          await sleep(attempt === 0 ? 300 : attempt < 10 ? 1000 : 2500);
+          /* Dismissed, already failed, or superseded by a newer launch: this
+             watcher no longer owns the slot and must not write to it. */
+          if (pendingSessionLaunch?.id !== launchId || pendingSessionLaunch.failed) {
+            return;
+          }
           await refreshSessions();
           const created = sessions
             .filter((session) => !knownSessionIds.has(session.session_id))
             .sort((a, b) => new Date(b.start_time || 0) - new Date(a.start_time || 0))[0];
           if (created) {
-            pendingSessionLaunch = null;
-            renderSessions();
+            if (pendingSessionLaunch?.id === launchId) {
+              pendingSessionLaunch = null;
+              renderSessions();
+            }
             navigateToSession(created.session_id);
             return;
           }
+          if (attempt === 10 && pendingSessionLaunch?.id === launchId) {
+            pendingSessionLaunch = {
+              ...pendingSessionLaunch,
+              detail: "Still waiting for the agent to publish the session…",
+            };
+            renderSessions();
+          }
         }
-        if (pendingSessionLaunch) {
-          pendingSessionLaunch = {
-            ...pendingSessionLaunch,
-            detail: "Still waiting for the session list to update…",
-          };
-          renderSessions();
-        }
-        statusEl.textContent = "Session is starting; refresh will pick it up.";
+        failSessionLaunch(SESSION_LAUNCH_TIMEOUT_DETAIL, launchId);
       }
 
       /* ---- timestamps ---- */
@@ -4601,7 +4677,16 @@
         const badge = document.createElement("span");
         badge.className = "launch-card-badge";
         badge.textContent = "launching";
-        top.append(title, badge);
+        const dismiss = document.createElement("button");
+        dismiss.type = "button";
+        dismiss.className = "launch-card-dismiss";
+        dismiss.textContent = "dismiss";
+        dismiss.hidden = true;
+        dismiss.addEventListener("click", () => {
+          pendingSessionLaunch = null;
+          renderSessions();
+        });
+        top.append(title, badge, dismiss);
 
         const meta = document.createElement("div");
         meta.className = "launch-card-meta";
@@ -4612,15 +4697,38 @@
         detail.className = "launch-card-detail";
 
         root.append(top, meta, bar, detail);
-        return { root, title, meta, detail };
+        return { root, title, badge, dismiss, meta, detail };
+      }
+
+      /* Move a launch into its failed state. The card stays in the list until
+         the user dismisses it: a launch that vanishes on its own leaves them
+         unable to tell a failure from a session that never existed. */
+      function failSessionLaunch(detail, launchId) {
+        if (
+          !pendingSessionLaunch ||
+          pendingSessionLaunch.failed ||
+          pendingSessionLaunch.id !== launchId
+        ) {
+          return;
+        }
+        pendingSessionLaunch = { ...pendingSessionLaunch, failed: true, detail };
+        renderSessions();
       }
 
       function renderLaunchSessionCard() {
+        /* Only a launch still believed to be in progress times out, and it
+           fails visibly rather than being deleted. Silently dropping the card
+           is what made a slow failure indistinguishable from no failure. */
         if (
           pendingSessionLaunch &&
-          Date.now() - pendingSessionLaunch.startedAt > SESSION_LAUNCH_INDICATOR_TTL_MS
+          !pendingSessionLaunch.failed &&
+          Date.now() - pendingSessionLaunch.startedAt > SESSION_LAUNCH_TIMEOUT_MS
         ) {
-          pendingSessionLaunch = null;
+          pendingSessionLaunch = {
+            ...pendingSessionLaunch,
+            failed: true,
+            detail: SESSION_LAUNCH_TIMEOUT_DETAIL,
+          };
         }
         if (!pendingSessionLaunch) {
           if (launchSessionCard) {
@@ -4632,11 +4740,19 @@
         if (!launchSessionCard) {
           launchSessionCard = createLaunchSessionCard();
         }
-        launchSessionCard.title.textContent = "Starting new session";
+        const failed = Boolean(pendingSessionLaunch.failed);
+        launchSessionCard.root.classList.toggle("is-failed", failed);
+        launchSessionCard.title.textContent = failed
+          ? "Session failed to start"
+          : "Starting new session";
+        launchSessionCard.badge.textContent = failed ? "failed" : "launching";
+        launchSessionCard.dismiss.hidden = !failed;
         launchSessionCard.meta.textContent = [pendingSessionLaunch.cwd, pendingSessionLaunch.worktree]
           .filter(Boolean)
           .join(" · ");
         launchSessionCard.detail.textContent = pendingSessionLaunch.detail;
+        /* A failure is not a routine status update; announce it. */
+        launchSessionCard.root.setAttribute("aria-live", failed ? "assertive" : "polite");
         return launchSessionCard.root;
       }
 
