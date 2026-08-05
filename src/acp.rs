@@ -501,6 +501,7 @@ pub enum LaunchError {
     /// crash, ...).
     SessionCreateFailed {
         source: agent_client_protocol::Error,
+        stdio_mcp_servers: Box<[String]>,
     },
     /// uvx was requested but uv could not be installed automatically.
     UvInstallFailed { source: String },
@@ -556,11 +557,43 @@ impl std::fmt::Display for LaunchError {
                 "configured ACP agent does not support HTTP MCP servers required for subagent delegation\n\
                  hint: update or choose an ACP adapter that advertises mcpCapabilities.http"
             ),
-            LaunchError::SessionCreateFailed { source } => write!(
-                f,
-                "agent rejected session/new: {source}\n\
-                 hint: verify --cwd is accessible to the agent"
-            ),
+            LaunchError::SessionCreateFailed {
+                source,
+                stdio_mcp_servers,
+            } => {
+                let error_text = session_error_search_text(source);
+                if !error_text.contains("spawn") {
+                    return write!(
+                        f,
+                        "agent rejected session/new: {source}\n\
+                         hint: verify --cwd is accessible to the agent"
+                    );
+                }
+
+                writeln!(f, "agent rejected session/new: {source}")?;
+                writeln!(
+                    f,
+                    "detail: the agent failed to launch a child process while creating the session"
+                )?;
+                let decoded_error = unknown_spawn_error_detail(&error_text, std::env::consts::OS);
+                if let Some(decoded) = decoded_error {
+                    writeln!(f, "detail: {}", decoded.detail)?;
+                }
+                let servers = if stdio_mcp_servers.is_empty() {
+                    "none".to_string()
+                } else {
+                    stdio_mcp_servers.join(", ")
+                };
+                writeln!(f, "stdio MCP servers forwarded on session/new: {servers}")?;
+                if let Some(decoded) = decoded_error {
+                    write!(f, "hint: {}", decoded.hint)
+                } else {
+                    write!(
+                        f,
+                        "hint: verify the agent CLI and any listed stdio MCP server commands can run, then retry"
+                    )
+                }
+            }
             LaunchError::UvInstallFailed { source } => write!(
                 f,
                 "uvx is required for this agent, but mj could not install uv automatically: {source}\n\
@@ -614,6 +647,67 @@ fn auth_required_detail(source: &agent_client_protocol::Error) -> Option<Option<
     Some(detail)
 }
 
+fn session_error_search_text(source: &agent_client_protocol::Error) -> String {
+    let mut text = source.message.to_ascii_lowercase();
+    if let Some(data) = source.data.as_ref() {
+        text.push(' ');
+        text.push_str(&data.to_string().to_ascii_lowercase());
+    }
+    text
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnknownSpawnErrorDetail {
+    detail: &'static str,
+    hint: &'static str,
+}
+
+fn unknown_spawn_error_detail(error_text: &str, host_os: &str) -> Option<UnknownSpawnErrorDetail> {
+    const REPAIR_EXECUTABLE_HINT: &str = "reinstall or repair the agent CLI, verify any listed stdio MCP server commands, then retry";
+    const CHECK_IPC_HINT: &str = "restart the agent adapter, inspect its stdio/IPC setup and any listed stdio MCP servers, then retry";
+
+    match (host_os, error_text) {
+        ("macos", text) if text.contains("unknown system error -86") => {
+            Some(UnknownSpawnErrorDetail {
+                detail: "macOS errno -86 is EBADARCH: the executable has the wrong CPU architecture",
+                hint: REPAIR_EXECUTABLE_HINT,
+            })
+        }
+        ("macos", text) if text.contains("unknown system error -88") => {
+            Some(UnknownSpawnErrorDetail {
+                detail: "macOS errno -88 is EBADMACHO: the executable is malformed or truncated",
+                hint: REPAIR_EXECUTABLE_HINT,
+            })
+        }
+        ("linux", text) if text.contains("unknown system error -86") => {
+            Some(UnknownSpawnErrorDetail {
+                detail: "Linux errno -86 is ESTRPIPE: a streams pipe operation failed",
+                hint: CHECK_IPC_HINT,
+            })
+        }
+        ("linux", text) if text.contains("unknown system error -88") => {
+            Some(UnknownSpawnErrorDetail {
+                detail: "Linux errno -88 is ENOTSOCK: a socket operation targeted a non-socket",
+                hint: CHECK_IPC_HINT,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn stdio_mcp_server_descriptions(mcp_servers: &[McpServer]) -> Box<[String]> {
+    mcp_servers
+        .iter()
+        .filter_map(|server| match server {
+            McpServer::Stdio(server) => {
+                Some(format!("{} ({})", server.name, server.command.display()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
 /// Classify an ACP error from the `initialize` handshake. Auth-required
 /// is split out so users get the same actionable text as on session/new;
 /// the spec permits an agent to demand auth before opening any session.
@@ -627,9 +721,19 @@ fn classify_initialize_error(source: agent_client_protocol::Error) -> LaunchErro
 /// Classify a session lifecycle ACP error. Auth-required is split out
 /// because it has a different remediation than a generic failure.
 fn classify_session_error(source: agent_client_protocol::Error) -> LaunchError {
+    classify_session_error_with_mcp_servers(source, &[])
+}
+
+fn classify_session_error_with_mcp_servers(
+    source: agent_client_protocol::Error,
+    mcp_servers: &[McpServer],
+) -> LaunchError {
     match auth_required_detail(&source) {
         Some(detail) => LaunchError::AuthRequired { detail },
-        None => LaunchError::SessionCreateFailed { source },
+        None => LaunchError::SessionCreateFailed {
+            source,
+            stdio_mcp_servers: stdio_mcp_server_descriptions(mcp_servers),
+        },
     }
 }
 
@@ -733,9 +837,9 @@ async fn create_new_session(
                 conn.send_request(request())
                     .block_task()
                     .await
-                    .map_err(classify_session_error)
+                    .map_err(|source| classify_session_error_with_mcp_servers(source, mcp_servers))
             }
-            None => Err(classify_session_error(source)),
+            None => Err(classify_session_error_with_mcp_servers(source, mcp_servers)),
         },
     }
 }
@@ -2675,7 +2779,10 @@ async fn reload_active_session(
     session_state
         .set_active_session_with_roots(session_id.clone(), &cwd, additional_directories)
         .await
-        .map_err(|source| LaunchError::SessionCreateFailed { source })?;
+        .map_err(|source| LaunchError::SessionCreateFailed {
+            source,
+            stdio_mcp_servers: Box::default(),
+        })?;
     let loaded_config = load_existing_session(
         conn,
         session_id.clone(),
@@ -2741,7 +2848,10 @@ async fn switch_existing_session(
     session_state
         .set_active_session_with_roots(target_session_id.clone(), &cwd, additional_directories)
         .await
-        .map_err(|source| LaunchError::SessionCreateFailed { source })?;
+        .map_err(|source| LaunchError::SessionCreateFailed {
+            source,
+            stdio_mcp_servers: Box::default(),
+        })?;
     // Agents may stream replay notifications before replying to session/load.
     // Move every consumer to the target first so replay cannot be recorded on
     // the old session and then discarded by the reset below.
@@ -11491,12 +11601,85 @@ mod tests {
             },
             LaunchError::SessionCreateFailed {
                 source: agent_client_protocol::Error::invalid_params(),
+                stdio_mcp_servers: Box::default(),
             },
         ];
         for case in cases {
             let text = case.to_string();
             assert!(text.contains("hint:"), "missing hint in: {text}");
         }
+    }
+
+    #[test]
+    fn session_create_spawn_errors_replace_the_cwd_hint_with_process_diagnostics() {
+        let mcp_servers = vec![McpServer::Stdio(
+            agent_client_protocol::schema::v1::McpServerStdio::new(
+                "workspace-tools",
+                "/opt/mjolnir/workspace-tools",
+            ),
+        )];
+
+        for errno in ["-86", "-88"] {
+            let source = agent_client_protocol::Error::internal_error().data(serde_json::json!({
+                "details": format!("spawn Unknown system error {errno}")
+            }));
+            let text = classify_session_error_with_mcp_servers(source, &mcp_servers).to_string();
+
+            assert!(text.contains("failed to launch a child process"), "{text}");
+            assert!(
+                text.contains("workspace-tools (/opt/mjolnir/workspace-tools)"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("--cwd"),
+                "spawn failures must not blame cwd: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn unnamed_spawn_errno_decoding_is_platform_specific() {
+        assert_eq!(
+            unknown_spawn_error_detail("spawn unknown system error -86", "macos"),
+            Some(UnknownSpawnErrorDetail {
+                detail: "macOS errno -86 is EBADARCH: the executable has the wrong CPU architecture",
+                hint: "reinstall or repair the agent CLI, verify any listed stdio MCP server commands, then retry",
+            })
+        );
+        assert_eq!(
+            unknown_spawn_error_detail("spawn unknown system error -88", "macos"),
+            Some(UnknownSpawnErrorDetail {
+                detail: "macOS errno -88 is EBADMACHO: the executable is malformed or truncated",
+                hint: "reinstall or repair the agent CLI, verify any listed stdio MCP server commands, then retry",
+            })
+        );
+        assert_eq!(
+            unknown_spawn_error_detail("spawn unknown system error -86", "linux"),
+            Some(UnknownSpawnErrorDetail {
+                detail: "Linux errno -86 is ESTRPIPE: a streams pipe operation failed",
+                hint: "restart the agent adapter, inspect its stdio/IPC setup and any listed stdio MCP servers, then retry",
+            })
+        );
+        assert_eq!(
+            unknown_spawn_error_detail("spawn unknown system error -88", "linux"),
+            Some(UnknownSpawnErrorDetail {
+                detail: "Linux errno -88 is ENOTSOCK: a socket operation targeted a non-socket",
+                hint: "restart the agent adapter, inspect its stdio/IPC setup and any listed stdio MCP servers, then retry",
+            })
+        );
+        assert_eq!(
+            unknown_spawn_error_detail("spawn unknown system error -88", "windows"),
+            None
+        );
+    }
+
+    #[test]
+    fn session_create_non_spawn_errors_keep_the_cwd_hint() {
+        let text =
+            classify_session_error(agent_client_protocol::Error::invalid_params()).to_string();
+
+        assert!(text.contains("--cwd"), "{text}");
+        assert!(!text.contains("failed to launch a child process"), "{text}");
     }
 
     #[test]
