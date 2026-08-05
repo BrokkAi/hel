@@ -8953,6 +8953,20 @@ mod tests {
         assert!(viewer.contains("candidate.status?.cwd === cwd"));
     }
 
+    #[test]
+    fn embedded_viewer_contains_read_only_session_history() {
+        let viewer = include_str!("remote_viewer.html");
+        assert!(viewer.contains("id=\"history-toggle\""));
+        assert!(viewer.contains("id=\"history-sessions\""));
+        assert!(viewer.contains("apiFetch(\"/sessions\""));
+        assert!(viewer.contains("function archivedSessions"));
+        assert!(viewer.contains("composerEl.hidden = readOnly"));
+        assert!(viewer.contains("renderPermissions(readOnly ? null : session)"));
+        assert!(viewer.contains("selectedSessionIsArchived()"));
+        assert!(viewer.contains("!selectedSessionIsLive()"));
+        assert!(viewer.contains("Only live sessions can accept prompts."));
+    }
+
     #[tokio::test]
     async fn select_elicitations_track_cards_and_forward_valid_choices() {
         for (tool, choice) in [
