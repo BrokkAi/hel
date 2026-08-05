@@ -5670,9 +5670,6 @@ fn mjconfig_server_status(server: &roster::AcpServerInfo) -> String {
 }
 
 fn mjconfig_server_detail(server: &roster::AcpServerInfo) -> String {
-    if server.id == "anvil" {
-        return server.evidence.clone();
-    }
     let args = server.launch.args.join(" ");
     let command = if args.is_empty() {
         server.launch.command.display().to_string()
@@ -6034,9 +6031,6 @@ fn mjconfig_apply_edits(
             let policy = policy_from_wire(&policy)
                 .ok_or_else(|| bad_request(format!("unknown policy: {policy}")))?;
             config.set_acp_server_policy(&id, policy);
-            if id == "anvil" && policy == config::AcpServerPolicy::Enabled {
-                crate::anvil::retry_background_install();
-            }
         }
     }
     let reasoning_effort_key = format!("config:{}", acp::REASONING_EFFORT_CONFIG_ID);
@@ -9357,7 +9351,12 @@ mod tests {
     async fn mjconfig_snapshot_reports_probed_session_options() {
         use agent_client_protocol::schema::v1::{SessionConfigOption, SessionConfigSelectOption};
         let runtime = test_mjconfig_runtime();
-        let mut inventory = roster::discover_inventory(&config::Config::default());
+        // The snapshot re-derives the inventory from the *saved* config, so
+        // the explicit policy has to be on disk: an undetected built-in left
+        // on `Auto` is hidden, and rediscovery would drop the seeded options.
+        let config = roster::config_with_a_visible_builtin();
+        config.save(&runtime.config_path).expect("seed config");
+        let mut inventory = roster::discover_inventory(&config);
         let server = inventory.servers.first_mut().expect("visible ACP server");
         let server_id = server.id.clone();
         server.session_config = vec![SessionConfigOption::select(
@@ -9418,7 +9417,7 @@ mod tests {
                         "codex-acp": { "config:reasoning_effort": "low" }
                     },
                     "priority": {
-                        "review": { "source": "codex-acp", "order": ["codex-acp", "anvil"] }
+                        "review": { "source": "codex-acp", "order": ["codex-acp", "kimi"] }
                     },
                     "add_custom_server": { "name": "my-agent", "command": "npx -y my-agent --acp" }
                 })),
@@ -9462,7 +9461,7 @@ mod tests {
         // A thought-level default also updates the seat's reasoning effort.
         assert_eq!(saved.subagents.reasoning_effort.as_deref(), Some("low"));
         assert_eq!(saved.review.acp_source.as_deref(), Some("codex-acp"));
-        assert_eq!(saved.review.acp_priority, vec!["codex-acp", "anvil"]);
+        assert_eq!(saved.review.acp_priority, vec!["codex-acp", "kimi"]);
         let custom = saved
             .acp
             .servers
@@ -10616,7 +10615,7 @@ mod tests {
             "last_update": "2026-06-03T10:00:00Z",
             "total_messages": 0,
             "project": "mjolnir",
-            "agent": "anvil",
+            "agent": "kimi",
         });
         let session: SessionRecord = serde_json::from_value(legacy).expect("legacy record");
         assert!(session.subagents.is_empty());
@@ -11757,7 +11756,7 @@ mod tests {
             total_messages: 4,
             project: "mjolnir".to_string(),
             worktree: Some("bold-fox".to_string()),
-            agent: "anvil".to_string(),
+            agent: "kimi".to_string(),
             transcript: vec![
                 TranscriptEntry {
                     kind: "user".to_string(),
@@ -11886,7 +11885,7 @@ mod tests {
             "last_update": "2026-06-03T10:00:20Z",
             "total_messages": 1,
             "project": "mjolnir",
-            "agent": "anvil"
+            "agent": "kimi"
         }"#;
         let record: SessionRecord = serde_json::from_str(json).expect("deserialize");
         assert_eq!(record.worktree, None);
@@ -13833,7 +13832,7 @@ mod tests {
             total_messages: 1,
             project: "mjolnir".to_string(),
             worktree: None,
-            agent: "anvil".to_string(),
+            agent: "kimi".to_string(),
             transcript: Vec::new(),
             queued_prompt_count: 0,
             prompt_in_flight: false,
