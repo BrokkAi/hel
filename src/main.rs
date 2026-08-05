@@ -2278,6 +2278,14 @@ async fn run_session(
     cmd_workspace_roots.push(cwd.clone());
     cmd_workspace_roots.extend(runtime_options.additional_directories.iter().cloned());
     let cmd_snapshot_exclusions = runtime_options.snapshot_exclusions.clone();
+    // Two reads can overlap and finish out of order; the refresher publishes
+    // only the newest, because an older worktree state landing over a newer
+    // one is exactly the staleness this reader exists to avoid.
+    let workspace_diff_refresher = acp::WorkspaceHeadDiffRefresher::new(
+        cmd_workspace_roots.clone(),
+        cmd_snapshot_exclusions.clone(),
+        runtime_options.fs_max_text_bytes,
+    );
     let side_agent = agent.clone();
     let side_cwd = cwd.clone();
     let side_additional_directories = runtime_options.additional_directories.clone();
@@ -2330,6 +2338,13 @@ async fn run_session(
                 {
                     let _ = side_ui_event_tx.send(UiEvent::Warning(message));
                 }
+                continue;
+            }
+            // Handled before side forwarding: the diff is a property of the
+            // workspace on disk, which a side conversation shares, so routing
+            // it into a side runtime would only lose it.
+            if matches!(command, UiCommand::RefreshWorkspaceDiff) {
+                workspace_diff_refresher.spawn(side_ui_event_tx.clone());
                 continue;
             }
             let (command, force_main) = match command {
