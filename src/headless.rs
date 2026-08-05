@@ -2142,6 +2142,7 @@ mod tests {
                         "https://example.com/login",
                     )
                     .into(),
+                    remote_id: None,
                     responder: elicitation_tx,
                 },
             },
@@ -2344,6 +2345,7 @@ mod tests {
                 "https://example.com/auth",
             )
             .into(),
+            remote_id: None,
             responder,
         });
         assert!(matches!(

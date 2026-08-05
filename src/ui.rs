@@ -16050,6 +16050,7 @@ mod tests {
                 ElicitationSessionScope::new("setup".to_string()),
                 schema,
             )),
+            remote_id: None,
             responder,
         }
     }
@@ -16081,6 +16082,7 @@ mod tests {
                 ElicitationSessionScope::new("setup".to_string()),
                 schema,
             )),
+            remote_id: None,
             responder,
         }
     }
@@ -16098,6 +16100,7 @@ mod tests {
                 ElicitationId::new("login-1"),
                 url,
             )),
+            remote_id: None,
             responder,
         }
     }
@@ -16305,6 +16308,7 @@ mod tests {
                 ElicitationSessionScope::new("setup".to_string()),
                 schema,
             )),
+            remote_id: None,
             responder,
         }
     }
