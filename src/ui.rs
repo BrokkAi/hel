@@ -1139,6 +1139,7 @@ pub struct UiRunOptions<'a> {
     pub configured_models: crate::config::ModelsConfig,
     pub active_models: crate::config::ModelsConfig,
     pub review_enabled: bool,
+    pub review_tier: crate::config::ReviewTier,
     pub ragnarok_models: Vec<crate::roster::ResolvedAgent>,
     pub ragnarok_observer: Option<mpsc::UnboundedSender<Option<RagnarokObservation>>>,
     pub primary_acp_name: String,
@@ -1173,6 +1174,7 @@ struct UiInitialState {
     configured_models: crate::config::ModelsConfig,
     active_models: crate::config::ModelsConfig,
     review_enabled: bool,
+    review_tier: crate::config::ReviewTier,
     ragnarok_models: Vec<crate::roster::ResolvedAgent>,
     ragnarok_observer: Option<mpsc::UnboundedSender<Option<RagnarokObservation>>>,
     primary_acp_name: String,
@@ -1237,6 +1239,7 @@ pub async fn run(
             configured_models: options.configured_models,
             active_models: options.active_models,
             review_enabled: options.review_enabled,
+            review_tier: options.review_tier,
             ragnarok_models: options.ragnarok_models,
             ragnarok_observer: options.ragnarok_observer,
             primary_acp_name: options.primary_acp_name,
@@ -1488,6 +1491,7 @@ async fn ui_loop(
     state.configured_models = initial.configured_models;
     state.active_models = initial.active_models;
     state.review_enabled = initial.review_enabled;
+    state.review_tier = initial.review_tier;
     state.ragnarok_models = initial.ragnarok_models;
     let ragnarok_observer = initial.ragnarok_observer;
     let mut last_ragnarok_observation = None;
@@ -5129,7 +5133,8 @@ fn persist_mjconfig_selection(
 ) {
     let theme = config.theme;
     let style = config.spinner;
-    let review_changed = state.review_enabled != config.agent.discrete_review;
+    let review_changed = state.review_enabled != config.agent.discrete_review
+        || state.review_tier != config.agent.review_tier;
     let feature_hints_enabled = config.feature_hints;
     let keep_awake_enabled = config.keep_awake;
     let live_session_updates = live_primary_session_config_updates(state, &config);
@@ -5145,11 +5150,13 @@ fn persist_mjconfig_selection(
                 state.acp_inventory =
                     crate::roster::rediscover_inventory(&config, &state.acp_inventory);
                 state.review_enabled = config.agent.discrete_review;
+                state.review_tier = config.agent.review_tier;
                 state.feature_hints_enabled = feature_hints_enabled;
                 state.keep_awake.set_enabled(keep_awake_enabled);
                 if review_changed {
                     let _ = cmd_tx.send(UiCommand::SetReviewPolicy {
                         enabled: config.agent.discrete_review,
+                        tier: config.agent.review_tier,
                     });
                 }
                 for (target, value) in live_session_updates {
@@ -18604,12 +18611,15 @@ mod tests {
         state.mjconfig_menu_key(KeyCode::Right);
         let previewed = state.spinner_style;
 
-        // Agents tab: toggle discrete review and apply it to the running session.
+        // Agents tab: toggle discrete review, deepen the review tier, and apply
+        // both to the running session.
         state.mjconfig_menu_key(KeyCode::Tab);
         for _ in 0..2 {
             state.mjconfig_menu_key(KeyCode::Down);
         }
         state.mjconfig_menu_key(KeyCode::Char(' '));
+        state.mjconfig_menu_key(KeyCode::Down);
+        state.mjconfig_menu_key(KeyCode::Right);
 
         handle_mjconfig_menu_key(
             &mut state,
@@ -18628,9 +18638,13 @@ mod tests {
             crate::config::AcpServerPolicy::Disabled
         );
         assert!(!saved.agent.discrete_review);
+        assert_eq!(saved.agent.review_tier, config::ReviewTier::Extended);
         assert!(matches!(
             cmd_rx.try_recv(),
-            Ok(UiCommand::SetReviewPolicy { enabled: false })
+            Ok(UiCommand::SetReviewPolicy {
+                enabled: false,
+                tier: config::ReviewTier::Extended
+            })
         ));
     }
 
