@@ -5,9 +5,9 @@ description: Choose a Codex and Claude team, then configure its models, ACP serv
 
 Open `/mjconfig` to edit settings from the TUI. The **Team** tab chooses who
 codes and who reviews; model and ACP-server changes are available in the other
-tabs. Team and adapter changes apply to a new session. When credentials or
-adapter capabilities change, run `mj models refresh` before starting Mjolnir
-again.
+tabs. Team and adapter changes apply to a new session. Credentials and adapter
+capabilities are probed whenever a new session roster is resolved;
+`mj models refresh` runs that probe as a standalone diagnostic.
 
 The config schema is versioned. The current schema is `version = 3`; a
 `version = 2` file is migrated in place on load. Any other version starts from

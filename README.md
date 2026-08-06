@@ -122,8 +122,9 @@ mj
 First launch asks which agent codes and which reviews. Choose one of the four
 teams and start the session. Press **Ctrl+Tab** to switch teams later, or open
 the **Team** tab in `/mjconfig`. Team, model, and adapter changes apply to a new
-session. If provider credentials or capabilities change, run
-`mj models refresh` before starting Mjolnir again.
+session. If provider credentials or capabilities change, start a new session
+so the configured adapters are probed again. `mj models refresh` runs the same
+probe as a standalone diagnostic.
 
 ## Try it
 
