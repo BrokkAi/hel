@@ -5521,14 +5521,12 @@ fn spawn_tailscale_cert_renewer(ts: TailscaleTls, resolver: Arc<SniCertResolver>
 
 /// Server-side runtime for the web `/mjconfig` editor: where the config file
 /// lives, the model choices and active seat bindings resolved at server start,
-/// and the at-most-one background login/install job the panel may run.
+/// and the at-most-one background login job the panel may run.
 #[derive(Debug)]
 struct MjConfigRuntime {
     config_path: PathBuf,
     discovery: Mutex<MjConfigDiscovery>,
     login: Mutex<Option<MjLoginJob>>,
-    install: Mutex<Option<MjInstallJob>>,
-    registry: tokio::sync::Mutex<Option<crate::registry::Registry>>,
 }
 
 #[derive(Debug)]
@@ -5570,8 +5568,6 @@ impl MjConfigRuntime {
                 refresh_requested: false,
             }),
             login: Mutex::new(None),
-            install: Mutex::new(None),
-            registry: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -5676,21 +5672,6 @@ struct MjLoginJob {
     abort: tokio::task::AbortHandle,
 }
 
-#[derive(Debug, Default)]
-struct MjInstallProgress {
-    total_bytes: Option<u64>,
-    downloaded_bytes: u64,
-    extracting: bool,
-    result: Option<std::result::Result<(PathBuf, Vec<String>), String>>,
-}
-
-#[derive(Debug)]
-struct MjInstallJob {
-    agent: crate::registry::Agent,
-    progress: Arc<Mutex<MjInstallProgress>>,
-    abort: tokio::task::AbortHandle,
-}
-
 #[derive(Debug, Serialize)]
 struct MjConfigSnapshot {
     agents: MjAgentsPanel,
@@ -5705,14 +5686,12 @@ struct MjConfigSnapshot {
     acp_priority: MjPriorityPanel,
     appearance: MjAppearancePanel,
     login: Option<MjLoginStatus>,
-    install: Option<MjInstallStatus>,
     /// True while adapters are still being probed for model and session-option
     /// capabilities. The browser polls until the final inventory is available.
     probing: bool,
     /// Changes whenever an incremental probe snapshot updates the inventory.
     discovery_revision: u64,
-    /// One-shot message produced while folding finished background jobs into
-    /// the config (e.g. "installed X" or an install failure).
+    /// One-shot message produced while applying an edit.
     notice: Option<String>,
 }
 
@@ -5846,16 +5825,6 @@ struct MjLoginStatus {
     message: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct MjInstallStatus {
-    agent_id: String,
-    agent_name: String,
-    running: bool,
-    total_bytes: Option<u64>,
-    downloaded_bytes: u64,
-    extracting: bool,
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MjConfigApplyRequest {
@@ -5885,7 +5854,6 @@ struct MjConfigApplyRequest {
     subagent_session_defaults: Option<BTreeMap<String, BTreeMap<String, String>>>,
     /// Seat (`primary` | `review` | `subagents`) → source/order edit.
     priority: Option<BTreeMap<String, MjSeatPriorityEdit>>,
-    add_custom_server: Option<MjCustomServerRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5896,28 +5864,8 @@ struct MjSeatPriorityEdit {
 }
 
 #[derive(Debug, Deserialize)]
-struct MjCustomServerRequest {
-    name: String,
-    command: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct MjLoginRequest {
     vendor: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct MjInstallRequest {
-    id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct MjRegistryEntry {
-    id: String,
-    name: String,
-    description: String,
-    version: String,
-    kind: String,
 }
 
 fn mjconfig_load(state: &ServerState) -> config::Config {
@@ -5951,9 +5899,7 @@ fn mjconfig_editor(
 
 /// Mirror of the TUI's server-row status line in `settings::draw_servers`.
 fn mjconfig_server_status(server: &roster::AcpServerInfo) -> String {
-    let status = if server.installing {
-        "installing".to_string()
-    } else if server.policy == config::AcpServerPolicy::Disabled {
+    let status = if server.policy == config::AcpServerPolicy::Disabled {
         "disabled".to_string()
     } else if let Some(error) = &server.error {
         format!("error: {error}")
@@ -6011,61 +5957,6 @@ const MJ_SEATS: [(crate::settings::PrioritySeat, &str, &str); 3] = [
     ),
 ];
 
-/// Fold a finished background install into the config, mirroring the TUI's
-/// `poll_background`: success registers the server enabled, failure surfaces
-/// as a notice. Returns the notice to show, if any.
-fn mjconfig_absorb_finished_install(state: &ServerState) -> Option<String> {
-    let mut guard = state
-        .mjconfig
-        .install
-        .lock()
-        .expect("mjconfig install lock");
-    let finished = {
-        let job = guard.as_ref()?;
-        let mut progress = job.progress.lock().expect("mjconfig install progress");
-        progress.result.take()
-    };
-    let result = finished?;
-    let job = guard.take().expect("job present");
-    match result {
-        Ok((command, args)) => {
-            let platform = crate::registry::current_platform();
-            let env = job
-                .agent
-                .distribution
-                .binary
-                .as_ref()
-                .and_then(|targets| targets.get(&platform))
-                .map(|target| target.env.clone())
-                .unwrap_or_default();
-            let mut config = mjconfig_load(state);
-            let server = config::ConfiguredAcpServer {
-                id: job.agent.id.clone(),
-                label: job.agent.name.clone(),
-                command,
-                args,
-                env,
-                origin: config::AcpServerOrigin::Registry,
-                policy: config::AcpServerPolicy::Enabled,
-            };
-            config
-                .acp
-                .servers
-                .retain(|existing| existing.id != server.id);
-            config.acp.policies.remove(&server.id);
-            config.acp.servers.push(server);
-            match config::save_user_config_preserving_session_routes(
-                &state.mjconfig.config_path,
-                &mut config,
-            ) {
-                Ok(()) => Some(format!("Installed {}", job.agent.name)),
-                Err(error) => Some(format!("Install saved settings failed: {error:#}")),
-            }
-        }
-        Err(error) => Some(format!("Install failed: {error}")),
-    }
-}
-
 fn mjconfig_login_status(state: &ServerState) -> Option<MjLoginStatus> {
     let mut guard = state.mjconfig.login.lock().expect("mjconfig login lock");
     let job = guard.as_ref()?;
@@ -6089,31 +5980,12 @@ fn mjconfig_login_status(state: &ServerState) -> Option<MjLoginStatus> {
     Some(status)
 }
 
-fn mjconfig_install_status(state: &ServerState) -> Option<MjInstallStatus> {
-    let guard = state
-        .mjconfig
-        .install
-        .lock()
-        .expect("mjconfig install lock");
-    let job = guard.as_ref()?;
-    let progress = job.progress.lock().expect("mjconfig install progress");
-    Some(MjInstallStatus {
-        agent_id: job.agent.id.clone(),
-        agent_name: job.agent.name.clone(),
-        running: progress.result.is_none(),
-        total_bytes: progress.total_bytes,
-        downloaded_bytes: progress.downloaded_bytes,
-        extracting: progress.extracting,
-    })
-}
-
 fn mjconfig_snapshot_response(state: &ServerState, notice: Option<String>) -> MjConfigSnapshot {
     // Read the job first. If sign-in completed, its task has already requested
     // discovery; if it is still running, this snapshot keeps browser polling
     // active until a later response can start the refresh.
     let login = mjconfig_login_status(state);
     refresh_mjconfig_discovery_if_needed(state);
-    let install_notice = mjconfig_absorb_finished_install(state);
     let config = mjconfig_load(state);
     let (editor, probing, discovery_revision) = mjconfig_editor(state, config);
     let config = &editor.config;
@@ -6173,6 +6045,7 @@ fn mjconfig_snapshot_response(state: &ServerState, notice: Option<String>) -> Mj
     let servers = inventory
         .servers
         .iter()
+        .filter(|server| crate::settings::is_configurable_acp_server(&server.id))
         .map(|server| {
             let allowed: &[config::AcpServerPolicy] = if server.origin.is_some() {
                 &[
@@ -6302,10 +6175,9 @@ fn mjconfig_snapshot_response(state: &ServerState, notice: Option<String>) -> Mj
         },
         appearance,
         login,
-        install: mjconfig_install_status(state),
         probing,
         discovery_revision,
-        notice: notice.or(install_notice),
+        notice,
     }
 }
 
@@ -6397,6 +6269,11 @@ fn mjconfig_apply_edits(
     }
     if let Some(policies) = request.server_policies {
         for (id, policy) in policies {
+            if !crate::settings::is_configurable_acp_server(&id) {
+                return Err(bad_request(format!(
+                    "ACP server policy is not configurable: {id}"
+                )));
+            }
             let policy = policy_from_wire(&policy)
                 .ok_or_else(|| bad_request(format!("unknown policy: {policy}")))?;
             config.set_acp_server_policy(&id, policy);
@@ -6477,38 +6354,6 @@ fn mjconfig_apply_edits(
             }
         }
     }
-    if let Some(custom) = request.add_custom_server {
-        let name = custom.name.trim();
-        let parts = match shell_words::split(&custom.command) {
-            Ok(parts) if !parts.is_empty() => parts,
-            Ok(_) => return Err(bad_request("Command is required".to_string())),
-            Err(error) => return Err(bad_request(format!("Invalid command: {error}"))),
-        };
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
-            return Err(bad_request(
-                "Name must contain only letters, digits, '-' or '_'".to_string(),
-            ));
-        }
-        let server = config::ConfiguredAcpServer {
-            id: format!("custom:{name}"),
-            label: name.to_string(),
-            command: PathBuf::from(&parts[0]),
-            args: parts[1..].to_vec(),
-            env: Default::default(),
-            origin: config::AcpServerOrigin::Custom,
-            policy: config::AcpServerPolicy::Enabled,
-        };
-        config
-            .acp
-            .servers
-            .retain(|existing| existing.id != server.id);
-        config.acp.policies.remove(&server.id);
-        config.acp.servers.push(server);
-    }
     Ok(())
 }
 
@@ -6557,213 +6402,6 @@ async fn mjconfig_apply(
         format!("Saved. {}", reroute_notices.join("; "))
     };
     Ok(Json(mjconfig_snapshot_response(&state, Some(notice))))
-}
-
-async fn mjconfig_registry(
-    State(state): State<ServerState>,
-) -> std::result::Result<Json<Vec<MjRegistryEntry>>, (StatusCode, String)> {
-    let mut cached = state.mjconfig.registry.lock().await;
-    if cached.is_none() {
-        *cached = Some(
-            crate::registry::load()
-                .await
-                .map_err(|error| internal_error(format!("load ACP registry: {error:#}")))?,
-        );
-    }
-    let registry = cached.as_ref().expect("registry cached");
-    let config = mjconfig_load(&state);
-    let configured: HashSet<String> = roster::discover_inventory(&config)
-        .servers
-        .into_iter()
-        .map(|server| server.id)
-        .collect();
-    let platform = crate::registry::current_platform();
-    let mut agents: Vec<&crate::registry::Agent> = registry
-        .agents
-        .iter()
-        .filter(|agent| !configured.contains(&agent.id))
-        .filter(|agent| agent.preferred_kind(&platform).is_some())
-        .collect();
-    agents.sort_by_key(|agent| agent.name.to_ascii_lowercase());
-    Ok(Json(
-        agents
-            .into_iter()
-            .map(|agent| MjRegistryEntry {
-                id: agent.id.clone(),
-                name: agent.name.clone(),
-                description: agent.description.clone(),
-                version: agent.version.clone(),
-                kind: agent
-                    .preferred_kind(&platform)
-                    .map(crate::registry::DistributionKind::label)
-                    .unwrap_or("unsupported")
-                    .to_string(),
-            })
-            .collect(),
-    ))
-}
-
-async fn mjconfig_install_start(
-    State(state): State<ServerState>,
-    Json(request): Json<MjInstallRequest>,
-) -> std::result::Result<Json<MjConfigSnapshot>, (StatusCode, String)> {
-    let agent = {
-        let cached = state.mjconfig.registry.lock().await;
-        cached
-            .as_ref()
-            .and_then(|registry| {
-                registry
-                    .agents
-                    .iter()
-                    .find(|agent| agent.id == request.id)
-                    .cloned()
-            })
-            .ok_or((
-                StatusCode::NOT_FOUND,
-                "unknown registry agent; refresh the catalog".to_string(),
-            ))?
-    };
-    let platform = crate::registry::current_platform();
-    match agent.preferred_kind(&platform) {
-        Some(crate::registry::DistributionKind::Npx) => {
-            let package = agent.distribution.npx.as_ref().expect("npx selected");
-            let mut args = vec!["-y".to_string(), package.package.clone()];
-            args.extend(package.args.clone());
-            mjconfig_add_registry_server(&state, &agent, PathBuf::from("npx"), args)?;
-            Ok(Json(mjconfig_snapshot_response(
-                &state,
-                Some(format!("Added {}", agent.name)),
-            )))
-        }
-        Some(crate::registry::DistributionKind::Uvx) => {
-            let package = agent.distribution.uvx.as_ref().expect("uvx selected");
-            let mut args = vec![package.package.clone()];
-            args.extend(package.args.clone());
-            mjconfig_add_registry_server(&state, &agent, PathBuf::from("uvx"), args)?;
-            Ok(Json(mjconfig_snapshot_response(
-                &state,
-                Some(format!("Added {}", agent.name)),
-            )))
-        }
-        Some(crate::registry::DistributionKind::Binary) => {
-            let mut guard = state
-                .mjconfig
-                .install
-                .lock()
-                .expect("mjconfig install lock");
-            if guard
-                .as_ref()
-                .is_some_and(|job| job.progress.lock().expect("progress").result.is_none())
-            {
-                return Err((
-                    StatusCode::CONFLICT,
-                    "another install is already running".to_string(),
-                ));
-            }
-            let target = agent
-                .distribution
-                .binary
-                .as_ref()
-                .and_then(|targets| targets.get(&platform))
-                .cloned()
-                .ok_or_else(|| {
-                    internal_error("no binary distribution for this platform".to_string())
-                })?;
-            let progress = Arc::new(Mutex::new(MjInstallProgress::default()));
-            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-            let progress_sink = Arc::clone(&progress);
-            tokio::spawn(async move {
-                while let Some(event) = progress_rx.recv().await {
-                    let Ok(mut state) = progress_sink.lock() else {
-                        break;
-                    };
-                    match event {
-                        crate::install::Progress::Started { total_bytes } => {
-                            state.total_bytes = total_bytes;
-                        }
-                        crate::install::Progress::Downloaded { downloaded_bytes } => {
-                            state.downloaded_bytes = downloaded_bytes;
-                        }
-                        crate::install::Progress::Extracting => state.extracting = true,
-                        crate::install::Progress::Done => {}
-                    }
-                }
-            });
-            let output = Arc::clone(&progress);
-            let id = agent.id.clone();
-            let version = agent.version.clone();
-            let task = tokio::spawn(async move {
-                let result =
-                    crate::install::install_or_resolve(&id, &version, &target, progress_tx)
-                        .await
-                        .map_err(|error| format!("{error:#}"));
-                if let Ok(mut progress) = output.lock() {
-                    progress.result = Some(result);
-                }
-            });
-            *guard = Some(MjInstallJob {
-                agent,
-                progress,
-                abort: task.abort_handle(),
-            });
-            drop(guard);
-            Ok(Json(mjconfig_snapshot_response(&state, None)))
-        }
-        None => Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "No supported distribution for this platform".to_string(),
-        )),
-    }
-}
-
-fn mjconfig_add_registry_server(
-    state: &ServerState,
-    agent: &crate::registry::Agent,
-    command: PathBuf,
-    args: Vec<String>,
-) -> std::result::Result<(), (StatusCode, String)> {
-    let env = match agent.preferred_kind(&crate::registry::current_platform()) {
-        Some(crate::registry::DistributionKind::Npx) => {
-            agent.distribution.npx.as_ref().map(|p| p.env.clone())
-        }
-        Some(crate::registry::DistributionKind::Uvx) => {
-            agent.distribution.uvx.as_ref().map(|p| p.env.clone())
-        }
-        _ => None,
-    }
-    .unwrap_or_default();
-    let mut config = mjconfig_load(state);
-    let server = config::ConfiguredAcpServer {
-        id: agent.id.clone(),
-        label: agent.name.clone(),
-        command,
-        args,
-        env,
-        origin: config::AcpServerOrigin::Registry,
-        policy: config::AcpServerPolicy::Enabled,
-    };
-    config
-        .acp
-        .servers
-        .retain(|existing| existing.id != server.id);
-    config.acp.policies.remove(&server.id);
-    config.acp.servers.push(server);
-    config::save_user_config_preserving_session_routes(&state.mjconfig.config_path, &mut config)
-        .map_err(|error| internal_error(format!("save config: {error:#}")))?;
-    Ok(())
-}
-
-async fn mjconfig_install_cancel(State(state): State<ServerState>) -> Json<MjConfigSnapshot> {
-    if let Some(job) = state
-        .mjconfig
-        .install
-        .lock()
-        .expect("mjconfig install lock")
-        .take()
-    {
-        job.abort.abort();
-    }
-    Json(mjconfig_snapshot_response(&state, None))
 }
 
 async fn mjconfig_login_start(
@@ -6961,11 +6599,6 @@ fn build_router(config: RouterConfig) -> Router {
         .route("/api/config-changes", post(queue_config_change))
         .route("/api/config-changes/claim", post(claim_config_change))
         .route("/api/mjconfig", get(mjconfig_snapshot).post(mjconfig_apply))
-        .route("/api/mjconfig/registry", get(mjconfig_registry))
-        .route(
-            "/api/mjconfig/install",
-            post(mjconfig_install_start).delete(mjconfig_install_cancel),
-        )
         .route(
             "/api/mjconfig/login",
             post(mjconfig_login_start).delete(mjconfig_login_cancel),
@@ -10255,9 +9888,47 @@ mod tests {
             "subagent_options key present"
         );
         assert!(snapshot["login"].is_null());
-        assert!(snapshot["install"].is_null());
+        assert!(snapshot.get("install").is_none());
         assert_eq!(snapshot["probing"], false);
         assert_eq!(snapshot["discovery_revision"], 0);
+    }
+
+    #[tokio::test]
+    async fn mjconfig_snapshot_only_exposes_codex_and_claude_server_controls() {
+        let runtime = test_mjconfig_runtime();
+        let mut config = roster::config_with_a_visible_builtin();
+        config.acp.servers.push(config::ConfiguredAcpServer {
+            id: "custom:company".to_string(),
+            label: "Company".to_string(),
+            command: PathBuf::from("company-acp"),
+            args: Vec::new(),
+            env: Default::default(),
+            origin: config::AcpServerOrigin::Custom,
+            policy: config::AcpServerPolicy::Enabled,
+        });
+        config.save(&runtime.config_path).expect("seed config");
+        let app = mjconfig_test_router(runtime, "mjconfig-token");
+
+        let response = app
+            .oneshot(mjconfig_request("GET", Some("mjconfig-token"), None))
+            .await
+            .expect("response");
+        let snapshot = json_body(response).await;
+        let servers = snapshot["acp_servers"]["servers"]
+            .as_array()
+            .expect("servers");
+
+        assert!(!servers.is_empty());
+        assert!(
+            servers
+                .iter()
+                .all(|server| matches!(server["id"].as_str(), Some("codex-acp" | "claude-acp")))
+        );
+        assert!(
+            !servers
+                .iter()
+                .any(|server| server["id"] == "custom:company")
+        );
     }
 
     #[tokio::test]
@@ -10412,8 +10083,7 @@ mod tests {
                     },
                     "priority": {
                         "review": { "source": "codex-acp", "order": ["codex-acp", "claude-acp"] }
-                    },
-                    "add_custom_server": { "name": "my-agent", "command": "npx -y my-agent --acp" }
+                    }
                 })),
             ))
             .await
@@ -10477,18 +10147,6 @@ mod tests {
         assert_eq!(saved.subagents.reasoning_effort.as_deref(), Some("low"));
         assert_eq!(saved.review.acp_source.as_deref(), Some("codex-acp"));
         assert_eq!(saved.review.acp_priority, vec!["codex-acp", "claude-acp"]);
-        let custom = saved
-            .acp
-            .servers
-            .iter()
-            .find(|server| server.id == "custom:my-agent")
-            .expect("custom server saved");
-        // Windows resolves the launcher to npx.cmd on load.
-        assert_eq!(
-            custom.command.file_stem().and_then(|stem| stem.to_str()),
-            Some("npx")
-        );
-        assert_eq!(custom.args, vec!["-y", "my-agent", "--acp"]);
 
         // Clearing the source constraint round-trips back to "any".
         let response = app
@@ -10553,8 +10211,8 @@ mod tests {
             serde_json::json!({ "spinner": "cube" }),
             serde_json::json!({ "review_tier": "thorough" }),
             serde_json::json!({ "priority": { "sidekick": { "source": "x" } } }),
-            serde_json::json!({ "add_custom_server": { "name": "bad name!", "command": "x" } }),
-            serde_json::json!({ "add_custom_server": { "name": "ok", "command": "" } }),
+            serde_json::json!({ "server_policies": { "custom:company": "enabled" } }),
+            serde_json::json!({ "add_custom_server": { "name": "retired", "command": "x" } }),
         ];
         for body in cases {
             let response = app
@@ -10830,6 +10488,16 @@ mod tests {
         assert!(viewer.contains("previous.discovery_revision"));
         assert!(viewer.contains("Discovering ACP session options"));
         assert!(viewer.contains("openMjConfig(\"agents\")"));
+    }
+
+    #[test]
+    fn embedded_viewer_only_configures_supported_acp_servers() {
+        let viewer = include_str!("remote_viewer.html");
+        assert!(viewer.contains("Supported servers"));
+        assert!(!viewer.contains("/api/mjconfig/registry"));
+        assert!(!viewer.contains("/api/mjconfig/install"));
+        assert!(!viewer.contains("+ Add server"));
+        assert!(!viewer.contains("Add a custom ACP server command"));
     }
 
     #[test]
