@@ -6,7 +6,9 @@
 //! this state.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -23,7 +25,7 @@ use agent_client_protocol::schema::v1::{
 
 use crate::event::{
     ElicitationOutcome, ElicitationPrompt, InternalMessage, PermissionDecision, PermissionPrompt,
-    PromptImage, ReviewTarget, SessionConfigTarget, SubagentEvent, SubagentOutcome,
+    PromptImage, PromptResource, ReviewTarget, SessionConfigTarget, SubagentEvent, SubagentOutcome,
     SubagentStatusKind, TerminalOutputSnapshot, UiEvent, content_block_text,
 };
 use crate::palette::TerminalTheme;
@@ -1068,6 +1070,9 @@ pub struct AppState {
     /// Previously submitted prompts, oldest first. Used for Up/Down
     /// navigation in the input buffer.
     prompt_history: Vec<String>,
+    /// Structured file resources associated with each prompt-history entry.
+    /// Entries loaded from the legacy text-only history file use an empty vec.
+    prompt_history_resources: Vec<Vec<PromptResource>>,
     /// Index into `prompt_history` when navigating history. `None` means
     /// the user is not currently browsing history (they're editing a fresh
     /// input or the navigation was reset).
@@ -1075,12 +1080,17 @@ pub struct AppState {
     /// Saved input when history navigation starts. Restored when the user
     /// presses Down past the most recent history entry.
     history_saved_input: String,
+    /// File chips belonging to `history_saved_input`.
+    history_saved_file_attachments: Vec<FileAttachment>,
     /// Text attachments shown as compact badges in the input box; their
     /// contents are concatenated with `input` when the prompt is submitted.
     pub attachments: Vec<PastedAttachment>,
     /// Pasted image attachments shown as compact badges and submitted as
     /// ACP image content blocks.
     pub image_attachments: Vec<PastedImageAttachment>,
+    /// Workspace files selected through `@` completion and submitted as ACP
+    /// resource links.
+    pub file_attachments: Vec<FileAttachment>,
     /// Fast plain-character stream candidate. Terminals can deliver
     /// drag/drop and paste data as key events instead of bracketed paste.
     pub input_paste_burst: InputPasteBurst,
@@ -1184,8 +1194,15 @@ pub struct AppState {
     pub claude_usage: Option<ClaudeUsageStatus>,
     /// Last Codex app-server quota query, including explicit unavailable states.
     pub codex_usage: Option<CodexUsageStatus>,
-    /// Slash-command autocomplete state, recomputed on every input edit.
+    /// Slash-command and workspace-file autocomplete state.
     pub autocomplete: Autocomplete,
+    /// Additional directories registered as ACP workspace roots.
+    pub additional_workspace_roots: Vec<PathBuf>,
+    file_autocomplete_indexed_roots: Option<Vec<PathBuf>>,
+    file_autocomplete_indexed_at: Option<Instant>,
+    file_autocomplete_loading_roots: Option<Vec<PathBuf>>,
+    file_autocomplete_scan_request: Option<Vec<PathBuf>>,
+    file_autocomplete_candidates: Vec<WorkspaceFile>,
     /// True while the keyboard help overlay is visible.
     pub help_overlay: bool,
     /// Wrapped row offset shown by the keyboard help overlay.
@@ -1236,6 +1253,8 @@ pub struct QueuedPrompt {
     pub text: String,
     /// Image content blocks captured at queue time.
     pub images: Vec<PromptImage>,
+    /// ACP resource links captured at queue time.
+    pub resources: Vec<PromptResource>,
     /// Transcript-ready display text (matches what `submit_prompt` would
     /// have produced if the prompt had fired immediately).
     pub display_text: String,
@@ -1537,6 +1556,16 @@ pub struct PastedImageAttachment {
     pub byte_len: usize,
 }
 
+/// Workspace file shown as an anchored chip in the prompt editor.
+#[derive(Debug, Clone)]
+pub struct FileAttachment {
+    #[allow(dead_code)]
+    pub id: usize,
+    pub position: usize,
+    pub display_path: String,
+    pub resource: PromptResource,
+}
+
 /// Candidate text inserted by a rapid stream of plain character events.
 #[derive(Debug, Clone, Default)]
 pub struct InputPasteBurst {
@@ -1620,16 +1649,225 @@ pub struct ReviewPicker {
     pub selected: usize,
 }
 
-/// Autocomplete popover for slash-commands.
+/// The candidate collection currently shown by the prompt autocomplete.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutocompleteKind {
+    #[default]
+    Commands,
+    Files {
+        trigger_start: usize,
+        trigger_end: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceFile {
+    display_path: String,
+    absolute_path: PathBuf,
+    root: PathBuf,
+    size: Option<i64>,
+}
+
+/// Autocomplete popover for slash commands and workspace files.
 ///
-/// `matches` holds indices into `AppState.available_commands` so the
-/// popup keeps pointing at the right command even if the agent pushes a
-/// new `AvailableCommandsUpdate` (we just recompute the list).
+/// `matches` holds indices into either `AppState.available_commands` or the
+/// cached workspace-file index, as identified by `kind`.
 #[derive(Debug, Default)]
 pub struct Autocomplete {
     pub visible: bool,
     pub selected: usize,
     pub matches: Vec<usize>,
+    pub kind: AutocompleteKind,
+}
+
+const MAX_FILE_AUTOCOMPLETE_CANDIDATES: usize = 50_000;
+const MAX_FILE_AUTOCOMPLETE_MATCHES: usize = 200;
+const FILE_AUTOCOMPLETE_CACHE_TTL: Duration = Duration::from_secs(5);
+
+fn input_byte_index_at_char(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
+
+fn active_file_autocomplete(input: &str, cursor: usize) -> Option<(usize, usize, String)> {
+    let chars: Vec<char> = input.chars().collect();
+    let cursor = cursor.min(chars.len());
+    for index in (0..cursor).rev() {
+        let ch = chars[index];
+        if ch.is_whitespace() {
+            break;
+        }
+        if ch != '@' {
+            continue;
+        }
+        let at_boundary = index == 0
+            || chars[index - 1].is_whitespace()
+            || matches!(chars[index - 1], '(' | '[' | '{' | ',' | ';' | ':');
+        if !at_boundary {
+            return None;
+        }
+        let query: String = chars[index + 1..cursor].iter().collect();
+        return Some((index, cursor, query));
+    }
+    None
+}
+
+pub(crate) fn file_mention_text(path: &str) -> String {
+    if path.chars().any(char::is_whitespace) {
+        format!("@\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        format!("@{path}")
+    }
+}
+
+fn git_workspace_files(root: &Path, limit: usize) -> Option<Vec<PathBuf>> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let mut reader = BufReader::new(stdout);
+    let mut relative_paths = Vec::new();
+    let mut path = Vec::new();
+    while relative_paths.len() < limit {
+        path.clear();
+        let read = match reader.read_until(0, &mut path) {
+            Ok(read) => read,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        if path.last() == Some(&0) {
+            path.pop();
+        }
+        if !path.is_empty() {
+            relative_paths.push(PathBuf::from(String::from_utf8_lossy(&path).into_owned()));
+        }
+    }
+
+    if relative_paths.len() == limit {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Some(relative_paths);
+    }
+    child
+        .wait()
+        .ok()
+        .filter(|status| status.success())
+        .map(|_| relative_paths)
+}
+
+fn workspace_root_label(root: &Path, index: usize) -> Option<String> {
+    (index > 0).then(|| crate::paths::folder_label(root))
+}
+
+pub(crate) fn workspace_file_candidates(roots: &[PathBuf]) -> Vec<WorkspaceFile> {
+    let mut files = Vec::new();
+    let mut canonical_roots = Vec::new();
+    for root in roots {
+        let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if !canonical_roots.iter().any(|candidate| candidate == &root) {
+            canonical_roots.push(root);
+        }
+    }
+
+    for (root_index, root) in canonical_roots.iter().enumerate() {
+        let roots_left = canonical_roots.len() - root_index;
+        let remaining = MAX_FILE_AUTOCOMPLETE_CANDIDATES.saturating_sub(files.len());
+        if remaining == 0 {
+            break;
+        }
+        // Reserve a fair share for every remaining root. Unused capacity from
+        // a small root rolls forward to later roots.
+        let root_limit = remaining / roots_left;
+        let relative_paths = git_workspace_files(root, root_limit)
+            .unwrap_or_else(|| fallback_workspace_files(root, root_limit));
+        let root_label = workspace_root_label(root, root_index);
+        for relative_path in relative_paths {
+            if relative_path.is_absolute()
+                || relative_path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                continue;
+            }
+            let absolute_path = root.join(&relative_path);
+            let Ok(metadata) = std::fs::symlink_metadata(&absolute_path) else {
+                continue;
+            };
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+            let relative_display = relative_path.to_string_lossy().replace('\\', "/");
+            let display_path = root_label
+                .as_ref()
+                .map(|label| format!("{label}/{relative_display}"))
+                .unwrap_or(relative_display);
+            files.push(WorkspaceFile {
+                display_path,
+                absolute_path,
+                root: root.clone(),
+                size: i64::try_from(metadata.len()).ok(),
+            });
+        }
+    }
+    files.sort_by_cached_key(|file| file.display_path.to_lowercase());
+    files
+}
+
+fn fallback_workspace_files(root: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if files.len() >= limit {
+                return files;
+            }
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !matches!(
+                    name.as_ref(),
+                    ".git" | ".hg" | ".mjolnir" | ".svn" | "node_modules" | "target"
+                ) {
+                    pending.push(path);
+                }
+            } else if file_type.is_file()
+                && let Ok(relative) = path.strip_prefix(root)
+            {
+                files.push(relative.to_path_buf());
+            }
+        }
+    }
+    files
 }
 
 impl AppState {
@@ -1692,11 +1930,14 @@ impl AppState {
             input_scroll_offset: 0,
             attachments: Vec::new(),
             image_attachments: Vec::new(),
+            file_attachments: Vec::new(),
             input_paste_burst: InputPasteBurst::default(),
             next_attachment_id: 0,
             prompt_history: Vec::new(),
+            prompt_history_resources: Vec::new(),
             history_cursor: None,
             history_saved_input: String::new(),
+            history_saved_file_attachments: Vec::new(),
             permission_queue: VecDeque::new(),
             elicitation_queue: VecDeque::new(),
             agent_picker: None,
@@ -1743,6 +1984,12 @@ impl AppState {
             claude_usage: None,
             codex_usage: None,
             autocomplete: Autocomplete::default(),
+            additional_workspace_roots: Vec::new(),
+            file_autocomplete_indexed_roots: None,
+            file_autocomplete_indexed_at: None,
+            file_autocomplete_loading_roots: None,
+            file_autocomplete_scan_request: None,
+            file_autocomplete_candidates: Vec::new(),
             help_overlay: false,
             help_scroll: 0,
             text_selection_mode: false,
@@ -1777,6 +2024,7 @@ impl AppState {
         side.worktree_label = self.worktree_label.clone();
         side.additional_roots = self.additional_roots;
         side.session_cwd = self.session_cwd.clone();
+        side.additional_workspace_roots = self.additional_workspace_roots.clone();
         side.agent_label = format!("Side · {}", self.agent_label);
         side.primary_acp_name = self.primary_acp_name.clone();
         side.agent_source_id = self.agent_source_id.clone();
@@ -2045,16 +2293,67 @@ impl AppState {
     /// Replace the in-memory prompt history (e.g. with entries loaded
     /// from disk at startup).
     pub fn set_prompt_history(&mut self, entries: Vec<String>) {
+        self.prompt_history_resources = vec![Vec::new(); entries.len()];
         self.prompt_history = entries;
     }
 
     pub fn record_prompt_history(&mut self, text: String) {
+        self.record_prompt_history_with_resources(text, Vec::new());
+    }
+
+    fn record_prompt_history_with_resources(
+        &mut self,
+        text: String,
+        resources: Vec<PromptResource>,
+    ) {
         // Deduplicate consecutive identical prompts, matching the normal
         // agent prompt path and shell-style history behavior.
-        if self.prompt_history.last().map(String::as_str) != Some(&text) {
+        let duplicate = self.prompt_history.last().map(String::as_str) == Some(&text)
+            && self.prompt_history_resources.last() == Some(&resources);
+        if !duplicate {
             self.prompt_history.push(text);
+            self.prompt_history_resources.push(resources);
         }
         self.reset_history_navigation();
+    }
+
+    fn restore_prompt_history_entry(&mut self, index: usize) {
+        let mut input = self.prompt_history[index].clone();
+        let resources = self
+            .prompt_history_resources
+            .get(index)
+            .cloned()
+            .unwrap_or_default();
+        let mut attachments = Vec::with_capacity(resources.len());
+        let mut search_start = 0usize;
+        for resource in resources {
+            let mention = file_mention_text(&resource.name);
+            let mention_start = input
+                .get(search_start..)
+                .and_then(|suffix| suffix.find(&mention).map(|offset| search_start + offset));
+            let position = if let Some(byte_start) = mention_start {
+                let position = input[..byte_start].chars().count();
+                input.replace_range(byte_start..byte_start + mention.len(), "");
+                search_start = byte_start;
+                position
+            } else {
+                if !input.is_empty() && !input.ends_with(char::is_whitespace) {
+                    input.push(' ');
+                }
+                input.chars().count()
+            };
+            let id = self.next_attachment_id;
+            self.next_attachment_id += 1;
+            attachments.push(FileAttachment {
+                id,
+                position,
+                display_path: resource.name.clone(),
+                resource,
+            });
+        }
+        self.input = input;
+        self.file_attachments = attachments;
+        self.input_cursor = self.input.chars().count();
     }
 
     /// Navigate to the previous (older) prompt in history. Returns `true`
@@ -2075,10 +2374,10 @@ impl AppState {
         };
         if self.history_cursor.is_none() {
             self.history_saved_input = self.input.clone();
+            self.history_saved_file_attachments = self.file_attachments.clone();
         }
         self.history_cursor = Some(new_cursor);
-        self.input = self.prompt_history[new_cursor].clone();
-        self.input_cursor = self.input.chars().count();
+        self.restore_prompt_history_entry(new_cursor);
         self.scroll_input_to_bottom();
         self.update_autocomplete();
         true
@@ -2096,8 +2395,10 @@ impl AppState {
                 if i + 1 >= self.prompt_history.len() {
                     // Past the end: restore saved input.
                     let saved = std::mem::take(&mut self.history_saved_input);
+                    let saved_files = std::mem::take(&mut self.history_saved_file_attachments);
                     self.history_cursor = None;
                     self.input = saved;
+                    self.file_attachments = saved_files;
                     self.input_cursor = self.input.chars().count();
                     self.scroll_input_to_bottom();
                     self.update_autocomplete();
@@ -2105,8 +2406,7 @@ impl AppState {
                 } else {
                     let new_cursor = i + 1;
                     self.history_cursor = Some(new_cursor);
-                    self.input = self.prompt_history[new_cursor].clone();
-                    self.input_cursor = self.input.chars().count();
+                    self.restore_prompt_history_entry(new_cursor);
                     self.scroll_input_to_bottom();
                     self.update_autocomplete();
                     true
@@ -2121,6 +2421,7 @@ impl AppState {
     pub fn reset_history_navigation(&mut self) {
         self.history_cursor = None;
         self.history_saved_input.clear();
+        self.history_saved_file_attachments.clear();
     }
 
     /// Monotonic counter that the UI uses as a cache key for the rendered
@@ -3221,6 +3522,14 @@ impl AppState {
     /// Push a user prompt into the transcript immediately, before the
     /// command reaches the runtime. Keeps the UI responsive.
     pub fn record_user_prompt(&mut self, text: String) {
+        self.record_user_prompt_with_resources(text, Vec::new());
+    }
+
+    pub fn record_user_prompt_with_resources(
+        &mut self,
+        text: String,
+        resources: Vec<PromptResource>,
+    ) {
         self.workflow_clocks.retain(|workflow_id, _| {
             self.workflows
                 .get(*workflow_id)
@@ -3236,7 +3545,7 @@ impl AppState {
             completed: false,
         });
         self.active_prompt_turn = Some(prompt_index);
-        self.record_prompt_history(text);
+        self.record_prompt_history_with_resources(text, resources);
         self.bump_transcript_revision();
         self.set_connection_state(ConnectionState::Streaming);
         self.turn_started_at = Some(Instant::now());
@@ -3386,26 +3695,26 @@ impl AppState {
         Some((target, value))
     }
 
-    /// Recompute the slash-command autocomplete popover from the current
-    /// `input` buffer. Call this every time the input is mutated.
-    ///
-    /// The popover is shown when:
-    /// - the input starts with `/`,
-    /// - no permission modal is open (it owns the keyboard),
-    /// - the runtime is still accepting commands,
-    /// - the runtime is still accepting commands.
-    ///
-    /// Filtering: case-insensitive prefix match on the slug after `/`,
-    /// and falls back to substring match if no prefix hits, so a typo
-    /// like `/plan` still surfaces `/create_plan`. The original ordering
-    /// of `available_commands` is preserved (the agent's emit order is
-    /// usually significant, for example when it groups commands by category).
+    /// Recompute slash-command or inline workspace-file completion from the
+    /// current prompt and cursor.
     pub fn update_autocomplete(&mut self) {
-        let trigger_active = self.input.starts_with('/')
-            && !self.has_pending_permission()
-            && self.config_picker.is_none()
-            && !self.runtime_closed;
-        if !trigger_active {
+        if self.has_pending_permission() || self.config_picker.is_some() || self.runtime_closed {
+            self.autocomplete = Autocomplete::default();
+            return;
+        }
+
+        if let Some((trigger_start, trigger_end, query)) =
+            active_file_autocomplete(&self.input, self.input_cursor)
+        {
+            self.update_file_autocomplete(trigger_start, trigger_end, &query);
+            return;
+        }
+
+        self.update_command_autocomplete();
+    }
+
+    fn update_command_autocomplete(&mut self) {
+        if !self.input.starts_with('/') {
             self.autocomplete = Autocomplete::default();
             return;
         }
@@ -3420,12 +3729,15 @@ impl AppState {
         }
         let query = after_slash.to_lowercase();
 
-        let prev_selected_name = self
-            .autocomplete
-            .matches
-            .get(self.autocomplete.selected)
-            .and_then(|&i| self.available_commands.get(i))
-            .map(|c| c.name.clone());
+        let prev_selected_name = (self.autocomplete.kind == AutocompleteKind::Commands)
+            .then(|| {
+                self.autocomplete
+                    .matches
+                    .get(self.autocomplete.selected)
+                    .and_then(|&i| self.available_commands.get(i))
+                    .map(|c| c.name.clone())
+            })
+            .flatten();
 
         let prefix: Vec<usize> = self
             .available_commands
@@ -3459,7 +3771,120 @@ impl AppState {
             visible: !matches.is_empty(),
             selected,
             matches,
+            kind: AutocompleteKind::Commands,
         };
+    }
+
+    fn update_file_autocomplete(&mut self, trigger_start: usize, trigger_end: usize, query: &str) {
+        let mut roots = Vec::with_capacity(1 + self.additional_workspace_roots.len());
+        for root in std::iter::once(&self.session_cwd).chain(&self.additional_workspace_roots) {
+            let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if !roots.iter().any(|candidate| candidate == &root) {
+                roots.push(root);
+            }
+        }
+        let continuing_file_completion =
+            matches!(self.autocomplete.kind, AutocompleteKind::Files { .. });
+        let cache_matches = self.file_autocomplete_indexed_roots.as_ref() == Some(&roots);
+        let cache_stale = self
+            .file_autocomplete_indexed_at
+            .is_none_or(|indexed_at| indexed_at.elapsed() >= FILE_AUTOCOMPLETE_CACHE_TTL);
+        if (!cache_matches || (!continuing_file_completion && cache_stale))
+            && self.file_autocomplete_loading_roots.as_ref() != Some(&roots)
+        {
+            if !cache_matches {
+                self.file_autocomplete_candidates.clear();
+                self.file_autocomplete_indexed_roots = None;
+                self.file_autocomplete_indexed_at = None;
+            }
+            self.file_autocomplete_loading_roots = Some(roots.clone());
+            self.file_autocomplete_scan_request = Some(roots);
+        }
+
+        let previous_path = matches!(self.autocomplete.kind, AutocompleteKind::Files { .. })
+            .then(|| {
+                self.autocomplete
+                    .matches
+                    .get(self.autocomplete.selected)
+                    .and_then(|index| self.file_autocomplete_candidates.get(*index))
+                    .map(|file| file.display_path.clone())
+            })
+            .flatten();
+        let query = query
+            .trim_start_matches("./")
+            .replace('\\', "/")
+            .to_lowercase();
+        let mut matches: Vec<usize> = self
+            .file_autocomplete_candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| file.display_path.to_lowercase().contains(&query))
+            .map(|(index, _)| index)
+            .collect();
+        matches.sort_by_key(|index| {
+            let path = self.file_autocomplete_candidates[*index]
+                .display_path
+                .to_lowercase();
+            let file_name = path.rsplit('/').next().unwrap_or(&path);
+            let rank = if file_name == query {
+                0
+            } else if file_name.starts_with(&query) {
+                1
+            } else if path.starts_with(&query) {
+                2
+            } else {
+                3
+            };
+            (rank, path.find(&query).unwrap_or(usize::MAX), path.len())
+        });
+        matches.truncate(MAX_FILE_AUTOCOMPLETE_MATCHES);
+
+        let selected = previous_path
+            .and_then(|path| {
+                matches.iter().position(|index| {
+                    self.file_autocomplete_candidates[*index].display_path == path
+                })
+            })
+            .unwrap_or(0);
+        self.autocomplete = Autocomplete {
+            visible: !matches.is_empty(),
+            selected,
+            matches,
+            kind: AutocompleteKind::Files {
+                trigger_start,
+                trigger_end,
+            },
+        };
+    }
+
+    pub(crate) fn take_file_autocomplete_scan_request(&mut self) -> Option<Vec<PathBuf>> {
+        self.file_autocomplete_scan_request.take()
+    }
+
+    pub(crate) fn awaits_file_autocomplete_scan(&self, roots: &[PathBuf]) -> bool {
+        self.file_autocomplete_loading_roots.as_deref() == Some(roots)
+    }
+
+    pub(crate) fn apply_file_autocomplete_scan(
+        &mut self,
+        roots: Vec<PathBuf>,
+        candidates: Vec<WorkspaceFile>,
+    ) -> bool {
+        if self.file_autocomplete_loading_roots.as_ref() != Some(&roots) {
+            return false;
+        }
+        self.file_autocomplete_loading_roots = None;
+        self.file_autocomplete_indexed_roots = Some(roots);
+        self.file_autocomplete_indexed_at = Some(Instant::now());
+        self.file_autocomplete_candidates = candidates;
+        self.update_autocomplete();
+        true
+    }
+
+    pub fn autocomplete_file_path(&self, index: usize) -> Option<&str> {
+        self.file_autocomplete_candidates
+            .get(index)
+            .map(|file| file.display_path.as_str())
     }
 
     /// Move the autocomplete cursor by `delta`, wrapping at both ends.
@@ -3472,24 +3897,86 @@ impl AppState {
         move_wrapped(&mut self.autocomplete.selected, delta, len);
     }
 
-    /// Replace the input buffer with the currently-selected command,
-    /// followed by a trailing space so the user can keep typing
-    /// arguments. Returns `true` if a command was actually inserted.
+    /// Accept the selected command or file. File completion replaces only the
+    /// active `@query` range and anchors a resource-link chip at that point.
     pub fn autocomplete_accept(&mut self) -> bool {
         if !self.autocomplete.visible {
             return false;
         }
-        let Some(&idx) = self.autocomplete.matches.get(self.autocomplete.selected) else {
+        let Some(&index) = self.autocomplete.matches.get(self.autocomplete.selected) else {
             return false;
         };
-        let Some(cmd) = self.available_commands.get(idx) else {
-            return false;
-        };
-        self.input = format!("/{} ", cmd.name);
-        self.input_cursor = self.input.chars().count();
+        match self.autocomplete.kind {
+            AutocompleteKind::Commands => {
+                let Some(cmd) = self.available_commands.get(index) else {
+                    return false;
+                };
+                self.input = format!("/{} ", cmd.name);
+                self.input_cursor = self.input.chars().count();
+            }
+            AutocompleteKind::Files {
+                trigger_start,
+                trigger_end,
+            } => {
+                let Some(file) = self.file_autocomplete_candidates.get(index).cloned() else {
+                    return false;
+                };
+                let Ok(path) = file.absolute_path.canonicalize() else {
+                    return false;
+                };
+                if !path.starts_with(&file.root) {
+                    return false;
+                }
+                let Ok(uri) = url::Url::from_file_path(&path) else {
+                    return false;
+                };
+                self.replace_input_range_for_completion(trigger_start, trigger_end, " ");
+                let id = self.next_attachment_id;
+                self.next_attachment_id += 1;
+                self.file_attachments.push(FileAttachment {
+                    id,
+                    position: trigger_start,
+                    display_path: file.display_path.clone(),
+                    resource: PromptResource {
+                        name: file.display_path,
+                        uri: uri.to_string(),
+                        size: file.size,
+                    },
+                });
+            }
+        }
         self.scroll_input_to_bottom();
         self.autocomplete = Autocomplete::default();
         true
+    }
+
+    fn replace_input_range_for_completion(&mut self, start: usize, end: usize, replacement: &str) {
+        self.reset_history_navigation();
+        let len = self.input.chars().count();
+        let start = start.min(len);
+        let end = end.min(len).max(start);
+        let byte_start = input_byte_index_at_char(&self.input, start);
+        let byte_end = input_byte_index_at_char(&self.input, end);
+        self.input.replace_range(byte_start..byte_end, replacement);
+        let removed = end - start;
+        let inserted = replacement.chars().count();
+        let adjust = |position: &mut usize| {
+            if *position > end {
+                *position = position.saturating_sub(removed).saturating_add(inserted);
+            } else if *position > start {
+                *position = start + inserted;
+            }
+        };
+        for attachment in &mut self.attachments {
+            adjust(&mut attachment.position);
+        }
+        for attachment in &mut self.image_attachments {
+            adjust(&mut attachment.position);
+        }
+        for attachment in &mut self.file_attachments {
+            adjust(&mut attachment.position);
+        }
+        self.input_cursor = start + inserted;
     }
 
     /// Hide the popover without modifying the input buffer.
@@ -8385,6 +8872,7 @@ mod tests {
         s.push_queued_prompt(QueuedPrompt {
             text: "queued body".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
             display_text: "queued body".to_string(),
         });
 
@@ -8484,6 +8972,7 @@ mod tests {
             s.push_queued_prompt(QueuedPrompt {
                 text: "queued".to_string(),
                 images: Vec::new(),
+                resources: Vec::new(),
                 display_text: "queued".to_string(),
             });
             s.status_line = Some(StatusMessage::info("queued 1: queued"));
@@ -9151,6 +9640,14 @@ mod tests {
             cmd("research_codebase"),
             cmd("clear"),
         ];
+    }
+
+    fn finish_file_autocomplete_scan(state: &mut AppState) {
+        let roots = state
+            .take_file_autocomplete_scan_request()
+            .expect("file autocomplete scan requested");
+        let candidates = workspace_file_candidates(&roots);
+        assert!(state.apply_file_autocomplete_scan(roots, candidates));
     }
 
     fn permission_prompt() -> PermissionPrompt {
@@ -10027,6 +10524,139 @@ mod tests {
     }
 
     #[test]
+    fn file_autocomplete_accepts_inline_query_as_resource_link() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(directory.path().join("src")).expect("create src");
+        let file = directory.path().join("src/acp.rs");
+        std::fs::write(&file, "acp").expect("write source");
+
+        let mut state = AppState::new();
+        state.session_cwd = directory.path().to_path_buf();
+        state.input = "Review @acp".to_string();
+        state.input_cursor = state.input.chars().count();
+        state.update_autocomplete();
+
+        assert!(matches!(
+            state.autocomplete.kind,
+            AutocompleteKind::Files { .. }
+        ));
+        assert!(!state.autocomplete.visible);
+        finish_file_autocomplete_scan(&mut state);
+        assert!(state.autocomplete.visible);
+        let paths: Vec<&str> = state
+            .autocomplete
+            .matches
+            .iter()
+            .filter_map(|index| state.autocomplete_file_path(*index))
+            .collect();
+        assert_eq!(paths, vec!["src/acp.rs"]);
+
+        assert!(state.autocomplete_accept());
+        assert_eq!(state.input, "Review  ");
+        assert_eq!(state.input_cursor, 8);
+        assert_eq!(state.file_attachments.len(), 1);
+        let attachment = &state.file_attachments[0];
+        assert_eq!(attachment.position, 7);
+        assert_eq!(attachment.display_path, "src/acp.rs");
+        assert_eq!(attachment.resource.name, "src/acp.rs");
+        assert_eq!(attachment.resource.size, Some(3));
+        assert_eq!(
+            attachment.resource.uri,
+            url::Url::from_file_path(file.canonicalize().expect("canonical file"))
+                .expect("file URL")
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn file_autocomplete_uses_the_query_at_the_cursor() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(directory.path().join("src")).expect("create src");
+        std::fs::write(directory.path().join("src/app.rs"), "app").expect("write source");
+
+        let mut state = AppState::new();
+        state.session_cwd = directory.path().to_path_buf();
+        state.input = "Review @app, then continue".to_string();
+        state.input_cursor = "Review @app".chars().count();
+        state.update_autocomplete();
+        finish_file_autocomplete_scan(&mut state);
+        assert!(state.autocomplete.visible);
+
+        assert!(state.autocomplete_accept());
+        assert_eq!(state.input, "Review  , then continue");
+        assert_eq!(state.file_attachments[0].display_path, "src/app.rs");
+    }
+
+    #[test]
+    fn file_autocomplete_does_not_trigger_inside_email_address() {
+        let mut state = AppState::new();
+        state.input = "ask dev@example.com".to_string();
+        state.input_cursor = state.input.chars().count();
+
+        state.update_autocomplete();
+
+        assert!(!state.autocomplete.visible);
+        assert!(state.autocomplete.matches.is_empty());
+    }
+
+    #[test]
+    fn file_autocomplete_respects_gitignore() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+        std::fs::write(directory.path().join(".gitignore"), "ignored.txt\n")
+            .expect("write gitignore");
+        std::fs::write(directory.path().join("ignored.txt"), "ignored")
+            .expect("write ignored file");
+        std::fs::write(directory.path().join("visible.txt"), "visible")
+            .expect("write visible file");
+
+        let mut state = AppState::new();
+        state.session_cwd = directory.path().to_path_buf();
+        state.input = "@ignored".to_string();
+        state.input_cursor = state.input.chars().count();
+        state.update_autocomplete();
+        finish_file_autocomplete_scan(&mut state);
+        assert!(!state.autocomplete.visible);
+
+        state.input = "@visible".to_string();
+        state.input_cursor = state.input.chars().count();
+        state.update_autocomplete();
+        assert!(state.autocomplete.visible);
+        let path = state.autocomplete.matches[0];
+        assert_eq!(state.autocomplete_file_path(path), Some("visible.txt"));
+    }
+
+    #[test]
+    fn file_autocomplete_indexes_additional_workspace_roots() {
+        let primary = tempfile::tempdir().expect("primary tempdir");
+        let additional = tempfile::tempdir().expect("additional tempdir");
+        std::fs::write(additional.path().join("notes.md"), "notes").expect("write notes");
+
+        let mut state = AppState::new();
+        state.session_cwd = primary.path().to_path_buf();
+        state.additional_workspace_roots = vec![additional.path().to_path_buf()];
+        state.input = "@notes".to_string();
+        state.input_cursor = state.input.chars().count();
+        state.update_autocomplete();
+        finish_file_autocomplete_scan(&mut state);
+
+        assert!(state.autocomplete.visible);
+        let path = state.autocomplete.matches[0];
+        let root_label = crate::paths::folder_label(additional.path());
+        assert_eq!(
+            state.autocomplete_file_path(path),
+            Some(format!("{root_label}/notes.md").as_str())
+        );
+        assert!(state.autocomplete_accept());
+        assert!(state.file_attachments[0].resource.uri.contains("notes.md"));
+    }
+
+    #[test]
     fn autocomplete_keeps_selection_on_same_command_when_filter_narrows() {
         let mut s = AppState::new();
         seed_commands(&mut s);
@@ -10256,6 +10886,44 @@ mod tests {
         assert_eq!(s.input, "draft");
         // history_cursor is None, so no more forward.
         assert!(!s.prompt_history_next());
+    }
+
+    #[test]
+    fn prompt_history_restores_file_resource_links_and_saved_draft_chips() {
+        let history_resource = PromptResource {
+            name: "src/app.rs".to_string(),
+            uri: "file:///workspace/src/app.rs".to_string(),
+            size: Some(42),
+        };
+        let draft_resource = PromptResource {
+            name: "README.md".to_string(),
+            uri: "file:///workspace/README.md".to_string(),
+            size: Some(7),
+        };
+        let mut state = AppState::new();
+        state.record_user_prompt_with_resources(
+            "Review @src/app.rs".to_string(),
+            vec![history_resource.clone()],
+        );
+        state.input = "Then ".to_string();
+        state.input_cursor = state.input.chars().count();
+        state.file_attachments = vec![FileAttachment {
+            id: 99,
+            position: 5,
+            display_path: draft_resource.name.clone(),
+            resource: draft_resource.clone(),
+        }];
+
+        assert!(state.prompt_history_previous());
+        assert_eq!(state.input, "Review ");
+        assert_eq!(state.file_attachments.len(), 1);
+        assert_eq!(state.file_attachments[0].position, 7);
+        assert_eq!(state.file_attachments[0].resource, history_resource);
+
+        assert!(state.prompt_history_next());
+        assert_eq!(state.input, "Then ");
+        assert_eq!(state.file_attachments.len(), 1);
+        assert_eq!(state.file_attachments[0].resource, draft_resource);
     }
 
     #[test]

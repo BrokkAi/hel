@@ -43,21 +43,23 @@ use tokio_util::sync::CancellationToken;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    AgentPickerStep, AppState, ArenaPane, ConfigValueChoice, ConnectionState,
-    CurrentBranchPullRequest, ElicitationFormFieldKind, ElicitationView, Entry,
+    AgentPickerStep, AppState, ArenaPane, AutocompleteKind, ConfigValueChoice, ConnectionState,
+    CurrentBranchPullRequest, ElicitationFormFieldKind, ElicitationView, Entry, FileAttachment,
     PRIMARY_EFFORT_OPTIONS, PastedAttachment, PastedImageAttachment, PendingElicitation,
     PendingPermission, QUEUED_PROMPT_PREVIEW_WIDTH, QueuedPrompt, RagnarokDraftPrStatus,
     RagnarokFighterUi, RagnarokObservation, RagnarokUi, StatusKind, StatusMessage, SubagentStatus,
-    ToolCallOutput, TranscriptSearch, UiExitReason, classify_elicitation, config_option_choices,
-    config_option_current_value_label, primary_effort_value,
+    ToolCallOutput, TranscriptSearch, UiExitReason, WorkspaceFile, classify_elicitation,
+    config_option_choices, config_option_current_value_label, file_mention_text,
+    primary_effort_value, workspace_file_candidates,
 };
 use crate::clipboard::{
     ClipboardImage, copy_to_clipboard, load_image_path_as_png, read_clipboard_image_as_png,
 };
 use crate::config;
 use crate::event::{
-    PermissionDecision, PermissionPrompt, PromptImage, ReviewTarget, SessionConfigTarget,
-    SubagentEvent, SubagentOutcome, UiCommand, UiEvent, WorkspaceHeadDiffUnavailable,
+    PermissionDecision, PermissionPrompt, PromptImage, PromptResource, ReviewTarget,
+    SessionConfigTarget, SubagentEvent, SubagentOutcome, UiCommand, UiEvent,
+    WorkspaceHeadDiffUnavailable,
 };
 use crate::ink::{Ink, InkStyle};
 use crate::notifications::TerminalNotificationBackend;
@@ -1134,6 +1136,8 @@ pub struct UiRunOptions<'a> {
     pub session_boundary: Option<String>,
     /// The ACP session cwd; `/ragnarok` battles are rooted here.
     pub session_cwd: PathBuf,
+    /// Additional directories registered with the ACP session.
+    pub additional_workspace_roots: Vec<PathBuf>,
     pub model_choices: Vec<crate::roster::ModelChoice>,
     pub acp_inventory: crate::roster::AcpInventory,
     pub configured_models: crate::config::ModelsConfig,
@@ -1169,6 +1173,7 @@ struct UiInitialState {
     keep_awake_enabled: bool,
     session_boundary: Option<String>,
     session_cwd: PathBuf,
+    additional_workspace_roots: Vec<PathBuf>,
     model_choices: Vec<crate::roster::ModelChoice>,
     acp_inventory: crate::roster::AcpInventory,
     configured_models: crate::config::ModelsConfig,
@@ -1190,6 +1195,21 @@ struct UiLoopOutcome {
     theme_kind: TerminalThemeKind,
     spinner_style: SpinnerStyle,
     history: Vec<String>,
+}
+
+struct FileAutocompleteScan {
+    roots: Vec<PathBuf>,
+    candidates: Vec<WorkspaceFile>,
+}
+
+fn start_file_autocomplete_scan(
+    roots: Vec<PathBuf>,
+    tx: mpsc::UnboundedSender<FileAutocompleteScan>,
+) {
+    std::mem::drop(tokio::task::spawn_blocking(move || {
+        let candidates = workspace_file_candidates(&roots);
+        let _ = tx.send(FileAutocompleteScan { roots, candidates });
+    }));
 }
 
 pub async fn run(
@@ -1234,6 +1254,7 @@ pub async fn run(
             keep_awake_enabled: options.keep_awake_enabled,
             session_boundary: options.session_boundary,
             session_cwd: options.session_cwd,
+            additional_workspace_roots: options.additional_workspace_roots,
             model_choices: options.model_choices,
             acp_inventory: options.acp_inventory,
             configured_models: options.configured_models,
@@ -1486,6 +1507,7 @@ async fn ui_loop(
     }
     state.active_agent_launch = initial.active_agent_launch;
     state.session_cwd = initial.session_cwd;
+    state.additional_workspace_roots = initial.additional_workspace_roots;
     state.model_choices = initial.model_choices;
     state.acp_inventory = initial.acp_inventory;
     state.configured_models = initial.configured_models;
@@ -1519,6 +1541,7 @@ async fn ui_loop(
     let mut dictation_cancel_tx: Option<std_mpsc::Sender<()>> = None;
     let (current_pr_tx, mut current_pr_rx) = mpsc::unbounded_channel::<CurrentBranchPrProbe>();
     let mut current_pr_probe_in_flight = false;
+    let (file_scan_tx, mut file_scan_rx) = mpsc::unbounded_channel::<FileAutocompleteScan>();
     // Ragnarok battles report through their own channel (the sender stays
     // alive here for the whole loop, so `recv` pends rather than closing).
     let (ragnarok_tx, mut ragnarok_rx) = mpsc::unbounded_channel::<ragnarok::RagnarokEvent>();
@@ -1676,6 +1699,32 @@ async fn ui_loop(
                     && apply_current_branch_pr_probe(&mut state, probe)
                 {
                     pending_redraw.mark_interactive();
+                }
+            }
+            maybe_scan = file_scan_rx.recv() => {
+                if let Some(scan) = maybe_scan {
+                    let apply_current = state.awaits_file_autocomplete_scan(&scan.roots);
+                    let apply_main = main_state
+                        .as_ref()
+                        .is_some_and(|main| main.awaits_file_autocomplete_scan(&scan.roots));
+                    let applied = match (apply_current, apply_main) {
+                        // Both states can only be waiting after each scheduled
+                        // its own scan. Let the next result populate `main`
+                        // instead of cloning the potentially large index here.
+                        (true, true) => {
+                            state.apply_file_autocomplete_scan(scan.roots, scan.candidates)
+                        }
+                        (true, false) => {
+                            state.apply_file_autocomplete_scan(scan.roots, scan.candidates)
+                        }
+                        (false, true) => main_state.as_mut().is_some_and(|main| {
+                            main.apply_file_autocomplete_scan(scan.roots, scan.candidates)
+                        }),
+                        (false, false) => false,
+                    };
+                    if applied {
+                        pending_redraw.mark_interactive();
+                    }
                 }
             }
             _ = current_pr_tick.tick(), if !current_pr_probe_in_flight => {
@@ -1849,6 +1898,16 @@ async fn ui_loop(
                     pending_redraw.mark_animation();
                 }
             }
+        }
+
+        if let Some(roots) = state.take_file_autocomplete_scan_request() {
+            start_file_autocomplete_scan(roots, file_scan_tx.clone());
+        }
+        if let Some(roots) = main_state
+            .as_mut()
+            .and_then(AppState::take_file_autocomplete_scan_request)
+        {
+            start_file_autocomplete_scan(roots, file_scan_tx.clone());
         }
 
         if state.side_start_requested && main_state.is_none() {
@@ -3193,7 +3252,7 @@ fn handle_crossterm(
         flush_input_paste_burst_if_due(state, Instant::now(), true);
     }
 
-    // Slash-command autocomplete owns Tab and Up/Down while it's
+    // Prompt autocomplete owns Tab and Up/Down while it's
     // visible, and intercepts Enter/Esc before the normal handlers see
     // them. Plain typing still falls through so the user can refine the
     // filter.
@@ -3313,15 +3372,19 @@ fn handle_crossterm(
         }
         (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
             move_input_cursor_to_line_start(state);
+            state.update_autocomplete();
         }
         (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
             move_input_cursor_to_line_end(state);
+            state.update_autocomplete();
         }
         (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
             move_input_cursor_left(state);
+            state.update_autocomplete();
         }
         (KeyModifiers::CONTROL, KeyCode::Char('f')) => {
             move_input_cursor_right(state);
+            state.update_autocomplete();
         }
         (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
             delete_to_line_end(state);
@@ -3360,9 +3423,11 @@ fn handle_crossterm(
         }
         (KeyModifiers::ALT, KeyCode::Char('b')) => {
             move_input_cursor_word_left(state);
+            state.update_autocomplete();
         }
         (KeyModifiers::ALT, KeyCode::Char('f')) => {
             move_input_cursor_word_right(state);
+            state.update_autocomplete();
         }
         (_, KeyCode::Backspace) => {
             let mut handled = state.input.is_empty() && pop_last_attachment(state);
@@ -3386,16 +3451,36 @@ fn handle_crossterm(
         }
         (_, KeyCode::Left) => {
             move_input_cursor_left(state);
+            state.update_autocomplete();
         }
         (_, KeyCode::Right) => {
             move_input_cursor_right(state);
+            state.update_autocomplete();
         }
-        (_, KeyCode::Up) => move_input_cursor_up_or_history(state, 1),
-        (_, KeyCode::Down) => move_input_cursor_down_or_history(state, 1),
-        (_, KeyCode::PageUp) => move_input_cursor_up(state, TRANSCRIPT_SCROLL_PAGE_STEP),
-        (_, KeyCode::PageDown) => move_input_cursor_down(state, TRANSCRIPT_SCROLL_PAGE_STEP),
-        (_, KeyCode::Home) => move_input_cursor_to_line_start(state),
-        (_, KeyCode::End) => move_input_cursor_to_line_end(state),
+        (_, KeyCode::Up) => {
+            move_input_cursor_up_or_history(state, 1);
+            state.update_autocomplete();
+        }
+        (_, KeyCode::Down) => {
+            move_input_cursor_down_or_history(state, 1);
+            state.update_autocomplete();
+        }
+        (_, KeyCode::PageUp) => {
+            move_input_cursor_up(state, TRANSCRIPT_SCROLL_PAGE_STEP);
+            state.update_autocomplete();
+        }
+        (_, KeyCode::PageDown) => {
+            move_input_cursor_down(state, TRANSCRIPT_SCROLL_PAGE_STEP);
+            state.update_autocomplete();
+        }
+        (_, KeyCode::Home) => {
+            move_input_cursor_to_line_start(state);
+            state.update_autocomplete();
+        }
+        (_, KeyCode::End) => {
+            move_input_cursor_to_line_end(state);
+            state.update_autocomplete();
+        }
         (_, KeyCode::Char(c)) => {
             let cursor_before_insert = state.input_cursor;
             insert_text_at_cursor(state, &c.to_string());
@@ -3582,6 +3667,11 @@ fn insert_text_at_cursor(state: &mut AppState, text: &str) {
             attachment.position = attachment.position.saturating_add(inserted);
         }
     }
+    for attachment in &mut state.file_attachments {
+        if attachment.position > cursor {
+            attachment.position = attachment.position.saturating_add(inserted);
+        }
+    }
     state.input_cursor = cursor + inserted;
 }
 
@@ -3606,6 +3696,13 @@ fn delete_input_range(state: &mut AppState, start: usize, end: usize, new_cursor
         }
     }
     for attachment in &mut state.image_attachments {
+        if attachment.position > end {
+            attachment.position = attachment.position.saturating_sub(removed);
+        } else if attachment.position > start {
+            attachment.position = start;
+        }
+    }
+    for attachment in &mut state.file_attachments {
         if attachment.position > end {
             attachment.position = attachment.position.saturating_sub(removed);
         } else if attachment.position > start {
@@ -3643,6 +3740,16 @@ fn replace_input_range(
         }
     }
     for attachment in &mut state.image_attachments {
+        if attachment.position > end {
+            attachment.position = attachment
+                .position
+                .saturating_sub(removed)
+                .saturating_add(inserted);
+        } else if attachment.position > start {
+            attachment.position = start + inserted;
+        }
+    }
+    for attachment in &mut state.file_attachments {
         if attachment.position > end {
             attachment.position = attachment
                 .position
@@ -3886,27 +3993,40 @@ fn move_input_cursor_down(state: &mut AppState, lines: usize) {
 }
 
 fn attachment_count(state: &AppState) -> usize {
-    state.attachments.len() + state.image_attachments.len()
+    state.attachments.len() + state.image_attachments.len() + state.file_attachments.len()
 }
 
 fn clear_attachments(state: &mut AppState) {
     state.attachments.clear();
     state.image_attachments.clear();
+    state.file_attachments.clear();
 }
 
 fn pop_last_attachment(state: &mut AppState) -> bool {
-    let text_id = state.attachments.last().map(|attachment| attachment.id);
-    let image_id = state
-        .image_attachments
+    let newest = state
+        .attachments
         .last()
-        .map(|attachment| attachment.id);
+        .map(|attachment| (attachment.id, 0))
+        .into_iter()
+        .chain(
+            state
+                .image_attachments
+                .last()
+                .map(|attachment| (attachment.id, 1)),
+        )
+        .chain(
+            state
+                .file_attachments
+                .last()
+                .map(|attachment| (attachment.id, 2)),
+        )
+        .max_by_key(|(id, _)| *id);
 
-    match (text_id, image_id) {
-        (Some(t), Some(i)) if t > i => state.attachments.pop().is_some(),
-        (Some(_), Some(_)) => state.image_attachments.pop().is_some(),
-        (Some(_), None) => state.attachments.pop().is_some(),
-        (None, Some(_)) => state.image_attachments.pop().is_some(),
-        (None, None) => false,
+    match newest.map(|(_, kind)| kind) {
+        Some(0) => state.attachments.pop().is_some(),
+        Some(1) => state.image_attachments.pop().is_some(),
+        Some(2) => state.file_attachments.pop().is_some(),
+        _ => false,
     }
 }
 
@@ -3926,25 +4046,34 @@ fn pop_inline_attachment_at_cursor(state: &mut AppState) -> bool {
         .filter(|(_, attachment)| attachment.position.min(input_char_count(&state.input)) == cursor)
         .max_by_key(|(_, attachment)| attachment.id)
         .map(|(index, attachment)| (attachment.id, index));
+    let file = state
+        .file_attachments
+        .iter()
+        .enumerate()
+        .filter(|(_, attachment)| attachment.position.min(input_char_count(&state.input)) == cursor)
+        .max_by_key(|(_, attachment)| attachment.id)
+        .map(|(index, attachment)| (attachment.id, index));
+    let newest = text
+        .map(|(id, index)| (id, 0, index))
+        .into_iter()
+        .chain(image.map(|(id, index)| (id, 1, index)))
+        .chain(file.map(|(id, index)| (id, 2, index)))
+        .max_by_key(|(id, _, _)| *id);
 
-    match (text, image) {
-        (Some((text_id, text_index)), Some((image_id, _))) if text_id > image_id => {
-            state.attachments.remove(text_index);
+    match newest.map(|(_, kind, index)| (kind, index)) {
+        Some((0, index)) => {
+            state.attachments.remove(index);
             true
         }
-        (Some(_), Some((_, image_index))) => {
-            state.image_attachments.remove(image_index);
+        Some((1, index)) => {
+            state.image_attachments.remove(index);
             true
         }
-        (Some((_, text_index)), None) => {
-            state.attachments.remove(text_index);
+        Some((2, index)) => {
+            state.file_attachments.remove(index);
             true
         }
-        (None, Some((_, image_index))) => {
-            state.image_attachments.remove(image_index);
-            true
-        }
-        (None, None) => false,
+        _ => false,
     }
 }
 
@@ -4730,22 +4859,60 @@ fn should_open_help(modifiers: KeyModifiers, code: KeyCode) -> bool {
     modifiers.is_empty() && matches!(code, KeyCode::F(10))
 }
 
-fn input_text_with_attachments(input: &str, attachments: &[PastedAttachment]) -> String {
+fn input_text_with_attachments(
+    input: &str,
+    attachments: &[PastedAttachment],
+    file_attachments: &[FileAttachment],
+) -> String {
     let input_len = input_char_count(input);
-    let mut ordered: Vec<&PastedAttachment> = attachments.iter().collect();
-    ordered.sort_by_key(|attachment| (attachment.position.min(input_len), attachment.id));
+    enum Insertion<'a> {
+        Pasted(&'a PastedAttachment),
+        File(&'a FileAttachment),
+    }
+    let mut ordered: Vec<(usize, usize, Insertion<'_>)> = attachments
+        .iter()
+        .map(|attachment| {
+            (
+                attachment.position.min(input_len),
+                attachment.id,
+                Insertion::Pasted(attachment),
+            )
+        })
+        .chain(file_attachments.iter().map(|attachment| {
+            (
+                attachment.position.min(input_len),
+                attachment.id,
+                Insertion::File(attachment),
+            )
+        }))
+        .collect();
+    ordered.sort_by_key(|(position, id, _)| (*position, *id));
 
     let mut combined = String::new();
     let mut text_start = 0usize;
-    for attachment in ordered {
-        let position = attachment.position.min(input_len);
+    let mut previous_file_position = None;
+    for (position, _, insertion) in ordered {
         combined.push_str(input_char_slice(input, text_start, position));
-        if !combined.is_empty() && !combined.ends_with('\n') {
-            combined.push('\n');
-        }
-        combined.push_str(&attachment.content);
-        if position < input_len && !combined.ends_with('\n') {
-            combined.push('\n');
+        match insertion {
+            Insertion::Pasted(attachment) => {
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&attachment.content);
+                if position < input_len && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                previous_file_position = None;
+            }
+            Insertion::File(attachment) => {
+                if previous_file_position == Some(position)
+                    && !combined.ends_with(char::is_whitespace)
+                {
+                    combined.push(' ');
+                }
+                combined.push_str(&file_mention_text(&attachment.display_path));
+                previous_file_position = Some(position);
+            }
         }
         text_start = position;
     }
@@ -4754,7 +4921,8 @@ fn input_text_with_attachments(input: &str, attachments: &[PastedAttachment]) ->
 }
 
 fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>) {
-    let combined = input_text_with_attachments(&state.input, &state.attachments);
+    let combined =
+        input_text_with_attachments(&state.input, &state.attachments, &state.file_attachments);
 
     let input_len = input_char_count(&state.input);
     let mut ordered_images: Vec<&PastedImageAttachment> = state.image_attachments.iter().collect();
@@ -4768,15 +4936,22 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
             height: attachment.height,
         })
         .collect();
+    let mut ordered_files: Vec<&FileAttachment> = state.file_attachments.iter().collect();
+    ordered_files.sort_by_key(|attachment| (attachment.position.min(input_len), attachment.id));
+    let resources: Vec<PromptResource> = ordered_files
+        .into_iter()
+        .map(|attachment| attachment.resource.clone())
+        .collect();
 
     let text = combined.trim().to_string();
-    if text.is_empty() && images.is_empty() {
+    if text.is_empty() && images.is_empty() && resources.is_empty() {
         return;
     }
+    let plain_text_only = images.is_empty() && resources.is_empty();
 
     // Client-side commands are handled here without forwarding anything
     // to the agent.
-    if images.is_empty() && text == "/new" {
+    if plain_text_only && text == "/new" {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
@@ -4785,7 +4960,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && text == "/clear" {
+    if plain_text_only && text == "/clear" {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
@@ -4794,7 +4969,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && text == "/compact" {
+    if plain_text_only && text == "/compact" {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
@@ -4804,7 +4979,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && text == "/load" {
+    if plain_text_only && text == "/load" {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
@@ -4813,7 +4988,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && text == "/mjconfig" {
+    if plain_text_only && text == "/mjconfig" {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
@@ -4822,7 +4997,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && text == "/agents" {
+    if plain_text_only && text == "/agents" {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
@@ -4831,7 +5006,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty()
+    if plain_text_only
         && let Some(rest) = text.strip_prefix("/review")
         && (rest.is_empty() || rest.starts_with(char::is_whitespace))
     {
@@ -4865,7 +5040,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && matches!(text.as_str(), "/export" | "/export full") {
+    if plain_text_only && matches!(text.as_str(), "/export" | "/export full") {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
@@ -4888,7 +5063,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && text == "/terminals" {
+    if plain_text_only && text == "/terminals" {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
@@ -4899,7 +5074,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && text == "/subagents" {
+    if plain_text_only && text == "/subagents" {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
@@ -4910,7 +5085,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty()
+    if plain_text_only
         && let Some(rest) = text.strip_prefix("/side")
         && (rest.is_empty() || rest.starts_with(char::is_whitespace))
     {
@@ -4947,7 +5122,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty() && text == "/fork" {
+    if plain_text_only && text == "/fork" {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
@@ -4977,7 +5152,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty()
+    if plain_text_only
         && let Some(rest) = text.strip_prefix("/ragnarok")
         && (rest.is_empty() || rest.starts_with(char::is_whitespace))
     {
@@ -5002,9 +5177,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    if images.is_empty()
-        && let Some(rest) = text.strip_prefix("/mj:")
-    {
+    if plain_text_only && let Some(rest) = text.strip_prefix("/mj:") {
         let other = rest.trim();
         state.record_status_message(
             StatusKind::Warning,
@@ -5029,9 +5202,17 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         let prompt = QueuedPrompt {
             text: text.clone(),
             images: images.clone(),
+            resources: resources.clone(),
             display_text: prompt_display_text(&text, images.len()),
         };
-        if cmd_tx.send(UiCommand::SendPrompt { text, images }).is_err() {
+        if cmd_tx
+            .send(UiCommand::SendPrompt {
+                text,
+                images,
+                resources,
+            })
+            .is_err()
+        {
             state.record_status_message(
                 StatusKind::Warning,
                 "the ACP runtime closed before the startup prompt could be queued",
@@ -5056,6 +5237,7 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         state.push_queued_prompt(QueuedPrompt {
             text,
             images,
+            resources,
             display_text,
         });
         let queued = state.queued_prompt_count();
@@ -5063,8 +5245,12 @@ fn submit_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCommand>
         return;
     }
 
-    state.record_user_prompt(display_text);
-    let _ = cmd_tx.send(UiCommand::SendPrompt { text, images });
+    state.record_user_prompt_with_resources(display_text, resources.clone());
+    let _ = cmd_tx.send(UiCommand::SendPrompt {
+        text,
+        images,
+        resources,
+    });
 }
 
 fn parse_review_target(value: &str) -> Option<ReviewTarget> {
@@ -5622,10 +5808,11 @@ fn drain_queued_prompt(state: &mut AppState, cmd_tx: &mpsc::UnboundedSender<UiCo
     let Some(queued) = state.take_queued_prompt() else {
         return;
     };
-    state.record_user_prompt(queued.display_text);
+    state.record_user_prompt_with_resources(queued.display_text, queued.resources.clone());
     let _ = cmd_tx.send(UiCommand::SendPrompt {
         text: queued.text,
         images: queued.images,
+        resources: queued.resources,
     });
 }
 
@@ -5641,9 +5828,10 @@ fn finalize_startup_prompt(state: &mut AppState) {
         return;
     };
 
-    let current_text = input_text_with_attachments(&state.input, &state.attachments)
-        .trim()
-        .to_string();
+    let current_text =
+        input_text_with_attachments(&state.input, &state.attachments, &state.file_attachments)
+            .trim()
+            .to_string();
     let input_len = input_char_count(&state.input);
     let mut ordered_images: Vec<&PastedImageAttachment> = state.image_attachments.iter().collect();
     ordered_images.sort_by_key(|attachment| (attachment.position.min(input_len), attachment.id));
@@ -5656,14 +5844,23 @@ fn finalize_startup_prompt(state: &mut AppState) {
             height: attachment.height,
         })
         .collect();
-    if current_text == prompt.text && current_images == prompt.images {
+    let mut current_files: Vec<&FileAttachment> = state.file_attachments.iter().collect();
+    current_files.sort_by_key(|attachment| (attachment.position.min(input_len), attachment.id));
+    let current_resources: Vec<PromptResource> = current_files
+        .into_iter()
+        .map(|attachment| attachment.resource.clone())
+        .collect();
+    if current_text == prompt.text
+        && current_images == prompt.images
+        && current_resources == prompt.resources
+    {
         state.input.clear();
         clear_attachments(state);
         state.input_cursor = 0;
         state.scroll_input_to_bottom();
     }
 
-    state.record_user_prompt(prompt.display_text);
+    state.record_user_prompt_with_resources(prompt.display_text, prompt.resources);
 }
 
 /// Truncate the display text to a short single-line preview for the
@@ -11198,6 +11395,10 @@ fn image_attachment_label(attachment: &PastedImageAttachment) -> String {
     )
 }
 
+fn file_attachment_label(attachment: &FileAttachment) -> String {
+    format!("@{}", attachment.display_path)
+}
+
 fn attachment_span(label: String, theme: TerminalTheme) -> Span<'static> {
     Span::styled(
         label,
@@ -11303,7 +11504,10 @@ impl InputInlineBuilder {
 
 fn input_layout_with_attachments(state: &AppState, inner_w: usize) -> InputAttachmentLayout {
     let input_len = input_char_count(&state.input);
-    if state.attachments.is_empty() && state.image_attachments.is_empty() {
+    if state.attachments.is_empty()
+        && state.image_attachments.is_empty()
+        && state.file_attachments.is_empty()
+    {
         let layout = input_wrapped_layout(&state.input, state.input_cursor, inner_w);
         return InputAttachmentLayout {
             lines: layout.rows.into_iter().map(Line::from).collect(),
@@ -11328,6 +11532,16 @@ fn input_layout_with_attachments(state: &AppState, inner_w: usize) -> InputAttac
                     id: attachment.id,
                     position: attachment.position.min(input_len),
                     span: attachment_span(image_attachment_label(attachment), state.theme),
+                }),
+        )
+        .chain(
+            state
+                .file_attachments
+                .iter()
+                .map(|attachment| InlineAttachmentChip {
+                    id: attachment.id,
+                    position: attachment.position.min(input_len),
+                    span: attachment_span(file_attachment_label(attachment), state.theme),
                 }),
         )
         .collect();
@@ -13584,7 +13798,7 @@ fn draw_config_value_picker_modal(f: &mut ratatui::Frame, area: Rect, state: &Ap
     f.render_widget(footer, layout[3]);
 }
 
-/// Slash-command autocomplete popover. Anchored to the top edge of the
+/// Prompt autocomplete popover. Anchored to the top edge of the
 /// input box and grows upward into the transcript pane so it never
 /// covers the user's cursor. Width matches the input box; height caps
 /// at 8 visible rows + 2 borders.
@@ -13610,9 +13824,13 @@ fn draw_autocomplete_popover(f: &mut ratatui::Frame, input_area: Rect, state: &A
     );
 
     f.render_widget(Clear, rect);
+    let title = match state.autocomplete.kind {
+        AutocompleteKind::Commands => " commands (Tab/Enter accept, Esc cancel) ",
+        AutocompleteKind::Files { .. } => " files (Tab/Enter attach, Esc cancel) ",
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" commands (Tab/Enter accept, Esc cancel) ")
+        .title(title)
         .style(Style::default().ink(state.theme.primary));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -13625,25 +13843,10 @@ fn draw_autocomplete_popover(f: &mut ratatui::Frame, input_area: Rect, state: &A
     let items: Vec<ListItem> = state.autocomplete.matches[range]
         .iter()
         .enumerate()
-        .map(|(offset, &cmd_idx)| {
+        .map(|(offset, &match_index)| {
             let absolute = start + offset;
-            let cmd = &state.available_commands[cmd_idx];
             let marker = if absolute == selected { ">" } else { " " };
-            let hint = cmd
-                .input
-                .as_ref()
-                .map(|i| match i {
-                    AvailableCommandInput::Unstructured(u) => format!(" <{}>", u.hint),
-                    _ => String::new(),
-                })
-                .unwrap_or_default();
-            let mut line = format!("{marker} /{}{hint}", cmd.name);
-            // Append a trimmed description on the same row.
-            let description = cmd.description.trim();
-            if !description.is_empty() {
-                line.push_str("  -- ");
-                line.push_str(description);
-            }
+            let line = autocomplete_row_text(state, match_index, marker);
             truncate_line(line, inner.width, absolute == selected, state.theme)
         })
         .collect();
@@ -13665,9 +13868,13 @@ fn draw_inline_autocomplete_popover(f: &mut ratatui::Frame, area: Rect, state: &
     let rect = Rect::new(area.x, area.y, area.width, height);
 
     f.render_widget(Clear, rect);
+    let title = match state.autocomplete.kind {
+        AutocompleteKind::Commands => " commands (Tab/Enter accept, Esc cancel) ",
+        AutocompleteKind::Files { .. } => " files (Tab/Enter attach, Esc cancel) ",
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" commands (Tab/Enter accept, Esc cancel) ")
+        .title(title)
         .style(Style::default().ink(state.theme.primary));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -13681,15 +13888,27 @@ fn draw_inline_autocomplete_popover(f: &mut ratatui::Frame, area: Rect, state: &
     let items: Vec<ListItem> = state.autocomplete.matches[range]
         .iter()
         .enumerate()
-        .map(|(offset, &cmd_idx)| {
+        .map(|(offset, &match_index)| {
             let absolute = start + offset;
-            let cmd = &state.available_commands[cmd_idx];
             let marker = if absolute == selected { ">" } else { " " };
+            let line = autocomplete_row_text(state, match_index, marker);
+            truncate_line(line, inner.width, marker == ">", state.theme)
+        })
+        .collect();
+    f.render_widget(List::new(items), inner);
+}
+
+fn autocomplete_row_text(state: &AppState, match_index: usize, marker: &str) -> String {
+    match state.autocomplete.kind {
+        AutocompleteKind::Commands => {
+            let cmd = &state.available_commands[match_index];
             let hint = cmd
                 .input
                 .as_ref()
-                .map(|i| match i {
-                    AvailableCommandInput::Unstructured(u) => format!(" <{}>", u.hint),
+                .map(|input| match input {
+                    AvailableCommandInput::Unstructured(unstructured) => {
+                        format!(" <{}>", unstructured.hint)
+                    }
                     _ => String::new(),
                 })
                 .unwrap_or_default();
@@ -13699,10 +13918,15 @@ fn draw_inline_autocomplete_popover(f: &mut ratatui::Frame, area: Rect, state: &
                 line.push_str("  -- ");
                 line.push_str(description);
             }
-            truncate_line(line, inner.width, marker == ">", state.theme)
-        })
-        .collect();
-    f.render_widget(List::new(items), inner);
+            line
+        }
+        AutocompleteKind::Files { .. } => format!(
+            "{marker} @{}",
+            state
+                .autocomplete_file_path(match_index)
+                .unwrap_or_default()
+        ),
+    }
 }
 
 fn truncate_line(
@@ -18526,7 +18750,7 @@ mod tests {
         assert!(state.mjconfig_menu.is_none());
         assert!(matches!(
             cmd_rx.try_recv(),
-            Ok(UiCommand::SendPrompt { text, images }) if text == "/models" && images.is_empty()
+            Ok(UiCommand::SendPrompt { text, images, .. }) if text == "/models" && images.is_empty()
         ));
     }
 
@@ -19131,7 +19355,7 @@ mod tests {
         drain_queued_prompt(&mut state, &cmd_tx);
 
         match cmd_rx.try_recv() {
-            Ok(UiCommand::SendPrompt { text, images }) => {
+            Ok(UiCommand::SendPrompt { text, images, .. }) => {
                 assert_eq!(text, "queued prompt");
                 assert!(images.is_empty());
             }
@@ -22802,6 +23026,7 @@ mod tests {
         state.push_queued_prompt(QueuedPrompt {
             text: "next".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
             display_text: "next".to_string(),
         });
         let queued = line_text(&busy_prompt_title(&state).expect("queued title"));
@@ -25348,7 +25573,7 @@ mod tests {
 
         assert_eq!(request, TerminalRequest::StopDictation);
         match cmd_rx.try_recv().expect("spoken prompt dispatched") {
-            UiCommand::SendPrompt { text, images } => {
+            UiCommand::SendPrompt { text, images, .. } => {
                 assert_eq!(text, "spoken prompt");
                 assert!(images.is_empty());
             }
@@ -25773,7 +25998,7 @@ mod tests {
 
         let cmd = cmd_rx.try_recv().expect("prompt was sent");
         match cmd {
-            UiCommand::SendPrompt { text, images } => {
+            UiCommand::SendPrompt { text, images, .. } => {
                 assert_eq!(text, "line one\nline two\nline three");
                 assert!(images.is_empty());
             }
@@ -26056,6 +26281,68 @@ mod tests {
     }
 
     #[test]
+    fn submit_prompt_preserves_file_mention_and_resource_link() {
+        let mut state = ready_state_with_session();
+        state.input = "Review  now".to_string();
+        state.input_cursor = state.input.chars().count();
+        state.file_attachments.push(FileAttachment {
+            id: 0,
+            position: 7,
+            display_path: "src/acp.rs".to_string(),
+            resource: PromptResource {
+                name: "src/acp.rs".to_string(),
+                uri: "file:///workspace/src/acp.rs".to_string(),
+                size: Some(42),
+            },
+        });
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+        submit_prompt(&mut state, &cmd_tx);
+
+        let command = cmd_rx.try_recv().expect("prompt command");
+        let UiCommand::SendPrompt {
+            text,
+            images,
+            resources,
+        } = command
+        else {
+            panic!("expected prompt command");
+        };
+        assert_eq!(text, "Review @src/acp.rs now");
+        assert!(images.is_empty());
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].name, "src/acp.rs");
+        assert_eq!(resources[0].uri, "file:///workspace/src/acp.rs");
+        assert_eq!(resources[0].size, Some(42));
+        assert!(state.file_attachments.is_empty());
+
+        state.apply_event(UiEvent::PromptDone {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        });
+        assert!(state.prompt_history_previous());
+        assert_eq!(state.input, "Review  now");
+        assert_eq!(state.file_attachments.len(), 1);
+
+        submit_prompt(&mut state, &cmd_tx);
+        let UiCommand::SendPrompt { resources, .. } =
+            cmd_rx.try_recv().expect("replayed prompt command")
+        else {
+            panic!("expected replayed prompt command");
+        };
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].uri, "file:///workspace/src/acp.rs");
+    }
+
+    #[test]
+    fn file_mentions_quote_paths_with_spaces() {
+        assert_eq!(
+            file_mention_text("docs/design notes.md"),
+            "@\"docs/design notes.md\""
+        );
+    }
+
+    #[test]
     fn ctrl_v_warns_when_agent_does_not_support_images() {
         let mut state = AppState::new();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
@@ -26187,7 +26474,7 @@ mod tests {
 
         let cmd = cmd_rx.try_recv().expect("prompt was sent");
         match cmd {
-            UiCommand::SendPrompt { text, images } => {
+            UiCommand::SendPrompt { text, images, .. } => {
                 assert_eq!(text, "pasted-1\npasted-2\ntyped");
                 assert!(images.is_empty());
             }
@@ -26211,7 +26498,7 @@ mod tests {
 
         let cmd = cmd_rx.try_recv().expect("prompt was sent");
         match cmd {
-            UiCommand::SendPrompt { text, images } => {
+            UiCommand::SendPrompt { text, images, .. } => {
                 assert_eq!(text, "describe this");
                 assert_eq!(images.len(), 1);
                 assert_eq!(images[0].data_base64, "aW1hZ2U=");
@@ -26244,7 +26531,7 @@ mod tests {
 
         let queued = cmd_rx.try_recv().expect("startup prompt queued");
         match queued {
-            UiCommand::SendPrompt { text, images } => {
+            UiCommand::SendPrompt { text, images, .. } => {
                 assert_eq!(text, "describe this");
                 assert_eq!(images.len(), 1);
             }
@@ -27009,7 +27296,7 @@ mod tests {
         drain_queued_prompt(&mut state, &cmd_tx);
         assert!(state.queued_prompts().next().is_none(), "queue drained");
         match cmd_rx.try_recv().expect("queued prompt dispatched") {
-            UiCommand::SendPrompt { text, images } => {
+            UiCommand::SendPrompt { text, images, .. } => {
                 assert_eq!(text, "queued body");
                 assert!(images.is_empty());
             }
@@ -27105,7 +27392,7 @@ mod tests {
         );
         let cmd = cmd_rx.try_recv().expect("send prompt dispatched");
         match cmd {
-            UiCommand::SendPrompt { text, images } => {
+            UiCommand::SendPrompt { text, images, .. } => {
                 assert_eq!(text, "alpha");
                 assert!(images.is_empty());
             }
@@ -27158,6 +27445,11 @@ mod tests {
         state.push_queued_prompt(QueuedPrompt {
             text: "queued body".to_string(),
             images: Vec::new(),
+            resources: vec![PromptResource {
+                name: "src/acp.rs".to_string(),
+                uri: "file:///workspace/src/acp.rs".to_string(),
+                size: Some(42),
+            }],
             display_text: "queued body".to_string(),
         });
 
@@ -27175,9 +27467,15 @@ mod tests {
         );
         let cmd = cmd_rx.try_recv().expect("send prompt dispatched");
         match cmd {
-            UiCommand::SendPrompt { text, images } => {
+            UiCommand::SendPrompt {
+                text,
+                images,
+                resources,
+            } => {
                 assert_eq!(text, "queued body");
                 assert!(images.is_empty());
+                assert_eq!(resources.len(), 1);
+                assert_eq!(resources[0].name, "src/acp.rs");
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -27190,6 +27488,7 @@ mod tests {
         state.push_queued_prompt(QueuedPrompt {
             text: "keep me".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
             display_text: "keep me".to_string(),
         });
 
@@ -27265,6 +27564,7 @@ mod tests {
         state.push_queued_prompt(QueuedPrompt {
             text: "keep me".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
             display_text: "keep me".to_string(),
         });
 
@@ -27395,6 +27695,7 @@ mod tests {
         state.push_queued_prompt(QueuedPrompt {
             text: "stale".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
             display_text: "stale".to_string(),
         });
 

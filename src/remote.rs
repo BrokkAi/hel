@@ -4063,7 +4063,11 @@ impl RemoteSessionTracker {
                                 }
                             }
                             RemoteQueuedPromptAction::SendPrompt(text) => {
-                                let command = UiCommand::SendPrompt { text, images };
+                                let command = UiCommand::SendPrompt {
+                                    text,
+                                    images,
+                                    resources: Vec::new(),
+                                };
                                 if command_tx.send(command).is_err() {
                                     break;
                                 }
@@ -4611,6 +4615,7 @@ fn start_server_agent_session(
                             let prompt = UiCommand::SendPrompt {
                                 text,
                                 images: Vec::new(),
+                                resources: Vec::new(),
                             };
                             tracker.observe_side_command(&prompt);
                             let _ = side.send(prompt);
@@ -4657,13 +4662,13 @@ fn start_server_agent_session(
                         continue;
                     }
                     if matches!(command, UiCommand::CompactPrimary)
-                        || matches!(&command, UiCommand::SendPrompt { text, images } if text == "/compact" && images.is_empty())
+                        || matches!(&command, UiCommand::SendPrompt { text, images, resources } if text == "/compact" && images.is_empty() && resources.is_empty())
                     {
                         primary_orchestrator.compact_manual().await;
                         continue;
                     }
                     tracker.observe_command(&command);
-                    if let UiCommand::SendPrompt { text, images } = &command {
+                    if let UiCommand::SendPrompt { text, images, .. } = &command {
                         local_epoch = local_epoch.saturating_add(1);
                         handoffs.store(0, std::sync::atomic::Ordering::Release);
                         let snapshot =
@@ -10529,6 +10534,7 @@ mod tests {
         state.observe_command(&UiCommand::SendPrompt {
             text: "hello".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
         });
         state.observe_session_update(&SessionUpdate::AgentMessageChunk(
             agent_client_protocol::schema::v1::ContentChunk::new(
@@ -10558,6 +10564,7 @@ mod tests {
         state.observe_command(&UiCommand::SendPrompt {
             text: "hello".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
         });
         state.observe_session_update(&SessionUpdate::AgentMessageChunk(
             agent_client_protocol::schema::v1::ContentChunk::new(
@@ -10605,6 +10612,7 @@ mod tests {
         state.observe_command(&UiCommand::SendPrompt {
             text: "main question".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
         });
 
         state.begin_side_start(true);
@@ -10614,6 +10622,7 @@ mod tests {
         state.observe_side_command(&UiCommand::SendPrompt {
             text: "side question".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
         });
         state.observe_side_event(&UiEvent::SessionStarted {
             session_id: "side-session".to_string(),
@@ -11742,6 +11751,7 @@ mod tests {
         state.observe_command(&UiCommand::SendPrompt {
             text: "hello".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
         });
 
         state.observe_event(&UiEvent::Fatal("agent connection closed".to_string()));
@@ -11784,6 +11794,7 @@ mod tests {
         state.observe_command(&UiCommand::SendPrompt {
             text: "hello".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
         });
         let (_, started_at) = state
             .prompt_cancel_claim()
@@ -11815,6 +11826,7 @@ mod tests {
         state.observe_command(&UiCommand::SendPrompt {
             text: "implement it".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
         });
 
         state.observe_event(&UiEvent::InternalMessage(crate::event::InternalMessage {
@@ -11855,6 +11867,7 @@ mod tests {
         state.observe_command(&UiCommand::SendPrompt {
             text: "hello".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
         });
         let snapshot = state.snapshot().expect("active snapshot");
         assert!(snapshot.prompt_in_flight);
@@ -12285,6 +12298,7 @@ mod tests {
         state.observe_command(&UiCommand::SendPrompt {
             text: "old prompt".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
         });
         state.observe_event(&UiEvent::SessionConfigOptions {
             options: vec![SessionConfigOption::new(
@@ -14484,6 +14498,7 @@ mod tests {
         state.observe_command(&UiCommand::SendPrompt {
             text: "hello".to_string(),
             images: Vec::new(),
+            resources: Vec::new(),
         });
         assert!(state.config_claim_session().is_none());
 

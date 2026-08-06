@@ -2307,6 +2307,7 @@ async fn run_session(
                     let prompt = UiCommand::SendPrompt {
                         text,
                         images: Vec::new(),
+                        resources: Vec::new(),
                     };
                     cmd_tracker.observe_side_command(&prompt);
                     let _ = side.send(prompt);
@@ -2363,7 +2364,7 @@ async fn run_session(
                 cmd_orchestrator.compact_manual().await;
                 continue;
             }
-            if let UiCommand::SendPrompt { text, images } = &command {
+            if let UiCommand::SendPrompt { text, images, .. } = &command {
                 local_epoch = local_epoch.saturating_add(1);
                 subagent_handoffs_this_turn.store(0, Ordering::Release);
                 let snapshot = workspace_snapshot::WorkspaceSnapshot::capture_excluding(
@@ -2423,6 +2424,7 @@ async fn run_session(
                 }),
                 session_boundary: session_boundary.take(),
                 session_cwd: cwd.clone(),
+                additional_workspace_roots: runtime_options.additional_directories.clone(),
                 model_choices: roster.choices.clone(),
                 acp_inventory: roster.inventory.clone(),
                 configured_models: ui_config.model_names(),
