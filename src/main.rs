@@ -611,8 +611,12 @@ async fn main() -> Result<()> {
             Commands::Memory(args) => run_memory_command(args.command, &cwd),
             Commands::Models(args) => match args.command {
                 ModelsCommand::Refresh => {
-                    let cfg = Config::load(&config::default_config_path())?;
-                    let roster = roster::resolve(&cfg, &cwd).await?;
+                    let config_path = config::default_config_path();
+                    let mut cfg = Config::load(&config_path)?;
+                    let (roster, notices) = roster::resolve_recovering(&mut cfg, &cwd).await?;
+                    if !notices.is_empty() {
+                        cfg.save(&config_path)?;
+                    }
                     println!(
                         "Probed enabled ACP adapters; {} models available.",
                         available_model_count(&roster)
@@ -946,7 +950,7 @@ async fn run_resume(
     let mut resume_roster = if args.list {
         roster::resolve(&cfg, &cwd).await?
     } else {
-        resolve_roster_for_tui(&cfg, &cwd).await?
+        with_startup_spinner(roster::resolve(&cfg, &cwd)).await?
     };
     let mut agent = selected_agent_for_role(&resume_roster.primary);
     if let Some(session_id) = args.session_id.as_deref()
@@ -1404,8 +1408,11 @@ fn apply_session_result_to_config(cfg: &mut Config, result: &RunSessionResult) {
     cfg.spinner = result.spinner_style;
 }
 
-async fn resolve_roster_for_tui(cfg: &Config, cwd: &Path) -> Result<roster::Roster> {
-    with_startup_spinner(roster::resolve(cfg, cwd)).await
+async fn resolve_roster_for_tui(
+    cfg: &mut Config,
+    cwd: &Path,
+) -> Result<(roster::Roster, Vec<String>)> {
+    with_startup_spinner(roster::resolve_recovering(cfg, cwd)).await
 }
 
 async fn with_startup_spinner<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
@@ -1475,14 +1482,18 @@ async fn run_app(
     let config_path = config::default_config_path();
     let config_exists = config::Config::path_has_current_version(&config_path);
     let mut cfg = Config::load(&config_path)?;
+    let team_selection_required = config::TeamPreset::from_config(&cfg).is_none();
     let onboarding_kind = onboarding_kind(
         config_exists,
         cfg.onboarding_version,
+        team_selection_required,
         resume_target.as_ref(),
         initial_agent.as_ref(),
     );
     let mut roster = if let Some(kind) = onboarding_kind {
-        let initial_resolution = resolve_roster_for_tui(&cfg, &cwd).await;
+        let initial_resolution = resolve_roster_for_tui(&mut cfg, &cwd)
+            .await
+            .map(|(roster, _)| roster);
         let Some((accepted_config, accepted_roster)) = run_startup_onboarding(
             kind,
             cfg,
@@ -1490,6 +1501,10 @@ async fn run_app(
             &config_path,
             &cwd,
             termination.clone(),
+            team_selection_required.then_some(
+                "Your previous configuration does not map to a supported Team. Choose one of the four Teams to continue."
+                    .to_string(),
+            ),
         )
         .await?
         else {
@@ -1498,7 +1513,11 @@ async fn run_app(
         cfg = accepted_config;
         accepted_roster
     } else {
-        resolve_roster_for_tui(&cfg, &cwd).await?
+        let (roster, notices) = resolve_roster_for_tui(&mut cfg, &cwd).await?;
+        if !notices.is_empty() {
+            cfg.save(&config_path)?;
+        }
+        roster
     };
     if let Some(agent) = initial_agent.as_ref()
         && let Some(pinned) = roster.available.iter().find(|role| {
@@ -1558,7 +1577,11 @@ async fn run_app(
             UiExitReason::NewSession | UiExitReason::ClearSession => {
                 let show_new_session_boundary = session_result.reason == UiExitReason::NewSession;
                 cfg = Config::load(&config_path)?;
-                roster = resolve_roster_for_tui(&cfg, &cwd).await?;
+                let (resolved, notices) = resolve_roster_for_tui(&mut cfg, &cwd).await?;
+                if !notices.is_empty() {
+                    cfg.save(&config_path)?;
+                }
+                roster = resolved;
                 primary_agent = selected_agent_for_role(&roster.primary);
                 initial_agent = Some(primary_agent.clone());
                 pending_new_session_boundary = show_new_session_boundary;
@@ -1615,6 +1638,7 @@ async fn run_app(
 fn onboarding_kind(
     config_exists: bool,
     onboarding_version: u32,
+    team_selection_required: bool,
     resume_target: Option<&ResumeTarget>,
     initial_agent: Option<&SelectedAgent>,
 ) -> Option<onboarding::Kind> {
@@ -1624,7 +1648,8 @@ fn onboarding_kind(
     if !config_exists {
         return Some(onboarding::Kind::Fresh);
     }
-    (onboarding_version < config::ONBOARDING_CONTENT_VERSION).then_some(onboarding::Kind::Upgrade)
+    (team_selection_required || onboarding_version < config::ONBOARDING_CONTENT_VERSION)
+        .then_some(onboarding::Kind::Upgrade)
 }
 
 async fn run_startup_onboarding(
@@ -1634,8 +1659,9 @@ async fn run_startup_onboarding(
     config_path: &Path,
     cwd: &Path,
     termination: CancellationToken,
+    notice: Option<String>,
 ) -> Result<Option<(Config, roster::Roster)>> {
-    let outcome = run_onboarding_once(kind, candidate, preview, None, cwd, termination).await?;
+    let outcome = run_onboarding_once(kind, candidate, preview, notice, cwd, termination).await?;
     match outcome {
         onboarding::Outcome::Accept(next, resolved) => {
             let next = *next;
@@ -3429,19 +3455,23 @@ mod tests {
         };
 
         assert_eq!(
-            onboarding_kind(false, 0, None, None),
+            onboarding_kind(false, 0, false, None, None),
             Some(onboarding::Kind::Fresh)
         );
         assert_eq!(
-            onboarding_kind(true, 0, None, None),
+            onboarding_kind(true, 0, false, None, None),
             Some(onboarding::Kind::Upgrade)
         );
         assert_eq!(
-            onboarding_kind(true, config::ONBOARDING_CONTENT_VERSION, None, None),
+            onboarding_kind(true, config::ONBOARDING_CONTENT_VERSION, false, None, None),
             None
         );
-        assert_eq!(onboarding_kind(false, 0, Some(&resume), None), None);
-        assert_eq!(onboarding_kind(false, 0, None, Some(&agent)), None);
+        assert_eq!(
+            onboarding_kind(true, config::ONBOARDING_CONTENT_VERSION, true, None, None),
+            Some(onboarding::Kind::Upgrade)
+        );
+        assert_eq!(onboarding_kind(false, 0, true, Some(&resume), None), None);
+        assert_eq!(onboarding_kind(false, 0, true, None, Some(&agent)), None);
     }
 
     #[test]

@@ -159,6 +159,16 @@ fn source_candidates(available: &[ResolvedAgent], source: Option<&str>) -> Vec<R
         .collect()
 }
 
+/// Team routes constrain automatic selection only. A concrete saved model
+/// always resolves through the adapter that advertises that model.
+fn candidates_for_selector(
+    available: &[ResolvedAgent],
+    selector: &str,
+    source: Option<&str>,
+) -> Vec<ResolvedAgent> {
+    source_candidates(available, (selector == "auto").then_some(source).flatten())
+}
+
 fn failover_roles(
     initial: ResolvedAgent,
     available: &[ResolvedAgent],
@@ -918,10 +928,16 @@ fn unavailable_reason(
 }
 
 pub async fn resolve(config: &Config, cwd: &Path) -> Result<Roster> {
-    resolve_inner(config, cwd).await
+    let mut config = config.clone();
+    resolve_recovering(&mut config, cwd)
+        .await
+        .map(|(roster, _)| roster)
 }
 
-async fn resolve_inner(config: &Config, cwd: &Path) -> Result<Roster> {
+/// Resolve the roster and reset persisted explicit model choices only when a
+/// successful adapter probe proves they are no longer offered. Callers that
+/// own the config file should save `config` when notices are returned.
+pub async fn resolve_recovering(config: &mut Config, cwd: &Path) -> Result<(Roster, Vec<String>)> {
     let leaderboard = deepswe::load(
         &deepswe::default_cache_path(),
         deepswe::CACHE_TTL,
@@ -932,7 +948,61 @@ async fn resolve_inner(config: &Config, cwd: &Path) -> Result<Roster> {
     let availability = Availability::detect();
     let inventory = discover_inventory(config);
     let discovery = discover_available(&rows, &inventory, cwd).await;
-    assemble_roster(config, &rows, &availability, inventory, discovery)
+    let notices = recover_unavailable_explicit_models(config, &inventory, &discovery);
+    let mut roster = assemble_roster(config, &rows, &availability, inventory, discovery)?;
+    roster.warnings.extend(notices.iter().cloned());
+    roster.warnings.sort();
+    Ok((roster, notices))
+}
+
+fn recover_unavailable_explicit_models(
+    config: &mut Config,
+    inventory: &AcpInventory,
+    discovery: &Discovery,
+) -> Vec<String> {
+    let mut notices = Vec::new();
+    let source_was_probed = |source: &str| {
+        inventory
+            .servers
+            .iter()
+            .any(|server| server.selected && server.id == source)
+            && !discovery.adapter_errors.contains_key(source)
+    };
+    let all_selected_sources_were_probed = inventory
+        .servers
+        .iter()
+        .filter(|server| server.selected)
+        .all(|server| !discovery.adapter_errors.contains_key(&server.id));
+    let model_is_missing = |model: &str| {
+        !discovery
+            .available
+            .iter()
+            .any(|candidate| candidate.model.model == model)
+    };
+    let conclusively_missing = |model: &str| match adapter_kind(model) {
+        Some(kind) => model_is_missing(model) && source_was_probed(&launch_for(kind).source_id),
+        None => model_is_missing(model) && all_selected_sources_were_probed,
+    };
+
+    for (label, model) in [
+        ("Agent", &mut config.agent.model),
+        ("Review", &mut config.review.model),
+        ("Subagent", &mut config.subagents.model),
+    ] {
+        if matches!(
+            model.as_str(),
+            "auto" | crate::config::DISABLED_MODEL | "none"
+        ) || !conclusively_missing(model)
+        {
+            continue;
+        }
+        let unavailable = model.clone();
+        *model = "auto".to_string();
+        notices.push(format!(
+            "{label} model '{unavailable}' is no longer offered; switched to automatic selection"
+        ));
+    }
+    notices
 }
 
 /// Bind the primary agent and the default subagent model plus the model
@@ -1008,8 +1078,13 @@ fn assemble_roster(
     ) {
         bail!("the primary agent cannot be disabled");
     }
-    let primary_available = source_candidates(&available, config.agent.acp_source.as_deref());
-    if primary_available.is_empty()
+    let primary_available = candidates_for_selector(
+        &available,
+        &config.agent.model,
+        config.agent.acp_source.as_deref(),
+    );
+    if config.agent.model == "auto"
+        && primary_available.is_empty()
         && let Some(source) = &config.agent.acp_source
     {
         bail!("Agent ACP source '{source}' has no launchable models");
@@ -1030,7 +1105,11 @@ fn assemble_roster(
             &config.agent.acp_priority,
         )?
     };
-    let review_available = source_candidates(&available, config.review.acp_source.as_deref());
+    let review_available = candidates_for_selector(
+        &available,
+        &config.review.model,
+        config.review.acp_source.as_deref(),
+    );
     let mut review_supervisor = resolve_review_supervisor(
         &config.review.model,
         primary,
@@ -1040,7 +1119,11 @@ fn assemble_roster(
         config.agent.discrete_review,
     )?;
     let occupied = vec![primary.model.model.as_str()];
-    let subagent_available = source_candidates(&available, config.subagents.acp_source.as_deref());
+    let subagent_available = candidates_for_selector(
+        &available,
+        &config.subagents.model,
+        config.subagents.acp_source.as_deref(),
+    );
     let mut subagent_default = resolve_subagent_default(
         &config.subagents.model,
         rows,
@@ -1103,7 +1186,9 @@ fn assemble_roster(
         warnings,
         inventory,
         subagent_acp_priority: config.subagents.acp_priority.clone(),
-        subagent_acp_source: config.subagents.acp_source.clone(),
+        subagent_acp_source: (config.subagents.model == "auto")
+            .then(|| config.subagents.acp_source.clone())
+            .flatten(),
     })
 }
 
@@ -1312,6 +1397,39 @@ mod tests {
                 .iter()
                 .all(|candidate| candidate.launch.source_id == "codex-acp")
         );
+    }
+
+    #[test]
+    fn explicit_model_ignores_a_runtime_team_route() {
+        let primary = role("gpt-5-6-sol", 0.70);
+        let reviewer = role("claude-fable-5", 0.64);
+        let rows = vec![primary.model.clone(), reviewer.model.clone()];
+        let discovery = Discovery {
+            available: vec![primary.clone(), reviewer],
+            adapter_errors: HashMap::new(),
+            session_config: HashMap::new(),
+        };
+        let availability = Availability {
+            codex_credentials: false,
+            claude_status: ClaudeAuthStatus::NotLoggedIn,
+            subscriptions: Subscriptions::default(),
+        };
+        let mut config = Config::default();
+        config.agent.model = primary.model.model.clone();
+        config.agent.acp_source = Some("claude-acp".to_string());
+        config.subagents.model = crate::config::DISABLED_MODEL.to_string();
+
+        let roster = assemble_roster(
+            &config,
+            &rows,
+            &availability,
+            AcpInventory::default(),
+            discovery,
+        )
+        .expect("explicit model resolves through its own adapter");
+
+        assert_eq!(roster.primary.model.model, "gpt-5-6-sol");
+        assert_eq!(roster.primary.launch.source_id, "codex-acp");
     }
 
     #[test]
@@ -1767,6 +1885,43 @@ mod tests {
                 .contains("no HTTP-MCP-capable ACP adapter")
         );
         let _ = availability;
+    }
+
+    #[test]
+    fn confirmed_missing_explicit_model_switches_the_saved_seat_to_auto() {
+        let mut config = Config::default();
+        config.agent.model = "gpt-5-6-terra".to_string();
+        config.set_acp_server_policy("codex-acp", AcpServerPolicy::Enabled);
+        let inventory = discover_inventory(&config);
+        let discovery = Discovery {
+            available: vec![role("gpt-5-6-sol", 0.7)],
+            adapter_errors: HashMap::new(),
+            session_config: HashMap::new(),
+        };
+
+        let notices = recover_unavailable_explicit_models(&mut config, &inventory, &discovery);
+
+        assert_eq!(config.agent.model, "auto");
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("gpt-5-6-terra"));
+    }
+
+    #[test]
+    fn failed_adapter_probe_keeps_an_explicit_model_selection() {
+        let mut config = Config::default();
+        config.agent.model = "gpt-5-6-terra".to_string();
+        config.set_acp_server_policy("codex-acp", AcpServerPolicy::Enabled);
+        let inventory = discover_inventory(&config);
+        let discovery = Discovery {
+            available: vec![role("gpt-5-6-sol", 0.7)],
+            adapter_errors: HashMap::from([("codex-acp".to_string(), "timed out".to_string())]),
+            session_config: HashMap::new(),
+        };
+
+        let notices = recover_unavailable_explicit_models(&mut config, &inventory, &discovery);
+
+        assert_eq!(config.agent.model, "gpt-5-6-terra");
+        assert!(notices.is_empty());
     }
 
     #[test]

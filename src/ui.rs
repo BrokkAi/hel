@@ -6615,16 +6615,6 @@ fn persist_primary_picker_selection(
         }
     };
     config.agent.model.clone_from(&role.model.model);
-    // A seat pinned to another ACP source could never resolve the picked
-    // route; move the pin to the route that actually serves this model.
-    if config
-        .agent
-        .acp_source
-        .as_deref()
-        .is_some_and(|source| source != role.launch.source_id)
-    {
-        config.agent.acp_source = Some(role.launch.source_id.clone());
-    }
     config.agent.reasoning_effort = effort;
     match config.save(path) {
         Ok(()) => {
@@ -19376,9 +19366,7 @@ mod tests {
     }
 
     #[test]
-    fn picker_save_moves_a_mismatched_source_pin_to_the_picked_route() {
-        // A seat pinned to codex-acp picking a claude-served model (e.g. an
-        // unranked `haiku`) must not persist an unresolvable source/model pair.
+    fn picker_save_does_not_persist_an_acp_source_pin() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let mut config = crate::config::Config::default();
@@ -19410,7 +19398,7 @@ mod tests {
 
         let saved = crate::config::Config::load(&path).expect("reload");
         assert_eq!(saved.agent.model, "haiku");
-        assert_eq!(saved.agent.acp_source.as_deref(), Some("claude-acp"));
+        assert_eq!(saved.agent.acp_source, None);
     }
 
     #[test]

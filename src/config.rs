@@ -125,6 +125,10 @@ pub struct Config {
     /// Persistent cross-session memory behavior.
     #[serde(default, skip_serializing_if = "MemoryConfig::is_default")]
     pub memory: MemoryConfig,
+    /// The semantic team preference used to constrain automatic selection.
+    /// ACP adapter identities themselves are never persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
     /// The primary agent's model and review behavior.
     #[serde(default, skip_serializing_if = "AgentConfig::is_default")]
     pub agent: AgentConfig,
@@ -166,6 +170,7 @@ impl Default for Config {
             feature_hints: true,
             keep_awake: true,
             memory: MemoryConfig::default(),
+            team: None,
             agent: AgentConfig::default(),
             review: ReviewConfig::default(),
             subagents: SubagentsConfig::default(),
@@ -351,7 +356,16 @@ impl TeamPreset {
         Self::ALL.into_iter().find(|preset| preset.id() == id)
     }
 
+    fn from_legacy_sources(coder: &str, reviewer: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.sources() == (coder, reviewer))
+    }
+
     pub fn from_config(config: &Config) -> Option<Self> {
+        if let Some(team) = config.team.as_deref() {
+            return Self::from_id(team);
+        }
         let coder = config.agent.acp_source.as_deref()?;
         let reviewer = config.review.acp_source.as_deref()?;
         if config.subagents.acp_source.as_deref() != Some(reviewer) {
@@ -363,6 +377,7 @@ impl TeamPreset {
     }
 
     pub fn apply(self, config: &mut Config) {
+        config.team = Some(self.id().to_string());
         let (coder, reviewer) = self.sources();
         config.agent.model = default_auto();
         config.agent.acp_source = Some(coder.to_string());
@@ -375,6 +390,13 @@ impl TeamPreset {
         for source in [coder, reviewer] {
             config.set_acp_server_policy(source, AcpServerPolicy::Enabled);
         }
+    }
+
+    fn apply_runtime_routes(self, config: &mut Config) {
+        let (coder, reviewer) = self.sources();
+        config.agent.acp_source = Some(coder.to_string());
+        config.review.acp_source = Some(reviewer.to_string());
+        config.subagents.acp_source = Some(reviewer.to_string());
     }
 }
 
@@ -461,9 +483,9 @@ impl std::str::FromStr for ReviewTier {
 pub struct AgentConfig {
     #[serde(default = "default_auto")]
     pub model: String,
-    /// Restrict this seat to one ACP source while retaining automatic model
-    /// selection within that source. `None` allows every enabled source.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Runtime-only route hint. Model selection is the persisted preference;
+    /// a compatible ACP adapter is discovered when a session starts.
+    #[serde(skip)]
     pub acp_source: Option<String>,
     /// Preferred ACP sources when more than one enabled adapter offers the
     /// selected model. Unlisted sources follow in discovery order.
@@ -520,9 +542,9 @@ impl AgentConfig {
 pub struct ReviewConfig {
     #[serde(default = "default_auto")]
     pub model: String,
-    /// Restrict this seat to one ACP source while retaining automatic model
-    /// selection within that source. `None` allows every enabled source.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Runtime-only route hint. Never persist an ACP adapter alongside the
+    /// selected review model.
+    #[serde(skip)]
     pub acp_source: Option<String>,
     /// Preferred ACP sources when more than one enabled adapter offers the
     /// selected review supervisor model. Unlisted sources follow in discovery
@@ -563,9 +585,9 @@ impl ReviewConfig {
 pub struct SubagentsConfig {
     #[serde(default = "default_auto")]
     pub model: String,
-    /// Restrict this seat and its automatic failover pool to one ACP source.
-    /// `None` allows every enabled source.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Runtime-only route hint. Never persist an ACP adapter alongside the
+    /// selected subagent model.
+    #[serde(skip)]
     pub acp_source: Option<String>,
     /// Preferred ACP sources when more than one enabled adapter offers the
     /// selected worker model. Unlisted sources follow in discovery order.
@@ -826,6 +848,12 @@ impl Config {
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let document: toml::Value =
             toml::from_str(&s).with_context(|| format!("parse {}", path.display()))?;
+        let has_persisted_acp_source = ["agent", "review", "subagents"].into_iter().any(|seat| {
+            document
+                .get(seat)
+                .and_then(toml::Value::as_table)
+                .is_some_and(|table| table.contains_key("acp_source"))
+        });
         let version = document.get("version").and_then(toml::Value::as_integer);
         if version == Some(i64::from(MIGRATABLE_VERSION)) {
             let mut cfg = migrate_v2(&s).with_context(|| format!("migrate {}", path.display()))?;
@@ -850,7 +878,17 @@ impl Config {
         }
         let mut cfg: Self =
             toml::from_str(&s).with_context(|| format!("parse {}", path.display()))?;
+        if cfg.team.is_none() {
+            cfg.team = legacy_team_preset(&document).map(|team| team.id().to_string());
+        }
         cfg.normalize()?;
+        if has_persisted_acp_source && let Err(error) = cfg.save(path) {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "removed obsolete persisted ACP source pins in memory but could not write config"
+            );
+        }
         Ok(cfg)
     }
 
@@ -878,6 +916,11 @@ impl Config {
             self.subagents.model = DISABLED_MODEL.to_string();
         }
         self.drop_retired_sources();
+        if let Some(team) = self.team.as_deref().and_then(TeamPreset::from_id) {
+            team.apply_runtime_routes(self);
+        } else {
+            self.team = None;
+        }
         for (seat, priority) in [
             ("agent", &self.agent.acp_priority),
             ("review", &self.review.acp_priority),
@@ -912,6 +955,23 @@ impl Config {
 
         Ok(())
     }
+}
+
+/// The old configuration stored one ACP route per role. The supported Team
+/// model has only a coder route and a reviewer route; workers intentionally
+/// follow the reviewer. Preserve the selected valid team on upgrade by using
+/// the old primary/reviewer pair and normalizing the old worker route.
+fn legacy_team_preset(document: &toml::Value) -> Option<TeamPreset> {
+    let source = |seat: &str| {
+        document
+            .get(seat)
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.get("acp_source"))
+            .and_then(toml::Value::as_str)
+    };
+    let coder = source("agent")?;
+    let reviewer = source("review").or_else(|| source("subagents"))?;
+    TeamPreset::from_legacy_sources(coder, reviewer)
 }
 
 impl AcpConfig {
@@ -1038,6 +1098,7 @@ fn migrate_v2(body: &str) -> Result<Config> {
         feature_hints: true,
         keep_awake: true,
         memory: MemoryConfig::default(),
+        team: None,
         agent: AgentConfig {
             model: old.thor.model,
             acp_source: None,
@@ -1489,9 +1550,10 @@ kimi = "disabled"
         assert!(!loaded.acp.policies.contains_key("kimi"));
         // The pinned model's provider has no built-in adapter left either.
         assert_eq!(loaded.agent.model, "auto");
-        // Still-served pins are untouched.
+        // Still-served model choices remain, but their obsolete source pin is
+        // removed as well.
         assert_eq!(loaded.subagents.model, "gpt-5-6-sol");
-        assert_eq!(loaded.subagents.acp_source.as_deref(), Some("codex-acp"));
+        assert_eq!(loaded.subagents.acp_source, None);
     }
 
     #[test]
@@ -1512,7 +1574,7 @@ kimi = "disabled"
     }
 
     #[test]
-    fn independent_acp_priorities_roundtrip() {
+    fn acp_priorities_roundtrip_without_persisting_source_pins() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let mut cfg = Config::default();
@@ -1526,9 +1588,9 @@ kimi = "disabled"
         cfg.save(&path).expect("save");
         let loaded = Config::load(&path).expect("load");
 
-        assert_eq!(loaded.agent.acp_source, cfg.agent.acp_source);
-        assert_eq!(loaded.review.acp_source, cfg.review.acp_source);
-        assert_eq!(loaded.subagents.acp_source, cfg.subagents.acp_source);
+        assert_eq!(loaded.agent.acp_source, None);
+        assert_eq!(loaded.review.acp_source, None);
+        assert_eq!(loaded.subagents.acp_source, None);
         assert_eq!(loaded.agent.acp_priority, cfg.agent.acp_priority);
         assert_eq!(loaded.review.acp_priority, cfg.review.acp_priority);
         assert_eq!(loaded.subagents.acp_priority, cfg.subagents.acp_priority);
@@ -2083,6 +2145,41 @@ origin = "custom"
     }
 
     #[test]
+    fn load_removes_obsolete_persisted_acp_source_pins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+version = 3
+
+[agent]
+model = "gpt-5-6-terra"
+acp_source = "claude-acp"
+
+[review]
+model = "claude-fable-5"
+acp_source = "codex-acp"
+"#,
+        )
+        .expect("write");
+
+        let config = Config::load(&path).expect("load");
+
+        assert_eq!(config.agent.model, "gpt-5-6-terra");
+        assert_eq!(config.review.model, "claude-fable-5");
+        assert_eq!(config.team.as_deref(), Some("claude_codex"));
+        assert_eq!(config.agent.acp_source.as_deref(), Some("claude-acp"));
+        assert_eq!(config.review.acp_source.as_deref(), Some("codex-acp"));
+        let rewritten = std::fs::read_to_string(&path).expect("read rewritten config");
+        assert!(!rewritten.contains("acp_source"), "config: {rewritten}");
+        assert!(
+            rewritten.contains("team = \"claude_codex\""),
+            "config: {rewritten}"
+        );
+    }
+
+    #[test]
     fn incompatible_version_is_discarded() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
@@ -2143,6 +2240,7 @@ mode = "ask"
         let mut config = Config::default();
         TeamPreset::CodexWithClaudeReviewer.apply(&mut config);
         config.subagents.acp_source = config.agent.acp_source.clone();
+        config.team = None;
 
         assert_eq!(TeamPreset::from_config(&config), None);
     }
