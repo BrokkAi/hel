@@ -139,7 +139,12 @@ impl Controller {
         let bundle = backend_bundle(bundle)?;
         let provision = hel_targets::provision_plan(&target, session_id, &bundle)?;
 
-        let result = provision.execute(executor);
+        let preflight = if matches!(template, TargetTemplate::LocalPodman { .. }) {
+            hel_targets::verify_local_podman(executor).map(|_| ())
+        } else {
+            Ok(())
+        };
+        let result = preflight.and_then(|()| provision.execute(executor));
         match result {
             Ok(outputs) => {
                 let locator = locator_after_provision(

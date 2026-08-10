@@ -15,6 +15,7 @@ use crate::hel_config::{
 use crate::hel_targets::{
     CommandExecutor, CommandOutput, CommandSpec, ContainerTemplate as RuntimeContainerTemplate,
     ProcessExecutor, TargetTemplate as RuntimeTargetTemplate, setup_smoke_plan,
+    verify_local_podman,
 };
 
 const DEFAULT_IMAGE: &str = "ubuntu:24.04";
@@ -189,12 +190,7 @@ fn discover_github_repository(cwd: &Path) -> Option<GithubRepository> {
 }
 
 pub fn probe_local_runtimes(executor: &impl CommandExecutor, is_macos: bool) -> Vec<RuntimeProbe> {
-    let mut probes = vec![probe_runtime(
-        executor,
-        RuntimeKind::Podman,
-        CommandSpec::new("podman", ["info", "--format", "{{.Host.OCIRuntime.Name}}"])
-            .purpose("check Podman runtime"),
-    )];
+    let mut probes = vec![probe_podman_runtime(executor)];
     if is_macos {
         probes.push(probe_runtime(
             executor,
@@ -204,6 +200,21 @@ pub fn probe_local_runtimes(executor: &impl CommandExecutor, is_macos: bool) -> 
         ));
     }
     probes
+}
+
+fn probe_podman_runtime(executor: &impl CommandExecutor) -> RuntimeProbe {
+    match verify_local_podman(executor) {
+        Ok(preflight) => RuntimeProbe {
+            kind: RuntimeKind::Podman,
+            usable: true,
+            detail: format!("Podman {} with a valid rootless UID map", preflight.version),
+        },
+        Err(error) => RuntimeProbe {
+            kind: RuntimeKind::Podman,
+            usable: false,
+            detail: format!("{error:#}"),
+        },
+    }
 }
 
 fn probe_runtime(
@@ -349,9 +360,13 @@ pub fn run_setup_dialog_with(
     write_runtimes(output, &discovery.runtimes)?;
 
     let Some(recommended) = recommended_runtime(&discovery.runtimes) else {
-        bail!(
-            "no usable local container runtime found; install Podman or Apple's container CLI and run `hel setup` again"
-        );
+        let failures = discovery
+            .runtimes
+            .iter()
+            .map(|runtime| format!("{}: {}", runtime.kind.label(), runtime.detail))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!("no usable local container runtime found:\n{failures}");
     };
     let runtime = select_runtime(input, output, &discovery.runtimes, recommended)?;
     let image = prompt(
@@ -614,6 +629,18 @@ mod tests {
         }
     }
 
+    struct RuntimeProbeExecutor {
+        commands: RefCell<Vec<CommandSpec>>,
+        outputs: RefCell<Vec<CommandOutput>>,
+    }
+
+    impl CommandExecutor for RuntimeProbeExecutor {
+        fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+            self.commands.borrow_mut().push(command.clone());
+            Ok(self.outputs.borrow_mut().remove(0))
+        }
+    }
+
     #[test]
     fn discovers_default_and_overridden_homes_with_authentication_markers() {
         let directory = tempfile::tempdir().unwrap();
@@ -694,18 +721,47 @@ mod tests {
     }
 
     #[test]
-    fn runtime_probe_prefers_podman_and_checks_apple_container_on_macos() {
-        let executor = FakeExecutor::succeeds();
+    fn runtime_probe_requires_podman_rootless_preflight_and_checks_apple_on_macos() {
+        let executor = RuntimeProbeExecutor {
+            commands: RefCell::new(vec![]),
+            outputs: RefCell::new(vec![
+                CommandOutput {
+                    status: 0,
+                    stdout: b"podman version 5.4.2\n".to_vec(),
+                    stderr: vec![],
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: b"true\n".to_vec(),
+                    stderr: vec![],
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: b"0 1000 1\n1 100000 65536\n".to_vec(),
+                    stderr: vec![],
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: b"available".to_vec(),
+                    stderr: vec![],
+                },
+            ]),
+        };
         let runtimes = probe_local_runtimes(&executor, true);
 
         assert_eq!(runtimes.len(), 2);
         assert_eq!(recommended_runtime(&runtimes), Some(RuntimeKind::Podman));
         assert_eq!(executor.commands.borrow()[0].program, "podman");
+        assert_eq!(executor.commands.borrow()[0].args, ["--version"]);
         assert_eq!(
-            executor.commands.borrow()[0].args,
-            ["info", "--format", "{{.Host.OCIRuntime.Name}}"]
+            executor.commands.borrow()[1].args,
+            ["info", "--format", "{{.Host.Security.Rootless}}"]
         );
-        assert_eq!(executor.commands.borrow()[1].program, "container");
+        assert_eq!(
+            executor.commands.borrow()[2].args,
+            ["unshare", "cat", "/proc/self/uid_map"]
+        );
+        assert_eq!(executor.commands.borrow()[3].program, "container");
     }
 
     #[test]

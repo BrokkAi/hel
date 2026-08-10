@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 pub const SESSION_LABEL: &str = "dev.hel.session";
 pub const SESSION_TAG: &str = "dev.hel.session";
 pub const CONTAINER_WORKSPACE: &str = "/workspace";
+pub const PODMAN_DOCUMENTATION_PATH: &str = "docs/PODMAN.md";
+
+const PODMAN_MINIMUM_MAJOR_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSpec {
@@ -71,6 +74,126 @@ impl CommandExecutor for ProcessExecutor {
             stderr: output.stderr,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodmanPreflight {
+    pub version: String,
+}
+
+/// Verify the fast local preconditions for Hel's rootless Podman target.
+///
+/// This intentionally never pulls an image. Image availability is verified by
+/// `hel setup`'s smoke test and by the subsequent target creation command.
+pub fn verify_local_podman(executor: &impl CommandExecutor) -> Result<PodmanPreflight> {
+    let version = execute_podman_preflight(
+        executor,
+        CommandSpec::new("podman", ["--version"]).purpose("check Podman version"),
+        "Postcondition `podman --version` succeeds with Podman 4.0.0 or newer",
+        "Install or upgrade Podman: Debian/Ubuntu `sudo apt update && sudo apt install -y podman uidmap`; Fedora `sudo dnf install -y podman shadow-utils`.",
+    )?;
+    let version = parse_podman_version(&version.stdout)?;
+
+    let rootless = execute_podman_preflight(
+        executor,
+        CommandSpec::new(
+            "podman",
+            ["info", "--format", "{{.Host.Security.Rootless}}"],
+        )
+        .purpose("check rootless Podman mode"),
+        "Postcondition `podman info --format '{{.Host.Security.Rootless}}'` prints `true`",
+        "Run Hel as the ordinary user without `sudo`; if a remote Podman connection is configured, unset `CONTAINER_HOST` or select the rootless local connection.",
+    )?;
+    let rootless_output = String::from_utf8_lossy(&rootless.stdout);
+    if rootless_output.trim() != "true" {
+        bail!(
+            "Podman preflight failed: Postcondition `podman info --format '{{{{.Host.Security.Rootless}}}}'` prints `true` returned {:?}. Run Hel as the ordinary user without `sudo`; if a remote Podman connection is configured, unset `CONTAINER_HOST` or select the rootless local connection. See {PODMAN_DOCUMENTATION_PATH}.",
+            rootless_output.trim()
+        );
+    }
+
+    let uid_map = execute_podman_preflight(
+        executor,
+        CommandSpec::new("podman", ["unshare", "cat", "/proc/self/uid_map"])
+            .purpose("check rootless Podman UID map"),
+        "Postcondition `podman unshare cat /proc/self/uid_map` maps container UIDs 0 and 1",
+        "Install UID-map helpers (`sudo apt install -y uidmap` on Debian/Ubuntu or `sudo dnf install -y shadow-utils` on Fedora), then add subordinate ranges with `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 \"$USER\"` and start a fresh login session.",
+    )?;
+    if !valid_rootless_uid_map(&uid_map.stdout) {
+        bail!(
+            "Podman preflight failed: Postcondition `podman unshare cat /proc/self/uid_map` maps container UIDs 0 and 1 was not met. Add subordinate ranges with `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 \"$USER\"`, verify `/etc/subuid` and `/etc/subgid`, then log out and back in. See {PODMAN_DOCUMENTATION_PATH}."
+        );
+    }
+
+    Ok(PodmanPreflight { version })
+}
+
+fn execute_podman_preflight(
+    executor: &impl CommandExecutor,
+    command: CommandSpec,
+    postcondition: &str,
+    remediation: &str,
+) -> Result<CommandOutput> {
+    let output = executor.execute(&command).map_err(|error| {
+        anyhow::anyhow!(
+            "Podman preflight failed: {postcondition}. {remediation} See {PODMAN_DOCUMENTATION_PATH}. Underlying error: {error}"
+        )
+    })?;
+    if output.status != 0 {
+        bail!(
+            "Podman preflight failed: {postcondition}. {remediation} See {PODMAN_DOCUMENTATION_PATH}. Podman reported: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output)
+}
+
+fn parse_podman_version(stdout: &[u8]) -> Result<String> {
+    let version = String::from_utf8_lossy(stdout).trim().to_owned();
+    let Some(candidate) = version
+        .split_whitespace()
+        .find(|part| part.as_bytes().first().is_some_and(u8::is_ascii_digit))
+    else {
+        bail!(
+            "Podman preflight failed: Postcondition `podman --version` succeeds with Podman 4.0.0 or newer returned {version:?}. Install or upgrade Podman: Debian/Ubuntu `sudo apt update && sudo apt install -y podman uidmap`; Fedora `sudo dnf install -y podman shadow-utils`. See {PODMAN_DOCUMENTATION_PATH}."
+        );
+    };
+    let Some(major) = candidate
+        .split('.')
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+    else {
+        bail!(
+            "Podman preflight failed: Postcondition `podman --version` succeeds with Podman 4.0.0 or newer returned {version:?}. Install or upgrade Podman: Debian/Ubuntu `sudo apt update && sudo apt install -y podman uidmap`; Fedora `sudo dnf install -y podman shadow-utils`. See {PODMAN_DOCUMENTATION_PATH}."
+        );
+    };
+    if major < PODMAN_MINIMUM_MAJOR_VERSION {
+        bail!(
+            "Podman preflight failed: Postcondition `podman --version` succeeds with Podman 4.0.0 or newer was not met (found {candidate}). Upgrade Podman to 4.0.0 or newer: Debian/Ubuntu `sudo apt update && sudo apt install -y podman uidmap`; Fedora `sudo dnf install -y podman shadow-utils`. See {PODMAN_DOCUMENTATION_PATH}."
+        );
+    }
+    Ok(candidate.to_owned())
+}
+
+fn valid_rootless_uid_map(stdout: &[u8]) -> bool {
+    let mappings = String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((
+                fields.next()?.parse::<u64>().ok()?,
+                fields.next()?.parse::<u64>().ok()?,
+                fields.next()?.parse::<u64>().ok()?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    [0, 1].into_iter().all(|container_id| {
+        mappings.iter().any(|(inside, _outside, length)| {
+            inside
+                .checked_add(*length)
+                .is_some_and(|end| *inside <= container_id && container_id < end)
+        })
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -868,6 +991,102 @@ mod tests {
             destination: "dev@example.test".to_owned(),
             ssh_args: vec!["-o".to_owned(), "BatchMode=yes".to_owned()],
         }
+    }
+
+    struct PodmanPreflightExecutor {
+        seen: RefCell<Vec<CommandSpec>>,
+        outputs: RefCell<Vec<CommandOutput>>,
+    }
+
+    impl PodmanPreflightExecutor {
+        fn with_outputs(outputs: impl IntoIterator<Item = CommandOutput>) -> Self {
+            Self {
+                seen: RefCell::new(vec![]),
+                outputs: RefCell::new(outputs.into_iter().collect()),
+            }
+        }
+    }
+
+    impl CommandExecutor for PodmanPreflightExecutor {
+        fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+            self.seen.borrow_mut().push(command.clone());
+            Ok(self.outputs.borrow_mut().remove(0))
+        }
+    }
+
+    fn podman_output(stdout: impl AsRef<[u8]>) -> CommandOutput {
+        CommandOutput {
+            status: 0,
+            stdout: stdout.as_ref().to_vec(),
+            stderr: vec![],
+        }
+    }
+
+    #[test]
+    fn podman_preflight_requires_supported_rootless_uid_mapped_runtime() {
+        let executor = PodmanPreflightExecutor::with_outputs([
+            podman_output(b"podman version 5.4.2\n"),
+            podman_output(b"true\n"),
+            podman_output(b"         0       1000          1\n         1     100000      65536\n"),
+        ]);
+
+        assert_eq!(
+            verify_local_podman(&executor).unwrap(),
+            PodmanPreflight {
+                version: "5.4.2".into()
+            }
+        );
+        let seen = executor.seen.borrow();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].args, ["--version"]);
+        assert_eq!(
+            seen[1].args,
+            ["info", "--format", "{{.Host.Security.Rootless}}"]
+        );
+        assert_eq!(seen[2].args, ["unshare", "cat", "/proc/self/uid_map"]);
+    }
+
+    #[test]
+    fn podman_preflight_rejects_unsupported_version_with_upgrade_remediation() {
+        let executor =
+            PodmanPreflightExecutor::with_outputs([podman_output(b"podman version 3.4.7\n")]);
+
+        let error = verify_local_podman(&executor).unwrap_err().to_string();
+        assert!(error.contains("Podman 4.0.0 or newer"));
+        assert!(error.contains("apt install -y podman uidmap"));
+        assert!(error.contains(PODMAN_DOCUMENTATION_PATH));
+    }
+
+    #[test]
+    fn podman_preflight_reports_uidmap_helper_remediation() {
+        let executor = PodmanPreflightExecutor::with_outputs([
+            podman_output(b"podman version 5.4.2\n"),
+            podman_output(b"true\n"),
+            CommandOutput {
+                status: 1,
+                stdout: vec![],
+                stderr: b"cannot find newuidmap executable".to_vec(),
+            },
+        ]);
+
+        let error = verify_local_podman(&executor).unwrap_err().to_string();
+        assert!(error.contains("podman unshare cat /proc/self/uid_map"));
+        assert!(error.contains("apt install -y uidmap"));
+        assert!(error.contains(PODMAN_DOCUMENTATION_PATH));
+    }
+
+    #[test]
+    fn podman_preflight_rejects_a_uid_map_without_subordinate_ids() {
+        let executor = PodmanPreflightExecutor::with_outputs([
+            podman_output(b"podman version 5.4.2\n"),
+            podman_output(b"true\n"),
+            podman_output(b"         0       1000          1\n"),
+        ]);
+
+        let error = verify_local_podman(&executor).unwrap_err().to_string();
+        assert!(error.contains("maps container UIDs 0 and 1"));
+        assert!(error.contains("usermod --add-subuids"));
+        assert!(error.contains(PODMAN_DOCUMENTATION_PATH));
     }
 
     #[test]
