@@ -4,7 +4,9 @@
 //! shell is used only at the SSH boundary, where OpenSSH necessarily sends a
 //! command string; every remotely supplied argument is POSIX-quoted there.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -51,6 +53,110 @@ pub struct CommandOutput {
     pub status: i32,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+/// An additional host directory made available to a single container session.
+///
+/// The runtime selects the isolation mode: Podman uses a copy-on-write overlay
+/// mount while Apple Container receives a read-only bind mount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdditionalMount {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+}
+
+pub fn validate_additional_mounts(mounts: &[AdditionalMount]) -> Result<()> {
+    let mut destinations = BTreeSet::new();
+    for mount in mounts {
+        if !mount.source.is_absolute() || mount.source.as_os_str().is_empty() {
+            bail!("additional mount source must be an absolute directory path");
+        }
+        if !mount.destination.is_absolute()
+            || mount.destination.as_os_str().is_empty()
+            || mount
+                .destination
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            bail!("additional mount destination must be a safe absolute container path");
+        }
+        if !destinations.insert(mount.destination.clone()) {
+            bail!(
+                "additional mount destination {:?} is configured more than once",
+                mount.destination
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Choose the editable default destination for an additional host directory.
+pub fn default_mount_destination(source: &Path, existing: &[AdditionalMount]) -> PathBuf {
+    let basename = source
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| std::ffi::OsStr::new("mount"));
+    let base = PathBuf::from("/mnt").join(basename);
+    if !existing.iter().any(|mount| mount.destination == base) {
+        return base;
+    }
+    for number in 2.. {
+        let candidate =
+            PathBuf::from("/mnt").join(format!("{}-{number}", basename.to_string_lossy()));
+        if !existing.iter().any(|mount| mount.destination == candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("a finite mount list always has an unused numbered destination")
+}
+
+/// Complete an on-disk directory path without spawning a shell.
+pub fn local_directory_completions(prefix: &str) -> Vec<String> {
+    let (directory, fragment) = match prefix.rsplit_once('/') {
+        Some((directory, fragment)) => (format!("{directory}/"), fragment),
+        None => (String::new(), prefix),
+    };
+    let lookup = if directory.is_empty() {
+        "."
+    } else {
+        &directory
+    };
+    let Ok(entries) = fs::read_dir(lookup) else {
+        return Vec::new();
+    };
+    let mut matches = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            (name.starts_with(fragment) && entry.path().is_dir())
+                .then(|| format!("{directory}{name}/"))
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+/// Return the single match or the extra shared path prefix that Tab can add.
+pub fn path_completion(prefix: &str, candidates: &[String]) -> Option<String> {
+    let first = candidates.first()?;
+    if candidates.len() == 1 {
+        return Some(first.clone());
+    }
+    let common = candidates
+        .iter()
+        .skip(1)
+        .fold(first.clone(), |common, next| {
+            common
+                .chars()
+                .zip(next.chars())
+                .take_while(|(left, right)| left == right)
+                .map(|(character, _)| character)
+                .collect()
+        });
+    (common.len() > prefix.len() && common.starts_with(prefix)).then_some(common)
 }
 
 pub trait CommandExecutor {
@@ -370,14 +476,31 @@ pub fn provision_plan(
     template: &TargetTemplate,
     session_id: &str,
     bundle: &ProjectBundleSpec,
+    additional_mounts: &[AdditionalMount],
 ) -> Result<CommandPlan> {
     bundle.validate()?;
+    if !additional_mounts.is_empty()
+        && !matches!(
+            template,
+            TargetTemplate::LocalPodman(_)
+                | TargetTemplate::AppleContainer(_)
+                | TargetTemplate::SshPodman { .. }
+        )
+    {
+        bail!("additional mounts require a container-backed target");
+    }
     let name = resource_name(session_id)?;
     let mut commands = Vec::new();
     match template {
         TargetTemplate::LocalPodman(container) => {
             validate_container_template(container)?;
-            commands.push(container_run("podman", container, &name, session_id));
+            commands.push(container_run(
+                "podman",
+                container,
+                &name,
+                session_id,
+                additional_mounts,
+            )?);
             commands.extend(
                 install_git_plan(ExecutionBoundary::Container {
                     engine: "podman",
@@ -395,7 +518,13 @@ pub fn provision_plan(
                 CommandSpec::new("container", ["system", "status"])
                     .purpose("check Apple container service"),
             );
-            commands.push(container_run("container", container, &name, session_id));
+            commands.push(container_run(
+                "container",
+                container,
+                &name,
+                session_id,
+                additional_mounts,
+            )?);
             commands.extend(
                 install_git_plan(ExecutionBoundary::Container {
                     engine: "container",
@@ -461,7 +590,13 @@ pub fn provision_plan(
             validate_ssh(ssh)?;
             validate_container_template(container)?;
             let mut run = vec!["podman".to_owned()];
-            run.extend(container_run_args(container, &name, session_id));
+            run.extend(container_run_args(
+                "podman",
+                container,
+                &name,
+                session_id,
+                additional_mounts,
+            )?);
             commands.push(ssh_command_owned(ssh, run).purpose("start remote Podman container"));
             commands.extend(
                 install_git_plan(ExecutionBoundary::SshPodman {
@@ -499,7 +634,7 @@ pub fn setup_smoke_plan(template: &TargetTemplate, smoke_id: &str) -> Result<Com
     Ok(CommandPlan {
         description: format!("smoke test Hel setup target {smoke_id}"),
         commands: vec![
-            container_run(engine, container, &name, smoke_id)
+            container_run(engine, container, &name, smoke_id, &[])?
                 .purpose("create disposable setup container"),
             container_exec(engine, &name, ["true"]).purpose("execute setup smoke command"),
             CommandSpec::new(engine, ["rm", "--force", &name])
@@ -767,12 +902,23 @@ fn container_run(
     template: &ContainerTemplate,
     name: &str,
     session_id: &str,
-) -> CommandSpec {
-    CommandSpec::new(engine, container_run_args(template, name, session_id))
-        .purpose("start session container")
+    additional_mounts: &[AdditionalMount],
+) -> Result<CommandSpec> {
+    Ok(CommandSpec::new(
+        engine,
+        container_run_args(engine, template, name, session_id, additional_mounts)?,
+    )
+    .purpose("start session container"))
 }
 
-fn container_run_args(template: &ContainerTemplate, name: &str, session_id: &str) -> Vec<String> {
+fn container_run_args(
+    engine: &str,
+    template: &ContainerTemplate,
+    name: &str,
+    session_id: &str,
+    additional_mounts: &[AdditionalMount],
+) -> Result<Vec<String>> {
+    validate_additional_mounts(additional_mounts)?;
     let mut args = vec![
         "run".to_owned(),
         "--detach".to_owned(),
@@ -782,12 +928,24 @@ fn container_run_args(template: &ContainerTemplate, name: &str, session_id: &str
         format!("{SESSION_LABEL}={session_id}"),
     ];
     args.extend(template.extra_run_args.clone());
+    for mount in additional_mounts {
+        let source = mount.source.to_string_lossy();
+        let destination = mount.destination.to_string_lossy();
+        match engine {
+            "podman" => args.extend(["--volume".to_owned(), format!("{source}:{destination}:O")]),
+            "container" => args.extend([
+                "--mount".to_owned(),
+                format!("type=bind,source={source},target={destination},readonly"),
+            ]),
+            _ => bail!("additional mounts are unsupported for container engine {engine:?}"),
+        }
+    }
     args.extend([
         template.image.clone(),
         "sleep".to_owned(),
         "infinity".to_owned(),
     ]);
-    args
+    Ok(args)
 }
 
 fn container_exec(
@@ -842,6 +1000,48 @@ pub fn join_remote_command(args: &[String]) -> String {
         .map(|arg| posix_quote(arg))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Complete remote directory paths through the configured SSH target.
+///
+/// The SSH connection timeout and noninteractive mode keep a Tab press from
+/// blocking the wizard when a host is unavailable. The quoted prefix remains
+/// literal while the trailing glob is expanded only by the remote shell.
+pub fn ssh_directory_completions(
+    ssh: &SshTarget,
+    prefix: &str,
+    executor: &impl CommandExecutor,
+) -> Result<Vec<String>> {
+    if prefix.is_empty() {
+        return Ok(Vec::new());
+    }
+    let remote_command = format!("ls -d -- {}*/ 2>/dev/null", posix_quote(prefix));
+    let mut args = ssh.ssh_args.clone();
+    args.extend([
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=3".into(),
+        "-o".into(),
+        "ServerAliveInterval=2".into(),
+        "-o".into(),
+        "ServerAliveCountMax=1".into(),
+        ssh.destination.clone(),
+        remote_command,
+    ]);
+    let output = executor
+        .execute(&CommandSpec::new("ssh", args).purpose("complete remote mount directory"))?;
+    if output.status != 0 {
+        return Ok(Vec::new());
+    }
+    let mut matches = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|path| path.starts_with(prefix) && path.ends_with('/'))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
 }
 
 fn posix_quote(value: &str) -> String {
@@ -1126,6 +1326,7 @@ mod tests {
             }),
             SESSION,
             &bundle(),
+            &[],
         )
         .unwrap();
         let name = resource_name(SESSION).unwrap();
@@ -1158,6 +1359,56 @@ mod tests {
     }
 
     #[test]
+    fn podman_additional_mounts_use_copy_on_write_overlay_volumes() {
+        let mounts = [AdditionalMount {
+            source: PathBuf::from("/host/cache"),
+            destination: PathBuf::from("/mnt/cache"),
+        }];
+        let plan = provision_plan(
+            &TargetTemplate::LocalPodman(ContainerTemplate {
+                image: "ubuntu:24.04".to_owned(),
+                extra_run_args: vec![],
+            }),
+            SESSION,
+            &bundle(),
+            &mounts,
+        )
+        .unwrap();
+
+        assert!(
+            plan.commands[0]
+                .args
+                .windows(2)
+                .any(|args| args == ["--volume", "/host/cache:/mnt/cache:O"])
+        );
+    }
+
+    #[test]
+    fn apple_additional_mounts_use_read_only_bind_fallback() {
+        let mounts = [AdditionalMount {
+            source: PathBuf::from("/Users/me/assets"),
+            destination: PathBuf::from("/mnt/assets"),
+        }];
+        let plan = provision_plan(
+            &TargetTemplate::AppleContainer(ContainerTemplate {
+                image: "ubuntu:24.04".to_owned(),
+                extra_run_args: vec![],
+            }),
+            SESSION,
+            &bundle(),
+            &mounts,
+        )
+        .unwrap();
+
+        assert!(plan.commands[1].args.windows(2).any(|args| {
+            args == [
+                "--mount",
+                "type=bind,source=/Users/me/assets,target=/mnt/assets,readonly",
+            ]
+        }));
+    }
+
+    #[test]
     fn apple_plan_preflights_and_uses_container_cli() {
         let plan = provision_plan(
             &TargetTemplate::AppleContainer(ContainerTemplate {
@@ -1166,6 +1417,7 @@ mod tests {
             }),
             SESSION,
             &bundle(),
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1232,6 +1484,7 @@ mod tests {
             },
             SESSION,
             &bundle(),
+            &[],
         )
         .unwrap();
         assert!(plan.commands.iter().all(|command| command.program == "ssh"));
@@ -1252,6 +1505,57 @@ mod tests {
     }
 
     #[test]
+    fn local_path_completion_returns_directory_components_and_tab_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("data")).unwrap();
+        std::fs::create_dir(directory.path().join("dashboard")).unwrap();
+        std::fs::write(directory.path().join("data.txt"), "not a directory").unwrap();
+        let prefix = format!("{}/da", directory.path().display());
+
+        let matches = local_directory_completions(&prefix);
+
+        assert_eq!(
+            matches,
+            vec![
+                format!("{}/dashboard/", directory.path().display()),
+                format!("{}/data/", directory.path().display()),
+            ]
+        );
+        assert_eq!(path_completion(&prefix, &matches), None);
+        assert_eq!(
+            path_completion("/srv/da", &["/srv/data/".into(), "/srv/database/".into()],),
+            Some("/srv/data".into())
+        );
+        assert_eq!(
+            path_completion("/srv/da", &["/srv/data/".into()]),
+            Some("/srv/data/".into())
+        );
+    }
+
+    #[test]
+    fn ssh_path_completion_uses_short_timeout_and_fake_executor() {
+        let executor = PodmanPreflightExecutor::with_outputs([CommandOutput {
+            status: 0,
+            stdout: b"/srv/projects/\n/srv/prompts/\n".to_vec(),
+            stderr: vec![],
+        }]);
+
+        let matches = ssh_directory_completions(&ssh(), "/srv/pr", &executor).unwrap();
+
+        assert_eq!(matches, vec!["/srv/projects/", "/srv/prompts/"]);
+        let command = &executor.seen.borrow()[0];
+        assert_eq!(command.program, "ssh");
+        assert!(command.args.contains(&"ConnectTimeout=3".to_owned()));
+        assert!(
+            command
+                .args
+                .last()
+                .unwrap()
+                .contains("ls -d -- '/srv/pr'*/")
+        );
+    }
+
+    #[test]
     fn aws_plan_tags_instance_and_close_uses_recorded_id() {
         let template = TargetTemplate::AwsEc2(AwsTemplate {
             profile: "work".to_owned(),
@@ -1260,7 +1564,7 @@ mod tests {
             launch_template_version: Some("3".to_owned()),
             ssh: ssh(),
         });
-        let provision = provision_plan(&template, SESSION, &bundle()).unwrap();
+        let provision = provision_plan(&template, SESSION, &bundle(), &[]).unwrap();
         assert_eq!(provision.commands.len(), 1);
         assert!(
             provision.commands[0]

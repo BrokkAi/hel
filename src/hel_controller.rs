@@ -22,8 +22,8 @@ use crate::hel_state::{
     CheckpointMetadata, HelState, SessionRecord, SessionState, TargetLocator, new_session_id,
 };
 use crate::hel_targets::{
-    self, AwsTemplate, CommandExecutor, CommandOutput, CommandSpec, ContainerTemplate,
-    ProcessExecutor, ProjectBundleSpec, RepositorySpec, SshTarget,
+    self, AdditionalMount, AwsTemplate, CommandExecutor, CommandOutput, CommandSpec,
+    ContainerTemplate, ProcessExecutor, ProjectBundleSpec, RepositorySpec, SshTarget,
 };
 use crate::hel_worker::{
     PROTOCOL_VERSION, RequestEnvelope, ResponseBody, ResponsePayload, VersionRange, WorkerEvent,
@@ -50,12 +50,46 @@ impl Controller {
         Ok(())
     }
 
+    /// Complete a mount source at the same host that will run the container.
+    pub fn complete_mount_source(
+        &self,
+        target_id: &str,
+        prefix: &str,
+        executor: &impl CommandExecutor,
+    ) -> Result<Vec<String>> {
+        let target = self
+            .config
+            .targets
+            .get(target_id)
+            .with_context(|| format!("unknown target template {target_id:?}"))?;
+        match target {
+            TargetTemplate::LocalPodman { .. } | TargetTemplate::AppleContainer { .. } => {
+                Ok(hel_targets::local_directory_completions(prefix))
+            }
+            TargetTemplate::SshPodman { ssh, .. } => {
+                hel_targets::ssh_directory_completions(&backend_ssh(ssh), prefix, executor)
+            }
+            _ => bail!("mount path completion requires a container-backed target"),
+        }
+    }
+
     pub fn register_session(
         &mut self,
         profile_id: &str,
         bundle_id: &str,
         target_id: &str,
         title: impl Into<String>,
+    ) -> Result<String> {
+        self.register_session_with_mounts(profile_id, bundle_id, target_id, title, Vec::new())
+    }
+
+    pub fn register_session_with_mounts(
+        &mut self,
+        profile_id: &str,
+        bundle_id: &str,
+        target_id: &str,
+        title: impl Into<String>,
+        additional_mounts: Vec<AdditionalMount>,
     ) -> Result<String> {
         let profile = self
             .config
@@ -66,10 +100,15 @@ impl Controller {
             .bundles
             .get(bundle_id)
             .with_context(|| format!("unknown bundle {bundle_id:?}"))?;
-        self.config
+        let template = self
+            .config
             .targets
             .get(target_id)
             .with_context(|| format!("unknown target template {target_id:?}"))?;
+        if !additional_mounts.is_empty() && mount_history_host(template).is_none() {
+            bail!("additional mounts require a container-backed target");
+        }
+        hel_targets::validate_additional_mounts(&additional_mounts)?;
         let id = new_session_id()?;
         let now = now();
         let record = SessionRecord {
@@ -79,6 +118,7 @@ impl Controller {
             last_profile: profile_id.to_string(),
             bundle_id: bundle_id.to_string(),
             target_template_id: target_id.to_string(),
+            additional_mounts: additional_mounts.clone(),
             state: SessionState::Provisioning,
             target: None,
             native_session_id: None,
@@ -88,6 +128,9 @@ impl Controller {
             checkpoint: None,
         };
         self.state.sessions.insert(id.clone(), record);
+        if let Some(host) = mount_history_host(template) {
+            self.state.remember_mount_sources(&host, &additional_mounts);
+        }
         self.state.save()?;
         Ok(id)
     }
@@ -137,7 +180,8 @@ impl Controller {
             .context("project bundle disappeared during provisioning")?;
         let target = backend_target(template)?;
         let bundle = backend_bundle(bundle)?;
-        let provision = hel_targets::provision_plan(&target, session_id, &bundle)?;
+        let provision =
+            hel_targets::provision_plan(&target, session_id, &bundle, &session.additional_mounts)?;
 
         let result =
             preflight_target(template, executor).and_then(|()| provision.execute(executor));
@@ -335,10 +379,14 @@ impl Controller {
             .profiles
             .get(profile_id)
             .with_context(|| format!("unknown profile {profile_id:?}"))?;
-        self.config
+        let target_template = self
+            .config
             .targets
             .get(target_id)
             .with_context(|| format!("unknown target template {target_id:?}"))?;
+        if !previous.additional_mounts.is_empty() && mount_history_host(target_template).is_none() {
+            bail!("resuming a session with additional mounts requires a container-backed target");
+        }
         let same_harness = profile.kind == archive.manifest.session.harness_kind;
         let conversion_context = (!same_harness)
             .then(|| conversion_context(&archive))
@@ -1083,6 +1131,16 @@ fn backend_target(template: &TargetTemplate) -> Result<hel_targets::TargetTempla
             container: backend_container(container),
         },
     })
+}
+
+fn mount_history_host(template: &TargetTemplate) -> Option<String> {
+    match template {
+        TargetTemplate::LocalPodman { .. } | TargetTemplate::AppleContainer { .. } => {
+            Some("local".into())
+        }
+        TargetTemplate::SshPodman { ssh, .. } => Some(ssh.host.clone()),
+        TargetTemplate::AwsEc2 { .. } | TargetTemplate::SshBare { .. } => None,
+    }
 }
 
 fn backend_container(container: &crate::hel_config::ContainerTemplate) -> ContainerTemplate {

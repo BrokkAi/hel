@@ -878,6 +878,7 @@ mod tests {
                     last_profile: "codex-1".into(),
                     bundle_id: "hel".into(),
                     target_template_id: "podman".into(),
+                    additional_mounts: vec![],
                     state: SessionState::Running,
                     target: None,
                     native_session_id: Some("native-secret-id".into()),
@@ -887,6 +888,7 @@ mod tests {
                     checkpoint: None,
                 },
             )]),
+            mount_history: BTreeMap::new(),
         };
         (config, state)
     }

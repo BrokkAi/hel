@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::hel_config::{HarnessKind, HelConfig, atomic_write, data_dir, validate_id};
+use crate::hel_targets::{AdditionalMount, validate_additional_mounts};
 
 pub const STATE_VERSION: u32 = 1;
 
@@ -142,6 +143,8 @@ pub struct SessionRecord {
     pub last_profile: String,
     pub bundle_id: String,
     pub target_template_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_mounts: Vec<AdditionalMount>,
     pub state: SessionState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<TargetLocator>,
@@ -167,6 +170,7 @@ impl SessionRecord {
         validate_id("profile", &self.last_profile)?;
         validate_id("bundle", &self.bundle_id)?;
         validate_id("target template", &self.target_template_id)?;
+        validate_additional_mounts(&self.additional_mounts)?;
         if self.title.trim().is_empty() {
             bail!("session {:?} has an empty title", self.id);
         }
@@ -189,6 +193,9 @@ pub struct HelState {
     pub version: u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sessions: BTreeMap<String, SessionRecord>,
+    /// Recently used source directories, keyed by `local` or SSH host name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mount_history: BTreeMap<String, Vec<PathBuf>>,
 }
 
 impl Default for HelState {
@@ -196,6 +203,7 @@ impl Default for HelState {
         Self {
             version: STATE_VERSION,
             sessions: BTreeMap::new(),
+            mount_history: BTreeMap::new(),
         }
     }
 }
@@ -211,7 +219,27 @@ impl HelState {
         for (id, session) in &self.sessions {
             session.validate(id)?;
         }
+        for (host, sources) in &self.mount_history {
+            if host.trim().is_empty() {
+                bail!("mount history contains an empty host key");
+            }
+            if sources.iter().any(|source| !source.is_absolute()) {
+                bail!("mount history for {host:?} contains a non-absolute source path");
+            }
+        }
         Ok(())
+    }
+
+    pub fn remember_mount_sources(&mut self, host: &str, mounts: &[AdditionalMount]) {
+        if mounts.is_empty() {
+            return;
+        }
+        let sources = self.mount_history.entry(host.to_owned()).or_default();
+        for mount in mounts.iter().rev() {
+            sources.retain(|source| source != &mount.source);
+            sources.insert(0, mount.source.clone());
+        }
+        sources.truncate(20);
     }
 
     /// Validate persisted foreign keys without preventing config entries from
@@ -317,6 +345,10 @@ mod tests {
             last_profile: "codex-1".into(),
             bundle_id: "hel".into(),
             target_template_id: "podman".into(),
+            additional_mounts: vec![AdditionalMount {
+                source: PathBuf::from("/home/test/cache"),
+                destination: PathBuf::from("/mnt/cache"),
+            }],
             state: SessionState::Running,
             target: Some(TargetLocator::LocalPodman {
                 container_id: "afb67d".into(),
@@ -335,6 +367,10 @@ mod tests {
         HelState {
             version: STATE_VERSION,
             sessions: BTreeMap::from([(session.id.clone(), session)]),
+            mount_history: BTreeMap::from([(
+                "local".into(),
+                vec![PathBuf::from("/home/test/cache")],
+            )]),
         }
     }
 
@@ -396,6 +432,36 @@ mod tests {
                         .to_string_lossy()
                         .ends_with(".tmp")
                 })
+        );
+    }
+
+    #[test]
+    fn mount_history_keeps_unique_recent_sources_per_host() {
+        let mut state = HelState::default();
+        state.remember_mount_sources(
+            "builder.example.test",
+            &[
+                AdditionalMount {
+                    source: "/srv/first".into(),
+                    destination: "/mnt/first".into(),
+                },
+                AdditionalMount {
+                    source: "/srv/second".into(),
+                    destination: "/mnt/second".into(),
+                },
+            ],
+        );
+        state.remember_mount_sources(
+            "builder.example.test",
+            &[AdditionalMount {
+                source: "/srv/first".into(),
+                destination: "/mnt/again".into(),
+            }],
+        );
+
+        assert_eq!(
+            state.mount_history["builder.example.test"],
+            vec![PathBuf::from("/srv/first"), PathBuf::from("/srv/second")]
         );
     }
 
