@@ -2,7 +2,7 @@
 
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -13,11 +13,13 @@ use crossterm::terminal::{
 };
 use hel::hel_config::config_path;
 use hel::hel_controller::Controller;
-use hel::hel_quota::QuotaManager;
+use hel::hel_quota::{ProfileQuota, QuotaManager};
 use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapshot};
 use hel::hel_setup::{SetupOutcome, run_setup_dialog};
-use hel::hel_targets::ProcessExecutor;
+use hel::hel_state::harness_session_title;
+use hel::hel_targets::{CommandSpec, ProcessExecutor};
 use hel::hel_tui::{DashboardAction, DashboardState, render};
+use hel::hel_worker::SequencedEvent;
 use hel::hel_worker_client::WorkerClient;
 use hel::hel_worker_runtime::{WorkerLaunchConfig, proxy, run_daemon};
 use ratatui::Terminal;
@@ -91,6 +93,37 @@ struct ServerArgs {
 struct WorkerArgs {
     #[command(subcommand)]
     command: WorkerCommand,
+}
+
+const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const WORKER_POLL_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Clone)]
+struct QuotaRefreshProfile {
+    id: String,
+    harness: hel::hel_config::HarnessKind,
+    home: PathBuf,
+    environment: std::collections::BTreeMap<String, String>,
+    cwd: PathBuf,
+}
+
+#[derive(Debug)]
+enum QuotaUpdate {
+    Refreshing(Vec<String>),
+    Report(ProfileQuota),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerPollTarget {
+    session_id: String,
+    spec: CommandSpec,
+}
+
+#[derive(Debug)]
+struct WorkerPollUpdate {
+    session_id: String,
+    events: Vec<SequencedEvent>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -304,6 +337,244 @@ async fn worker_prompt(controller: &Controller, session_id: &str, text: String) 
     client.detach().await
 }
 
+fn quota_refresh_profiles(controller: &Controller) -> Vec<QuotaRefreshProfile> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    controller
+        .config
+        .profiles
+        .iter()
+        .map(|(id, profile)| {
+            let mut environment = profile.environment.clone();
+            environment.insert(
+                profile.home_env().to_string(),
+                profile.home.to_string_lossy().into_owned(),
+            );
+            QuotaRefreshProfile {
+                id: id.clone(),
+                harness: profile.kind,
+                home: profile.home.clone(),
+                environment,
+                cwd: cwd.clone(),
+            }
+        })
+        .collect()
+}
+
+fn spawn_dashboard_quota_refresher() -> (
+    tokio::sync::watch::Sender<Vec<QuotaRefreshProfile>>,
+    tokio::sync::mpsc::Receiver<QuotaUpdate>,
+) {
+    let (profiles_tx, mut profiles_rx) = tokio::sync::watch::channel(Vec::new());
+    let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(32);
+    tokio::spawn(async move {
+        let mut quotas = QuotaManager::default();
+        let mut profiles = Vec::new();
+        let mut interval = tokio::time::interval(QUOTA_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick(), if !profiles.is_empty() => {
+                    if !refresh_profile_quotas(&mut quotas, &profiles, &updates_tx).await {
+                        break;
+                    }
+                }
+                changed = profiles_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    profiles = profiles_rx.borrow_and_update().clone();
+                    if !profiles.is_empty()
+                        && !refresh_profile_quotas(&mut quotas, &profiles, &updates_tx).await
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        quotas.shutdown().await;
+    });
+    (profiles_tx, updates_rx)
+}
+
+async fn refresh_profile_quotas(
+    quotas: &mut QuotaManager,
+    profiles: &[QuotaRefreshProfile],
+    updates: &tokio::sync::mpsc::Sender<QuotaUpdate>,
+) -> bool {
+    let ids = profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect::<Vec<_>>();
+    if updates.send(QuotaUpdate::Refreshing(ids)).await.is_err() {
+        return false;
+    }
+    for profile in profiles {
+        let quota = quotas
+            .refresh(
+                &profile.id,
+                profile.harness,
+                &profile.home,
+                &profile.environment,
+                &profile.cwd,
+            )
+            .await;
+        if updates.send(QuotaUpdate::Report(quota)).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPollTarget> {
+    controller
+        .state
+        .sessions
+        .values()
+        .filter(|session| session.state.is_active() && session.target.is_some())
+        .filter_map(|session| {
+            controller
+                .reconnect_command(&session.id)
+                .ok()
+                .map(|spec| WorkerPollTarget {
+                    session_id: session.id.clone(),
+                    spec,
+                })
+        })
+        .collect()
+}
+
+fn spawn_dashboard_worker_poller() -> (
+    tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
+    tokio::sync::mpsc::Receiver<WorkerPollUpdate>,
+) {
+    let (targets_tx, mut targets_rx) = tokio::sync::watch::channel(Vec::<WorkerPollTarget>::new());
+    let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        let mut targets: std::collections::BTreeMap<String, WorkerPollTarget> =
+            std::collections::BTreeMap::new();
+        let mut clients: std::collections::BTreeMap<String, (CommandSpec, WorkerClient)> =
+            std::collections::BTreeMap::new();
+        let mut interval = tokio::time::interval(WORKER_POLL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if !poll_dashboard_workers(&targets, &mut clients, &updates_tx).await {
+                        break;
+                    }
+                }
+                changed = targets_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    targets = targets_rx
+                        .borrow_and_update()
+                        .iter()
+                        .cloned()
+                        .map(|target| (target.session_id.clone(), target))
+                        .collect();
+                    clients.retain(|id, (spec, _)| {
+                        targets.get(id).is_some_and(|target| spec == &target.spec)
+                    });
+                }
+            }
+        }
+    });
+    (targets_tx, updates_rx)
+}
+
+async fn poll_dashboard_workers(
+    targets: &std::collections::BTreeMap<String, WorkerPollTarget>,
+    clients: &mut std::collections::BTreeMap<String, (CommandSpec, WorkerClient)>,
+    updates: &tokio::sync::mpsc::Sender<WorkerPollUpdate>,
+) -> bool {
+    for target in targets.values() {
+        let synced = match clients.get_mut(&target.session_id) {
+            Some((spec, client)) if spec == &target.spec => {
+                Some(tokio::time::timeout(WORKER_POLL_TIMEOUT, client.sync()).await)
+            }
+            _ => None,
+        };
+        match synced {
+            Some(Ok(Ok(events))) => {
+                if !events.is_empty()
+                    && updates
+                        .send(WorkerPollUpdate {
+                            session_id: target.session_id.clone(),
+                            events,
+                        })
+                        .await
+                        .is_err()
+                {
+                    return false;
+                }
+            }
+            Some(_) => {
+                clients.remove(&target.session_id);
+            }
+            None => {
+                let connected = tokio::time::timeout(WORKER_POLL_TIMEOUT, async {
+                    let mut client =
+                        WorkerClient::connect(&target.spec, &target.session_id).await?;
+                    let bootstrap = client.bootstrap().await?;
+                    Ok::<_, anyhow::Error>((client, bootstrap.events))
+                })
+                .await;
+                if let Ok(Ok((client, events))) = connected {
+                    clients.insert(target.session_id.clone(), (target.spec.clone(), client));
+                    if !events.is_empty()
+                        && updates
+                            .send(WorkerPollUpdate {
+                                session_id: target.session_id.clone(),
+                                events,
+                            })
+                            .await
+                            .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn current_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn request_dashboard_quota_refresh(
+    controller: &Controller,
+    dashboard: &mut DashboardState,
+    profiles_tx: &tokio::sync::watch::Sender<Vec<QuotaRefreshProfile>>,
+) {
+    let profiles = quota_refresh_profiles(controller);
+    dashboard.begin_quota_refresh(profiles.iter().map(|profile| profile.id.clone()));
+    profiles_tx.send_replace(profiles);
+}
+
+fn apply_worker_poll_update(
+    controller: &mut Controller,
+    dashboard: &mut DashboardState,
+    update: WorkerPollUpdate,
+) -> Result<()> {
+    if let Some(title) = harness_session_title(&update.events)
+        && let Some(session) = controller.state.sessions.get_mut(&update.session_id)
+        && session.title != title
+    {
+        session.title = title;
+        controller.state.save()?;
+        dashboard.set_state(controller.state.clone());
+    }
+    dashboard.apply_worker_events(&update.session_id, &update.events, current_epoch_seconds());
+    Ok(())
+}
+
 async fn run_dashboard() -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         println!("Welcome to Hel.");
@@ -312,11 +583,10 @@ async fn run_dashboard() -> Result<()> {
     }
 
     let mut controller = Controller::load()?;
-    let mut quotas = QuotaManager::default();
     let mut dashboard = DashboardState::new(
         controller.config.clone(),
         controller.state.clone(),
-        quotas.reports().clone(),
+        std::collections::BTreeMap::new(),
     );
     let mut terminal = TerminalGuard::enter()?;
     if configuration_needs_setup(&controller.config) {
@@ -333,9 +603,24 @@ async fn run_dashboard() -> Result<()> {
             SetupOutcome::Cancelled => return Ok(()),
         }
     }
+    let (quota_profiles_tx, mut quota_updates_rx) = spawn_dashboard_quota_refresher();
+    request_dashboard_quota_refresh(&controller, &mut dashboard, &quota_profiles_tx);
+    let (worker_targets_tx, mut worker_updates_rx) = spawn_dashboard_worker_poller();
+    worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
     let termination = hel::termination::Coordinator::install().token();
 
     loop {
+        while let Ok(update) = quota_updates_rx.try_recv() {
+            match update {
+                QuotaUpdate::Refreshing(ids) => dashboard.begin_quota_refresh(ids),
+                QuotaUpdate::Report(quota) => dashboard.apply_quota(quota),
+            }
+        }
+        while let Ok(update) = worker_updates_rx.try_recv() {
+            if let Err(error) = apply_worker_poll_update(&mut controller, &mut dashboard, update) {
+                dashboard.set_notice(format!("Could not save harness title: {error:#}"));
+            }
+        }
         terminal
             .terminal
             .draw(|frame| render(frame, &mut dashboard))?;
@@ -361,6 +646,12 @@ async fn run_dashboard() -> Result<()> {
                         controller.reload()?;
                         dashboard.set_config(controller.config.clone());
                         dashboard.set_state(controller.state.clone());
+                        request_dashboard_quota_refresh(
+                            &controller,
+                            &mut dashboard,
+                            &quota_profiles_tx,
+                        );
+                        worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
                         dashboard
                             .set_notice("Setup complete. Press n to start your first session.");
                     }
@@ -368,7 +659,8 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
             DashboardAction::RefreshQuotas => {
-                refresh_quotas(&controller, &mut quotas, &mut dashboard).await;
+                request_dashboard_quota_refresh(&controller, &mut dashboard, &quota_profiles_tx);
+                dashboard.set_notice("Refreshing profile quotas…");
             }
             DashboardAction::CompleteMountSource {
                 target_template_id,
@@ -402,15 +694,23 @@ async fn run_dashboard() -> Result<()> {
                             .terminal
                             .draw(|frame| render(frame, &mut dashboard))?;
                         match controller.provision_session(&session_id).await {
-                            Ok(()) => dashboard.set_notice(format!(
-                                "Target ready for {}; connecting worker",
-                                short_id(&session_id)
-                            )),
+                            Ok(()) => {
+                                dashboard.set_notice(format!(
+                                    "Target ready for {}; connecting worker",
+                                    short_id(&session_id)
+                                ));
+                                request_dashboard_quota_refresh(
+                                    &controller,
+                                    &mut dashboard,
+                                    &quota_profiles_tx,
+                                );
+                            }
                             Err(error) => {
                                 dashboard.set_notice(format!("Provisioning failed: {error:#}"))
                             }
                         }
                         dashboard.set_state(controller.state.clone());
+                        worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
                     }
                     Err(error) => {
                         dashboard.set_notice(format!("Could not create session: {error:#}"))
@@ -443,13 +743,21 @@ async fn run_dashboard() -> Result<()> {
                     .resume_session(&session_id, &profile_id, &target_template_id)
                     .await
                 {
-                    Ok(()) => dashboard.set_notice(format!(
-                        "Resumed {} with {profile_id} on {target_template_id}",
-                        short_id(&session_id)
-                    )),
+                    Ok(()) => {
+                        dashboard.set_notice(format!(
+                            "Resumed {} with {profile_id} on {target_template_id}",
+                            short_id(&session_id)
+                        ));
+                        request_dashboard_quota_refresh(
+                            &controller,
+                            &mut dashboard,
+                            &quota_profiles_tx,
+                        );
+                    }
                     Err(error) => dashboard.set_notice(format!("Resume failed: {error:#}")),
                 }
                 dashboard.set_state(controller.state.clone());
+                worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
             }
             DashboardAction::Checkpoint { session_id } => {
                 match controller.checkpoint_session(&session_id).await {
@@ -461,6 +769,7 @@ async fn run_dashboard() -> Result<()> {
                     Err(error) => dashboard.set_notice(format!("Checkpoint failed: {error:#}")),
                 }
                 dashboard.set_state(controller.state.clone());
+                worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
             }
             DashboardAction::Close { session_id } => {
                 match controller.close_session(&session_id).await {
@@ -469,6 +778,7 @@ async fn run_dashboard() -> Result<()> {
                     Err(error) => dashboard.set_notice(format!("Close blocked: {error:#}")),
                 }
                 dashboard.set_state(controller.state.clone());
+                worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
             }
             DashboardAction::ForceDestroy { session_id } => {
                 match controller.force_destroy(&session_id, &ProcessExecutor) {
@@ -479,31 +789,11 @@ async fn run_dashboard() -> Result<()> {
                     Err(error) => dashboard.set_notice(format!("Destroy failed: {error:#}")),
                 }
                 dashboard.set_state(controller.state.clone());
+                worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
             }
         }
     }
-    quotas.shutdown().await;
     Ok(())
-}
-
-async fn refresh_quotas(
-    controller: &Controller,
-    quotas: &mut QuotaManager,
-    dashboard: &mut DashboardState,
-) {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    for (id, profile) in &controller.config.profiles {
-        let mut environment = profile.environment.clone();
-        environment.insert(
-            profile.home_env().to_string(),
-            profile.home.to_string_lossy().into_owned(),
-        );
-        quotas
-            .refresh(id, profile.kind, &profile.home, &environment, &cwd)
-            .await;
-    }
-    dashboard.set_quotas(quotas.reports().clone());
-    dashboard.set_notice("Quota dashboard refreshed");
 }
 
 fn short_id(id: &str) -> &str {
