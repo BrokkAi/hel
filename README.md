@@ -46,6 +46,10 @@ kind = "local-podman"
 image = "localhost/hel/agent-dev:latest"
 ```
 
+See [docs/PODMAN.md](docs/PODMAN.md) for the rootless installation,
+verification, and remediation contract Hel enforces before local-Podman
+provisioning.
+
 `hel` opens the session/quota dashboard. On a first run with no configuration,
 it drops into the same plain-stdio setup dialog as `hel setup`. The dialog finds
 local Codex, Claude Code, and Kimi Code homes, reports whether their credentials
