@@ -210,10 +210,7 @@ impl WorkerClient {
     }
 
     fn request_id(&mut self) -> String {
-        let id = format!(
-            "hel-{:016x}-{}",
-            self.connection_nonce, self.next_request
-        );
+        let id = format!("hel-{:016x}-{}", self.connection_nonce, self.next_request);
         self.next_request = self.next_request.wrapping_add(1);
         id
     }

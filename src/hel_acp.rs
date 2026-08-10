@@ -231,26 +231,25 @@ async fn drive_connection(
     } else {
         None
     };
-    let (session_id, config_options, modes, resumed) = if let Some((id, options, modes)) =
-        loaded_session
-    {
-        (id, options, modes, true)
-    } else {
-        let created = connection
-            .send_request(
-                NewSessionRequest::new(spec.cwd.clone())
-                    .additional_directories(spec.additional_directories.clone()),
+    let (session_id, config_options, modes, resumed) =
+        if let Some((id, options, modes)) = loaded_session {
+            (id, options, modes, true)
+        } else {
+            let created = connection
+                .send_request(
+                    NewSessionRequest::new(spec.cwd.clone())
+                        .additional_directories(spec.additional_directories.clone()),
+                )
+                .block_task()
+                .await
+                .context("create ACP session")?;
+            (
+                created.session_id,
+                created.config_options,
+                created.modes,
+                false,
             )
-            .block_task()
-            .await
-            .context("create ACP session")?;
-        (
-            created.session_id,
-            created.config_options,
-            created.modes,
-            false,
-        )
-    };
+        };
 
     let desired_mode = spec.harness.unrestricted_mode();
     enforce_unrestricted_mode(
@@ -414,5 +413,4 @@ mod tests {
             ));
         assert!(select_contains(&grouped, "bypassPermissions"));
     }
-
 }

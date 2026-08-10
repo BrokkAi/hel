@@ -921,7 +921,8 @@ mod tests {
         let prompted = br#"{"seq":1,"event":{"type":"adapter","data":{"kind":"x","payload":{}}}}
 {"seq":2,"event":{"type":"prompt_accepted","data":{"request_id":"p","text":"hi","attachments":[]}}}"#;
         assert!(events_contain_prompt(prompted));
-        let unprompted = br#"{"seq":1,"event":{"type":"adapter","data":{"kind":"x","payload":{}}}}"#;
+        let unprompted =
+            br#"{"seq":1,"event":{"type":"adapter","data":{"kind":"x","payload":{}}}}"#;
         assert!(!events_contain_prompt(unprompted));
     }
 
@@ -936,7 +937,8 @@ mod tests {
         let other = temp.path().join("sessions/workspace/other");
         fs::create_dir_all(&other).unwrap();
         fs::write(other.join("state.json"), b"other").unwrap();
-        let artifacts = collect_native_artifacts(HarnessKind::Kimi, temp.path(), NATIVE, false).unwrap();
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Kimi, temp.path(), NATIVE, false).unwrap();
         assert_eq!(artifacts.len(), 2);
         assert!(
             artifacts
@@ -962,7 +964,8 @@ mod tests {
         fs::write(project.join("other-session.jsonl"), b"other").unwrap();
         fs::write(project.join("settings.json"), b"secret config").unwrap();
 
-        let artifacts = collect_native_artifacts(HarnessKind::Claude, temp.path(), NATIVE, false).unwrap();
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Claude, temp.path(), NATIVE, false).unwrap();
         assert_eq!(artifacts.len(), 2);
         assert!(
             artifacts

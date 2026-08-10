@@ -209,7 +209,12 @@ impl Controller {
             .await
         {
             Ok(native_session_id) => Ok(native_session_id),
-            Err(error) => Err(worker_probe_diagnosis(executor, &backend, &worker_root, error)),
+            Err(error) => Err(worker_probe_diagnosis(
+                executor,
+                &backend,
+                &worker_root,
+                error,
+            )),
         }
     }
 

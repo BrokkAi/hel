@@ -257,7 +257,10 @@ impl ChatState {
                     text: title.to_owned(),
                 });
             }
-            "tool_call_update" | "plan" | "available_commands_update" | "current_mode_update"
+            "tool_call_update"
+            | "plan"
+            | "available_commands_update"
+            | "current_mode_update"
             | "user_message_chunk" => {}
             _ => {
                 // Unknown update shapes keep the permissive text projection.
@@ -321,55 +324,61 @@ pub async fn run_chat(
             }
         }
         terminal.draw(|frame| render(frame, &chat))?;
-        if event::poll(Duration::from_millis(150))?
-            && let Event::Key(key) = event::read()?
-        {
-            let action = chat.handle_key(key);
-            let result = match action {
-                ChatAction::None => None,
-                ChatAction::Prompt(text) => match client.prompt(text.clone(), Vec::new()).await {
-                    Ok(_) => None,
-                    Err(error) => {
-                        chat.input = text;
-                        Some(error)
-                    }
-                },
-                ChatAction::Cancel => client.cancel().await.err(),
-                ChatAction::Checkpoint => client
-                    .checkpoint(Some("manual chat checkpoint".into()))
-                    .await
-                    .err(),
-                ChatAction::ToggleVoice => {
-                    if let Some(cancel) = voice_cancel.as_ref() {
-                        let _ = cancel.send(());
-                        chat.set_notice("Stopping voice dictation…");
-                        None
-                    } else if !crate::speech::voice_input_supported() {
-                        chat.set_notice(
+        // Drain every queued input event before redrawing or syncing: a paste
+        // delivers thousands of key events, and one draw + worker sync per
+        // character would lag the trailing Enter by minutes.
+        let mut pending = event::poll(Duration::from_millis(150))?;
+        while pending {
+            if let Event::Key(key) = event::read()? {
+                let action = chat.handle_key(key);
+                let result = match action {
+                    ChatAction::None => None,
+                    ChatAction::Prompt(text) => match client.prompt(text.clone(), Vec::new()).await
+                    {
+                        Ok(_) => None,
+                        Err(error) => {
+                            chat.input = text;
+                            Some(error)
+                        }
+                    },
+                    ChatAction::Cancel => client.cancel().await.err(),
+                    ChatAction::Checkpoint => client
+                        .checkpoint(Some("manual chat checkpoint".into()))
+                        .await
+                        .err(),
+                    ChatAction::ToggleVoice => {
+                        if let Some(cancel) = voice_cancel.as_ref() {
+                            let _ = cancel.send(());
+                            chat.set_notice("Stopping voice dictation…");
+                            None
+                        } else if !crate::speech::voice_input_supported() {
+                            chat.set_notice(
                             "Voice helper unavailable; install hel-voice-worker beside hel or set HEL_VOICE_WORKER",
                         );
-                        None
-                    } else {
-                        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
-                        voice_cancel = Some(cancel_tx);
-                        voice_prefix.clone_from(&chat.input);
-                        chat.voice_active = true;
-                        chat.set_notice("Listening… press Ctrl-V again to stop");
-                        spawn_dictation(voice_updates_tx.clone(), cancel_rx);
-                        None
+                            None
+                        } else {
+                            let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+                            voice_cancel = Some(cancel_tx);
+                            voice_prefix.clone_from(&chat.input);
+                            chat.voice_active = true;
+                            chat.set_notice("Listening… press Ctrl-V again to stop");
+                            spawn_dictation(voice_updates_tx.clone(), cancel_rx);
+                            None
+                        }
                     }
-                }
-                ChatAction::Back => {
-                    if let Some(cancel) = voice_cancel.take() {
-                        let _ = cancel.send(());
+                    ChatAction::Back => {
+                        if let Some(cancel) = voice_cancel.take() {
+                            let _ = cancel.send(());
+                        }
+                        client.detach().await?;
+                        return Ok(ChatExit::Detached);
                     }
-                    client.detach().await?;
-                    return Ok(ChatExit::Detached);
+                };
+                if let Some(error) = result {
+                    chat.set_notice(format!("{error:#}"));
                 }
-            };
-            if let Some(error) = result {
-                chat.set_notice(format!("{error:#}"));
             }
+            pending = event::poll(Duration::from_millis(0))?;
         }
         match client.sync().await {
             Ok(events) => chat.apply_events(&events),
