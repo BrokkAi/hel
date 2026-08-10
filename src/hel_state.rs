@@ -157,6 +157,8 @@ pub struct SessionRecord {
     pub session_title_override: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub last_viewed_event_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -430,6 +432,7 @@ mod tests {
             session_title_override: None,
             created_at: "2026-08-09T12:00:00Z".into(),
             updated_at: "2026-08-09T12:01:00Z".into(),
+            last_viewed_event_sequence: 0,
             last_error: None,
             checkpoint: Some(CheckpointMetadata {
                 archive_path: PathBuf::from("sessions/0123456789abcdef.hel.zip"),

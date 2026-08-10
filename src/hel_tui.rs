@@ -167,6 +167,9 @@ struct SessionDetail {
     last_event_sequence: u64,
     current_turn_started_at: Option<u64>,
     last_turn_completed_at: Option<u64>,
+    last_agent_text_at: Option<u64>,
+    agent_text_stream_open: bool,
+    unread_agent_message_sequences: Vec<u64>,
     activity: Option<SessionActivity>,
 }
 
@@ -210,6 +213,16 @@ impl DashboardState {
 
     pub fn set_state(&mut self, state: HelState) {
         self.state = state;
+        for (session_id, detail) in &mut self.session_details {
+            let viewed_through = self
+                .state
+                .sessions
+                .get(session_id)
+                .map_or(0, |session| session.last_viewed_event_sequence);
+            detail
+                .unread_agent_message_sequences
+                .retain(|seq| *seq > viewed_through);
+        }
         self.clamp_selections();
     }
 
@@ -228,15 +241,18 @@ impl DashboardState {
         self.quotas.insert(quota.profile_id.clone(), quota);
     }
 
-    /// Incorporate the newly replayed worker events for one session. Details
-    /// are intentionally dashboard-local; only harness titles need durable
-    /// controller state.
+    /// Incorporate the newly replayed worker events for one session.
     pub fn apply_worker_events(
         &mut self,
         session_id: &str,
         events: &[SequencedEvent],
         observed_at_epoch_seconds: u64,
     ) {
+        let viewed_through = self
+            .state
+            .sessions
+            .get(session_id)
+            .map_or(0, |session| session.last_viewed_event_sequence);
         let detail = self
             .session_details
             .entry(session_id.to_string())
@@ -248,21 +264,36 @@ impl DashboardState {
             detail.last_event_sequence = event.seq;
             match &event.event {
                 WorkerEvent::PromptAccepted { .. } => {
+                    detail.agent_text_stream_open = false;
                     detail.current_turn_started_at = Some(observed_at_epoch_seconds);
                 }
                 WorkerEvent::TurnCompleted | WorkerEvent::Cancelled => {
+                    detail.agent_text_stream_open = false;
                     detail.current_turn_started_at = None;
                     detail.last_turn_completed_at = Some(observed_at_epoch_seconds);
                 }
                 WorkerEvent::Adapter { payload, .. } => {
                     if let Some(activity) = activity_from_adapter(payload) {
+                        if activity.kind == ActivityKind::AgentText {
+                            if !detail.agent_text_stream_open && event.seq > viewed_through {
+                                detail.unread_agent_message_sequences.push(event.seq);
+                            }
+                            detail.agent_text_stream_open = true;
+                            detail.last_agent_text_at = Some(observed_at_epoch_seconds);
+                        } else {
+                            detail.agent_text_stream_open = false;
+                        }
                         update_activity(detail, activity);
+                    } else {
+                        detail.agent_text_stream_open = false;
                     }
                 }
                 WorkerEvent::ConfigChanged { .. }
                 | WorkerEvent::Checkpointed { .. }
                 | WorkerEvent::Closing
-                | WorkerEvent::Closed => {}
+                | WorkerEvent::Closed => {
+                    detail.agent_text_stream_open = false;
+                }
             }
         }
     }
@@ -856,7 +887,8 @@ impl DashboardState {
     }
 
     fn ordered_sessions(&self) -> Vec<&SessionRecord> {
-        let (active, archived) = partition_sessions(self.state.sessions.values());
+        let (active, archived) =
+            partition_sessions(self.state.sessions.values(), &self.session_details);
         active.into_iter().chain(archived).collect()
     }
 
@@ -931,6 +963,7 @@ impl DashboardState {
 
 fn partition_sessions<'a>(
     sessions: impl IntoIterator<Item = &'a SessionRecord>,
+    session_details: &BTreeMap<String, SessionDetail>,
 ) -> (Vec<&'a SessionRecord>, Vec<&'a SessionRecord>) {
     let mut active = Vec::new();
     let mut archived = Vec::new();
@@ -941,6 +974,16 @@ fn partition_sessions<'a>(
             archived.push(session);
         }
     }
+    active.sort_by(|left, right| {
+        let last_agent_text_at = |session: &SessionRecord| {
+            session_details
+                .get(&session.id)
+                .and_then(|detail| detail.last_agent_text_at)
+        };
+        last_agent_text_at(right)
+            .cmp(&last_agent_text_at(left))
+            .then_with(|| left.id.cmp(&right.id))
+    });
     (active, archived)
 }
 
@@ -1123,7 +1166,10 @@ fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) 
 }
 
 fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
-    let (active, archived) = partition_sessions(dashboard.state.sessions.values());
+    let (active, archived) = partition_sessions(
+        dashboard.state.sessions.values(),
+        &dashboard.session_details,
+    );
     let now_epoch_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1279,6 +1325,19 @@ fn session_name(session: &SessionRecord) -> &str {
         .unwrap_or_default()
 }
 
+fn session_name_line(session_name: String, unread_count: usize) -> Line<'static> {
+    let mut spans = vec![Span::raw(session_name)];
+    if unread_count > 0 {
+        spans.push(Span::styled(
+            format!("  {unread_count} unread"),
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
 fn active_session_row(
     session: &SessionRecord,
     detail: Option<&SessionDetail>,
@@ -1286,12 +1345,13 @@ fn active_session_row(
 ) -> Row<'static> {
     let (clock, profile, target, checkpoint, session_name) =
         session_values(session, detail, now_epoch_seconds);
+    let unread_count = detail.map_or(0, |detail| detail.unread_agent_message_sequences.len());
     Row::new([
         Cell::from(clock),
         Cell::from(profile),
         Cell::from(target),
         Cell::from(checkpoint),
-        Cell::from(session_name),
+        Cell::from(session_name_line(session_name, unread_count)),
     ])
     .height(3)
 }
@@ -1894,6 +1954,7 @@ mod tests {
             session_title_override: None,
             created_at: "2026-08-09T00:00:00Z".into(),
             updated_at: "2026-08-09T01:00:00Z".into(),
+            last_viewed_event_sequence: 0,
             last_error: None,
             checkpoint: Some(CheckpointMetadata {
                 archive_path: PathBuf::from("sessions/session-1.hel.zip"),
@@ -1917,6 +1978,23 @@ mod tests {
         )
     }
 
+    fn adapter_text_event(seq: u64, kind: &str, text: &str) -> SequencedEvent {
+        SequencedEvent {
+            seq,
+            request_id: None,
+            event: WorkerEvent::Adapter {
+                kind: "session_update".into(),
+                payload: serde_json::json!({
+                    "type": "session_update",
+                    "update": {
+                        "sessionUpdate": kind,
+                        "content": { "text": text }
+                    }
+                }),
+            },
+        }
+    }
+
     #[test]
     fn archived_pane_includes_terminal_sessions_without_losing_selection_order() {
         let mut running = archived_session();
@@ -1935,7 +2013,7 @@ mod tests {
             ]),
             mount_history: BTreeMap::new(),
         };
-        let (active, archived) = partition_sessions(state.sessions.values());
+        let (active, archived) = partition_sessions(state.sessions.values(), &BTreeMap::new());
         assert_eq!(
             active
                 .iter()
@@ -1958,6 +2036,144 @@ mod tests {
                 .selected_session()
                 .map(|session| session.id.as_str()),
             Some("session-1")
+        );
+    }
+
+    #[test]
+    fn active_sessions_are_sorted_by_most_recent_agent_text() {
+        let active_session = |id: &str| {
+            let mut session = archived_session();
+            session.id = id.into();
+            session.state = SessionState::Running;
+            session
+        };
+        let sessions = [
+            active_session("session-a"),
+            active_session("session-b"),
+            active_session("session-c"),
+        ];
+        let state = HelState {
+            version: STATE_VERSION,
+            sessions: sessions
+                .into_iter()
+                .map(|session| (session.id.clone(), session))
+                .collect(),
+            mount_history: BTreeMap::new(),
+        };
+        let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
+        let ordered_ids = |dashboard: &DashboardState| {
+            dashboard
+                .ordered_sessions()
+                .into_iter()
+                .map(|session| session.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        dashboard.apply_worker_events(
+            "session-b",
+            &[adapter_text_event(1, "agent_message_chunk", "second")],
+            100,
+        );
+        assert_eq!(
+            ordered_ids(&dashboard),
+            ["session-b", "session-a", "session-c"]
+        );
+
+        dashboard.apply_worker_events(
+            "session-c",
+            &[adapter_text_event(
+                1,
+                "agent_thought_chunk",
+                "later thought",
+            )],
+            200,
+        );
+        assert_eq!(
+            ordered_ids(&dashboard),
+            ["session-b", "session-a", "session-c"]
+        );
+
+        dashboard.apply_worker_events(
+            "session-a",
+            &[adapter_text_event(1, "agent_message_chunk", "newest")],
+            300,
+        );
+        assert_eq!(
+            ordered_ids(&dashboard),
+            ["session-a", "session-b", "session-c"]
+        );
+
+        dashboard.apply_worker_events(
+            "session-b",
+            &[SequencedEvent {
+                seq: 2,
+                request_id: None,
+                event: WorkerEvent::Adapter {
+                    kind: "session_update".into(),
+                    payload: serde_json::json!({
+                        "type": "session_update",
+                        "update": { "sessionUpdate": "tool_call", "title": "later tool" }
+                    }),
+                },
+            }],
+            400,
+        );
+        assert_eq!(
+            ordered_ids(&dashboard),
+            ["session-a", "session-b", "session-c"]
+        );
+    }
+
+    #[test]
+    fn unread_badge_counts_messages_not_chunks_and_clears_through_viewed_sequence() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.apply_worker_events(
+            "session-1",
+            &[
+                adapter_text_event(1, "agent_message_chunk", "first "),
+                adapter_text_event(2, "agent_message_chunk", "message"),
+                adapter_text_event(3, "agent_thought_chunk", "thinking"),
+                adapter_text_event(4, "agent_message_chunk", "second message"),
+            ],
+            100,
+        );
+
+        let detail = dashboard.session_details.get("session-1").unwrap();
+        assert_eq!(detail.unread_agent_message_sequences, [1, 4]);
+        let badge = session_name_line("session".into(), 2);
+        assert_eq!(badge.spans[1].content.as_ref(), "  2 unread");
+        assert_eq!(
+            badge.spans[1].style,
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
+        );
+
+        let mut state = dashboard.state.clone();
+        state
+            .sessions
+            .get_mut("session-1")
+            .unwrap()
+            .last_viewed_event_sequence = 1;
+        dashboard.set_state(state);
+        assert_eq!(
+            dashboard.session_details["session-1"].unread_agent_message_sequences,
+            [4]
+        );
+
+        let mut state = dashboard.state.clone();
+        state
+            .sessions
+            .get_mut("session-1")
+            .unwrap()
+            .last_viewed_event_sequence = 4;
+        dashboard.set_state(state);
+        assert!(
+            dashboard.session_details["session-1"]
+                .unread_agent_message_sequences
+                .is_empty()
         );
     }
 
