@@ -17,7 +17,20 @@ its unrestricted mode (`agent-full-access`, `bypassPermissions`, or `auto`).
 This branch is an early Hel fork. Its state/config namespace is deliberately
 separate from MJ and there is no automatic MJ migration.
 
-## Build and run
+## Install
+
+Install the latest released Hel binary and its Linux worker companions with:
+
+```console
+curl -fsSL https://raw.githubusercontent.com/BrokkAi/hel/master/install.sh | sh
+```
+
+This downloads a verified release into `~/.local/bin`. Rust and a source
+checkout are not required. The installer prints `hel doctor` as the first next
+step and also supports `--prefix` and `--version`; run it with `--help` to see
+those options.
+
+## From source
 
 ```console
 cargo build --release
