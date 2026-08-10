@@ -1122,13 +1122,24 @@ async fn run_dashboard() -> Result<()> {
                 let result = async {
                     let spec = controller.reconnect_command(&session_id)?;
                     let client = WorkerClient::connect(&spec, &session_id).await?;
-                    hel::hel_chat::run_chat(&mut terminal.terminal, client).await?;
-                    Ok::<_, anyhow::Error>(())
+                    hel::hel_chat::run_chat(&mut terminal.terminal, client).await
                 }
                 .await;
                 match result {
-                    Ok(()) => {
-                        dashboard.set_notice(format!("Detached from {}", short_id(&session_id)))
+                    Ok(hel::hel_chat::ChatExit::Detached {
+                        last_seen_event_sequence,
+                    }) => {
+                        let read_result = controller
+                            .mark_session_viewed_through(&session_id, last_seen_event_sequence);
+                        dashboard.set_state(controller.state.clone());
+                        match read_result {
+                            Ok(()) => dashboard
+                                .set_notice(format!("Detached from {}", short_id(&session_id))),
+                            Err(error) => dashboard.set_notice(format!(
+                                "Detached from {}; could not save read status: {error:#}",
+                                short_id(&session_id)
+                            )),
+                        }
                     }
                     Err(error) => {
                         dashboard.set_notice(format!("Could not open session: {error:#}"))

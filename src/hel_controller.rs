@@ -127,6 +127,7 @@ impl Controller {
             session_title_override: None,
             created_at: now.clone(),
             updated_at: now,
+            last_viewed_event_sequence: 0,
             last_error: None,
             checkpoint: None,
         };
@@ -168,6 +169,23 @@ impl Controller {
         record.updated_at = now();
         self.state.save()?;
         Ok(title)
+    }
+
+    pub fn mark_session_viewed_through(
+        &mut self,
+        session_id: &str,
+        event_sequence: u64,
+    ) -> Result<()> {
+        let record = self
+            .state
+            .sessions
+            .get_mut(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?;
+        if event_sequence > record.last_viewed_event_sequence {
+            record.last_viewed_event_sequence = event_sequence;
+            self.state.save()?;
+        }
+        Ok(())
     }
 
     pub async fn provision_session_with(

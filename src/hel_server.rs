@@ -891,6 +891,7 @@ mod tests {
                     session_title_override: None,
                     created_at: "now".into(),
                     updated_at: "now".into(),
+                    last_viewed_event_sequence: 0,
                     last_error: Some("secret-token at /highly/secret/codex".into()),
                     checkpoint: None,
                 },

@@ -19,7 +19,7 @@ use crate::hel_worker_client::WorkerClient;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatExit {
-    Detached,
+    Detached { last_seen_event_sequence: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,8 +429,11 @@ pub async fn run_chat(
                         if let Some(cancel) = voice_cancel.take() {
                             let _ = cancel.send(());
                         }
+                        let last_seen_event_sequence = chat.latest_seq();
                         client.detach().await?;
-                        return Ok(ChatExit::Detached);
+                        return Ok(ChatExit::Detached {
+                            last_seen_event_sequence,
+                        });
                     }
                 };
                 if let Some(error) = result {
