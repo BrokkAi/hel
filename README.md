@@ -50,6 +50,10 @@ See [docs/PODMAN.md](docs/PODMAN.md) for the rootless installation,
 verification, and remediation contract Hel enforces before local-Podman
 provisioning.
 
+To delegate host setup, run `hel setup instructions --platform linux` (or
+`macos`) and `hel doctor --json`; give the instructions page plus the output of
+`hel doctor --json` to your coding agent.
+
 `hel` opens the session/quota dashboard. On a first run with no configuration,
 it drops into the same plain-stdio setup dialog as `hel setup`. The dialog finds
 local Codex, Claude Code, and Kimi Code homes, reports whether their credentials

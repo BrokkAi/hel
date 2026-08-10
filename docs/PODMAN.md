@@ -1,9 +1,11 @@
 # Podman for Hel
 
 This is the operational contract for a host that runs Hel `local-podman`
-targets. Give this file to an installation agent together with the Hel checkout.
-The host is ready only when every postcondition in [Verification](#verification)
-passes for the same unprivileged user that will run `hel`.
+targets. For a coding-agent handoff, run `hel setup instructions --platform
+linux` and `hel doctor --json`, then give the instructions page plus the output
+of `hel doctor --json` to the coding agent. The host is ready only when every
+postcondition in [Verification](#verification) passes for the same unprivileged
+user that will run `hel`.
 
 Hel supports Podman **4.0.0 or newer**. Version 4 is the minimum because Hel's
 local target relies on the mature rootless user-namespace behavior and CLI
