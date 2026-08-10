@@ -17,7 +17,7 @@ use crate::hel_archive::{
     ArchiveInput, BundleManifest, GitCollectionSpec, SystemGit, TargetManifest,
     collect_git_snapshot, write_archive_atomic,
 };
-use crate::hel_checkpoint::collect_native_artifacts;
+use crate::hel_checkpoint::{collect_import_native_artifacts, collect_native_artifacts};
 use crate::hel_config::{HarnessKind, HelConfig, ProjectBundle, ProjectRepository, validate_id};
 use crate::hel_setup::{GithubRepository, github_repository_from_origin};
 use crate::hel_state::{
@@ -209,9 +209,12 @@ fn codex_session_id(path: &Path) -> Result<Option<String>> {
         if record.get("type").and_then(Value::as_str) != Some("session_meta") {
             continue;
         }
+        // Codex ACP loads a rollout by its payload `id`, which is also the
+        // UUID embedded in the rollout filename. `session_id` can name a
+        // parent thread and therefore is not necessarily resumable itself.
         let id = record
-            .pointer("/payload/session_id")
-            .or_else(|| record.pointer("/payload/id"))
+            .pointer("/payload/id")
+            .or_else(|| record.pointer("/payload/session_id"))
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
             .map(ToOwned::to_owned);
@@ -979,7 +982,7 @@ fn import_native_session(
     };
     let repositories = collect_local_repositories(bundle, &transcript.cwd)?;
     let native_artifacts =
-        collect_native_artifacts(harness, harness_home, native_session_id, false)?;
+        collect_import_native_artifacts(harness, harness_home, native_session_id, source_path)?;
     let canonical_events = encode_events(&transcript.events)?;
     let session_id = new_session_id()?;
     let timestamp = timestamp();
@@ -1094,16 +1097,16 @@ fn collect_local_repositories(
                 repository.id,
                 path.display()
             );
-            let base_commit = git_text(&path, ["rev-parse", "HEAD"])?;
+            let base_commit = import_base_commit(&path)?;
             collect_git_snapshot(
                 &git,
                 &path,
                 &GitCollectionSpec {
                     id: repository.id.clone(),
                     relative_destination: repository.destination.clone(),
-                    // Import begins from exactly the observed worktree head;
-                    // staged, unstaged, and untracked content are collected
-                    // separately by `collect_git_snapshot`.
+                    // Import starts from the common ancestor of the local
+                    // checkout and the tracked remote, so unpushed commits
+                    // are included in the committed delta bundle.
                     base_commit,
                 },
             )
@@ -1153,6 +1156,39 @@ fn default_profile(config: &HelConfig, harness: HarnessKind, home: &Path) -> Str
         })
         .map(|(id, _)| id.clone())
         .unwrap_or_else(|| format!("{}-import", harness_name(harness).to_ascii_lowercase()))
+}
+
+fn import_base_commit(path: &Path) -> Result<String> {
+    let upstream = git_optional_text(path, ["rev-parse", "--verify", "--quiet", "@{upstream}"])?
+        .or(git_optional_text(
+            path,
+            [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/remotes/origin/HEAD",
+            ],
+        )?);
+    let Some(upstream) = upstream else {
+        // A repository without remote refs cannot tell us which ancestry a
+        // newly provisioned clone has. Preserve the previous HEAD-only
+        // behavior; normal tracked checkouts take the bundle-preserving path.
+        return git_text(path, ["rev-parse", "HEAD"]);
+    };
+    git_text(path, ["merge-base", "HEAD", &upstream])
+}
+
+fn git_optional_text<const N: usize>(cwd: &Path, arguments: [&str; N]) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("start git in {}", cwd.display()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8(output.stdout).context("decode Git output")?;
+    Ok((!text.trim().is_empty()).then(|| text.trim().to_owned()))
 }
 
 fn git_text<const N: usize>(cwd: &Path, arguments: [&str; N]) -> Result<String> {
@@ -1366,6 +1402,28 @@ mod tests {
             transcript.events[2].event,
             WorkerEvent::TurnCompleted
         ));
+    }
+
+    #[test]
+    fn codex_locator_uses_rollout_id_when_session_id_names_a_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let rollout = directory
+            .path()
+            .join("sessions/2026/08/10/rollout-2026-08-10T00-00-00-019feb6c-6b55-7111-a210-6d85ee0772cd.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(
+            &rollout,
+            r#"{"type":"session_meta","payload":{"session_id":"019feb6c-5ffc-7c12-ad99-bdeaeb6be79d","id":"019feb6c-6b55-7111-a210-6d85ee0772cd"}}"#,
+        )
+        .unwrap();
+
+        let located = locate_codex_session(
+            directory.path(),
+            &CodexSessionSelection::Session("019feb6c-6b55-7111-a210-6d85ee0772cd".into()),
+        )
+        .unwrap();
+        assert_eq!(located.session_id, "019feb6c-6b55-7111-a210-6d85ee0772cd");
+        assert_eq!(located.jsonl_path, rollout);
     }
 
     #[test]

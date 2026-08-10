@@ -43,7 +43,7 @@ RUN apt-get update \
 # intentionally left to Hel's official on-demand installer because that path is
 # not version-pinned yet.
 RUN npm install --global --no-audit --no-fund \
-        @agentclientprotocol/codex-acp@1.1.4 \
+        @agentclientprotocol/codex-acp@1.1.14 \
         @agentclientprotocol/claude-agent-acp@0.63.0 \
     && npm cache clean --force
 

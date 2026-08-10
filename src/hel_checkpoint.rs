@@ -562,6 +562,64 @@ pub fn collect_native_artifacts(
     );
     Ok(output)
 }
+/// Collect native artifacts for an import whose locator already resolved the
+/// exact source artifact. Codex rollouts are standalone JSONL files, so this
+/// avoids probing every historical rollout (and any unrelated corrupt one).
+pub fn collect_import_native_artifacts(
+    harness: HarnessKind,
+    home: &Path,
+    session_id: &str,
+    source_path: &Path,
+) -> Result<Vec<NativeArtifact>> {
+    if harness != HarnessKind::Codex {
+        return collect_native_artifacts(harness, home, session_id, false);
+    }
+    validate_component(session_id, "native session ID")?;
+    let relative = source_path.strip_prefix(home).with_context(|| {
+        format!(
+            "Codex rollout {} is outside {}",
+            source_path.display(),
+            home.display()
+        )
+    })?;
+    validate_relative_path(relative)?;
+    ensure!(
+        matches!(relative.components().next(), Some(Component::Normal(component)) if component == "sessions" || component == "archived_sessions"),
+        "Codex rollout '{}' is outside a session root",
+        source_path.display()
+    );
+    let name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    ensure!(
+        name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"),
+        "Codex rollout '{}' is not a JSONL artifact",
+        source_path.display()
+    );
+    ensure!(
+        !secret_like_path(relative),
+        "Codex rollout '{}' has a forbidden path",
+        source_path.display()
+    );
+    let metadata = fs::symlink_metadata(source_path)
+        .with_context(|| format!("stat Codex rollout {}", source_path.display()))?;
+    ensure!(
+        !metadata.file_type().is_symlink() && metadata.is_file(),
+        "Codex rollout '{}' is not a regular file",
+        source_path.display()
+    );
+    ensure!(
+        metadata.len() <= MAX_NATIVE_FILE,
+        "Codex rollout is too large"
+    );
+    Ok(vec![NativeArtifact {
+        relative_path: relative.to_path_buf(),
+        data: fs::read(source_path)
+            .with_context(|| format!("read Codex rollout {}", source_path.display()))?,
+        mode: file_mode(&metadata),
+    }])
+}
 
 fn collect_kimi_registry_artifacts(
     home: &Path,
@@ -681,7 +739,7 @@ fn collect_native_tree(
         HarnessKind::Codex => {
             (name.contains(session_id)
                 && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst")))
-                || (name.ends_with(".jsonl") && codex_rollout_has_session_id(path, session_id)?)
+                || (name.ends_with(".jsonl") && codex_rollout_has_session_id(path, session_id))
         }
         HarnessKind::Claude => inside || name == format!("{session_id}.jsonl"),
         HarnessKind::Kimi => inside,
@@ -703,28 +761,33 @@ fn collect_native_tree(
     Ok(())
 }
 
-fn codex_rollout_has_session_id(path: &Path, session_id: &str) -> Result<bool> {
-    let file =
-        File::open(path).with_context(|| format!("open Codex rollout {}", path.display()))?;
+fn codex_rollout_has_session_id(path: &Path, session_id: &str) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
     let mut reader = BufReader::new(file);
     let mut line = String::new();
     for _ in 0..8 {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        let Ok(read) = reader.read_line(&mut line) else {
+            return false;
+        };
+        if read == 0 {
             break;
         }
-        let record: Value = serde_json::from_str(&line)
-            .with_context(|| format!("parse Codex rollout {}", path.display()))?;
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            return false;
+        };
         if record.get("type").and_then(Value::as_str) == Some("session_meta")
             && record
                 .pointer("/payload/session_id")
                 .and_then(Value::as_str)
                 == Some(session_id)
         {
-            return Ok(true);
+            return true;
         }
     }
-    Ok(false)
+    false
 }
 
 fn reject_dirty_submodules(runner: &dyn GitCommandRunner, repository: &Path) -> Result<()> {
@@ -1267,6 +1330,27 @@ mod tests {
             collect_native_artifacts(HarnessKind::Codex, temp.path(), NATIVE, true).unwrap();
         assert!(artifacts.is_empty());
     }
+    #[test]
+    fn codex_collection_ignores_malformed_unrelated_rollouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions/2026/08/10");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("rollout-unrelated.jsonl"), b"{malformed\n").unwrap();
+        let selected = sessions.join("rollout-renamed.jsonl");
+        fs::write(
+            &selected,
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{NATIVE}\"}}}}\n"),
+        )
+        .unwrap();
+
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Codex, temp.path(), NATIVE, false).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            artifacts[0].relative_path,
+            PathBuf::from("sessions/2026/08/10/rollout-renamed.jsonl")
+        );
+    }
 
     #[test]
     fn prompt_detection_reads_canonical_event_type() {
@@ -1308,13 +1392,13 @@ mod tests {
             collect_native_artifacts(HarnessKind::Kimi, temp.path(), NATIVE, false).unwrap();
         assert_eq!(artifacts.len(), 4);
         assert!(
-            artifacts
-                .iter()
-                .any(|artifact| { artifact.relative_path == PathBuf::from("workspaces.json") })
+            artifacts.iter().any(|artifact| {
+                artifact.relative_path.as_path() == Path::new("workspaces.json")
+            })
         );
         let index = artifacts
             .iter()
-            .find(|artifact| artifact.relative_path == PathBuf::from("session_index.jsonl"))
+            .find(|artifact| artifact.relative_path.as_path() == Path::new("session_index.jsonl"))
             .unwrap();
         assert!(std::str::from_utf8(&index.data).unwrap().contains(NATIVE));
         assert!(!std::str::from_utf8(&index.data).unwrap().contains("other"));
