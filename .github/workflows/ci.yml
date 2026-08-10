@@ -9,6 +9,8 @@ jobs:
   licenses:
     name: Dependency licenses
     runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
     steps:
     - uses: actions/checkout@v6
 
@@ -52,8 +54,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+        - os: ubuntu-latest
+          target: x86_64-unknown-linux-gnu
+        - os: macos-latest
+          target: aarch64-apple-darwin
+        - os: windows-latest
+          target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
 
     steps:
     - uses: actions/checkout@v6
@@ -97,6 +107,8 @@ jobs:
   voice-worker:
     name: Voice worker (ubuntu-latest)
     runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
     steps:
     - uses: actions/checkout@v6
 
