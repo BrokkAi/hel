@@ -202,22 +202,39 @@ async fn drive_connection(
             .map(|info| info.version.clone()),
     });
 
-    let (session_id, config_options, modes, resumed) = if let Some(existing) = &spec.resume_session
-    {
-        let loaded = connection
+    let loaded_session = if let Some(existing) = &spec.resume_session {
+        // A session that never ran a prompt may have no harness-side history
+        // (Codex writes its rollout lazily), so a failed load falls back to a
+        // fresh native session instead of killing the worker.
+        match connection
             .send_request(
                 LoadSessionRequest::new(SessionId::from(existing.clone()), spec.cwd.clone())
                     .additional_directories(spec.additional_directories.clone()),
             )
             .block_task()
             .await
-            .with_context(|| format!("load ACP session {existing}"))?;
-        (
-            SessionId::from(existing.clone()),
-            loaded.config_options,
-            loaded.modes,
-            true,
-        )
+        {
+            Ok(loaded) => Some((
+                SessionId::from(existing.clone()),
+                loaded.config_options,
+                loaded.modes,
+            )),
+            Err(error) => {
+                let _ = events.send(RuntimeEvent::Warning {
+                    message: format!(
+                        "could not load ACP session {existing}; starting a fresh session: {error:#}"
+                    ),
+                });
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (session_id, config_options, modes, resumed) = if let Some((id, options, modes)) =
+        loaded_session
+    {
+        (id, options, modes, true)
     } else {
         let created = connection
             .send_request(
