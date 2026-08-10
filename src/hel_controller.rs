@@ -139,12 +139,8 @@ impl Controller {
         let bundle = backend_bundle(bundle)?;
         let provision = hel_targets::provision_plan(&target, session_id, &bundle)?;
 
-        let preflight = if matches!(template, TargetTemplate::LocalPodman { .. }) {
-            hel_targets::verify_local_podman(executor).map(|_| ())
-        } else {
-            Ok(())
-        };
-        let result = preflight.and_then(|()| provision.execute(executor));
+        let result =
+            preflight_target(template, executor).and_then(|()| provision.execute(executor));
         match result {
             Ok(outputs) => {
                 let locator = locator_after_provision(
@@ -662,6 +658,36 @@ impl Controller {
     }
 }
 
+fn preflight_target(template: &TargetTemplate, executor: &impl CommandExecutor) -> Result<()> {
+    match template {
+        TargetTemplate::LocalPodman { .. } => hel_targets::verify_local_podman(executor)
+            .map(|_| ())
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "local Podman preflight failed; run `hel doctor` for actionable prerequisites: {error:#}"
+                )
+            }),
+        TargetTemplate::AppleContainer { .. } => {
+            let command = CommandSpec::new("container", ["system", "status"])
+                .purpose("preflight Apple container runtime");
+            let output = executor.execute(&command).map_err(|error| {
+                anyhow::anyhow!(
+                    "Apple container preflight failed; run `hel doctor` for actionable prerequisites: {error}"
+                )
+            })?;
+            if output.status != 0 {
+                bail!(
+                    "Apple container preflight failed; run `hel doctor` for actionable prerequisites: container system status exited {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn native_session_id_from_events(events: &[crate::hel_worker::SequencedEvent]) -> Option<String> {
     events.iter().rev().find_map(|event| {
         let WorkerEvent::Adapter { payload, .. } = &event.event else {
@@ -676,27 +702,54 @@ fn native_session_id_from_events(events: &[crate::hel_worker::SequencedEvent]) -
     })
 }
 
-fn worker_binary_for(
-    locator: &hel_targets::TargetLocator,
-    executor: &impl CommandExecutor,
-) -> Result<PathBuf> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerBinaryAvailability {
+    Local {
+        path: PathBuf,
+        source: String,
+    },
+    Remote {
+        url: String,
+        sha256: String,
+        triple: String,
+    },
+}
+
+/// Find a worker source without downloading it.
+///
+/// Container provisioning resolves this after discovering the target
+/// architecture. Doctor uses the same lookup with the selected container's
+/// expected architecture, so it can recommend a fix without creating a
+/// container or making a network request.
+pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAvailability> {
+    let triple = format!("{arch}-unknown-linux-musl");
+    let current = std::env::current_exe().context("resolve Hel controller binary")?;
     if let Some(path) = std::env::var_os("HEL_WORKER_BINARY").map(PathBuf::from) {
         if !path.is_file() {
             bail!("HEL_WORKER_BINARY is not a file: {}", path.display());
         }
-        return Ok(path);
+        return Ok(WorkerBinaryAvailability::Local {
+            path,
+            source: "HEL_WORKER_BINARY".into(),
+        });
     }
-    let arch = target_architecture(locator, executor)?;
-    let triple = format!("{arch}-unknown-linux-musl");
-    let current = std::env::current_exe().context("resolve Hel controller binary")?;
     let mut candidates = Vec::new();
     if let Some(directory) = std::env::var_os("HEL_WORKER_DIR").map(PathBuf::from) {
-        candidates.push(directory.join(format!("hel-worker-{triple}")));
-        candidates.push(directory.join(&triple).join("hel"));
+        candidates.push((
+            directory.join(format!("hel-worker-{triple}")),
+            "HEL_WORKER_DIR",
+        ));
+        candidates.push((directory.join(&triple).join("hel"), "HEL_WORKER_DIR"));
     }
     if let Some(directory) = current.parent() {
-        candidates.push(directory.join(format!("hel-worker-{triple}")));
-        candidates.push(directory.join(format!("hel-{triple}")));
+        candidates.push((
+            directory.join(format!("hel-worker-{triple}")),
+            "beside the Hel binary",
+        ));
+        candidates.push((
+            directory.join(format!("hel-{triple}")),
+            "beside the Hel binary",
+        ));
         // Development checkout: a controller at target/<profile>/hel finds its
         // musl sibling at target/<triple>/<profile>/hel. The static build is
         // preferred because the target's glibc may be older than the host's.
@@ -704,26 +757,55 @@ fn worker_binary_for(
             directory.file_name().map(std::ffi::OsString::from),
             directory.parent(),
         ) {
-            candidates.push(target_dir.join(&triple).join(profile).join("hel"));
+            candidates.push((
+                target_dir.join(&triple).join(profile).join("hel"),
+                "development musl sibling",
+            ));
         }
     }
-    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
-        return Ok(path);
+    if let Some((path, source)) = candidates.into_iter().find(|(path, _)| path.is_file()) {
+        return Ok(WorkerBinaryAvailability::Local {
+            path,
+            source: source.into(),
+        });
     }
     if cfg!(target_os = "linux")
         && ((arch == "x86_64" && cfg!(target_arch = "x86_64"))
             || (arch == "aarch64" && cfg!(target_arch = "aarch64")))
     {
-        return Ok(current);
+        return Ok(WorkerBinaryAvailability::Local {
+            path: current,
+            source: "native Linux Hel binary".into(),
+        });
     }
     if let Ok(template) = std::env::var("HEL_WORKER_URL") {
         let expected = std::env::var("HEL_WORKER_SHA256")
             .context("HEL_WORKER_URL requires HEL_WORKER_SHA256")?;
-        return download_worker(&template.replace("{target}", &triple), &expected, &triple);
+        validate_worker_sha256(&expected)?;
+        return Ok(WorkerBinaryAvailability::Remote {
+            url: template.replace("{target}", &triple),
+            sha256: expected,
+            triple,
+        });
     }
     bail!(
         "no Linux worker for {triple}; install hel-worker-{triple} beside Hel, set HEL_WORKER_DIR/HEL_WORKER_BINARY, or configure HEL_WORKER_URL and HEL_WORKER_SHA256"
     )
+}
+
+fn worker_binary_for(
+    locator: &hel_targets::TargetLocator,
+    executor: &impl CommandExecutor,
+) -> Result<PathBuf> {
+    let arch = target_architecture(locator, executor)?;
+    match worker_binary_prerequisite_for_arch(arch)? {
+        WorkerBinaryAvailability::Local { path, .. } => Ok(path),
+        WorkerBinaryAvailability::Remote {
+            url,
+            sha256,
+            triple,
+        } => download_worker(&url, &sha256, &triple),
+    }
 }
 
 fn target_architecture(
@@ -753,10 +835,7 @@ fn target_architecture(
 }
 
 fn download_worker(url: &str, expected_sha256: &str, triple: &str) -> Result<PathBuf> {
-    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        bail!("HEL_WORKER_SHA256 must be a 64-character hexadecimal digest");
-    }
+    validate_worker_sha256(expected_sha256)?;
     let directory = data_dir()
         .join("workers")
         .join(env!("CARGO_PKG_VERSION"))
@@ -792,6 +871,14 @@ fn download_worker(url: &str, expected_sha256: &str, triple: &str) -> Result<Pat
         std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(destination)
+}
+
+fn validate_worker_sha256(expected_sha256: &str) -> Result<()> {
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("HEL_WORKER_SHA256 must be a 64-character hexadecimal digest");
+    }
+    Ok(())
 }
 
 fn conversion_context(archive: &crate::hel_archive::VerifiedArchive) -> Result<String> {
@@ -1824,6 +1911,8 @@ fn now() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::hel_config::{ContainerTemplate as ConfigContainer, ProjectRepository};
 
@@ -1907,5 +1996,67 @@ mod tests {
         };
         assert!(container.extra_run_args.contains(&"--cpus=4".into()));
         assert!(container.extra_run_args.contains(&"A=b c".into()));
+    }
+
+    struct PreflightExecutor {
+        outputs: RefCell<Vec<CommandOutput>>,
+    }
+
+    impl CommandExecutor for PreflightExecutor {
+        fn execute(&self, _command: &CommandSpec) -> Result<CommandOutput> {
+            Ok(self.outputs.borrow_mut().remove(0))
+        }
+    }
+
+    #[test]
+    fn local_podman_preflight_failures_recommend_doctor() {
+        let template = TargetTemplate::LocalPodman {
+            container: ConfigContainer {
+                image: "ubuntu:24.04".into(),
+                platform: None,
+                cpus: None,
+                memory: None,
+                environment: std::collections::BTreeMap::new(),
+            },
+        };
+        let executor = PreflightExecutor {
+            outputs: RefCell::new(vec![CommandOutput {
+                status: 0,
+                stdout: b"podman version 3.4.7\n".to_vec(),
+                stderr: vec![],
+            }]),
+        };
+
+        let error = preflight_target(&template, &executor)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hel doctor"));
+        assert!(error.contains("Podman 4.0.0"));
+    }
+
+    #[test]
+    fn apple_container_preflight_failures_recommend_doctor() {
+        let template = TargetTemplate::AppleContainer {
+            container: ConfigContainer {
+                image: "ubuntu:24.04".into(),
+                platform: None,
+                cpus: None,
+                memory: None,
+                environment: std::collections::BTreeMap::new(),
+            },
+        };
+        let executor = PreflightExecutor {
+            outputs: RefCell::new(vec![CommandOutput {
+                status: 1,
+                stdout: vec![],
+                stderr: b"daemon is not running".to_vec(),
+            }]),
+        };
+
+        let error = preflight_target(&template, &executor)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hel doctor"));
+        assert!(error.contains("daemon is not running"));
     }
 }

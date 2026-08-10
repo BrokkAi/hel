@@ -4,8 +4,8 @@ use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::event::{self, Event};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -37,10 +37,41 @@ enum Command {
     /// Internal target-side worker commands.
     #[command(hide = true)]
     Worker(WorkerArgs),
-    /// Validate profiles, bundles, target templates, and persisted sessions.
-    Doctor,
+    /// Diagnose platform and configuration prerequisites.
+    Doctor(DoctorArgs),
     /// Discover local agent homes and create an initial Hel configuration.
-    Setup,
+    Setup(SetupArgs),
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Emit a machine-readable array of prerequisite checks.
+    #[arg(long)]
+    json: bool,
+    /// Run disposable container smoke tests where supported.
+    #[arg(long)]
+    smoke: bool,
+}
+
+#[derive(Debug, Args)]
+struct SetupArgs {
+    #[command(subcommand)]
+    command: Option<SetupCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum SetupCommand {
+    /// Print coding-agent instructions for preparing a host.
+    Instructions {
+        #[arg(long, value_enum)]
+        platform: SetupPlatform,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SetupPlatform {
+    Linux,
+    Macos,
 }
 
 #[derive(Debug, Args)]
@@ -108,26 +139,39 @@ async fn main() -> Result<()> {
                 hel::hel_checkpoint::restore_from_spec_file(&spec)
             }
         },
-        Some(Command::Doctor) => doctor(),
-        Some(Command::Setup) => setup(),
+        Some(Command::Doctor(args)) => doctor(args),
+        Some(Command::Setup(args)) => setup(args),
     }
 }
 
-fn setup() -> Result<()> {
-    match run_setup_dialog(&config_path())? {
-        SetupOutcome::Written | SetupOutcome::Cancelled => Ok(()),
+fn setup(args: SetupArgs) -> Result<()> {
+    match args.command {
+        Some(SetupCommand::Instructions { platform }) => {
+            let platform = match platform {
+                SetupPlatform::Linux => hel::hel_doctor::InstructionsPlatform::Linux,
+                SetupPlatform::Macos => hel::hel_doctor::InstructionsPlatform::Macos,
+            };
+            print!("{}", hel::hel_doctor::setup_instructions(platform));
+            Ok(())
+        }
+        None => match run_setup_dialog(&config_path())? {
+            SetupOutcome::Written | SetupOutcome::Cancelled => Ok(()),
+        },
     }
 }
 
-fn doctor() -> Result<()> {
-    let controller = Controller::load()?;
-    println!("Welcome to Hel.");
-    println!("config: {}", config_path().display());
-    println!("profiles: {}", controller.config.profiles.len());
-    println!("bundles: {}", controller.config.bundles.len());
-    println!("targets: {}", controller.config.targets.len());
-    println!("managed sessions: {}", controller.state.sessions.len());
-    Ok(())
+fn doctor(args: DoctorArgs) -> Result<()> {
+    let checks = hel::hel_doctor::run_current(hel::hel_doctor::DoctorOptions { smoke: args.smoke });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&checks)?);
+    } else {
+        hel::hel_doctor::render_human(&checks, &mut io::stdout())?;
+    }
+    if hel::hel_doctor::all_ready(&checks) {
+        Ok(())
+    } else {
+        bail!("Hel has fixable prerequisites; run `hel doctor --json` and follow its remediations.")
+    }
 }
 
 async fn run_server(args: ServerArgs) -> Result<()> {
@@ -524,6 +568,29 @@ mod tests {
                 .get_subcommands()
                 .any(|sub| sub.get_name() == "setup")
         );
+    }
+
+    #[test]
+    fn doctor_json_and_setup_instructions_are_parseable() {
+        let doctor = Cli::try_parse_from(["hel", "doctor", "--json"]).unwrap();
+        assert!(matches!(
+            doctor.command,
+            Some(Command::Doctor(DoctorArgs {
+                json: true,
+                smoke: false
+            }))
+        ));
+
+        let setup =
+            Cli::try_parse_from(["hel", "setup", "instructions", "--platform", "linux"]).unwrap();
+        assert!(matches!(
+            setup.command,
+            Some(Command::Setup(SetupArgs {
+                command: Some(SetupCommand::Instructions {
+                    platform: SetupPlatform::Linux
+                })
+            }))
+        ));
     }
 
     #[test]

@@ -508,6 +508,34 @@ pub fn setup_smoke_plan(template: &TargetTemplate, smoke_id: &str) -> Result<Com
     })
 }
 
+/// Run the disposable setup smoke test and always attempt container cleanup
+/// after a successful create step.
+pub fn run_setup_smoke_test(
+    template: &TargetTemplate,
+    smoke_id: &str,
+    executor: &impl CommandExecutor,
+) -> Result<()> {
+    let plan = setup_smoke_plan(template, smoke_id)?;
+    execute_checked(executor, &plan.commands[0])?;
+    let smoke_result = execute_checked(executor, &plan.commands[1]);
+    let cleanup_result = execute_checked(executor, &plan.commands[2]);
+    smoke_result?;
+    cleanup_result
+}
+
+fn execute_checked(executor: &impl CommandExecutor, command: &CommandSpec) -> Result<()> {
+    let output = executor.execute(command)?;
+    if output.status != 0 {
+        bail!(
+            "{} failed with status {}: {}",
+            command.purpose,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Clone/bootstrap commands for AWS once the exact instance ID and address are known.
 pub fn provision_on_locator_plan(
     locator: &TargetLocator,
@@ -1168,6 +1196,28 @@ mod tests {
             plan.commands[2].purpose,
             "remove disposable setup container"
         );
+    }
+
+    #[test]
+    fn setup_smoke_test_removes_a_container_after_a_failed_exec() {
+        let executor = FakeExecutor {
+            seen: RefCell::new(vec![]),
+            fail_at: Some(1),
+        };
+
+        assert!(
+            run_setup_smoke_test(
+                &TargetTemplate::AppleContainer(ContainerTemplate {
+                    image: "ubuntu:24.04".to_owned(),
+                    extra_run_args: vec![],
+                }),
+                "setup-123",
+                &executor,
+            )
+            .is_err()
+        );
+        assert_eq!(executor.seen.borrow().len(), 3);
+        assert_eq!(executor.seen.borrow()[2].args[0], "rm");
     }
 
     #[test]

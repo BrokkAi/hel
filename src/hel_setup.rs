@@ -137,14 +137,14 @@ pub fn discover_harness_homes(
         .into_iter()
         .filter(|(kind, path)| seen.insert((*kind, path.clone())) && path.is_dir())
         .map(|(kind, path)| DiscoveredHome {
-            authenticated: authentication_marker(kind, &path).is_file(),
+            authenticated: harness_authentication_marker(kind, &path).is_file(),
             kind,
             path,
         })
         .collect()
 }
 
-fn authentication_marker(kind: HarnessKind, home: &Path) -> PathBuf {
+pub fn harness_authentication_marker(kind: HarnessKind, home: &Path) -> PathBuf {
     home.join(match kind {
         HarnessKind::Codex => "auth.json",
         HarnessKind::Claude => ".credentials.json",
