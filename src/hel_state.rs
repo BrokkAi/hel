@@ -344,6 +344,8 @@ mod tests {
             profiles: BTreeMap::from([(
                 "codex-1".into(),
                 HarnessProfile {
+                    model: None,
+                    reasoning_effort: None,
                     kind: HarnessKind::Codex,
                     home: PathBuf::from("/home/test/.codex"),
                     executable: None,

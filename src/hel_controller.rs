@@ -260,7 +260,7 @@ impl Controller {
         let launch_path = staging.path().join("launch.json");
         launch.write(&launch_path)?;
         let profile_stage = staging.path().join("profile");
-        stage_profile(profile.kind, &profile.home, &profile_stage)?;
+        stage_profile(profile, &profile_stage)?;
         let worker_binary = worker_binary_for(&backend, executor)?;
 
         install_worker_files(
@@ -1279,11 +1279,9 @@ fn ensure_node_script() -> &'static str {
     "if ! command -v npx >/dev/null 2>&1; then if [ \"$(id -u)\" = 0 ]; then SUDO=''; elif command -v sudo >/dev/null 2>&1 && sudo -n true; then SUDO='sudo'; else echo 'Hel needs Node/npx or passwordless sudo to install it' >&2; exit 127; fi; if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update && $SUDO apt-get install -y nodejs npm; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y nodejs npm; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y nodejs npm; elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache nodejs npm; else echo 'Hel cannot install Node on this image; bake npx or a compatible ACP bridge into it' >&2; exit 127; fi; fi"
 }
 
-fn stage_profile(
-    harness: crate::hel_config::HarnessKind,
-    source: &Path,
-    destination: &Path,
-) -> Result<()> {
+fn stage_profile(profile: &crate::hel_config::HarnessProfile, destination: &Path) -> Result<()> {
+    let harness = profile.kind;
+    let source = profile.home.as_path();
     std::fs::create_dir_all(destination)?;
     let allowlist: &[&str] = match harness {
         crate::hel_config::HarnessKind::Codex => &[
@@ -1317,6 +1315,58 @@ fn stage_profile(
         if from.exists() {
             copy_profile_entry(&from, &destination.join(name))?;
         }
+    }
+    apply_profile_overrides(profile, destination)
+}
+
+/// Apply `model`/`reasoning_effort` overrides to the staged per-session copy
+/// of the harness configuration. The controller-side home stays untouched.
+fn apply_profile_overrides(
+    profile: &crate::hel_config::HarnessProfile,
+    destination: &Path,
+) -> Result<()> {
+    if profile.model.is_none() && profile.reasoning_effort.is_none() {
+        return Ok(());
+    }
+    match profile.kind {
+        crate::hel_config::HarnessKind::Codex => {
+            let path = destination.join("config.toml");
+            let mut table: toml::Table = if path.is_file() {
+                std::fs::read_to_string(&path)?
+                    .parse()
+                    .with_context(|| format!("parse staged codex config {}", path.display()))?
+            } else {
+                toml::Table::new()
+            };
+            if let Some(model) = &profile.model {
+                table.insert("model".into(), toml::Value::String(model.clone()));
+            }
+            if let Some(effort) = &profile.reasoning_effort {
+                table.insert(
+                    "model_reasoning_effort".into(),
+                    toml::Value::String(effort.clone()),
+                );
+            }
+            std::fs::write(&path, toml::to_string_pretty(&table)?)?;
+        }
+        crate::hel_config::HarnessKind::Claude => {
+            let path = destination.join("settings.json");
+            let mut settings: serde_json::Value = if path.is_file() {
+                serde_json::from_str(&std::fs::read_to_string(&path)?)
+                    .with_context(|| format!("parse staged claude settings {}", path.display()))?
+            } else {
+                serde_json::json!({})
+            };
+            let object = settings
+                .as_object_mut()
+                .context("staged claude settings.json is not a JSON object")?;
+            if let Some(model) = &profile.model {
+                object.insert("model".into(), serde_json::Value::String(model.clone()));
+            }
+            std::fs::write(&path, serde_json::to_string_pretty(&settings)?)?;
+        }
+        // Config validation rejects overrides for Kimi profiles.
+        crate::hel_config::HarnessKind::Kimi => {}
     }
     Ok(())
 }
@@ -1709,6 +1759,49 @@ fn now() -> String {
 mod tests {
     use super::*;
     use crate::hel_config::{ContainerTemplate as ConfigContainer, ProjectRepository};
+
+    #[test]
+    fn stage_profile_applies_codex_model_and_effort_overrides() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model = \"gpt-old\"\nsandbox_mode = \"workspace-write\"\n",
+        )
+        .unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let profile = crate::hel_config::HarnessProfile {
+            kind: crate::hel_config::HarnessKind::Codex,
+            home: home.path().to_path_buf(),
+            executable: None,
+            environment: std::collections::BTreeMap::new(),
+            model: Some("gpt-5.6-terra".into()),
+            reasoning_effort: Some("xhigh".into()),
+        };
+        stage_profile(&profile, staged.path()).unwrap();
+        let staged_config: toml::Table = std::fs::read_to_string(staged.path().join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            staged_config["model"].as_str().unwrap(),
+            "gpt-5.6-terra",
+            "override replaces the copied model"
+        );
+        assert_eq!(
+            staged_config["model_reasoning_effort"].as_str().unwrap(),
+            "xhigh"
+        );
+        assert_eq!(
+            staged_config["sandbox_mode"].as_str().unwrap(),
+            "workspace-write",
+            "unrelated keys survive the rewrite"
+        );
+        let source_config = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(
+            source_config.contains("gpt-old"),
+            "controller-side home must stay untouched"
+        );
+    }
 
     #[test]
     fn canonical_bundle_maps_github_shorthand_and_primary_destination() {

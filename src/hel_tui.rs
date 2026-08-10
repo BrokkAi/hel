@@ -1001,6 +1001,8 @@ mod tests {
                 (
                     "claude-1".into(),
                     HarnessProfile {
+                        model: None,
+                        reasoning_effort: None,
                         kind: HarnessKind::Claude,
                         home: PathBuf::from("/profiles/claude"),
                         executable: None,
@@ -1010,6 +1012,8 @@ mod tests {
                 (
                     "codex-1".into(),
                     HarnessProfile {
+                        model: None,
+                        reasoning_effort: None,
                         kind: HarnessKind::Codex,
                         home: PathBuf::from("/profiles/codex"),
                         executable: None,
@@ -1019,6 +1023,8 @@ mod tests {
                 (
                     "codex-2".into(),
                     HarnessProfile {
+                        model: None,
+                        reasoning_effort: None,
                         kind: HarnessKind::Codex,
                         home: PathBuf::from("/profiles/codex-two"),
                         executable: None,

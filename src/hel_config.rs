@@ -54,6 +54,13 @@ pub struct HarnessProfile {
     pub executable: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
+    /// Model override applied to the per-session copy of the harness config.
+    /// The controller-side home is never modified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reasoning-effort override (Codex `model_reasoning_effort`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl HarnessProfile {
@@ -82,6 +89,22 @@ impl HarnessProfile {
                 "profile {id:?} must use `home`, not override {} in `environment`",
                 self.kind.home_env()
             );
+        }
+        if self.reasoning_effort.is_some() && self.kind != HarnessKind::Codex {
+            bail!("profile {id:?}: `reasoning_effort` is only supported for codex profiles");
+        }
+        if self.model.is_some() && self.kind == HarnessKind::Kimi {
+            bail!("profile {id:?}: `model` override is not supported for kimi profiles");
+        }
+        if let Some(model) = &self.model
+            && model.trim().is_empty()
+        {
+            bail!("profile {id:?} has an empty `model` override");
+        }
+        if let Some(effort) = &self.reasoning_effort
+            && effort.trim().is_empty()
+        {
+            bail!("profile {id:?} has an empty `reasoning_effort` override");
         }
         Ok(())
     }
@@ -544,6 +567,8 @@ mod tests {
             profiles: BTreeMap::from([(
                 "codex-1".into(),
                 HarnessProfile {
+                    model: None,
+                    reasoning_effort: None,
                     kind: HarnessKind::Codex,
                     home: PathBuf::from("/home/test/.codex-one"),
                     executable: None,
