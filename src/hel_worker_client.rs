@@ -104,7 +104,16 @@ impl WorkerClient {
     /// Fetch a coherent snapshot and the complete canonical transcript.
     pub async fn bootstrap(&mut self) -> Result<WorkerBootstrap> {
         let snapshot = self.snapshot().await?;
-        let events = self.replay_after(0).await?;
+        let mut events = self.replay_after(0).await?;
+        // Replay pages by byte budget; keep paging from the last observed
+        // sequence until a page comes back empty.
+        loop {
+            let page = self.replay_after(self.latest_seq).await?;
+            if page.is_empty() {
+                break;
+            }
+            events.extend(page);
+        }
         Ok(WorkerBootstrap { snapshot, events })
     }
 
@@ -134,7 +143,15 @@ impl WorkerClient {
 
     /// Poll for events emitted after the most recently observed sequence.
     pub async fn sync(&mut self) -> Result<Vec<SequencedEvent>> {
-        self.replay_after(self.latest_seq).await
+        let mut events = self.replay_after(self.latest_seq).await?;
+        while !events.is_empty() {
+            let page = self.replay_after(self.latest_seq).await?;
+            if page.is_empty() {
+                break;
+            }
+            events.extend(page);
+        }
+        Ok(events)
     }
 
     pub async fn prompt(&mut self, text: String, attachments: Vec<Attachment>) -> Result<u64> {

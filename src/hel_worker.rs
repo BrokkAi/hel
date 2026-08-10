@@ -16,6 +16,33 @@ use serde_json::Value;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Serialized bytes of events allowed in one replay response, well under
+/// `MAX_FRAME_BYTES` to leave room for the envelope.
+pub const REPLAY_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+
+/// Trim a replay to the byte budget. Returns the events to send and the
+/// sequence the client is current through: the last included event's seq, or
+/// `latest_seq` when nothing had to be trimmed (also when the replay is empty).
+fn page_events(
+    events: Vec<SequencedEvent>,
+    after_seq: u64,
+    latest_seq: u64,
+) -> (Vec<SequencedEvent>, u64) {
+    let mut used = 0_usize;
+    let mut included = Vec::new();
+    for event in events {
+        let size = serde_json::to_vec(&event).map_or(usize::MAX, |bytes| bytes.len());
+        if !included.is_empty() && used.saturating_add(size) > REPLAY_BYTE_BUDGET {
+            let through = included
+                .last()
+                .map_or(after_seq, |last: &SequencedEvent| last.seq);
+            return (included, through);
+        }
+        used = used.saturating_add(size);
+        included.push(event);
+    }
+    (included, latest_seq)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionRange {
@@ -430,10 +457,15 @@ impl DurableWorker {
             WorkerRequest::Status => ResponsePayload::Status(self.snapshot.status()),
             WorkerRequest::Snapshot => ResponsePayload::Snapshot(self.snapshot.clone()),
             WorkerRequest::Subscribe { after_seq } => match self.events_after(*after_seq) {
-                Ok(events) => ResponsePayload::Replay {
-                    events,
-                    latest_seq: self.snapshot.latest_seq,
-                },
+                Ok(events) => {
+                    // A full transcript can exceed the protocol frame cap, so
+                    // replay pages by byte budget. latest_seq reports the last
+                    // sequence actually included; clients page until a replay
+                    // comes back empty.
+                    let (events, latest_seq) =
+                        page_events(events, *after_seq, self.snapshot.latest_seq);
+                    ResponsePayload::Replay { events, latest_seq }
+                }
                 Err(error) => {
                     return Ok(super_error(
                         ErrorCode::SequenceOutOfRange,
@@ -791,6 +823,31 @@ mod tests {
             panic!("expected accepted response, got {:?}", response.body);
         };
         *seq
+    }
+
+    #[test]
+    fn replay_pages_stop_at_byte_budget_and_report_included_seq() {
+        let big_text = "x".repeat(REPLAY_BYTE_BUDGET / 3);
+        let events: Vec<SequencedEvent> = (1..=3)
+            .map(|seq| SequencedEvent {
+                seq,
+                request_id: None,
+                event: WorkerEvent::PromptAccepted {
+                    request_id: format!("r{seq}"),
+                    text: big_text.clone(),
+                    attachments: vec![],
+                },
+            })
+            .collect();
+        let (page, through) = page_events(events.clone(), 0, 3);
+        assert_eq!(page.len(), 2, "two half-budget events fill the page");
+        assert_eq!(through, 2, "reports the last included sequence");
+        let (rest, through) = page_events(events[2..].to_vec(), 2, 3);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(through, 3, "an untrimmed page reports the global latest");
+        let (empty, through) = page_events(Vec::new(), 3, 3);
+        assert!(empty.is_empty());
+        assert_eq!(through, 3);
     }
 
     #[test]
