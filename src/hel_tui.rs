@@ -11,7 +11,9 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap,
+};
 
 use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use crate::hel_quota::ProfileQuota;
@@ -122,6 +124,7 @@ struct ResumeWizard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Confirmation {
     Close { session_id: String },
+    CloseFailed { session_id: String, error: String },
     ForceDestroy { session_id: String, typed: String },
 }
 
@@ -259,6 +262,14 @@ impl DashboardState {
         self.notice = None;
     }
 
+    /// Show the recovery choices after a checkpointed close could not finish.
+    pub fn show_close_failure(&mut self, session_id: String, error: impl Into<String>) {
+        self.mode = Mode::Confirm(Confirmation::CloseFailed {
+            session_id,
+            error: error.into(),
+        });
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return DashboardAction::None;
@@ -327,15 +338,6 @@ impl DashboardState {
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(Confirmation::Close {
                         session_id: session.id.clone(),
-                    });
-                }
-                DashboardAction::None
-            }
-            KeyCode::Char('x') => {
-                if let Some(session) = self.selected_session() {
-                    self.mode = Mode::Confirm(Confirmation::ForceDestroy {
-                        session_id: session.id.clone(),
-                        typed: String::new(),
                     });
                 }
                 DashboardAction::None
@@ -677,6 +679,27 @@ impl DashboardState {
                 }
                 _ => DashboardAction::None,
             },
+            Confirmation::CloseFailed { session_id, error } => match code {
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.cancel_modal();
+                    DashboardAction::Close { session_id }
+                }
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    self.mode = Mode::Confirm(Confirmation::ForceDestroy {
+                        session_id,
+                        typed: String::new(),
+                    });
+                    DashboardAction::None
+                }
+                KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => {
+                    self.cancel_modal();
+                    DashboardAction::None
+                }
+                _ => {
+                    self.mode = Mode::Confirm(Confirmation::CloseFailed { session_id, error });
+                    DashboardAction::None
+                }
+            },
             Confirmation::ForceDestroy {
                 session_id,
                 mut typed,
@@ -869,8 +892,7 @@ fn activity_from_adapter(payload: &serde_json::Value) -> Option<SessionActivity>
             .get("content")
             .and_then(|content| content.get("text"))
             .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
+            .filter(|text| !text.trim().is_empty())
     };
     match kind {
         "agent_thought_chunk" => text().map(|text| SessionActivity {
@@ -884,8 +906,7 @@ fn activity_from_adapter(payload: &serde_json::Value) -> Option<SessionActivity>
         "tool_call" => update
             .get("title")
             .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|title| !title.is_empty())
+            .filter(|title| !title.trim().is_empty())
             .map(|text| SessionActivity {
                 kind: ActivityKind::ToolCall,
                 text: text.to_string(),
@@ -915,11 +936,11 @@ fn activity_label(activity: &SessionActivity) -> String {
         ActivityKind::AgentText => "agent",
         ActivityKind::ToolCall => "tool",
     };
-    format!("{label}: {}", activity.text)
+    format!("{label}: {}", collapse_whitespace(&activity.text))
 }
 
 fn truncate_text(text: &str, width: usize) -> String {
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = collapse_whitespace(text);
     if text.chars().count() <= width {
         return text;
     }
@@ -929,6 +950,10 @@ fn truncate_text(text: &str, width: usize) -> String {
     let mut truncated = text.chars().take(width - 1).collect::<String>();
     truncated.push('…');
     truncated
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 impl NewWizard {
@@ -1071,15 +1096,21 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
             session_index += 1;
         }
     }
-    let title = if dashboard.focus == Focus::Sessions {
-        " Sessions [focused] "
+    let title = " Sessions ";
+    let border_type = if dashboard.focus == Focus::Sessions {
+        BorderType::Double
     } else {
-        " Sessions "
+        BorderType::Plain
     };
     let table = Table::new(rows, [Constraint::Percentage(100)])
         .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
         .highlight_symbol("› ")
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(border_type)
+                .title(title),
+        );
     let mut state = TableState::default().with_selected(selected_row);
     frame.render_stateful_widget(table, area, &mut state);
 }
@@ -1161,10 +1192,11 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
             Cell::from(refreshed),
         ])
     });
-    let title = if dashboard.focus == Focus::Quotas {
-        " Profile quotas [focused] "
+    let title = " Profile quotas ";
+    let border_type = if dashboard.focus == Focus::Quotas {
+        BorderType::Double
     } else {
-        " Profile quotas "
+        BorderType::Plain
     };
     let table = Table::new(
         rows,
@@ -1188,7 +1220,12 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
     )
     .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
     .highlight_symbol("› ")
-    .block(Block::default().borders(Borders::ALL).title(title));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(border_type)
+            .title(title),
+    );
     let mut state = TableState::default()
         .with_selected((!dashboard.config.profiles.is_empty()).then_some(dashboard.quota_index));
     frame.render_stateful_widget(table, area, &mut state);
@@ -1196,7 +1233,7 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
 
 fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     let text = dashboard.notice.as_deref().unwrap_or(
-        "n new · Enter open/resume · p checkpoint · c close · x force · u quota · Tab pane · q detach",
+        "n new · Enter open/resume · p checkpoint · c close · u quota · Tab pane · q detach",
     );
     let style = if dashboard.notice.is_some() {
         Style::default().fg(Color::Yellow)
@@ -1255,7 +1292,7 @@ fn render_new_wizard(
         title,
         choices,
         selected,
-        "Enter next · ← back · Esc cancel",
+        &["Enter next · ← back · Esc cancel"],
     );
 }
 
@@ -1384,15 +1421,30 @@ fn render_resume_wizard(
     dashboard: &DashboardState,
     wizard: &ResumeWizard,
 ) {
-    let (title, choices, selected) = match wizard.step {
+    let (title, choices, selected, help) = match wizard.step {
         WizardStep::Profile => (
             " Resume · 1/2 profile (cross-harness supported) ",
             dashboard
                 .compatible_profiles(&wizard.session_id)
                 .into_iter()
-                .map(|(id, harness)| dashboard.profile_choice(id, harness))
+                .map(|(id, harness)| {
+                    let mut choice = dashboard.profile_choice(id, harness);
+                    if dashboard
+                        .state
+                        .sessions
+                        .get(&wizard.session_id)
+                        .is_some_and(|session| session.harness_kind != harness)
+                    {
+                        choice.insert_str(id.len(), "  (lossy: text-only transcript)");
+                    }
+                    choice
+                })
                 .collect(),
             wizard.profile,
+            &[
+                "Enter next · ← back · Esc cancel",
+                "Lossy: text only; tool calls + reasoning dropped.",
+            ][..],
         ),
         WizardStep::Target => (
             " Resume · 2/2 new target ",
@@ -1403,18 +1455,12 @@ fn render_resume_wizard(
                 .map(|(id, target)| format!("{id}  {}", target_label(target)))
                 .collect(),
             wizard.target,
+            &["Enter next · ← back · Esc cancel"][..],
         ),
         WizardStep::Bundle => unreachable!("resume does not select a bundle"),
         WizardStep::Mounts => unreachable!("resume does not select mounts"),
     };
-    render_picker(
-        frame,
-        area,
-        title,
-        choices,
-        selected,
-        "Enter next · ← back · Esc cancel",
-    );
+    render_picker(frame, area, title, choices, selected, help);
 }
 
 fn render_picker(
@@ -1423,9 +1469,13 @@ fn render_picker(
     title: &str,
     choices: Vec<String>,
     selected: usize,
-    help: &str,
+    help: &[&str],
 ) {
-    let popup = centered_rect(68, (choices.len() as u16 + 5).clamp(8, 18), area);
+    let popup = centered_rect(
+        68,
+        (choices.len() as u16 + help.len() as u16 + 4).clamp(8, 18),
+        area,
+    );
     frame.render_widget(Clear, popup);
     let lines = choices
         .into_iter()
@@ -1439,10 +1489,11 @@ fn render_picker(
             };
             Line::styled(format!("{marker}{choice}"), style)
         })
-        .chain([
-            Line::raw(""),
-            Line::styled(help, Style::default().fg(Color::DarkGray)),
-        ])
+        .chain([Line::raw("")])
+        .chain(
+            help.iter()
+                .map(|line| Line::styled(*line, Style::default().fg(Color::DarkGray))),
+        )
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(lines)
@@ -1453,7 +1504,14 @@ fn render_picker(
 }
 
 fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmation) {
-    let popup = centered_rect(64, 9, area);
+    let popup = centered_rect(
+        72,
+        match confirmation {
+            Confirmation::CloseFailed { .. } => 12,
+            Confirmation::Close { .. } | Confirmation::ForceDestroy { .. } => 9,
+        },
+        area,
+    );
     frame.render_widget(Clear, popup);
     let (title, lines) = match confirmation {
         Confirmation::Close { session_id } => (
@@ -1463,6 +1521,19 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
                 Line::raw(""),
                 Line::raw("Hel will verify the checkpoint before destroying the target."),
                 Line::raw("Press y/Enter to close, or n/Esc to cancel."),
+            ],
+        ),
+        Confirmation::CloseFailed { session_id, error } => (
+            " Close could not complete ",
+            vec![
+                Line::raw(format!("Session: {session_id}")),
+                Line::raw(""),
+                Line::styled(
+                    format!("Close failed: {error}"),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Line::raw(""),
+                Line::raw("r retry close · f force destroy · Esc cancel"),
             ],
         ),
         Confirmation::ForceDestroy { session_id, typed } => (
@@ -1835,7 +1906,65 @@ mod tests {
     }
 
     #[test]
-    fn close_and_force_destroy_have_separate_confirmation_strengths() {
+    fn resume_profile_step_marks_cross_harness_profiles_as_lossy() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.handle_key(key(KeyCode::Char('r')));
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("(lossy: text-only transcript)"));
+        assert!(rendered.contains("Lossy: text only; tool calls + reasoning dropped."));
+    }
+
+    #[test]
+    fn activity_snippet_collapses_newlines_to_spaces_when_rendered() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.apply_worker_events(
+            "session-1",
+            &[SequencedEvent {
+                seq: 1,
+                request_id: None,
+                event: WorkerEvent::Adapter {
+                    kind: "session_update".into(),
+                    payload: serde_json::json!({
+                        "type": "session_update",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": { "text": "a b\nc" }
+                        }
+                    }),
+                },
+            }],
+            100,
+        );
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("agent: a b c"));
+    }
+
+    #[test]
+    fn failed_close_dialog_offers_retry_or_explicit_force_destroy() {
         let mut dashboard = dashboard_with_session(archived_session());
         dashboard.handle_key(key(KeyCode::Char('c')));
         assert_eq!(
@@ -1845,7 +1974,23 @@ mod tests {
             }
         );
 
-        dashboard.handle_key(key(KeyCode::Char('x')));
+        dashboard.show_close_failure("session-1".into(), "archive unavailable");
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('r'))),
+            DashboardAction::Close {
+                session_id: "session-1".into()
+            }
+        );
+
+        dashboard.show_close_failure("session-1".into(), "archive unavailable");
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('x'))),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('f'))),
+            DashboardAction::None
+        );
         for character in FORCE_CONFIRMATION.chars() {
             assert_eq!(
                 dashboard.handle_key(key(KeyCode::Char(character))),
@@ -1858,6 +2003,39 @@ mod tests {
                 session_id: "session-1".into()
             }
         );
+    }
+
+    #[test]
+    fn focused_panes_use_double_borders_without_focus_title_text() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("╔ Sessions"));
+        assert!(!rendered.contains("[focused]"));
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("╔ Profile quotas"));
+        assert!(!rendered.contains("[focused]"));
     }
 
     #[test]
