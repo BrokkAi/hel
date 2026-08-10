@@ -3,7 +3,7 @@
 //! This module deliberately has no provisioning or persistence side effects.
 //! Input is reduced to [`DashboardAction`] values for the controller to run.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -17,6 +17,7 @@ use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use crate::hel_quota::ProfileQuota;
 use crate::hel_state::{HelState, SessionRecord, SessionState};
 use crate::hel_targets::{AdditionalMount, default_mount_destination, path_completion};
+use crate::hel_worker::{SequencedEvent, WorkerEvent};
 
 const FORCE_CONFIRMATION: &str = "DESTROY";
 
@@ -132,11 +133,34 @@ enum Mode {
     Confirm(Confirmation),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityKind {
+    Thinking,
+    AgentText,
+    ToolCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionActivity {
+    kind: ActivityKind,
+    text: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SessionDetail {
+    last_event_sequence: u64,
+    current_turn_started_at: Option<u64>,
+    last_turn_completed_at: Option<u64>,
+    activity: Option<SessionActivity>,
+}
+
 /// Stateful, renderable projection of controller configuration and state.
 pub struct DashboardState {
     config: HelConfig,
     state: HelState,
     quotas: BTreeMap<String, ProfileQuota>,
+    quota_refreshing: BTreeSet<String>,
+    session_details: BTreeMap<String, SessionDetail>,
     session_index: usize,
     quota_index: usize,
     focus: Focus,
@@ -150,6 +174,8 @@ impl DashboardState {
             config,
             state,
             quotas,
+            quota_refreshing: BTreeSet::new(),
+            session_details: BTreeMap::new(),
             session_index: 0,
             quota_index: 0,
             focus: Focus::Sessions,
@@ -172,8 +198,57 @@ impl DashboardState {
     }
 
     pub fn set_quotas(&mut self, quotas: BTreeMap<String, ProfileQuota>) {
+        self.quota_refreshing.retain(|id| !quotas.contains_key(id));
         self.quotas = quotas;
         self.clamp_selections();
+    }
+
+    pub fn begin_quota_refresh(&mut self, profile_ids: impl IntoIterator<Item = String>) {
+        self.quota_refreshing.extend(profile_ids);
+    }
+
+    pub fn apply_quota(&mut self, quota: ProfileQuota) {
+        self.quota_refreshing.remove(&quota.profile_id);
+        self.quotas.insert(quota.profile_id.clone(), quota);
+    }
+
+    /// Incorporate the newly replayed worker events for one session. Details
+    /// are intentionally dashboard-local; only harness titles need durable
+    /// controller state.
+    pub fn apply_worker_events(
+        &mut self,
+        session_id: &str,
+        events: &[SequencedEvent],
+        observed_at_epoch_seconds: u64,
+    ) {
+        let detail = self
+            .session_details
+            .entry(session_id.to_string())
+            .or_default();
+        for event in events {
+            if event.seq <= detail.last_event_sequence {
+                continue;
+            }
+            detail.last_event_sequence = event.seq;
+            match &event.event {
+                WorkerEvent::PromptAccepted { .. } => {
+                    detail.current_turn_started_at = Some(observed_at_epoch_seconds);
+                }
+                WorkerEvent::TurnCompleted | WorkerEvent::Cancelled => {
+                    detail.current_turn_started_at = None;
+                    detail.last_turn_completed_at = Some(observed_at_epoch_seconds);
+                }
+                WorkerEvent::Adapter { payload, .. } => {
+                    if let Some(activity) = activity_from_adapter(payload) {
+                        update_activity(detail, activity);
+                    }
+                }
+                WorkerEvent::ConfigChanged { .. }
+                | WorkerEvent::Checkpointed { .. }
+                | WorkerEvent::Closing
+                | WorkerEvent::Closed => {}
+            }
+        }
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
@@ -690,7 +765,12 @@ impl DashboardState {
     }
 
     fn selected_session(&self) -> Option<&SessionRecord> {
-        self.state.sessions.values().nth(self.session_index)
+        self.ordered_sessions().get(self.session_index).copied()
+    }
+
+    fn ordered_sessions(&self) -> Vec<&SessionRecord> {
+        let (active, archived) = partition_sessions(self.state.sessions.values());
+        active.into_iter().chain(archived).collect()
     }
 
     fn compatible_profiles(&self, session_id: &str) -> Vec<(&String, HarnessKind)> {
@@ -702,6 +782,22 @@ impl DashboardState {
             .iter()
             .map(|(id, profile)| (id, profile.kind))
             .collect()
+    }
+
+    fn profile_choice(&self, id: &str, harness: HarnessKind) -> String {
+        let quota = if self.quota_refreshing.contains(id) {
+            "refreshing".to_string()
+        } else {
+            self.quotas
+                .get(id)
+                .map(ProfileQuota::compact)
+                .unwrap_or_else(|| "refreshing".to_string())
+        };
+        format!(
+            "{id}  {}  [{}]  ·  {quota}",
+            harness_label(harness),
+            harness.unrestricted_mode(),
+        )
     }
 
     fn config_is_empty(&self) -> bool {
@@ -744,6 +840,95 @@ impl DashboardState {
             .quota_index
             .min(self.config.profiles.len().saturating_sub(1));
     }
+}
+
+fn partition_sessions<'a>(
+    sessions: impl IntoIterator<Item = &'a SessionRecord>,
+) -> (Vec<&'a SessionRecord>, Vec<&'a SessionRecord>) {
+    let mut active = Vec::new();
+    let mut archived = Vec::new();
+    for session in sessions {
+        if session.state == SessionState::Archived {
+            archived.push(session);
+        } else {
+            active.push(session);
+        }
+    }
+    (active, archived)
+}
+
+fn activity_from_adapter(payload: &serde_json::Value) -> Option<SessionActivity> {
+    let update = payload.get("update").filter(|_| {
+        payload.get("type").and_then(serde_json::Value::as_str) == Some("session_update")
+    })?;
+    let kind = update
+        .get("sessionUpdate")
+        .and_then(serde_json::Value::as_str)?;
+    let text = || {
+        update
+            .get("content")
+            .and_then(|content| content.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    match kind {
+        "agent_thought_chunk" => text().map(|text| SessionActivity {
+            kind: ActivityKind::Thinking,
+            text: text.to_string(),
+        }),
+        "agent_message_chunk" => text().map(|text| SessionActivity {
+            kind: ActivityKind::AgentText,
+            text: text.to_string(),
+        }),
+        "tool_call" => update
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(|text| SessionActivity {
+                kind: ActivityKind::ToolCall,
+                text: text.to_string(),
+            }),
+        _ => None,
+    }
+}
+
+fn update_activity(detail: &mut SessionDetail, activity: SessionActivity) {
+    if let Some(previous) = detail.activity.as_mut()
+        && previous.kind == activity.kind
+        && matches!(
+            activity.kind,
+            ActivityKind::Thinking | ActivityKind::AgentText
+        )
+    {
+        previous.text.push_str(&activity.text);
+        previous.text = truncate_text(&previous.text, 512);
+        return;
+    }
+    detail.activity = Some(activity);
+}
+
+fn activity_label(activity: &SessionActivity) -> String {
+    let label = match activity.kind {
+        ActivityKind::Thinking => "thinking",
+        ActivityKind::AgentText => "agent",
+        ActivityKind::ToolCall => "tool",
+    };
+    format!("{label}: {}", activity.text)
+}
+
+fn truncate_text(text: &str, width: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= width {
+        return text;
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let mut truncated = text.chars().take(width - 1).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 impl NewWizard {
@@ -848,56 +1033,107 @@ fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) 
 }
 
 fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
-    let rows = dashboard.state.sessions.values().map(|session| {
-        Row::new([
-            Cell::from(session.title.clone()),
-            Cell::from(format!(
-                "{} / {}",
-                harness_label(session.harness_kind),
-                session.last_profile
-            )),
-            Cell::from(session.target_template_id.clone()),
-            Cell::from(state_label(session.state)),
-            Cell::from(
-                session
-                    .checkpoint
-                    .as_ref()
-                    .map(|checkpoint| checkpoint.created_at.clone())
-                    .unwrap_or_else(|| "never".into()),
-            ),
-        ])
-    });
+    let (active, archived) = partition_sessions(dashboard.state.sessions.values());
+    let now_epoch_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let width = area.width.saturating_sub(8) as usize;
+    let mut rows = Vec::new();
+    let mut selected_row = None;
+    let mut session_index = 0;
+
+    rows.push(session_section_row("Active", active.len()));
+    for session in active {
+        if session_index == dashboard.session_index {
+            selected_row = Some(rows.len());
+        }
+        rows.push(session_row(
+            session,
+            dashboard.session_details.get(&session.id),
+            now_epoch_seconds,
+            width,
+        ));
+        session_index += 1;
+    }
+    if !archived.is_empty() {
+        rows.push(session_section_row("Archived", archived.len()));
+        for session in archived {
+            if session_index == dashboard.session_index {
+                selected_row = Some(rows.len());
+            }
+            rows.push(session_row(
+                session,
+                dashboard.session_details.get(&session.id),
+                now_epoch_seconds,
+                width,
+            ));
+            session_index += 1;
+        }
+    }
     let title = if dashboard.focus == Focus::Sessions {
         " Sessions [focused] "
     } else {
         " Sessions "
     };
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(28),
-            Constraint::Percentage(23),
-            Constraint::Percentage(18),
-            Constraint::Percentage(14),
-            Constraint::Percentage(17),
-        ],
-    )
-    .header(
-        Row::new([
-            "Title",
-            "Harness / profile",
-            "Target",
-            "State",
-            "Checkpoint",
-        ])
-        .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-    .highlight_symbol("› ")
-    .block(Block::default().borders(Borders::ALL).title(title));
-    let mut state = TableState::default()
-        .with_selected((!dashboard.state.sessions.is_empty()).then_some(dashboard.session_index));
+    let table = Table::new(rows, [Constraint::Percentage(100)])
+        .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol("› ")
+        .block(Block::default().borders(Borders::ALL).title(title));
+    let mut state = TableState::default().with_selected(selected_row);
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn session_section_row(label: &str, count: usize) -> Row<'static> {
+    Row::new([Cell::from(format!(" {label} ({count}) "))])
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .height(1)
+}
+
+fn session_row(
+    session: &SessionRecord,
+    detail: Option<&SessionDetail>,
+    now_epoch_seconds: u64,
+    width: usize,
+) -> Row<'static> {
+    let checkpoint = session
+        .checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.created_at.as_str())
+        .unwrap_or("never");
+    let summary = format!(
+        "{}  ·  {} / {}  ·  {}  ·  {}  ·  checkpoint {}",
+        session.title,
+        harness_label(session.harness_kind),
+        session.last_profile,
+        session.target_template_id,
+        state_label(session.state),
+        checkpoint,
+    );
+    let clock = crate::usage_format::format_turn_clock(
+        now_epoch_seconds,
+        detail.and_then(|detail| detail.current_turn_started_at),
+        detail.and_then(|detail| detail.last_turn_completed_at),
+    );
+    let activity = detail
+        .and_then(|detail| detail.activity.as_ref())
+        .map(activity_label);
+    let detail = match activity {
+        Some(activity) => format!("{clock}  ·  {activity}"),
+        None => clock,
+    };
+    Row::new([Cell::from(vec![
+        Line::raw(truncate_text(&summary, width)),
+        Line::styled(
+            truncate_text(&detail, width),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])])
+    .height(2)
 }
 
 fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
@@ -906,12 +1142,16 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         .unwrap_or_default()
         .as_secs();
     let rows = dashboard.config.profiles.iter().map(|(id, profile)| {
-        let (usage, refreshed) = match dashboard.quotas.get(id) {
-            Some(quota) => (
-                quota.compact(),
-                quota_age(now, quota.refreshed_at_epoch_seconds),
-            ),
-            None => ("not refreshed".into(), "never".into()),
+        let (usage, refreshed) = if dashboard.quota_refreshing.contains(id) {
+            ("refreshing".into(), "…".into())
+        } else {
+            match dashboard.quotas.get(id) {
+                Some(quota) => (
+                    quota.compact(),
+                    quota_age(now, quota.refreshed_at_epoch_seconds),
+                ),
+                None => ("refreshing".into(), "…".into()),
+            }
         };
         Row::new([
             Cell::from(id.clone()),
@@ -983,13 +1223,7 @@ fn render_new_wizard(
                 .config
                 .profiles
                 .iter()
-                .map(|(id, profile)| {
-                    format!(
-                        "{id}  {}  [{}]",
-                        harness_label(profile.kind),
-                        profile.unrestricted_mode()
-                    )
-                })
+                .map(|(id, profile)| dashboard.profile_choice(id, profile.kind))
                 .collect(),
             wizard.profile,
         ),
@@ -1156,7 +1390,7 @@ fn render_resume_wizard(
             dashboard
                 .compatible_profiles(&wizard.session_id)
                 .into_iter()
-                .map(|(id, harness)| format!("{id}  {}", harness_label(harness)))
+                .map(|(id, harness)| dashboard.profile_choice(id, harness))
                 .collect(),
             wizard.profile,
         ),
@@ -1466,6 +1700,46 @@ mod tests {
             },
             BTreeMap::new(),
         )
+    }
+
+    #[test]
+    fn archived_section_partitions_sessions_without_losing_selection_order() {
+        let mut running = archived_session();
+        running.id = "session-0".into();
+        running.state = SessionState::Running;
+        let archived = archived_session();
+        let state = HelState {
+            version: STATE_VERSION,
+            sessions: BTreeMap::from([
+                (running.id.clone(), running),
+                (archived.id.clone(), archived),
+            ]),
+            mount_history: BTreeMap::new(),
+        };
+        let (active, archived) = partition_sessions(state.sessions.values());
+        assert_eq!(
+            active
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["session-0"]
+        );
+        assert_eq!(
+            archived
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["session-1"]
+        );
+
+        let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
+        dashboard.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            dashboard
+                .selected_session()
+                .map(|session| session.id.as_str()),
+            Some("session-1")
+        );
     }
 
     #[test]
