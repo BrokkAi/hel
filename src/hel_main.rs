@@ -370,17 +370,30 @@ async fn run_dashboard() -> Result<()> {
             DashboardAction::RefreshQuotas => {
                 refresh_quotas(&controller, &mut quotas, &mut dashboard).await;
             }
+            DashboardAction::CompleteMountSource {
+                target_template_id,
+                prefix,
+            } => match controller.complete_mount_source(
+                &target_template_id,
+                &prefix,
+                &ProcessExecutor,
+            ) {
+                Ok(candidates) => dashboard.apply_mount_source_completions(&prefix, candidates),
+                Err(error) => dashboard.set_notice(format!("Path completion failed: {error:#}")),
+            },
             DashboardAction::CreateSession {
                 profile_id,
                 bundle_id,
                 target_template_id,
+                additional_mounts,
             } => {
                 let title = format!("{bundle_id} via {profile_id}");
-                match controller.register_session(
+                match controller.register_session_with_mounts(
                     &profile_id,
                     &bundle_id,
                     &target_template_id,
                     title,
+                    additional_mounts,
                 ) {
                     Ok(session_id) => {
                         dashboard.set_state(controller.state.clone());
