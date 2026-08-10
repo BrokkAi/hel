@@ -151,10 +151,22 @@ pub struct LoginInvocation {
 
 pub async fn headless_login_invocation(vendor: AuthVendor) -> Result<LoginInvocation> {
     let mut invocation = bundled_invocation(vendor).await?;
+    append_login_args(&mut invocation, login_args_for_selection(1));
+    Ok(invocation)
+}
+
+fn login_args_for_selection(selected: usize) -> &'static [&'static str] {
+    if selected == 1 {
+        &["login", "--device-auth"]
+    } else {
+        &["login"]
+    }
+}
+
+fn append_login_args(invocation: &mut LoginInvocation, args: &[&str]) {
     invocation
         .args
-        .extend(["login".to_string(), "--device-auth".to_string()]);
-    Ok(invocation)
+        .extend(args.iter().map(|arg| arg.to_string()));
 }
 
 pub async fn run_login(vendor: AuthVendor) -> Result<LoginOutcome> {
@@ -183,11 +195,7 @@ pub async fn run_login(vendor: AuthVendor) -> Result<LoginOutcome> {
                     "OpenAI / ChatGPT sign-in cancelled".to_string(),
                 ));
             };
-            if selected == 1 {
-                vec!["login", "--device-auth"]
-            } else {
-                vec!["login"]
-            }
+            login_args_for_selection(selected)
         }
     };
     println!(
@@ -195,7 +203,7 @@ pub async fn run_login(vendor: AuthVendor) -> Result<LoginOutcome> {
         vendor.label()
     );
     let mut invocation = bundled_invocation(vendor).await?;
-    invocation.args.extend(args.into_iter().map(str::to_string));
+    append_login_args(&mut invocation, args);
     let _interrupt_guard = crate::termination::suppress_interrupts();
     let status = tokio::process::Command::new(&invocation.command)
         .args(&invocation.args)
@@ -203,10 +211,21 @@ pub async fn run_login(vendor: AuthVendor) -> Result<LoginOutcome> {
         .status()
         .await
         .with_context(|| format!("run {} login", vendor.label()))?;
-    if !status.success() {
+    let success = status.success();
+    let credentials_available = success && detect(vendor).available();
+    login_outcome_from_status(vendor, success, &status.to_string(), credentials_available)
+}
+
+fn login_outcome_from_status(
+    vendor: AuthVendor,
+    success: bool,
+    status: &str,
+    credentials_available: bool,
+) -> Result<LoginOutcome> {
+    if !success {
         bail!("{} login exited with {status}", vendor.label());
     }
-    if !detect(vendor).available() {
+    if !credentials_available {
         bail!(
             "{} login finished but no supported credential was found",
             vendor.label()
@@ -219,17 +238,25 @@ pub async fn run_login(vendor: AuthVendor) -> Result<LoginOutcome> {
 }
 
 async fn bundled_invocation(vendor: AuthVendor) -> Result<LoginInvocation> {
-    let provider = match vendor {
-        AuthVendor::OpenAi => crate::acp::ProviderCli::Codex,
-    };
+    let provider = bundled_provider(vendor);
     let prepared = crate::acp::prepare_provider_cli(provider, &Default::default())
         .await
         .with_context(|| format!("prepare bundled {} CLI", vendor.label()))?;
-    Ok(LoginInvocation {
+    Ok(login_invocation_from_prepared(prepared))
+}
+
+fn bundled_provider(vendor: AuthVendor) -> crate::acp::ProviderCli {
+    match vendor {
+        AuthVendor::OpenAi => crate::acp::ProviderCli::Codex,
+    }
+}
+
+fn login_invocation_from_prepared(prepared: crate::acp::PreparedProviderCli) -> LoginInvocation {
+    LoginInvocation {
         command: prepared.command,
         args: prepared.args,
         env: prepared.env,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +268,42 @@ mod tests {
         assert_eq!(AuthVendor::ALL, [AuthVendor::OpenAi]);
         assert_eq!(AuthVendor::OpenAi.label(), "OpenAI / ChatGPT");
         assert_eq!(AuthVendor::OpenAi.enables(), "Codex");
+        assert_eq!(AuthVendor::OpenAi.id(), "openai");
+        assert_eq!(AuthVendor::from_id("openai"), Some(AuthVendor::OpenAi));
+        assert_eq!(AuthVendor::from_id("unknown"), None);
+    }
+
+    #[test]
+    fn login_arguments_preserve_bundled_launcher_arguments() {
+        let prepared = crate::acp::PreparedProviderCli {
+            command: PathBuf::from("npx"),
+            args: vec!["--package=codex-acp".to_string(), "codex".to_string()],
+            env: [("NPM_CONFIG_CACHE".to_string(), "/tmp/npm".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let mut invocation = login_invocation_from_prepared(prepared);
+
+        append_login_args(&mut invocation, login_args_for_selection(1));
+
+        assert_eq!(invocation.command, PathBuf::from("npx"));
+        assert_eq!(
+            invocation.args,
+            ["--package=codex-acp", "codex", "login", "--device-auth"]
+        );
+        assert_eq!(invocation.env["NPM_CONFIG_CACHE"], "/tmp/npm");
+
+        let mut browser = LoginInvocation {
+            command: PathBuf::from("npx"),
+            args: Vec::new(),
+            env: Default::default(),
+        };
+        append_login_args(&mut browser, login_args_for_selection(0));
+        assert_eq!(browser.args, ["login"]);
+        assert_eq!(
+            bundled_provider(AuthVendor::OpenAi),
+            crate::acp::ProviderCli::Codex
+        );
     }
 
     #[test]
@@ -266,6 +329,19 @@ mod tests {
         let cancelled = LoginOutcome::Cancelled("cancelled".to_string());
         assert!(matches!(&cancelled, LoginOutcome::Cancelled(_)));
         assert_eq!(cancelled.into_message(), "cancelled");
+
+        let failed = login_outcome_from_status(AuthVendor::OpenAi, false, "exit status: 1", false)
+            .unwrap_err();
+        assert!(failed.to_string().contains("login exited"));
+        let missing =
+            login_outcome_from_status(AuthVendor::OpenAi, true, "success", false).unwrap_err();
+        assert!(missing.to_string().contains("no supported credential"));
+        assert_eq!(
+            login_outcome_from_status(AuthVendor::OpenAi, true, "success", true).unwrap(),
+            LoginOutcome::SignedIn(
+                "Signed in to OpenAI / ChatGPT; adapters reprobe on /new or /clear".to_string()
+            )
+        );
     }
 
     #[test]
@@ -316,6 +392,10 @@ mod tests {
         );
         assert_eq!(
             detect_openai_with(false, false, None),
+            CredentialSource::Missing
+        );
+        assert_eq!(
+            detect_openai_with(false, false, Some(dir.path().join("missing"))),
             CredentialSource::Missing
         );
     }
