@@ -20,6 +20,7 @@ use crate::hel_config::{
 };
 use crate::hel_state::{
     CheckpointMetadata, HelState, SessionRecord, SessionState, TargetLocator, new_session_id,
+    normalize_session_title,
 };
 use crate::hel_targets::{
     self, AdditionalMount, AwsTemplate, CommandExecutor, CommandOutput, CommandSpec,
@@ -122,6 +123,8 @@ impl Controller {
             state: SessionState::Provisioning,
             target: None,
             native_session_id: None,
+            acp_session_title: None,
+            session_title_override: None,
             created_at: now.clone(),
             updated_at: now,
             last_error: None,
@@ -152,6 +155,19 @@ impl Controller {
                 Err(error)
             }
         }
+    }
+
+    pub fn rename_session(&mut self, session_id: &str, title: &str) -> Result<String> {
+        let title = normalize_session_title(title).context("session name cannot be empty")?;
+        let record = self
+            .state
+            .sessions
+            .get_mut(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?;
+        record.session_title_override = Some(title.clone());
+        record.updated_at = now();
+        self.state.save()?;
+        Ok(title)
     }
 
     pub async fn provision_session_with(

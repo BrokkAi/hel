@@ -646,9 +646,9 @@ fn apply_worker_poll_update(
         WorkerPollPayload::Events(events) => {
             if let Some(title) = harness_session_title(&events)
                 && let Some(session) = controller.state.sessions.get_mut(&update.session_id)
-                && session.title != title
+                && session.acp_session_title.as_deref() != Some(&title)
             {
-                session.title = title;
+                session.acp_session_title = Some(title);
                 controller.state.save()?;
                 dashboard.set_state(controller.state.clone());
             }
@@ -764,6 +764,15 @@ async fn run_dashboard() -> Result<()> {
             DashboardAction::RefreshQuotas => {
                 request_dashboard_quota_refresh(&controller, &mut dashboard, &quota_profiles_tx);
                 dashboard.set_notice("Refreshing profile quotas…");
+            }
+            DashboardAction::RenameSession { session_id, title } => {
+                match controller.rename_session(&session_id, &title) {
+                    Ok(title) => {
+                        dashboard.set_state(controller.state.clone());
+                        dashboard.set_notice(format!("Renamed session to {title}"));
+                    }
+                    Err(error) => dashboard.set_notice(format!("Rename failed: {error:#}")),
+                }
             }
             DashboardAction::CompleteMountSource {
                 target_template_id,

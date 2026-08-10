@@ -17,7 +17,9 @@ use ratatui::widgets::{
 
 use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use crate::hel_quota::ProfileQuota;
-use crate::hel_state::{HelState, SessionRecord, SessionState};
+#[cfg(test)]
+use crate::hel_state::SessionState;
+use crate::hel_state::{HelState, SessionRecord};
 use crate::hel_targets::{AdditionalMount, default_mount_destination, path_completion};
 use crate::hel_worker::{SequencedEvent, WorkerEvent};
 
@@ -53,6 +55,10 @@ pub enum DashboardAction {
     },
     ForceDestroy {
         session_id: String,
+    },
+    RenameSession {
+        session_id: String,
+        title: String,
     },
     RefreshQuotas,
     OpenConfig,
@@ -122,6 +128,12 @@ struct ResumeWizard {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct RenameEditor {
+    session_id: String,
+    title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Confirmation {
     Close { session_id: String },
     CloseFailed { session_id: String, error: String },
@@ -133,6 +145,7 @@ enum Mode {
     Dashboard,
     New(NewWizard),
     Resume(ResumeWizard),
+    Rename(RenameEditor),
     Confirm(Confirmation),
 }
 
@@ -283,6 +296,7 @@ impl DashboardState {
             Mode::Dashboard => self.handle_dashboard_key(key.code),
             Mode::New(wizard) => self.handle_new_key(key.code, wizard),
             Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
+            Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
             Mode::Confirm(confirmation) => self.handle_confirmation_key(key.code, confirmation),
         }
     }
@@ -322,7 +336,7 @@ impl DashboardState {
                 if self.focus == Focus::Quotas {
                     DashboardAction::RefreshQuotas
                 } else {
-                    self.begin_resume();
+                    self.begin_rename();
                     DashboardAction::None
                 }
             }
@@ -344,6 +358,56 @@ impl DashboardState {
             }
             KeyCode::Enter | KeyCode::Char('o') => self.open_or_resume(),
             _ => DashboardAction::None,
+        }
+    }
+
+    fn begin_rename(&mut self) {
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        self.mode = Mode::Rename(RenameEditor {
+            session_id: session.id.clone(),
+            title: session
+                .session_title_override
+                .as_ref()
+                .or(session.acp_session_title.as_ref())
+                .cloned()
+                .unwrap_or_default(),
+        });
+    }
+
+    fn handle_rename_key(&mut self, code: KeyCode, mut editor: RenameEditor) -> DashboardAction {
+        match code {
+            KeyCode::Esc => {
+                self.cancel_modal();
+                DashboardAction::None
+            }
+            KeyCode::Enter if editor.title.trim().is_empty() => {
+                self.notice = Some("Session name cannot be empty.".into());
+                self.mode = Mode::Rename(editor);
+                DashboardAction::None
+            }
+            KeyCode::Enter => {
+                self.cancel_modal();
+                DashboardAction::RenameSession {
+                    session_id: editor.session_id,
+                    title: editor.title,
+                }
+            }
+            KeyCode::Backspace => {
+                editor.title.pop();
+                self.mode = Mode::Rename(editor);
+                DashboardAction::None
+            }
+            KeyCode::Char(character) if editor.title.chars().count() < 64 => {
+                editor.title.push(character);
+                self.mode = Mode::Rename(editor);
+                DashboardAction::None
+            }
+            _ => {
+                self.mode = Mode::Rename(editor);
+                DashboardAction::None
+            }
         }
     }
 
@@ -871,10 +935,10 @@ fn partition_sessions<'a>(
     let mut active = Vec::new();
     let mut archived = Vec::new();
     for session in sessions {
-        if session.state == SessionState::Archived {
-            archived.push(session);
-        } else {
+        if session.state.is_active() {
             active.push(session);
+        } else {
+            archived.push(session);
         }
     }
     (active, archived)
@@ -1021,6 +1085,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     match &dashboard.mode {
         Mode::New(wizard) => render_new_wizard(frame, area, dashboard, wizard),
         Mode::Resume(wizard) => render_resume_wizard(frame, area, dashboard, wizard),
+        Mode::Rename(editor) => render_rename_editor(frame, area, editor),
         Mode::Confirm(confirmation) => render_confirmation(frame, area, confirmation),
         Mode::Dashboard => {}
     }
@@ -1063,108 +1128,178 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let width = area.width.saturating_sub(8) as usize;
-    let mut rows = Vec::new();
-    let mut selected_row = None;
-    let mut session_index = 0;
+    let archived_height = (archived.len() as u16 + 3)
+        .max(3)
+        .min(area.height.saturating_sub(3).max(3));
+    let panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(archived_height)])
+        .split(area);
+    let selected_archived = dashboard.session_index >= active.len();
 
-    rows.push(session_section_row("Active", active.len()));
-    for session in active {
-        if session_index == dashboard.session_index {
-            selected_row = Some(rows.len());
-        }
-        rows.push(session_row(
+    let active_rows = active.iter().map(|session| {
+        active_session_row(
             session,
             dashboard.session_details.get(&session.id),
             now_epoch_seconds,
-            width,
-        ));
-        session_index += 1;
-    }
-    if !archived.is_empty() {
-        rows.push(session_section_row("Archived", archived.len()));
-        for session in archived {
-            if session_index == dashboard.session_index {
-                selected_row = Some(rows.len());
-            }
-            rows.push(session_row(
-                session,
-                dashboard.session_details.get(&session.id),
-                now_epoch_seconds,
-                width,
-            ));
-            session_index += 1;
-        }
-    }
-    let title = " Sessions ";
-    let border_type = if dashboard.focus == Focus::Sessions {
-        BorderType::Double
-    } else {
-        BorderType::Plain
-    };
-    let table = Table::new(rows, [Constraint::Percentage(100)])
+        )
+    });
+    let active_table = Table::new(active_rows, session_column_constraints())
+        .header(session_header())
         .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
         .highlight_symbol("› ")
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(border_type)
-                .title(title),
+                .border_type(focus_border(
+                    dashboard.focus == Focus::Sessions && !selected_archived,
+                ))
+                .title(" Active "),
         );
-    let mut state = TableState::default().with_selected(selected_row);
-    frame.render_stateful_widget(table, area, &mut state);
+    let mut active_state = TableState::default()
+        .with_selected((dashboard.session_index < active.len()).then_some(dashboard.session_index));
+    frame.render_stateful_widget(active_table, panes[0], &mut active_state);
+    let active_offset = active_state.offset();
+    for (visible_index, session) in active.iter().skip(active_offset).enumerate() {
+        let detail_y = panes[0].y + 3 + visible_index as u16 * 3;
+        if detail_y >= panes[0].bottom().saturating_sub(1) {
+            break;
+        }
+        let Some(activity) = dashboard
+            .session_details
+            .get(&session.id)
+            .and_then(|detail| detail.activity.as_ref())
+            .map(activity_label)
+        else {
+            continue;
+        };
+        let selected = active_offset + visible_index == dashboard.session_index;
+        let style = if selected {
+            Style::default().fg(Color::Gray).bg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        frame.render_widget(
+            Paragraph::new(truncate_text(
+                &activity,
+                panes[0].width.saturating_sub(4) as usize,
+            ))
+            .style(style),
+            Rect::new(
+                panes[0].x + 3,
+                detail_y,
+                panes[0].width.saturating_sub(4),
+                1,
+            ),
+        );
+    }
+
+    let archived_rows = archived
+        .iter()
+        .map(|session| archived_session_row(session, now_epoch_seconds));
+    let archived_table = Table::new(archived_rows, session_column_constraints())
+        .header(session_header())
+        .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol("› ")
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(focus_border(
+                    dashboard.focus == Focus::Sessions && selected_archived,
+                ))
+                .title(" Archived "),
+        );
+    let mut archived_state = TableState::default().with_selected(
+        selected_archived
+            .then(|| dashboard.session_index.saturating_sub(active.len()))
+            .filter(|index| *index < archived.len()),
+    );
+    frame.render_stateful_widget(archived_table, panes[1], &mut archived_state);
 }
 
-fn session_section_row(label: &str, count: usize) -> Row<'static> {
-    Row::new([Cell::from(format!(" {label} ({count}) "))])
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .height(1)
+fn focus_border(focused: bool) -> BorderType {
+    if focused {
+        BorderType::Double
+    } else {
+        BorderType::Plain
+    }
 }
 
-fn session_row(
+fn session_column_constraints() -> [Constraint; 5] {
+    [
+        Constraint::Length(14),
+        Constraint::Length(18),
+        Constraint::Length(18),
+        Constraint::Length(21),
+        Constraint::Min(24),
+    ]
+}
+
+fn session_header() -> Row<'static> {
+    Row::new([
+        "Turn clock",
+        "Profile",
+        "Target",
+        "Checkpoint",
+        "Session name",
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD))
+}
+
+fn session_values(
     session: &SessionRecord,
     detail: Option<&SessionDetail>,
     now_epoch_seconds: u64,
-    width: usize,
-) -> Row<'static> {
+) -> (String, String, String, String, String) {
     let checkpoint = session
         .checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.created_at.as_str())
         .unwrap_or("never");
-    let summary = format!(
-        "{}  ·  {} / {}  ·  {}  ·  {}  ·  checkpoint {}",
-        session.title,
-        harness_label(session.harness_kind),
-        session.last_profile,
-        session.target_template_id,
-        state_label(session.state),
-        checkpoint,
-    );
     let clock = crate::usage_format::format_turn_clock(
         now_epoch_seconds,
         detail.and_then(|detail| detail.current_turn_started_at),
         detail.and_then(|detail| detail.last_turn_completed_at),
     );
-    let activity = detail
-        .and_then(|detail| detail.activity.as_ref())
-        .map(activity_label);
-    let detail = match activity {
-        Some(activity) => format!("{clock}  ·  {activity}"),
-        None => clock,
-    };
-    Row::new([Cell::from(vec![
-        Line::raw(truncate_text(&summary, width)),
-        Line::styled(
-            truncate_text(&detail, width),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ])])
-    .height(2)
+    (
+        clock,
+        session.last_profile.clone(),
+        session.target_template_id.clone(),
+        checkpoint.to_string(),
+        session_name(session).to_string(),
+    )
+}
+
+fn session_name(session: &SessionRecord) -> &str {
+    session
+        .session_title_override
+        .as_deref()
+        .or(session.acp_session_title.as_deref())
+        .or(session.native_session_id.as_deref())
+        .unwrap_or_default()
+}
+
+fn active_session_row(
+    session: &SessionRecord,
+    detail: Option<&SessionDetail>,
+    now_epoch_seconds: u64,
+) -> Row<'static> {
+    let (clock, profile, target, checkpoint, session_name) =
+        session_values(session, detail, now_epoch_seconds);
+    Row::new([
+        Cell::from(clock),
+        Cell::from(profile),
+        Cell::from(target),
+        Cell::from(checkpoint),
+        Cell::from(session_name),
+    ])
+    .height(3)
+}
+
+fn archived_session_row(session: &SessionRecord, now_epoch_seconds: u64) -> Row<'static> {
+    let (clock, profile, target, checkpoint, session_name) =
+        session_values(session, None, now_epoch_seconds);
+    Row::new([clock, profile, target, checkpoint, session_name])
 }
 
 fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
@@ -1173,15 +1308,12 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         .unwrap_or_default()
         .as_secs();
     let rows = dashboard.config.profiles.iter().map(|(id, profile)| {
-        let (usage, refreshed) = if dashboard.quota_refreshing.contains(id) {
-            ("refreshing".into(), "…".into())
+        let usage = if dashboard.quota_refreshing.contains(id) {
+            "refreshing".into()
         } else {
             match dashboard.quotas.get(id) {
-                Some(quota) => (
-                    quota.compact(),
-                    quota_age(now, quota.refreshed_at_epoch_seconds),
-                ),
-                None => ("refreshing".into(), "…".into()),
+                Some(quota) => quota.compact(),
+                None => "refreshing".into(),
             }
         };
         Row::new([
@@ -1189,10 +1321,26 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
             Cell::from(harness_label(profile.kind)),
             Cell::from(profile.unrestricted_mode()),
             Cell::from(usage),
-            Cell::from(refreshed),
         ])
     });
-    let title = " Profile quotas ";
+    let refresh_status = if !dashboard.quota_refreshing.is_empty() {
+        "refreshing…".to_string()
+    } else {
+        dashboard
+            .quotas
+            .values()
+            .map(|quota| quota.refreshed_at_epoch_seconds)
+            .min()
+            .map(|refreshed| format!("refreshed {}", refresh_age(now, refreshed)))
+            .unwrap_or_else(|| "not refreshed".to_string())
+    };
+    let title = Line::from(vec![
+        Span::raw(" Profile Quotas "),
+        Span::styled(
+            format!("({refresh_status}) "),
+            Style::default().fg(Color::Gray),
+        ),
+    ]);
     let border_type = if dashboard.focus == Focus::Quotas {
         BorderType::Double
     } else {
@@ -1204,19 +1352,12 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
             Constraint::Percentage(14),
             Constraint::Percentage(12),
             Constraint::Percentage(18),
-            Constraint::Percentage(44),
-            Constraint::Percentage(12),
+            Constraint::Percentage(56),
         ],
     )
     .header(
-        Row::new([
-            "Profile",
-            "Harness",
-            "Access",
-            "Quota / reset / error",
-            "Refreshed",
-        ])
-        .style(Style::default().add_modifier(Modifier::BOLD)),
+        Row::new(["Profile", "Harness", "Access", "Quota / reset / error"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
     .highlight_symbol("› ")
@@ -1233,7 +1374,7 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
 
 fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     let text = dashboard.notice.as_deref().unwrap_or(
-        "n new · Enter open/resume · p checkpoint · c close · u quota · Tab pane · q detach",
+        "n new · Enter open/resume · r rename · p checkpoint · c close · u quota · Tab pane · q detach",
     );
     let style = if dashboard.notice.is_some() {
         Style::default().fg(Color::Yellow)
@@ -1503,6 +1644,25 @@ fn render_picker(
     );
 }
 
+fn render_rename_editor(frame: &mut Frame, area: Rect, editor: &RenameEditor) {
+    let popup = centered_rect(60, 7, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw(format!("Session: {}", editor.session_id)),
+            Line::raw(""),
+            Line::styled(editor.title.clone(), Style::default().fg(Color::Cyan)),
+            Line::styled("Enter save · Esc cancel", Style::default().fg(Color::Gray)),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Rename session "),
+        ),
+        popup,
+    );
+}
+
 fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmation) {
     let popup = centered_rect(
         72,
@@ -1621,21 +1781,7 @@ fn mount_history_host(target: &TargetTemplate) -> Option<&str> {
     }
 }
 
-fn state_label(state: SessionState) -> &'static str {
-    match state {
-        SessionState::Provisioning => "provisioning",
-        SessionState::Running => "running",
-        SessionState::Disconnected => "disconnected",
-        SessionState::Checkpointing => "checkpointing",
-        SessionState::Closing => "closing",
-        SessionState::Archived => "archived",
-        SessionState::Lost => "lost",
-        SessionState::Error => "error",
-        SessionState::DestroyedWithDataLoss => "data lost",
-    }
-}
-
-fn quota_age(now: u64, refreshed: u64) -> String {
+fn refresh_age(now: u64, refreshed: u64) -> String {
     if refreshed == 0 {
         return "unknown".into();
     }
@@ -1647,11 +1793,7 @@ fn quota_age(now: u64, refreshed: u64) -> String {
     } else {
         (age / 3_600, "h")
     };
-    if age > 15 * 60 {
-        format!("stale · {value}{unit}")
-    } else {
-        format!("{value}{unit} ago")
-    }
+    format!("{value}{unit} ago")
 }
 
 #[cfg(test)]
@@ -1748,6 +1890,8 @@ mod tests {
             state: SessionState::Archived,
             target: None,
             native_session_id: Some("native-1".into()),
+            acp_session_title: Some("ACP pretty name".into()),
+            session_title_override: None,
             created_at: "2026-08-09T00:00:00Z".into(),
             updated_at: "2026-08-09T01:00:00Z".into(),
             last_error: None,
@@ -1774,16 +1918,20 @@ mod tests {
     }
 
     #[test]
-    fn archived_section_partitions_sessions_without_losing_selection_order() {
+    fn archived_pane_includes_terminal_sessions_without_losing_selection_order() {
         let mut running = archived_session();
         running.id = "session-0".into();
         running.state = SessionState::Running;
         let archived = archived_session();
+        let mut lost = archived_session();
+        lost.id = "session-2".into();
+        lost.state = SessionState::Lost;
         let state = HelState {
             version: STATE_VERSION,
             sessions: BTreeMap::from([
                 (running.id.clone(), running),
                 (archived.id.clone(), archived),
+                (lost.id.clone(), lost),
             ]),
             mount_history: BTreeMap::new(),
         };
@@ -1800,7 +1948,7 @@ mod tests {
                 .iter()
                 .map(|session| session.id.as_str())
                 .collect::<Vec<_>>(),
-            ["session-1"]
+            ["session-1", "session-2"]
         );
 
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
@@ -1879,7 +2027,7 @@ mod tests {
     #[test]
     fn resume_can_convert_to_another_harness() {
         let mut dashboard = dashboard_with_session(archived_session());
-        dashboard.handle_key(key(KeyCode::Char('r')));
+        dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
@@ -1889,6 +2037,34 @@ mod tests {
                 target_template_id: "podman".into(),
             }
         );
+    }
+
+    #[test]
+    fn rename_uses_acp_title_as_the_initial_value() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.handle_key(key(KeyCode::Char('r')));
+        for character in " v2".chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::RenameSession {
+                session_id: "session-1".into(),
+                title: "ACP pretty name v2".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn session_name_prefers_override_then_acp_title_then_uuid() {
+        let mut session = archived_session();
+        assert_eq!(session_name(&session), "ACP pretty name");
+
+        session.acp_session_title = None;
+        assert_eq!(session_name(&session), "native-1");
+
+        session.session_title_override = Some("My name".into());
+        assert_eq!(session_name(&session), "My name");
     }
 
     #[test]
@@ -1908,7 +2084,7 @@ mod tests {
     #[test]
     fn resume_profile_step_marks_cross_harness_profiles_as_lossy() {
         let mut dashboard = dashboard_with_session(archived_session());
-        dashboard.handle_key(key(KeyCode::Char('r')));
+        dashboard.handle_key(key(KeyCode::Enter));
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -1928,7 +2104,9 @@ mod tests {
 
     #[test]
     fn activity_snippet_collapses_newlines_to_spaces_when_rendered() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
         dashboard.apply_worker_events(
             "session-1",
             &[SequencedEvent {
@@ -1961,6 +2139,14 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("agent: a b c"));
+        assert!(rendered.contains("Turn clock"));
+        assert!(rendered.contains("Profile"));
+        assert!(rendered.contains("Target"));
+        assert!(rendered.contains("Checkpoint"));
+        assert!(rendered.contains("Session name"));
+        assert!(rendered.contains("ACP pretty name"));
+        assert!(!rendered.contains("native-1"));
+        assert!(!rendered.contains("Raise the dead"));
     }
 
     #[test]
@@ -2020,7 +2206,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("╔ Sessions"));
+        assert!(rendered.contains("╔ Archived"));
+        assert!(rendered.contains("┌ Active"));
         assert!(!rendered.contains("[focused]"));
 
         dashboard.handle_key(key(KeyCode::Tab));
@@ -2034,7 +2221,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("╔ Profile quotas"));
+        assert!(rendered.contains("╔ Profile Quotas"));
         assert!(!rendered.contains("[focused]"));
     }
 
@@ -2062,7 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_render_includes_errors_and_stale_refresh_age() {
+    fn quota_render_includes_errors_and_refresh_age_in_title() {
         let mut dashboard = DashboardState::new(
             config(),
             HelState::default(),
@@ -2091,6 +2278,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("unavailable: offline"));
-        assert!(rendered.contains("stale"));
+        assert!(rendered.contains("Profile Quotas (refreshed"));
+        assert!(!rendered.contains("Refreshed"));
     }
 }

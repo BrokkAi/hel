@@ -1,6 +1,6 @@
 //! Shared formatting for provider quota and rate-limit displays.
 
-use chrono::{DateTime, Datelike, FixedOffset, Local, NaiveDate, NaiveTime, TimeZone};
+use chrono::{DateTime, Datelike, Days, FixedOffset, Local, NaiveDate, NaiveTime, TimeZone};
 
 /// Format a Unix reset timestamp as wall-clock time in the machine's local
 /// time zone. Accepts seconds or milliseconds and rejects non-finite or
@@ -23,9 +23,13 @@ pub(crate) fn format_reset_local_seconds(epoch: i64) -> Option<String> {
 }
 
 /// Normalize a provider's textual reset value to the compact 24-hour form
-/// used by the dashboard. Values without both a date and a time are left out:
-/// showing a precise-looking but guessed reset is worse than omitting it.
+/// used by the dashboard. A time-only value is the next occurrence of that
+/// wall-clock time; Claude Code uses this shape for its five-hour window.
 pub(crate) fn normalize_reset_text(value: &str) -> Option<String> {
+    normalize_reset_text_at(value, Local::now().fixed_offset())
+}
+
+fn normalize_reset_text_at(value: &str, now: DateTime<FixedOffset>) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
         return None;
@@ -45,17 +49,59 @@ pub(crate) fn normalize_reset_text(value: &str) -> Option<String> {
         .split('(')
         .next()
         .unwrap_or(value)
-        .trim();
-    let (date, time) = value.split_once(" at ")?;
-    let year = Local::now().year();
-    let date = NaiveDate::parse_from_str(&format!("{date} {year}"), "%b %e %Y").ok()?;
-    let time = ["%I:%M%P", "%I%P", "%H:%M"]
-        .iter()
-        .find_map(|format| NaiveTime::parse_from_str(time.trim(), format).ok())?;
-    Local
+        .trim()
+        .trim_end_matches(',');
+    let parse_time = |value: &str| {
+        let value = value
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>();
+        let value = ["am", "pm"]
+            .into_iter()
+            .find_map(|suffix| {
+                let hour = value.strip_suffix(suffix)?;
+                (!hour.contains(':')).then(|| format!("{hour}:00{suffix}"))
+            })
+            .unwrap_or(value);
+        ["%I:%M%P", "%I%P", "%H:%M"]
+            .iter()
+            .find_map(|format| NaiveTime::parse_from_str(&value, format).ok())
+    };
+
+    if let Some((date, time)) = value.split_once(" at ") {
+        let time = parse_time(time.trim())?;
+        let date = date.trim().trim_end_matches(',');
+        let date = match date.to_ascii_lowercase().as_str() {
+            "today" => now.date_naive(),
+            "tomorrow" => now.date_naive().checked_add_days(Days::new(1))?,
+            _ => NaiveDate::parse_from_str(
+                &format!("{} {}", date.replace(',', ""), now.year()),
+                "%b %e %Y",
+            )
+            .ok()?,
+        };
+        return now
+            .timezone()
+            .from_local_datetime(&date.and_time(time))
+            .single()
+            .map(format_reset_label);
+    }
+
+    let time = parse_time(value)?;
+    let mut date = now.date_naive();
+    let mut reset = now
+        .timezone()
         .from_local_datetime(&date.and_time(time))
-        .single()
-        .map(|timestamp| format_reset_label(timestamp.fixed_offset()))
+        .single()?;
+    if reset <= now {
+        date = date.checked_add_days(Days::new(1))?;
+        reset = now
+            .timezone()
+            .from_local_datetime(&date.and_time(time))
+            .single()?;
+    }
+    Some(format_reset_label(reset))
 }
 
 /// Render a session's current-turn or idle clock from wall-clock seconds.
@@ -113,6 +159,23 @@ mod tests {
         assert_eq!(
             format_reset_local(seconds),
             format_reset_local_seconds(seconds as i64)
+        );
+    }
+
+    #[test]
+    fn time_only_reset_is_rendered_as_the_next_datetime() {
+        let zone = FixedOffset::west_opt(5 * 3_600).expect("offset");
+        let now = zone
+            .with_ymd_and_hms(2026, 8, 10, 14, 0, 0)
+            .single()
+            .expect("now");
+        assert_eq!(
+            normalize_reset_text_at("3:30 PM (America/Chicago)", now).as_deref(),
+            Some("15:30 Aug 10")
+        );
+        assert_eq!(
+            normalize_reset_text_at("at 1pm (America/Chicago)", now).as_deref(),
+            Some("13:00 Aug 11")
         );
     }
 

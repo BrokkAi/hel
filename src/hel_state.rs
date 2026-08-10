@@ -151,6 +151,10 @@ pub struct SessionRecord {
     pub target: Option<TargetLocator>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_session_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_title_override: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,6 +178,17 @@ impl SessionRecord {
         validate_additional_mounts(&self.additional_mounts)?;
         if self.title.trim().is_empty() {
             bail!("session {:?} has an empty title", self.id);
+        }
+        if self
+            .acp_session_title
+            .as_ref()
+            .is_some_and(|title| title.trim().is_empty())
+            || self
+                .session_title_override
+                .as_ref()
+                .is_some_and(|title| title.trim().is_empty())
+        {
+            bail!("session {:?} has an empty display title", self.id);
         }
         if self.created_at.trim().is_empty() || self.updated_at.trim().is_empty() {
             bail!("session {:?} has an empty timestamp", self.id);
@@ -330,18 +345,9 @@ pub fn new_session_id() -> Result<String> {
     Ok(encoded)
 }
 
-/// Return a clean display title from a batch of canonical worker events.
-/// Session-info updates are standard ACP; Codex also emits title/summary-shaped
-/// extension updates in some bridge versions. When a harness has not supplied
-/// a title distinct from the initial prompt, the prompt is a useful fallback.
+/// Return the newest clean ACP session title from canonical worker events.
 pub fn harness_session_title(events: &[SequencedEvent]) -> Option<String> {
-    let first_prompt = events.iter().find_map(|event| {
-        let WorkerEvent::PromptAccepted { text, .. } = &event.event else {
-            return None;
-        };
-        normalize_session_title(text)
-    });
-    let harness_title = events.iter().rev().find_map(|event| {
+    events.iter().rev().find_map(|event| {
         let WorkerEvent::Adapter { payload, .. } = &event.event else {
             return None;
         };
@@ -357,24 +363,13 @@ pub fn harness_session_title(events: &[SequencedEvent]) -> Option<String> {
             "session_info_update" | "session_title" => {
                 update.get("title").and_then(serde_json::Value::as_str)
             }
-            "session_summary" => update
-                .get("title")
-                .or_else(|| update.get("summary"))
-                .and_then(serde_json::Value::as_str),
             _ => None,
         }?;
         normalize_session_title(title)
-    });
-
-    match (harness_title, first_prompt) {
-        (Some(title), Some(prompt)) if title != prompt => Some(title),
-        (Some(_), Some(prompt)) | (None, Some(prompt)) => Some(prompt),
-        (Some(title), None) => Some(title),
-        (None, None) => None,
-    }
+    })
 }
 
-fn normalize_session_title(title: &str) -> Option<String> {
+pub(crate) fn normalize_session_title(title: &str) -> Option<String> {
     const MAX_TITLE_CHARS: usize = 64;
 
     let words = title.split_whitespace().collect::<Vec<_>>();
@@ -431,6 +426,8 @@ mod tests {
                 container_id: "afb67d".into(),
             }),
             native_session_id: Some("native-1".into()),
+            acp_session_title: Some("Build Hel".into()),
+            session_title_override: None,
             created_at: "2026-08-09T12:00:00Z".into(),
             updated_at: "2026-08-09T12:01:00Z".into(),
             last_error: None,
@@ -602,12 +599,12 @@ mod tests {
 
         assert_eq!(
             harness_session_title(&events).as_deref(),
-            Some("Build the dashboard")
+            Some("First title")
         );
     }
 
     #[test]
-    fn harness_title_falls_back_to_a_clean_truncated_first_prompt() {
+    fn extension_session_title_is_cleaned_and_truncated() {
         let first_prompt = format!("{}overflow", "word ".repeat(20));
         let expected = format!("{}word…", "word ".repeat(11));
         let events = vec![
@@ -640,6 +637,21 @@ mod tests {
             harness_session_title(&events).as_deref(),
             Some(expected.as_str())
         );
+    }
+
+    #[test]
+    fn first_prompt_is_not_used_as_an_acp_session_title() {
+        let events = vec![SequencedEvent {
+            seq: 1,
+            request_id: Some("prompt-1".into()),
+            event: WorkerEvent::PromptAccepted {
+                request_id: "prompt-1".into(),
+                text: "Do not use me as a title".into(),
+                attachments: vec![],
+            },
+        }];
+
+        assert_eq!(harness_session_title(&events), None);
     }
 
     #[test]

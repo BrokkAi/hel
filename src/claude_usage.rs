@@ -632,6 +632,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_reset_from_following_table_row() {
+        let report = parse(
+            r#"
+            Current session
+            12% used
+            Resets 4:30pm (America/Chicago)
+            Current week (all models)
+            37% used
+            Resets Aug 14 at 9am (America/Chicago)
+            "#,
+        )
+        .expect("report");
+
+        assert_eq!(
+            report.five_hour.unwrap().reset_context.as_deref(),
+            Some("4:30pm (America/Chicago)")
+        );
+        assert_eq!(
+            report.week.unwrap().reset_context.as_deref(),
+            Some("Aug 14 at 9am (America/Chicago)")
+        );
+    }
+
+    #[test]
     fn prefers_global_week_over_model_specific_week() {
         let report = parse(
             r#"

@@ -165,7 +165,12 @@ impl ViewerSnapshot {
             .values()
             .map(|session| ViewerSession {
                 id: session.id.clone(),
-                title: session.title.clone(),
+                title: session
+                    .session_title_override
+                    .as_ref()
+                    .or(session.acp_session_title.as_ref())
+                    .cloned()
+                    .unwrap_or_else(|| session.title.clone()),
                 harness_kind: harness_kind_name(session.harness_kind).into(),
                 profile_id: session.last_profile.clone(),
                 bundle_id: session.bundle_id.clone(),
@@ -882,6 +887,8 @@ mod tests {
                     state: SessionState::Running,
                     target: None,
                     native_session_id: Some("native-secret-id".into()),
+                    acp_session_title: Some("Build Hel".into()),
+                    session_title_override: None,
                     created_at: "now".into(),
                     updated_at: "now".into(),
                     last_error: Some("secret-token at /highly/secret/codex".into()),
