@@ -36,6 +36,10 @@ pub enum ChatAction {
 pub enum ChatRole {
     User,
     Agent,
+    /// Agent reasoning stream, rendered dimmed.
+    Thought,
+    /// Tool invocation titles.
+    Tool,
     System,
 }
 
@@ -193,15 +197,7 @@ impl ChatState {
             return;
         };
         match runtime {
-            RuntimeEvent::SessionUpdate { update } => {
-                for text in extract_text(&update) {
-                    self.entries.push(ChatEntry {
-                        seq,
-                        role: ChatRole::Agent,
-                        text,
-                    });
-                }
-            }
+            RuntimeEvent::SessionUpdate { update } => self.apply_session_update(seq, &update),
             RuntimeEvent::Warning { message } => self.entries.push(ChatEntry {
                 seq,
                 role: ChatRole::System,
@@ -218,6 +214,73 @@ impl ChatState {
             }),
             _ => {}
         }
+    }
+
+    /// Project one ACP `session/update` notification into the transcript.
+    /// Streamed message and thought chunks coalesce into the previous entry of
+    /// the same role so tokens don't each become their own transcript line.
+    fn apply_session_update(&mut self, seq: u64, update: &serde_json::Value) {
+        let Some(object) = update.as_object() else {
+            return;
+        };
+        for (kind, body) in [
+            ("agent_message_chunk", ChatRole::Agent),
+            ("agent_thought_chunk", ChatRole::Thought),
+        ] {
+            if let Some(chunk) = object.get(kind) {
+                let text = chunk
+                    .get("content")
+                    .and_then(|content| content.get("text"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    self.push_streamed(seq, body, text);
+                }
+                return;
+            }
+        }
+        if let Some(call) = object.get("tool_call") {
+            let title = call
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool call");
+            self.entries.push(ChatEntry {
+                seq,
+                role: ChatRole::Tool,
+                text: title.to_owned(),
+            });
+            return;
+        }
+        if object.contains_key("tool_call_update")
+            || object.contains_key("plan")
+            || object.contains_key("available_commands_update")
+            || object.contains_key("current_mode_update")
+        {
+            return;
+        }
+        // Unknown update shapes keep the permissive text projection.
+        for text in extract_text(update) {
+            self.entries.push(ChatEntry {
+                seq,
+                role: ChatRole::Agent,
+                text,
+            });
+        }
+    }
+
+    fn push_streamed(&mut self, seq: u64, role: ChatRole, text: &str) {
+        if let Some(last) = self.entries.last_mut()
+            && last.role == role
+        {
+            last.seq = seq;
+            last.text.push_str(text);
+            return;
+        }
+        self.entries.push(ChatEntry {
+            seq,
+            role,
+            text: text.to_owned(),
+        });
     }
 }
 
@@ -403,12 +466,23 @@ fn render_transcript(frame: &mut Frame, area: Rect, chat: &ChatState) {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
+            ChatRole::Thought => (
+                "think",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            ChatRole::Tool => ("tool", Style::default().fg(Color::Yellow)),
             ChatRole::System => ("hel", Style::default().fg(Color::DarkGray)),
         };
+        let mut text_lines = entry.text.lines();
         lines.push(Line::from(vec![
             Span::styled(format!("{label}> "), style),
-            Span::raw(entry.text.clone()),
+            Span::raw(text_lines.next().unwrap_or_default().to_owned()),
         ]));
+        for continuation in text_lines {
+            lines.push(Line::raw(continuation.to_owned()));
+        }
         lines.push(Line::raw(""));
     }
     let line_count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
@@ -551,6 +625,50 @@ mod tests {
         assert_eq!(chat.entries.len(), 2);
         assert_eq!(chat.entries[0].role, ChatRole::User);
         assert_eq!(chat.entries[1].text, "done");
+    }
+
+    #[test]
+    fn streamed_message_chunks_coalesce_into_one_entry() {
+        let mut initial = snapshot();
+        initial.latest_seq = 0;
+        let mut chat = ChatState::new(&initial, &[]);
+        for (seq, text) in [(1, "gpt"), (2, "-5.6"), (3, "-terra")] {
+            chat.apply_session_update(
+                seq,
+                &serde_json::json!({
+                    "agent_message_chunk": {"content": {"type": "text", "text": text}}
+                }),
+            );
+        }
+        chat.apply_session_update(
+            4,
+            &serde_json::json!({
+                "agent_thought_chunk": {"content": {"type": "text", "text": "hmm"}}
+            }),
+        );
+        assert_eq!(chat.entries.len(), 2);
+        assert_eq!(chat.entries[0].role, ChatRole::Agent);
+        assert_eq!(chat.entries[0].text, "gpt-5.6-terra");
+        assert_eq!(chat.entries[1].role, ChatRole::Thought);
+    }
+
+    #[test]
+    fn tool_calls_render_title_and_updates_stay_quiet() {
+        let mut initial = snapshot();
+        initial.latest_seq = 0;
+        let mut chat = ChatState::new(&initial, &[]);
+        chat.apply_session_update(
+            1,
+            &serde_json::json!({"tool_call": {"title": "grep config", "status": "pending"}}),
+        );
+        chat.apply_session_update(
+            2,
+            &serde_json::json!({"tool_call_update": {"status": "completed",
+                "content": [{"type": "content", "content": {"type": "text", "text": "noise"}}]}}),
+        );
+        assert_eq!(chat.entries.len(), 1);
+        assert_eq!(chat.entries[0].role, ChatRole::Tool);
+        assert_eq!(chat.entries[0].text, "grep config");
     }
 
     #[test]
