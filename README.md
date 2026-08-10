@@ -24,6 +24,27 @@ cargo build --release
 ./target/release/hel
 ```
 
+For a local Podman target, build the agent-development image with:
+
+```console
+podman build --pull=always \
+  --file containers/Containerfile.agent-dev \
+  --tag localhost/hel/agent-dev:latest \
+  containers
+```
+
+The image includes Rust, Node 24, Git, the Codex ACP bridge, and the Claude ACP
+bridge. Hel copies its worker and the selected harness profile into each new
+container. Kimi Code uses Hel's official on-demand installer fallback.
+
+Configure it as a target with:
+
+```toml
+[targets.podman]
+kind = "local-podman"
+image = "localhost/hel/agent-dev:latest"
+```
+
 `hel` opens the session/quota dashboard. `q` or Back detaches; it does not stop
 the target-side worker. `hel server` explicitly starts the authenticated phone
 controller. It binds only to loopback unless direct TLS is configured:

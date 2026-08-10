@@ -1,0 +1,62 @@
+ARG NODE_IMAGE=docker.io/library/node:24-bookworm
+ARG RUST_IMAGE=docker.io/library/rust:1-bookworm
+
+FROM ${NODE_IMAGE} AS node
+FROM ${RUST_IMAGE}
+
+LABEL org.opencontainers.image.title="Hel agent development environment" \
+      org.opencontainers.image.source="https://github.com/BrokkAi/hel"
+
+# The Node image and Rust image share the Bookworm base. Copying /usr/local
+# brings in Node, npm, npx, Corepack, and the headers needed by native modules.
+COPY --from=node /usr/local/ /usr/local/
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        bash \
+        build-essential \
+        ca-certificates \
+        clang \
+        cmake \
+        curl \
+        fd-find \
+        file \
+        git \
+        jq \
+        less \
+        libssl-dev \
+        musl-tools \
+        openssh-client \
+        patch \
+        pkg-config \
+        procps \
+        python3 \
+        python3-pip \
+        python3-venv \
+        ripgrep \
+        sudo \
+        unzip \
+        zip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Keep these in lockstep with bridge_launch() in src/hel_controller.rs. Kimi is
+# intentionally left to Hel's official on-demand installer because that path is
+# not version-pinned yet.
+RUN npm install --global --no-audit --no-fund \
+        @agentclientprotocol/codex-acp@1.1.4 \
+        @agentclientprotocol/claude-agent-acp@0.63.0 \
+    && npm cache clean --force
+
+RUN rustup component add clippy rustfmt \
+    && rustup target add x86_64-unknown-linux-musl
+
+RUN mkdir -p /workspace /var/lib/hel \
+    && chmod 0755 /workspace /var/lib/hel
+
+ENV SHELL=/bin/bash
+WORKDIR /workspace
+
+# Hel overrides the command with the same keepalive, but retaining it here also
+# makes the image convenient to inspect directly.
+STOPSIGNAL SIGKILL
+CMD ["sleep", "infinity"]
