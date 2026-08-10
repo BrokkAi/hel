@@ -194,10 +194,15 @@ pub fn export_checkpoint_with_git(
     let spec = &resolved;
     validate_export_spec(spec)?;
     let (canonical_events, event_sequence) = collect_canonical_events(&spec.worker_root)?;
+    // A session that never accepted a prompt legitimately has no native
+    // harness artifacts yet; requiring them would make an unused session
+    // impossible to close cleanly.
+    let prompted = events_contain_prompt(&canonical_events);
     let native_artifacts = collect_native_artifacts(
         spec.session.harness_kind,
         &spec.harness_home,
         &spec.session.native_session_id,
+        !prompted,
     )?;
     let mut repositories = Vec::with_capacity(spec.repositories.len());
     for repository in &spec.repositories {
@@ -267,6 +272,17 @@ fn validate_export_spec(spec: &CheckpointExportSpec) -> Result<()> {
     Ok(())
 }
 
+fn events_contain_prompt(canonical_events: &[u8]) -> bool {
+    canonical_events.split(|byte| *byte == b'\n').any(|line| {
+        serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|event| {
+            event
+                .pointer("/event/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("prompt_accepted")
+        })
+    })
+}
+
 fn collect_canonical_events(worker_root: &Path) -> Result<(Vec<u8>, u64)> {
     let path = worker_root.join("events.jsonl");
     let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
@@ -278,6 +294,7 @@ pub fn collect_native_artifacts(
     harness: HarnessKind,
     home: &Path,
     session_id: &str,
+    allow_empty: bool,
 ) -> Result<Vec<NativeArtifact>> {
     validate_component(session_id, "native session ID")?;
     let roots: &[&str] = match harness {
@@ -294,7 +311,7 @@ pub fn collect_native_artifacts(
     }
     output.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     ensure!(
-        !output.is_empty(),
+        allow_empty || !output.is_empty(),
         "no allowlisted native session artifacts found"
     );
     let total = output
@@ -888,6 +905,27 @@ mod tests {
     }
 
     #[test]
+    fn empty_native_artifacts_allowed_only_for_unprompted_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = collect_native_artifacts(HarnessKind::Codex, temp.path(), NATIVE, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no allowlisted native session artifacts"));
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Codex, temp.path(), NATIVE, true).unwrap();
+        assert!(artifacts.is_empty());
+    }
+
+    #[test]
+    fn prompt_detection_reads_canonical_event_type() {
+        let prompted = br#"{"seq":1,"event":{"type":"adapter","data":{"kind":"x","payload":{}}}}
+{"seq":2,"event":{"type":"prompt_accepted","data":{"request_id":"p","text":"hi","attachments":[]}}}"#;
+        assert!(events_contain_prompt(prompted));
+        let unprompted = br#"{"seq":1,"event":{"type":"adapter","data":{"kind":"x","payload":{}}}}"#;
+        assert!(!events_contain_prompt(unprompted));
+    }
+
+    #[test]
     fn native_allowlist_excludes_credentials_and_other_sessions() {
         let temp = tempfile::tempdir().unwrap();
         let session = temp.path().join("sessions/workspace").join(NATIVE);
@@ -898,7 +936,7 @@ mod tests {
         let other = temp.path().join("sessions/workspace/other");
         fs::create_dir_all(&other).unwrap();
         fs::write(other.join("state.json"), b"other").unwrap();
-        let artifacts = collect_native_artifacts(HarnessKind::Kimi, temp.path(), NATIVE).unwrap();
+        let artifacts = collect_native_artifacts(HarnessKind::Kimi, temp.path(), NATIVE, false).unwrap();
         assert_eq!(artifacts.len(), 2);
         assert!(
             artifacts
@@ -924,7 +962,7 @@ mod tests {
         fs::write(project.join("other-session.jsonl"), b"other").unwrap();
         fs::write(project.join("settings.json"), b"secret config").unwrap();
 
-        let artifacts = collect_native_artifacts(HarnessKind::Claude, temp.path(), NATIVE).unwrap();
+        let artifacts = collect_native_artifacts(HarnessKind::Claude, temp.path(), NATIVE, false).unwrap();
         assert_eq!(artifacts.len(), 2);
         assert!(
             artifacts

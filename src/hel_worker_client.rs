@@ -21,6 +21,10 @@ pub struct WorkerClient {
     input: ChildStdin,
     output: Lines<BufReader<ChildStdout>>,
     next_request: u64,
+    /// Random per-connection component of request IDs. The worker's
+    /// idempotency ledger outlives connections, so a counter alone would
+    /// collide when the same controller process reconnects.
+    connection_nonce: u64,
     protocol_version: u32,
     session_id: String,
     latest_seq: u64,
@@ -53,11 +57,15 @@ impl WorkerClient {
             .stdout
             .take()
             .context("worker proxy stdout unavailable")?;
+        let mut nonce_bytes = [0_u8; 8];
+        getrandom::fill(&mut nonce_bytes)
+            .map_err(|error| anyhow!("generate worker request nonce: {error}"))?;
         let mut client = Self {
             child,
             input,
             output: BufReader::new(output).lines(),
             next_request: 1,
+            connection_nonce: u64::from_le_bytes(nonce_bytes),
             protocol_version: PROTOCOL_VERSION,
             session_id: String::new(),
             latest_seq: 0,
@@ -202,7 +210,10 @@ impl WorkerClient {
     }
 
     fn request_id(&mut self) -> String {
-        let id = format!("hel-{}-{}", std::process::id(), self.next_request);
+        let id = format!(
+            "hel-{:016x}-{}",
+            self.connection_nonce, self.next_request
+        );
         self.next_request = self.next_request.wrapping_add(1);
         id
     }
