@@ -878,7 +878,9 @@ async fn run_dashboard() -> Result<()> {
                 match controller.close_session(&session_id).await {
                     Ok(()) => dashboard
                         .set_notice(format!("Archived and closed {}", short_id(&session_id))),
-                    Err(error) => dashboard.set_notice(format!("Close blocked: {error:#}")),
+                    Err(error) => {
+                        dashboard.show_close_failure(session_id.clone(), format!("{error:#}"))
+                    }
                 }
                 dashboard.set_state(controller.state.clone());
                 worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
