@@ -1448,6 +1448,8 @@ fn ensure_node_script() -> &'static str {
     "if ! command -v npx >/dev/null 2>&1; then if [ \"$(id -u)\" = 0 ]; then SUDO=''; elif command -v sudo >/dev/null 2>&1 && sudo -n true; then SUDO='sudo'; else echo 'Hel needs Node/npx or passwordless sudo to install it' >&2; exit 127; fi; if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update && $SUDO apt-get install -y nodejs npm; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y nodejs npm; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y nodejs npm; elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache nodejs npm; else echo 'Hel cannot install Node on this image; bake npx or a compatible ACP bridge into it' >&2; exit 127; fi; fi"
 }
 
+const HEL_CONTAINER_ENVIRONMENT: &str = "## Hel container environment\n\nThis session runs in a disposable Hel container. When the session closes, Hel checkpoints everything in project workspace directories (`/workspace/...`), including committed work, staged and unstaged changes, and untracked files.\n\nEverything outside the workspace, including installed packages, `/home/jonathan`, and `/tmp`, is ephemeral and will be lost when the session ends. Keep durable results in the workspace or push them to a remote.\n";
+
 fn stage_profile(profile: &crate::hel_config::HarnessProfile, destination: &Path) -> Result<()> {
     let harness = profile.kind;
     let source = profile.home.as_path();
@@ -1485,7 +1487,8 @@ fn stage_profile(profile: &crate::hel_config::HarnessProfile, destination: &Path
             copy_profile_entry(&from, &destination.join(name))?;
         }
     }
-    apply_profile_overrides(profile, destination)
+    apply_profile_overrides(profile, destination)?;
+    append_hel_container_environment(profile.kind, destination)
 }
 
 /// Apply `model`/`reasoning_effort` overrides to the staged per-session copy
@@ -1537,6 +1540,35 @@ fn apply_profile_overrides(
         // Config validation rejects overrides for Kimi profiles.
         crate::hel_config::HarnessKind::Kimi => {}
     }
+    Ok(())
+}
+
+/// Add the Hel lifecycle guidance only to the staged per-session profile.
+fn append_hel_container_environment(
+    harness: crate::hel_config::HarnessKind,
+    destination: &Path,
+) -> Result<()> {
+    let instructions = match harness {
+        crate::hel_config::HarnessKind::Codex => "AGENTS.md",
+        crate::hel_config::HarnessKind::Claude => "CLAUDE.md",
+        crate::hel_config::HarnessKind::Kimi => "SYSTEM.md",
+    };
+    let path = destination.join(instructions);
+    let separator = match std::fs::read_to_string(&path) {
+        Ok(contents) if !contents.is_empty() && !contents.ends_with('\n') => "\n\n",
+        Ok(contents) if !contents.is_empty() => "\n",
+        Ok(_) => "",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "",
+        Err(error) => return Err(error.into()),
+    };
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open staged harness instructions {}", path.display()))?;
+    file.write_all(separator.as_bytes())?;
+    file.write_all(HEL_CONTAINER_ENVIRONMENT.as_bytes())?;
     Ok(())
 }
 
@@ -2028,6 +2060,64 @@ mod tests {
             source_config.contains("gpt-old"),
             "controller-side home must stay untouched"
         );
+    }
+
+    #[test]
+    fn stage_profile_appends_container_environment_for_each_harness_without_touching_home() {
+        for (kind, instructions) in [
+            (crate::hel_config::HarnessKind::Codex, "AGENTS.md"),
+            (crate::hel_config::HarnessKind::Claude, "CLAUDE.md"),
+            (crate::hel_config::HarnessKind::Kimi, "SYSTEM.md"),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let original = "# Controller instructions\n\nKeep this source unchanged.\n";
+            let source_instructions = home.path().join(instructions);
+            std::fs::write(&source_instructions, original).unwrap();
+            let staged = tempfile::tempdir().unwrap();
+            let profile = crate::hel_config::HarnessProfile {
+                kind,
+                home: home.path().to_path_buf(),
+                executable: None,
+                environment: std::collections::BTreeMap::new(),
+                model: None,
+                reasoning_effort: None,
+            };
+
+            stage_profile(&profile, staged.path()).unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(staged.path().join(instructions)).unwrap(),
+                format!("{original}\n{HEL_CONTAINER_ENVIRONMENT}"),
+                "{instructions} receives the section in the staged profile"
+            );
+            assert_eq!(
+                std::fs::read_to_string(source_instructions).unwrap(),
+                original,
+                "{instructions} in the controller-side home stays untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_profile_creates_missing_staged_container_instructions() {
+        let home = tempfile::tempdir().unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let profile = crate::hel_config::HarnessProfile {
+            kind: crate::hel_config::HarnessKind::Kimi,
+            home: home.path().to_path_buf(),
+            executable: None,
+            environment: std::collections::BTreeMap::new(),
+            model: None,
+            reasoning_effort: None,
+        };
+
+        stage_profile(&profile, staged.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(staged.path().join("SYSTEM.md")).unwrap(),
+            HEL_CONTAINER_ENVIRONMENT
+        );
+        assert!(!home.path().join("SYSTEM.md").exists());
     }
 
     #[test]
