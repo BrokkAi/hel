@@ -100,6 +100,15 @@ impl Coordinator {
         if signal == 0 && SUPPRESSED_INTERRUPTS.load(Ordering::Acquire) > 0 {
             return;
         }
+        // SIGHUP means the controlling terminal is gone. A graceful cancel
+        // cannot work then: crossterm 0.29 busy-loops inside event::read on
+        // the dead tty's EOF, so the UI thread never observes the token and
+        // the process survives as a headless CPU spinner. Exit immediately;
+        // detached workers are unaffected and child proxies exit on EOF.
+        #[cfg(unix)]
+        if signal == libc::SIGHUP {
+            std::process::exit(exit_code(signal));
+        }
         match next_signal_action(&self.signals_seen) {
             SignalAction::Graceful => self.token.cancel(),
             SignalAction::Force => std::process::exit(exit_code(signal)),

@@ -16,7 +16,7 @@ use hel::hel_controller::Controller;
 use hel::hel_quota::{ProfileQuota, QuotaManager};
 use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapshot};
 use hel::hel_setup::{SetupOutcome, run_setup_dialog};
-use hel::hel_state::harness_session_title;
+use hel::hel_state::{SessionState, harness_session_title};
 use hel::hel_targets::{CommandSpec, ProcessExecutor};
 use hel::hel_tui::{DashboardAction, DashboardState, render};
 use hel::hel_worker::SequencedEvent;
@@ -123,8 +123,20 @@ struct WorkerPollTarget {
 #[derive(Debug)]
 struct WorkerPollUpdate {
     session_id: String,
-    events: Vec<SequencedEvent>,
+    payload: WorkerPollPayload,
 }
+
+#[derive(Debug)]
+enum WorkerPollPayload {
+    Events(Vec<SequencedEvent>),
+    /// The worker failed several consecutive polls; the session needs
+    /// attention and a diagnosis.
+    Unreachable { detail: String },
+}
+
+/// Consecutive failed polls before a running session is declared unreachable.
+/// One failure is routinely a transient exec hiccup.
+const WORKER_POLL_FAILURE_THRESHOLD: u32 = 3;
 
 #[derive(Debug, Subcommand)]
 enum WorkerCommand {
@@ -152,6 +164,32 @@ enum WorkerCommand {
     },
 }
 
+/// Record why a worker died where the controller can find it. The daemon's
+/// stdout/stderr go to worker.log; this file is the structured summary read
+/// by `Controller` diagnosis when a worker becomes unreachable.
+fn write_worker_exit_record(root: &std::path::Path, reason: &str) {
+    let record = serde_json::json!({
+        "reason": reason,
+        "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    let _ = std::fs::write(
+        root.join("worker-exit.json"),
+        serde_json::to_vec_pretty(&record).unwrap_or_default(),
+    );
+}
+
+/// Capture panics as last words too; the default hook then prints the
+/// backtrace to stderr, which the launch redirect lands in worker.log.
+fn install_worker_last_words(root: &std::path::Path) {
+    let root = root.to_path_buf();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        write_worker_exit_record(&root, &format!("panic: {info}"));
+        default_hook(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -160,7 +198,12 @@ async fn main() -> Result<()> {
         Some(Command::Server(args)) => run_server(args).await,
         Some(Command::Worker(args)) => match args.command {
             WorkerCommand::Run { root, config } => {
-                run_daemon(root, WorkerLaunchConfig::read(&config)?).await
+                install_worker_last_words(&root);
+                let result = run_daemon(root.clone(), WorkerLaunchConfig::read(&config)?).await;
+                if let Err(error) = &result {
+                    write_worker_exit_record(&root, &format!("{error:#}"));
+                }
+                result
             }
             WorkerCommand::Proxy { root } => proxy(root).await,
             WorkerCommand::ExportCheckpoint { spec } => {
@@ -455,12 +498,14 @@ fn spawn_dashboard_worker_poller() -> (
             std::collections::BTreeMap::new();
         let mut clients: std::collections::BTreeMap<String, (CommandSpec, WorkerClient)> =
             std::collections::BTreeMap::new();
+        let mut failures: std::collections::BTreeMap<String, (u32, String)> =
+            std::collections::BTreeMap::new();
         let mut interval = tokio::time::interval(WORKER_POLL_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if !poll_dashboard_workers(&targets, &mut clients, &updates_tx).await {
+                    if !poll_dashboard_workers(&targets, &mut clients, &mut failures, &updates_tx).await {
                         break;
                     }
                 }
@@ -487,6 +532,7 @@ fn spawn_dashboard_worker_poller() -> (
 async fn poll_dashboard_workers(
     targets: &std::collections::BTreeMap<String, WorkerPollTarget>,
     clients: &mut std::collections::BTreeMap<String, (CommandSpec, WorkerClient)>,
+    failures: &mut std::collections::BTreeMap<String, (u32, String)>,
     updates: &tokio::sync::mpsc::Sender<WorkerPollUpdate>,
 ) -> bool {
     for target in targets.values() {
@@ -496,22 +542,29 @@ async fn poll_dashboard_workers(
             }
             _ => None,
         };
-        match synced {
+        let failure = match synced {
             Some(Ok(Ok(events))) => {
+                failures.remove(&target.session_id);
                 if !events.is_empty()
                     && updates
                         .send(WorkerPollUpdate {
                             session_id: target.session_id.clone(),
-                            events,
+                            payload: WorkerPollPayload::Events(events),
                         })
                         .await
                         .is_err()
                 {
                     return false;
                 }
+                None
             }
-            Some(_) => {
+            Some(Ok(Err(error))) => {
                 clients.remove(&target.session_id);
+                Some(format!("{error:#}"))
+            }
+            Some(Err(_)) => {
+                clients.remove(&target.session_id);
+                Some("worker poll timed out".to_string())
             }
             None => {
                 let connected = tokio::time::timeout(WORKER_POLL_TIMEOUT, async {
@@ -521,19 +574,45 @@ async fn poll_dashboard_workers(
                     Ok::<_, anyhow::Error>((client, bootstrap.events))
                 })
                 .await;
-                if let Ok(Ok((client, events))) = connected {
-                    clients.insert(target.session_id.clone(), (target.spec.clone(), client));
-                    if !events.is_empty()
-                        && updates
-                            .send(WorkerPollUpdate {
-                                session_id: target.session_id.clone(),
-                                events,
-                            })
-                            .await
-                            .is_err()
-                    {
-                        return false;
+                match connected {
+                    Ok(Ok((client, events))) => {
+                        failures.remove(&target.session_id);
+                        clients.insert(target.session_id.clone(), (target.spec.clone(), client));
+                        if !events.is_empty()
+                            && updates
+                                .send(WorkerPollUpdate {
+                                    session_id: target.session_id.clone(),
+                                    payload: WorkerPollPayload::Events(events),
+                                })
+                                .await
+                                .is_err()
+                        {
+                            return false;
+                        }
+                        None
                     }
+                    Ok(Err(error)) => Some(format!("{error:#}")),
+                    Err(_) => Some("worker connect timed out".to_string()),
+                }
+            }
+        };
+        if let Some(detail) = failure {
+            let entry = failures
+                .entry(target.session_id.clone())
+                .or_insert((0, String::new()));
+            entry.0 += 1;
+            entry.1 = detail;
+            if entry.0 == WORKER_POLL_FAILURE_THRESHOLD {
+                let detail = entry.1.clone();
+                if updates
+                    .send(WorkerPollUpdate {
+                        session_id: target.session_id.clone(),
+                        payload: WorkerPollPayload::Unreachable { detail },
+                    })
+                    .await
+                    .is_err()
+                {
+                    return false;
                 }
             }
         }
@@ -563,15 +642,39 @@ fn apply_worker_poll_update(
     dashboard: &mut DashboardState,
     update: WorkerPollUpdate,
 ) -> Result<()> {
-    if let Some(title) = harness_session_title(&update.events)
-        && let Some(session) = controller.state.sessions.get_mut(&update.session_id)
-        && session.title != title
-    {
-        session.title = title;
-        controller.state.save()?;
-        dashboard.set_state(controller.state.clone());
+    match update.payload {
+        WorkerPollPayload::Events(events) => {
+            if let Some(title) = harness_session_title(&events)
+                && let Some(session) = controller.state.sessions.get_mut(&update.session_id)
+                && session.title != title
+            {
+                session.title = title;
+                controller.state.save()?;
+                dashboard.set_state(controller.state.clone());
+            }
+            dashboard.apply_worker_events(&update.session_id, &events, current_epoch_seconds());
+        }
+        WorkerPollPayload::Unreachable { detail } => {
+            let diagnosis = controller.diagnose_worker(&update.session_id);
+            let mut message = format!("worker unreachable: {detail}");
+            if let Some(diagnosis) = diagnosis {
+                message.push_str("; ");
+                message.push_str(&diagnosis);
+            }
+            if let Some(session) = controller.state.sessions.get_mut(&update.session_id)
+                && session.state == SessionState::Running
+            {
+                session.state = SessionState::Error;
+                session.last_error = Some(message.clone());
+                controller.state.save()?;
+                dashboard.set_state(controller.state.clone());
+            }
+            dashboard.set_notice(format!(
+                "Session {}: {message}",
+                &update.session_id[..update.session_id.len().min(8)]
+            ));
+        }
     }
-    dashboard.apply_worker_events(&update.session_id, &update.events, current_epoch_seconds());
     Ok(())
 }
 

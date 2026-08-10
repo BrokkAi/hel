@@ -331,6 +331,17 @@ impl Controller {
         Ok((backend, worker_root))
     }
 
+    /// Collect the dead worker's exit record and log tail for a session whose
+    /// worker has become unreachable. Best-effort; returns None when the
+    /// target no longer exists or has no diagnostics.
+    pub fn diagnose_worker(&self, session_id: &str) -> Option<String> {
+        let session = self.state.sessions.get(session_id)?;
+        let locator = session.target.as_ref()?;
+        let backend = backend_locator(locator, session, &self.config).ok()?;
+        let worker_root = hel_targets::worker_root(&backend, session_id).ok()?;
+        worker_last_words(&ProcessExecutor, &backend, &worker_root)
+    }
+
     pub fn reconnect_command(&self, session_id: &str) -> Result<CommandSpec> {
         let session = self
             .state
@@ -1846,36 +1857,29 @@ fn start_worker(
         ]),
         hel_targets::join_remote_command(&[format!("{worker_root}/worker.log")]),
     );
+    // Redirect daemon output to worker.log in every launch mode; an
+    // unexplained dead worker is undebuggable without it.
+    let exec_script = format!(
+        "exec {} >{} 2>&1",
+        hel_targets::join_remote_command(&[
+            binary.clone(),
+            "worker".into(),
+            "run".into(),
+            "--root".into(),
+            worker_root.into(),
+            "--config".into(),
+            config.clone(),
+        ]),
+        hel_targets::join_remote_command(&[format!("{worker_root}/worker.log")]),
+    );
     let command = match locator {
         hel_targets::TargetLocator::LocalPodman { container_id } => CommandSpec::new(
             "podman",
-            [
-                "exec",
-                "--detach",
-                container_id,
-                &binary,
-                "worker",
-                "run",
-                "--root",
-                worker_root,
-                "--config",
-                &config,
-            ],
+            ["exec", "--detach", container_id, "sh", "-c", &exec_script],
         ),
         hel_targets::TargetLocator::AppleContainer { container_id } => CommandSpec::new(
             "container",
-            [
-                "exec",
-                "--detach",
-                container_id,
-                &binary,
-                "worker",
-                "run",
-                "--root",
-                worker_root,
-                "--config",
-                &config,
-            ],
+            ["exec", "--detach", container_id, "sh", "-c", &exec_script],
         ),
         hel_targets::TargetLocator::AwsEc2 { ssh, .. }
         | hel_targets::TargetLocator::SshBare { ssh, .. } => {
@@ -1888,13 +1892,9 @@ fn start_worker(
                 "exec",
                 "--detach",
                 container_id,
-                &binary,
-                "worker",
-                "run",
-                "--root",
-                worker_root,
-                "--config",
-                &config,
+                "sh",
+                "-c",
+                &exec_script,
             ],
         ),
     }
@@ -1955,7 +1955,7 @@ fn worker_probe_diagnosis(
         ),
     }
     .purpose("probe installed worker binary");
-    match executor.execute(&command) {
+    let error = match executor.execute(&command) {
         Ok(output) if output.status == 0 => error,
         Ok(output) => {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1967,7 +1967,44 @@ fn worker_probe_diagnosis(
             ))
         }
         Err(probe_error) => error.context(format!("worker probe failed: {probe_error:#}")),
+    };
+    match worker_last_words(executor, locator, worker_root) {
+        Some(last_words) => error.context(last_words),
+        None => error,
     }
+}
+
+/// Fetch the dead worker's structured exit record and log tail from the
+/// target, so unreachable-worker errors carry the root cause.
+fn worker_last_words(
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    worker_root: &str,
+) -> Option<String> {
+    let script = format!(
+        "if [ -f {root}/worker-exit.json ]; then echo '--- worker-exit.json ---'; cat {root}/worker-exit.json; fi; if [ -f {root}/worker.log ]; then echo '--- worker.log (tail) ---'; tail -n 20 {root}/worker.log; fi",
+        root = worker_root
+    );
+    let command = match locator {
+        hel_targets::TargetLocator::LocalPodman { container_id } => {
+            CommandSpec::new("podman", ["exec", container_id, "sh", "-c", &script])
+        }
+        hel_targets::TargetLocator::AppleContainer { container_id } => {
+            CommandSpec::new("container", ["exec", container_id, "sh", "-c", &script])
+        }
+        hel_targets::TargetLocator::AwsEc2 { ssh, .. }
+        | hel_targets::TargetLocator::SshBare { ssh, .. } => {
+            ssh_command_spec(ssh, ["sh", "-lc", &script])
+        }
+        hel_targets::TargetLocator::SshPodman { ssh, container_id } => ssh_command_spec(
+            ssh,
+            ["podman", "exec", container_id, "sh", "-c", &script],
+        ),
+    }
+    .purpose("collect worker last words");
+    let output = executor.execute(&command).ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then(|| format!("worker diagnostics:\n{text}"))
 }
 
 async fn handshake_worker(command: &CommandSpec) -> Result<Option<String>> {
