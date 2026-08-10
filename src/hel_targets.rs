@@ -14,11 +14,37 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const SESSION_LABEL: &str = "dev.hel.session";
+pub const MANAGED_LABEL: &str = "dev.hel.managed";
 pub const SESSION_TAG: &str = "dev.hel.session";
+pub const MANAGED_TAG: &str = "dev.hel.managed";
 pub const CONTAINER_WORKSPACE: &str = "/workspace";
 pub const PODMAN_DOCUMENTATION_PATH: &str = "docs/PODMAN.md";
 
 const PODMAN_MINIMUM_MAJOR_VERSION: u32 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedResourceKind {
+    Container,
+    Ec2Instance,
+}
+
+/// Build command-line fragments that identify resources Hel owns for a session.
+fn managed_resource_identity_args(kind: ManagedResourceKind, session_id: &str) -> Vec<String> {
+    match kind {
+        ManagedResourceKind::Container => vec![
+            "--label".to_owned(),
+            format!("{SESSION_LABEL}={session_id}"),
+            "--label".to_owned(),
+            format!("{MANAGED_LABEL}=true"),
+        ],
+        ManagedResourceKind::Ec2Instance => vec![
+            "--tag-specifications".to_owned(),
+            format!(
+                "ResourceType=instance,Tags=[{{Key={SESSION_TAG},Value={session_id}}},{{Key={MANAGED_TAG},Value=true}}]"
+            ),
+        ],
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSpec {
@@ -548,28 +574,22 @@ pub fn provision_plan(
                 launch.push_str(",Version=");
                 launch.push_str(version);
             }
-            commands.push(
-                CommandSpec::new(
-                    "aws",
-                    [
-                        "--profile".to_owned(),
-                        aws.profile.clone(),
-                        "--region".to_owned(),
-                        aws.region.clone(),
-                        "ec2".to_owned(),
-                        "run-instances".to_owned(),
-                        "--launch-template".to_owned(),
-                        launch,
-                        "--tag-specifications".to_owned(),
-                        format!(
-                            "ResourceType=instance,Tags=[{{Key={SESSION_TAG},Value={session_id}}}]"
-                        ),
-                        "--output".to_owned(),
-                        "json".to_owned(),
-                    ],
-                )
-                .purpose("launch EC2 session instance"),
-            );
+            let mut args = vec![
+                "--profile".to_owned(),
+                aws.profile.clone(),
+                "--region".to_owned(),
+                aws.region.clone(),
+                "ec2".to_owned(),
+                "run-instances".to_owned(),
+                "--launch-template".to_owned(),
+                launch,
+            ];
+            args.extend(managed_resource_identity_args(
+                ManagedResourceKind::Ec2Instance,
+                session_id,
+            ));
+            args.extend(["--output".to_owned(), "json".to_owned()]);
+            commands.push(CommandSpec::new("aws", args).purpose("launch EC2 session instance"));
         }
         TargetTemplate::SshBare {
             ssh,
@@ -924,9 +944,11 @@ fn container_run_args(
         "--detach".to_owned(),
         "--name".to_owned(),
         name.to_owned(),
-        "--label".to_owned(),
-        format!("{SESSION_LABEL}={session_id}"),
     ];
+    args.extend(managed_resource_identity_args(
+        ManagedResourceKind::Container,
+        session_id,
+    ));
     args.extend(template.extra_run_args.clone());
     for mount in additional_mounts {
         let source = mount.source.to_string_lossy();
@@ -1133,11 +1155,12 @@ fn validate_container_template(template: &ContainerTemplate) -> Result<()> {
     {
         bail!("container template may not override the generated name");
     }
-    if template
-        .extra_run_args
-        .iter()
-        .any(|arg| arg == "--label" || arg.starts_with(&format!("--label={SESSION_LABEL}")))
-    {
+    if template.extra_run_args.iter().any(|arg| {
+        arg == "--label"
+            || [SESSION_LABEL, MANAGED_LABEL]
+                .iter()
+                .any(|label| arg.starts_with(&format!("--label={label}=")))
+    }) {
         bail!("container template may not override Hel ownership labels");
     }
     Ok(())
@@ -1318,6 +1341,26 @@ mod tests {
     }
 
     #[test]
+    fn managed_resource_identity_args_build_container_labels_and_ec2_tags() {
+        assert_eq!(
+            managed_resource_identity_args(ManagedResourceKind::Container, SESSION),
+            vec![
+                "--label",
+                "dev.hel.session=018f9dd2-a3b4-7c8d-9000-123456789abc",
+                "--label",
+                "dev.hel.managed=true",
+            ]
+        );
+        assert_eq!(
+            managed_resource_identity_args(ManagedResourceKind::Ec2Instance, SESSION),
+            vec![
+                "--tag-specifications",
+                "ResourceType=instance,Tags=[{Key=dev.hel.session,Value=018f9dd2-a3b4-7c8d-9000-123456789abc},{Key=dev.hel.managed,Value=true}]",
+            ]
+        );
+    }
+
+    #[test]
     fn podman_plan_uses_owned_name_label_and_argv_clones() {
         let plan = provision_plan(
             &TargetTemplate::LocalPodman(ContainerTemplate {
@@ -1338,9 +1381,8 @@ mod tests {
                 .any(|args| args == ["--name", &name])
         );
         assert!(
-            plan.commands[0]
-                .args
-                .contains(&format!("{SESSION_LABEL}={SESSION}"))
+            plan.commands[0].args.windows(4).any(|args| args
+                == managed_resource_identity_args(ManagedResourceKind::Container, SESSION))
         );
         let clone = plan
             .commands
@@ -1426,6 +1468,9 @@ mod tests {
                 .purpose("check Apple container service")
         );
         assert_eq!(plan.commands[1].program, "container");
+        assert!(plan.commands[1].args.windows(4).any(|args| {
+            args == managed_resource_identity_args(ManagedResourceKind::Container, SESSION)
+        }));
     }
 
     #[test]
@@ -1495,6 +1540,9 @@ mod tests {
                 .unwrap()
                 .contains("'podman' 'run'")
         );
+        assert!(plan.commands[0].args.last().unwrap().contains(&format!(
+            "'--label' '{SESSION_LABEL}={SESSION}' '--label' '{MANAGED_LABEL}=true'"
+        )));
         assert!(
             !plan
                 .commands
@@ -1566,12 +1614,8 @@ mod tests {
         });
         let provision = provision_plan(&template, SESSION, &bundle(), &[]).unwrap();
         assert_eq!(provision.commands.len(), 1);
-        assert!(
-            provision.commands[0]
-                .args
-                .iter()
-                .any(|arg| arg.contains(&format!("Key={SESSION_TAG},Value={SESSION}")))
-        );
+        assert!(provision.commands[0].args.windows(2).any(|args| args
+            == managed_resource_identity_args(ManagedResourceKind::Ec2Instance, SESSION)));
         let close = close_plan(
             &TargetLocator::AwsEc2 {
                 profile: "work".to_owned(),
