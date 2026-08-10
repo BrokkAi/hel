@@ -269,6 +269,7 @@ mod unix {
     }
 }
 
+#[cfg(unix)]
 fn resolve_relative_harness_home(config: &mut WorkerLaunchConfig, base: &Path) {
     let key = config.harness.home_env();
     let Some(value) = config.environment.get_mut(key) else {
@@ -296,7 +297,7 @@ pub async fn proxy(_root: std::path::PathBuf) -> anyhow::Result<()> {
     anyhow::bail!("target workers require Unix")
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
