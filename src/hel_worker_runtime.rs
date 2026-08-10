@@ -61,7 +61,8 @@ mod unix {
         WorkerRequest,
     };
 
-    pub async fn run_daemon(root: PathBuf, config: WorkerLaunchConfig) -> Result<()> {
+    pub async fn run_daemon(root: PathBuf, mut config: WorkerLaunchConfig) -> Result<()> {
+        super::resolve_relative_harness_home(&mut config, &std::env::current_dir()?);
         std::fs::create_dir_all(&root)
             .with_context(|| format!("create worker root {}", root.display()))?;
         let socket = root.join("control.sock");
@@ -268,6 +269,17 @@ mod unix {
     }
 }
 
+fn resolve_relative_harness_home(config: &mut WorkerLaunchConfig, base: &Path) {
+    let key = config.harness.home_env();
+    let Some(value) = config.environment.get_mut(key) else {
+        return;
+    };
+    let path = Path::new(value);
+    if path.is_relative() {
+        *value = base.join(path).to_string_lossy().into_owned();
+    }
+}
+
 #[cfg(unix)]
 pub use unix::{proxy, run_daemon};
 
@@ -282,4 +294,47 @@ pub async fn run_daemon(
 #[cfg(not(unix))]
 pub async fn proxy(_root: std::path::PathBuf) -> anyhow::Result<()> {
     anyhow::bail!("target workers require Unix")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn launch_config(profile_home: &str) -> WorkerLaunchConfig {
+        WorkerLaunchConfig {
+            session_id: "session".into(),
+            harness: HarnessKind::Codex,
+            bridge_command: "codex-acp".into(),
+            bridge_args: Vec::new(),
+            environment: BTreeMap::from([("CODEX_HOME".into(), profile_home.into())]),
+            cwd: ".local/share/hel/workspaces/session/repo".into(),
+            additional_directories: Vec::new(),
+            native_session_id: None,
+        }
+    }
+
+    #[test]
+    fn relative_harness_home_is_resolved_before_bridge_changes_directory() {
+        let mut config = launch_config(".local/share/hel/profiles/session");
+
+        resolve_relative_harness_home(&mut config, Path::new("/home/ubuntu"));
+
+        assert_eq!(
+            config.environment["CODEX_HOME"],
+            "/home/ubuntu/.local/share/hel/profiles/session"
+        );
+    }
+
+    #[test]
+    fn absolute_harness_home_is_preserved() {
+        let mut config = launch_config("/var/lib/hel/profiles/session");
+
+        resolve_relative_harness_home(&mut config, Path::new("/home/ubuntu"));
+
+        assert_eq!(
+            config.environment["CODEX_HOME"],
+            "/var/lib/hel/profiles/session"
+        );
+    }
 }
