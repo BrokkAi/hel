@@ -931,31 +931,33 @@ fn validate_worker_sha256(expected_sha256: &str) -> Result<()> {
 
 fn conversion_context(archive: &crate::hel_archive::VerifiedArchive) -> Result<String> {
     let bytes = archive.payload_by_role(&PayloadRole::CanonicalEvents)?;
+    conversion_context_from_events(bytes)
+}
+
+fn conversion_context_from_events(bytes: &[u8]) -> Result<String> {
     let mut entries = Vec::new();
+    let mut assistant_text = String::new();
     for line in bytes
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
         let event: crate::hel_worker::SequencedEvent = serde_json::from_slice(line)?;
         match event.event {
-            WorkerEvent::PromptAccepted { text, .. } => entries.push(format!("USER:\n{text}")),
+            WorkerEvent::PromptAccepted { text, .. } => {
+                flush_assistant_entry(&mut entries, &mut assistant_text);
+                entries.push(format!("USER:\n{text}"));
+            }
             WorkerEvent::Adapter { payload, .. } => {
-                if let Ok(runtime) = serde_json::from_value::<crate::hel_acp::RuntimeEvent>(payload)
-                {
-                    match runtime {
-                        crate::hel_acp::RuntimeEvent::SessionUpdate { update } => {
-                            entries.push(format!("PREVIOUS AGENT UPDATE:\n{update}"));
-                        }
-                        crate::hel_acp::RuntimeEvent::Warning { message } => {
-                            entries.push(format!("SYSTEM WARNING: {message}"));
-                        }
-                        _ => {}
-                    }
+                if let Some(text) = agent_message_chunk_text(payload) {
+                    assistant_text.push_str(&text);
+                } else {
+                    flush_assistant_entry(&mut entries, &mut assistant_text);
                 }
             }
-            _ => {}
+            _ => flush_assistant_entry(&mut entries, &mut assistant_text),
         }
     }
+    flush_assistant_entry(&mut entries, &mut assistant_text);
     let mut used = 0usize;
     let selected = entries
         .iter()
@@ -970,6 +972,32 @@ fn conversion_context(archive: &crate::hel_archive::VerifiedArchive) -> Result<S
     Ok(format!(
         "You are continuing a coding session previously run by another ACP harness. Treat the restored workspace as authoritative. Here is the recent canonical transcript for continuity; do not repeat completed work unless verification requires it.\n\n{transcript}"
     ))
+}
+
+fn flush_assistant_entry(entries: &mut Vec<String>, assistant_text: &mut String) {
+    if !assistant_text.is_empty() {
+        entries.push(format!("ASSISTANT:\n{assistant_text}"));
+        assistant_text.clear();
+    }
+}
+
+fn agent_message_chunk_text(payload: serde_json::Value) -> Option<String> {
+    let crate::hel_acp::RuntimeEvent::SessionUpdate { update } =
+        serde_json::from_value(payload).ok()?
+    else {
+        return None;
+    };
+    (update
+        .get("sessionUpdate")
+        .and_then(serde_json::Value::as_str)
+        == Some("agent_message_chunk"))
+    .then(|| {
+        update
+            .pointer("/content/text")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+    .flatten()
 }
 
 fn target_kind(locator: &hel_targets::TargetLocator) -> &'static str {
@@ -2017,6 +2045,86 @@ mod tests {
             packaged_worker_binary_path(directory, "aarch64-unknown-linux-musl"),
             directory.join("hel-worker-aarch64-unknown-linux-musl")
         );
+    }
+
+    #[test]
+    fn conversion_context_coalesces_agent_messages_and_skips_non_transcript_updates() {
+        let session_update = |update| WorkerEvent::Adapter {
+            kind: "session_update".into(),
+            payload: serde_json::to_value(crate::hel_acp::RuntimeEvent::SessionUpdate { update })
+                .unwrap(),
+        };
+        let events = [
+            WorkerEvent::PromptAccepted {
+                request_id: "prompt-1".into(),
+                text: "Inspect the checkout.".into(),
+                attachments: vec![],
+            },
+            session_update(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"text": "I inspected "},
+            })),
+            session_update(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"text": "the checkout."},
+            })),
+            session_update(serde_json::json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"text": "private reasoning"},
+            })),
+            session_update(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "title": "run tests",
+            })),
+            WorkerEvent::Adapter {
+                kind: "warning".into(),
+                payload: serde_json::to_value(crate::hel_acp::RuntimeEvent::Warning {
+                    message: "transient warning".into(),
+                })
+                .unwrap(),
+            },
+            session_update(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"text": "The build passes."},
+            })),
+            session_update(serde_json::json!({
+                "sessionUpdate": "tool_update",
+                "status": "completed",
+            })),
+        ];
+        let mut canonical_events = Vec::new();
+        for (index, event) in events.into_iter().enumerate() {
+            serde_json::to_writer(
+                &mut canonical_events,
+                &crate::hel_worker::SequencedEvent {
+                    seq: (index + 1) as u64,
+                    request_id: None,
+                    event,
+                },
+            )
+            .unwrap();
+            canonical_events.push(b'\n');
+        }
+
+        let context = conversion_context_from_events(&canonical_events).unwrap();
+        let (_, transcript) = context.split_once("\n\n").unwrap();
+
+        assert_eq!(
+            transcript,
+            "USER:\nInspect the checkout.\n\nASSISTANT:\nI inspected the checkout.\n\nASSISTANT:\nThe build passes."
+        );
+        for excluded in [
+            "agent_message_chunk",
+            "agent_thought_chunk",
+            "private reasoning",
+            "tool_call",
+            "run tests",
+            "tool_update",
+            "transient warning",
+            "PREVIOUS AGENT UPDATE",
+        ] {
+            assert!(!context.contains(excluded), "context included {excluded:?}");
+        }
     }
 
     #[test]
