@@ -82,51 +82,58 @@ impl Gate {
             }
         }
 
-        let result = match role.launch.kind {
-            AdapterKind::Claude => {
-                match crate::claude_usage::query(self.cwd.clone(), role.launch.env.clone()).await {
-                    Ok(report) => {
-                        let result = claude_check(&report);
-                        let _ = self
-                            .ui_tx
-                            .send(UiEvent::ClaudeUsage(ClaudeUsageStatus::Available(report)));
-                        result
-                    }
-                    Err(error) => {
-                        let _ =
-                            self.ui_tx
-                                .send(UiEvent::ClaudeUsage(ClaudeUsageStatus::Unavailable(
-                                    error.user_reason().to_string(),
-                                )));
-                        Check::Unavailable
-                    }
-                }
-            }
-            AdapterKind::Codex => {
-                let mut client = self.codex.lock().await;
-                match crate::codex_usage::refresh(
-                    &mut client,
-                    self.cwd.clone(),
-                    role.launch.env.clone(),
-                )
-                .await
-                {
-                    CodexUsageStatus::Available(report) => {
-                        let result = codex_check(&report);
-                        let _ = self
-                            .ui_tx
-                            .send(UiEvent::CodexUsage(CodexUsageStatus::Available(report)));
-                        result
-                    }
-                    CodexUsageStatus::Unavailable(reason) => {
-                        let _ = self
-                            .ui_tx
-                            .send(UiEvent::CodexUsage(CodexUsageStatus::Unavailable(reason)));
-                        Check::Unavailable
+        let result =
+            match role.launch.kind {
+                AdapterKind::Claude => {
+                    // A forced recheck (after an agent failure) must not be
+                    // satisfied by a minute-old shared fact.
+                    let queried = if force {
+                        crate::claude_usage::query_fresh(self.cwd.clone(), role.launch.env.clone())
+                            .await
+                    } else {
+                        crate::claude_usage::query(self.cwd.clone(), role.launch.env.clone()).await
+                    };
+                    match queried {
+                        Ok(report) => {
+                            let result = claude_check(&report);
+                            let _ = self
+                                .ui_tx
+                                .send(UiEvent::ClaudeUsage(ClaudeUsageStatus::Available(report)));
+                            result
+                        }
+                        Err(error) => {
+                            let _ = self.ui_tx.send(UiEvent::ClaudeUsage(
+                                ClaudeUsageStatus::Unavailable(error.user_reason().to_string()),
+                            ));
+                            Check::Unavailable
+                        }
                     }
                 }
-            }
-        };
+                AdapterKind::Codex => {
+                    let mut client = self.codex.lock().await;
+                    match crate::codex_usage::refresh(
+                        &mut client,
+                        self.cwd.clone(),
+                        role.launch.env.clone(),
+                    )
+                    .await
+                    {
+                        CodexUsageStatus::Available(report) => {
+                            let result = codex_check(&report);
+                            let _ = self
+                                .ui_tx
+                                .send(UiEvent::CodexUsage(CodexUsageStatus::Available(report)));
+                            result
+                        }
+                        CodexUsageStatus::Unavailable(reason) => {
+                            let _ = self
+                                .ui_tx
+                                .send(UiEvent::CodexUsage(CodexUsageStatus::Unavailable(reason)));
+                            Check::Unavailable
+                        }
+                    }
+                }
+            };
         self.cache.lock().await.insert(
             key,
             Cached {
@@ -398,6 +405,55 @@ mod tests {
         assert!(!pool.handle_near_limit(&claude, None));
         assert!(!pool.handle_near_limit(&claude, None));
         assert!(matches!(ui_rx.try_recv(), Ok(UiEvent::Warning(_))));
+        assert!(ui_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn near_limit_for_a_non_current_provider_keeps_the_selection_quietly() {
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let claude = role("claude-opus", "claude-acp", AdapterKind::Claude);
+        let codex = role("gpt-codex", "codex-acp", AdapterKind::Codex);
+        let pool = RolePool::new(
+            vec![claude.clone(), codex.clone()],
+            Gate::new(PathBuf::from("."), ui_tx.clone()),
+            true,
+            "subagents",
+            ui_tx,
+        );
+
+        // The fallback seat hit its limit while the current seat is
+        // fine: it is excluded for later failover, nothing else changes.
+        assert!(pool.handle_near_limit(&codex, None));
+        assert_eq!(pool.current().launch.source_id, claude.launch.source_id);
+        assert!(ui_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn exhausted_failover_announces_the_block_with_reset_time() {
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let claude = role("claude-opus", "claude-acp", AdapterKind::Claude);
+        let codex = role("gpt-codex", "codex-acp", AdapterKind::Codex);
+        let pool = RolePool::new(
+            vec![claude.clone(), codex.clone()],
+            Gate::new(PathBuf::from("."), ui_tx.clone()),
+            true,
+            "subagents",
+            ui_tx,
+        );
+
+        assert!(pool.handle_near_limit(&claude, None));
+        while ui_rx.try_recv().is_ok() {}
+
+        // Every provider is now excluded, so the pool blocks and names
+        // the reset time in its warning.
+        assert!(!pool.handle_near_limit(&codex, Some(0)));
+        match ui_rx.try_recv() {
+            Ok(UiEvent::Warning(text)) => {
+                assert!(text.contains("codex-acp"), "unexpected warning: {text}");
+                assert!(text.contains(" until "), "missing reset time: {text}");
+            }
+            other => panic!("expected block warning, got {other:?}"),
+        }
         assert!(ui_rx.try_recv().is_err());
     }
 }
