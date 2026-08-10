@@ -1,6 +1,6 @@
 //! One-pane quota collection for Hel harness profiles.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -36,6 +36,7 @@ impl ProfileQuota {
         if let Some(error) = &self.error {
             return format!("unavailable: {error}");
         }
+        let mut seen_resets = BTreeSet::new();
         let mut parts = self
             .windows
             .iter()
@@ -45,8 +46,12 @@ impl ProfileQuota {
                     (_, Some(used), Some(limit)) => format!("{used}/{limit}"),
                     _ => "available".to_string(),
                 };
-                match &window.resets {
-                    Some(reset) => format!("{} {usage}, {reset}", window.label),
+                match window
+                    .resets
+                    .as_ref()
+                    .filter(|reset| seen_resets.insert((*reset).clone()))
+                {
+                    Some(reset) => format!("{} {usage}, resets {reset}", window.label),
                     None => format!("{} {usage}", window.label),
                 }
             })
@@ -111,8 +116,7 @@ impl QuotaManager {
                                 limit: None,
                                 resets: window
                                     .resets_at
-                                    .and_then(crate::usage_format::format_reset_local_seconds)
-                                    .map(|at| format!("resets at {at}")),
+                                    .and_then(crate::usage_format::format_reset_local_seconds),
                             })
                             .collect(),
                         extra: None,
@@ -138,7 +142,10 @@ impl QuotaManager {
                         remaining_percent: Some(window.remaining_percent),
                         used: None,
                         limit: None,
-                        resets: window.reset_context,
+                        resets: window
+                            .reset_context
+                            .as_deref()
+                            .and_then(crate::usage_format::normalize_reset_text),
                     })
                     .collect(),
                     extra: None,
@@ -255,8 +262,8 @@ fn parse_kimi_window(value: &Value, fallback: &str) -> Option<QuotaWindow> {
         .to_string();
     let resets = ["resetAt", "reset_at", "resetTime", "reset_time"]
         .iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_str))
-        .map(|reset| format!("resets at {reset}"));
+        .find_map(|key| value.get(*key))
+        .and_then(normalize_kimi_reset);
     Some(QuotaWindow {
         label,
         remaining_percent: None,
@@ -270,6 +277,17 @@ fn value_i64(value: &Value) -> Option<i64> {
     value
         .as_i64()
         .or_else(|| value.as_str()?.parse::<i64>().ok())
+}
+
+fn normalize_kimi_reset(value: &Value) -> Option<String> {
+    value
+        .as_f64()
+        .and_then(crate::usage_format::format_reset_local)
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(crate::usage_format::normalize_reset_text)
+        })
 }
 
 #[cfg(test)]
@@ -300,13 +318,44 @@ mod tests {
                 remaining_percent: Some(80),
                 used: None,
                 limit: None,
-                resets: Some("resets at 10".into()),
+                resets: Some("10:00 Jun 17".into()),
             }],
             extra: None,
             error: None,
             refreshed_at_epoch_seconds: 0,
         };
         assert!(report.compact().contains("80% left"));
-        assert!(report.compact().contains("resets at 10"));
+        assert!(report.compact().contains("resets 10:00 Jun 17"));
+    }
+
+    #[test]
+    fn compact_displays_a_shared_reset_once() {
+        let report = ProfileQuota {
+            profile_id: "codex-1".into(),
+            harness: HarnessKind::Codex,
+            windows: vec![
+                QuotaWindow {
+                    label: "5H".into(),
+                    remaining_percent: Some(80),
+                    used: None,
+                    limit: None,
+                    resets: Some("10:00 Jun 17".into()),
+                },
+                QuotaWindow {
+                    label: "week".into(),
+                    remaining_percent: Some(55),
+                    used: None,
+                    limit: None,
+                    resets: Some("10:00 Jun 17".into()),
+                },
+            ],
+            extra: None,
+            error: None,
+            refreshed_at_epoch_seconds: 0,
+        };
+        assert_eq!(
+            report.compact(),
+            "5H 80% left, resets 10:00 Jun 17 · week 55% left"
+        );
     }
 }
