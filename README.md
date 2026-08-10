@@ -145,6 +145,20 @@ ssh_user = "ubuntu"
 address_source = "public-dns"
 ```
 
+For the rotating RunsOn Ubuntu 24 image, use the included updater instead of
+pinning an upstream AMI ID. It copies the newest RunsOn image into your AWS
+account, makes that copy the default version of `hel-runson`, refreshes the
+controller's SSH ingress, and can add the matching target on its first run:
+
+```bash
+scripts/update-runson-launch-template.sh --write-hel-config
+```
+
+Later runs reuse an existing owned copy when the upstream image is unchanged.
+EC2 launches from the account-owned AMI copy; S3 is useful for image
+export/import and runtime artifacts, but is not a boot source for an EC2 launch
+template.
+
 Repository values accept `owner/repo`, an HTTPS URL, or an SSH GitHub URL.
 Each target starts from a full clone. Container and EC2 resources are unnamed
 templates: closing a session first writes and verifies a `.hel.zip` checkpoint,
