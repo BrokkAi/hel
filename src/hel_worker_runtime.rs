@@ -1,59 +1,65 @@
 //! Target-side daemon and stdio proxy for the durable worker protocol.
 
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::hel_config::HarnessKind;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerLaunchConfig {
+    pub session_id: String,
+    pub harness: HarnessKind,
+    pub bridge_command: PathBuf,
+    #[serde(default)]
+    pub bridge_args: Vec<String>,
+    #[serde(default)]
+    pub environment: std::collections::BTreeMap<String, String>,
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub additional_directories: Vec<PathBuf>,
+    pub native_session_id: Option<String>,
+}
+
+impl WorkerLaunchConfig {
+    pub fn read(path: &Path) -> Result<Self> {
+        let body = std::fs::read(path)
+            .with_context(|| format!("read worker launch config {}", path.display()))?;
+        serde_json::from_slice(&body)
+            .with_context(|| format!("parse worker launch config {}", path.display()))
+    }
+
+    pub fn write(&self, path: &Path) -> Result<()> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let body = serde_json::to_vec_pretty(self)?;
+        std::fs::write(path, body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 mod unix {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use anyhow::{Context, Result, bail};
-    use serde::{Deserialize, Serialize};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::mpsc;
 
+    use super::WorkerLaunchConfig;
     use crate::hel_acp::{self, CommandRequest, LaunchSpec, RuntimeEvent};
-    use crate::hel_config::HarnessKind;
     use crate::hel_worker::{
         DurableWorker, RequestEnvelope, ResponseBody, ResponseEnvelope, ResponsePayload,
         WorkerRequest,
     };
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct WorkerLaunchConfig {
-        pub session_id: String,
-        pub harness: HarnessKind,
-        pub bridge_command: PathBuf,
-        #[serde(default)]
-        pub bridge_args: Vec<String>,
-        #[serde(default)]
-        pub environment: std::collections::BTreeMap<String, String>,
-        pub cwd: PathBuf,
-        #[serde(default)]
-        pub additional_directories: Vec<PathBuf>,
-        pub native_session_id: Option<String>,
-    }
-
-    impl WorkerLaunchConfig {
-        pub fn read(path: &Path) -> Result<Self> {
-            let body = std::fs::read(path)
-                .with_context(|| format!("read worker launch config {}", path.display()))?;
-            serde_json::from_slice(&body)
-                .with_context(|| format!("parse worker launch config {}", path.display()))
-        }
-
-        pub fn write(&self, path: &Path) -> Result<()> {
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            std::fs::create_dir_all(parent)?;
-            let body = serde_json::to_vec_pretty(self)?;
-            std::fs::write(path, body)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-            }
-            Ok(())
-        }
-    }
 
     pub async fn run_daemon(root: PathBuf, config: WorkerLaunchConfig) -> Result<()> {
         std::fs::create_dir_all(&root)
@@ -263,11 +269,7 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{WorkerLaunchConfig, proxy, run_daemon};
-
-#[cfg(not(unix))]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct WorkerLaunchConfig;
+pub use unix::{proxy, run_daemon};
 
 #[cfg(not(unix))]
 pub async fn run_daemon(
