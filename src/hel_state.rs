@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hel_config::{HarnessKind, HelConfig, atomic_write, data_dir, validate_id};
 use crate::hel_targets::{AdditionalMount, validate_additional_mounts};
+use crate::hel_worker::{SequencedEvent, WorkerEvent};
 
 pub const STATE_VERSION: u32 = 1;
 
@@ -329,6 +330,42 @@ pub fn new_session_id() -> Result<String> {
     Ok(encoded)
 }
 
+/// Return the newest title reported by an ACP harness in a batch of canonical
+/// worker events. Session-info updates are standard ACP; Codex also emits
+/// title/summary-shaped extension updates in some bridge versions.
+pub fn harness_session_title(events: &[SequencedEvent]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        let WorkerEvent::Adapter { payload, .. } = &event.event else {
+            return None;
+        };
+        let crate::hel_acp::RuntimeEvent::SessionUpdate { update } =
+            serde_json::from_value(payload.clone()).ok()?
+        else {
+            return None;
+        };
+        let kind = update
+            .get("sessionUpdate")
+            .and_then(serde_json::Value::as_str)?;
+        let title = match kind {
+            "session_info_update" | "session_title" => {
+                update.get("title").and_then(serde_json::Value::as_str)
+            }
+            "session_summary" => update
+                .get("title")
+                .or_else(|| update.get("summary"))
+                .and_then(serde_json::Value::as_str),
+            _ => None,
+        }?;
+        normalize_session_title(title)
+    })
+}
+
+fn normalize_session_title(title: &str) -> Option<String> {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = title.chars().take(160).collect::<String>();
+    (!title.is_empty()).then_some(title)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +525,45 @@ mod tests {
         state
             .validate_against_config(&HelConfig::default())
             .unwrap();
+    }
+
+    #[test]
+    fn harness_title_prefers_the_newest_session_info_update() {
+        let events = vec![
+            SequencedEvent {
+                seq: 1,
+                request_id: None,
+                event: WorkerEvent::Adapter {
+                    kind: "session_update".into(),
+                    payload: serde_json::json!({
+                        "type": "session_update",
+                        "update": {
+                            "sessionUpdate": "session_info_update",
+                            "title": "First title"
+                        }
+                    }),
+                },
+            },
+            SequencedEvent {
+                seq: 2,
+                request_id: None,
+                event: WorkerEvent::Adapter {
+                    kind: "session_update".into(),
+                    payload: serde_json::json!({
+                        "type": "session_update",
+                        "update": {
+                            "sessionUpdate": "session_summary",
+                            "summary": "  Build   the dashboard  "
+                        }
+                    }),
+                },
+            },
+        ];
+
+        assert_eq!(
+            harness_session_title(&events).as_deref(),
+            Some("Build the dashboard")
+        );
     }
 
     #[test]
