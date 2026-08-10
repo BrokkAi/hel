@@ -200,7 +200,12 @@ impl Controller {
     ) -> Result<Option<String>> {
         let (backend, worker_root) = self.prepare_worker_files(session_id, executor)?;
         start_worker(executor, &backend, &worker_root)?;
-        handshake_worker(&hel_targets::reconnect_plan(&backend, session_id)?.commands[0]).await
+        match handshake_worker(&hel_targets::reconnect_plan(&backend, session_id)?.commands[0])
+            .await
+        {
+            Ok(native_session_id) => Ok(native_session_id),
+            Err(error) => Err(worker_probe_diagnosis(executor, &backend, &worker_root, error)),
+        }
     }
 
     fn prepare_worker_files(
@@ -674,12 +679,6 @@ fn worker_binary_for(
     let arch = target_architecture(locator, executor)?;
     let triple = format!("{arch}-unknown-linux-musl");
     let current = std::env::current_exe().context("resolve Hel controller binary")?;
-    if cfg!(target_os = "linux")
-        && ((arch == "x86_64" && cfg!(target_arch = "x86_64"))
-            || (arch == "aarch64" && cfg!(target_arch = "aarch64")))
-    {
-        return Ok(current);
-    }
     let mut candidates = Vec::new();
     if let Some(directory) = std::env::var_os("HEL_WORKER_DIR").map(PathBuf::from) {
         candidates.push(directory.join(format!("hel-worker-{triple}")));
@@ -688,9 +687,24 @@ fn worker_binary_for(
     if let Some(directory) = current.parent() {
         candidates.push(directory.join(format!("hel-worker-{triple}")));
         candidates.push(directory.join(format!("hel-{triple}")));
+        // Development checkout: a controller at target/<profile>/hel finds its
+        // musl sibling at target/<triple>/<profile>/hel. The static build is
+        // preferred because the target's glibc may be older than the host's.
+        if let (Some(profile), Some(target_dir)) = (
+            directory.file_name().map(std::ffi::OsString::from),
+            directory.parent(),
+        ) {
+            candidates.push(target_dir.join(&triple).join(profile).join("hel"));
+        }
     }
     if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
         return Ok(path);
+    }
+    if cfg!(target_os = "linux")
+        && ((arch == "x86_64" && cfg!(target_arch = "x86_64"))
+            || (arch == "aarch64" && cfg!(target_arch = "aarch64")))
+    {
+        return Ok(current);
     }
     if let Ok(template) = std::env::var("HEL_WORKER_URL") {
         let expected = std::env::var("HEL_WORKER_SHA256")
@@ -1696,6 +1710,49 @@ fn scp_command_spec(ssh: &SshTarget, source: &Path, remote: &str, recursive: boo
     args.push(source.to_string_lossy().into_owned());
     args.push(format!("{}:{remote}", ssh.destination));
     CommandSpec::new("scp", args)
+}
+
+/// Enrich an opaque handshake failure by running the installed worker binary
+/// directly in the target. This surfaces loader errors (for example a
+/// glibc-linked worker inside an older-glibc container) that a detached start
+/// swallows.
+fn worker_probe_diagnosis(
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    worker_root: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let binary = format!("{worker_root}/hel");
+    let command = match locator {
+        hel_targets::TargetLocator::LocalPodman { container_id } => {
+            CommandSpec::new("podman", ["exec", container_id, &binary, "--version"])
+        }
+        hel_targets::TargetLocator::AppleContainer { container_id } => {
+            CommandSpec::new("container", ["exec", container_id, &binary, "--version"])
+        }
+        hel_targets::TargetLocator::AwsEc2 { ssh, .. }
+        | hel_targets::TargetLocator::SshBare { ssh, .. } => {
+            ssh_command_spec(ssh, [binary.as_str(), "--version"])
+        }
+        hel_targets::TargetLocator::SshPodman { ssh, container_id } => ssh_command_spec(
+            ssh,
+            ["podman", "exec", container_id, binary.as_str(), "--version"],
+        ),
+    }
+    .purpose("probe installed worker binary");
+    match executor.execute(&command) {
+        Ok(output) if output.status == 0 => error,
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            error.context(format!(
+                "worker binary {binary} fails to run in the target: {detail}; \
+                 if this is a loader/glibc error, provide a musl worker \
+                 (cargo build --release --target <arch>-unknown-linux-musl, \
+                 or set HEL_WORKER_BINARY/HEL_WORKER_DIR)"
+            ))
+        }
+        Err(probe_error) => error.context(format!("worker probe failed: {probe_error:#}")),
+    }
 }
 
 async fn handshake_worker(command: &CommandSpec) -> Result<Option<String>> {
