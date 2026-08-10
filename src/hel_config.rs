@@ -422,6 +422,9 @@ impl HelConfig {
         }
         let contents = fs::read_to_string(path)
             .with_context(|| format!("read Hel config {}", path.display()))?;
+        if contents.trim().is_empty() {
+            return Ok(Self::default());
+        }
         let config: Self = toml::from_str(&contents)
             .with_context(|| format!("parse Hel config {}", path.display()))?;
         config.validate()?;
@@ -697,6 +700,14 @@ mod tests {
             HelConfig::load_from(&directory.path().join("missing.toml")).unwrap(),
             HelConfig::default()
         );
+    }
+
+    #[test]
+    fn empty_config_uses_clean_v1_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "\n\t").unwrap();
+        assert_eq!(HelConfig::load_from(&path).unwrap(), HelConfig::default());
     }
 
     #[test]

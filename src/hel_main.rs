@@ -15,6 +15,7 @@ use hel::hel_config::config_path;
 use hel::hel_controller::Controller;
 use hel::hel_quota::QuotaManager;
 use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapshot};
+use hel::hel_setup::{SetupOutcome, run_setup_dialog};
 use hel::hel_targets::ProcessExecutor;
 use hel::hel_tui::{DashboardAction, DashboardState, render};
 use hel::hel_worker_client::WorkerClient;
@@ -38,6 +39,8 @@ enum Command {
     Worker(WorkerArgs),
     /// Validate profiles, bundles, target templates, and persisted sessions.
     Doctor,
+    /// Discover local agent homes and create an initial Hel configuration.
+    Setup,
 }
 
 #[derive(Debug, Args)]
@@ -106,6 +109,13 @@ async fn main() -> Result<()> {
             }
         },
         Some(Command::Doctor) => doctor(),
+        Some(Command::Setup) => setup(),
+    }
+}
+
+fn setup() -> Result<()> {
+    match run_setup_dialog(&config_path())? {
+        SetupOutcome::Written | SetupOutcome::Cancelled => Ok(()),
     }
 }
 
@@ -265,6 +275,20 @@ async fn run_dashboard() -> Result<()> {
         quotas.reports().clone(),
     );
     let mut terminal = TerminalGuard::enter()?;
+    if configuration_needs_setup(&controller.config) {
+        terminal.suspend()?;
+        let setup_result = run_setup_dialog(&config_path());
+        terminal.resume()?;
+        match setup_result? {
+            SetupOutcome::Written => {
+                controller.reload()?;
+                dashboard.set_config(controller.config.clone());
+                dashboard.set_state(controller.state.clone());
+                dashboard.set_notice("Setup complete. Press n to start your first session.");
+            }
+            SetupOutcome::Cancelled => return Ok(()),
+        }
+    }
     let termination = hel::termination::Coordinator::install().token();
 
     loop {
@@ -285,10 +309,19 @@ async fn run_dashboard() -> Result<()> {
             DashboardAction::None => {}
             DashboardAction::QuitDetach => break,
             DashboardAction::OpenConfig => {
-                dashboard.set_notice(format!(
-                    "Edit {}, then restart Hel",
-                    config_path().display()
-                ));
+                terminal.suspend()?;
+                let setup_result = run_setup_dialog(&config_path());
+                terminal.resume()?;
+                match setup_result? {
+                    SetupOutcome::Written => {
+                        controller.reload()?;
+                        dashboard.set_config(controller.config.clone());
+                        dashboard.set_state(controller.state.clone());
+                        dashboard
+                            .set_notice("Setup complete. Press n to start your first session.");
+                    }
+                    SetupOutcome::Cancelled => dashboard.set_notice("Setup cancelled."),
+                }
             }
             DashboardAction::RefreshQuotas => {
                 refresh_quotas(&controller, &mut quotas, &mut dashboard).await;
@@ -420,6 +453,10 @@ fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
+fn configuration_needs_setup(config: &hel::hel_config::HelConfig) -> bool {
+    config.profiles.is_empty() && config.bundles.is_empty() && config.targets.is_empty()
+}
+
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
 }
@@ -431,6 +468,26 @@ impl TerminalGuard {
         execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal })
+    }
+
+    fn suspend(&mut self) -> Result<()> {
+        disable_raw_mode().context("disable terminal raw mode for setup")?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)
+            .context("leave alternate screen for setup")?;
+        self.terminal
+            .show_cursor()
+            .context("show cursor for setup")?;
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        enable_raw_mode().context("re-enable terminal raw mode after setup")?;
+        execute!(self.terminal.backend_mut(), EnterAlternateScreen)
+            .context("re-enter alternate screen after setup")?;
+        self.terminal
+            .clear()
+            .context("clear dashboard after setup")?;
+        Ok(())
     }
 }
 
@@ -462,5 +519,29 @@ mod tests {
                 .get_subcommands()
                 .any(|sub| sub.get_name() == "worker")
         );
+        assert!(
+            command
+                .get_subcommands()
+                .any(|sub| sub.get_name() == "setup")
+        );
+    }
+
+    #[test]
+    fn only_a_fully_empty_config_triggers_automatic_setup() {
+        let mut config = hel::hel_config::HelConfig::default();
+        assert!(configuration_needs_setup(&config));
+        config.targets.insert(
+            "podman".into(),
+            hel::hel_config::TargetTemplate::LocalPodman {
+                container: hel::hel_config::ContainerTemplate {
+                    image: "ubuntu:24.04".into(),
+                    platform: None,
+                    cpus: None,
+                    memory: None,
+                    environment: std::collections::BTreeMap::new(),
+                },
+            },
+        );
+        assert!(!configuration_needs_setup(&config));
     }
 }

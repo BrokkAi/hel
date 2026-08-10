@@ -360,6 +360,31 @@ pub fn provision_plan(
     })
 }
 
+/// Create the short-lived local container used to verify a setup target.
+///
+/// This deliberately shares the same argv construction as session targets so
+/// setup catches an unusable image or runtime before the first session exists.
+pub fn setup_smoke_plan(template: &TargetTemplate, smoke_id: &str) -> Result<CommandPlan> {
+    let name = resource_name(smoke_id)?;
+    let (engine, container) = match template {
+        TargetTemplate::LocalPodman(container) => ("podman", container),
+        TargetTemplate::AppleContainer(container) => ("container", container),
+        _ => bail!("setup smoke tests require a local container target"),
+    };
+    validate_container_template(container)?;
+
+    Ok(CommandPlan {
+        description: format!("smoke test Hel setup target {smoke_id}"),
+        commands: vec![
+            container_run(engine, container, &name, smoke_id)
+                .purpose("create disposable setup container"),
+            container_exec(engine, &name, ["true"]).purpose("execute setup smoke command"),
+            CommandSpec::new(engine, ["rm", "--force", &name])
+                .purpose("remove disposable setup container"),
+        ],
+    })
+}
+
 /// Clone/bootstrap commands for AWS once the exact instance ID and address are known.
 pub fn provision_on_locator_plan(
     locator: &TargetLocator,
@@ -902,6 +927,28 @@ mod tests {
                 .purpose("check Apple container service")
         );
         assert_eq!(plan.commands[1].program, "container");
+    }
+
+    #[test]
+    fn setup_smoke_plan_uses_the_configured_local_runtime_and_cleans_up() {
+        let plan = setup_smoke_plan(
+            &TargetTemplate::LocalPodman(ContainerTemplate {
+                image: "ubuntu:24.04".to_owned(),
+                extra_run_args: vec![],
+            }),
+            "setup-123",
+        )
+        .unwrap();
+
+        assert_eq!(plan.commands.len(), 3);
+        assert_eq!(plan.commands[0].program, "podman");
+        assert!(plan.commands[0].args.contains(&"ubuntu:24.04".to_owned()));
+        assert_eq!(plan.commands[1].args.last().unwrap(), "true");
+        assert_eq!(plan.commands[2].args[0], "rm");
+        assert_eq!(
+            plan.commands[2].purpose,
+            "remove disposable setup container"
+        );
     }
 
     #[test]

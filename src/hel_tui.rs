@@ -594,8 +594,8 @@ fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) 
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::raw(""),
-            Line::raw(format!("Configure {missing} in Hel's config file.")),
-            Line::raw("Press e to ask the controller to open it, then return and reload."),
+            Line::raw(format!("Setup can create {missing} from this machine.")),
+            Line::raw("Press e to run setup, or edit Hel's TOML configuration by hand."),
         ])
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })

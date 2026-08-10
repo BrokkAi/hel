@@ -14,6 +14,7 @@ pub mod hel_config;
 pub mod hel_controller;
 pub mod hel_quota;
 pub mod hel_server;
+pub mod hel_setup;
 pub mod hel_state;
 pub mod hel_targets;
 pub mod hel_tui;
