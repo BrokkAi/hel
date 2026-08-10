@@ -1,176 +1,127 @@
-<h1 align="center">Mjolnir</h1>
+# Hel
 
-<p align="center">
-  <a href="https://mjolnir.brokk.ai/">
-    <img src="docs/public/og.png?v=2" alt="Mjolnir — choose Codex or Claude to code and review" width="720">
-  </a>
-</p>
+> Welcome to Hel.
 
-Mjolnir (`mj`) is a full-featured frontend for **Codex and Claude**. It gives
-both agents the same terminal workflow, team configuration, review pipeline,
-and remote-control surface.
+Hel (`hel`) is a terminal control plane for long-running ACP coding-agent
+sessions. It keeps the useful ACP client and TUI shell from Mjolnir, while
+removing its review, council, delegation, and subagent business logic.
 
-## Features
+The dashboard gives one view of sessions and quotas across any number of
+Codex, Claude Code, and Kimi Code profiles. A session can run in a local Podman
+container, an Apple `container`, a disposable EC2 instance, a named SSH
+machine, or Podman reached through SSH. Hel always gives the selected harness
+its unrestricted mode (`agent-full-access`, `bypassPermissions`, or `auto`).
 
-- **Codex and Claude teams:** use either agent for coding and review, or split
-  the roles between them without changing tools or workflows.
-- **Parallel subagents:** delegate to as many as 16 write-capable agents in
-  fresh sessions, with live progress and completed reports returned to the
-  primary agent.
-- **Integrated adversarial review:** automatically challenge changed turns
-  with an independent reviewer and targeted specialist checks.
-- **Worktree sessions:** start work in a linked Git worktree and keep agent
-  changes separate from the current checkout, whichever coder you choose.
-- **Remote control:** run the workspace and control plane on your machine while
-  driving the session from another browser or device.
-- **Local voice input:** dictate prompts on macOS, Linux, and Windows with
-  cross-platform, on-device speech recognition.
+## Status
 
-### Terminal
+This branch is an early Hel fork. Its state/config namespace is deliberately
+separate from MJ and there is no automatic MJ migration.
 
-![Mjolnir review session showing the primary agent, reviewer progress, and usage](docs/readme-images/default-ui.png)
+## Build and run
 
-### Web interface
-
-![Mjolnir browser interface showing session history, streaming agent output, and queued prompt controls](docs/readme-images/remote-ui.png)
-
-## Four teams, one shortcut
-
-Choose one of four teams during onboarding, from `/mjconfig`, or with
-**Ctrl+Tab** in a session:
-
-- **Codex**
-- **Claude**
-- **Codex coder + Claude reviewer**
-- **Claude coder + Codex reviewer**
-
-The coder owns the primary session. The reviewer backs the independent review
-pass that challenges changed turns, plus the default subagent pool. Switching
-teams keeps Mjolnir's terminal, permissions, sessions, tools, and remote
-workflow unchanged.
-
-Mjolnir itself, its remote-control server, transcripts, and workspace tools run
-on infrastructure you control. Model requests still use the selected provider
-under its terms and data boundaries.
-
-## Requirements
-
-You need credentials for at least one configured model provider. Mjolnir ships
-with built-in Codex and Claude ACP routes and, on macOS, Linux, and Windows,
-manages the Node.js runtime those routes need. A system Node.js installation is
-only required when installing through npm/npx or when using the built-in routes
-on Android. Provider use may incur cost.
-
-Review the
-[data and trust boundaries](https://mjolnir.brokk.ai/data-boundaries/) before
-connecting a private repository.
-
-## Install
-
-Choose any of the following methods.
-
-**Release installer:** macOS and Linux on x86-64 or ARM64; Android on ARM64:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/BrokkAi/mjolnir/master/install.sh | bash
-```
-
-**Homebrew:** macOS (Apple Silicon or Intel) and Linux (x86-64 or ARM64 glibc):
-
-```bash
-brew install brokkai/tap/mjolnir
-```
-
-**npm or npx:** macOS, Linux, Windows, and Android with Node.js 18 or later:
-
-```bash
-npm install -g @brokkai/mjolnir
-# Or run without a global install:
-npx -y @brokkai/mjolnir
-```
-
-**crates.io:** install the terminal client and desktop voice worker with Rust:
-
-```bash
-cargo install --locked brokk-mjolnir brokk-mj-voice-worker
-```
-
-**Release archive:** download the archive for Linux, macOS, Windows, or
-Android from [GitHub Releases](https://github.com/BrokkAi/mjolnir/releases).
-
-**Build from source:**
-
-```bash
-git clone https://github.com/BrokkAi/mjolnir.git
-cd mjolnir
+```console
 cargo build --release
-./target/release/mj --cwd .
+./target/release/hel
 ```
 
-Desktop release packages include `mj-voice-worker`; Android packages omit
-voice support. See the full [installation guide](https://mjolnir.brokk.ai/install/)
-for platform details, upgrades, checksums, and custom install paths.
+`hel` opens the session/quota dashboard. `q` or Back detaches; it does not stop
+the target-side worker. `hel server` explicitly starts the authenticated phone
+controller. It binds only to loopback unless direct TLS is configured:
 
-## Run
-
-Open a repository and run:
-
-```bash
-mj
+```console
+hel server
+hel server --bind 0.0.0.0:3765 --tls-cert ./hel.crt --tls-key ./hel.key
 ```
 
-First launch discovers available provider credentials and asks which team to
-use. Press **Ctrl+Tab** to switch teams later, or open the **Team** tab in
-`/mjconfig`. Team, model, and adapter changes apply to a new session.
+## Configuration
 
-## Try it
+Hel reads `~/.config/hel/config.toml` on Linux (the platform-equivalent config
+directory elsewhere) and writes controller state beneath the platform data
+directory's `hel/` folder.
 
-The [10-minute evaluation](https://mjolnir.brokk.ai/evaluate/) uses a
-checked-in disposable fixture to exercise a delegated subagent change, its
-pushed-back report, explicit review, session resume, and headless output without
-risking a real repository.
+```toml
+version = 1
 
-For a quick read-only headless check:
+[profiles.codex-1]
+kind = "codex"
+home = "/home/me/.codex-1"
 
-```bash
-mj --print --permission-mode manual "summarize this repository; do not modify files"
+[profiles.codex-2]
+kind = "codex"
+home = "/home/me/.codex-2"
+
+[profiles.claude-1]
+kind = "claude"
+home = "/home/me/.claude-1"
+
+[profiles.kimi-1]
+kind = "kimi"
+home = "/home/me/.kimi"
+
+[bundles.hel]
+primary_repo = "hel"
+
+[[bundles.hel.repositories]]
+id = "hel"
+github = "your-org/hel"
+destination = "hel"
+
+[[bundles.hel.repositories]]
+id = "shared"
+github = "your-org/shared"
+destination = "shared"
+
+[targets.podman]
+kind = "local-podman"
+image = "ghcr.io/your-org/agent-dev:latest"
+
+[targets.mac-container]
+kind = "apple-container"
+image = "ghcr.io/your-org/agent-dev:latest"
+
+[targets.builder]
+kind = "ssh-bare"
+host = "builder"
+workspace_prefix = ".local/share/hel/workspaces"
+
+[targets.builder-podman]
+kind = "ssh-podman"
+host = "builder"
+image = "ghcr.io/your-org/agent-dev:latest"
+
+[targets.ec2]
+kind = "aws-ec2"
+region = "us-east-1"
+launch_template = "hel-agent"
+ssh_user = "ubuntu"
+address_source = "public-dns"
 ```
 
-Use an isolated worktree for an interactive coding session:
+Repository values accept `owner/repo`, an HTTPS URL, or an SSH GitHub URL.
+Each target starts from a full clone. Container and EC2 resources are unnamed
+templates: closing a session first writes and verifies a `.hel.zip` checkpoint,
+then deletes that exact resource. Named SSH machines persist, but Hel removes
+the exact per-session workspace after the same verified checkpoint.
 
-```bash
-mj --worktree
-```
+Profiles point at controller-side homes. Hel copies only a harness-specific
+allowlist into a fresh target-side home and sets `CODEX_HOME`,
+`CLAUDE_CONFIG_DIR`, or `KIMI_CODE_HOME`. Images may bake compatible harnesses
+and ACP bridges in; otherwise Hel uses its pinned fallback bootstrap where one
+is available. Hel probes the target architecture and uses the controller
+binary only for a matching Linux host. macOS and cross-architecture installs
+ship a `hel-worker-<arch>-unknown-linux-musl` companion beside `hel`;
+development builds can set `HEL_WORKER_DIR` or `HEL_WORKER_BINARY`. A release
+service may instead set an `HEL_WORKER_URL` containing `{target}` plus its
+required `HEL_WORKER_SHA256`; Hel verifies the download before caching or
+executing it.
 
-## Documentation
+## Session archives
 
-- [Teams and adversarial review](https://mjolnir.brokk.ai/teams/)
-- [Install and run](https://mjolnir.brokk.ai/install/)
-- [Start with Codex](https://mjolnir.brokk.ai/codex/)
-- [Start with Claude](https://mjolnir.brokk.ai/claude/)
-- [10-minute evaluation](https://mjolnir.brokk.ai/evaluate/)
-- [Remote control](https://mjolnir.brokk.ai/remote/)
-- [Voice dictation](https://mjolnir.brokk.ai/voice/)
-- [Subagents](https://mjolnir.brokk.ai/subagents/)
-- [Delegation and adversarial review](https://mjolnir.brokk.ai/delegation-review/)
-- [Permissions and workspace scope](https://mjolnir.brokk.ai/permissions/)
-- [Sessions, worktrees, and resume](https://mjolnir.brokk.ai/sessions-worktrees/)
-- [Headless automation](https://mjolnir.brokk.ai/headless/)
-- [Other agents and models](https://mjolnir.brokk.ai/adapters/)
-- [License and use cases](https://mjolnir.brokk.ai/license-use-cases/)
-- [Data and trust boundaries](https://mjolnir.brokk.ai/data-boundaries/)
+Checkpoint archives are versioned ZIPs containing a manifest, a canonical
+event stream, allowlisted native harness artifacts, and Git state for every
+repository (committed bundle, staged and unstaged patches, and untracked
+files). Every payload is SHA-256 verified after the archive is atomically
+installed. Normal Close refuses teardown if that verification fails; explicit
+force-destroy is the data-loss escape hatch.
 
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, runtime
-invariants, tests, and dependency-license maintenance. Maintainers tagging a
-release should follow [RELEASING.md](RELEASING.md). Repository-specific agent
-guidance lives in [AGENTS.md](AGENTS.md).
-
-## License
-
-Mjolnir and its voice worker are licensed under `GPL-3.0-only`. See
-[LICENSE](LICENSE). Official release archives include the corresponding source
-offer, dependency reports, and supplemental notices.
-See [License and use cases](https://mjolnir.brokk.ai/license-use-cases/)
-and [Third-party notices](https://mjolnir.brokk.ai/third-party-notices/).
+Hel is licensed under `GPL-3.0-only`.

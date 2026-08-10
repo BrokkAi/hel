@@ -21,7 +21,7 @@ enum SignalAction {
 
 static SUPPRESSED_INTERRUPTS: AtomicUsize = AtomicUsize::new(0);
 
-/// Keeps a foreground child process's Ctrl-C from also terminating Mjolnir.
+/// Keeps a foreground child process's Ctrl-C from also terminating Hel.
 ///
 /// The child remains in the terminal's foreground process group and receives
 /// the signal normally; only Mjolnir's process-wide graceful shutdown is
@@ -67,7 +67,7 @@ impl Coordinator {
                     .expect("install termination signal listeners");
             let listener = coordinator.clone();
             std::thread::Builder::new()
-                .name("mj-termination".to_string())
+                .name("hel-termination".to_string())
                 .spawn(move || {
                     for signal in signals.forever() {
                         listener.received_signal(signal);

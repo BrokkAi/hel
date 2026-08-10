@@ -1,8 +1,8 @@
 //! Prompt dictation support.
 //!
-//! Non-Android platforms run a fully local `mj-voice-worker` sidecar built on
+//! Non-Android platforms run a fully local `hel-voice-worker` sidecar built on
 //! sherpa-onnx. Keeping the native speech stack in its own workspace package
-//! means ordinary `mj` builds never compile or link ONNX Runtime.
+//! means ordinary `hel` builds never compile or link ONNX Runtime.
 //!
 //! The native speech stack can raise foreign C++ exceptions across the FFI boundary or
 //! abort outright when system libraries are incompatible or model files are
@@ -73,25 +73,25 @@ mod worker {
     }
 
     pub(super) fn voice_worker_executable() -> Result<PathBuf> {
-        if let Some(path) = std::env::var_os("MJ_VOICE_WORKER") {
+        if let Some(path) = std::env::var_os("HEL_VOICE_WORKER") {
             let path = PathBuf::from(path);
             anyhow::ensure!(
                 path.is_file(),
-                "MJ_VOICE_WORKER does not exist: {}",
+                "HEL_VOICE_WORKER does not exist: {}",
                 path.display()
             );
             return Ok(path);
         }
 
-        let mj = std::env::current_exe().context("locate the mj executable")?;
-        let worker = mj.with_file_name(if cfg!(windows) {
-            "mj-voice-worker.exe"
+        let hel = std::env::current_exe().context("locate the hel executable")?;
+        let worker = hel.with_file_name(if cfg!(windows) {
+            "hel-voice-worker.exe"
         } else {
-            "mj-voice-worker"
+            "hel-voice-worker"
         });
         anyhow::ensure!(
             worker.is_file(),
-            "voice dictation helper is missing: {}; install it beside mj or set MJ_VOICE_WORKER",
+            "voice dictation helper is missing: {}; install it beside hel or set HEL_VOICE_WORKER",
             worker.display()
         );
         Ok(worker)
@@ -231,7 +231,7 @@ mod worker {
             message.push_str(&format!(": {line}"));
         }
         let cache = dirs::cache_dir()
-            .map(|path| path.join("mj/voice").display().to_string())
+            .map(|path| path.join("hel/voice").display().to_string())
             .unwrap_or_else(|| "the voice model cache".to_string());
         message.push_str(&format!(
             " — the dictation engine runs in a separate process, so your session is unaffected; \

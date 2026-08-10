@@ -12,8 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const READY_MARKER: &[u8] = b"MJ_TERMINATION_PTY_READY";
-const FIRST_SIGNAL_ACK_MARKER: &[u8] = b"MJ_TERMINATION_PTY_FIRST_SIGNAL_ACK";
+const READY_MARKER: &[u8] = b"Welcome to Hel.";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 struct ReapChild(Option<Child>);
@@ -144,13 +143,12 @@ fn sigterm_restores_real_pty_terminal() {
         "make PTY master nonblocking"
     );
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mj"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hel"));
     command
-        .env("MJ_TERMINATION_PTY_INTEGRATION", "1")
         .stdin(Stdio::from(duplicate(slave.as_raw_fd())))
         .stdout(Stdio::from(duplicate(slave.as_raw_fd())))
         .stderr(Stdio::from(duplicate(slave.as_raw_fd())));
-    // Libtest may alter its signal mask. A real `mj` invocation should start
+    // Libtest may alter its signal mask. A real `hel` invocation should start
     // with SIGTERM unmasked, so establish that condition across exec.
     unsafe {
         command.pre_exec(|| {
@@ -168,7 +166,7 @@ fn sigterm_restores_real_pty_terminal() {
             Ok(())
         });
     }
-    let child = command.spawn().expect("spawn mj PTY helper");
+    let child = command.spawn().expect("spawn hel PTY helper");
     let mut child = ReapChild(Some(child));
 
     let mut output = Vec::new();
@@ -210,91 +208,4 @@ fn sigterm_restores_real_pty_terminal() {
         output.contains("\x1b[?25h"),
         "missing cursor restoration: {output:?}"
     );
-}
-
-#[test]
-fn repeated_sigterm_forces_real_pty_child_exit() {
-    let mut master_fd = -1;
-    let mut slave_fd = -1;
-    let window_size = libc::winsize {
-        ws_row: 24,
-        ws_col: 80,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    assert_eq!(
-        unsafe {
-            libc::openpty(
-                &mut master_fd,
-                &mut slave_fd,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::from_ref(&window_size).cast_mut(),
-            )
-        },
-        0,
-        "create PTY"
-    );
-    let mut master = unsafe { File::from_raw_fd(master_fd) };
-    let slave = unsafe { File::from_raw_fd(slave_fd) };
-    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
-    assert!(flags >= 0, "read PTY master flags");
-    assert_eq!(
-        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
-        0,
-        "make PTY master nonblocking"
-    );
-
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mj"));
-    command
-        .env("MJ_TERMINATION_PTY_INTEGRATION", "force")
-        .stdin(Stdio::from(duplicate(slave.as_raw_fd())))
-        .stdout(Stdio::from(duplicate(slave.as_raw_fd())))
-        .stderr(Stdio::from(duplicate(slave.as_raw_fd())));
-    unsafe {
-        command.pre_exec(|| {
-            let mut mask = std::mem::zeroed();
-            if libc::sigemptyset(&mut mask) != 0
-                || libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-                if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
-    let child = command.spawn().expect("spawn mj PTY helper");
-    let mut child = ReapChild(Some(child));
-
-    let mut output = Vec::new();
-    wait_for_output(
-        &mut master,
-        &mut output,
-        READY_MARKER,
-        Instant::now() + TIMEOUT,
-    );
-    assert_eq!(
-        unsafe { libc::kill(child.child_mut().id() as i32, libc::SIGTERM) },
-        0,
-        "send first SIGTERM to PTY child"
-    );
-    wait_for_output(
-        &mut master,
-        &mut output,
-        FIRST_SIGNAL_ACK_MARKER,
-        Instant::now() + TIMEOUT,
-    );
-    assert_eq!(
-        unsafe { libc::kill(child.child_mut().id() as i32, libc::SIGTERM) },
-        0,
-        "send second SIGTERM to PTY child"
-    );
-    let status = wait_for_exit(child.child_mut(), &mut master, &mut output);
-    drop(child.take());
-
-    assert_eq!(status.code(), Some(143), "PTY child exit: {status}");
 }

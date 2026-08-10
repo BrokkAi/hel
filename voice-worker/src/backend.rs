@@ -77,14 +77,14 @@ pub(super) fn has_model_data(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn mjolnir_cache_dir() -> Result<PathBuf> {
+fn hel_cache_dir() -> Result<PathBuf> {
     dirs::cache_dir()
-        .map(|dir| dir.join("mj"))
+        .map(|dir| dir.join("hel"))
         .context("locate user cache directory")
 }
 
 pub(super) fn model_paths() -> Result<ModelPaths> {
-    Ok(ModelPaths::in_cache(mjolnir_cache_dir()?))
+    Ok(ModelPaths::in_cache(hel_cache_dir()?))
 }
 
 /// Stream a URL to `dest`, reporting (downloaded, total) byte counts.
@@ -102,7 +102,7 @@ where
     let (progress_tx, progress_rx) = mpsc::channel::<(u64, Option<u64>)>();
     let worker = thread::spawn(move || -> Result<()> {
         let mut response = reqwest::blocking::Client::builder()
-            .user_agent("mjolnir-voice-setup")
+            .user_agent("hel-voice-setup")
             .build()
             .context("build download client")?
             .get(&url)
@@ -565,7 +565,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "downloads ~0.7 GB of models; run with: cargo test -p brokk-mj-voice-worker -- --ignored"]
+    #[ignore = "downloads ~0.7 GB of models; run with: cargo test -p hel-voice-worker -- --ignored"]
     fn models_install_and_decode_test_wav() {
         let paths = model_paths().expect("resolve model paths");
         ensure_models_installed(&paths, &mut |status| eprintln!("{status}"))
@@ -588,8 +588,8 @@ mod tests {
 
     #[test]
     fn model_paths_are_under_voice_cache() {
-        let paths = ModelPaths::in_cache(PathBuf::from("/cache/mj"));
-        let voice = PathBuf::from("/cache/mj").join("voice");
+        let paths = ModelPaths::in_cache(PathBuf::from("/cache/hel"));
+        let voice = PathBuf::from("/cache/hel").join("voice");
         assert_eq!(
             paths.dir,
             voice.join("sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8")

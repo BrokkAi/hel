@@ -15,11 +15,13 @@ use tokio::process::Command;
 const USAGE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub enum ClaudeUsageStatus {
     Available(ClaudeUsageReport),
     Unavailable(String),
 }
 
+#[cfg(test)]
 impl ClaudeUsageStatus {
     pub fn compact_label(&self) -> String {
         match self {
@@ -35,6 +37,7 @@ pub struct ClaudeUsageReport {
     pub week: Option<ClaudeUsageWindow>,
 }
 
+#[cfg(test)]
 impl ClaudeUsageReport {
     pub fn compact_label(&self) -> String {
         let mut parts = Vec::new();
@@ -60,6 +63,7 @@ pub struct ClaudeUsageWindow {
     pub reset_context: Option<String>,
 }
 
+#[cfg(test)]
 impl ClaudeUsageWindow {
     fn compact_label(&self, label: &str) -> String {
         let mut text = format!("{label} {}% left", self.remaining_percent);
@@ -82,6 +86,7 @@ pub enum ClaudeUsageError {
     Parse,
 }
 
+#[cfg(test)]
 impl ClaudeUsageError {
     pub fn user_reason(&self) -> &'static str {
         match self {

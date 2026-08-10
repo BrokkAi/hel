@@ -22,6 +22,7 @@ pub enum CodexUsageStatus {
     Unavailable(String),
 }
 
+#[cfg(test)]
 impl CodexUsageStatus {
     pub fn compact_label(&self) -> String {
         match self {
@@ -37,6 +38,7 @@ pub struct CodexUsageReport {
     pub secondary: Option<CodexUsageWindow>,
 }
 
+#[cfg(test)]
 impl CodexUsageReport {
     fn compact_label(&self) -> String {
         let parts = [&self.primary, &self.secondary]
@@ -55,6 +57,7 @@ pub struct CodexUsageWindow {
     pub resets_at: Option<i64>,
 }
 
+#[cfg(test)]
 impl CodexUsageWindow {
     fn compact_label(&self) -> String {
         let mut label = format!("{} {}% left", self.label, self.remaining_percent);
@@ -71,7 +74,6 @@ impl CodexUsageWindow {
 
 pub struct CodexUsageClient {
     child: Child,
-    pid: Option<u32>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
@@ -91,7 +93,6 @@ impl CodexUsageClient {
             .take()
             .ok_or(QueryError::Protocol(ProtocolError::Io))?;
         Ok(Self {
-            pid: child.id(),
             child,
             stdin,
             stdout: BufReader::new(stdout),
@@ -109,8 +110,8 @@ impl CodexUsageClient {
                 "initialize",
                 json!({
                     "clientInfo": {
-                        "name": "mjolnir",
-                        "title": "Mjolnir",
+                        "name": "hel",
+                        "title": "Hel",
                         "version": env!("CARGO_PKG_VERSION")
                     }
                 }),
@@ -175,12 +176,11 @@ impl CodexUsageClient {
 
     pub async fn shutdown(mut self) {
         drop(self.stdin);
-        // Closing stdin asks app-server to stop; always follow with process-tree
-        // cleanup so a wrapper cannot exit successfully while leaving a helper
-        // behind. `kill_agent_tree` sends SIGTERM before escalating on Unix.
-        if let Err(error) = crate::acp::kill_agent_tree(&mut self.child, self.pid).await {
-            tracing::warn!("reap Codex usage client: {error:#}");
-        }
+        // Closing stdin asks app-server to stop. The quota process is always
+        // launched directly (never through npx), so killing the recorded child
+        // is sufficient if it does not notice EOF promptly.
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
     }
 }
 
@@ -286,11 +286,10 @@ fn spawn_codex(cwd: PathBuf, env: HashMap<String, String>) -> Result<Child, Quer
             .args(["app-server", "--stdio"])
             .current_dir(&cwd)
             .envs(&env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        crate::acp::configure_isolated_child(
-            &mut command,
-            crate::acp::SpawnIsolation::ProcessGroup,
-        );
+        command.kill_on_drop(true);
         match command.spawn() {
             Ok(child) => return Ok(child),
             Err(error)

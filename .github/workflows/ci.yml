@@ -41,14 +41,14 @@ jobs:
     - name: Check crate package license files
       run: |
         diff -u LICENSE voice-worker/LICENSE
-        cargo package --locked --allow-dirty --list -p brokk-mjolnir > /tmp/mjolnir-package-files.txt
-        cargo package --locked --allow-dirty --list -p brokk-mj-voice-worker > /tmp/voice-worker-package-files.txt
-        grep -Fx LICENSE /tmp/mjolnir-package-files.txt
-        grep -Fx licenses/THIRD_PARTY_LICENSES.html /tmp/mjolnir-package-files.txt
-        grep -Fx licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/mjolnir-package-files.txt
+        cargo package --locked --allow-dirty --list -p hel > /tmp/hel-package-files.txt
+        cargo package --locked --allow-dirty --list -p hel-voice-worker > /tmp/voice-worker-package-files.txt
+        grep -Fx LICENSE /tmp/hel-package-files.txt
+        grep -Fx licenses/THIRD_PARTY_LICENSES.html /tmp/hel-package-files.txt
+        grep -Fx licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/hel-package-files.txt
         grep -Fx LICENSE /tmp/voice-worker-package-files.txt
 
-  mjolnir:
+  hel:
     strategy:
       fail-fast: false
       matrix:
@@ -77,10 +77,10 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-mjolnir-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+        key: ${{ runner.os }}-hel-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-mjolnir-cargo-${{ steps.toolchain.outputs.cachekey }}-
-          ${{ runner.os }}-mjolnir-cargo-
+          ${{ runner.os }}-hel-cargo-${{ steps.toolchain.outputs.cachekey }}-
+          ${{ runner.os }}-hel-cargo-
 
     - name: Check Rust formatting
       run: cargo fmt --check
@@ -88,7 +88,7 @@ jobs:
     - name: Run Clippy lints
       run: cargo clippy --all-targets -- -D warnings
 
-    - name: Build mjolnir
+    - name: Build Hel
       run: cargo build --release
 
     - name: Run tests
@@ -111,10 +111,10 @@ jobs:
         sudo apt-get install --no-install-recommends --assume-yes libasound2-dev
 
     - name: Check voice worker
-      run: cargo clippy -p brokk-mj-voice-worker --all-targets -- -D warnings
+      run: cargo clippy -p hel-voice-worker --all-targets -- -D warnings
 
     - name: Test voice worker
-      run: cargo test -p brokk-mj-voice-worker
+      run: cargo test -p hel-voice-worker
 
   android:
     name: Android aarch64-linux-android
