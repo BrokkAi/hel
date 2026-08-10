@@ -22,6 +22,7 @@ separate from MJ and there is no automatic MJ migration.
 ```console
 cargo build --release
 ./target/release/hel
+./target/release/hel setup
 ```
 
 For a local Podman target, build the agent-development image with:
@@ -45,9 +46,14 @@ kind = "local-podman"
 image = "localhost/hel/agent-dev:latest"
 ```
 
-`hel` opens the session/quota dashboard. `q` or Back detaches; it does not stop
-the target-side worker. `hel server` explicitly starts the authenticated phone
-controller. It binds only to loopback unless direct TLS is configured:
+`hel` opens the session/quota dashboard. On a first run with no configuration,
+it drops into the same plain-stdio setup dialog as `hel setup`. The dialog finds
+local Codex, Claude Code, and Kimi Code homes, reports whether their credentials
+appear present, detects the current GitHub origin, recommends a usable local
+container runtime, writes the configuration after confirmation, and smoke-tests
+the selected image. `q` or Back detaches; it does not stop the target-side
+worker. `hel server` explicitly starts the authenticated phone controller. It
+binds only to loopback unless direct TLS is configured:
 
 ```console
 hel server
@@ -135,6 +141,11 @@ development builds can set `HEL_WORKER_DIR` or `HEL_WORKER_BINARY`. A release
 service may instead set an `HEL_WORKER_URL` containing `{target}` plus its
 required `HEL_WORKER_SHA256`; Hel verifies the download before caching or
 executing it.
+
+The first-run dialog intentionally creates one local target and, when started
+inside a GitHub checkout, one-repository bundle. Advanced configurations remain
+TOML-first: edit `config.toml` directly to add profiles, virtual monorepos, SSH
+targets, or AWS targets.
 
 ## Session archives
 

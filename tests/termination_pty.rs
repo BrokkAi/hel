@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::{
+    fs,
     fs::File,
     io::{self, ErrorKind, Read},
     os::{
@@ -111,6 +112,31 @@ fn wait_for_exit(child: &mut Child, master: &mut File, output: &mut Vec<u8>) -> 
 
 #[test]
 fn sigterm_restores_real_pty_terminal() {
+    let storage = tempfile::tempdir().expect("create Hel test storage");
+    let config_root = storage.path().join("config");
+    fs::create_dir_all(config_root.join("hel")).expect("create Hel config directory");
+    fs::write(
+        config_root.join("hel/config.toml"),
+        r#"version = 1
+
+[profiles.codex]
+kind = "codex"
+home = "/profiles/codex"
+
+[bundles.hel]
+primary_repo = "hel"
+
+[[bundles.hel.repositories]]
+id = "hel"
+github = "BrokkAi/hel"
+destination = "hel"
+
+[targets.podman]
+kind = "local-podman"
+image = "ubuntu:24.04"
+"#,
+    )
+    .expect("write Hel test config");
     let mut master_fd = -1;
     let mut slave_fd = -1;
     let window_size = libc::winsize {
@@ -147,7 +173,9 @@ fn sigterm_restores_real_pty_terminal() {
     command
         .stdin(Stdio::from(duplicate(slave.as_raw_fd())))
         .stdout(Stdio::from(duplicate(slave.as_raw_fd())))
-        .stderr(Stdio::from(duplicate(slave.as_raw_fd())));
+        .stderr(Stdio::from(duplicate(slave.as_raw_fd())))
+        .env("XDG_CONFIG_HOME", &config_root)
+        .env("XDG_DATA_HOME", storage.path().join("data"));
     // Libtest may alter its signal mask. A real `hel` invocation should start
     // with SIGTERM unmasked, so establish that condition across exec.
     unsafe {
