@@ -763,6 +763,10 @@ pub enum WorkerBinaryAvailability {
     },
 }
 
+fn packaged_worker_binary_path(directory: &Path, triple: &str) -> PathBuf {
+    directory.join(format!("hel-worker-{triple}"))
+}
+
 /// Find a worker source without downloading it.
 ///
 /// Container provisioning resolves this after discovering the target
@@ -784,18 +788,14 @@ pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAva
     let mut candidates = Vec::new();
     if let Some(directory) = std::env::var_os("HEL_WORKER_DIR").map(PathBuf::from) {
         candidates.push((
-            directory.join(format!("hel-worker-{triple}")),
+            packaged_worker_binary_path(&directory, &triple),
             "HEL_WORKER_DIR",
         ));
         candidates.push((directory.join(&triple).join("hel"), "HEL_WORKER_DIR"));
     }
     if let Some(directory) = current.parent() {
         candidates.push((
-            directory.join(format!("hel-worker-{triple}")),
-            "beside the Hel binary",
-        ));
-        candidates.push((
-            directory.join(format!("hel-{triple}")),
+            packaged_worker_binary_path(directory, &triple),
             "beside the Hel binary",
         ));
         // Development checkout: a controller at target/<profile>/hel finds its
@@ -1973,6 +1973,19 @@ mod tests {
 
     use super::*;
     use crate::hel_config::{ContainerTemplate as ConfigContainer, ProjectRepository};
+
+    #[test]
+    fn packaged_worker_names_match_release_archives() {
+        let directory = Path::new("/opt/hel/bin");
+        assert_eq!(
+            packaged_worker_binary_path(directory, "x86_64-unknown-linux-musl"),
+            directory.join("hel-worker-x86_64-unknown-linux-musl")
+        );
+        assert_eq!(
+            packaged_worker_binary_path(directory, "aarch64-unknown-linux-musl"),
+            directory.join("hel-worker-aarch64-unknown-linux-musl")
+        );
+    }
 
     #[test]
     fn stage_profile_applies_codex_model_and_effort_overrides() {
