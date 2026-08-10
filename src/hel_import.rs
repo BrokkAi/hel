@@ -294,15 +294,15 @@ fn select_jsonl_session(
     match selection {
         CodexSessionSelection::Session(session_id) => {
             validate_id(&format!("{harness} session"), session_id)?;
-            let mut matches = candidates
+            candidates
                 .into_iter()
                 .filter(|candidate| candidate.session_id == *session_id)
-                .collect::<Vec<_>>();
-            match matches.len() {
-                0 => bail!("{harness} session {session_id:?} was not found"),
-                1 => Ok(matches.remove(0)),
-                _ => bail!("{harness} session {session_id:?} occurs in multiple locations"),
-            }
+                .max_by(|left, right| {
+                    left.modified_at
+                        .cmp(&right.modified_at)
+                        .then_with(|| left.jsonl_path.cmp(&right.jsonl_path))
+                })
+                .with_context(|| format!("{harness} session {session_id:?} was not found"))
         }
         CodexSessionSelection::Latest => candidates
             .into_iter()

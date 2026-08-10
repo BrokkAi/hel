@@ -50,10 +50,14 @@ RUN npm install --global --no-audit --no-fund \
 RUN rustup component add clippy rustfmt \
     && rustup target add x86_64-unknown-linux-musl
 
-RUN mkdir -p /workspace /var/lib/hel \
+RUN useradd --create-home --shell /bin/bash hel \
+    && mkdir -p /workspace /var/lib/hel \
+    && chown -R hel:hel /workspace /var/lib/hel \
     && chmod 0755 /workspace /var/lib/hel
 
-ENV SHELL=/bin/bash
+USER hel
+ENV HOME=/home/hel \
+    SHELL=/bin/bash
 WORKDIR /workspace
 
 # Hel overrides the command with the same keepalive, but retaining it here also
