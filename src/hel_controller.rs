@@ -201,16 +201,27 @@ impl Controller {
 
         let result =
             preflight_target(template, executor).and_then(|()| provision.execute(executor));
+        // Everything after resource creation must funnel through the error
+        // branch below: an early `?` here once left records stuck in
+        // Provisioning with a live, untracked cloud resource.
+        let result = result.and_then(|outputs| {
+            locator_after_provision(
+                template,
+                &target,
+                session_id,
+                outputs.first(),
+                executor,
+                &bundle,
+            )
+            .map_err(|error| {
+                match cleanup_failed_provision(template, session_id, outputs.first(), executor) {
+                    Some(note) => error.context(note),
+                    None => error,
+                }
+            })
+        });
         match result {
-            Ok(outputs) => {
-                let locator = locator_after_provision(
-                    template,
-                    &target,
-                    session_id,
-                    outputs.first(),
-                    executor,
-                    &bundle,
-                )?;
+            Ok(locator) => {
                 let record = self.state.sessions.get_mut(session_id).unwrap();
                 record.target = Some(locator);
                 // Provisioning has completed, but Running is reserved for a
@@ -1230,12 +1241,87 @@ fn backend_ssh(ssh: &SshConnection) -> SshTarget {
 }
 
 fn ssh_args_with_identity(args: &[String], identity: Option<&Path>) -> Vec<String> {
-    let mut result = args.to_vec();
+    // Hel drives ssh non-interactively from a TUI; a host-key or password
+    // prompt would steal the terminal and wedge provisioning. BatchMode fails
+    // fast instead of prompting, and accept-new trusts a first-seen host key
+    // (fresh EC2 instances are always first-seen) while still rejecting
+    // changed keys. User-supplied ssh_args come last so they can override.
+    let mut result = vec![
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(),
+        "ConnectTimeout=15".into(),
+    ];
+    result.extend(args.iter().cloned());
     if let Some(identity) = identity {
         result.push("-i".into());
         result.push(identity.to_string_lossy().into_owned());
     }
     result
+}
+
+/// Best-effort teardown of a freshly created resource whose provisioning
+/// failed before a locator was recorded. Returns a note describing what
+/// happened for inclusion in the session error.
+fn cleanup_failed_provision(
+    canonical: &TargetTemplate,
+    session_id: &str,
+    first_output: Option<&CommandOutput>,
+    executor: &impl CommandExecutor,
+) -> Option<String> {
+    let command = match canonical {
+        TargetTemplate::LocalPodman { .. } => {
+            let name = hel_targets::resource_name(session_id).ok()?;
+            CommandSpec::new("podman", ["rm", "--force", &name])
+                .purpose("remove container after failed provisioning")
+        }
+        TargetTemplate::AppleContainer { .. } => {
+            let name = hel_targets::resource_name(session_id).ok()?;
+            CommandSpec::new("container", ["rm", "--force", &name])
+                .purpose("remove container after failed provisioning")
+        }
+        TargetTemplate::AwsEc2 {
+            aws_profile,
+            region,
+            ..
+        } => {
+            let instance_id = serde_json::from_slice::<serde_json::Value>(&first_output?.stdout)
+                .ok()?
+                .pointer("/Instances/0/InstanceId")?
+                .as_str()?
+                .to_string();
+            let profile = aws_profile.clone().unwrap_or_else(|| "default".into());
+            CommandSpec::new(
+                "aws",
+                [
+                    "--profile",
+                    &profile,
+                    "--region",
+                    region,
+                    "ec2",
+                    "terminate-instances",
+                    "--instance-ids",
+                    &instance_id,
+                ],
+            )
+            .purpose("terminate EC2 instance after failed provisioning")
+        }
+        // SSH machines are persistent; nothing was created that must die.
+        TargetTemplate::SshBare { .. } | TargetTemplate::SshPodman { .. } => return None,
+    };
+    let purpose = command.purpose.clone();
+    match executor.execute(&command) {
+        Ok(output) if output.status == 0 => Some(format!("cleanup succeeded: {purpose}")),
+        Ok(output) => Some(format!(
+            "cleanup FAILED ({purpose}, status {}): the resource may still exist; find it via its dev.hel.session={session_id} label/tag",
+            output.status
+        )),
+        Err(error) => Some(format!(
+            "cleanup FAILED ({purpose}): {error:#}; the resource may still exist; find it via its dev.hel.session={session_id} label/tag"
+        )),
+    }
 }
 
 fn locator_after_provision(
@@ -1493,7 +1579,7 @@ fn bridge_launch(
             "sh".into(),
             vec![
                 "-lc".into(),
-                "if command -v kimi >/dev/null 2>&1; then exec kimi acp; elif [ -x \"$HOME/.local/bin/kimi\" ]; then exec \"$HOME/.local/bin/kimi\" acp; elif command -v curl >/dev/null 2>&1; then curl -fsSL https://code.kimi.com/kimi-code/install.sh | sh && exec \"$HOME/.local/bin/kimi\" acp; else echo 'Hel needs compatible Kimi Code or curl for its official installer' >&2; exit 127; fi".into(),
+                "if command -v kimi >/dev/null 2>&1; then exec kimi acp; elif [ -x \"$HOME/.kimi-code/bin/kimi\" ]; then exec \"$HOME/.kimi-code/bin/kimi\" acp; elif command -v curl >/dev/null 2>&1; then curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash && exec \"$HOME/.kimi-code/bin/kimi\" acp; else echo 'Hel needs compatible Kimi Code or curl for its official installer' >&2; exit 127; fi".into(),
             ],
         ),
     }
@@ -2012,10 +2098,9 @@ fn worker_last_words(
         | hel_targets::TargetLocator::SshBare { ssh, .. } => {
             ssh_command_spec(ssh, ["sh", "-lc", &script])
         }
-        hel_targets::TargetLocator::SshPodman { ssh, container_id } => ssh_command_spec(
-            ssh,
-            ["podman", "exec", container_id, "sh", "-c", &script],
-        ),
+        hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
+            ssh_command_spec(ssh, ["podman", "exec", container_id, "sh", "-c", &script])
+        }
     }
     .purpose("collect worker last words");
     let output = executor.execute(&command).ok()?;
@@ -2098,6 +2183,15 @@ mod tests {
             packaged_worker_binary_path(directory, "aarch64-unknown-linux-musl"),
             directory.join("hel-worker-aarch64-unknown-linux-musl")
         );
+    }
+
+    #[test]
+    fn kimi_default_bridge_uses_bash_for_the_official_installer() {
+        let (command, arguments) = bridge_launch(crate::hel_config::HarnessKind::Kimi, None);
+        assert_eq!(command, "sh");
+        assert_eq!(arguments[0], "-lc");
+        assert!(arguments[1].contains("install.sh | bash &&"));
+        assert!(arguments[1].contains("$HOME/.kimi-code/bin/kimi"));
     }
 
     #[test]

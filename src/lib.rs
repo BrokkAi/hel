@@ -13,6 +13,7 @@ pub mod hel_checkpoint;
 pub mod hel_config;
 pub mod hel_controller;
 pub mod hel_doctor;
+pub mod hel_import;
 pub mod hel_quota;
 pub mod hel_server;
 pub mod hel_setup;

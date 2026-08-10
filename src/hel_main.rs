@@ -5,18 +5,25 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use crossterm::event::{self, Event};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use hel::hel_config::config_path;
+use hel::hel_config::{HelConfig, config_path, sessions_dir};
 use hel::hel_controller::Controller;
+use hel::hel_import::{
+    BundleResolution, ClaudeImportRequest, ClaudeSessionSelection, CodexImportRequest,
+    CodexSessionSelection, KimiImportRequest, KimiSessionSelection, claude_config_home,
+    codex_config_home, import_claude_session, import_codex_session, import_kimi_session,
+    kimi_config_home, locate_claude_session, locate_codex_session, locate_kimi_session,
+    read_claude_transcript, read_codex_transcript, read_kimi_transcript, resolve_bundle,
+};
 use hel::hel_quota::{ProfileQuota, QuotaManager};
 use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapshot};
 use hel::hel_setup::{SetupOutcome, run_setup_dialog};
-use hel::hel_state::{SessionState, harness_session_title};
+use hel::hel_state::{HelState, SessionState, harness_session_title};
 use hel::hel_targets::{CommandSpec, ProcessExecutor};
 use hel::hel_tui::{DashboardAction, DashboardState, render};
 use hel::hel_worker::SequencedEvent;
@@ -43,6 +50,8 @@ enum Command {
     Doctor(DoctorArgs),
     /// Discover local agent homes and create an initial Hel configuration.
     Setup(SetupArgs),
+    /// Adopt a native coding-agent session as an archived Hel session.
+    Import(ImportArgs),
 }
 
 #[derive(Debug, Args)]
@@ -59,6 +68,85 @@ struct DoctorArgs {
 struct SetupArgs {
     #[command(subcommand)]
     command: Option<SetupCommand>,
+}
+
+#[derive(Debug, Args)]
+struct ImportArgs {
+    #[command(subcommand)]
+    command: ImportCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ImportCommand {
+    /// Import a session created by vanilla Claude Code.
+    Claude(ClaudeImportArgs),
+    /// Import a session created by vanilla Codex.
+    Codex(CodexImportArgs),
+    /// Import a session created by vanilla Kimi Code.
+    Kimi(KimiImportArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("codex-session-selection")
+        .required(true)
+        .args(["session", "latest"])
+))]
+struct CodexImportArgs {
+    /// Native Codex session UUID to import.
+    #[arg(long)]
+    session: Option<String>,
+    /// Import the most recently modified Codex session.
+    #[arg(long)]
+    latest: bool,
+    /// Existing configured bundle to associate with the imported session.
+    #[arg(long)]
+    bundle: Option<String>,
+    /// Title displayed in Hel's dashboard.
+    #[arg(long)]
+    title: Option<String>,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("kimi-session-selection")
+        .required(true)
+        .args(["session", "latest"])
+))]
+struct KimiImportArgs {
+    /// Native Kimi session UUID to import.
+    #[arg(long)]
+    session: Option<String>,
+    /// Import the most recently modified Kimi session.
+    #[arg(long)]
+    latest: bool,
+    /// Existing configured bundle to associate with the imported session.
+    #[arg(long)]
+    bundle: Option<String>,
+    /// Title displayed in Hel's dashboard.
+    #[arg(long)]
+    title: Option<String>,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("claude-session-selection")
+        .required(true)
+        .args(["session", "latest"])
+))]
+struct ClaudeImportArgs {
+    /// Native Claude session UUID to import.
+    #[arg(long)]
+    session: Option<String>,
+    /// Import the most recently modified Claude session across all projects.
+    #[arg(long)]
+    latest: bool,
+    /// Existing configured bundle to associate with the imported session.
+    #[arg(long)]
+    bundle: Option<String>,
+    /// Title displayed in Hel's dashboard.
+    #[arg(long)]
+    title: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -131,7 +219,9 @@ enum WorkerPollPayload {
     Events(Vec<SequencedEvent>),
     /// The worker failed several consecutive polls; the session needs
     /// attention and a diagnosis.
-    Unreachable { detail: String },
+    Unreachable {
+        detail: String,
+    },
 }
 
 /// Consecutive failed polls before a running session is declared unreachable.
@@ -217,6 +307,7 @@ async fn main() -> Result<()> {
         },
         Some(Command::Doctor(args)) => doctor(args),
         Some(Command::Setup(args)) => setup(args),
+        Some(Command::Import(args)) => import(args),
     }
 }
 
@@ -234,6 +325,204 @@ fn setup(args: SetupArgs) -> Result<()> {
             SetupOutcome::Written | SetupOutcome::Cancelled => Ok(()),
         },
     }
+}
+
+fn import(args: ImportArgs) -> Result<()> {
+    match args.command {
+        ImportCommand::Claude(args) => import_claude(args),
+        ImportCommand::Codex(args) => import_codex(args),
+        ImportCommand::Kimi(args) => import_kimi(args),
+    }
+}
+
+fn import_claude(args: ClaudeImportArgs) -> Result<()> {
+    let claude_home = claude_config_home()?;
+    let selection = match args.session {
+        Some(session) => ClaudeSessionSelection::Session(session),
+        None => ClaudeSessionSelection::Latest,
+    };
+    let source = locate_claude_session(&claude_home, &selection)?;
+    println!(
+        "Selected Claude session {} at {}",
+        source.session_id,
+        source.jsonl_path.display()
+    );
+    let transcript = read_claude_transcript(&source.jsonl_path)?;
+    println!("Original cwd: {}", transcript.cwd.display());
+
+    let mut config = HelConfig::load()?;
+    let mut state = HelState::load()?;
+    state.validate_against_config(&config)?;
+    let resolution = resolve_bundle(&config, &transcript.cwd, args.bundle.as_deref())?;
+    let bundle_id = match resolution {
+        BundleResolution::Existing(bundle_id) => bundle_id,
+        BundleResolution::Synthesized { id, bundle } => {
+            let repository = bundle.primary().expect("synthesized bundle has a primary");
+            if !confirm_synthesized_bundle(&id, &repository.github, &repository.destination)? {
+                println!("Import cancelled; no Hel files were changed.");
+                return Ok(());
+            }
+            config.bundles.insert(id.clone(), bundle);
+            id
+        }
+    };
+    let imported = import_claude_session(
+        &config,
+        &mut state,
+        ClaudeImportRequest {
+            claude_home: &claude_home,
+            source: &source,
+            transcript: &transcript,
+            bundle_id: &bundle_id,
+            title: args.title.as_deref(),
+            archive_directory: &sessions_dir(),
+        },
+    )?;
+    // Both writes are atomic. The archive was already written and reopened by
+    // `write_archive_atomic`; persist a synthesized config before the state
+    // record that references it.
+    config.save()?;
+    state.save()?;
+    println!(
+        "Imported {} as Hel session {} (bundle {}, archive {})",
+        imported.native_session_id,
+        imported.session_id,
+        imported.bundle_id,
+        imported.archive_path.display()
+    );
+    Ok(())
+}
+
+fn import_codex(args: CodexImportArgs) -> Result<()> {
+    let codex_home = codex_config_home()?;
+    let selection = match args.session {
+        Some(session) => CodexSessionSelection::Session(session),
+        None => CodexSessionSelection::Latest,
+    };
+    let source = locate_codex_session(&codex_home, &selection)?;
+    println!(
+        "Selected Codex session {} at {}",
+        source.session_id,
+        source.jsonl_path.display()
+    );
+    let transcript = read_codex_transcript(&source.jsonl_path)?;
+    println!("Original cwd: {}", transcript.cwd.display());
+
+    let mut config = HelConfig::load()?;
+    let mut state = HelState::load()?;
+    state.validate_against_config(&config)?;
+    let Some(bundle_id) =
+        resolve_import_bundle(&mut config, &transcript.cwd, args.bundle.as_deref())?
+    else {
+        return Ok(());
+    };
+    let imported = import_codex_session(
+        &config,
+        &mut state,
+        CodexImportRequest {
+            codex_home: &codex_home,
+            source: &source,
+            transcript: &transcript,
+            bundle_id: &bundle_id,
+            title: args.title.as_deref(),
+            archive_directory: &sessions_dir(),
+        },
+    )?;
+    config.save()?;
+    state.save()?;
+    println!(
+        "Imported {} as Hel session {} (bundle {}, archive {})",
+        imported.native_session_id,
+        imported.session_id,
+        imported.bundle_id,
+        imported.archive_path.display()
+    );
+    Ok(())
+}
+
+fn import_kimi(args: KimiImportArgs) -> Result<()> {
+    let kimi_home = kimi_config_home()?;
+    let selection = match args.session {
+        Some(session) => KimiSessionSelection::Session(session),
+        None => KimiSessionSelection::Latest,
+    };
+    let source = locate_kimi_session(&kimi_home, &selection)?;
+    println!(
+        "Selected Kimi session {} at {}",
+        source.session_id,
+        source.session_path.display()
+    );
+    let transcript = read_kimi_transcript(&source.session_path)?;
+    println!("Original cwd: {}", transcript.cwd.display());
+
+    let mut config = HelConfig::load()?;
+    let mut state = HelState::load()?;
+    state.validate_against_config(&config)?;
+    let Some(bundle_id) =
+        resolve_import_bundle(&mut config, &transcript.cwd, args.bundle.as_deref())?
+    else {
+        return Ok(());
+    };
+    let imported = import_kimi_session(
+        &config,
+        &mut state,
+        KimiImportRequest {
+            kimi_home: &kimi_home,
+            source: &source,
+            transcript: &transcript,
+            bundle_id: &bundle_id,
+            title: args.title.as_deref(),
+            archive_directory: &sessions_dir(),
+        },
+    )?;
+    config.save()?;
+    state.save()?;
+    println!(
+        "Imported {} as Hel session {} (bundle {}, archive {})",
+        imported.native_session_id,
+        imported.session_id,
+        imported.bundle_id,
+        imported.archive_path.display()
+    );
+    Ok(())
+}
+
+fn resolve_import_bundle(
+    config: &mut HelConfig,
+    cwd: &std::path::Path,
+    requested_bundle: Option<&str>,
+) -> Result<Option<String>> {
+    match resolve_bundle(config, cwd, requested_bundle)? {
+        BundleResolution::Existing(bundle_id) => Ok(Some(bundle_id)),
+        BundleResolution::Synthesized { id, bundle } => {
+            let repository = bundle.primary().expect("synthesized bundle has a primary");
+            if !confirm_synthesized_bundle(&id, &repository.github, &repository.destination)? {
+                println!("Import cancelled; no Hel files were changed.");
+                return Ok(None);
+            }
+            config.bundles.insert(id.clone(), bundle);
+            Ok(Some(id))
+        }
+    }
+}
+
+fn confirm_synthesized_bundle(
+    bundle_id: &str,
+    github: &str,
+    destination: &std::path::Path,
+) -> Result<bool> {
+    print!(
+        "No configured bundle matches this repository. Create bundle {bundle_id:?} for {github} at {}? [y/N]: ",
+        destination.display()
+    );
+    use std::io::Write as _;
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn doctor(args: DoctorArgs) -> Result<()> {

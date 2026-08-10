@@ -443,6 +443,9 @@ impl HelConfig {
 }
 
 pub fn config_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("HEL_CONFIG_DIR") {
+        return PathBuf::from(path);
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from(".config"))
         .join(PRODUCT_DIR)
@@ -453,6 +456,9 @@ pub fn config_path() -> PathBuf {
 }
 
 pub fn data_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("HEL_DATA_DIR") {
+        return PathBuf::from(path);
+    }
     dirs::data_local_dir()
         .or_else(dirs::data_dir)
         .unwrap_or_else(|| PathBuf::from(".local/share"))

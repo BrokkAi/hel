@@ -158,7 +158,10 @@ pub fn github_repository_from_origin(origin: &str) -> Option<GithubRepository> {
         .strip_prefix("https://github.com/")
         .or_else(|| origin.strip_prefix("http://github.com/"))
         .or_else(|| origin.strip_prefix("git@github.com:"))
-        .or_else(|| origin.strip_prefix("ssh://git@github.com/"))?;
+        .or_else(|| origin.strip_prefix("ssh://git@github.com/"))
+        // Config accepts owner/repository shorthand, and import uses the same
+        // parser to compare that configured source with `git remote` output.
+        .unwrap_or(origin);
     let path = path.trim_end_matches(".git");
     let mut parts = path.split('/');
     let owner = parts.next()?;

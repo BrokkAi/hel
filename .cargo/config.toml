@@ -1,0 +1,8 @@
+# Default to the static musl target on Linux development machines: the built
+# controller then doubles as the container worker (matching triple, no glibc
+# dependency), so plain `cargo run` is self-consistent without a second build.
+# Explicit `--target` flags (CI release matrix, macOS builds) override this.
+# On non-x86_64-Linux hosts, pass your host triple explicitly, e.g.
+# `cargo build --target aarch64-apple-darwin`.
+[build]
+target = "x86_64-unknown-linux-musl"

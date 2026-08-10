@@ -11,6 +11,8 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::hel_archive::{
     ArchiveInput, BundleManifest, GitCollectionSpec, GitCommand, GitCommandRunner, NativeArtifact,
@@ -152,16 +154,150 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
             let PayloadRole::NativeArtifact { relative_path } = &descriptor.role else {
                 continue;
             };
-            validate_relative_path(relative_path)?;
+            let native_data = archive.payload(descriptor)?;
+            let relative_path = restored_native_relative_path(
+                archive.manifest.session.harness_kind,
+                relative_path,
+                &archive.manifest.bundle.primary_repository,
+                &archive.manifest.repositories,
+                &spec.workspace_root,
+            )?;
+            let native_data = restored_native_artifact_bytes(
+                archive.manifest.session.harness_kind,
+                &relative_path,
+                native_data,
+                &archive.manifest.bundle.primary_repository,
+                &archive.manifest.repositories,
+                &spec.workspace_root,
+            )?;
+            validate_relative_path(&relative_path)?;
             ensure!(
-                !secret_like_path(relative_path),
+                !secret_like_path(&relative_path),
                 "native artifact path is secret-like"
             );
             let destination = spec.harness_home.join(relative_path);
-            write_private_file(&destination, archive.payload(descriptor)?, descriptor.mode)?;
+            write_private_file(&destination, &native_data, descriptor.mode)?;
         }
     }
     Ok(())
+}
+
+/// Native session files use harness-specific working-directory keys. Rewrite
+fn restored_native_relative_path(
+    harness: HarnessKind,
+    relative_path: &Path,
+    primary_repository: &str,
+    repositories: &[crate::hel_archive::RepositoryManifest],
+    workspace_root: &Path,
+) -> Result<PathBuf> {
+    let Some(target_cwd) = target_primary_cwd(primary_repository, repositories, workspace_root)
+    else {
+        return Ok(relative_path.to_path_buf());
+    };
+    let mut components = relative_path.components();
+    match harness {
+        HarnessKind::Claude => {
+            if components.next() != Some(Component::Normal("projects".as_ref()))
+                || components.next().is_none()
+            {
+                return Ok(relative_path.to_path_buf());
+            }
+            let mut rewritten = PathBuf::from("projects");
+            rewritten.push(claude_project_slug(&target_cwd));
+            rewritten.extend(components);
+            Ok(rewritten)
+        }
+        HarnessKind::Kimi => {
+            if components.next() != Some(Component::Normal("sessions".as_ref()))
+                || components.next().is_none()
+            {
+                return Ok(relative_path.to_path_buf());
+            }
+            let mut rewritten = PathBuf::from("sessions");
+            rewritten.push(kimi_workspace_key(&target_cwd));
+            rewritten.extend(components);
+            Ok(rewritten)
+        }
+        HarnessKind::Codex => Ok(relative_path.to_path_buf()),
+    }
+}
+
+fn target_primary_cwd(
+    primary_repository: &str,
+    repositories: &[crate::hel_archive::RepositoryManifest],
+    workspace_root: &Path,
+) -> Option<PathBuf> {
+    repositories
+        .iter()
+        .find(|repository| repository.metadata.id == primary_repository)
+        .map(|primary| workspace_root.join(&primary.metadata.relative_destination))
+}
+
+fn restored_native_artifact_bytes(
+    harness: HarnessKind,
+    relative_path: &Path,
+    data: &[u8],
+    primary_repository: &str,
+    repositories: &[crate::hel_archive::RepositoryManifest],
+    workspace_root: &Path,
+) -> Result<Vec<u8>> {
+    if harness != HarnessKind::Kimi || !is_kimi_session_state(relative_path) {
+        return Ok(data.to_vec());
+    }
+    let Some(target_cwd) = target_primary_cwd(primary_repository, repositories, workspace_root)
+    else {
+        return Ok(data.to_vec());
+    };
+    let mut state: Value =
+        serde_json::from_slice(data).context("parse Kimi native session state")?;
+    let object = state
+        .as_object_mut()
+        .context("Kimi native session state is not a JSON object")?;
+    for key in ["workDir", "cwd"] {
+        if object.contains_key(key) {
+            object.insert(
+                key.into(),
+                Value::String(target_cwd.to_string_lossy().into_owned()),
+            );
+        }
+    }
+    Ok(serde_json::to_vec(&state)?)
+}
+
+fn is_kimi_session_state(relative_path: &Path) -> bool {
+    let mut components = relative_path.components();
+    matches!(components.next(), Some(Component::Normal(component)) if component == "sessions")
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && matches!(components.next(), Some(Component::Normal(component)) if component.to_string_lossy().starts_with("session_"))
+        && matches!(components.next(), Some(Component::Normal(component)) if component == "state.json")
+        && components.next().is_none()
+}
+
+/// Claude Code's on-disk project-key algorithm, captured from local rollouts:
+/// every non-ASCII-alphanumeric cwd character becomes a hyphen.
+pub fn claude_project_slug(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Kimi Code keys session directories by the final cwd component and the
+/// first 12 hexadecimal digits of SHA-256(cwd), captured from real rollouts.
+fn kimi_workspace_key(cwd: &Path) -> String {
+    let basename = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("workspace");
+    let digest = format!("{:x}", Sha256::digest(cwd.to_string_lossy().as_bytes()));
+    format!("wd_{basename}_{}", &digest[..12])
 }
 
 fn write_private_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
@@ -339,7 +475,12 @@ fn collect_native_tree(
     if metadata.file_type().is_symlink() {
         return Ok(());
     }
-    let inside = inside_session || path.file_name().is_some_and(|name| name == session_id);
+    let inside = inside_session
+        || path.file_name().is_some_and(|name| {
+            name == session_id
+                || (harness == HarnessKind::Kimi
+                    && name.to_str() == Some(&format!("session_{session_id}")))
+        });
     if metadata.is_dir() {
         for entry in fs::read_dir(path)? {
             collect_native_tree(harness, home, &entry?.path(), session_id, inside, output)?;
@@ -929,7 +1070,10 @@ mod tests {
     #[test]
     fn native_allowlist_excludes_credentials_and_other_sessions() {
         let temp = tempfile::tempdir().unwrap();
-        let session = temp.path().join("sessions/workspace").join(NATIVE);
+        let session = temp
+            .path()
+            .join("sessions/workspace")
+            .join(format!("session_{NATIVE}"));
         fs::create_dir_all(session.join("agents/main")).unwrap();
         fs::write(session.join("state.json"), b"state").unwrap();
         fs::write(session.join("agents/main/wire.jsonl"), b"events").unwrap();
@@ -977,6 +1121,93 @@ mod tests {
                 .iter()
                 .any(|artifact| { artifact.relative_path.ends_with("subagents/agent-a.jsonl") })
         );
+    }
+
+    #[test]
+    fn claude_project_slug_matches_captured_local_rollout_fixtures() {
+        // These cwd/directory pairs come from the local Claude home used to
+        // establish the import format. Dots are substituted just like slash.
+        assert_eq!(
+            claude_project_slug(Path::new("/home/jonathan/Projects/mjolnir/.mjolnir/repro")),
+            "-home-jonathan-Projects-mjolnir--mjolnir-repro"
+        );
+        assert_eq!(
+            claude_project_slug(Path::new("/tmp/mj-live-transcript.59w2Hg")),
+            "-tmp-mj-live-transcript-59w2Hg"
+        );
+    }
+
+    #[test]
+    fn restore_rewrites_claude_project_artifacts_for_target_workspace() {
+        let repositories = vec![crate::hel_archive::RepositoryManifest {
+            metadata: crate::hel_archive::RepositoryMetadata {
+                id: "app".into(),
+                relative_destination: "app".into(),
+                origin: "owner/app".into(),
+                base_commit: "a".repeat(40),
+                head_commit: "a".repeat(40),
+                branch: Some("main".into()),
+            },
+            committed_bundle_path: "repositories/app/committed.bundle".into(),
+            staged_patch_path: "repositories/app/staged.patch".into(),
+            unstaged_patch_path: "repositories/app/unstaged.patch".into(),
+            untracked_tar_path: "repositories/app/untracked.tar".into(),
+        }];
+        let path = restored_native_relative_path(
+            HarnessKind::Claude,
+            Path::new("projects/-home-me-app/session.jsonl"),
+            "app",
+            &repositories,
+            Path::new("/workspace"),
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("projects/-workspace-app/session.jsonl"));
+    }
+
+    #[test]
+    fn restore_rewrites_kimi_workspace_and_state_for_target_workspace() {
+        let repositories = vec![crate::hel_archive::RepositoryManifest {
+            metadata: crate::hel_archive::RepositoryMetadata {
+                id: "app".into(),
+                relative_destination: "app".into(),
+                origin: "owner/app".into(),
+                base_commit: "a".repeat(40),
+                head_commit: "a".repeat(40),
+                branch: Some("main".into()),
+            },
+            committed_bundle_path: "repositories/app/committed.bundle".into(),
+            staged_patch_path: "repositories/app/staged.patch".into(),
+            unstaged_patch_path: "repositories/app/unstaged.patch".into(),
+            untracked_tar_path: "repositories/app/untracked.tar".into(),
+        }];
+        let path = restored_native_relative_path(
+            HarnessKind::Kimi,
+            Path::new(
+                "sessions/wd_kimi-code_78153cfca00c/session_1b6c3192-2480-48e0-8f49-4b8a1572f5b2/state.json",
+            ),
+            "app",
+            &repositories,
+            Path::new("/workspace"),
+        )
+        .unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "sessions/wd_app_af7e243d70b1/session_1b6c3192-2480-48e0-8f49-4b8a1572f5b2/state.json",
+            )
+        );
+        let state = restored_native_artifact_bytes(
+            HarnessKind::Kimi,
+            &path,
+            br#"{"workDir":"/home/jonathan/Projects/kimi-code","cwd":"/home/jonathan/Projects/kimi-code"}"#,
+            "app",
+            &repositories,
+            Path::new("/workspace"),
+        )
+        .unwrap();
+        let state: Value = serde_json::from_slice(&state).unwrap();
+        assert_eq!(state["workDir"], "/workspace/app");
+        assert_eq!(state["cwd"], "/workspace/app");
     }
 
     fn git(repository: &Path, args: &[&str]) -> String {
