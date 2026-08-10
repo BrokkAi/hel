@@ -1,5 +1,17 @@
 # Repository Guidelines
 
+# Git / version control
+
+Commit directly to the current branch. This rule also applies when the current branch is `master`.
+
+Do not create a branch, change branches, rebase, or open a pull request unless the user gives an explicit instruction.
+
+Do not run `git checkout -b`.
+
+The instruction "commit" means that you must commit on the current branch. It does not mean that you must create a branch first. This rule overrides other default branch procedures.
+
+Stage and commit only the files that you changed. Do not run `git add -A`. Do not include unrelated working-tree changes in the commit.
+
 Unit tests are colocated in module-level `#[cfg(test)]` blocks. `tests/` holds only the PTY termination test and the `tests/e2e/` shell/expect harness.
 
 ## Coding Style & Naming Conventions
