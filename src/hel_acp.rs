@@ -367,16 +367,6 @@ fn select_contains(kind: &SessionConfigKind, desired: &str) -> bool {
     }
 }
 
-pub fn update_text(update: &serde_json::Value) -> Option<String> {
-    update
-        .get("agent_message_chunk")
-        .or_else(|| update.get("agentMessageChunk"))
-        .and_then(|chunk| chunk.get("content"))
-        .and_then(|content| content.get("text"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,11 +398,4 @@ mod tests {
         assert!(select_contains(&grouped, "bypassPermissions"));
     }
 
-    #[test]
-    fn extracts_text_from_serialized_session_update() {
-        let update = serde_json::json!({
-            "agent_message_chunk": {"content": {"type": "text", "text": "hello"}}
-        });
-        assert_eq!(update_text(&update).as_deref(), Some("hello"));
-    }
 }

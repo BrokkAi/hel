@@ -220,51 +220,55 @@ impl ChatState {
     /// Streamed message and thought chunks coalesce into the previous entry of
     /// the same role so tokens don't each become their own transcript line.
     fn apply_session_update(&mut self, seq: u64, update: &serde_json::Value) {
-        let Some(object) = update.as_object() else {
-            return;
-        };
-        for (kind, body) in [
-            ("agent_message_chunk", ChatRole::Agent),
-            ("agent_thought_chunk", ChatRole::Thought),
-        ] {
-            if let Some(chunk) = object.get(kind) {
-                let text = chunk
-                    .get("content")
-                    .and_then(|content| content.get("text"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default();
-                if !text.is_empty() {
-                    self.push_streamed(seq, body, text);
-                }
-                return;
-            }
-        }
-        if let Some(call) = object.get("tool_call") {
-            let title = call
-                .get("title")
+        // ACP serializes updates internally tagged:
+        // {"sessionUpdate": "agent_message_chunk", "content": {...}}.
+        let kind = update
+            .get("sessionUpdate")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let content_text = || {
+            update
+                .get("content")
+                .and_then(|content| content.get("text"))
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("tool call");
-            self.entries.push(ChatEntry {
-                seq,
-                role: ChatRole::Tool,
-                text: title.to_owned(),
-            });
-            return;
-        }
-        if object.contains_key("tool_call_update")
-            || object.contains_key("plan")
-            || object.contains_key("available_commands_update")
-            || object.contains_key("current_mode_update")
-        {
-            return;
-        }
-        // Unknown update shapes keep the permissive text projection.
-        for text in extract_text(update) {
-            self.entries.push(ChatEntry {
-                seq,
-                role: ChatRole::Agent,
-                text,
-            });
+                .unwrap_or_default()
+        };
+        match kind {
+            "agent_message_chunk" => {
+                let text = content_text();
+                if !text.is_empty() {
+                    self.push_streamed(seq, ChatRole::Agent, text);
+                }
+            }
+            "agent_thought_chunk" => {
+                let text = content_text();
+                if !text.is_empty() {
+                    self.push_streamed(seq, ChatRole::Thought, text);
+                }
+            }
+            "tool_call" => {
+                let title = update
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool call");
+                self.entries.push(ChatEntry {
+                    seq,
+                    role: ChatRole::Tool,
+                    text: title.to_owned(),
+                });
+            }
+            "tool_call_update" | "plan" | "available_commands_update" | "current_mode_update"
+            | "user_message_chunk" => {}
+            _ => {
+                // Unknown update shapes keep the permissive text projection.
+                for text in extract_text(update) {
+                    self.entries.push(ChatEntry {
+                        seq,
+                        role: ChatRole::Agent,
+                        text,
+                    });
+                }
+            }
         }
     }
 
@@ -636,14 +640,16 @@ mod tests {
             chat.apply_session_update(
                 seq,
                 &serde_json::json!({
-                    "agent_message_chunk": {"content": {"type": "text", "text": text}}
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": text}
                 }),
             );
         }
         chat.apply_session_update(
             4,
             &serde_json::json!({
-                "agent_thought_chunk": {"content": {"type": "text", "text": "hmm"}}
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "hmm"}
             }),
         );
         assert_eq!(chat.entries.len(), 2);
@@ -659,12 +665,13 @@ mod tests {
         let mut chat = ChatState::new(&initial, &[]);
         chat.apply_session_update(
             1,
-            &serde_json::json!({"tool_call": {"title": "grep config", "status": "pending"}}),
+            &serde_json::json!({"sessionUpdate": "tool_call",
+                "title": "grep config", "status": "pending"}),
         );
         chat.apply_session_update(
             2,
-            &serde_json::json!({"tool_call_update": {"status": "completed",
-                "content": [{"type": "content", "content": {"type": "text", "text": "noise"}}]}}),
+            &serde_json::json!({"sessionUpdate": "tool_call_update", "status": "completed",
+                "content": [{"type": "content", "content": {"type": "text", "text": "noise"}}]}),
         );
         assert_eq!(chat.entries.len(), 1);
         assert_eq!(chat.entries[0].role, ChatRole::Tool);
