@@ -1565,7 +1565,7 @@ fn bridge_launch(
             "sh".into(),
             vec![
                 "-lc".into(),
-                format!("if command -v codex-acp >/dev/null 2>&1; then exec codex-acp; fi; {}; exec npx -y @agentclientprotocol/codex-acp@1.1.4", ensure_node_script()),
+                format!("if command -v codex-acp >/dev/null 2>&1; then exec codex-acp; fi; {}; exec npx -y @agentclientprotocol/codex-acp@1.1.14", ensure_node_script()),
             ],
         ),
         crate::hel_config::HarnessKind::Claude => (
