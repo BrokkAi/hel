@@ -203,16 +203,62 @@ mod unix {
     }
 
     pub async fn proxy(root: PathBuf) -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let stream = UnixStream::connect(root.join("control.sock"))
             .await
             .with_context(|| format!("connect worker at {}", root.display()))?;
         let (mut socket_read, mut socket_write) = stream.into_split();
         let mut stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
-        let upload = tokio::io::copy(&mut stdin, &mut socket_write);
-        let download = tokio::io::copy(&mut socket_read, &mut stdout);
-        let (_, _) = tokio::try_join!(upload, download)?;
-        Ok(())
+        // The proxy must die with its client. Joining both copy directions
+        // left the process alive forever after stdin EOF (a killed `podman
+        // exec` client), leaking one thread-heavy process per poll inside the
+        // container. Exit as soon as either side closes, with an idle
+        // watchdog for transports that never deliver EOF.
+        const IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+        let mut stdin_buf = [0_u8; 64 * 1024];
+        let mut socket_buf = [0_u8; 64 * 1024];
+        let idle = tokio::time::sleep(IDLE_LIMIT);
+        tokio::pin!(idle);
+        loop {
+            tokio::select! {
+                read = stdin.read(&mut stdin_buf) => {
+                    let count = read.context("read proxy stdin")?;
+                    if count == 0 {
+                        // Client is gone; flush any final in-flight response
+                        // briefly, then exit.
+                        let _ = socket_write.shutdown().await;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_millis(500),
+                            tokio::io::copy(&mut socket_read, &mut stdout),
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    socket_write
+                        .write_all(&stdin_buf[..count])
+                        .await
+                        .context("forward request to worker")?;
+                    idle.as_mut().reset(tokio::time::Instant::now() + IDLE_LIMIT);
+                }
+                read = socket_read.read(&mut socket_buf) => {
+                    let count = read.context("read worker socket")?;
+                    if count == 0 {
+                        return Ok(());
+                    }
+                    stdout
+                        .write_all(&socket_buf[..count])
+                        .await
+                        .context("forward response to client")?;
+                    stdout.flush().await.context("flush proxy stdout")?;
+                    idle.as_mut().reset(tokio::time::Instant::now() + IDLE_LIMIT);
+                }
+                _ = &mut idle => {
+                    return Ok(());
+                }
+            }
+        }
     }
 }
 
