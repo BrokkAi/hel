@@ -330,11 +330,18 @@ pub fn new_session_id() -> Result<String> {
     Ok(encoded)
 }
 
-/// Return the newest title reported by an ACP harness in a batch of canonical
-/// worker events. Session-info updates are standard ACP; Codex also emits
-/// title/summary-shaped extension updates in some bridge versions.
+/// Return a clean display title from a batch of canonical worker events.
+/// Session-info updates are standard ACP; Codex also emits title/summary-shaped
+/// extension updates in some bridge versions. When a harness has not supplied
+/// a title distinct from the initial prompt, the prompt is a useful fallback.
 pub fn harness_session_title(events: &[SequencedEvent]) -> Option<String> {
-    events.iter().rev().find_map(|event| {
+    let first_prompt = events.iter().find_map(|event| {
+        let WorkerEvent::PromptAccepted { text, .. } = &event.event else {
+            return None;
+        };
+        normalize_session_title(text)
+    });
+    let harness_title = events.iter().rev().find_map(|event| {
         let WorkerEvent::Adapter { payload, .. } = &event.event else {
             return None;
         };
@@ -357,13 +364,46 @@ pub fn harness_session_title(events: &[SequencedEvent]) -> Option<String> {
             _ => None,
         }?;
         normalize_session_title(title)
-    })
+    });
+
+    match (harness_title, first_prompt) {
+        (Some(title), Some(prompt)) if title != prompt => Some(title),
+        (Some(_), Some(prompt)) | (None, Some(prompt)) => Some(prompt),
+        (Some(title), None) => Some(title),
+        (None, None) => None,
+    }
 }
 
 fn normalize_session_title(title: &str) -> Option<String> {
-    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    let title = title.chars().take(160).collect::<String>();
-    (!title.is_empty()).then_some(title)
+    const MAX_TITLE_CHARS: usize = 64;
+
+    let words = title.split_whitespace().collect::<Vec<_>>();
+    if words.is_empty() {
+        return None;
+    }
+    let normalized = words.join(" ");
+    if normalized.chars().count() <= MAX_TITLE_CHARS {
+        return Some(normalized);
+    }
+
+    let mut truncated = String::new();
+    for word in words {
+        let separator = (!truncated.is_empty()).then_some(' ');
+        let candidate_len =
+            truncated.chars().count() + usize::from(separator.is_some()) + word.chars().count() + 1;
+        if candidate_len > MAX_TITLE_CHARS {
+            break;
+        }
+        if let Some(separator) = separator {
+            truncated.push(separator);
+        }
+        truncated.push_str(word);
+    }
+    if truncated.is_empty() {
+        truncated = normalized.chars().take(MAX_TITLE_CHARS - 1).collect();
+    }
+    truncated.push('…');
+    Some(truncated)
 }
 
 #[cfg(test)]
@@ -563,6 +603,65 @@ mod tests {
         assert_eq!(
             harness_session_title(&events).as_deref(),
             Some("Build the dashboard")
+        );
+    }
+
+    #[test]
+    fn harness_title_falls_back_to_a_clean_truncated_first_prompt() {
+        let first_prompt = format!("{}overflow", "word ".repeat(20));
+        let expected = format!("{}word…", "word ".repeat(11));
+        let events = vec![
+            SequencedEvent {
+                seq: 1,
+                request_id: Some("prompt-1".into()),
+                event: WorkerEvent::PromptAccepted {
+                    request_id: "prompt-1".into(),
+                    text: format!("  {first_prompt}\n"),
+                    attachments: vec![],
+                },
+            },
+            SequencedEvent {
+                seq: 2,
+                request_id: None,
+                event: WorkerEvent::Adapter {
+                    kind: "session_update".into(),
+                    payload: serde_json::json!({
+                        "type": "session_update",
+                        "update": {
+                            "sessionUpdate": "session_title",
+                            "title": first_prompt
+                        }
+                    }),
+                },
+            },
+        ];
+
+        assert_eq!(
+            harness_session_title(&events).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn harness_titles_are_single_line_and_truncated_at_word_boundaries() {
+        let events = vec![SequencedEvent {
+            seq: 1,
+            request_id: None,
+            event: WorkerEvent::Adapter {
+                kind: "session_update".into(),
+                payload: serde_json::json!({
+                    "type": "session_update",
+                    "update": {
+                        "sessionUpdate": "session_title",
+                        "title": "first\nsecond\tthird fourth fifth sixth seventh eighth ninth tenth eleventh twelfth thirteenth"
+                    }
+                }),
+            },
+        }];
+
+        assert_eq!(
+            harness_session_title(&events).as_deref(),
+            Some("first second third fourth fifth sixth seventh eighth ninth…")
         );
     }
 
