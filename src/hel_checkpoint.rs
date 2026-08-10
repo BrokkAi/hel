@@ -10,6 +10,7 @@ use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -340,22 +341,28 @@ pub fn export_checkpoint_with_git(
         &spec.session.native_session_id,
         !prompted,
     )?;
-    let mut repositories = Vec::with_capacity(spec.repositories.len());
-    for repository in &spec.repositories {
-        let path = spec.workspace_root.join(&repository.relative_destination);
-        ensure!(path.is_dir(), "repository {} is missing", path.display());
-        reject_dirty_submodules(git, &path)
-            .with_context(|| format!("repository '{}'", repository.id))?;
-        repositories.push(collect_git_snapshot(
-            git,
-            &path,
-            &GitCollectionSpec {
-                id: repository.id.clone(),
-                relative_destination: repository.relative_destination.clone(),
-                base_commit: repository.base_commit.clone(),
-            },
-        )?);
-    }
+    // Indexed parallel iteration preserves the spec order, which in turn keeps
+    // the manifest and ZIP entry order deterministic.
+    let repositories = spec
+        .repositories
+        .par_iter()
+        .map(|repository| {
+            let path = spec.workspace_root.join(&repository.relative_destination);
+            ensure!(path.is_dir(), "repository {} is missing", path.display());
+            reject_dirty_submodules(git, &path)
+                .with_context(|| format!("repository '{}'", repository.id))?;
+            collect_git_snapshot(
+                git,
+                &path,
+                &GitCollectionSpec {
+                    id: repository.id.clone(),
+                    relative_destination: repository.relative_destination.clone(),
+                    base_commit: repository.base_commit.clone(),
+                },
+            )
+            .with_context(|| format!("repository '{}'", repository.id))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let verified = write_archive_atomic(
         &spec.output_path,
         &ArchiveInput {
@@ -1336,6 +1343,30 @@ mod tests {
             read_archive_verified(&destination).unwrap().archive_sha256,
             gate.sha256()
         );
+    }
+
+    #[test]
+    fn parallel_repository_collection_preserves_manifest_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut spec, _) = fixture(temp.path());
+        git(&spec.workspace_root, &["clone", "-q", "app", "worker"]);
+        let worker = spec.workspace_root.join("worker");
+        let base = git(&worker, &["rev-parse", "HEAD"]);
+        spec.repositories.push(CheckpointRepositorySpec {
+            id: "worker".into(),
+            relative_destination: "worker".into(),
+            base_commit: base,
+        });
+
+        export_checkpoint(&spec).unwrap();
+        let verified = read_archive_verified(&spec.output_path).unwrap();
+        let repository_ids = verified
+            .manifest
+            .repositories
+            .iter()
+            .map(|repository| repository.metadata.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(repository_ids, ["app", "worker"]);
     }
 
     #[test]

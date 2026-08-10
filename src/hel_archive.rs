@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
@@ -321,6 +322,10 @@ fn prepare_archive(input: &ArchiveInput) -> Result<(ArchiveManifest, Vec<Pending
         });
     }
 
+    payloads.par_iter_mut().for_each(|payload| {
+        payload.descriptor.sha256 = digest_bytes(&payload.data);
+    });
+
     let mut paths = BTreeSet::new();
     for payload in &payloads {
         ensure!(
@@ -359,7 +364,7 @@ fn push_payload(
     );
     let descriptor = PayloadDescriptor {
         path,
-        sha256: digest_bytes(&data),
+        sha256: String::new(),
         size: data.len() as u64,
         mode: normalized_mode(mode)?,
         role,
@@ -801,7 +806,7 @@ fn redact_origin_credentials(origin: &str) -> Result<String> {
 
 /// A command boundary that lets Git collection and restore be tested without
 /// invoking the host's Git executable.
-pub trait GitCommandRunner {
+pub trait GitCommandRunner: Sync {
     fn run(&self, repository: &Path, command: &GitCommand) -> Result<GitOutput>;
 }
 
@@ -894,45 +899,70 @@ pub fn collect_git_snapshot(
     )?
     .parse::<u64>()
     .context("parse committed delta count")?;
-    let committed_bundle = if count == 0 {
-        Vec::new()
-    } else {
-        git_bytes(
-            runner,
-            repository,
-            [
-                "bundle",
-                "create",
-                "-",
-                "HEAD",
-                &format!("^{}", spec.base_commit),
-            ],
-            &[],
-            "create committed delta bundle",
-        )?
-    };
-    let staged_patch = git_bytes(
-        runner,
-        repository,
-        ["diff", "--binary", "--cached", "--no-ext-diff"],
-        &[],
-        "collect staged Git patch",
-    )?;
-    let unstaged_patch = git_bytes(
-        runner,
-        repository,
-        ["diff", "--binary", "--no-ext-diff"],
-        &[],
-        "collect unstaged Git patch",
-    )?;
-    let untracked = git_bytes(
-        runner,
-        repository,
-        ["ls-files", "--others", "--exclude-standard", "-z"],
-        &[],
-        "list nonignored untracked files",
-    )?;
-    let untracked_tar = build_untracked_tar(repository, &untracked)?;
+    // These commands only inspect repository state and produce independent
+    // payloads. Nested joins share Rayon's bounded worker pool, including when
+    // several repositories are being collected at once.
+    let ((committed_bundle, staged_patch), (unstaged_patch, untracked_tar)) = rayon::join(
+        || {
+            rayon::join(
+                || {
+                    if count == 0 {
+                        Ok(Vec::new())
+                    } else {
+                        git_bytes(
+                            runner,
+                            repository,
+                            [
+                                "bundle",
+                                "create",
+                                "-",
+                                "HEAD",
+                                &format!("^{}", spec.base_commit),
+                            ],
+                            &[],
+                            "create committed delta bundle",
+                        )
+                    }
+                },
+                || {
+                    git_bytes(
+                        runner,
+                        repository,
+                        ["diff", "--binary", "--cached", "--no-ext-diff"],
+                        &[],
+                        "collect staged Git patch",
+                    )
+                },
+            )
+        },
+        || {
+            rayon::join(
+                || {
+                    git_bytes(
+                        runner,
+                        repository,
+                        ["diff", "--binary", "--no-ext-diff"],
+                        &[],
+                        "collect unstaged Git patch",
+                    )
+                },
+                || {
+                    let untracked = git_bytes(
+                        runner,
+                        repository,
+                        ["ls-files", "--others", "--exclude-standard", "-z"],
+                        &[],
+                        "list nonignored untracked files",
+                    )?;
+                    build_untracked_tar(repository, &untracked)
+                },
+            )
+        },
+    );
+    let committed_bundle = committed_bundle?;
+    let staged_patch = staged_patch?;
+    let unstaged_patch = unstaged_patch?;
+    let untracked_tar = untracked_tar?;
 
     Ok(RepositorySnapshot {
         metadata: RepositoryMetadata {
@@ -1287,7 +1317,7 @@ fn create_symlink(_target: &Path, _destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::sync::{Barrier, Mutex};
 
     use super::*;
 
@@ -1318,6 +1348,65 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .ok_or_else(|| anyhow!("unexpected Git command: {:?}", command.arguments))
+        }
+    }
+
+    struct CollectionGit {
+        delta_count: u64,
+        payload_barrier: Option<Barrier>,
+        commands: Mutex<Vec<GitCommand>>,
+    }
+
+    impl CollectionGit {
+        fn new(delta_count: u64, concurrent_payloads: bool) -> Self {
+            Self {
+                delta_count,
+                payload_barrier: concurrent_payloads.then(|| Barrier::new(4)),
+                commands: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn commands(&self) -> Vec<GitCommand> {
+            self.commands.lock().unwrap().clone()
+        }
+    }
+
+    impl GitCommandRunner for CollectionGit {
+        fn run(&self, _repository: &Path, command: &GitCommand) -> Result<GitOutput> {
+            self.commands.lock().unwrap().push(command.clone());
+            let arguments = command
+                .arguments
+                .iter()
+                .map(|argument| argument.to_string_lossy())
+                .collect::<Vec<_>>();
+            let stdout = match arguments.first().map(|argument| argument.as_ref()) {
+                Some("remote") => b"https://token@github.com/example/repo.git\n".to_vec(),
+                Some("rev-parse") => format!("{}\n", "b".repeat(40)).into_bytes(),
+                Some("symbolic-ref") => b"feature/hel\n".to_vec(),
+                Some("rev-list") => format!("{}\n", self.delta_count).into_bytes(),
+                Some("bundle") => {
+                    self.payload_barrier.as_ref().unwrap().wait();
+                    b"bundle".to_vec()
+                }
+                Some("diff") => {
+                    if let Some(barrier) = &self.payload_barrier {
+                        barrier.wait();
+                    }
+                    if arguments.iter().any(|argument| argument == "--cached") {
+                        b"staged".to_vec()
+                    } else {
+                        b"unstaged".to_vec()
+                    }
+                }
+                Some("ls-files") => {
+                    if let Some(barrier) = &self.payload_barrier {
+                        barrier.wait();
+                    }
+                    b"note.txt\0.env\0".to_vec()
+                }
+                other => return Err(anyhow!("unexpected Git command: {other:?}")),
+            };
+            Ok(git_ok(stdout))
         }
     }
 
@@ -1551,15 +1640,7 @@ mod tests {
         let repository = tempfile::tempdir().unwrap();
         fs::write(repository.path().join("note.txt"), b"keep").unwrap();
         fs::write(repository.path().join(".env"), b"SECRET=nope").unwrap();
-        let runner = FakeGit::with_outputs([
-            git_ok(b"https://token@github.com/example/repo.git\n".to_vec()),
-            git_ok(format!("{}\n", "b".repeat(40)).into_bytes()),
-            git_ok(b"feature/hel\n".to_vec()),
-            git_ok(b"0\n".to_vec()),
-            git_ok(b"staged".to_vec()),
-            git_ok(b"unstaged".to_vec()),
-            git_ok(b"note.txt\0.env\0".to_vec()),
-        ]);
+        let runner = CollectionGit::new(0, false);
         let snapshot = collect_git_snapshot(
             &runner,
             repository.path(),
@@ -1582,6 +1663,37 @@ mod tests {
             .collect();
         assert_eq!(paths, vec![PathBuf::from("note.txt")]);
         assert_eq!(runner.commands().len(), 7);
+    }
+
+    #[test]
+    fn git_collection_builds_independent_payloads_concurrently() {
+        let repository = tempfile::tempdir().unwrap();
+        fs::write(repository.path().join("note.txt"), b"keep").unwrap();
+        fs::write(repository.path().join(".env"), b"SECRET=nope").unwrap();
+        let runner = CollectionGit::new(1, true);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+
+        let snapshot = pool
+            .install(|| {
+                collect_git_snapshot(
+                    &runner,
+                    repository.path(),
+                    &GitCollectionSpec {
+                        id: "repo".into(),
+                        relative_destination: PathBuf::from("repo"),
+                        base_commit: "a".repeat(40),
+                    },
+                )
+            })
+            .unwrap();
+
+        assert_eq!(snapshot.committed_bundle, b"bundle");
+        assert_eq!(snapshot.staged_patch, b"staged");
+        assert_eq!(snapshot.unstaged_patch, b"unstaged");
+        assert_eq!(runner.commands().len(), 8);
     }
 
     #[test]

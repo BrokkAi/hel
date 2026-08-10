@@ -10,6 +10,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
+use rayon::prelude::*;
 use serde_json::{Value, json};
 
 use crate::hel_archive::{
@@ -1078,7 +1079,9 @@ fn collect_local_repositories(
     let git = SystemGit;
     bundle
         .repositories
-        .iter()
+        // Indexed parallel iteration keeps repository and manifest order
+        // identical to the configured bundle.
+        .par_iter()
         .map(|repository| {
             let path = if repository.id == primary.id {
                 primary_path.clone()
@@ -1183,6 +1186,45 @@ fn timestamp() -> String {
 mod tests {
     use super::*;
 
+    fn initialize_repository(path: &Path, id: &str) {
+        fs::create_dir_all(path).unwrap();
+        for arguments in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "Hel Test"],
+            vec!["config", "user.email", "hel@example.test"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                &format!("https://github.com/example/{id}.git"),
+            ],
+        ] {
+            let output = Command::new("git")
+                .args(arguments)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::write(path.join("README.md"), id).unwrap();
+        let output = Command::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = Command::new("git")
+            .args(["commit", "-qm", "base"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
+
     #[test]
     fn projects_jsonl_projects_user_and_assistant_text_in_source_order() {
         let directory = tempfile::tempdir().unwrap();
@@ -1258,6 +1300,39 @@ mod tests {
             configured_bundle_for_origin(&config, &origin).as_deref(),
             Some("hel")
         );
+    }
+
+    #[test]
+    fn local_repository_collection_preserves_bundle_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let app = workspace.join("app");
+        initialize_repository(&app, "app");
+        initialize_repository(&workspace.join("worker"), "worker");
+        let bundle = ProjectBundle {
+            primary_repo: "app".into(),
+            repositories: vec![
+                ProjectRepository {
+                    id: "worker".into(),
+                    github: "example/worker".into(),
+                    destination: "worker".into(),
+                    git_ref: None,
+                },
+                ProjectRepository {
+                    id: "app".into(),
+                    github: "example/app".into(),
+                    destination: "app".into(),
+                    git_ref: None,
+                },
+            ],
+        };
+
+        let snapshots = collect_local_repositories(&bundle, &app).unwrap();
+        let ids = snapshots
+            .iter()
+            .map(|snapshot| snapshot.metadata.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["worker", "app"]);
     }
 
     #[test]
