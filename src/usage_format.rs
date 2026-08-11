@@ -69,7 +69,14 @@ fn normalize_reset_text_at(value: &str, now: DateTime<FixedOffset>) -> Option<St
             .find_map(|format| NaiveTime::parse_from_str(&value, format).ok())
     };
 
-    if let Some((date, time)) = value.split_once(" at ") {
+    // Claude has used both `Aug 14 at 4am` and `Aug 14, 4am` across
+    // releases. Keep the provider punctuation out of the date/time parsers.
+    let dated_time = value.split_once(" at ").or_else(|| {
+        value
+            .split_once(',')
+            .map(|(date, time)| (date, time.trim()))
+    });
+    if let Some((date, time)) = dated_time {
         let time = parse_time(time.trim())?;
         let date = date.trim().trim_end_matches(',');
         let date = match date.to_ascii_lowercase().as_str() {
@@ -176,6 +183,19 @@ mod tests {
         assert_eq!(
             normalize_reset_text_at("at 1pm (America/Chicago)", now).as_deref(),
             Some("13:00 Aug 11")
+        );
+    }
+
+    #[test]
+    fn claude_comma_separated_reset_is_normalized() {
+        let zone = FixedOffset::west_opt(5 * 3_600).expect("offset");
+        let now = zone
+            .with_ymd_and_hms(2026, 8, 11, 7, 0, 0)
+            .single()
+            .expect("now");
+        assert_eq!(
+            normalize_reset_text_at("Aug 14, 4am (America/Chicago)", now).as_deref(),
+            Some("04:00 Aug 14")
         );
     }
 
