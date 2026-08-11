@@ -46,6 +46,7 @@ hmac = "0.12"
 # Resolves the IANA zone name (e.g. "Europe/Paris") to append to reset times.
 iana-time-zone = "0.1"
 libc = "0.2"
+pulldown-cmark = { version = "0.10", default-features = false }
 signal-hook = "0.3"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
@@ -56,10 +57,12 @@ serde_json = "1"
 sha2 = "0.10"
 tar = "0.4"
 tempfile = "3"
+textwrap = "0.16"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
 toml = "0.8"
 tracing = "0.1"
+unicode-segmentation = "1"
 url = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 

@@ -1,8 +1,14 @@
 //! Minimal full-screen chat for one persistent Hel worker.
 
+mod rendering;
+
 use std::io;
 use std::time::Duration;
 
+use agent_client_protocol::schema::v1::{
+    ContentBlock, EmbeddedResourceResource, PlanEntryStatus, SessionUpdate, ToolCallContent,
+    ToolCallLocation, ToolCallStatus,
+};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -16,6 +22,10 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::hel_acp::RuntimeEvent;
 use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot};
 use crate::hel_worker_client::WorkerClient;
+use rendering::{
+    LogicalLine, TranscriptRenderMode, markdown_lines, raw_lines, sanitize_terminal_text,
+    wrap_styled_line,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatExit {
@@ -41,6 +51,8 @@ pub enum ChatRole {
     Thought,
     /// Tool invocation titles.
     Tool,
+    /// Current agent plan.
+    Plan,
     System,
 }
 
@@ -49,8 +61,13 @@ pub struct ChatEntry {
     pub seq: u64,
     pub role: ChatRole,
     pub text: String,
+    revision: u64,
+    message_id: Option<String>,
     tool_call_id: Option<String>,
     tool_status: Option<ToolStatus>,
+    tool_content: Vec<String>,
+    tool_locations: Vec<String>,
+    plan: Vec<PlanLine>,
 }
 
 impl ChatEntry {
@@ -58,9 +75,14 @@ impl ChatEntry {
         Self {
             seq,
             role,
-            text: text.into(),
+            text: sanitize_terminal_text(&text.into()),
+            revision: 0,
+            message_id: None,
             tool_call_id: None,
             tool_status: None,
+            tool_content: Vec::new(),
+            tool_locations: Vec::new(),
+            plan: Vec::new(),
         }
     }
 
@@ -73,10 +95,35 @@ impl ChatEntry {
         Self {
             seq,
             role: ChatRole::Tool,
-            text: title.into(),
+            text: sanitize_terminal_text(&title.into()),
+            revision: 0,
+            message_id: None,
             tool_call_id,
             tool_status: Some(tool_status),
+            tool_content: Vec::new(),
+            tool_locations: Vec::new(),
+            plan: Vec::new(),
         }
+    }
+
+    fn plan(seq: u64, plan: Vec<PlanLine>) -> Self {
+        Self {
+            seq,
+            role: ChatRole::Plan,
+            text: String::new(),
+            revision: 0,
+            message_id: None,
+            tool_call_id: None,
+            tool_status: None,
+            tool_content: Vec::new(),
+            tool_locations: Vec::new(),
+            plan,
+        }
+    }
+
+    fn touch(&mut self, seq: u64) {
+        self.seq = seq;
+        self.revision = self.revision.wrapping_add(1);
     }
 }
 
@@ -89,13 +136,54 @@ enum ToolStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanStatus {
+    Pending,
+    Running,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanLine {
+    text: String,
+    status: PlanStatus,
+}
+
+#[derive(Debug, Clone)]
+struct CachedEntry {
+    revision: u64,
+    lines: Vec<Line<'static>>,
+}
+
+#[derive(Debug)]
+struct TranscriptRenderCache {
+    width: u16,
+    mode: TranscriptRenderMode,
+    entries: Vec<Option<CachedEntry>>,
+}
+
+impl Default for TranscriptRenderCache {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            mode: TranscriptRenderMode::Rich,
+            entries: Vec::new(),
+        }
+    }
+}
+
 pub struct ChatState {
     session_id: String,
     phase: WorkerPhase,
     latest_seq: u64,
     entries: Vec<ChatEntry>,
     input: String,
-    scroll_back: u16,
+    scroll_top: usize,
+    follow_bottom: bool,
+    last_content_height: usize,
+    last_viewport_height: usize,
+    render_mode: TranscriptRenderMode,
+    render_cache: TranscriptRenderCache,
     notice: Option<String>,
     voice_active: bool,
 }
@@ -108,7 +196,12 @@ impl ChatState {
             latest_seq: 0,
             entries: Vec::new(),
             input: String::new(),
-            scroll_back: 0,
+            scroll_top: 0,
+            follow_bottom: true,
+            last_content_height: 0,
+            last_viewport_height: 0,
+            render_mode: TranscriptRenderMode::Rich,
+            render_cache: TranscriptRenderCache::default(),
             notice: None,
             voice_active: false,
         };
@@ -130,7 +223,7 @@ impl ChatState {
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
-        self.notice = Some(notice.into());
+        self.notice = Some(sanitize_terminal_text(&notice.into()));
     }
 
     pub fn apply_events(&mut self, events: &[SequencedEvent]) {
@@ -190,6 +283,17 @@ impl ChatState {
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 ChatAction::ToggleVoice
             }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.render_mode = self.render_mode.toggled();
+                self.notice = Some(
+                    match self.render_mode {
+                        TranscriptRenderMode::Rich => "Rich transcript rendering enabled",
+                        TranscriptRenderMode::Raw => "Raw transcript source enabled",
+                    }
+                    .into(),
+                );
+                ChatAction::None
+            }
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -199,15 +303,36 @@ impl ChatState {
                 ChatAction::None
             }
             KeyCode::PageUp => {
-                self.scroll_back = self.scroll_back.saturating_add(8);
+                let page = self.last_viewport_height.max(1);
+                if self.follow_bottom {
+                    self.scroll_top = self
+                        .last_content_height
+                        .saturating_sub(self.last_viewport_height);
+                }
+                self.follow_bottom = false;
+                self.scroll_top = self.scroll_top.saturating_sub(page);
                 ChatAction::None
             }
             KeyCode::PageDown => {
-                self.scroll_back = self.scroll_back.saturating_sub(8);
+                let maximum = self
+                    .last_content_height
+                    .saturating_sub(self.last_viewport_height);
+                self.scroll_top = self
+                    .scroll_top
+                    .saturating_add(self.last_viewport_height.max(1));
+                if self.scroll_top >= maximum {
+                    self.scroll_top = maximum;
+                    self.follow_bottom = true;
+                }
+                ChatAction::None
+            }
+            KeyCode::Home => {
+                self.scroll_top = 0;
+                self.follow_bottom = false;
                 ChatAction::None
             }
             KeyCode::End => {
-                self.scroll_back = 0;
+                self.follow_bottom = true;
                 ChatAction::None
             }
             _ => ChatAction::None,
@@ -268,103 +393,178 @@ impl ChatState {
         }
     }
 
-    /// Project one ACP `session/update` notification into the transcript.
-    /// Streamed message and thought chunks coalesce into the previous entry of
-    /// the same role so tokens don't each become their own transcript line.
+    /// Project one typed ACP update into stable transcript items. The runtime
+    /// keeps JSON at the persistence boundary so old event logs remain wire
+    /// compatible; rendering never guesses at arbitrary JSON shapes.
     fn apply_session_update(&mut self, seq: u64, update: &serde_json::Value) {
-        // ACP serializes updates internally tagged:
-        // {"sessionUpdate": "agent_message_chunk", "content": {...}}.
-        let kind = update
-            .get("sessionUpdate")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let content_text = || {
-            update
-                .get("content")
-                .and_then(|content| content.get("text"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
+        let parsed = match serde_json::from_value::<SessionUpdate>(update.clone()) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                tracing::debug!(%error, "ignoring invalid ACP session update");
+                return;
+            }
         };
-        match kind {
-            "agent_message_chunk" => {
-                let text = content_text();
-                if !text.is_empty() {
-                    self.push_streamed(seq, ChatRole::Agent, text);
+        match parsed {
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                let message_id = chunk.message_id.map(|id| id.to_string());
+                if let Some(text) = content_block_text(&chunk.content) {
+                    self.push_streamed(seq, ChatRole::Agent, message_id, &text);
                 }
             }
-            "agent_thought_chunk" => {
-                let text = content_text();
-                if !text.is_empty() {
-                    self.push_streamed(seq, ChatRole::Thought, text);
+            SessionUpdate::AgentThoughtChunk(chunk) => {
+                let message_id = chunk.message_id.map(|id| id.to_string());
+                if let Some(text) = content_block_text(&chunk.content) {
+                    self.push_streamed(seq, ChatRole::Thought, message_id, &text);
                 }
             }
-            "tool_call" => {
-                let title = update
-                    .get("title")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("tool call");
-                let tool_call_id = update
-                    .get("toolCallId")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
-                self.entries.push(ChatEntry::tool(
+            // PromptAccepted is the canonical local user-message event. ACP
+            // user chunks would duplicate it during replay.
+            SessionUpdate::UserMessageChunk(_) => {}
+            SessionUpdate::ToolCall(call) => {
+                let mut entry = ChatEntry::tool(
                     seq,
-                    title,
-                    tool_call_id,
-                    tool_status(update.get("status")),
-                ));
+                    call.title,
+                    Some(call.tool_call_id.to_string()),
+                    tool_status(&call.status),
+                );
+                entry.tool_content = tool_content_details(&call.content);
+                entry.tool_locations = tool_location_details(&call.locations);
+                self.entries.push(entry);
             }
-            "tool_call_update" => self.update_tool_call(seq, update),
-            "plan" | "available_commands_update" | "current_mode_update" | "user_message_chunk" => {
-            }
-            _ => {
-                // Unknown update shapes keep the permissive text projection.
-                for text in extract_text(update) {
-                    self.entries
-                        .push(ChatEntry::plain(seq, ChatRole::Agent, text));
+            SessionUpdate::ToolCallUpdate(update) => {
+                let tool_call_id = update.tool_call_id.to_string();
+                let Some(entry) = self.entries.iter_mut().rev().find(|entry| {
+                    entry.role == ChatRole::Tool
+                        && entry.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+                }) else {
+                    return;
+                };
+                entry.touch(seq);
+                if let Some(title) = update.fields.title {
+                    entry.text = sanitize_terminal_text(&title);
+                }
+                if let Some(status) = update.fields.status {
+                    entry.tool_status = Some(tool_status(&status));
+                }
+                if let Some(content) = update.fields.content {
+                    entry.tool_content = tool_content_details(&content);
+                }
+                if let Some(locations) = update.fields.locations {
+                    entry.tool_locations = tool_location_details(&locations);
                 }
             }
+            SessionUpdate::Plan(plan) => {
+                let lines = plan
+                    .entries
+                    .into_iter()
+                    .map(|entry| PlanLine {
+                        text: sanitize_terminal_text(&entry.content),
+                        status: plan_status(&entry.status),
+                    })
+                    .collect();
+                let latest_user_seq = self
+                    .entries
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.role == ChatRole::User)
+                    .map_or(0, |entry| entry.seq);
+                if let Some(entry) = self
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .find(|entry| entry.role == ChatRole::Plan && entry.seq > latest_user_seq)
+                {
+                    entry.touch(seq);
+                    entry.plan = lines;
+                } else {
+                    self.entries.push(ChatEntry::plan(seq, lines));
+                }
+            }
+            _ => {}
         }
     }
 
-    fn update_tool_call(&mut self, seq: u64, update: &serde_json::Value) {
-        let Some(tool_call_id) = update.get("toolCallId").and_then(serde_json::Value::as_str)
-        else {
-            return;
-        };
-        let Some(entry) = self.entries.iter_mut().rev().find(|entry| {
-            entry.role == ChatRole::Tool && entry.tool_call_id.as_deref() == Some(tool_call_id)
-        }) else {
-            return;
-        };
-        entry.seq = seq;
-        if let Some(title) = update.get("title").and_then(serde_json::Value::as_str) {
-            entry.text = title.to_owned();
-        }
-        if update.get("status").is_some() {
-            entry.tool_status = Some(tool_status(update.get("status")));
-        }
-    }
-
-    fn push_streamed(&mut self, seq: u64, role: ChatRole, text: &str) {
+    fn push_streamed(&mut self, seq: u64, role: ChatRole, message_id: Option<String>, text: &str) {
+        let text = sanitize_terminal_text(text);
         if let Some(last) = self.entries.last_mut()
             && last.role == role
+            && last.message_id == message_id
         {
-            last.seq = seq;
-            last.text.push_str(text);
+            last.touch(seq);
+            last.text.push_str(&text);
             return;
         }
-        self.entries.push(ChatEntry::plain(seq, role, text));
+        let mut entry = ChatEntry::plain(seq, role, text);
+        entry.message_id = message_id;
+        self.entries.push(entry);
     }
 }
 
-fn tool_status(status: Option<&serde_json::Value>) -> ToolStatus {
-    match status.and_then(serde_json::Value::as_str) {
-        Some("in_progress" | "running") => ToolStatus::Running,
-        Some("completed" | "done") => ToolStatus::Completed,
-        Some("failed") => ToolStatus::Failed,
+fn tool_status(status: &ToolCallStatus) -> ToolStatus {
+    match status {
+        ToolCallStatus::InProgress => ToolStatus::Running,
+        ToolCallStatus::Completed => ToolStatus::Completed,
+        ToolCallStatus::Failed => ToolStatus::Failed,
         _ => ToolStatus::Pending,
     }
+}
+
+fn plan_status(status: &PlanEntryStatus) -> PlanStatus {
+    match status {
+        PlanEntryStatus::InProgress => PlanStatus::Running,
+        PlanEntryStatus::Completed => PlanStatus::Completed,
+        _ => PlanStatus::Pending,
+    }
+}
+
+fn content_block_text(content: &ContentBlock) -> Option<String> {
+    match content {
+        ContentBlock::Text(text) => Some(text.text.clone()),
+        ContentBlock::Image(_) => Some("[image]".into()),
+        ContentBlock::Audio(_) => Some("[audio]".into()),
+        ContentBlock::ResourceLink(link) => Some(format!("[{}]({})", link.name, link.uri)),
+        ContentBlock::Resource(resource) => Some(match &resource.resource {
+            EmbeddedResourceResource::TextResourceContents(resource) => resource.text.clone(),
+            EmbeddedResourceResource::BlobResourceContents(resource) => {
+                format!("[embedded resource: {}]", resource.uri)
+            }
+            _ => "[embedded resource]".into(),
+        }),
+        _ => None,
+    }
+}
+
+fn tool_content_details(content: &[ToolCallContent]) -> Vec<String> {
+    const MAX_DETAILS: usize = 8;
+    let mut details = Vec::new();
+    for item in content {
+        let detail = match item {
+            ToolCallContent::Content(content) => content_block_text(&content.content),
+            ToolCallContent::Diff(diff) => Some(format!("changed {}", diff.path.display())),
+            ToolCallContent::Terminal(terminal) => {
+                Some(format!("terminal {}", terminal.terminal_id))
+            }
+            _ => None,
+        };
+        if let Some(detail) = detail {
+            details.push(sanitize_terminal_text(&detail));
+        }
+        if details.len() == MAX_DETAILS {
+            return details;
+        }
+    }
+    details
+}
+
+fn tool_location_details(locations: &[ToolCallLocation]) -> Vec<String> {
+    locations
+        .iter()
+        .take(8)
+        .map(|location| match location.line {
+            Some(line) => format!("{}:{line}", location.path.display()),
+            None => location.path.display().to_string(),
+        })
+        .collect()
 }
 
 /// Run chat until the user presses Escape. This detaches the proxy and leaves
@@ -399,7 +599,7 @@ pub async fn run_chat(
                 }
             }
         }
-        terminal.draw(|frame| render(frame, &chat))?;
+        terminal.draw(|frame| render(frame, &mut chat))?;
         // Drain every queued input event before redrawing or syncing: a paste
         // delivers thousands of key events, and one draw + worker sync per
         // character would lag the trailing Enter by minutes.
@@ -484,7 +684,7 @@ fn slash_config(prompt: &str) -> Option<(&str, &str)> {
     None
 }
 
-pub fn render(frame: &mut Frame, chat: &ChatState) {
+pub fn render(frame: &mut Frame, chat: &mut ChatState) {
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -516,7 +716,7 @@ pub fn render(frame: &mut Frame, chat: &ChatState) {
     let default_footer = if chat.voice_active {
         "Listening… Ctrl-V stop · Esc back (worker keeps running)"
     } else {
-        "Enter send · Shift-Enter newline · Ctrl-V dictate · Ctrl-P checkpoint · Esc back"
+        "Enter send · Shift-Enter newline · Ctrl-R raw/rich · Ctrl-V dictate · Ctrl-P checkpoint · Esc back"
     };
     let footer = chat.notice.as_deref().unwrap_or(default_footer);
     frame.render_widget(
@@ -560,19 +760,29 @@ fn append_dictation(prefix: &str, transcript: &str) -> String {
     }
 }
 
-fn render_transcript(frame: &mut Frame, area: Rect, chat: &ChatState) {
-    // The original mj transcript pre-wrapped role and tool blocks before
-    // handing them to `Paragraph`: otherwise ratatui would only put a role
-    // marker or tool rail on the first visual row. Keep that treatment here so
-    // long responses remain easy to scan in a narrow terminal.
-    let lines = transcript_lines(&chat.entries, area.width);
-    let viewport_height = area.height.saturating_sub(2);
-    let max_scroll_back = lines.len().saturating_sub(usize::from(viewport_height));
-    let scroll_back = usize::from(chat.scroll_back).min(max_scroll_back);
-    let title = if scroll_back == 0 {
-        " Conversation ".to_owned()
+fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatState) {
+    let lines = transcript_lines(chat, area.width);
+    let viewport_height = usize::from(area.height.saturating_sub(2));
+    let maximum = lines.len().saturating_sub(viewport_height);
+    chat.last_content_height = lines.len();
+    chat.last_viewport_height = viewport_height;
+    if chat.follow_bottom {
+        chat.scroll_top = maximum;
     } else {
-        format!(" Conversation · scrolled +{scroll_back} · End to follow ")
+        chat.scroll_top = chat.scroll_top.min(maximum);
+    }
+    let title = if chat.follow_bottom {
+        match chat.render_mode {
+            TranscriptRenderMode::Rich => " Conversation ".to_owned(),
+            TranscriptRenderMode::Raw => " Conversation · raw source ".to_owned(),
+        }
+    } else {
+        format!(
+            " Conversation · rows {}–{} of {} · End to follow ",
+            chat.scroll_top.saturating_add(1),
+            (chat.scroll_top + viewport_height).min(lines.len()),
+            lines.len()
+        )
     };
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
@@ -580,14 +790,12 @@ fn render_transcript(frame: &mut Frame, area: Rect, chat: &ChatState) {
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let offset = lines
-        .len()
-        .saturating_sub(usize::from(inner.height))
-        .saturating_sub(scroll_back);
-    frame.render_widget(
-        Paragraph::new(lines).scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
-        inner,
-    );
+    let visible = lines
+        .into_iter()
+        .skip(chat.scroll_top)
+        .take(usize::from(inner.height))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), inner);
 }
 
 const ROLE_GUTTER: &str = "│ ";
@@ -596,10 +804,28 @@ const ROLE_GUTTER_WIDTH: usize = 2;
 /// Render the complete transcript into already-wrapped visual rows. Keeping
 /// layout separate from painting makes scrolling a count of actual terminal
 /// rows rather than logical message lines.
-fn transcript_lines(entries: &[ChatEntry], width: u16) -> Vec<Line<'static>> {
+fn transcript_lines(chat: &mut ChatState, width: u16) -> Vec<Line<'static>> {
+    if chat.render_cache.width != width || chat.render_cache.mode != chat.render_mode {
+        chat.render_cache.width = width;
+        chat.render_cache.mode = chat.render_mode;
+        chat.render_cache.entries.clear();
+    }
+    chat.render_cache.entries.resize(chat.entries.len(), None);
     let mut lines = Vec::new();
-    for entry in entries {
-        push_transcript_entry(&mut lines, entry, usize::from(width));
+    for (index, entry) in chat.entries.iter().enumerate() {
+        let cached = chat.render_cache.entries[index]
+            .as_ref()
+            .filter(|cached| cached.revision == entry.revision)
+            .map(|cached| cached.lines.clone());
+        let entry_lines = cached.unwrap_or_else(|| {
+            let rendered = render_transcript_entry(entry, usize::from(width), chat.render_mode);
+            chat.render_cache.entries[index] = Some(CachedEntry {
+                revision: entry.revision,
+                lines: rendered.clone(),
+            });
+            rendered
+        });
+        lines.extend(entry_lines);
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -612,7 +838,12 @@ fn transcript_lines(entries: &[ChatEntry], width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn push_transcript_entry(out: &mut Vec<Line<'static>>, entry: &ChatEntry, width: usize) {
+fn render_transcript_entry(
+    entry: &ChatEntry,
+    width: usize,
+    mode: TranscriptRenderMode,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
     let visual = entry_visual(entry);
     let header = Line::from(vec![
         Span::styled(
@@ -620,16 +851,16 @@ fn push_transcript_entry(out: &mut Vec<Line<'static>>, entry: &ChatEntry, width:
             visual.header_style.add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            visual.label,
+            visual.label.clone(),
             visual.header_style.add_modifier(Modifier::BOLD),
         ),
     ]);
     out.extend(wrap_styled_line(header, width, ROLE_GUTTER_WIDTH));
 
     let content_width = width.saturating_sub(ROLE_GUTTER_WIDTH).max(1);
-    for (raw, line) in markdownish_lines(&entry.text, visual.body_style, visual.header_style) {
-        let continuation = markdown_continuation_width(raw).min(content_width.saturating_sub(1));
-        for row in wrap_styled_line(line, content_width, continuation) {
+    let logical_lines = entry_logical_lines(entry, mode, &visual, content_width);
+    for logical in logical_lines {
+        for row in wrap_styled_line(logical.line, content_width, logical.continuation_indent) {
             if line_is_empty(&row) {
                 out.push(Line::from(""));
             } else {
@@ -638,6 +869,54 @@ fn push_transcript_entry(out: &mut Vec<Line<'static>>, entry: &ChatEntry, width:
         }
     }
     out.push(Line::from(""));
+    out
+}
+
+fn entry_logical_lines(
+    entry: &ChatEntry,
+    mode: TranscriptRenderMode,
+    visual: &EntryVisual,
+    width: usize,
+) -> Vec<LogicalLine> {
+    if entry.role == ChatRole::Plan {
+        return entry
+            .plan
+            .iter()
+            .map(|item| {
+                let (glyph, style) = match item.status {
+                    PlanStatus::Pending => ("○", Style::default().fg(Color::DarkGray)),
+                    PlanStatus::Running => ("●", Style::default().fg(Color::Yellow)),
+                    PlanStatus::Completed => ("✓", Style::default().fg(Color::Green)),
+                };
+                LogicalLine {
+                    line: Line::from(vec![
+                        Span::styled(format!("{glyph} "), style),
+                        Span::styled(item.text.clone(), visual.body_style),
+                    ]),
+                    continuation_indent: 2,
+                }
+            })
+            .collect();
+    }
+
+    let details = entry
+        .tool_content
+        .iter()
+        .chain(&entry.tool_locations)
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>();
+    let source = if mode == TranscriptRenderMode::Raw && !details.is_empty() {
+        format!("{}\n{}", entry.text, details.join("\n"))
+    } else {
+        entry.text.clone()
+    };
+    match mode {
+        TranscriptRenderMode::Rich => {
+            markdown_lines(&source, visual.body_style, visual.header_style, width)
+        }
+        TranscriptRenderMode::Raw => raw_lines(&source, visual.body_style),
+    }
 }
 
 struct EntryVisual {
@@ -693,6 +972,16 @@ fn entry_visual(entry: &ChatEntry) -> EntryVisual {
                 rail_style: style,
             }
         }
+        ChatRole::Plan => {
+            let style = Style::default().fg(Color::Magenta);
+            EntryVisual {
+                glyph: "◇",
+                label: "Plan".into(),
+                header_style: style,
+                body_style: Style::default(),
+                rail_style: style,
+            }
+        }
         ChatRole::System => {
             let style = Style::default().fg(Color::DarkGray);
             EntryVisual {
@@ -726,338 +1015,6 @@ fn line_is_empty(line: &Line<'_>) -> bool {
     line.spans.iter().all(|span| span.content.trim().is_empty())
 }
 
-/// Render just enough Markdown to make common agent output readable without
-/// turning Hel's intentionally small chat state into a full Markdown engine.
-fn markdownish_lines(
-    text: &str,
-    body_style: Style,
-    accent_style: Style,
-) -> Vec<(&str, Line<'static>)> {
-    let mut lines = Vec::new();
-    let mut in_code_block = false;
-    for raw in text.split('\n') {
-        let trimmed = raw.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_code_block = !in_code_block;
-            let language = trimmed[3..].trim();
-            let label = if language.is_empty() {
-                "code".to_owned()
-            } else {
-                format!("code · {language}")
-            };
-            lines.push((
-                raw,
-                Line::from(Span::styled(
-                    label,
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )),
-            ));
-            continue;
-        }
-        if in_code_block {
-            lines.push((
-                raw,
-                Line::from(Span::styled(
-                    raw.to_owned(),
-                    Style::default().fg(Color::Gray),
-                )),
-            ));
-            continue;
-        }
-        if let Some((level, heading)) = markdown_heading(raw) {
-            lines.push((
-                raw,
-                Line::from(vec![
-                    Span::styled(
-                        format!("{} ", "#".repeat(level)),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(
-                        heading.to_owned(),
-                        accent_style.add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-            ));
-            continue;
-        }
-        if markdown_rule(raw) {
-            lines.push((
-                raw,
-                Line::from(Span::styled(
-                    "────────────────────",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ));
-            continue;
-        }
-        if let Some(quoted) = trimmed.strip_prefix("> ") {
-            lines.push((
-                raw,
-                Line::from(vec![
-                    Span::styled("> ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        quoted.to_owned(),
-                        body_style
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                ]),
-            ));
-            continue;
-        }
-        if let Some((prefix, item)) = markdown_list_item(raw) {
-            let mut spans = vec![Span::styled(prefix, Style::default().fg(Color::DarkGray))];
-            spans.extend(inline_markdown_spans(item, body_style));
-            lines.push((raw, Line::from(spans)));
-            continue;
-        }
-        lines.push((raw, Line::from(inline_markdown_spans(raw, body_style))));
-    }
-    lines
-}
-
-fn markdown_heading(raw: &str) -> Option<(usize, &str)> {
-    let trimmed = raw.trim_start();
-    let level = trimmed.chars().take_while(|ch| *ch == '#').count();
-    (1..=6)
-        .contains(&level)
-        .then(|| trimmed.get(level..))
-        .flatten()
-        .and_then(|rest| {
-            rest.strip_prefix(' ')
-                .map(|heading| (level, heading.trim()))
-        })
-}
-
-fn markdown_rule(raw: &str) -> bool {
-    let trimmed = raw.trim();
-    trimmed.len() >= 3
-        && (trimmed.chars().all(|ch| ch == '-')
-            || trimmed.chars().all(|ch| ch == '*')
-            || trimmed.chars().all(|ch| ch == '_'))
-}
-
-fn markdown_list_item(raw: &str) -> Option<(String, &str)> {
-    let indent = &raw[..raw.len() - raw.trim_start().len()];
-    let trimmed = raw.trim_start();
-    if let Some(item) = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-    {
-        return Some((format!("{indent}• "), item));
-    }
-    let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
-    (digits > 0 && trimmed[digits..].starts_with(". ")).then(|| {
-        (
-            format!("{indent}{}. ", &trimmed[..digits]),
-            &trimmed[digits + 2..],
-        )
-    })
-}
-
-fn inline_markdown_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut rest = text;
-    let mut bold = false;
-    let mut code = false;
-    while !rest.is_empty() {
-        let bold_at = rest.find("**");
-        let code_at = rest.find('`');
-        let next = match (bold_at, code_at) {
-            (Some(bold_at), Some(code_at)) if bold_at <= code_at => Some((bold_at, 2, true)),
-            (Some(_), Some(code_at)) => Some((code_at, 1, false)),
-            (Some(bold_at), None) => Some((bold_at, 2, true)),
-            (None, Some(code_at)) => Some((code_at, 1, false)),
-            (None, None) => None,
-        };
-        let Some((index, marker_len, is_bold)) = next else {
-            spans.push(Span::styled(
-                rest.to_owned(),
-                markdown_style(base_style, bold, code),
-            ));
-            break;
-        };
-        if index > 0 {
-            spans.push(Span::styled(
-                rest[..index].to_owned(),
-                markdown_style(base_style, bold, code),
-            ));
-        }
-        if is_bold {
-            bold = !bold;
-        } else {
-            code = !code;
-        }
-        rest = &rest[index + marker_len..];
-    }
-    spans
-}
-
-fn markdown_style(base_style: Style, bold: bool, code: bool) -> Style {
-    let mut style = base_style;
-    if bold {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    if code {
-        style = style.fg(Color::Yellow);
-    }
-    style
-}
-
-/// Wrap a styled line ourselves, preserving styles and a hanging indent for
-/// list items. `Paragraph` wrapping cannot retain either on continuation rows.
-fn wrap_styled_line(
-    line: Line<'static>,
-    width: usize,
-    continuation_width: usize,
-) -> Vec<Line<'static>> {
-    let width = width.max(1);
-    let continuation_width = continuation_width.min(width.saturating_sub(1));
-    let continuation_style = line
-        .spans
-        .first()
-        .map(|span| span.style)
-        .unwrap_or_default();
-    let continuation = vec![(' ', continuation_style); continuation_width];
-    let mut tokens: Vec<Vec<(char, Style)>> = Vec::new();
-    let mut token = Vec::new();
-    let mut whitespace = None;
-    for span in &line.spans {
-        for ch in span.content.chars() {
-            let is_whitespace = ch.is_whitespace();
-            if whitespace != Some(is_whitespace) {
-                if !token.is_empty() {
-                    tokens.push(std::mem::take(&mut token));
-                }
-                whitespace = Some(is_whitespace);
-            }
-            token.push((ch, span.style));
-        }
-    }
-    if !token.is_empty() {
-        tokens.push(token);
-    }
-
-    let mut rows = Vec::new();
-    let mut current = Vec::new();
-    let mut current_width = 0;
-    for token in tokens {
-        let token_width = styled_token_width(&token);
-        let is_whitespace = token.first().is_some_and(|(ch, _)| ch.is_whitespace());
-        if current_width + token_width <= width {
-            current.extend(token);
-            current_width += token_width;
-        } else if is_whitespace {
-            rows.push(std::mem::take(&mut current));
-            current = continuation.clone();
-            current_width = continuation_width;
-        } else if token_width + continuation_width <= width {
-            if current.len() > continuation.len() {
-                trim_trailing_whitespace(&mut current);
-                rows.push(std::mem::take(&mut current));
-            }
-            current = continuation.clone();
-            current.extend(token);
-            current_width = continuation_width + token_width;
-        } else {
-            for (ch, style) in token {
-                let char_width = display_width(&ch.to_string());
-                if current_width + char_width > width && !current.is_empty() {
-                    trim_trailing_whitespace(&mut current);
-                    rows.push(std::mem::take(&mut current));
-                    current = continuation.clone();
-                    current_width = continuation_width;
-                }
-                current.push((ch, style));
-                current_width += char_width;
-            }
-        }
-    }
-    if !current.is_empty() || rows.is_empty() {
-        rows.push(current);
-    }
-    rows.into_iter().map(styled_chars_line).collect()
-}
-
-fn markdown_continuation_width(raw: &str) -> usize {
-    let leading = &raw[..raw.len() - raw.trim_start().len()];
-    let trimmed = raw.trim_start();
-    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("> ") {
-        return display_width(leading) + 2;
-    }
-    let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
-    if digits > 0 && trimmed[digits..].starts_with(". ") {
-        return display_width(leading) + digits + 2;
-    }
-    display_width(leading)
-}
-
-fn styled_token_width(token: &[(char, Style)]) -> usize {
-    token
-        .iter()
-        .map(|(ch, _)| display_width(&ch.to_string()))
-        .sum()
-}
-
-fn trim_trailing_whitespace(chars: &mut Vec<(char, Style)>) {
-    while chars.last().is_some_and(|(ch, _)| ch.is_whitespace()) {
-        chars.pop();
-    }
-}
-
-fn styled_chars_line(chars: Vec<(char, Style)>) -> Line<'static> {
-    let mut spans = Vec::new();
-    let mut text = String::new();
-    let mut style = None;
-    for (ch, next_style) in chars {
-        if style != Some(next_style) {
-            if let Some(style) = style {
-                spans.push(Span::styled(std::mem::take(&mut text), style));
-            }
-            style = Some(next_style);
-        }
-        text.push(ch);
-    }
-    if let Some(style) = style {
-        spans.push(Span::styled(text, style));
-    }
-    Line::from(spans)
-}
-
-fn display_width(text: &str) -> usize {
-    Line::raw(text.to_owned()).width()
-}
-
-fn extract_text(value: &serde_json::Value) -> Vec<String> {
-    let mut texts = Vec::new();
-    collect_text(value, &mut texts);
-    texts
-}
-
-fn collect_text(value: &serde_json::Value, texts: &mut Vec<String>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(text) = map.get("text").and_then(serde_json::Value::as_str)
-                && !text.is_empty()
-            {
-                texts.push(text.to_owned());
-                return;
-            }
-            for child in map.values() {
-                collect_text(child, texts);
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for child in values {
-                collect_text(child, texts);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
@@ -1082,6 +1039,18 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn transcript_text(chat: &mut ChatState, width: u16) -> Vec<String> {
+        transcript_lines(chat, width)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
     }
 
     #[test]
@@ -1161,7 +1130,10 @@ mod tests {
     #[test]
     fn replay_projects_user_and_agent_text() {
         let runtime = RuntimeEvent::SessionUpdate {
-            update: serde_json::json!({"content": {"text": "done"}}),
+            update: serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "done"}
+            }),
         };
         let events = vec![
             SequencedEvent {
@@ -1225,11 +1197,13 @@ mod tests {
         chat.apply_session_update(
             1,
             &serde_json::json!({"sessionUpdate": "tool_call",
+                "toolCallId": "grep-config",
                 "title": "grep config", "status": "pending"}),
         );
         chat.apply_session_update(
             2,
-            &serde_json::json!({"sessionUpdate": "tool_call_update", "status": "completed",
+            &serde_json::json!({"sessionUpdate": "tool_call_update",
+                "toolCallId": "grep-config", "status": "completed",
                 "content": [{"type": "content", "content": {"type": "text", "text": "noise"}}]}),
         );
         assert_eq!(chat.entries.len(), 1);
@@ -1264,18 +1238,43 @@ mod tests {
     }
 
     #[test]
+    fn partial_tool_updates_preserve_unchanged_structured_fields() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.apply_session_update(
+            1,
+            &serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "inspect",
+                "title": "inspect",
+                "content": [{
+                    "type": "content",
+                    "content": {"type": "text", "text": "first result"}
+                }],
+                "locations": [{"path": "src/lib.rs", "line": 7}]
+            }),
+        );
+        chat.apply_session_update(
+            2,
+            &serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "inspect",
+                "content": [{
+                    "type": "content",
+                    "content": {"type": "text", "text": "replacement result"}
+                }]
+            }),
+        );
+
+        assert_eq!(chat.entries[0].tool_content, ["replacement result"]);
+        assert_eq!(chat.entries[0].tool_locations, ["src/lib.rs:7"]);
+    }
+
+    #[test]
     fn transcript_blocks_keep_role_headers_and_wrapped_body_indented() {
         let entry = ChatEntry::plain(1, ChatRole::User, "alpha beta gamma");
-        let lines = transcript_lines(&[entry], 12);
-        let text = lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(entry);
+        let text = transcript_text(&mut chat, 12);
 
         assert_eq!(text, ["❯ You", "│ alpha beta", "│ gamma", ""]);
     }
@@ -1283,15 +1282,9 @@ mod tests {
     #[test]
     fn markdown_list_wrapping_uses_a_hanging_indent() {
         let entry = ChatEntry::plain(1, ChatRole::Agent, "- alpha beta gamma");
-        let text = transcript_lines(&[entry], 13)
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(entry);
+        let text = transcript_text(&mut chat, 13);
 
         assert!(text.iter().any(|line| line == "│ • alpha"));
         assert!(text.iter().any(|line| line == "│   beta"));
@@ -1301,20 +1294,74 @@ mod tests {
     #[test]
     fn page_navigation_keeps_end_attached_to_the_latest_message() {
         let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.last_content_height = 30;
+        chat.last_viewport_height = 10;
         chat.handle_key(key(KeyCode::PageUp));
-        assert_eq!(chat.scroll_back, 8);
+        assert_eq!(chat.scroll_top, 10);
+        assert!(!chat.follow_bottom);
         chat.handle_key(key(KeyCode::PageDown));
-        assert_eq!(chat.scroll_back, 0);
+        assert_eq!(chat.scroll_top, 20);
+        assert!(chat.follow_bottom);
         chat.handle_key(key(KeyCode::PageUp));
         chat.handle_key(key(KeyCode::End));
-        assert_eq!(chat.scroll_back, 0);
+        assert!(chat.follow_bottom);
     }
 
     #[test]
-    fn text_extraction_ignores_non_text_scalars() {
-        assert_eq!(
-            extract_text(&serde_json::json!({"items": [{"text": "a"}, {"count": 3}]})),
-            vec!["a"]
+    fn unknown_json_does_not_leak_nested_text_into_the_transcript() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.apply_session_update(
+            1,
+            &serde_json::json!({"items": [{"text": "not an ACP message"}]}),
         );
+        assert!(chat.entries.is_empty());
+    }
+
+    #[test]
+    fn message_ids_keep_adjacent_agent_messages_separate() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        for (seq, id, text) in [(1, "one", "first"), (2, "two", "second")] {
+            chat.apply_session_update(
+                seq,
+                &serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": id,
+                    "content": {"type": "text", "text": text}
+                }),
+            );
+        }
+        assert_eq!(chat.entries.len(), 2);
+        assert_eq!(chat.entries[0].text, "first");
+        assert_eq!(chat.entries[1].text, "second");
+    }
+
+    #[test]
+    fn plan_updates_replace_the_current_turn_plan() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        for (seq, status) in [(1, "pending"), (2, "completed")] {
+            chat.apply_session_update(
+                seq,
+                &serde_json::json!({
+                    "sessionUpdate": "plan",
+                    "entries": [{
+                        "content": "inspect renderer",
+                        "priority": "high",
+                        "status": status
+                    }]
+                }),
+            );
+        }
+        assert_eq!(chat.entries.len(), 1);
+        assert_eq!(chat.entries[0].role, ChatRole::Plan);
+        assert_eq!(chat.entries[0].plan[0].status, PlanStatus::Completed);
+    }
+
+    #[test]
+    fn raw_mode_preserves_markdown_markers_and_exposes_tool_details() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries
+            .push(ChatEntry::plain(1, ChatRole::Agent, "**bold**"));
+        chat.render_mode = TranscriptRenderMode::Raw;
+        assert!(transcript_text(&mut chat, 30).contains(&"│ **bold**".into()));
     }
 }
