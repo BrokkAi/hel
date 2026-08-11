@@ -87,6 +87,9 @@ pub enum RuntimeEvent {
         resumed: bool,
         unrestricted_mode: String,
     },
+    SessionConfigured {
+        config_options: Vec<SessionConfigOption>,
+    },
     SessionUpdate {
         update: serde_json::Value,
     },
@@ -306,6 +309,9 @@ async fn drive_connection(
         resumed,
         unrestricted_mode: desired_mode.to_string(),
     });
+    let _ = events.send(RuntimeEvent::SessionConfigured {
+        config_options: config_options.clone(),
+    });
 
     while let Some(request) = requests.recv().await {
         match request {
@@ -372,6 +378,9 @@ async fn drive_connection(
                 {
                     Ok(()) => {
                         let _ = events.send(RuntimeEvent::ConfigApplied { key, value });
+                        let _ = events.send(RuntimeEvent::SessionConfigured {
+                            config_options: config_options.clone(),
+                        });
                     }
                     Err(error) => {
                         let _ = events.send(RuntimeEvent::Warning {

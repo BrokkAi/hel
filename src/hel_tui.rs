@@ -84,6 +84,7 @@ pub struct ImportSessionOption {
     pub native_session_id: String,
     pub title: String,
     pub details: String,
+    pub unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,10 +332,11 @@ impl DashboardState {
                     detail.agent_text_stream_open = false;
                     detail.current_turn_started_at = Some(observed_at_epoch_seconds);
                 }
-                WorkerEvent::TurnCompleted | WorkerEvent::Cancelled => {
+                WorkerEvent::TurnCompleted => {
                     detail.agent_text_stream_open = false;
                     detail.current_turn_started_at = None;
                 }
+                WorkerEvent::Cancelled => detail.agent_text_stream_open = false,
                 WorkerEvent::Adapter { payload, .. } => {
                     if let Some(activity) = activity_from_adapter(payload) {
                         if activity.kind == ActivityKind::AgentText {
@@ -671,6 +673,10 @@ impl DashboardState {
                     self.mode = Mode::Import(dialog);
                     return DashboardAction::None;
                 };
+                if session.unavailable_reason.is_some() {
+                    self.mode = Mode::Import(dialog);
+                    return DashboardAction::None;
+                }
                 let action = DashboardAction::ImportSession {
                     profile_id: profile.profile_id.clone(),
                     native_session_id: session.native_session_id.clone(),
@@ -1339,7 +1345,19 @@ fn partition_sessions<'a>(
             .cmp(&last_agent_text_at(left))
             .then_with(|| left.id.cmp(&right.id))
     });
+    archived.sort_by(|left, right| {
+        checkpoint_time(right)
+            .cmp(&checkpoint_time(left))
+            .then_with(|| left.id.cmp(&right.id))
+    });
     (active, archived)
+}
+
+fn checkpoint_time(session: &SessionRecord) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    session
+        .checkpoint
+        .as_ref()
+        .and_then(|checkpoint| chrono::DateTime::parse_from_rfc3339(&checkpoint.created_at).ok())
 }
 
 fn activity_from_adapter(payload: &serde_json::Value) -> Option<SessionActivity> {
@@ -1543,7 +1561,7 @@ fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
     frame.render_widget(outer, popup);
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .constraints([Constraint::Min(5), Constraint::Length(3)])
         .split(inner);
     let panes = Layout::default()
         .direction(Direction::Horizontal)
@@ -1601,15 +1619,25 @@ fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
                     .sessions
                     .iter()
                     .map(|session| {
+                        let title_style = if session.unavailable_reason.is_some() {
+                            Style::default().fg(Color::DarkGray)
+                        } else {
+                            Style::default().add_modifier(Modifier::BOLD)
+                        };
+                        let details = if session.unavailable_reason.is_some() {
+                            format!("{} · unavailable", session.details)
+                        } else {
+                            session.details.clone()
+                        };
                         ListItem::new(vec![
                             Line::styled(
                                 truncate_text(
                                     &session.title,
                                     panes[1].width.saturating_sub(4) as usize,
                                 ),
-                                Style::default().add_modifier(Modifier::BOLD),
+                                title_style,
                             ),
-                            Line::styled(session.details.clone(), Style::default().fg(Color::Gray)),
+                            Line::styled(details, Style::default().fg(Color::Gray)),
                         ])
                     })
                     .collect()
@@ -1644,10 +1672,28 @@ fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
         &mut session_state,
     );
 
+    let unavailable_reason = selected_profile
+        .and_then(|profile| profile.sessions.get(dialog.session_index))
+        .and_then(|session| session.unavailable_reason.as_deref());
+    let (footer, footer_style) = unavailable_reason.map_or_else(
+        || {
+            (
+                "Tab pane · ←/→ pane · ↑/↓ select · Enter import · Esc cancel".to_owned(),
+                Style::default().fg(Color::Gray),
+            )
+        },
+        |reason| {
+            (
+                format!("Cannot import: {reason}"),
+                Style::default().fg(Color::Yellow),
+            )
+        },
+    );
     frame.render_widget(
-        Paragraph::new("Tab pane · ←/→ pane · ↑/↓ select · Enter import · Esc cancel")
+        Paragraph::new(footer)
             .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::Gray)),
+            .style(footer_style)
+            .wrap(Wrap { trim: true }),
         rows[1],
     );
 }
@@ -1881,7 +1927,7 @@ fn session_values(
             if session.state.is_active() {
                 checkpoint_age(now_epoch_seconds, &checkpoint.created_at)
             } else {
-                checkpoint.created_at.clone()
+                checkpoint_time_display(&checkpoint.created_at)
             }
         })
         .unwrap_or_else(|| "never".into());
@@ -1983,6 +2029,12 @@ fn checkpoint_age(now_epoch_seconds: u64, checkpointed_at: &str) -> String {
     } else {
         format!("{}d", age / 86_400)
     }
+}
+
+fn checkpoint_time_display(checkpointed_at: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(checkpointed_at)
+        .map(|checkpointed_at| checkpointed_at.format("%y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|_| "unknown".into())
 }
 
 fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
@@ -2679,6 +2731,30 @@ mod tests {
     }
 
     #[test]
+    fn archived_sessions_are_ordered_by_checkpoint_time_descending() {
+        let mut oldest = archived_session();
+        oldest.id = "session-z".into();
+        oldest.checkpoint.as_mut().unwrap().created_at = "2026-08-09T01:00:00Z".into();
+        let mut newest = archived_session();
+        newest.id = "session-y".into();
+        newest.checkpoint.as_mut().unwrap().created_at = "2026-08-09T00:30:00-02:00".into();
+        let mut without_checkpoint = archived_session();
+        without_checkpoint.id = "session-a".into();
+        without_checkpoint.checkpoint = None;
+
+        let (_, archived) =
+            partition_sessions([&without_checkpoint, &oldest, &newest], &BTreeMap::new());
+
+        assert_eq!(
+            archived
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["session-y", "session-z", "session-a"]
+        );
+    }
+
+    #[test]
     fn active_sessions_are_sorted_by_most_recent_agent_text() {
         let active_session = |id: &str| {
             let mut session = archived_session();
@@ -3031,6 +3107,7 @@ mod tests {
                     native_session_id: "codex-session".into(),
                     title: "Codex title".into(),
                     details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
+                    unavailable_reason: None,
                 }],
                 scan_progress: Some((1, 1)),
                 error: None,
@@ -3042,6 +3119,7 @@ mod tests {
                     native_session_id: "claude-session".into(),
                     title: "Claude title".into(),
                     details: "4m ago · master · 2.0MB · ~/Projects/hel".into(),
+                    unavailable_reason: None,
                 }],
                 scan_progress: Some((1, 1)),
                 error: None,
@@ -3063,12 +3141,57 @@ mod tests {
     }
 
     #[test]
+    fn import_dialog_explains_and_blocks_unavailable_sessions() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        let profiles = vec![ImportProfileOption {
+            profile_id: "codex-1".into(),
+            harness_kind: HarnessKind::Codex,
+            sessions: vec![ImportSessionOption {
+                native_session_id: "legacy-session".into(),
+                title: "Legacy Codex session".into(),
+                details: "2d ago · master · 1.0MB · ~/Projects/hel".into(),
+                unavailable_reason: Some(
+                    "Legacy Codex history cannot be imported; run codex migrate-rollouts --apply"
+                        .into(),
+                ),
+            }],
+            scan_progress: Some((1, 1)),
+            error: None,
+        }];
+        dashboard.show_import_dialog(1, profiles.clone());
+        dashboard.apply_import_profiles(1, profiles);
+        dashboard.handle_key(key(KeyCode::Right));
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::Import(_)));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("unavailable"));
+        assert!(rendered.contains("Cannot import: Legacy Codex history"));
+        assert!(rendered.contains("codex migrate-rollouts --apply"));
+    }
+
+    #[test]
     fn incremental_import_results_preserve_the_selected_session() {
         let mut dashboard = dashboard_with_session(archived_session());
         let session = |id: &str| ImportSessionOption {
             native_session_id: id.into(),
             title: "Same title".into(),
             details: "just now · master · 1.0KB · ~/Projects/hel".into(),
+            unavailable_reason: None,
         };
         let profile = |sessions: Vec<ImportSessionOption>, progress| ImportProfileOption {
             profile_id: "codex-1".into(),
@@ -3108,6 +3231,7 @@ mod tests {
                 native_session_id: "native-session-1".into(),
                 title: "Native session title".into(),
                 details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
+                unavailable_reason: None,
             }],
             scan_progress: Some((1, 1)),
             error: None,
@@ -3146,6 +3270,7 @@ mod tests {
                 native_session_id: "native-session-1".into(),
                 title: "Native session title".into(),
                 details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
+                unavailable_reason: None,
             }],
             scan_progress: Some((1, 1)),
             error: None,
@@ -3367,8 +3492,18 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("Turn clock"));
-        assert!(rendered.contains("2026-08-09T01:00:00Z"));
+        assert!(rendered.contains("26-08-09 01:00"));
+        assert!(!rendered.contains("2026-08-09T01:00:00Z"));
         assert!(!rendered.contains("idle"));
+    }
+
+    #[test]
+    fn archived_checkpoint_time_preserves_its_reported_timezone() {
+        assert_eq!(
+            checkpoint_time_display("2026-08-09T01:02:03-05:00"),
+            "26-08-09 01:02"
+        );
+        assert_eq!(checkpoint_time_display("not-a-timestamp"), "unknown");
     }
 
     #[test]

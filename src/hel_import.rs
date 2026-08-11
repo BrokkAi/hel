@@ -48,7 +48,35 @@ pub struct LocatedClaudeSession {
     pub size_bytes: u64,
 }
 
-pub type LocatedCodexSession = LocatedClaudeSession;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexHistoryMode {
+    Legacy,
+    Paginated,
+}
+
+pub const CODEX_LEGACY_IMPORT_ISSUE: &str = "Legacy Codex history cannot be imported. Run codex migrate-rollouts --apply, then reopen \
+     this dialog.";
+
+impl CodexHistoryMode {
+    pub fn import_issue(self) -> Option<&'static str> {
+        match self {
+            Self::Legacy => Some(CODEX_LEGACY_IMPORT_ISSUE),
+            Self::Paginated => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LocatedCodexSession {
+    pub native_session_id: String,
+    pub jsonl_path: PathBuf,
+    pub modified_at: SystemTime,
+    pub title: String,
+    pub cwd: PathBuf,
+    pub git_branch: String,
+    pub size_bytes: u64,
+    pub history_mode: CodexHistoryMode,
+}
 
 #[derive(Debug, Clone)]
 pub struct LocatedKimiSession {
@@ -82,6 +110,14 @@ struct KimiScanCandidate {
     modified_at: SystemTime,
     title: String,
     cwd: PathBuf,
+}
+
+#[derive(Debug)]
+struct CodexSessionMetadata {
+    id: String,
+    cwd: PathBuf,
+    git_branch: String,
+    history_mode: CodexHistoryMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,21 +252,22 @@ fn locate_unindexed_codex_session(home: &Path, session_id: &str) -> Result<Locat
     let titles = codex_native_titles(home)?;
     let mut matches = Vec::new();
     for candidate in candidates {
-        let Some((candidate_id, cwd, git_branch)) = codex_session_metadata(&candidate.path)? else {
+        let Some(metadata) = codex_session_metadata(&candidate.path)? else {
             continue;
         };
-        if candidate_id == session_id {
+        if metadata.id == session_id {
             matches.push(LocatedCodexSession {
                 title: titles
                     .get(session_id)
                     .cloned()
                     .unwrap_or_else(|| session_id.to_owned()),
-                native_session_id: candidate_id,
+                native_session_id: metadata.id,
                 jsonl_path: candidate.path,
                 modified_at: candidate.modified_at,
-                cwd,
-                git_branch,
+                cwd: metadata.cwd,
+                git_branch: metadata.git_branch,
                 size_bytes: candidate.size_bytes,
+                history_mode: metadata.history_mode,
             });
         }
     }
@@ -296,21 +333,22 @@ pub fn scan_codex_sessions(
         session: None,
     });
     for (index, candidate) in candidates.into_iter().enumerate() {
-        let session =
-            codex_session_metadata(&candidate.path)?.map(|(session_id, cwd, git_branch)| {
-                LocatedCodexSession {
-                    title: titles
-                        .get(&session_id)
-                        .cloned()
-                        .unwrap_or_else(|| session_id.clone()),
-                    native_session_id: session_id,
-                    jsonl_path: candidate.path,
-                    modified_at: candidate.modified_at,
-                    cwd,
-                    git_branch,
-                    size_bytes: candidate.size_bytes,
-                }
-            });
+        let session = codex_session_metadata(&candidate.path)?.map(|metadata| {
+            let session_id = metadata.id;
+            LocatedCodexSession {
+                title: titles
+                    .get(&session_id)
+                    .cloned()
+                    .unwrap_or_else(|| session_id.clone()),
+                native_session_id: session_id,
+                jsonl_path: candidate.path,
+                modified_at: candidate.modified_at,
+                cwd: metadata.cwd,
+                git_branch: metadata.git_branch,
+                size_bytes: candidate.size_bytes,
+                history_mode: metadata.history_mode,
+            }
+        });
         report(SessionScanProgress {
             scanned: index + 1,
             total,
@@ -329,17 +367,26 @@ fn codex_indexed_sessions(home: &Path) -> Result<Option<Vec<LocatedCodexSession>
         database,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    let Ok(mut statement) = connection.prepare(
+    let has_history_mode = connection
+        .prepare("SELECT history_mode FROM threads LIMIT 0")
+        .is_ok();
+    let history_mode_column = if has_history_mode {
+        "history_mode"
+    } else {
+        "'legacy'"
+    };
+    let query = format!(
         "SELECT id, rollout_path, updated_at, COALESCE(NULLIF(name, ''), NULLIF(title, ''), id), cwd, \
-         COALESCE(NULLIF(git_branch, ''), 'HEAD') \
+         COALESCE(NULLIF(git_branch, ''), 'HEAD'), {history_mode_column} \
          FROM threads \
          WHERE archived = 0 \
            AND source IN ('cli', 'vscode') \
            AND preview <> '' \
            AND rollout_path IS NOT NULL \
          ORDER BY updated_at DESC, id DESC \
-         LIMIT 25",
-    ) else {
+         LIMIT 25"
+    );
+    let Ok(mut statement) = connection.prepare(&query) else {
         return Ok(None);
     };
     let rows = statement.query_map([], |row| {
@@ -350,11 +397,12 @@ fn codex_indexed_sessions(home: &Path) -> Result<Option<Vec<LocatedCodexSession>
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
         ))
     })?;
     let mut sessions = Vec::new();
     for row in rows {
-        let (session_id, path, updated_at, title, cwd, git_branch) = row?;
+        let (session_id, path, updated_at, title, cwd, git_branch, history_mode) = row?;
         let path = PathBuf::from(path);
         if validate_id("Codex session", &session_id).is_err() || updated_at.is_negative() {
             continue;
@@ -377,6 +425,7 @@ fn codex_indexed_sessions(home: &Path) -> Result<Option<Vec<LocatedCodexSession>
             cwd: PathBuf::from(cwd),
             git_branch,
             size_bytes: metadata.len(),
+            history_mode: parse_codex_history_mode(&history_mode)?,
         });
     }
     Ok(Some(sessions))
@@ -426,7 +475,7 @@ fn codex_rollout_id_from_path(path: &Path) -> Option<&str> {
     .then_some(id)
 }
 
-fn codex_session_metadata(path: &Path) -> Result<Option<(String, PathBuf, String)>> {
+fn codex_session_metadata(path: &Path) -> Result<Option<CodexSessionMetadata>> {
     let file =
         fs::File::open(path).with_context(|| format!("open Codex session {}", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -442,6 +491,15 @@ fn codex_session_metadata(path: &Path) -> Result<Option<(String, PathBuf, String
             continue;
         }
         if !codex_source_is_interactive(record.pointer("/payload/source")) {
+            return Ok(None);
+        }
+        // Ephemeral Codex threads normally have no rollout path at all. Keep
+        // this defensive check so a future writer cannot expose one here.
+        if record
+            .pointer("/payload/ephemeral")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
             return Ok(None);
         }
         // Codex ACP loads a rollout by its payload `id`, which is also the
@@ -467,10 +525,29 @@ fn codex_session_metadata(path: &Path) -> Result<Option<(String, PathBuf, String
                 .filter(|branch| !branch.trim().is_empty())
                 .unwrap_or("HEAD")
                 .to_owned();
-            return Ok(Some((id, cwd, git_branch)));
+            let history_mode = record
+                .pointer("/payload/history_mode")
+                .and_then(Value::as_str)
+                .map(parse_codex_history_mode)
+                .transpose()?
+                .unwrap_or(CodexHistoryMode::Legacy);
+            return Ok(Some(CodexSessionMetadata {
+                id,
+                cwd,
+                git_branch,
+                history_mode,
+            }));
         }
     }
     Ok(None)
+}
+
+fn parse_codex_history_mode(value: &str) -> Result<CodexHistoryMode> {
+    match value {
+        "legacy" => Ok(CodexHistoryMode::Legacy),
+        "paginated" => Ok(CodexHistoryMode::Paginated),
+        other => bail!("unsupported Codex history mode {other:?}"),
+    }
 }
 
 fn codex_source_is_interactive(source: Option<&Value>) -> bool {
@@ -1219,8 +1296,9 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
     let body = fs::read_to_string(path)
         .with_context(|| format!("read Codex session {}", path.display()))?;
     let mut cwd = None;
+    let mut history_mode = None;
     let mut events = Vec::new();
-    let mut saw_raw_user = false;
+    let mut saw_user = false;
     for (index, line) in body.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -1228,42 +1306,38 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
         let record: Value = serde_json::from_str(line).with_context(|| {
             format!("parse Codex session {} line {}", path.display(), index + 1)
         })?;
-        if record.get("type").and_then(Value::as_str) == Some("session_meta") && cwd.is_none() {
-            cwd = record
-                .pointer("/payload/cwd")
-                .and_then(Value::as_str)
-                .filter(|cwd| !cwd.trim().is_empty())
-                .map(PathBuf::from);
-        }
-        let record_type = record.get("type").and_then(Value::as_str);
-        let payload_type = record.pointer("/payload/type").and_then(Value::as_str);
-        let compaction_artifact = matches!(
-            record_type,
-            Some("compacted" | "context_compaction" | "compaction_summary")
-        ) || (record_type == Some("response_item")
-            && matches!(
-                payload_type,
-                Some("compaction" | "compaction_summary" | "context_compaction")
-            ));
-        if compaction_artifact {
-            ensure!(
-                saw_raw_user,
-                "Codex session contains a compaction artifact before recoverable raw history"
-            );
+        if record.get("type").and_then(Value::as_str) == Some("session_meta") {
+            if cwd.is_none() {
+                cwd = record
+                    .pointer("/payload/cwd")
+                    .and_then(Value::as_str)
+                    .filter(|cwd| !cwd.trim().is_empty())
+                    .map(PathBuf::from);
+            }
+            if history_mode.is_none() {
+                history_mode = Some(
+                    record
+                        .pointer("/payload/history_mode")
+                        .and_then(Value::as_str)
+                        .map(parse_codex_history_mode)
+                        .transpose()?
+                        .unwrap_or(CodexHistoryMode::Legacy),
+                );
+            }
             continue;
         }
         if record.get("type").and_then(Value::as_str) != Some("event_msg") {
             continue;
         }
         match record.pointer("/payload/type").and_then(Value::as_str) {
-            Some("user_message") => {
-                let Some(text) = record
-                    .pointer("/payload/message")
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.trim().is_empty())
-                else {
+            Some("item_completed")
+                if record.pointer("/payload/item/type").and_then(Value::as_str)
+                    == Some("UserMessage") =>
+            {
+                let Some(text) = codex_completed_item_text(&record) else {
                     continue;
                 };
+                finish_imported_turn(&mut events);
                 let request_id = format!("import-{}", events.len() + 1);
                 push_event(
                     &mut events,
@@ -1273,14 +1347,13 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
                         attachments: Vec::new(),
                     },
                 );
-                saw_raw_user = true;
+                saw_user = true;
             }
-            Some("agent_message") => {
-                let Some(text) = record
-                    .pointer("/payload/message")
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty())
-                else {
+            Some("item_completed")
+                if record.pointer("/payload/item/type").and_then(Value::as_str)
+                    == Some("AgentMessage") =>
+            {
+                let Some(text) = codex_completed_item_text(&record) else {
                     continue;
                 };
                 push_event(
@@ -1296,14 +1369,19 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
                         }),
                     },
                 );
-                if record.pointer("/payload/phase").and_then(Value::as_str) == Some("final_answer")
-                {
-                    push_event(&mut events, WorkerEvent::TurnCompleted);
-                }
             }
+            Some("turn_complete" | "turn_aborted") => finish_imported_turn(&mut events),
             _ => {}
         }
     }
+    ensure!(
+        history_mode == Some(CodexHistoryMode::Paginated),
+        "{CODEX_LEGACY_IMPORT_ISSUE}"
+    );
+    ensure!(
+        saw_user,
+        "Codex paginated session contains no importable user messages"
+    );
     finish_imported_turn(&mut events);
     let cwd = cwd.context("Codex session does not declare its original cwd")?;
     ensure!(
@@ -1312,6 +1390,17 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
         cwd.display()
     );
     Ok(CodexTranscript { cwd, events })
+}
+
+fn codex_completed_item_text(record: &Value) -> Option<String> {
+    let parts = record
+        .pointer("/payload/item/content")?
+        .as_array()?
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
 /// Project a Kimi session directory. The main wire stream contains prompts and
@@ -2217,11 +2306,13 @@ mod tests {
         fs::write(
             &path,
             concat!(
-                r#"{"type":"session_meta","payload":{"session_id":"019feb6c-5ffc-7c12-ad99-bdeaeb6be79d","cwd":"/work/app"}}"#,
+                r#"{"type":"session_meta","payload":{"session_id":"019feb6c-5ffc-7c12-ad99-bdeaeb6be79d","cwd":"/work/app","history_mode":"paginated"}}"#,
                 "\n",
-                r#"{"type":"event_msg","payload":{"type":"user_message","message":"first prompt"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"user-1","content":[{"type":"text","text":"first prompt","text_elements":[]}]}}}"#,
                 "\n",
-                r#"{"type":"event_msg","payload":{"type":"agent_message","message":"first reply","phase":"final_answer"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"agent-1","content":[{"type":"Text","text":"first reply"}],"phase":"final_answer"}}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"turn_complete","turn_id":"turn-1"}}"#,
                 "\n",
             ),
         )
@@ -2244,7 +2335,31 @@ mod tests {
     }
 
     #[test]
-    fn codex_import_omits_compaction_blobs_but_requires_prior_raw_history() {
+    fn codex_paginated_import_ignores_compaction_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rollout.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/work/app","history_mode":"paginated"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"compaction","encrypted_content":"opaque"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"user-1","content":[{"type":"text","text":"prompt after compaction"}]}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let transcript = read_codex_transcript(&path).unwrap();
+        assert!(matches!(
+            &transcript.events[0].event,
+            WorkerEvent::PromptAccepted { text, .. } if text == "prompt after compaction"
+        ));
+        assert_eq!(transcript.events.len(), 2);
+    }
+
+    #[test]
+    fn codex_import_rejects_legacy_history_with_migration_guidance() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("rollout.jsonl");
         fs::write(
@@ -2252,32 +2367,14 @@ mod tests {
             concat!(
                 r#"{"type":"session_meta","payload":{"cwd":"/work/app"}}"#,
                 "\n",
-                r#"{"type":"response_item","payload":{"type":"compaction","encrypted_content":"opaque"}}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-        assert!(
-            read_codex_transcript(&path)
-                .unwrap_err()
-                .to_string()
-                .contains("before recoverable raw history")
-        );
-
-        fs::write(
-            &path,
-            concat!(
-                r#"{"type":"session_meta","payload":{"cwd":"/work/app"}}"#,
-                "\n",
                 r#"{"type":"event_msg","payload":{"type":"user_message","message":"raw prompt"}}"#,
                 "\n",
-                r#"{"type":"response_item","payload":{"type":"compaction","encrypted_content":"opaque"}}"#,
-                "\n",
             ),
         )
         .unwrap();
-        let transcript = read_codex_transcript(&path).unwrap();
-        assert_eq!(transcript.events.len(), 2);
+        let error = read_codex_transcript(&path).unwrap_err().to_string();
+        assert!(error.contains("Legacy Codex history cannot be imported"));
+        assert!(error.contains("codex migrate-rollouts --apply"));
     }
 
     #[test]
@@ -2351,6 +2448,7 @@ mod tests {
         assert_eq!(sessions[0].cwd, PathBuf::from("/work/app"));
         assert_eq!(sessions[0].git_branch, "feature");
         assert!(sessions[0].size_bytes > 0);
+        assert_eq!(sessions[0].history_mode, CodexHistoryMode::Legacy);
     }
 
     #[test]
@@ -2378,16 +2476,27 @@ mod tests {
                 json!({"subagent": {"thread_spawn": {"parent_thread_id": interactive_id}}}),
             ),
             (
+                sessions.join("ephemeral.jsonl"),
+                "019feb6c-6b55-7111-a210-6d85ee0772d1",
+                json!("cli"),
+            ),
+            (
                 archived.join("archived.jsonl"),
                 "019feb6c-6b55-7111-a210-6d85ee0772d0",
                 json!("cli"),
             ),
         ] {
+            let ephemeral = path.ends_with("ephemeral.jsonl");
             fs::write(
-                path,
+                &path,
                 json!({
                     "type": "session_meta",
-                    "payload": {"id": id, "source": source, "cwd": "/work/app"}
+                    "payload": {
+                        "id": id,
+                        "source": source,
+                        "cwd": "/work/app",
+                        "ephemeral": ephemeral
+                    }
                 })
                 .to_string(),
             )
@@ -2411,7 +2520,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_listing_uses_native_index_order_and_limit() {
+    fn codex_listing_uses_native_index_order_limit_and_persisted_threads() {
         let directory = tempfile::tempdir().unwrap();
         let sessions = directory.path().join("sessions");
         fs::create_dir_all(&sessions).unwrap();
@@ -2429,7 +2538,8 @@ mod tests {
                     git_branch TEXT,
                     archived INTEGER,
                     source TEXT,
-                    preview TEXT
+                    preview TEXT,
+                    history_mode TEXT
                 );",
             )
             .unwrap();
@@ -2439,7 +2549,8 @@ mod tests {
             fs::write(&rollout, "indexed").unwrap();
             connection
                 .execute(
-                    "INSERT INTO threads VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'cli', 'visible')",
+                    "INSERT INTO threads VALUES \
+                     (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'cli', 'visible', 'paginated')",
                     rusqlite::params![
                         id,
                         rollout.to_string_lossy(),
@@ -2452,13 +2563,23 @@ mod tests {
                 )
                 .unwrap();
         }
+        connection
+            .execute(
+                "INSERT INTO threads VALUES \
+                 (?1, NULL, 100, 'Ephemeral', 'Ephemeral', '/work/app', 'HEAD', 0, 'cli', \
+                  'visible', 'legacy')",
+                ["019feb6c-6b55-7111-a210-ffffffffffff"],
+            )
+            .unwrap();
         drop(connection);
 
         let listed = list_codex_sessions(directory.path()).unwrap();
         assert_eq!(listed.len(), 25);
         assert_eq!(listed[0].title, "Explicit newest title");
+        assert_eq!(listed[0].history_mode, CodexHistoryMode::Paginated);
         assert!(listed[0].modified_at > listed[1].modified_at);
         assert_eq!(listed[24].title, "Generated 5");
+        assert!(listed.iter().all(|session| session.title != "Ephemeral"));
     }
 
     #[test]
