@@ -9,6 +9,8 @@ jobs:
   licenses:
     name: Dependency licenses
     runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
     steps:
     - uses: actions/checkout@v6
 
@@ -52,8 +54,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+        - os: ubuntu-latest
+          target: x86_64-unknown-linux-gnu
+        - os: macos-latest
+          target: aarch64-apple-darwin
+        - os: windows-latest
+          target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
 
     steps:
     - uses: actions/checkout@v6
@@ -91,12 +101,22 @@ jobs:
     - name: Build Hel
       run: cargo build --release
 
+    # The runtime suite exercises Unix target paths, directory fsync, and Git
+    # worktree byte preservation. Clippy above still compiles every test target
+    # on Windows, while Linux and macOS execute the suite.
     - name: Run tests
+      if: runner.os != 'Windows'
       run: cargo test
+
+    - name: Compile tests on Windows
+      if: runner.os == 'Windows'
+      run: cargo test --no-run
 
   voice-worker:
     name: Voice worker (ubuntu-latest)
     runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
     steps:
     - uses: actions/checkout@v6
 

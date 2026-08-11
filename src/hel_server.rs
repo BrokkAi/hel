@@ -165,12 +165,7 @@ impl ViewerSnapshot {
             .values()
             .map(|session| ViewerSession {
                 id: session.id.clone(),
-                title: session
-                    .session_title_override
-                    .as_ref()
-                    .or(session.acp_session_title.as_ref())
-                    .cloned()
-                    .unwrap_or_else(|| session.title.clone()),
+                title: session.display_title().to_owned(),
                 harness_kind: harness_kind_name(session.harness_kind).into(),
                 profile_id: session.last_profile.clone(),
                 bundle_id: session.bundle_id.clone(),
@@ -841,6 +836,7 @@ mod tests {
                 HarnessProfile {
                     model: None,
                     reasoning_effort: None,
+                    context_window_bytes: None,
                     kind: HarnessKind::Codex,
                     home: "/highly/secret/codex".into(),
                     executable: None,
@@ -1032,6 +1028,7 @@ mod tests {
             HarnessProfile {
                 model: None,
                 reasoning_effort: None,
+                context_window_bytes: None,
                 kind: HarnessKind::Claude,
                 home: "/secret/claude".into(),
                 executable: None,

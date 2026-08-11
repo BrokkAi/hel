@@ -7,12 +7,13 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::hel_archive::{
@@ -170,6 +171,7 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
                 &archive.manifest.bundle.primary_repository,
                 &archive.manifest.repositories,
                 &spec.workspace_root,
+                &spec.harness_home,
             )?;
             validate_relative_path(&relative_path)?;
             ensure!(
@@ -233,7 +235,6 @@ fn target_primary_cwd(
         .find(|repository| repository.metadata.id == primary_repository)
         .map(|primary| workspace_root.join(&primary.metadata.relative_destination))
 }
-
 fn restored_native_artifact_bytes(
     harness: HarnessKind,
     relative_path: &Path,
@@ -241,14 +242,24 @@ fn restored_native_artifact_bytes(
     primary_repository: &str,
     repositories: &[crate::hel_archive::RepositoryManifest],
     workspace_root: &Path,
+    harness_home: &Path,
 ) -> Result<Vec<u8>> {
-    if harness != HarnessKind::Kimi || !is_kimi_session_state(relative_path) {
+    if harness != HarnessKind::Kimi {
         return Ok(data.to_vec());
     }
     let Some(target_cwd) = target_primary_cwd(primary_repository, repositories, workspace_root)
     else {
         return Ok(data.to_vec());
     };
+    if relative_path == Path::new("workspaces.json") {
+        return rewrite_kimi_workspace_registry(data, &target_cwd);
+    }
+    if relative_path == Path::new("session_index.jsonl") {
+        return rewrite_kimi_session_index(data, &target_cwd, harness_home);
+    }
+    if !is_kimi_session_state(relative_path) {
+        return Ok(data.to_vec());
+    }
     let mut state: Value =
         serde_json::from_slice(data).context("parse Kimi native session state")?;
     let object = state
@@ -263,6 +274,85 @@ fn restored_native_artifact_bytes(
         }
     }
     Ok(serde_json::to_vec(&state)?)
+}
+
+fn rewrite_kimi_workspace_registry(data: &[u8], target_cwd: &Path) -> Result<Vec<u8>> {
+    let mut registry: Value =
+        serde_json::from_slice(data).context("parse Kimi workspace registry")?;
+    let workspaces = registry
+        .get_mut("workspaces")
+        .and_then(Value::as_object_mut)
+        .context("Kimi workspace registry has no workspaces object")?;
+    ensure!(
+        workspaces.len() == 1,
+        "Kimi workspace registry must contain one imported workspace"
+    );
+    let (_, mut workspace) = std::mem::take(workspaces)
+        .into_iter()
+        .next()
+        .expect("one workspace was checked");
+    let workspace = workspace
+        .as_object_mut()
+        .context("Kimi workspace registry entry is not an object")?;
+    workspace.insert(
+        "root".into(),
+        Value::String(target_cwd.to_string_lossy().into_owned()),
+    );
+    if let Some(name) = target_cwd.file_name().and_then(|name| name.to_str()) {
+        workspace.insert("name".into(), Value::String(name.to_owned()));
+    }
+    workspaces.insert(kimi_workspace_key(target_cwd), workspace.clone().into());
+    Ok(serde_json::to_vec(&registry)?)
+}
+
+fn rewrite_kimi_session_index(
+    data: &[u8],
+    target_cwd: &Path,
+    harness_home: &Path,
+) -> Result<Vec<u8>> {
+    let mut rewritten = Vec::new();
+    let target_workspace = kimi_workspace_key(target_cwd);
+    for (line_number, line) in std::str::from_utf8(data)
+        .context("decode Kimi session index")?
+        .lines()
+        .enumerate()
+    {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut entry: Value = serde_json::from_str(line)
+            .with_context(|| format!("parse Kimi session index line {}", line_number + 1))?;
+        let session_id = entry
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .context("Kimi session index entry lacks sessionId")?
+            .to_owned();
+        let entry = entry
+            .as_object_mut()
+            .context("Kimi session index entry is not an object")?;
+        entry.insert(
+            "workDir".into(),
+            Value::String(target_cwd.to_string_lossy().into_owned()),
+        );
+        entry.insert(
+            "sessionDir".into(),
+            Value::String(
+                harness_home
+                    .join("sessions")
+                    .join(&target_workspace)
+                    .join(session_id)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        );
+        serde_json::to_writer(&mut rewritten, &entry)?;
+        rewritten.push(b'\n');
+    }
+    ensure!(
+        !rewritten.is_empty(),
+        "Kimi session index has no imported sessions"
+    );
+    Ok(rewritten)
 }
 
 fn is_kimi_session_state(relative_path: &Path) -> bool {
@@ -312,6 +402,8 @@ fn write_private_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o700))?;
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     Ok(())
 }
 
@@ -452,6 +544,9 @@ pub fn collect_native_artifacts(
             collect_native_tree(harness, home, &root, session_id, false, &mut output)?;
         }
     }
+    if harness == HarnessKind::Kimi && !output.is_empty() {
+        collect_kimi_registry_artifacts(home, session_id, &mut output)?;
+    }
     output.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     ensure!(
         allow_empty || !output.is_empty(),
@@ -468,6 +563,149 @@ pub fn collect_native_artifacts(
         "native session artifacts are too large"
     );
     Ok(output)
+}
+/// Collect native artifacts for an import whose locator already resolved the
+/// exact source artifact. Codex rollouts are standalone JSONL files, so this
+/// avoids probing every historical rollout (and any unrelated corrupt one).
+pub fn collect_import_native_artifacts(
+    harness: HarnessKind,
+    home: &Path,
+    session_id: &str,
+    source_path: &Path,
+) -> Result<Vec<NativeArtifact>> {
+    if harness != HarnessKind::Codex {
+        return collect_native_artifacts(harness, home, session_id, false);
+    }
+    validate_component(session_id, "native session ID")?;
+    let relative = source_path.strip_prefix(home).with_context(|| {
+        format!(
+            "Codex rollout {} is outside {}",
+            source_path.display(),
+            home.display()
+        )
+    })?;
+    validate_relative_path(relative)?;
+    ensure!(
+        matches!(relative.components().next(), Some(Component::Normal(component)) if component == "sessions" || component == "archived_sessions"),
+        "Codex rollout '{}' is outside a session root",
+        source_path.display()
+    );
+    let name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    ensure!(
+        name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"),
+        "Codex rollout '{}' is not a JSONL artifact",
+        source_path.display()
+    );
+    ensure!(
+        !secret_like_path(relative),
+        "Codex rollout '{}' has a forbidden path",
+        source_path.display()
+    );
+    let metadata = fs::symlink_metadata(source_path)
+        .with_context(|| format!("stat Codex rollout {}", source_path.display()))?;
+    ensure!(
+        !metadata.file_type().is_symlink() && metadata.is_file(),
+        "Codex rollout '{}' is not a regular file",
+        source_path.display()
+    );
+    ensure!(
+        metadata.len() <= MAX_NATIVE_FILE,
+        "Codex rollout is too large"
+    );
+    Ok(vec![NativeArtifact {
+        relative_path: relative.to_path_buf(),
+        data: fs::read(source_path)
+            .with_context(|| format!("read Codex rollout {}", source_path.display()))?,
+        mode: file_mode(&metadata),
+    }])
+}
+
+fn collect_kimi_registry_artifacts(
+    home: &Path,
+    session_id: &str,
+    output: &mut Vec<NativeArtifact>,
+) -> Result<()> {
+    let source_workspace = output
+        .iter()
+        .find_map(|artifact| kimi_source_workspace(&artifact.relative_path, session_id))
+        .context("Kimi native session state artifact is missing")?;
+    let workspaces_path = home.join("workspaces.json");
+    let metadata = fs::symlink_metadata(&workspaces_path)
+        .with_context(|| format!("read Kimi workspace registry {}", workspaces_path.display()))?;
+    ensure!(
+        !metadata.file_type().is_symlink() && metadata.is_file(),
+        "Kimi workspace registry is not a regular file"
+    );
+    ensure!(
+        metadata.len() <= MAX_NATIVE_FILE,
+        "Kimi workspace registry is too large"
+    );
+    let workspaces: Value = serde_json::from_slice(&fs::read(&workspaces_path)?)
+        .context("parse Kimi workspace registry")?;
+    let workspace = workspaces
+        .pointer(&format!("/workspaces/{source_workspace}"))
+        .cloned()
+        .with_context(|| format!("Kimi workspace {source_workspace:?} is missing from registry"))?;
+    let mut selected_workspaces = serde_json::Map::new();
+    selected_workspaces.insert(source_workspace, workspace);
+    output.push(NativeArtifact {
+        relative_path: PathBuf::from("workspaces.json"),
+        data: serde_json::to_vec(&json!({
+            "version": workspaces.get("version").cloned().unwrap_or(Value::Null),
+            "deleted_workspace_ids": [],
+            "workspaces": selected_workspaces,
+        }))?,
+        mode: file_mode(&metadata),
+    });
+
+    let index_path = home.join("session_index.jsonl");
+    let metadata = fs::symlink_metadata(&index_path)
+        .with_context(|| format!("read Kimi session index {}", index_path.display()))?;
+    ensure!(
+        !metadata.file_type().is_symlink() && metadata.is_file(),
+        "Kimi session index is not a regular file"
+    );
+    ensure!(
+        metadata.len() <= MAX_NATIVE_FILE,
+        "Kimi session index is too large"
+    );
+    let mut selected = Vec::new();
+    for (line_number, line) in fs::read_to_string(&index_path)?.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: Value = serde_json::from_str(line)
+            .with_context(|| format!("parse Kimi session index line {}", line_number + 1))?;
+        if entry.get("sessionId").and_then(Value::as_str) == Some(session_id) {
+            serde_json::to_writer(&mut selected, &entry)?;
+            selected.push(b'\n');
+        }
+    }
+    ensure!(
+        !selected.is_empty(),
+        "Kimi session index does not contain native session {session_id:?}"
+    );
+    output.push(NativeArtifact {
+        relative_path: PathBuf::from("session_index.jsonl"),
+        data: selected,
+        mode: file_mode(&metadata),
+    });
+    Ok(())
+}
+
+fn kimi_source_workspace(relative_path: &Path, session_id: &str) -> Option<String> {
+    let mut components = relative_path.components();
+    (components.next() == Some(Component::Normal("sessions".as_ref()))).then_some(())?;
+    let workspace = components.next()?.as_os_str().to_str()?.to_owned();
+    let session = components.next()?.as_os_str().to_str()?;
+    let file = components.next()?.as_os_str().to_str()?;
+    (components.next().is_none()
+        && file == "state.json"
+        && (session == session_id || session == format!("session_{session_id}")))
+    .then_some(workspace)
 }
 
 fn collect_native_tree(
@@ -499,14 +737,16 @@ fn collect_native_tree(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
+    let relative = path.strip_prefix(home)?;
     let selected = match harness {
         HarnessKind::Codex => {
-            name.contains(session_id) && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
+            (name.contains(session_id)
+                && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst")))
+                || (name.ends_with(".jsonl") && codex_rollout_has_session_id(path, session_id))
         }
         HarnessKind::Claude => inside || name == format!("{session_id}.jsonl"),
-        HarnessKind::Kimi => inside,
+        HarnessKind::Kimi => inside && kimi_session_artifact(relative, session_id),
     };
-    let relative = path.strip_prefix(home)?;
     if !selected || secret_like_path(relative) {
         return Ok(());
     }
@@ -521,6 +761,55 @@ fn collect_native_tree(
         mode: file_mode(&metadata),
     });
     Ok(())
+}
+
+fn kimi_session_artifact(relative: &Path, session_id: &str) -> bool {
+    let components = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(component) => component.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(session_index) = components.iter().position(|component| {
+        *component == session_id || *component == format!("session_{session_id}")
+    }) else {
+        return false;
+    };
+    matches!(&components[session_index + 1..], ["state.json"])
+        || matches!(
+            &components[session_index + 1..],
+            ["agents", _, "wire.jsonl"]
+        )
+}
+
+fn codex_rollout_has_session_id(path: &Path, session_id: &str) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    for _ in 0..8 {
+        line.clear();
+        let Ok(read) = reader.read_line(&mut line) else {
+            return false;
+        };
+        if read == 0 {
+            break;
+        }
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            return false;
+        };
+        if record.get("type").and_then(Value::as_str) == Some("session_meta")
+            && record
+                .pointer("/payload/session_id")
+                .and_then(Value::as_str)
+                == Some(session_id)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn reject_dirty_submodules(runner: &dyn GitCommandRunner, repository: &Path) -> Result<()> {
@@ -960,12 +1249,16 @@ fn restrict_permissions(path: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -1063,6 +1356,27 @@ mod tests {
             collect_native_artifacts(HarnessKind::Codex, temp.path(), NATIVE, true).unwrap();
         assert!(artifacts.is_empty());
     }
+    #[test]
+    fn codex_collection_ignores_malformed_unrelated_rollouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions/2026/08/10");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("rollout-unrelated.jsonl"), b"{malformed\n").unwrap();
+        let selected = sessions.join("rollout-renamed.jsonl");
+        fs::write(
+            &selected,
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{NATIVE}\"}}}}\n"),
+        )
+        .unwrap();
+
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Codex, temp.path(), NATIVE, false).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            artifacts[0].relative_path,
+            PathBuf::from("sessions/2026/08/10/rollout-renamed.jsonl")
+        );
+    }
 
     #[test]
     fn prompt_detection_reads_canonical_event_type() {
@@ -1084,23 +1398,58 @@ mod tests {
         fs::create_dir_all(session.join("agents/main")).unwrap();
         fs::write(session.join("state.json"), b"state").unwrap();
         fs::write(session.join("agents/main/wire.jsonl"), b"events").unwrap();
+        fs::create_dir_all(session.join("agents/main/tasks/bash-noise")).unwrap();
+        fs::write(
+            session.join("agents/main/tasks/bash-noise/output.log"),
+            b"tool output",
+        )
+        .unwrap();
+        fs::write(
+            session.join("agents/main/wire.jsonl.bak-before-edit"),
+            b"backup",
+        )
+        .unwrap();
+        fs::create_dir_all(session.join("logs")).unwrap();
+        fs::write(session.join("logs/kimi-code.log"), b"log").unwrap();
         fs::write(session.join("credentials.json"), b"secret").unwrap();
         let other = temp.path().join("sessions/workspace/other");
         fs::create_dir_all(&other).unwrap();
         fs::write(other.join("state.json"), b"other").unwrap();
+        fs::write(
+            temp.path().join("workspaces.json"),
+            r#"{"version":1,"deleted_workspace_ids":[],"workspaces":{"workspace":{"root":"/work/app","name":"app"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("session_index.jsonl"),
+            format!(
+                "{{\"sessionId\":\"{NATIVE}\",\"workDir\":\"/work/app\",\"sessionDir\":\"/sessions/workspace/session_{NATIVE}\"}}\n{{\"sessionId\":\"other\"}}\n"
+            ),
+        )
+        .unwrap();
         let artifacts =
             collect_native_artifacts(HarnessKind::Kimi, temp.path(), NATIVE, false).unwrap();
-        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts.len(), 4);
         assert!(
-            artifacts
-                .iter()
-                .all(|artifact| artifact.relative_path.to_string_lossy().contains(NATIVE))
+            artifacts.iter().any(|artifact| {
+                artifact.relative_path.as_path() == Path::new("workspaces.json")
+            })
         );
+        let index = artifacts
+            .iter()
+            .find(|artifact| artifact.relative_path.as_path() == Path::new("session_index.jsonl"))
+            .unwrap();
+        assert!(std::str::from_utf8(&index.data).unwrap().contains(NATIVE));
+        assert!(!std::str::from_utf8(&index.data).unwrap().contains("other"));
         assert!(artifacts.iter().all(|artifact| {
             !artifact
                 .relative_path
                 .to_string_lossy()
                 .contains("credentials")
+        }));
+        assert!(artifacts.iter().all(|artifact| {
+            let path = artifact.relative_path.to_string_lossy();
+            !path.contains("tasks") && !path.contains(".bak") && !path.contains("logs")
         }));
     }
 
@@ -1210,11 +1559,49 @@ mod tests {
             "app",
             &repositories,
             Path::new("/workspace"),
+            Path::new("/profiles/imported"),
         )
         .unwrap();
         let state: Value = serde_json::from_slice(&state).unwrap();
         assert_eq!(state["workDir"], "/workspace/app");
         assert_eq!(state["cwd"], "/workspace/app");
+        let registry = restored_native_artifact_bytes(
+            HarnessKind::Kimi,
+            Path::new("workspaces.json"),
+            br#"{"version":1,"deleted_workspace_ids":[],"workspaces":{"wd_kimi-code_78153cfca00c":{"root":"/home/jonathan/Projects/kimi-code","name":"kimi-code"}}}"#,
+            "app",
+            &repositories,
+            Path::new("/workspace"),
+            Path::new("/profiles/imported"),
+        )
+        .unwrap();
+        let registry: Value = serde_json::from_slice(&registry).unwrap();
+        assert_eq!(
+            registry["workspaces"]["wd_app_af7e243d70b1"]["root"],
+            "/workspace/app"
+        );
+        assert!(
+            registry["workspaces"]
+                .get("wd_kimi-code_78153cfca00c")
+                .is_none()
+        );
+
+        let index = restored_native_artifact_bytes(
+            HarnessKind::Kimi,
+            Path::new("session_index.jsonl"),
+            br#"{"sessionId":"session_1b6c3192-2480-48e0-8f49-4b8a1572f5b2","workDir":"/home/jonathan/Projects/kimi-code","sessionDir":"/home/jonathan/.kimi-code/sessions/wd_kimi-code_78153cfca00c/session_1b6c3192-2480-48e0-8f49-4b8a1572f5b2"}"#,
+            "app",
+            &repositories,
+            Path::new("/workspace"),
+            Path::new("/profiles/imported"),
+        )
+        .unwrap();
+        let index: Value = serde_json::from_slice(&index).unwrap();
+        assert_eq!(index["workDir"], "/workspace/app");
+        assert_eq!(
+            index["sessionDir"],
+            "/profiles/imported/sessions/wd_app_af7e243d70b1/session_1b6c3192-2480-48e0-8f49-4b8a1572f5b2"
+        );
     }
 
     fn git(repository: &Path, args: &[&str]) -> String {

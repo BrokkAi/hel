@@ -585,8 +585,8 @@ mod tests {
             r#"
             You are currently using your subscription to power your Claude Code usage
 
-            Current session: 2% used · resets Jul 1 at 12:40pm (Europe/Paris)
-            Current week (all models): 27% used · resets Jul 2 at 1am (Europe/Paris)
+            Current session: 2% used · resets Jul 1, 12:40pm (Europe/Paris)
+            Current week (all models): 27% used · resets Jul 2, 1am (Europe/Paris)
 
             What's contributing to your limits usage?
             Approximate, based on local sessions on this machine — does not include other devices or claude.ai. Behaviors are independent characteristics, not a breakdown.
@@ -612,7 +612,7 @@ mod tests {
         assert_eq!(report.week.as_ref().unwrap().remaining_percent, 73);
         assert_eq!(
             report.compact_label(),
-            "Claude usage: 5H 98% left · resets Jul 1 at 12:40pm (Europe/Paris) · week 73% left · resets Jul 2 at 1am (Europe/Paris)"
+            "Claude usage: 5H 98% left · resets Jul 1, 12:40pm (Europe/Paris) · week 73% left · resets Jul 2, 1am (Europe/Paris)"
         );
     }
 

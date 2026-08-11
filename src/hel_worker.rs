@@ -87,6 +87,11 @@ pub enum WorkerRequest {
         #[serde(default)]
         attachments: Vec<Attachment>,
     },
+    /// Run a prompt in a disposable ACP session. This does not enter the
+    /// destination session's canonical history.
+    Compact {
+        text: String,
+    },
     Cancel,
     SetConfig {
         key: String,
@@ -103,6 +108,7 @@ impl WorkerRequest {
         matches!(
             self,
             Self::Prompt { .. }
+                | Self::Compact { .. }
                 | Self::Cancel
                 | Self::SetConfig { .. }
                 | Self::Checkpoint { .. }
@@ -151,6 +157,9 @@ pub enum ResponsePayload {
     },
     Accepted {
         seq: u64,
+    },
+    Compacted {
+        text: String,
     },
 }
 
@@ -494,6 +503,13 @@ impl DurableWorker {
                     },
                 )?;
                 ResponsePayload::Accepted { seq }
+            }
+            WorkerRequest::Compact { .. } => {
+                return Ok(error(
+                    ErrorCode::InvalidRequest,
+                    "compact requests must be handled by the ACP runtime",
+                    false,
+                ));
             }
             WorkerRequest::Cancel => {
                 if self.snapshot.phase != WorkerPhase::Running {

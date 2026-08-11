@@ -43,17 +43,21 @@ RUN apt-get update \
 # intentionally left to Hel's official on-demand installer because that path is
 # not version-pinned yet.
 RUN npm install --global --no-audit --no-fund \
-        @agentclientprotocol/codex-acp@1.1.4 \
+        @agentclientprotocol/codex-acp@1.1.14 \
         @agentclientprotocol/claude-agent-acp@0.63.0 \
     && npm cache clean --force
 
 RUN rustup component add clippy rustfmt \
     && rustup target add x86_64-unknown-linux-musl
 
-RUN mkdir -p /workspace /var/lib/hel \
+RUN useradd --create-home --shell /bin/bash hel \
+    && mkdir -p /workspace /var/lib/hel \
+    && chown -R hel:hel /workspace /var/lib/hel \
     && chmod 0755 /workspace /var/lib/hel
 
-ENV SHELL=/bin/bash
+USER hel
+ENV HOME=/home/hel \
+    SHELL=/bin/bash
 WORKDIR /workspace
 
 # Hel overrides the command with the same keepalive, but retaining it here also

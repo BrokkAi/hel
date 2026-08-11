@@ -159,8 +159,23 @@ impl WorkerClient {
             .await
     }
 
+    pub async fn compact(&mut self, text: String) -> Result<String> {
+        match self.call(WorkerRequest::Compact { text }).await? {
+            ResponsePayload::Compacted { text } => Ok(text),
+            _ => bail!("worker returned an unexpected compaction response"),
+        }
+    }
+
     pub async fn cancel(&mut self) -> Result<u64> {
         self.accepted(WorkerRequest::Cancel).await
+    }
+
+    pub async fn set_config(&mut self, key: String, value: String) -> Result<u64> {
+        self.accepted(WorkerRequest::SetConfig {
+            key,
+            value: serde_json::Value::String(value),
+        })
+        .await
     }
 
     pub async fn checkpoint(&mut self, reason: Option<String>) -> Result<u64> {
@@ -230,6 +245,15 @@ impl WorkerClient {
         let id = format!("hel-{:016x}-{}", self.connection_nonce, self.next_request);
         self.next_request = self.next_request.wrapping_add(1);
         id
+    }
+}
+
+impl crate::hel_compaction::CompactionBackend for WorkerClient {
+    fn compact<'a>(
+        &'a mut self,
+        prompt: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move { self.compact(prompt).await })
     }
 }
 

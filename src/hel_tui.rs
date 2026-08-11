@@ -12,7 +12,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap,
+    Block, BorderType, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState,
+    Paragraph, Row, Table, TableState, Wrap,
 };
 
 use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
@@ -61,13 +62,39 @@ pub enum DashboardAction {
         title: String,
     },
     RefreshQuotas,
+    OpenImport,
+    ImportSession {
+        profile_id: String,
+        session_id: String,
+        title: String,
+    },
+    ConfirmImportBundle {
+        accepted: bool,
+    },
     OpenConfig,
     QuitDetach,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportSessionOption {
+    pub session_id: String,
+    pub title: String,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportProfileOption {
+    pub profile_id: String,
+    pub harness_kind: HarnessKind,
+    pub sessions: Vec<ImportSessionOption>,
+    pub scan_progress: Option<(usize, usize)>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
-    Sessions,
+    Active,
+    Archived,
     Quotas,
 }
 
@@ -146,7 +173,40 @@ enum Mode {
     New(NewWizard),
     Resume(ResumeWizard),
     Rename(RenameEditor),
+    Import(ImportDialog),
+    Importing(ImportProgress),
+    ConfirmImportBundle(ImportBundleConfirmation),
     Confirm(Confirmation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportProgress {
+    session_title: String,
+    step: usize,
+    total: Option<usize>,
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportBundleConfirmation {
+    bundle_id: String,
+    github: String,
+    destination: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportPane {
+    Profiles,
+    Sessions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportDialog {
+    discovery_id: u64,
+    profiles: Vec<ImportProfileOption>,
+    profile_index: usize,
+    session_index: usize,
+    pane: ImportPane,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,7 +257,7 @@ impl DashboardState {
             session_details: BTreeMap::new(),
             session_index: 0,
             quota_index: 0,
-            focus: Focus::Sessions,
+            focus: Focus::Active,
             mode: Mode::Dashboard,
             notice: None,
         };
@@ -314,6 +374,90 @@ impl DashboardState {
         });
     }
 
+    pub fn show_import_dialog(&mut self, discovery_id: u64, profiles: Vec<ImportProfileOption>) {
+        self.mode = Mode::Import(ImportDialog {
+            discovery_id,
+            profiles,
+            profile_index: 0,
+            session_index: 0,
+            pane: ImportPane::Profiles,
+        });
+    }
+
+    pub fn apply_import_profiles(&mut self, discovery_id: u64, profiles: Vec<ImportProfileOption>) {
+        let Mode::Import(dialog) = &mut self.mode else {
+            return;
+        };
+        if dialog.discovery_id != discovery_id {
+            return;
+        }
+        let selected_profile = dialog
+            .profiles
+            .get(dialog.profile_index)
+            .map(|profile| profile.profile_id.clone());
+        let selected_session = dialog
+            .profiles
+            .get(dialog.profile_index)
+            .and_then(|profile| profile.sessions.get(dialog.session_index))
+            .map(|session| session.session_id.clone());
+        dialog.profiles = profiles;
+        dialog.profile_index = selected_profile
+            .and_then(|selected| {
+                dialog
+                    .profiles
+                    .iter()
+                    .position(|profile| profile.profile_id == selected)
+            })
+            .unwrap_or(0);
+        let sessions = dialog
+            .profiles
+            .get(dialog.profile_index)
+            .map(|profile| profile.sessions.as_slice())
+            .unwrap_or_default();
+        dialog.session_index = selected_session
+            .and_then(|selected| {
+                sessions
+                    .iter()
+                    .position(|session| session.session_id == selected)
+            })
+            .unwrap_or_else(|| dialog.session_index.min(sessions.len().saturating_sub(1)));
+    }
+
+    pub fn show_import_progress(&mut self, session_title: String) {
+        self.mode = Mode::Importing(ImportProgress {
+            session_title,
+            step: 1,
+            total: None,
+            message: "Locating native session…".into(),
+        });
+    }
+
+    pub fn update_import_progress(&mut self, step: usize, total: Option<usize>, message: String) {
+        let Mode::Importing(progress) = &mut self.mode else {
+            return;
+        };
+        progress.step = step;
+        progress.total = total;
+        progress.message = message;
+    }
+
+    pub fn show_import_bundle_confirmation(
+        &mut self,
+        bundle_id: String,
+        github: String,
+        destination: String,
+    ) {
+        self.mode = Mode::ConfirmImportBundle(ImportBundleConfirmation {
+            bundle_id,
+            github,
+            destination,
+        });
+    }
+
+    pub fn finish_import(&mut self) {
+        self.cancel_modal();
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return DashboardAction::None;
@@ -328,6 +472,17 @@ impl DashboardState {
             Mode::New(wizard) => self.handle_new_key(key.code, wizard),
             Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
             Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
+            Mode::Import(dialog) => self.handle_import_key(key.code, dialog),
+            Mode::Importing(_) => DashboardAction::None,
+            Mode::ConfirmImportBundle(_) => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    DashboardAction::ConfirmImportBundle { accepted: true }
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    DashboardAction::ConfirmImportBundle { accepted: false }
+                }
+                _ => DashboardAction::None,
+            },
             Mode::Confirm(confirmation) => self.handle_confirmation_key(key.code, confirmation),
         }
     }
@@ -335,11 +490,12 @@ impl DashboardState {
     fn handle_dashboard_key(&mut self, code: KeyCode) -> DashboardAction {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => DashboardAction::QuitDetach,
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.focus = match self.focus {
-                    Focus::Sessions => Focus::Quotas,
-                    Focus::Quotas => Focus::Sessions,
-                };
+            KeyCode::Tab => {
+                self.cycle_focus(false);
+                DashboardAction::None
+            }
+            KeyCode::BackTab => {
+                self.cycle_focus(true);
                 DashboardAction::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -363,6 +519,7 @@ impl DashboardState {
                 self.begin_new();
                 DashboardAction::None
             }
+            KeyCode::Char('i') => DashboardAction::OpenImport,
             KeyCode::Char('r') => {
                 if self.focus == Focus::Quotas {
                     DashboardAction::RefreshQuotas
@@ -389,6 +546,93 @@ impl DashboardState {
             }
             KeyCode::Enter | KeyCode::Char('o') => self.open_or_resume(),
             _ => DashboardAction::None,
+        }
+    }
+
+    fn handle_import_key(&mut self, code: KeyCode, mut dialog: ImportDialog) -> DashboardAction {
+        match code {
+            KeyCode::Esc => {
+                self.cancel_modal();
+                DashboardAction::None
+            }
+            KeyCode::Left => {
+                dialog.pane = ImportPane::Profiles;
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Right => {
+                dialog.pane = ImportPane::Sessions;
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                dialog.pane = match dialog.pane {
+                    ImportPane::Profiles => ImportPane::Sessions,
+                    ImportPane::Sessions => ImportPane::Profiles,
+                };
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                match dialog.pane {
+                    ImportPane::Profiles => {
+                        move_index(&mut dialog.profile_index, dialog.profiles.len(), -1);
+                        dialog.session_index = 0;
+                    }
+                    ImportPane::Sessions => {
+                        let len = dialog
+                            .profiles
+                            .get(dialog.profile_index)
+                            .map_or(0, |profile| profile.sessions.len());
+                        move_index(&mut dialog.session_index, len, -1);
+                    }
+                }
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                match dialog.pane {
+                    ImportPane::Profiles => {
+                        move_index(&mut dialog.profile_index, dialog.profiles.len(), 1);
+                        dialog.session_index = 0;
+                    }
+                    ImportPane::Sessions => {
+                        let len = dialog
+                            .profiles
+                            .get(dialog.profile_index)
+                            .map_or(0, |profile| profile.sessions.len());
+                        move_index(&mut dialog.session_index, len, 1);
+                    }
+                }
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Enter if dialog.pane == ImportPane::Profiles => {
+                dialog.pane = ImportPane::Sessions;
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Enter => {
+                let Some(profile) = dialog.profiles.get(dialog.profile_index) else {
+                    self.mode = Mode::Import(dialog);
+                    return DashboardAction::None;
+                };
+                let Some(session) = profile.sessions.get(dialog.session_index) else {
+                    self.mode = Mode::Import(dialog);
+                    return DashboardAction::None;
+                };
+                let action = DashboardAction::ImportSession {
+                    profile_id: profile.profile_id.clone(),
+                    session_id: session.session_id.clone(),
+                    title: session.title.clone(),
+                };
+                self.cancel_modal();
+                action
+            }
+            _ => {
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
         }
     }
 
@@ -883,7 +1127,12 @@ impl DashboardState {
     }
 
     fn selected_session(&self) -> Option<&SessionRecord> {
-        self.ordered_sessions().get(self.session_index).copied()
+        let session = self.ordered_sessions().get(self.session_index).copied()?;
+        match self.focus {
+            Focus::Active if session.state.is_active() => Some(session),
+            Focus::Archived if !session.state.is_active() => Some(session),
+            Focus::Active | Focus::Archived | Focus::Quotas => None,
+        }
     }
 
     fn ordered_sessions(&self) -> Vec<&SessionRecord> {
@@ -930,15 +1179,22 @@ impl DashboardState {
     }
 
     fn focus_len(&self) -> usize {
+        let (active, archived) =
+            partition_sessions(self.state.sessions.values(), &self.session_details);
         match self.focus {
-            Focus::Sessions => self.state.sessions.len(),
+            Focus::Active => active.len(),
+            Focus::Archived => archived.len(),
             Focus::Quotas => self.config.profiles.len(),
         }
     }
 
     fn set_selection(&mut self, index: usize) {
+        let active_len = partition_sessions(self.state.sessions.values(), &self.session_details)
+            .0
+            .len();
         match self.focus {
-            Focus::Sessions => self.session_index = index,
+            Focus::Active => self.session_index = index,
+            Focus::Archived => self.session_index = active_len + index,
             Focus::Quotas => self.quota_index = index,
         }
     }
@@ -946,15 +1202,59 @@ impl DashboardState {
     fn move_selection(&mut self, delta: isize) {
         let len = self.focus_len();
         match self.focus {
-            Focus::Sessions => move_index(&mut self.session_index, len, delta),
+            Focus::Active => move_index(&mut self.session_index, len, delta),
+            Focus::Archived => {
+                let active_len =
+                    partition_sessions(self.state.sessions.values(), &self.session_details)
+                        .0
+                        .len();
+                let mut index = self.session_index.saturating_sub(active_len);
+                move_index(&mut index, len, delta);
+                self.session_index = active_len + index;
+            }
             Focus::Quotas => move_index(&mut self.quota_index, len, delta),
         }
     }
 
+    fn cycle_focus(&mut self, reverse: bool) {
+        self.focus = match (self.focus, reverse) {
+            (Focus::Active, false) | (Focus::Quotas, true) => Focus::Archived,
+            (Focus::Archived, false) | (Focus::Active, true) => Focus::Quotas,
+            (Focus::Quotas, false) | (Focus::Archived, true) => Focus::Active,
+        };
+        let active_len = partition_sessions(self.state.sessions.values(), &self.session_details)
+            .0
+            .len();
+        match self.focus {
+            Focus::Active => {
+                self.session_index = self.session_index.min(active_len.saturating_sub(1));
+            }
+            Focus::Archived => self.session_index = self.session_index.max(active_len),
+            Focus::Quotas => {}
+        }
+    }
+
     fn clamp_selections(&mut self) {
-        self.session_index = self
-            .session_index
-            .min(self.state.sessions.len().saturating_sub(1));
+        let (active, archived) =
+            partition_sessions(self.state.sessions.values(), &self.session_details);
+        if self.focus == Focus::Active && active.is_empty() && !archived.is_empty() {
+            self.focus = Focus::Archived;
+        } else if self.focus == Focus::Archived && archived.is_empty() && !active.is_empty() {
+            self.focus = Focus::Active;
+        }
+        self.session_index = match self.focus {
+            Focus::Active => self.session_index.min(active.len().saturating_sub(1)),
+            Focus::Archived => {
+                active.len()
+                    + self
+                        .session_index
+                        .saturating_sub(active.len())
+                        .min(archived.len().saturating_sub(1))
+            }
+            Focus::Quotas => self
+                .session_index
+                .min(self.state.sessions.len().saturating_sub(1)),
+        };
         self.quota_index = self
             .quota_index
             .min(self.config.profiles.len().saturating_sub(1));
@@ -1129,9 +1429,188 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
         Mode::New(wizard) => render_new_wizard(frame, area, dashboard, wizard),
         Mode::Resume(wizard) => render_resume_wizard(frame, area, dashboard, wizard),
         Mode::Rename(editor) => render_rename_editor(frame, area, editor),
+        Mode::Import(dialog) => render_import_dialog(frame, area, dialog),
+        Mode::Importing(progress) => render_import_progress(frame, area, progress),
+        Mode::ConfirmImportBundle(confirmation) => {
+            render_import_bundle_confirmation(frame, area, confirmation)
+        }
         Mode::Confirm(confirmation) => render_confirmation(frame, area, confirmation),
         Mode::Dashboard => {}
     }
+}
+
+fn render_import_progress(frame: &mut Frame, area: Rect, progress: &ImportProgress) {
+    let popup = centered_rect(68, 8, area);
+    frame.render_widget(Clear, popup);
+    let total = progress
+        .total
+        .map_or_else(|| "?".into(), |total| total.to_string());
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                truncate_text(&progress.session_title, 60),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::raw(progress.message.clone()),
+            Line::styled(
+                "The dashboard remains responsive while the import runs.",
+                Style::default().fg(Color::Gray),
+            ),
+        ])
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Importing session · step {}/{total} ",
+            progress.step
+        )))
+        .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+fn render_import_bundle_confirmation(
+    frame: &mut Frame,
+    area: Rect,
+    confirmation: &ImportBundleConfirmation,
+) {
+    let popup = centered_rect(72, 10, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw("No configured bundle matches this repository."),
+            Line::raw(""),
+            Line::raw(format!("Bundle: {}", confirmation.bundle_id)),
+            Line::raw(format!("GitHub: {}", confirmation.github)),
+            Line::raw(format!("Destination: {}", confirmation.destination)),
+            Line::raw(""),
+            Line::raw("Press y/Enter to create it, or n/Esc to cancel."),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Create bundle for imported session? "),
+        )
+        .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
+    let popup = centered_rect(82, 22, area);
+    frame.render_widget(Clear, popup);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" Import native session ");
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .split(inner);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .split(rows[0]);
+
+    let profile_items = dialog
+        .profiles
+        .iter()
+        .map(|profile| {
+            ListItem::new(format!(
+                "{}  {}",
+                profile.profile_id,
+                harness_label(profile.harness_kind)
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut profile_state = ListState::default()
+        .with_selected((!dialog.profiles.is_empty()).then_some(dialog.profile_index));
+    let profiles_focused = dialog.pane == ImportPane::Profiles;
+    frame.render_stateful_widget(
+        List::new(profile_items)
+            .highlight_symbol(if profiles_focused { "› " } else { "  " })
+            .highlight_style(if profiles_focused {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(focus_border(profiles_focused))
+                    .title(" Profiles "),
+            ),
+        panes[0],
+        &mut profile_state,
+    );
+
+    let selected_profile = dialog.profiles.get(dialog.profile_index);
+    let session_items = selected_profile
+        .map(|profile| {
+            if profile.sessions.is_empty() {
+                if let Some(error) = &profile.error {
+                    vec![ListItem::new(format!("Unavailable: {error}"))]
+                } else if profile
+                    .scan_progress
+                    .is_none_or(|(scanned, total)| scanned < total)
+                {
+                    vec![ListItem::new("Scanning native sessions…")]
+                } else {
+                    vec![ListItem::new("No native sessions found")]
+                }
+            } else {
+                profile
+                    .sessions
+                    .iter()
+                    .map(|session| {
+                        ListItem::new(vec![
+                            Line::styled(
+                                truncate_text(
+                                    &session.title,
+                                    panes[1].width.saturating_sub(4) as usize,
+                                ),
+                                Style::default().add_modifier(Modifier::BOLD),
+                            ),
+                            Line::styled(session.details.clone(), Style::default().fg(Color::Gray)),
+                        ])
+                    })
+                    .collect()
+            }
+        })
+        .unwrap_or_default();
+    let selectable_sessions = selected_profile.is_some_and(|profile| !profile.sessions.is_empty());
+    let mut session_state =
+        ListState::default().with_selected(selectable_sessions.then_some(dialog.session_index));
+    let sessions_focused = dialog.pane == ImportPane::Sessions;
+    let sessions_title = selected_profile
+        .and_then(|profile| profile.scan_progress)
+        .map(|(scanned, total)| {
+            format!(" Native sessions · newest first · {scanned}/{total} sessions scanned ")
+        })
+        .unwrap_or_else(|| " Native sessions · newest first · scanning… ".into());
+    frame.render_stateful_widget(
+        List::new(session_items)
+            .highlight_symbol(if sessions_focused { "› " } else { "  " })
+            .highlight_style(if sessions_focused {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(focus_border(sessions_focused))
+                    .title(sessions_title),
+            ),
+        panes[1],
+        &mut session_state,
+    );
+
+    frame.render_widget(
+        Paragraph::new("Tab pane · ←/→ pane · ↑/↓ select · Enter import · Esc cancel")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Gray)),
+        rows[1],
+    );
 }
 
 fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
@@ -1181,25 +1660,28 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(archived_height)])
         .split(area);
-    let selected_archived = dashboard.session_index >= active.len();
-
     let active_rows = active.iter().map(|session| {
         active_session_row(
             session,
             dashboard.session_details.get(&session.id),
             now_epoch_seconds,
+            &dashboard.config,
         )
     });
+    let active_focused = dashboard.focus == Focus::Active;
     let active_table = Table::new(active_rows, session_column_constraints())
         .header(session_header())
-        .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-        .highlight_symbol("› ")
+        .row_highlight_style(if active_focused {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        } else {
+            Style::default()
+        })
+        .highlight_symbol(if active_focused { "› " } else { "  " })
+        .highlight_spacing(HighlightSpacing::Always)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(focus_border(
-                    dashboard.focus == Focus::Sessions && !selected_archived,
-                ))
+                .border_type(focus_border(active_focused))
                 .title(" Active "),
         );
     let mut active_state = TableState::default()
@@ -1219,11 +1701,12 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         else {
             continue;
         };
-        let selected = active_offset + visible_index == dashboard.session_index;
+        let selected = dashboard.focus == Focus::Active
+            && active_offset + visible_index == dashboard.session_index;
         let style = if selected {
             Style::default().fg(Color::Gray).bg(Color::DarkGray)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(Color::DarkGray)
         };
         frame.render_widget(
             Paragraph::new(truncate_text(
@@ -1242,22 +1725,25 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
 
     let archived_rows = archived
         .iter()
-        .map(|session| archived_session_row(session, now_epoch_seconds));
+        .map(|session| archived_session_row(session, now_epoch_seconds, &dashboard.config));
+    let archived_focused = dashboard.focus == Focus::Archived;
     let archived_table = Table::new(archived_rows, session_column_constraints())
         .header(session_header())
-        .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-        .highlight_symbol("› ")
+        .row_highlight_style(if archived_focused {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        } else {
+            Style::default()
+        })
+        .highlight_symbol(if archived_focused { "› " } else { "  " })
+        .highlight_spacing(HighlightSpacing::Always)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(focus_border(
-                    dashboard.focus == Focus::Sessions && selected_archived,
-                ))
+                .border_type(focus_border(archived_focused))
                 .title(" Archived "),
         );
     let mut archived_state = TableState::default().with_selected(
-        selected_archived
-            .then(|| dashboard.session_index.saturating_sub(active.len()))
+        Some(dashboard.session_index.saturating_sub(active.len()))
             .filter(|index| *index < archived.len()),
     );
     frame.render_stateful_widget(archived_table, panes[1], &mut archived_state);
@@ -1273,9 +1759,9 @@ fn focus_border(focused: bool) -> BorderType {
 
 fn session_column_constraints() -> [Constraint; 5] {
     [
+        Constraint::Length(11),
         Constraint::Length(14),
-        Constraint::Length(18),
-        Constraint::Length(18),
+        Constraint::Length(32),
         Constraint::Length(21),
         Constraint::Min(24),
     ]
@@ -1296,12 +1782,19 @@ fn session_values(
     session: &SessionRecord,
     detail: Option<&SessionDetail>,
     now_epoch_seconds: u64,
+    config: &HelConfig,
 ) -> (String, String, String, String, String) {
     let checkpoint = session
         .checkpoint
         .as_ref()
-        .map(|checkpoint| checkpoint.created_at.as_str())
-        .unwrap_or("never");
+        .map(|checkpoint| {
+            if session.state.is_active() {
+                checkpoint_age(now_epoch_seconds, &checkpoint.created_at)
+            } else {
+                checkpoint.created_at.clone()
+            }
+        })
+        .unwrap_or_else(|| "never".into());
     let clock = crate::usage_format::format_turn_clock(
         now_epoch_seconds,
         detail.and_then(|detail| detail.current_turn_started_at),
@@ -1310,19 +1803,27 @@ fn session_values(
     (
         clock,
         session.last_profile.clone(),
-        session.target_template_id.clone(),
-        checkpoint.to_string(),
+        session_target(config, session),
+        checkpoint,
         session_name(session).to_string(),
     )
 }
 
+fn session_target(config: &HelConfig, session: &SessionRecord) -> String {
+    let Some(bundle) = config.bundles.get(&session.bundle_id) else {
+        return session.target_template_id.clone();
+    };
+    let project_dirs = bundle
+        .repositories
+        .iter()
+        .map(|repository| repository.destination.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{}: {project_dirs}", session.target_template_id)
+}
+
 fn session_name(session: &SessionRecord) -> &str {
-    session
-        .session_title_override
-        .as_deref()
-        .or(session.acp_session_title.as_deref())
-        .or(session.native_session_id.as_deref())
-        .unwrap_or_default()
+    session.display_title()
 }
 
 fn session_name_line(session_name: String, unread_count: usize) -> Line<'static> {
@@ -1342,9 +1843,10 @@ fn active_session_row(
     session: &SessionRecord,
     detail: Option<&SessionDetail>,
     now_epoch_seconds: u64,
+    config: &HelConfig,
 ) -> Row<'static> {
     let (clock, profile, target, checkpoint, session_name) =
-        session_values(session, detail, now_epoch_seconds);
+        session_values(session, detail, now_epoch_seconds, config);
     let unread_count = detail.map_or(0, |detail| detail.unread_agent_message_sequences.len());
     Row::new([
         Cell::from(clock),
@@ -1356,10 +1858,31 @@ fn active_session_row(
     .height(3)
 }
 
-fn archived_session_row(session: &SessionRecord, now_epoch_seconds: u64) -> Row<'static> {
-    let (clock, profile, target, checkpoint, session_name) =
-        session_values(session, None, now_epoch_seconds);
-    Row::new([clock, profile, target, checkpoint, session_name])
+fn archived_session_row(
+    session: &SessionRecord,
+    now_epoch_seconds: u64,
+    config: &HelConfig,
+) -> Row<'static> {
+    let (_clock, profile, target, checkpoint, session_name) =
+        session_values(session, None, now_epoch_seconds, config);
+    Row::new([String::new(), profile, target, checkpoint, session_name])
+}
+
+fn checkpoint_age(now_epoch_seconds: u64, checkpointed_at: &str) -> String {
+    let Ok(checkpointed_at) = chrono::DateTime::parse_from_rfc3339(checkpointed_at) else {
+        return "unknown".into();
+    };
+    let checkpointed_at = checkpointed_at.timestamp().max(0) as u64;
+    let age = now_epoch_seconds.saturating_sub(checkpointed_at);
+    if age < 60 {
+        format!("{age}s")
+    } else if age < 3_600 {
+        format!("{}m", age / 60)
+    } else if age < 86_400 {
+        format!("{}h", age / 3_600)
+    } else {
+        format!("{}d", age / 86_400)
+    }
 }
 
 fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
@@ -1398,10 +1921,11 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         Span::raw(" Profile Quotas "),
         Span::styled(
             format!("({refresh_status}) "),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::DarkGray),
         ),
     ]);
-    let border_type = if dashboard.focus == Focus::Quotas {
+    let quotas_focused = dashboard.focus == Focus::Quotas;
+    let border_type = if quotas_focused {
         BorderType::Double
     } else {
         BorderType::Plain
@@ -1419,8 +1943,13 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         Row::new(["Profile", "Harness", "Access", "Quota / reset / error"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
-    .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-    .highlight_symbol("› ")
+    .row_highlight_style(if quotas_focused {
+        Style::default().bg(Color::DarkGray).fg(Color::White)
+    } else {
+        Style::default()
+    })
+    .highlight_symbol(if quotas_focused { "› " } else { "  " })
+    .highlight_spacing(HighlightSpacing::Always)
     .block(
         Block::default()
             .borders(Borders::ALL)
@@ -1434,7 +1963,7 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
 
 fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     let text = dashboard.notice.as_deref().unwrap_or(
-        "n new · Enter open/resume · r rename · p checkpoint · c close · u quota · Tab pane · q detach",
+        "n new · i import · r rename · p checkpoint · c close · u quota · Tab pane · q detach",
     );
     let style = if dashboard.notice.is_some() {
         Style::default().fg(Color::Yellow)
@@ -1882,6 +2411,7 @@ mod tests {
                     HarnessProfile {
                         model: None,
                         reasoning_effort: None,
+                        context_window_bytes: None,
                         kind: HarnessKind::Claude,
                         home: PathBuf::from("/profiles/claude"),
                         executable: None,
@@ -1893,6 +2423,7 @@ mod tests {
                     HarnessProfile {
                         model: None,
                         reasoning_effort: None,
+                        context_window_bytes: None,
                         kind: HarnessKind::Codex,
                         home: PathBuf::from("/profiles/codex"),
                         executable: None,
@@ -1904,6 +2435,7 @@ mod tests {
                     HarnessProfile {
                         model: None,
                         reasoning_effort: None,
+                        context_window_bytes: None,
                         kind: HarnessKind::Codex,
                         home: PathBuf::from("/profiles/codex-two"),
                         executable: None,
@@ -1996,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_pane_includes_terminal_sessions_without_losing_selection_order() {
+    fn archived_pane_includes_terminal_sessions_with_pane_local_navigation() {
         let mut running = archived_session();
         running.id = "session-0".into();
         running.state = SessionState::Running;
@@ -2031,6 +2563,13 @@ mod tests {
 
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         dashboard.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            dashboard
+                .selected_session()
+                .map(|session| session.id.as_str()),
+            Some("session-0")
+        );
+        dashboard.handle_key(key(KeyCode::Tab));
         assert_eq!(
             dashboard
                 .selected_session()
@@ -2272,15 +2811,82 @@ mod tests {
     }
 
     #[test]
-    fn session_name_prefers_override_then_acp_title_then_uuid() {
+    fn session_name_prefers_override_then_acp_title_then_hel_uuid() {
         let mut session = archived_session();
         assert_eq!(session_name(&session), "ACP pretty name");
 
         session.acp_session_title = None;
-        assert_eq!(session_name(&session), "native-1");
+        assert_eq!(session_name(&session), "session-1");
 
         session.session_title_override = Some("My name".into());
         assert_eq!(session_name(&session), "My name");
+
+        session.session_title_override = None;
+        session.native_session_id = None;
+        assert_eq!(session_name(&session), "session-1");
+        assert_ne!(session_name(&session), session.title);
+    }
+
+    #[test]
+    fn dashboard_navigation_keeps_three_distinct_panes() {
+        let mut active = archived_session();
+        active.id = "session-0".into();
+        active.state = SessionState::Running;
+        let archived = archived_session();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions: BTreeMap::from([
+                    (active.id.clone(), active),
+                    (archived.id.clone(), archived),
+                ]),
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+
+        assert_eq!(dashboard.focus, Focus::Active);
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-0");
+        dashboard.handle_key(key(KeyCode::Down));
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-0");
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Archived);
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-1");
+        dashboard.handle_key(key(KeyCode::Down));
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-1");
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Quotas);
+        assert!(dashboard.selected_session().is_none());
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Active);
+
+        dashboard.handle_key(key(KeyCode::BackTab));
+        assert_eq!(dashboard.focus, Focus::Quotas);
+        dashboard.handle_key(key(KeyCode::BackTab));
+        assert_eq!(dashboard.focus, Focus::Archived);
+    }
+
+    #[test]
+    fn closing_last_active_session_moves_focus_to_archived_then_cycles_all_panes() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        assert_eq!(dashboard.focus, Focus::Active);
+
+        let mut state = dashboard.state.clone();
+        state.sessions.get_mut("session-1").unwrap().state = SessionState::Archived;
+        dashboard.set_state(state);
+        assert_eq!(dashboard.focus, Focus::Archived);
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Quotas);
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Active);
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Archived);
     }
 
     #[test]
@@ -2295,6 +2901,239 @@ mod tests {
                 session_id: "session-1".into()
             }
         );
+    }
+
+    #[test]
+    fn import_dialog_selects_a_session_from_the_chosen_profile() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('i'))),
+            DashboardAction::OpenImport
+        );
+        let profiles = vec![
+            ImportProfileOption {
+                profile_id: "codex-1".into(),
+                harness_kind: HarnessKind::Codex,
+                sessions: vec![ImportSessionOption {
+                    session_id: "codex-session".into(),
+                    title: "Codex title".into(),
+                    details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
+                }],
+                scan_progress: Some((1, 1)),
+                error: None,
+            },
+            ImportProfileOption {
+                profile_id: "claude-1".into(),
+                harness_kind: HarnessKind::Claude,
+                sessions: vec![ImportSessionOption {
+                    session_id: "claude-session".into(),
+                    title: "Claude title".into(),
+                    details: "4m ago · master · 2.0MB · ~/Projects/hel".into(),
+                }],
+                scan_progress: Some((1, 1)),
+                error: None,
+            },
+        ];
+        dashboard.show_import_dialog(1, profiles.clone());
+        dashboard.apply_import_profiles(1, profiles);
+
+        dashboard.handle_key(key(KeyCode::Down));
+        dashboard.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ImportSession {
+                profile_id: "claude-1".into(),
+                session_id: "claude-session".into(),
+                title: "Claude title".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn incremental_import_results_preserve_the_selected_session() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        let session = |id: &str| ImportSessionOption {
+            session_id: id.into(),
+            title: format!("Session {id}"),
+            details: "just now · master · 1.0KB · ~/Projects/hel".into(),
+        };
+        let profile = |sessions: Vec<ImportSessionOption>, progress| ImportProfileOption {
+            profile_id: "codex-1".into(),
+            harness_kind: HarnessKind::Codex,
+            sessions,
+            scan_progress: Some(progress),
+            error: None,
+        };
+        let initial = vec![profile(vec![session("a"), session("b")], (2, 3))];
+        dashboard.show_import_dialog(1, initial.clone());
+        dashboard.apply_import_profiles(1, initial);
+        dashboard.handle_key(key(KeyCode::Tab));
+        dashboard.handle_key(key(KeyCode::Down));
+
+        dashboard.apply_import_profiles(
+            1,
+            vec![profile(
+                vec![session("a"), session("b"), session("c")],
+                (3, 3),
+            )],
+        );
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ImportSession {
+                profile_id: "codex-1".into(),
+                session_id: "b".into(),
+                title: "Session b".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn import_dialog_renders_profile_and_session_panes() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        let profiles = vec![ImportProfileOption {
+            profile_id: "codex-1".into(),
+            harness_kind: HarnessKind::Codex,
+            sessions: vec![ImportSessionOption {
+                session_id: "native-session-1".into(),
+                title: "Native session title".into(),
+                details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
+            }],
+            scan_progress: Some((1, 1)),
+            error: None,
+        }];
+        dashboard.show_import_dialog(1, profiles.clone());
+        dashboard.apply_import_profiles(1, profiles);
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Profiles"));
+        assert!(rendered.contains("Native sessions"));
+        assert!(rendered.contains("codex-1"));
+        assert!(rendered.contains("Native session title"));
+        assert!(rendered.contains("1.0MB"));
+        assert!(rendered.contains("~/Projects/hel"));
+        assert!(rendered.contains("1/1 sessions scanned"));
+    }
+
+    #[test]
+    fn import_dialog_tab_cycles_focus_and_only_active_pane_draws_cursor() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        let profiles = vec![ImportProfileOption {
+            profile_id: "codex-1".into(),
+            harness_kind: HarnessKind::Codex,
+            sessions: vec![ImportSessionOption {
+                session_id: "native-session-1".into(),
+                title: "Native session title".into(),
+                details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
+            }],
+            scan_progress: Some((1, 1)),
+            error: None,
+        }];
+        dashboard.show_import_dialog(1, profiles.clone());
+        dashboard.apply_import_profiles(1, profiles);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+
+        for expected_pane in [
+            ImportPane::Profiles,
+            ImportPane::Sessions,
+            ImportPane::Profiles,
+        ] {
+            let Mode::Import(dialog) = &dashboard.mode else {
+                panic!("expected import dialog");
+            };
+            assert_eq!(dialog.pane, expected_pane);
+            terminal
+                .draw(|frame| render_import_dialog(frame, frame.area(), dialog))
+                .expect("draw import dialog");
+            assert_eq!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .filter(|cell| cell.symbol() == "›")
+                    .count(),
+                1
+            );
+            dashboard.handle_key(key(KeyCode::Tab));
+        }
+    }
+
+    #[test]
+    fn importing_session_renders_unknown_then_known_progress_and_ignores_navigation() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.show_import_progress("Chosen session".into());
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Down)),
+            DashboardAction::None
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw import progress");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Importing session · step 1/?"));
+
+        dashboard.update_import_progress(2, Some(4), "Native session parsed.".into());
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw known import progress");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Importing session · step 2/4"));
+        assert!(rendered.contains("Native session parsed."));
+    }
+
+    #[test]
+    fn import_dialog_shows_profiles_while_sessions_are_still_loading() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.show_import_dialog(
+            7,
+            vec![ImportProfileOption {
+                profile_id: "codex-1".into(),
+                harness_kind: HarnessKind::Codex,
+                sessions: Vec::new(),
+                scan_progress: None,
+                error: None,
+            }],
+        );
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("codex-1"));
+        assert!(rendered.contains("Scanning native sessions"));
     }
 
     #[test]
@@ -2363,6 +3202,61 @@ mod tests {
         assert!(rendered.contains("ACP pretty name"));
         assert!(!rendered.contains("native-1"));
         assert!(!rendered.contains("Raise the dead"));
+    }
+
+    #[test]
+    fn archived_sessions_leave_the_turn_clock_cell_blank() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Turn clock"));
+        assert!(rendered.contains("2026-08-09T01:00:00Z"));
+        assert!(!rendered.contains("idle"));
+    }
+
+    #[test]
+    fn active_checkpoint_age_uses_compact_seconds_minutes_hours_and_days() {
+        let checkpointed_at = "2026-08-09T01:00:00Z";
+        let base = chrono::DateTime::parse_from_rfc3339(checkpointed_at)
+            .unwrap()
+            .timestamp() as u64;
+
+        assert_eq!(checkpoint_age(base + 12, checkpointed_at), "12s");
+        assert_eq!(checkpoint_age(base + 8 * 60, checkpointed_at), "8m");
+        assert_eq!(checkpoint_age(base + 3 * 3_600, checkpointed_at), "3h");
+        assert_eq!(checkpoint_age(base + 2 * 86_400, checkpointed_at), "2d");
+    }
+
+    #[test]
+    fn target_cell_combines_infrastructure_and_project_directories() {
+        let mut config = config();
+        config
+            .bundles
+            .get_mut("hel")
+            .unwrap()
+            .repositories
+            .push(ProjectRepository {
+                id: "anvil".into(),
+                github: "BrokkAi/anvil".into(),
+                destination: "anvil".into(),
+                git_ref: None,
+            });
+
+        assert_eq!(
+            session_target(&config, &archived_session()),
+            "podman: hel, anvil"
+        );
     }
 
     #[test]
@@ -2439,6 +3333,62 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("╔ Profile Quotas"));
         assert!(!rendered.contains("[focused]"));
+    }
+
+    #[test]
+    fn only_focused_pane_draws_caret_without_shifting_session_columns() {
+        let mut active = archived_session();
+        active.id = "session-0".into();
+        active.state = SessionState::Running;
+        let archived = archived_session();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions: BTreeMap::from([
+                    (active.id.clone(), active),
+                    (archived.id.clone(), archived),
+                ]),
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        let backend = TestBackend::new(120, 28);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        for expected_focus in [Focus::Active, Focus::Archived, Focus::Quotas] {
+            assert_eq!(dashboard.focus, expected_focus);
+            terminal
+                .draw(|frame| render(frame, &mut dashboard))
+                .expect("draw dashboard");
+            let buffer = terminal.backend().buffer();
+            let lines = (buffer.area.y..buffer.area.bottom())
+                .map(|y| {
+                    (buffer.area.x..buffer.area.right())
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                lines
+                    .iter()
+                    .flat_map(|line| line.chars())
+                    .filter(|character| *character == '›')
+                    .count(),
+                1
+            );
+            let name_columns = lines
+                .iter()
+                .filter_map(|line| {
+                    line.find("ACP pretty name")
+                        .map(|byte| line[..byte].chars().count())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(name_columns.len(), 2);
+            assert_eq!(name_columns[0], name_columns[1]);
+
+            dashboard.handle_key(key(KeyCode::Tab));
+        }
     }
 
     #[test]

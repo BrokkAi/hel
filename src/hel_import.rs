@@ -17,7 +17,7 @@ use crate::hel_archive::{
     ArchiveInput, BundleManifest, GitCollectionSpec, SystemGit, TargetManifest,
     collect_git_snapshot, write_archive_atomic,
 };
-use crate::hel_checkpoint::collect_native_artifacts;
+use crate::hel_checkpoint::{collect_import_native_artifacts, collect_native_artifacts};
 use crate::hel_config::{HarnessKind, HelConfig, ProjectBundle, ProjectRepository, validate_id};
 use crate::hel_setup::{GithubRepository, github_repository_from_origin};
 use crate::hel_state::{
@@ -40,6 +40,10 @@ pub struct LocatedClaudeSession {
     pub session_id: String,
     pub jsonl_path: PathBuf,
     pub modified_at: SystemTime,
+    pub title: String,
+    pub cwd: PathBuf,
+    pub git_branch: String,
+    pub size_bytes: u64,
 }
 
 pub type LocatedCodexSession = LocatedClaudeSession;
@@ -49,6 +53,31 @@ pub struct LocatedKimiSession {
     pub session_id: String,
     pub session_path: PathBuf,
     pub modified_at: SystemTime,
+    pub title: String,
+    pub cwd: PathBuf,
+    pub git_branch: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionScanProgress<T> {
+    pub scanned: usize,
+    pub total: usize,
+    pub session: Option<T>,
+}
+
+#[derive(Debug)]
+struct FileScanCandidate {
+    path: PathBuf,
+    modified_at: SystemTime,
+    size_bytes: u64,
+}
+
+#[derive(Debug)]
+struct KimiScanCandidate {
+    session_id: String,
+    session_path: PathBuf,
+    modified_at: SystemTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +117,7 @@ pub struct ClaudeImportRequest<'a> {
     pub source: &'a LocatedClaudeSession,
     pub transcript: &'a ClaudeTranscript,
     pub bundle_id: &'a str,
+    pub profile_id: Option<&'a str>,
     pub title: Option<&'a str>,
     pub archive_directory: &'a Path,
 }
@@ -97,6 +127,7 @@ pub struct CodexImportRequest<'a> {
     pub source: &'a LocatedCodexSession,
     pub transcript: &'a CodexTranscript,
     pub bundle_id: &'a str,
+    pub profile_id: Option<&'a str>,
     pub title: Option<&'a str>,
     pub archive_directory: &'a Path,
 }
@@ -106,6 +137,7 @@ pub struct KimiImportRequest<'a> {
     pub source: &'a LocatedKimiSession,
     pub transcript: &'a KimiTranscript,
     pub bundle_id: &'a str,
+    pub profile_id: Option<&'a str>,
     pub title: Option<&'a str>,
     pub archive_directory: &'a Path,
 }
@@ -157,17 +189,74 @@ pub fn locate_codex_session(
     home: &Path,
     selection: &CodexSessionSelection,
 ) -> Result<LocatedCodexSession> {
+    select_jsonl_session(list_codex_sessions(home)?, selection, "Codex")
+}
+
+/// List native Codex sessions newest first.
+pub fn list_codex_sessions(home: &Path) -> Result<Vec<LocatedCodexSession>> {
+    let mut sessions = Vec::new();
+    scan_codex_sessions(home, |progress| {
+        if let Some(session) = progress.session {
+            sessions.push(session);
+        }
+    })?;
+    Ok(sessions)
+}
+
+/// Scan native Codex sessions newest first, reporting after every candidate file.
+pub fn scan_codex_sessions(
+    home: &Path,
+    mut report: impl FnMut(SessionScanProgress<LocatedCodexSession>),
+) -> Result<()> {
     let mut candidates = Vec::new();
     for root_name in ["sessions", "archived_sessions"] {
         let root = home.join(root_name);
         if root.is_dir() {
-            collect_codex_candidates(&root, &mut candidates)?;
+            collect_codex_candidate_paths(&root, &mut candidates)?;
         }
     }
-    select_jsonl_session(candidates, selection, "Codex")
+    candidates.sort_by(|left, right| {
+        right
+            .modified_at
+            .cmp(&left.modified_at)
+            .then_with(|| right.path.cmp(&left.path))
+    });
+    let total = candidates.len();
+    report(SessionScanProgress {
+        scanned: 0,
+        total,
+        session: None,
+    });
+    let titles = codex_native_titles(home)?;
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let session =
+            codex_session_metadata(&candidate.path)?.map(|(session_id, cwd, git_branch)| {
+                LocatedCodexSession {
+                    title: titles
+                        .get(&session_id)
+                        .cloned()
+                        .unwrap_or_else(|| session_id.clone()),
+                    session_id,
+                    jsonl_path: candidate.path,
+                    modified_at: candidate.modified_at,
+                    cwd,
+                    git_branch,
+                    size_bytes: candidate.size_bytes,
+                }
+            });
+        report(SessionScanProgress {
+            scanned: index + 1,
+            total,
+            session,
+        });
+    }
+    Ok(())
 }
 
-fn collect_codex_candidates(root: &Path, candidates: &mut Vec<LocatedCodexSession>) -> Result<()> {
+fn collect_codex_candidate_paths(
+    root: &Path,
+    candidates: &mut Vec<FileScanCandidate>,
+) -> Result<()> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
@@ -176,25 +265,22 @@ fn collect_codex_candidates(root: &Path, candidates: &mut Vec<LocatedCodexSessio
             continue;
         }
         if metadata.is_dir() {
-            collect_codex_candidates(&path, candidates)?;
+            collect_codex_candidate_paths(&path, candidates)?;
             continue;
         }
         if !metadata.is_file() || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
         {
             continue;
         }
-        let Some(session_id) = codex_session_id(&path)? else {
-            continue;
-        };
-        candidates.push(LocatedCodexSession {
-            session_id,
-            jsonl_path: path,
+        candidates.push(FileScanCandidate {
+            path,
             modified_at: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            size_bytes: metadata.len(),
         });
     }
     Ok(())
 }
-fn codex_session_id(path: &Path) -> Result<Option<String>> {
+fn codex_session_metadata(path: &Path) -> Result<Option<(String, PathBuf, String)>> {
     let file =
         fs::File::open(path).with_context(|| format!("open Codex session {}", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -209,18 +295,70 @@ fn codex_session_id(path: &Path) -> Result<Option<String>> {
         if record.get("type").and_then(Value::as_str) != Some("session_meta") {
             continue;
         }
+        // Codex ACP loads a rollout by its payload `id`, which is also the
+        // UUID embedded in the rollout filename. `session_id` can name a
+        // parent thread and therefore is not necessarily resumable itself.
         let id = record
-            .pointer("/payload/session_id")
-            .or_else(|| record.pointer("/payload/id"))
+            .pointer("/payload/id")
+            .or_else(|| record.pointer("/payload/session_id"))
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
             .map(ToOwned::to_owned);
         if let Some(id) = id {
             validate_id("Codex session", &id)?;
-            return Ok(Some(id));
+            let cwd = record
+                .pointer("/payload/cwd")
+                .and_then(Value::as_str)
+                .filter(|cwd| !cwd.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            let git_branch = record
+                .pointer("/payload/git/branch")
+                .and_then(Value::as_str)
+                .filter(|branch| !branch.trim().is_empty())
+                .unwrap_or("HEAD")
+                .to_owned();
+            return Ok(Some((id, cwd, git_branch)));
         }
     }
     Ok(None)
+}
+
+fn codex_native_titles(home: &Path) -> Result<BTreeMap<String, String>> {
+    let mut titles = BTreeMap::new();
+    let history = home.join("history.jsonl");
+    if history.is_file() {
+        for line in BufReader::new(fs::File::open(&history)?).lines() {
+            let record: Value = serde_json::from_str(&line?)?;
+            if let (Some(session_id), Some(text)) = (
+                record.get("session_id").and_then(Value::as_str),
+                record.get("text").and_then(Value::as_str),
+            ) && !text.trim().is_empty()
+            {
+                titles
+                    .entry(session_id.to_owned())
+                    .or_insert_with(|| single_line_title(text));
+            }
+        }
+    }
+    let index = home.join("session_index.jsonl");
+    if index.is_file() {
+        for line in BufReader::new(fs::File::open(&index)?).lines() {
+            let record: Value = serde_json::from_str(&line?)?;
+            if let (Some(session_id), Some(title)) = (
+                record.get("id").and_then(Value::as_str),
+                record.get("thread_name").and_then(Value::as_str),
+            ) && !title.trim().is_empty()
+            {
+                titles.insert(session_id.to_owned(), single_line_title(title));
+            }
+        }
+    }
+    Ok(titles)
+}
+
+fn single_line_title(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Locate a Kimi session directory. Its on-disk `session_<uuid>` name is the
@@ -229,6 +367,41 @@ pub fn locate_kimi_session(
     home: &Path,
     selection: &KimiSessionSelection,
 ) -> Result<LocatedKimiSession> {
+    let candidates = list_kimi_sessions(home)?;
+    let sessions = home.join("sessions");
+    match selection {
+        KimiSessionSelection::Session(session_id) => candidates
+            .into_iter()
+            .find(|candidate| candidate.session_id == *session_id)
+            .with_context(|| {
+                format!(
+                    "Kimi session {session_id:?} was not found under {}",
+                    sessions.display()
+                )
+            }),
+        KimiSessionSelection::Latest => candidates
+            .into_iter()
+            .next()
+            .context("no Kimi session directories were found"),
+    }
+}
+
+/// List native Kimi sessions newest first.
+pub fn list_kimi_sessions(home: &Path) -> Result<Vec<LocatedKimiSession>> {
+    let mut sessions = Vec::new();
+    scan_kimi_sessions(home, |progress| {
+        if let Some(session) = progress.session {
+            sessions.push(session);
+        }
+    })?;
+    Ok(sessions)
+}
+
+/// Scan native Kimi sessions newest first, reporting after every candidate directory.
+pub fn scan_kimi_sessions(
+    home: &Path,
+    mut report: impl FnMut(SessionScanProgress<LocatedKimiSession>),
+) -> Result<()> {
     let sessions = home.join("sessions");
     ensure!(
         sessions.is_dir(),
@@ -258,32 +431,52 @@ pub fn locate_kimi_session(
                 continue;
             };
             validate_id("Kimi session", session_id)?;
-            candidates.push(LocatedKimiSession {
+            candidates.push(KimiScanCandidate {
                 session_id: session_id.to_owned(),
                 session_path,
                 modified_at: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             });
         }
     }
-    match selection {
-        KimiSessionSelection::Session(session_id) => candidates
-            .into_iter()
-            .find(|candidate| candidate.session_id == *session_id)
-            .with_context(|| {
-                format!(
-                    "Kimi session {session_id:?} was not found under {}",
-                    sessions.display()
-                )
-            }),
-        KimiSessionSelection::Latest => candidates
-            .into_iter()
-            .max_by(|left, right| {
-                left.modified_at
-                    .cmp(&right.modified_at)
-                    .then_with(|| left.session_path.cmp(&right.session_path))
-            })
-            .context("no Kimi session directories were found"),
+    candidates.sort_by(|left, right| {
+        right
+            .modified_at
+            .cmp(&left.modified_at)
+            .then_with(|| right.session_path.cmp(&left.session_path))
+    });
+    let total = candidates.len();
+    report(SessionScanProgress {
+        scanned: 0,
+        total,
+        session: None,
+    });
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let size_bytes = directory_size(&candidate.session_path)?;
+        let transcript = read_kimi_transcript(&candidate.session_path).ok();
+        let cwd = transcript
+            .as_ref()
+            .map(|transcript| transcript.cwd.clone())
+            .unwrap_or_default();
+        let session_id = candidate.session_id;
+        let session = LocatedKimiSession {
+            title: transcript
+                .as_ref()
+                .and_then(|transcript| first_prompt_title(&transcript.events))
+                .unwrap_or_else(|| session_id.clone()),
+            session_id,
+            session_path: candidate.session_path,
+            modified_at: candidate.modified_at,
+            git_branch: git_branch_or_head(&cwd),
+            size_bytes,
+            cwd,
+        };
+        report(SessionScanProgress {
+            scanned: index + 1,
+            total,
+            session: Some(session),
+        });
     }
+    Ok(())
 }
 
 fn select_jsonl_session(
@@ -294,15 +487,15 @@ fn select_jsonl_session(
     match selection {
         CodexSessionSelection::Session(session_id) => {
             validate_id(&format!("{harness} session"), session_id)?;
-            let mut matches = candidates
+            candidates
                 .into_iter()
                 .filter(|candidate| candidate.session_id == *session_id)
-                .collect::<Vec<_>>();
-            match matches.len() {
-                0 => bail!("{harness} session {session_id:?} was not found"),
-                1 => Ok(matches.remove(0)),
-                _ => bail!("{harness} session {session_id:?} occurs in multiple locations"),
-            }
+                .max_by(|left, right| {
+                    left.modified_at
+                        .cmp(&right.modified_at)
+                        .then_with(|| left.jsonl_path.cmp(&right.jsonl_path))
+                })
+                .with_context(|| format!("{harness} session {session_id:?} was not found"))
         }
         CodexSessionSelection::Latest => candidates
             .into_iter()
@@ -321,6 +514,47 @@ pub fn locate_claude_session(
     home: &Path,
     selection: &ClaudeSessionSelection,
 ) -> Result<LocatedClaudeSession> {
+    let candidates = list_claude_sessions(home)?;
+    let projects = home.join("projects");
+    match selection {
+        ClaudeSessionSelection::Session(session_id) => {
+            validate_id("Claude session", session_id)?;
+            let mut matches = candidates
+                .into_iter()
+                .filter(|candidate| candidate.session_id == *session_id)
+                .collect::<Vec<_>>();
+            match matches.len() {
+                0 => bail!(
+                    "Claude session {session_id:?} was not found under {}",
+                    projects.display()
+                ),
+                1 => Ok(matches.remove(0)),
+                _ => bail!("Claude session {session_id:?} occurs in multiple project directories"),
+            }
+        }
+        ClaudeSessionSelection::Latest => candidates
+            .into_iter()
+            .next()
+            .context("no Claude session JSONL files were found"),
+    }
+}
+
+/// List native Claude sessions newest first.
+pub fn list_claude_sessions(home: &Path) -> Result<Vec<LocatedClaudeSession>> {
+    let mut sessions = Vec::new();
+    scan_claude_sessions(home, |progress| {
+        if let Some(session) = progress.session {
+            sessions.push(session);
+        }
+    })?;
+    Ok(sessions)
+}
+
+/// Scan native Claude sessions newest first, reporting after every candidate file.
+pub fn scan_claude_sessions(
+    home: &Path,
+    mut report: impl FnMut(SessionScanProgress<LocatedClaudeSession>),
+) -> Result<()> {
     let projects = home.join("projects");
     ensure!(
         projects.is_dir(),
@@ -353,39 +587,143 @@ pub fn locate_claude_session(
             if session_id.is_empty() {
                 continue;
             }
-            candidates.push(LocatedClaudeSession {
-                session_id: session_id.to_owned(),
-                jsonl_path: path,
+            candidates.push(FileScanCandidate {
+                path,
                 modified_at: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                size_bytes: metadata.len(),
             });
         }
     }
 
-    match selection {
-        ClaudeSessionSelection::Session(session_id) => {
-            validate_id("Claude session", session_id)?;
-            let mut matches = candidates
-                .into_iter()
-                .filter(|candidate| candidate.session_id == *session_id)
-                .collect::<Vec<_>>();
-            match matches.len() {
-                0 => bail!(
-                    "Claude session {session_id:?} was not found under {}",
-                    projects.display()
-                ),
-                1 => Ok(matches.remove(0)),
-                _ => bail!("Claude session {session_id:?} occurs in multiple project directories"),
-            }
-        }
-        ClaudeSessionSelection::Latest => candidates
-            .into_iter()
-            .max_by(|left, right| {
-                left.modified_at
-                    .cmp(&right.modified_at)
-                    .then_with(|| left.jsonl_path.cmp(&right.jsonl_path))
-            })
-            .context("no Claude session JSONL files were found"),
+    candidates.sort_by(|left, right| {
+        right
+            .modified_at
+            .cmp(&left.modified_at)
+            .then_with(|| right.path.cmp(&left.path))
+    });
+    let total = candidates.len();
+    report(SessionScanProgress {
+        scanned: 0,
+        total,
+        session: None,
+    });
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let session_id = candidate
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".jsonl"))
+            .expect("Claude candidates were validated during enumeration")
+            .to_owned();
+        let (title, cwd, git_branch) = claude_native_metadata(&candidate.path)
+            .unwrap_or_else(|_| (session_id.clone(), PathBuf::new(), "HEAD".to_owned()));
+        report(SessionScanProgress {
+            scanned: index + 1,
+            total,
+            session: Some(LocatedClaudeSession {
+                session_id,
+                jsonl_path: candidate.path,
+                modified_at: candidate.modified_at,
+                title,
+                cwd,
+                git_branch,
+                size_bytes: candidate.size_bytes,
+            }),
+        });
     }
+    Ok(())
+}
+
+fn claude_native_metadata(path: &Path) -> Result<(String, PathBuf, String)> {
+    let mut title = None;
+    let mut fallback_title = None;
+    let mut cwd = None;
+    let mut git_branch = None;
+    for line in BufReader::new(fs::File::open(path)?).lines() {
+        let record: Value = serde_json::from_str(&line?)?;
+        if cwd.is_none() {
+            cwd = record
+                .get("cwd")
+                .and_then(Value::as_str)
+                .filter(|cwd| !cwd.trim().is_empty())
+                .map(PathBuf::from);
+        }
+        if git_branch.is_none() {
+            git_branch = record
+                .get("gitBranch")
+                .and_then(Value::as_str)
+                .filter(|branch| !branch.trim().is_empty())
+                .map(str::to_owned);
+        }
+        match record.get("type").and_then(Value::as_str) {
+            Some("ai-title") => {
+                if let Some(native_title) = record
+                    .get("aiTitle")
+                    .and_then(Value::as_str)
+                    .filter(|title| !title.trim().is_empty())
+                {
+                    title = Some(single_line_title(native_title));
+                }
+            }
+            Some("agent-name") if title.is_none() => {
+                title = record
+                    .get("agentName")
+                    .and_then(Value::as_str)
+                    .filter(|title| !title.trim().is_empty())
+                    .map(single_line_title);
+            }
+            Some("user") if fallback_title.is_none() => {
+                fallback_title = record
+                    .pointer("/message/content")
+                    .and_then(Value::as_str)
+                    .filter(|title| !title.trim().is_empty())
+                    .map(single_line_title);
+            }
+            _ => {}
+        }
+    }
+    let cwd = cwd.with_context(|| format!("Claude session {} has no cwd", path.display()))?;
+    Ok((
+        title
+            .or(fallback_title)
+            .unwrap_or_else(|| "Untitled session".into()),
+        cwd,
+        git_branch.unwrap_or_else(|| "HEAD".into()),
+    ))
+}
+
+fn first_prompt_title(events: &[SequencedEvent]) -> Option<String> {
+    events.iter().find_map(|event| match &event.event {
+        WorkerEvent::PromptAccepted { text, .. } if !text.trim().is_empty() => {
+            Some(single_line_title(text))
+        }
+        _ => None,
+    })
+}
+
+fn git_branch_or_head(cwd: &Path) -> String {
+    if cwd.as_os_str().is_empty() {
+        return "HEAD".into();
+    }
+    git_optional_text(cwd, ["branch", "--show-current"])
+        .ok()
+        .flatten()
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or_else(|| "HEAD".into())
+}
+
+fn directory_size(path: &Path) -> Result<u64> {
+    let mut size = 0_u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_file() {
+            size = size.saturating_add(metadata.len());
+        } else if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            size = size.saturating_add(directory_size(&entry.path())?);
+        }
+    }
+    Ok(size)
 }
 
 /// Read the native JSONL only far enough to recover a transcript suitable for
@@ -396,6 +734,7 @@ pub fn read_claude_transcript(path: &Path) -> Result<ClaudeTranscript> {
         .with_context(|| format!("read Claude session {}", path.display()))?;
     let mut cwd = None;
     let mut events = Vec::new();
+    let mut saw_raw_user = false;
 
     for (index, line) in body.lines().enumerate() {
         if line.trim().is_empty() {
@@ -416,6 +755,23 @@ pub fn read_claude_transcript(path: &Path) -> Result<ClaudeTranscript> {
         {
             continue;
         }
+        let compaction_boundary = record.get("type").and_then(Value::as_str) == Some("system")
+            && matches!(
+                record.get("subtype").and_then(Value::as_str),
+                Some("compact_boundary" | "compaction")
+            );
+        let compaction_summary = record
+            .get("isCompactSummary")
+            .or_else(|| record.pointer("/message/isCompactSummary"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if compaction_boundary || compaction_summary {
+            ensure!(
+                saw_raw_user,
+                "Claude session contains a compaction artifact before recoverable raw history"
+            );
+            continue;
+        }
         match record.get("type").and_then(Value::as_str) {
             Some("user") => {
                 let Some(text) = record
@@ -434,6 +790,7 @@ pub fn read_claude_transcript(path: &Path) -> Result<ClaudeTranscript> {
                         attachments: Vec::new(),
                     },
                 );
+                saw_raw_user = true;
             }
             Some("assistant") => {
                 let Some(content) = record.pointer("/message/content").and_then(Value::as_array)
@@ -496,6 +853,7 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
         .with_context(|| format!("read Codex session {}", path.display()))?;
     let mut cwd = None;
     let mut events = Vec::new();
+    let mut saw_raw_user = false;
     for (index, line) in body.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -509,6 +867,23 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
                 .and_then(Value::as_str)
                 .filter(|cwd| !cwd.trim().is_empty())
                 .map(PathBuf::from);
+        }
+        let record_type = record.get("type").and_then(Value::as_str);
+        let payload_type = record.pointer("/payload/type").and_then(Value::as_str);
+        let compaction_artifact = matches!(
+            record_type,
+            Some("compacted" | "context_compaction" | "compaction_summary")
+        ) || (record_type == Some("response_item")
+            && matches!(
+                payload_type,
+                Some("compaction" | "compaction_summary" | "context_compaction")
+            ));
+        if compaction_artifact {
+            ensure!(
+                saw_raw_user,
+                "Codex session contains a compaction artifact before recoverable raw history"
+            );
+            continue;
         }
         if record.get("type").and_then(Value::as_str) != Some("event_msg") {
             continue;
@@ -531,6 +906,7 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
                         attachments: Vec::new(),
                     },
                 );
+                saw_raw_user = true;
             }
             Some("agent_message") => {
                 let Some(text) = record
@@ -593,6 +969,7 @@ pub fn read_kimi_transcript(session_path: &Path) -> Result<KimiTranscript> {
     let body = fs::read_to_string(&wire_path)
         .with_context(|| format!("read Kimi wire stream {}", wire_path.display()))?;
     let mut events = Vec::new();
+    let mut saw_raw_user = false;
     for (index, line) in body.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -604,8 +981,18 @@ pub fn read_kimi_transcript(session_path: &Path) -> Result<KimiTranscript> {
                 index + 1
             )
         })?;
+        if matches!(
+            record.get("type").and_then(Value::as_str),
+            Some("context.compaction" | "context.compacted" | "compaction")
+        ) {
+            ensure!(
+                saw_raw_user,
+                "Kimi session contains a compaction artifact before recoverable raw history"
+            );
+            continue;
+        }
         match record.get("type").and_then(Value::as_str) {
-            Some("turn.prompt")
+            Some("turn.prompt" | "turn.steer")
                 if record.pointer("/origin/kind").and_then(Value::as_str) == Some("user") =>
             {
                 finish_imported_turn(&mut events);
@@ -629,6 +1016,7 @@ pub fn read_kimi_transcript(session_path: &Path) -> Result<KimiTranscript> {
                             attachments: Vec::new(),
                         },
                     );
+                    saw_raw_user = true;
                 }
             }
             Some("context.append_loop_event")
@@ -784,6 +1172,7 @@ pub fn import_claude_session(
         source,
         transcript,
         bundle_id,
+        profile_id,
         title,
         archive_directory,
     } = request;
@@ -804,7 +1193,7 @@ pub fn import_claude_session(
     let canonical_events = encode_events(&transcript.events)?;
     let session_id = new_session_id()?;
     let timestamp = timestamp();
-    let profile_id = default_profile(config, HarnessKind::Claude, claude_home);
+    let profile_id = import_profile_id(config, profile_id, HarnessKind::Claude, claude_home)?;
     let target_id = config
         .targets
         .keys()
@@ -889,6 +1278,7 @@ pub fn import_codex_session(
         source,
         transcript,
         bundle_id,
+        profile_id,
         title,
         archive_directory,
     } = request;
@@ -902,6 +1292,7 @@ pub fn import_codex_session(
             source_path: &source.jsonl_path,
             transcript,
             bundle_id,
+            profile_id,
             title,
             archive_directory,
         },
@@ -918,6 +1309,7 @@ pub fn import_kimi_session(
         source,
         transcript,
         bundle_id,
+        profile_id,
         title,
         archive_directory,
     } = request;
@@ -931,6 +1323,7 @@ pub fn import_kimi_session(
             source_path: &source.session_path,
             transcript,
             bundle_id,
+            profile_id,
             title,
             archive_directory,
         },
@@ -944,6 +1337,7 @@ struct NativeImportRequest<'a> {
     source_path: &'a Path,
     transcript: &'a ClaudeTranscript,
     bundle_id: &'a str,
+    profile_id: Option<&'a str>,
     title: Option<&'a str>,
     archive_directory: &'a Path,
 }
@@ -960,6 +1354,7 @@ fn import_native_session(
         source_path,
         transcript,
         bundle_id,
+        profile_id,
         title,
         archive_directory,
     } = request;
@@ -980,11 +1375,11 @@ fn import_native_session(
     };
     let repositories = collect_local_repositories(bundle, &transcript.cwd)?;
     let native_artifacts =
-        collect_native_artifacts(harness, harness_home, native_session_id, false)?;
+        collect_import_native_artifacts(harness, harness_home, native_session_id, source_path)?;
     let canonical_events = encode_events(&transcript.events)?;
     let session_id = new_session_id()?;
     let timestamp = timestamp();
-    let profile_id = default_profile(config, harness, harness_home);
+    let profile_id = import_profile_id(config, profile_id, harness, harness_home)?;
     let target_id = config
         .targets
         .keys()
@@ -1096,16 +1491,16 @@ fn collect_local_repositories(
                 repository.id,
                 path.display()
             );
-            let base_commit = git_text(&path, ["rev-parse", "HEAD"])?;
+            let base_commit = import_base_commit(&path)?;
             collect_git_snapshot(
                 &git,
                 &path,
                 &GitCollectionSpec {
                     id: repository.id.clone(),
                     relative_destination: repository.destination.clone(),
-                    // Import begins from exactly the observed worktree head;
-                    // staged, unstaged, and untracked content are collected
-                    // separately by `collect_git_snapshot`.
+                    // Import starts from the common ancestor of the local
+                    // checkout and the tracked remote, so unpushed commits
+                    // are included in the committed delta bundle.
                     base_commit,
                 },
             )
@@ -1155,6 +1550,59 @@ fn default_profile(config: &HelConfig, harness: HarnessKind, home: &Path) -> Str
         })
         .map(|(id, _)| id.clone())
         .unwrap_or_else(|| format!("{}-import", harness_name(harness).to_ascii_lowercase()))
+}
+
+fn import_profile_id(
+    config: &HelConfig,
+    requested: Option<&str>,
+    harness: HarnessKind,
+    home: &Path,
+) -> Result<String> {
+    let Some(requested) = requested else {
+        return Ok(default_profile(config, harness, home));
+    };
+    let profile = config
+        .profiles
+        .get(requested)
+        .with_context(|| format!("unknown import profile {requested:?}"))?;
+    ensure!(
+        profile.kind == harness,
+        "import profile {requested:?} does not use {harness:?}"
+    );
+    Ok(requested.to_owned())
+}
+
+fn import_base_commit(path: &Path) -> Result<String> {
+    let upstream = git_optional_text(path, ["rev-parse", "--verify", "--quiet", "@{upstream}"])?
+        .or(git_optional_text(
+            path,
+            [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/remotes/origin/HEAD",
+            ],
+        )?);
+    let Some(upstream) = upstream else {
+        // A repository without remote refs cannot tell us which ancestry a
+        // newly provisioned clone has. Preserve the previous HEAD-only
+        // behavior; normal tracked checkouts take the bundle-preserving path.
+        return git_text(path, ["rev-parse", "HEAD"]);
+    };
+    git_text(path, ["merge-base", "HEAD", &upstream])
+}
+
+fn git_optional_text<const N: usize>(cwd: &Path, arguments: [&str; N]) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("start git in {}", cwd.display()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8(output.stdout).context("decode Git output")?;
+    Ok((!text.trim().is_empty()).then(|| text.trim().to_owned()))
 }
 
 fn git_text<const N: usize>(cwd: &Path, arguments: [&str; N]) -> Result<String> {
@@ -1371,6 +1819,170 @@ mod tests {
     }
 
     #[test]
+    fn codex_import_omits_compaction_blobs_but_requires_prior_raw_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rollout.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/work/app"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"compaction","encrypted_content":"opaque"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert!(
+            read_codex_transcript(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("before recoverable raw history")
+        );
+
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/work/app"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"raw prompt"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"compaction","encrypted_content":"opaque"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let transcript = read_codex_transcript(&path).unwrap();
+        assert_eq!(transcript.events.len(), 2);
+    }
+
+    #[test]
+    fn claude_import_rejects_a_compaction_summary_without_raw_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"system","subtype":"compact_boundary","cwd":"/work/app"}"#,
+                "\n",
+                r#"{"type":"user","isCompactSummary":true,"message":{"content":"summary"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert!(
+            read_claude_transcript(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("before recoverable raw history")
+        );
+    }
+
+    #[test]
+    fn codex_locator_uses_rollout_id_when_session_id_names_a_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let rollout = directory
+            .path()
+            .join("sessions/2026/08/10/rollout-2026-08-10T00-00-00-019feb6c-6b55-7111-a210-6d85ee0772cd.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(
+            &rollout,
+            r#"{"type":"session_meta","payload":{"session_id":"019feb6c-5ffc-7c12-ad99-bdeaeb6be79d","id":"019feb6c-6b55-7111-a210-6d85ee0772cd"}}"#,
+        )
+        .unwrap();
+
+        let located = locate_codex_session(
+            directory.path(),
+            &CodexSessionSelection::Session("019feb6c-6b55-7111-a210-6d85ee0772cd".into()),
+        )
+        .unwrap();
+        assert_eq!(located.session_id, "019feb6c-6b55-7111-a210-6d85ee0772cd");
+        assert_eq!(located.jsonl_path, rollout);
+    }
+
+    #[test]
+    fn codex_listing_uses_native_title_and_session_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = "019feb6c-6b55-7111-a210-6d85ee0772cd";
+        let rollout = directory.path().join("sessions/rollout.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(
+            &rollout,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{session_id}","cwd":"/work/app","git":{{"branch":"feature"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("history.jsonl"),
+            format!(r#"{{"session_id":"{session_id}","text":"native title\ncontinued"}}"#),
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(directory.path()).unwrap();
+        assert_eq!(sessions[0].title, "native title continued");
+        assert_eq!(sessions[0].cwd, PathBuf::from("/work/app"));
+        assert_eq!(sessions[0].git_branch, "feature");
+        assert!(sessions[0].size_bytes > 0);
+    }
+
+    #[test]
+    fn codex_scan_reports_progress_and_emits_newest_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let sessions = directory.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for (name, session_id) in [
+            ("first.jsonl", "019feb6c-6b55-7111-a210-6d85ee0772cd"),
+            ("second.jsonl", "019feb6c-6b55-7111-a210-6d85ee0772ce"),
+        ] {
+            fs::write(
+                sessions.join(name),
+                format!(r#"{{"type":"session_meta","payload":{{"id":"{session_id}"}}}}"#),
+            )
+            .unwrap();
+        }
+        let mut updates = Vec::new();
+        scan_codex_sessions(directory.path(), |progress| {
+            updates.push((
+                progress.scanned,
+                progress.total,
+                progress.session.map(|session| session.modified_at),
+            ));
+        })
+        .unwrap();
+
+        assert_eq!(updates.len(), 3);
+        assert_eq!((updates[0].0, updates[0].1), (0, 2));
+        assert!(updates[0].2.is_none());
+        assert_eq!((updates[1].0, updates[1].1), (1, 2));
+        assert_eq!((updates[2].0, updates[2].1), (2, 2));
+        assert!(updates[1].2 >= updates[2].2);
+    }
+
+    #[test]
+    fn claude_listing_uses_ai_title_and_native_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let rollout = directory
+            .path()
+            .join("projects/work/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"type":"user","cwd":"/work/app","gitBranch":"feature","message":{"content":"fallback"}}"#,
+                "\n",
+                r#"{"type":"ai-title","aiTitle":"Native Claude title"}"#,
+            ),
+        )
+        .unwrap();
+
+        let sessions = list_claude_sessions(directory.path()).unwrap();
+        assert_eq!(sessions[0].title, "Native Claude title");
+        assert_eq!(sessions[0].cwd, PathBuf::from("/work/app"));
+        assert_eq!(sessions[0].git_branch, "feature");
+        assert!(sessions[0].size_bytes > 0);
+    }
+
+    #[test]
     fn kimi_wire_projects_user_prompt_and_text_without_thought() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir_all(directory.path().join("agents/main")).unwrap();
@@ -1388,6 +2000,10 @@ mod tests {
                 "\n",
                 r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"first reply"}}}"#,
                 "\n",
+                r#"{"type":"turn.steer","origin":{"kind":"user"},"input":[{"type":"text","text":"follow up"}]}"#,
+                "\n",
+                r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"second reply"}}}"#,
+                "\n",
             ),
         )
         .unwrap();
@@ -1404,6 +2020,18 @@ mod tests {
         );
         assert!(matches!(
             transcript.events[2].event,
+            WorkerEvent::TurnCompleted
+        ));
+        assert!(matches!(
+            &transcript.events[3].event,
+            WorkerEvent::PromptAccepted { text, .. } if text == "follow up"
+        ));
+        assert_eq!(
+            agent_text(&transcript.events[4].event).as_deref(),
+            Some("second reply")
+        );
+        assert!(matches!(
+            transcript.events[5].event,
             WorkerEvent::TurnCompleted
         ));
     }

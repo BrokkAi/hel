@@ -1581,9 +1581,10 @@ mod tests {
             fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
             std::os::unix::fs::symlink("tool", source.path().join("scripts/current")).unwrap();
         }
-        let mut paths = b"scripts/tool\0".to_vec();
         #[cfg(unix)]
-        paths.extend_from_slice(b"scripts/current\0");
+        let paths = b"scripts/tool\0scripts/current\0".to_vec();
+        #[cfg(not(unix))]
+        let paths = b"scripts/tool\0".to_vec();
         let tar = build_untracked_tar(source.path(), &paths).unwrap();
         validate_untracked_tar(&tar).unwrap();
 
