@@ -8,7 +8,9 @@ use serde::Serialize;
 
 use crate::hel_config::{ContainerTemplate, HarnessKind, HelConfig, TargetTemplate, config_path};
 use crate::hel_controller::{WorkerBinaryAvailability, worker_binary_prerequisite_for_arch};
-use crate::hel_setup::{DiscoveredHome, discover_harness_homes, harness_authentication_marker};
+use crate::hel_setup::{
+    DiscoveredHome, discover_harness_homes, harness_authentication_marker, harness_is_authenticated,
+};
 use crate::hel_targets::{
     CommandExecutor, CommandSpec, ContainerTemplate as RuntimeContainerTemplate, ProcessExecutor,
     TargetTemplate as RuntimeTargetTemplate, run_setup_smoke_test, verify_local_podman,
@@ -336,7 +338,7 @@ fn harness_checks(config: Option<&HelConfig>) -> Vec<DoctorCheck> {
                     ),
                 );
             }
-            if !marker.is_file() {
+            if !harness_is_authenticated(profile.kind, &profile.home) {
                 return DoctorCheck::fixable(
                     format!("harness.{id}"),
                     title,

@@ -137,18 +137,23 @@ pub fn discover_harness_homes(
         .into_iter()
         .filter(|(kind, path)| seen.insert((*kind, path.clone())) && path.is_dir())
         .map(|(kind, path)| DiscoveredHome {
-            authenticated: harness_authentication_marker(kind, &path).is_file(),
+            authenticated: harness_is_authenticated(kind, &path),
             kind,
             path,
         })
         .collect()
 }
 
+pub fn harness_is_authenticated(kind: HarnessKind, home: &Path) -> bool {
+    harness_authentication_marker(kind, home).is_file()
+        || (kind == HarnessKind::Kimi && home.join("credentials").is_file())
+}
+
 pub fn harness_authentication_marker(kind: HarnessKind, home: &Path) -> PathBuf {
     home.join(match kind {
         HarnessKind::Codex => "auth.json",
         HarnessKind::Claude => ".credentials.json",
-        HarnessKind::Kimi => "credentials",
+        HarnessKind::Kimi => "credentials/kimi-code.json",
     })
 }
 
@@ -650,18 +655,22 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("home");
         let codex = home.join(".codex");
+        let kimi = home.join(".kimi-code");
         let claude = directory.path().join("claude-override");
         fs::create_dir_all(&codex).unwrap();
+        fs::create_dir_all(kimi.join("credentials")).unwrap();
         fs::create_dir_all(&claude).unwrap();
         fs::write(codex.join("auth.json"), "{}").unwrap();
+        fs::write(kimi.join("credentials/kimi-code.json"), "{}").unwrap();
         fs::write(claude.join(".credentials.json"), "{}").unwrap();
 
         let homes = discover_harness_homes(Some(&home), [(HarnessKind::Claude, claude.clone())]);
 
-        assert_eq!(homes.len(), 2);
+        assert_eq!(homes.len(), 3);
         assert!(homes.iter().all(|home| home.authenticated));
         assert!(homes.iter().any(|home| home.path == codex));
         assert!(homes.iter().any(|home| home.path == claude));
+        assert!(homes.iter().any(|home| home.path == kimi));
     }
 
     #[test]

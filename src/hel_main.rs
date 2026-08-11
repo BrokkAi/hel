@@ -21,7 +21,7 @@ use hel::hel_import::{
     read_claude_transcript, read_codex_transcript, read_kimi_transcript, resolve_bundle,
     scan_claude_sessions, scan_codex_sessions, scan_kimi_sessions,
 };
-use hel::hel_quota::{ProfileQuota, QuotaManager};
+use hel::hel_quota::{ProfileQuota, QuotaManager, QuotaRefreshRequest};
 use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapshot};
 use hel::hel_setup::{SetupOutcome, run_setup_dialog};
 use hel::hel_state::{HelState, SessionState, harness_session_title};
@@ -189,15 +189,6 @@ struct WorkerArgs {
 const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WORKER_POLL_TIMEOUT: Duration = Duration::from_secs(3);
-
-#[derive(Debug, Clone)]
-struct QuotaRefreshProfile {
-    id: String,
-    harness: hel::hel_config::HarnessKind,
-    home: PathBuf,
-    environment: std::collections::BTreeMap<String, String>,
-    cwd: PathBuf,
-}
 
 #[derive(Debug)]
 enum QuotaUpdate {
@@ -655,17 +646,9 @@ fn viewer_snapshot(
 }
 
 async fn refresh_all_quotas(controller: &Controller, quotas: &mut QuotaManager) {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    for (id, profile) in &controller.config.profiles {
-        let mut environment = profile.environment.clone();
-        environment.insert(
-            profile.home_env().to_string(),
-            profile.home.to_string_lossy().into_owned(),
-        );
-        quotas
-            .refresh(id, profile.kind, &profile.home, &environment, &cwd)
-            .await;
-    }
+    quotas
+        .refresh_profiles(quota_refresh_profiles(controller))
+        .await;
 }
 
 async fn worker_prompt(controller: &Controller, session_id: &str, text: String) -> Result<()> {
@@ -675,7 +658,7 @@ async fn worker_prompt(controller: &Controller, session_id: &str, text: String) 
     client.detach().await
 }
 
-fn quota_refresh_profiles(controller: &Controller) -> Vec<QuotaRefreshProfile> {
+fn quota_refresh_profiles(controller: &Controller) -> Vec<QuotaRefreshRequest> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     controller
         .config
@@ -687,10 +670,10 @@ fn quota_refresh_profiles(controller: &Controller) -> Vec<QuotaRefreshProfile> {
                 profile.home_env().to_string(),
                 profile.home.to_string_lossy().into_owned(),
             );
-            QuotaRefreshProfile {
-                id: id.clone(),
+            QuotaRefreshRequest {
+                profile_id: id.clone(),
                 harness: profile.kind,
-                home: profile.home.clone(),
+                source_home: profile.home.clone(),
                 environment,
                 cwd: cwd.clone(),
             }
@@ -699,7 +682,7 @@ fn quota_refresh_profiles(controller: &Controller) -> Vec<QuotaRefreshProfile> {
 }
 
 fn spawn_dashboard_quota_refresher() -> (
-    tokio::sync::watch::Sender<Vec<QuotaRefreshProfile>>,
+    tokio::sync::watch::Sender<Vec<QuotaRefreshRequest>>,
     tokio::sync::mpsc::Receiver<QuotaUpdate>,
 ) {
     let (profiles_tx, mut profiles_rx) = tokio::sync::watch::channel(Vec::new());
@@ -737,26 +720,17 @@ fn spawn_dashboard_quota_refresher() -> (
 
 async fn refresh_profile_quotas(
     quotas: &mut QuotaManager,
-    profiles: &[QuotaRefreshProfile],
+    profiles: &[QuotaRefreshRequest],
     updates: &tokio::sync::mpsc::Sender<QuotaUpdate>,
 ) -> bool {
     let ids = profiles
         .iter()
-        .map(|profile| profile.id.clone())
+        .map(|profile| profile.profile_id.clone())
         .collect::<Vec<_>>();
     if updates.send(QuotaUpdate::Refreshing(ids)).await.is_err() {
         return false;
     }
-    for profile in profiles {
-        let quota = quotas
-            .refresh(
-                &profile.id,
-                profile.harness,
-                &profile.home,
-                &profile.environment,
-                &profile.cwd,
-            )
-            .await;
+    for quota in quotas.refresh_profiles(profiles.to_vec()).await {
         if updates.send(QuotaUpdate::Report(quota)).await.is_err() {
             return false;
         }
@@ -925,10 +899,10 @@ fn current_epoch_seconds() -> u64 {
 fn request_dashboard_quota_refresh(
     controller: &Controller,
     dashboard: &mut DashboardState,
-    profiles_tx: &tokio::sync::watch::Sender<Vec<QuotaRefreshProfile>>,
+    profiles_tx: &tokio::sync::watch::Sender<Vec<QuotaRefreshRequest>>,
 ) {
     let profiles = quota_refresh_profiles(controller);
-    dashboard.begin_quota_refresh(profiles.iter().map(|profile| profile.id.clone()));
+    dashboard.begin_quota_refresh(profiles.iter().map(|profile| profile.profile_id.clone()));
     profiles_tx.send_replace(profiles);
 }
 
@@ -1042,7 +1016,7 @@ async fn run_dashboard() -> Result<()> {
     let (worker_targets_tx, mut worker_updates_rx) = spawn_dashboard_worker_poller();
     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
     let (import_updates_tx, mut import_updates_rx) =
-        tokio::sync::mpsc::channel::<(u64, Vec<ImportProfileOption>)>(8);
+        tokio::sync::mpsc::channel::<(u64, ImportProfileOption)>(32);
     let (import_task_tx, mut import_task_rx) =
         tokio::sync::mpsc::channel::<DashboardImportUpdate>(8);
     let mut pending_import = None;
@@ -1061,8 +1035,8 @@ async fn run_dashboard() -> Result<()> {
                 dashboard.set_notice(format!("Could not save harness title: {error:#}"));
             }
         }
-        while let Ok((discovery_id, profiles)) = import_updates_rx.try_recv() {
-            dashboard.apply_import_profiles(discovery_id, profiles);
+        while let Ok((discovery_id, profile)) = import_updates_rx.try_recv() {
+            dashboard.apply_import_profile(discovery_id, profile);
         }
         while let Ok(update) = import_task_rx.try_recv() {
             match update {
@@ -1178,14 +1152,23 @@ async fn run_dashboard() -> Result<()> {
                     import_discovery_id,
                     import_profile_placeholders(&controller.config),
                 );
-                let config = controller.config.clone();
-                let updates = import_updates_tx.clone();
                 let discovery_id = import_discovery_id;
-                tokio::task::spawn_blocking(move || {
-                    discover_import_sessions(&config, |profiles| {
-                        let _ = updates.blocking_send((discovery_id, profiles));
+                for (profile_id, profile) in controller.config.profiles.clone() {
+                    let updates = import_updates_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let completed = discover_import_profile(
+                            profile_id,
+                            profile.kind,
+                            profile.home,
+                            |profile| {
+                                if let Ok(permit) = updates.try_reserve() {
+                                    permit.send((discovery_id, profile.clone()));
+                                }
+                            },
+                        );
+                        let _ = updates.blocking_send((discovery_id, completed));
                     });
-                });
+                }
             }
             DashboardAction::ImportSession {
                 profile_id,
@@ -1429,63 +1412,68 @@ fn close_progress_notice(session_id: &str, elapsed: Duration, frame: usize) -> S
     )
 }
 
-fn discover_import_sessions(config: &HelConfig, mut publish: impl FnMut(Vec<ImportProfileOption>)) {
-    let mut profiles = import_profile_placeholders(config);
-    for index in 0..profiles.len() {
-        let profile_id = profiles[index].profile_id.clone();
-        let Some(profile) = config.profiles.get(&profile_id) else {
-            continue;
-        };
-        let home = profile.home.clone();
-        let discovered = match profile.kind {
-            hel::hel_config::HarnessKind::Codex => scan_codex_sessions(&home, |progress| {
-                profiles[index].scan_progress = Some((progress.scanned, progress.total));
-                if let Some(session) = progress.session {
-                    profiles[index].sessions.push(import_session_option(
-                        session.native_session_id,
-                        session.title,
-                        session.modified_at,
-                        session.git_branch,
-                        session.size_bytes,
-                        session.cwd,
-                    ));
-                }
-                publish(profiles.clone());
-            }),
-            hel::hel_config::HarnessKind::Claude => scan_claude_sessions(&home, |progress| {
-                profiles[index].scan_progress = Some((progress.scanned, progress.total));
-                if let Some(session) = progress.session {
-                    profiles[index].sessions.push(import_session_option(
-                        session.native_session_id,
-                        session.title,
-                        session.modified_at,
-                        session.git_branch,
-                        session.size_bytes,
-                        session.cwd,
-                    ));
-                }
-                publish(profiles.clone());
-            }),
-            hel::hel_config::HarnessKind::Kimi => scan_kimi_sessions(&home, |progress| {
-                profiles[index].scan_progress = Some((progress.scanned, progress.total));
-                if let Some(session) = progress.session {
-                    profiles[index].sessions.push(import_session_option(
-                        session.native_session_id,
-                        session.title,
-                        session.modified_at,
-                        session.git_branch,
-                        session.size_bytes,
-                        session.cwd,
-                    ));
-                }
-                publish(profiles.clone());
-            }),
-        };
-        if let Err(error) = discovered {
-            profiles[index].error = Some(format!("{error:#}"));
-            publish(profiles.clone());
-        }
+fn discover_import_profile(
+    profile_id: String,
+    harness_kind: hel::hel_config::HarnessKind,
+    home: PathBuf,
+    mut publish: impl FnMut(&ImportProfileOption),
+) -> ImportProfileOption {
+    let mut profile = ImportProfileOption {
+        profile_id,
+        harness_kind,
+        sessions: Vec::new(),
+        scan_progress: None,
+        error: None,
+    };
+    let discovered = match harness_kind {
+        hel::hel_config::HarnessKind::Codex => scan_codex_sessions(&home, |progress| {
+            profile.scan_progress = Some((progress.scanned, progress.total));
+            if let Some(session) = progress.session {
+                profile.sessions.push(import_session_option(
+                    session.native_session_id,
+                    session.title,
+                    session.modified_at,
+                    session.git_branch,
+                    session.size_bytes,
+                    session.cwd,
+                ));
+            }
+            publish(&profile);
+        }),
+        hel::hel_config::HarnessKind::Claude => scan_claude_sessions(&home, |progress| {
+            profile.scan_progress = Some((progress.scanned, progress.total));
+            if let Some(session) = progress.session {
+                profile.sessions.push(import_session_option(
+                    session.native_session_id,
+                    session.title,
+                    session.modified_at,
+                    session.git_branch,
+                    session.size_bytes,
+                    session.cwd,
+                ));
+            }
+            publish(&profile);
+        }),
+        hel::hel_config::HarnessKind::Kimi => scan_kimi_sessions(&home, |progress| {
+            profile.scan_progress = Some((progress.scanned, progress.total));
+            if let Some(session) = progress.session {
+                profile.sessions.push(import_session_option(
+                    session.native_session_id,
+                    session.title,
+                    session.modified_at,
+                    session.git_branch,
+                    session.size_bytes,
+                    session.cwd,
+                ));
+            }
+            publish(&profile);
+        }),
+    };
+    if let Err(error) = discovered {
+        profile.error = Some(format!("{error:#}"));
+        publish(&profile);
     }
+    profile
 }
 
 fn import_session_option(

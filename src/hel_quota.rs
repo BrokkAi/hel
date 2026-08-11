@@ -12,6 +12,15 @@ use crate::claude_usage;
 use crate::codex_usage::{self, CodexUsageClient, CodexUsageStatus};
 use crate::hel_config::HarnessKind;
 
+#[derive(Debug, Clone)]
+pub struct QuotaRefreshRequest {
+    pub profile_id: String,
+    pub harness: HarnessKind,
+    pub source_home: std::path::PathBuf,
+    pub environment: BTreeMap<String, String>,
+    pub cwd: std::path::PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuotaWindow {
     pub label: String,
@@ -78,104 +87,35 @@ impl QuotaManager {
         &self.reports
     }
 
-    pub async fn refresh(
+    /// Refresh each profile independently so one slow harness cannot delay the
+    /// others. Reports are returned in completion order.
+    pub async fn refresh_profiles(
         &mut self,
-        profile_id: &str,
-        harness: HarnessKind,
-        source_home: &Path,
-        environment: &BTreeMap<String, String>,
-        cwd: &Path,
-    ) -> ProfileQuota {
-        let environment = environment
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<HashMap<_, _>>();
-        let refreshed_at_epoch_seconds = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let result = match harness {
-            HarnessKind::Codex => {
-                let mut client = self.codex_clients.remove(profile_id);
-                let status =
-                    codex_usage::refresh(&mut client, cwd.to_path_buf(), environment).await;
-                if let Some(client) = client {
-                    self.codex_clients.insert(profile_id.to_string(), client);
+        requests: Vec<QuotaRefreshRequest>,
+    ) -> Vec<ProfileQuota> {
+        let mut tasks = tokio::task::JoinSet::new();
+        for request in requests {
+            let client = self.codex_clients.remove(&request.profile_id);
+            tasks.spawn(refresh_profile(request, client));
+        }
+
+        let mut refreshed = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            let (report, client) = match result {
+                Ok(output) => output,
+                Err(error) => {
+                    tracing::warn!(%error, "quota refresh task failed");
+                    continue;
                 }
-                match status {
-                    CodexUsageStatus::Available(report) => Ok(ProfileQuota {
-                        profile_id: profile_id.to_string(),
-                        harness,
-                        windows: [report.primary, report.secondary]
-                            .into_iter()
-                            .flatten()
-                            .map(|window| QuotaWindow {
-                                label: window.label,
-                                remaining_percent: Some(window.remaining_percent),
-                                used: None,
-                                limit: None,
-                                resets: window
-                                    .resets_at
-                                    .and_then(crate::usage_format::format_reset_local_seconds),
-                            })
-                            .collect(),
-                        extra: None,
-                        error: None,
-                        refreshed_at_epoch_seconds,
-                    }),
-                    CodexUsageStatus::Unavailable(error) => Err(anyhow::anyhow!(error)),
-                }
+            };
+            if let Some(client) = client {
+                self.codex_clients.insert(report.profile_id.clone(), client);
             }
-            HarnessKind::Claude => claude_usage::query(cwd.to_path_buf(), environment)
-                .await
-                .map(|report| ProfileQuota {
-                    profile_id: profile_id.to_string(),
-                    harness,
-                    windows: [
-                        report.five_hour.map(|window| ("5H", window)),
-                        report.week.map(|window| ("week", window)),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .map(|(label, window)| QuotaWindow {
-                        label: label.to_string(),
-                        remaining_percent: Some(window.remaining_percent),
-                        used: None,
-                        limit: None,
-                        resets: window
-                            .reset_context
-                            .as_deref()
-                            .and_then(crate::usage_format::normalize_reset_text),
-                    })
-                    .collect(),
-                    extra: None,
-                    error: None,
-                    refreshed_at_epoch_seconds,
-                })
-                .map_err(|error| anyhow::anyhow!(error.to_string())),
-            HarnessKind::Kimi => {
-                query_kimi(source_home, &environment)
-                    .await
-                    .map(|(windows, extra)| ProfileQuota {
-                        profile_id: profile_id.to_string(),
-                        harness,
-                        windows,
-                        extra,
-                        error: None,
-                        refreshed_at_epoch_seconds,
-                    })
-            }
-        };
-        let report = result.unwrap_or_else(|error| ProfileQuota {
-            profile_id: profile_id.to_string(),
-            harness,
-            windows: Vec::new(),
-            extra: None,
-            error: Some(error.to_string()),
-            refreshed_at_epoch_seconds,
-        });
-        self.reports.insert(profile_id.to_string(), report.clone());
-        report
+            self.reports
+                .insert(report.profile_id.clone(), report.clone());
+            refreshed.push(report);
+        }
+        refreshed
     }
 
     pub async fn shutdown(mut self) {
@@ -183,6 +123,100 @@ impl QuotaManager {
             client.shutdown().await;
         }
     }
+}
+
+async fn refresh_profile(
+    request: QuotaRefreshRequest,
+    mut codex_client: Option<CodexUsageClient>,
+) -> (ProfileQuota, Option<CodexUsageClient>) {
+    let QuotaRefreshRequest {
+        profile_id,
+        harness,
+        source_home,
+        environment,
+        cwd,
+    } = request;
+    let environment = environment.into_iter().collect::<HashMap<_, _>>();
+    let refreshed_at_epoch_seconds = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let result = match harness {
+        HarnessKind::Codex => {
+            let status = codex_usage::refresh(&mut codex_client, cwd, environment).await;
+            match status {
+                CodexUsageStatus::Available(report) => Ok(ProfileQuota {
+                    profile_id: profile_id.clone(),
+                    harness,
+                    windows: [report.primary, report.secondary]
+                        .into_iter()
+                        .flatten()
+                        .map(|window| QuotaWindow {
+                            label: window.label,
+                            remaining_percent: Some(window.remaining_percent),
+                            used: None,
+                            limit: None,
+                            resets: window
+                                .resets_at
+                                .and_then(crate::usage_format::format_reset_local_seconds),
+                        })
+                        .collect(),
+                    extra: None,
+                    error: None,
+                    refreshed_at_epoch_seconds,
+                }),
+                CodexUsageStatus::Unavailable(error) => Err(anyhow::anyhow!(error)),
+            }
+        }
+        HarnessKind::Claude => claude_usage::query(cwd, environment)
+            .await
+            .map(|report| ProfileQuota {
+                profile_id: profile_id.clone(),
+                harness,
+                windows: [
+                    report.five_hour.map(|window| ("5H", window)),
+                    report.week.map(|window| ("week", window)),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|(label, window)| QuotaWindow {
+                    label: label.to_string(),
+                    remaining_percent: Some(window.remaining_percent),
+                    used: None,
+                    limit: None,
+                    resets: window
+                        .reset_context
+                        .as_deref()
+                        .and_then(crate::usage_format::normalize_reset_text),
+                })
+                .collect(),
+                extra: None,
+                error: None,
+                refreshed_at_epoch_seconds,
+            })
+            .map_err(|error| anyhow::anyhow!(error.to_string())),
+        HarnessKind::Kimi => {
+            query_kimi(&source_home, &environment)
+                .await
+                .map(|(windows, extra)| ProfileQuota {
+                    profile_id: profile_id.clone(),
+                    harness,
+                    windows,
+                    extra,
+                    error: None,
+                    refreshed_at_epoch_seconds,
+                })
+        }
+    };
+    let report = result.unwrap_or_else(|error| ProfileQuota {
+        profile_id,
+        harness,
+        windows: Vec::new(),
+        extra: None,
+        error: Some(error.to_string()),
+        refreshed_at_epoch_seconds,
+    });
+    (report, codex_client)
 }
 
 async fn query_kimi(

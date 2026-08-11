@@ -423,6 +423,42 @@ impl DashboardState {
             .unwrap_or_else(|| dialog.session_index.min(sessions.len().saturating_sub(1)));
     }
 
+    pub fn apply_import_profile(&mut self, discovery_id: u64, profile: ImportProfileOption) {
+        let Mode::Import(dialog) = &mut self.mode else {
+            return;
+        };
+        if dialog.discovery_id != discovery_id {
+            return;
+        }
+        let Some(profile_index) = dialog
+            .profiles
+            .iter()
+            .position(|candidate| candidate.profile_id == profile.profile_id)
+        else {
+            return;
+        };
+        let selected_native_session_id = (dialog.profile_index == profile_index)
+            .then(|| {
+                dialog.profiles[profile_index]
+                    .sessions
+                    .get(dialog.session_index)
+                    .map(|session| session.native_session_id.clone())
+            })
+            .flatten();
+        dialog.profiles[profile_index] = profile;
+        if dialog.profile_index != profile_index {
+            return;
+        }
+        let sessions = &dialog.profiles[profile_index].sessions;
+        dialog.session_index = selected_native_session_id
+            .and_then(|selected| {
+                sessions
+                    .iter()
+                    .position(|session| session.native_session_id == selected)
+            })
+            .unwrap_or_else(|| dialog.session_index.min(sessions.len().saturating_sub(1)));
+    }
+
     pub fn show_import_progress(&mut self, session_title: String) {
         self.mode = Mode::Importing(ImportProgress {
             session_title,
@@ -2970,12 +3006,9 @@ mod tests {
         dashboard.handle_key(key(KeyCode::Tab));
         dashboard.handle_key(key(KeyCode::Down));
 
-        dashboard.apply_import_profiles(
+        dashboard.apply_import_profile(
             1,
-            vec![profile(
-                vec![session("a"), session("b"), session("c")],
-                (3, 3),
-            )],
+            profile(vec![session("a"), session("b"), session("c")], (3, 3)),
         );
 
         assert_eq!(
