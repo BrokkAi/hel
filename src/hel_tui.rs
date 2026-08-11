@@ -1323,7 +1323,19 @@ fn partition_sessions<'a>(
             .cmp(&last_agent_text_at(left))
             .then_with(|| left.id.cmp(&right.id))
     });
+    archived.sort_by(|left, right| {
+        checkpoint_time(right)
+            .cmp(&checkpoint_time(left))
+            .then_with(|| left.id.cmp(&right.id))
+    });
     (active, archived)
+}
+
+fn checkpoint_time(session: &SessionRecord) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    session
+        .checkpoint
+        .as_ref()
+        .and_then(|checkpoint| chrono::DateTime::parse_from_rfc3339(&checkpoint.created_at).ok())
 }
 
 fn activity_from_adapter(payload: &serde_json::Value) -> Option<SessionActivity> {
@@ -1858,7 +1870,7 @@ fn session_values(
             if session.state.is_active() {
                 checkpoint_age(now_epoch_seconds, &checkpoint.created_at)
             } else {
-                checkpoint.created_at.clone()
+                checkpoint_time_display(&checkpoint.created_at)
             }
         })
         .unwrap_or_else(|| "never".into());
@@ -1949,6 +1961,12 @@ fn checkpoint_age(now_epoch_seconds: u64, checkpointed_at: &str) -> String {
     } else {
         format!("{}d", age / 86_400)
     }
+}
+
+fn checkpoint_time_display(checkpointed_at: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(checkpointed_at)
+        .map(|checkpointed_at| checkpointed_at.format("%y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|_| "unknown".into())
 }
 
 fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
@@ -2645,6 +2663,30 @@ mod tests {
     }
 
     #[test]
+    fn archived_sessions_are_ordered_by_checkpoint_time_descending() {
+        let mut oldest = archived_session();
+        oldest.id = "session-z".into();
+        oldest.checkpoint.as_mut().unwrap().created_at = "2026-08-09T01:00:00Z".into();
+        let mut newest = archived_session();
+        newest.id = "session-y".into();
+        newest.checkpoint.as_mut().unwrap().created_at = "2026-08-09T00:30:00-02:00".into();
+        let mut without_checkpoint = archived_session();
+        without_checkpoint.id = "session-a".into();
+        without_checkpoint.checkpoint = None;
+
+        let (_, archived) =
+            partition_sessions([&without_checkpoint, &oldest, &newest], &BTreeMap::new());
+
+        assert_eq!(
+            archived
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["session-y", "session-z", "session-a"]
+        );
+    }
+
+    #[test]
     fn active_sessions_are_sorted_by_most_recent_agent_text() {
         let active_session = |id: &str| {
             let mut session = archived_session();
@@ -3333,8 +3375,18 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("Turn clock"));
-        assert!(rendered.contains("2026-08-09T01:00:00Z"));
+        assert!(rendered.contains("26-08-09 01:00"));
+        assert!(!rendered.contains("2026-08-09T01:00:00Z"));
         assert!(!rendered.contains("idle"));
+    }
+
+    #[test]
+    fn archived_checkpoint_time_preserves_its_reported_timezone() {
+        assert_eq!(
+            checkpoint_time_display("2026-08-09T01:02:03-05:00"),
+            "26-08-09 01:02"
+        );
+        assert_eq!(checkpoint_time_display("not-a-timestamp"), "unknown");
     }
 
     #[test]
