@@ -1429,6 +1429,7 @@ fn discover_import_profile(
         hel::hel_config::HarnessKind::Codex => scan_codex_sessions(&home, |progress| {
             profile.scan_progress = Some((progress.scanned, progress.total));
             if let Some(session) = progress.session {
+                let unavailable_reason = session.history_mode.import_issue().map(ToOwned::to_owned);
                 profile.sessions.push(import_session_option(
                     session.native_session_id,
                     session.title,
@@ -1436,6 +1437,7 @@ fn discover_import_profile(
                     session.git_branch,
                     session.size_bytes,
                     session.cwd,
+                    unavailable_reason,
                 ));
             }
             publish(&profile);
@@ -1450,6 +1452,7 @@ fn discover_import_profile(
                     session.git_branch,
                     session.size_bytes,
                     session.cwd,
+                    None,
                 ));
             }
             publish(&profile);
@@ -1464,6 +1467,7 @@ fn discover_import_profile(
                     session.git_branch,
                     session.size_bytes,
                     session.cwd,
+                    None,
                 ));
             }
             publish(&profile);
@@ -1483,6 +1487,7 @@ fn import_session_option(
     branch: String,
     size: u64,
     cwd: PathBuf,
+    unavailable_reason: Option<String>,
 ) -> ImportSessionOption {
     ImportSessionOption {
         native_session_id,
@@ -1494,6 +1499,7 @@ fn import_session_option(
             format_byte_size(size),
             display_home_relative(&cwd),
         ),
+        unavailable_reason,
     }
 }
 
