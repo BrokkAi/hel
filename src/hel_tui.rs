@@ -1144,10 +1144,15 @@ impl DashboardState {
             self.notice = Some("Resume needs a profile and a target template.".into());
             return;
         }
+        let profile = self
+            .compatible_profiles(&session.id)
+            .iter()
+            .position(|(profile_id, _)| profile_id.as_str() == session.last_profile)
+            .unwrap_or(0);
         self.mode = Mode::Resume(ResumeWizard {
             session_id: session.id.clone(),
             step: WizardStep::Profile,
-            profile: 0,
+            profile,
             target: 0,
         });
     }
@@ -1878,6 +1883,9 @@ fn session_values(
     let clock = crate::usage_format::format_turn_clock(
         now_epoch_seconds,
         detail.and_then(|detail| detail.current_turn_started_at),
+        detail
+            .and_then(|detail| detail.last_agent_text_at)
+            .or_else(|| session_updated_at_epoch_seconds(session)),
     );
     (
         clock,
@@ -1886,6 +1894,14 @@ fn session_values(
         checkpoint,
         session_name(session).to_string(),
     )
+}
+
+fn session_updated_at_epoch_seconds(session: &SessionRecord) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(&session.updated_at)
+        .ok()?
+        .timestamp()
+        .try_into()
+        .ok()
 }
 
 fn session_target(config: &HelConfig, session: &SessionRecord) -> String {
@@ -2892,6 +2908,7 @@ mod tests {
     fn resume_can_convert_to_another_harness() {
         let mut dashboard = dashboard_with_session(archived_session());
         dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Up));
         dashboard.handle_key(key(KeyCode::Enter));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
@@ -2901,6 +2918,18 @@ mod tests {
                 target_template_id: "podman".into(),
             }
         );
+    }
+
+    #[test]
+    fn resume_defaults_to_the_session_profile() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.handle_key(key(KeyCode::Enter));
+
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume wizard");
+        };
+        let profiles = dashboard.compatible_profiles(&wizard.session_id);
+        assert_eq!(profiles[wizard.profile].0, "codex-1");
     }
 
     #[test]
@@ -3401,6 +3430,19 @@ mod tests {
         assert_eq!(checkpoint_age(base + 8 * 60, checkpointed_at), "8m");
         assert_eq!(checkpoint_age(base + 3 * 3_600, checkpointed_at), "3h");
         assert_eq!(checkpoint_age(base + 2 * 86_400, checkpointed_at), "2d");
+    }
+
+    #[test]
+    fn active_idle_clock_uses_the_last_agent_activity_age() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let detail = SessionDetail {
+            last_agent_text_at: Some(1_000),
+            ..SessionDetail::default()
+        };
+
+        let (clock, _, _, _, _) = session_values(&session, Some(&detail), 1_480, &config());
+        assert_eq!(clock, "8m ago");
     }
 
     #[test]

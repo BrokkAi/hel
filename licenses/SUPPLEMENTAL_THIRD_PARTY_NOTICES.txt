@@ -93,6 +93,16 @@ bzip2/libbzip2 version 1.0.8 of 13 July 2019
 --------------------------------------------------------------------------
 
 ================================================================================
+SQLite 3.50.2 amalgamation
+================================================================================
+
+Source: https://crates.io/crates/libsqlite3-sys/0.35.0 (sqlite3/sqlite3.c)
+Inclusion: statically linked into hel by libsqlite3-sys with its bundled feature
+
+SQLite is dedicated to the public domain.
+https://www.sqlite.org/copyright.html
+
+================================================================================
 sherpa-onnx native static payload 1.13.3
 ================================================================================
 

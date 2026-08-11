@@ -1294,6 +1294,14 @@ async fn run_dashboard() -> Result<()> {
                 profile_id,
                 target_template_id,
             } => {
+                dashboard.set_notice(resume_progress_notice(
+                    &session_id,
+                    &profile_id,
+                    &target_template_id,
+                ));
+                terminal
+                    .terminal
+                    .draw(|frame| render(frame, &mut dashboard))?;
                 match controller
                     .resume_session(&session_id, &profile_id, &target_template_id)
                     .await
@@ -1751,6 +1759,13 @@ fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
+fn resume_progress_notice(session_id: &str, profile_id: &str, target_id: &str) -> String {
+    format!(
+        "Preparing {}: verifying checkpoint, provisioning {target_id}, and restoring {profile_id}…",
+        short_id(session_id)
+    )
+}
+
 fn configuration_needs_setup(config: &hel::hel_config::HelConfig) -> bool {
     config.profiles.is_empty() && config.bundles.is_empty() && config.targets.is_empty()
 }
@@ -1805,6 +1820,14 @@ mod tests {
     fn short_session_ids_are_safe() {
         assert_eq!(short_id("0123456789"), "01234567");
         assert_eq!(short_id("tiny"), "tiny");
+    }
+
+    #[test]
+    fn resume_progress_explains_the_blocking_work() {
+        assert_eq!(
+            resume_progress_notice("0123456789", "codex-1", "podman"),
+            "Preparing 01234567: verifying checkpoint, provisioning podman, and restoring codex-1…"
+        );
     }
 
     #[test]

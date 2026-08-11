@@ -18,7 +18,9 @@ use crate::hel_archive::{
     collect_git_snapshot, write_archive_atomic,
 };
 use crate::hel_checkpoint::{collect_import_native_artifacts, collect_native_artifacts};
-use crate::hel_config::{HarnessKind, HelConfig, ProjectBundle, ProjectRepository, validate_id};
+use crate::hel_config::{
+    HarnessKind, HelConfig, ProjectBundle, ProjectRepository, TargetTemplate, validate_id,
+};
 use crate::hel_setup::{GithubRepository, github_repository_from_origin};
 use crate::hel_state::{
     CheckpointMetadata, HelState, SessionRecord, SessionState, harness_session_title,
@@ -1652,12 +1654,7 @@ pub fn import_claude_session(
     let session_id = new_session_id()?;
     let timestamp = timestamp();
     let profile_id = import_profile_id(config, profile_id, HarnessKind::Claude, claude_home)?;
-    let target_id = config
-        .targets
-        .keys()
-        .next()
-        .cloned()
-        .unwrap_or_else(|| "import".into());
+    let target_id = default_import_target_id(config);
     let archive_path = archive_directory.join(format!("{session_id}.hel.zip"));
     let verified = write_archive_atomic(
         &archive_path,
@@ -1838,12 +1835,7 @@ fn import_native_session(
     let session_id = new_session_id()?;
     let timestamp = timestamp();
     let profile_id = import_profile_id(config, profile_id, harness, harness_home)?;
-    let target_id = config
-        .targets
-        .keys()
-        .next()
-        .cloned()
-        .unwrap_or_else(|| "import".into());
+    let target_id = default_import_target_id(config);
     let archive_path = archive_directory.join(format!("{session_id}.hel.zip"));
     let verified = write_archive_atomic(
         &archive_path,
@@ -1922,6 +1914,22 @@ fn harness_name(harness: HarnessKind) -> &'static str {
         HarnessKind::Kimi => "Kimi",
     }
 }
+
+fn default_import_target_id(config: &HelConfig) -> String {
+    config
+        .targets
+        .get_key_value("podman")
+        .map(|(id, _)| id)
+        .or_else(|| {
+            config.targets.iter().find_map(|(id, target)| {
+                matches!(target, TargetTemplate::LocalPodman { .. }).then_some(id)
+            })
+        })
+        .or_else(|| config.targets.keys().next())
+        .cloned()
+        .unwrap_or_else(|| "import".into())
+}
+
 fn collect_local_repositories(
     bundle: &ProjectBundle,
     cwd: &Path,
@@ -2093,6 +2101,54 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn container_template() -> crate::hel_config::ContainerTemplate {
+        crate::hel_config::ContainerTemplate {
+            image: "agent-dev:latest".into(),
+            platform: None,
+            cpus: None,
+            memory: None,
+            environment: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn imported_sessions_default_to_podman() {
+        let mut config = HelConfig::default();
+        config.targets.insert(
+            "apple".into(),
+            TargetTemplate::AppleContainer {
+                container: container_template(),
+            },
+        );
+        config.targets.insert(
+            "podman".into(),
+            TargetTemplate::LocalPodman {
+                container: container_template(),
+            },
+        );
+
+        assert_eq!(default_import_target_id(&config), "podman");
+    }
+
+    #[test]
+    fn imported_sessions_prefer_a_custom_named_local_podman_target() {
+        let mut config = HelConfig::default();
+        config.targets.insert(
+            "apple".into(),
+            TargetTemplate::AppleContainer {
+                container: container_template(),
+            },
+        );
+        config.targets.insert(
+            "workstation".into(),
+            TargetTemplate::LocalPodman {
+                container: container_template(),
+            },
+        );
+
+        assert_eq!(default_import_target_id(&config), "workstation");
+    }
 
     fn initialize_repository(path: &Path, id: &str) {
         fs::create_dir_all(path).unwrap();
@@ -2742,7 +2798,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(located.native_session_id, format!("session_{id}"));
-        assert_eq!(located.session_path, session);
+        assert_eq!(
+            located.session_path.canonicalize().unwrap(),
+            session.canonicalize().unwrap()
+        );
     }
 
     #[test]
