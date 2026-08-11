@@ -1138,10 +1138,15 @@ impl DashboardState {
             self.notice = Some("Resume needs a profile and a target template.".into());
             return;
         }
+        let profile = self
+            .compatible_profiles(&session.id)
+            .iter()
+            .position(|(profile_id, _)| profile_id.as_str() == session.last_profile)
+            .unwrap_or(0);
         self.mode = Mode::Resume(ResumeWizard {
             session_id: session.id.clone(),
             step: WizardStep::Profile,
-            profile: 0,
+            profile,
             target: 0,
         });
     }
@@ -2816,6 +2821,7 @@ mod tests {
     fn resume_can_convert_to_another_harness() {
         let mut dashboard = dashboard_with_session(archived_session());
         dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Up));
         dashboard.handle_key(key(KeyCode::Enter));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
@@ -2825,6 +2831,18 @@ mod tests {
                 target_template_id: "podman".into(),
             }
         );
+    }
+
+    #[test]
+    fn resume_defaults_to_the_session_profile() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.handle_key(key(KeyCode::Enter));
+
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume wizard");
+        };
+        let profiles = dashboard.compatible_profiles(&wizard.session_id);
+        assert_eq!(profiles[wizard.profile].0, "codex-1");
     }
 
     #[test]
