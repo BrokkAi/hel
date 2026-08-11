@@ -729,10 +729,13 @@ fn apply_event(snapshot: &mut WorkerSnapshot, event: &SequencedEvent) -> Result<
                 attachments: attachments.clone(),
             });
         }
-        WorkerEvent::TurnCompleted | WorkerEvent::Cancelled => {
+        WorkerEvent::TurnCompleted => {
             snapshot.phase = WorkerPhase::Idle;
             snapshot.active_prompt = None;
         }
+        // Cancellation acceptance precedes the ACP prompt future resolving.
+        // Keep rejecting prompts until the runtime records TurnCompleted.
+        WorkerEvent::Cancelled => {}
         WorkerEvent::ConfigChanged { key, value } => {
             snapshot.config.insert(key.clone(), value.clone());
         }
@@ -1201,6 +1204,43 @@ mod tests {
         };
         assert_eq!(latest_seq, 2);
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn cancellation_keeps_worker_busy_until_runtime_finishes_the_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        accepted(&worker.handle(request(
+            "prompt",
+            WorkerRequest::Prompt {
+                text: "wait".to_owned(),
+                attachments: vec![],
+            },
+        )));
+        accepted(&worker.handle(request("cancel", WorkerRequest::Cancel)));
+        assert_eq!(worker.snapshot.phase, WorkerPhase::Running);
+        assert!(worker.snapshot.active_prompt.is_some());
+
+        let early = worker.handle(request(
+            "too-early",
+            WorkerRequest::Prompt {
+                text: "next".to_owned(),
+                attachments: vec![],
+            },
+        ));
+        assert!(matches!(
+            early.body,
+            ResponseBody::Error {
+                error: ProtocolError {
+                    code: ErrorCode::InvalidState,
+                    ..
+                }
+            }
+        ));
+
+        worker.record_turn_completed().unwrap();
+        assert_eq!(worker.snapshot.phase, WorkerPhase::Idle);
+        assert!(worker.snapshot.active_prompt.is_none());
     }
 
     #[test]

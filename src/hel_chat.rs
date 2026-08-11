@@ -2,12 +2,14 @@
 
 mod rendering;
 
+use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, EmbeddedResourceResource, PlanEntryStatus, SessionUpdate, ToolCallContent,
-    ToolCallLocation, ToolCallStatus,
+    AvailableCommand, AvailableCommandInput, ContentBlock, EmbeddedResourceResource,
+    PlanEntryStatus, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOptions, SessionUpdate, ToolCallContent, ToolCallLocation, ToolCallStatus,
 };
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -17,7 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::hel_acp::RuntimeEvent;
 use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot};
@@ -38,9 +40,57 @@ pub enum ChatAction {
     Prompt(String),
     SetConfig { key: String, value: String },
     Cancel,
-    Checkpoint,
+    Checkpoint(Option<String>),
     ToggleVoice,
     Back,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalCommand {
+    Help,
+    Detach,
+    Checkpoint,
+    Model,
+    Effort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandSource {
+    Hel,
+    Agent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandChoice {
+    name: String,
+    description: String,
+    input_hint: Option<String>,
+    source: CommandSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigValueChoice {
+    value: String,
+    name: String,
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutocompleteKind {
+    Commands,
+    ConfigValues { key: &'static str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Autocomplete {
+    kind: AutocompleteKind,
+    selected: usize,
+    matches: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedPrompt {
+    text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +228,16 @@ pub struct ChatState {
     latest_seq: u64,
     entries: Vec<ChatEntry>,
     input: String,
+    input_cursor: usize,
+    prompt_history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: String,
+    queued_prompts: VecDeque<QueuedPrompt>,
+    agent_commands: Vec<AvailableCommand>,
+    command_choices: Vec<CommandChoice>,
+    model_values: Vec<ConfigValueChoice>,
+    effort_values: Vec<ConfigValueChoice>,
+    autocomplete: Option<Autocomplete>,
     scroll_top: usize,
     follow_bottom: bool,
     last_content_height: usize,
@@ -196,6 +256,16 @@ impl ChatState {
             latest_seq: 0,
             entries: Vec::new(),
             input: String::new(),
+            input_cursor: 0,
+            prompt_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            queued_prompts: VecDeque::new(),
+            agent_commands: Vec::new(),
+            command_choices: builtin_command_choices(),
+            model_values: Vec::new(),
+            effort_values: Vec::new(),
+            autocomplete: None,
             scroll_top: 0,
             follow_bottom: true,
             last_content_height: 0,
@@ -218,6 +288,11 @@ impl ChatState {
         self.latest_seq
     }
 
+    fn mark_prompt_submitted(&mut self) {
+        self.phase = WorkerPhase::Running;
+        self.notice = None;
+    }
+
     pub fn entries(&self) -> &[ChatEntry] {
         &self.entries
     }
@@ -236,6 +311,305 @@ impl ChatState {
         }
     }
 
+    fn set_input(&mut self, input: String) {
+        self.input = input;
+        self.input_cursor = self.input.chars().count();
+        self.history_index = None;
+        self.update_autocomplete();
+    }
+
+    fn clear_input(&mut self) {
+        self.set_input(String::new());
+    }
+
+    fn insert_character(&mut self, character: char) {
+        let byte = input_byte_index(&self.input, self.input_cursor);
+        self.input.insert(byte, character);
+        self.input_cursor += 1;
+        self.history_index = None;
+        self.update_autocomplete();
+    }
+
+    fn backspace(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let start = input_byte_index(&self.input, self.input_cursor - 1);
+        let end = input_byte_index(&self.input, self.input_cursor);
+        self.input.replace_range(start..end, "");
+        self.input_cursor -= 1;
+        self.history_index = None;
+        self.update_autocomplete();
+    }
+
+    fn delete(&mut self) {
+        if self.input_cursor >= self.input.chars().count() {
+            return;
+        }
+        let start = input_byte_index(&self.input, self.input_cursor);
+        let end = input_byte_index(&self.input, self.input_cursor + 1);
+        self.input.replace_range(start..end, "");
+        self.history_index = None;
+        self.update_autocomplete();
+    }
+
+    fn move_input_cursor(&mut self, delta: isize) {
+        self.input_cursor = self
+            .input_cursor
+            .saturating_add_signed(delta)
+            .min(self.input.chars().count());
+        self.update_autocomplete();
+    }
+
+    fn move_autocomplete(&mut self, delta: isize) {
+        let Some(autocomplete) = self.autocomplete.as_mut() else {
+            return;
+        };
+        let len = autocomplete.matches.len();
+        if len == 0 {
+            return;
+        }
+        autocomplete.selected = if delta.is_negative() {
+            autocomplete.selected.checked_sub(1).unwrap_or(len - 1)
+        } else {
+            (autocomplete.selected + 1) % len
+        };
+    }
+
+    fn accept_autocomplete(&mut self) -> bool {
+        let Some(autocomplete) = self.autocomplete.clone() else {
+            return false;
+        };
+        let Some(&index) = autocomplete.matches.get(autocomplete.selected) else {
+            return false;
+        };
+        let value = match autocomplete.kind {
+            AutocompleteKind::Commands => self
+                .command_choices
+                .get(index)
+                .map(|command| format!("/{} ", command.name)),
+            AutocompleteKind::ConfigValues { key: "model" } => self
+                .model_values
+                .get(index)
+                .map(|choice| format!("/model {}", choice.value)),
+            AutocompleteKind::ConfigValues { key: "effort" } => self
+                .effort_values
+                .get(index)
+                .map(|choice| format!("/effort {}", choice.value)),
+            AutocompleteKind::ConfigValues { .. } => None,
+        };
+        let Some(value) = value else {
+            return false;
+        };
+        self.set_input(value);
+        self.autocomplete = None;
+        true
+    }
+
+    fn update_autocomplete(&mut self) {
+        if self.input_cursor != self.input.chars().count() {
+            self.autocomplete = None;
+            return;
+        }
+        for (prefix, key, values) in [
+            ("/model ", "model", &self.model_values),
+            ("/effort ", "effort", &self.effort_values),
+        ] {
+            if let Some(query) = self.input.strip_prefix(prefix) {
+                let matches = matching_indices(values, query, |choice| {
+                    (&choice.value, Some(choice.name.as_str()))
+                });
+                self.autocomplete = (!matches.is_empty()).then_some(Autocomplete {
+                    kind: AutocompleteKind::ConfigValues { key },
+                    selected: 0,
+                    matches,
+                });
+                return;
+            }
+        }
+        let Some(query) = self.input.strip_prefix('/') else {
+            self.autocomplete = None;
+            return;
+        };
+        if query.contains(char::is_whitespace) {
+            self.autocomplete = None;
+            return;
+        }
+        let matches = matching_indices(&self.command_choices, query, |command| {
+            (&command.name, Some(command.description.as_str()))
+        });
+        self.autocomplete = (!matches.is_empty()).then_some(Autocomplete {
+            kind: AutocompleteKind::Commands,
+            selected: 0,
+            matches,
+        });
+    }
+
+    fn rebuild_command_choices(&mut self) {
+        let mut commands = builtin_command_choices();
+        for command in &self.agent_commands {
+            let name = command.name.trim();
+            if name.is_empty()
+                || commands
+                    .iter()
+                    .any(|existing| existing.name.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            let input_hint = command.input.as_ref().and_then(|input| match input {
+                AvailableCommandInput::Unstructured(input) => Some(input.hint.clone()),
+                _ => None,
+            });
+            commands.push(CommandChoice {
+                name: name.to_owned(),
+                description: command.description.trim().to_owned(),
+                input_hint,
+                source: CommandSource::Agent,
+            });
+        }
+        self.command_choices = commands;
+        self.update_autocomplete();
+    }
+
+    fn set_config_options(&mut self, options: &[SessionConfigOption]) {
+        self.model_values = config_values(options, "model");
+        self.effort_values = config_values(options, "effort");
+        self.update_autocomplete();
+    }
+
+    fn record_prompt_history(&mut self, prompt: &str) {
+        if self.prompt_history.last().is_none_or(|last| last != prompt) {
+            self.prompt_history.push(prompt.to_owned());
+        }
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    fn move_history(&mut self, delta: isize) {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        let next = match (self.history_index, delta.is_negative()) {
+            (None, true) => {
+                self.history_draft.clone_from(&self.input);
+                Some(self.prompt_history.len() - 1)
+            }
+            (None, false) => None,
+            (Some(index), true) => Some(index.saturating_sub(1)),
+            (Some(index), false) if index + 1 < self.prompt_history.len() => Some(index + 1),
+            (Some(_), false) => None,
+        };
+        self.history_index = next;
+        let input = next
+            .and_then(|index| self.prompt_history.get(index).cloned())
+            .unwrap_or_else(|| self.history_draft.clone());
+        self.input = input;
+        self.input_cursor = self.input.chars().count();
+        self.update_autocomplete();
+    }
+
+    fn edit_latest_queued_prompt(&mut self) {
+        let Some(queued) = self.queued_prompts.pop_back() else {
+            return;
+        };
+        self.set_input(queued.text);
+        self.set_notice("Editing the most recently queued prompt");
+    }
+
+    fn show_help(&mut self) {
+        let commands = self
+            .command_choices
+            .iter()
+            .map(|command| {
+                let hint = command
+                    .input_hint
+                    .as_deref()
+                    .map(|hint| format!(" <{hint}>"))
+                    .unwrap_or_default();
+                let source = match command.source {
+                    CommandSource::Hel => "hel",
+                    CommandSource::Agent => "agent",
+                };
+                format!(
+                    "/{name}{hint} — {description} [{source}]",
+                    name = command.name,
+                    description = command.description
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.entries.push(ChatEntry::plain(
+            self.latest_seq,
+            ChatRole::System,
+            format!("Available commands:\n{commands}"),
+        ));
+    }
+
+    fn submit_input(&mut self) -> ChatAction {
+        let prompt = self.input.trim().to_owned();
+        if prompt.is_empty() {
+            return ChatAction::None;
+        }
+        if let Some((command, args)) = parse_local_command(&prompt) {
+            return match command {
+                LocalCommand::Help => {
+                    self.clear_input();
+                    self.show_help();
+                    ChatAction::None
+                }
+                LocalCommand::Detach => {
+                    self.clear_input();
+                    ChatAction::Back
+                }
+                LocalCommand::Checkpoint => {
+                    self.clear_input();
+                    ChatAction::Checkpoint((!args.is_empty()).then(|| args.to_owned()))
+                }
+                LocalCommand::Model | LocalCommand::Effort => {
+                    let key = if command == LocalCommand::Model {
+                        "model"
+                    } else {
+                        "effort"
+                    };
+                    if self.phase != WorkerPhase::Idle {
+                        self.set_notice(format!(
+                            "/{key} is only available while the agent is idle"
+                        ));
+                        return ChatAction::None;
+                    }
+                    if args.is_empty() {
+                        self.set_notice(format!("usage: /{key} <value>"));
+                        return ChatAction::None;
+                    }
+                    self.clear_input();
+                    ChatAction::SetConfig {
+                        key: key.to_owned(),
+                        value: args.to_owned(),
+                    }
+                }
+            };
+        }
+        if matches!(self.phase, WorkerPhase::Closing | WorkerPhase::Closed) {
+            self.set_notice("The worker is closing; this prompt was not sent");
+            return ChatAction::None;
+        }
+        self.record_prompt_history(&prompt);
+        self.clear_input();
+        if self.phase == WorkerPhase::Running {
+            self.queued_prompts.push_back(QueuedPrompt {
+                text: prompt.clone(),
+            });
+            self.set_notice(format!(
+                "Queued {}: {}",
+                self.queued_prompts.len(),
+                queued_prompt_preview(&prompt)
+            ));
+            ChatAction::None
+        } else {
+            ChatAction::Prompt(prompt)
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> ChatAction {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return ChatAction::None;
@@ -244,41 +618,36 @@ impl ChatState {
             return if self.phase == WorkerPhase::Running {
                 ChatAction::Cancel
             } else {
-                ChatAction::Back
+                ChatAction::None
             };
         }
         match key.code {
             KeyCode::Esc => ChatAction::Back,
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.input.push('\n');
+                self.insert_character('\n');
                 ChatAction::None
             }
             KeyCode::Enter => {
-                let prompt = self.input.trim().to_owned();
-                if prompt.is_empty() || self.phase != WorkerPhase::Idle {
+                if self.accept_autocomplete() {
                     ChatAction::None
-                } else if let Some((key, value)) = slash_config(&prompt) {
-                    self.input.clear();
-                    if value.is_empty() {
-                        self.set_notice(format!("usage: /{key} <value>"));
-                        ChatAction::None
-                    } else {
-                        ChatAction::SetConfig {
-                            key: key.to_owned(),
-                            value: value.to_owned(),
-                        }
-                    }
                 } else {
-                    self.input.clear();
-                    ChatAction::Prompt(prompt)
+                    self.submit_input()
                 }
             }
             KeyCode::Backspace => {
-                self.input.pop();
+                self.backspace();
+                ChatAction::None
+            }
+            KeyCode::Delete => {
+                self.delete();
+                ChatAction::None
+            }
+            KeyCode::Tab => {
+                self.accept_autocomplete();
                 ChatAction::None
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ChatAction::Checkpoint
+                ChatAction::Checkpoint(None)
             }
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 ChatAction::ToggleVoice
@@ -299,7 +668,44 @@ impl ChatState {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.input.push(character);
+                self.insert_character(character);
+                ChatAction::None
+            }
+            KeyCode::Up
+                if key.modifiers.contains(KeyModifiers::ALT) && !self.queued_prompts.is_empty() =>
+            {
+                self.edit_latest_queued_prompt();
+                ChatAction::None
+            }
+            KeyCode::Up if self.autocomplete.is_some() => {
+                self.move_autocomplete(-1);
+                ChatAction::None
+            }
+            KeyCode::Down if self.autocomplete.is_some() => {
+                self.move_autocomplete(1);
+                ChatAction::None
+            }
+            KeyCode::Up => {
+                self.move_history(-1);
+                ChatAction::None
+            }
+            KeyCode::Down => {
+                self.move_history(1);
+                ChatAction::None
+            }
+            KeyCode::Left
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !self.queued_prompts.is_empty() =>
+            {
+                self.edit_latest_queued_prompt();
+                ChatAction::None
+            }
+            KeyCode::Left => {
+                self.move_input_cursor(-1);
+                ChatAction::None
+            }
+            KeyCode::Right => {
+                self.move_input_cursor(1);
                 ChatAction::None
             }
             KeyCode::PageUp => {
@@ -326,13 +732,23 @@ impl ChatState {
                 }
                 ChatAction::None
             }
-            KeyCode::Home => {
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.scroll_top = 0;
                 self.follow_bottom = false;
                 ChatAction::None
             }
-            KeyCode::End => {
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.follow_bottom = true;
+                ChatAction::None
+            }
+            KeyCode::Home => {
+                self.input_cursor = 0;
+                self.update_autocomplete();
+                ChatAction::None
+            }
+            KeyCode::End => {
+                self.input_cursor = self.input.chars().count();
+                self.update_autocomplete();
                 ChatAction::None
             }
             _ => ChatAction::None,
@@ -346,8 +762,14 @@ impl ChatState {
                 self.entries
                     .push(ChatEntry::plain(event.seq, ChatRole::User, text));
             }
-            WorkerEvent::TurnCompleted | WorkerEvent::Cancelled => {
+            WorkerEvent::TurnCompleted => {
                 self.phase = WorkerPhase::Idle;
+            }
+            // The durable worker records cancellation acceptance before the
+            // ACP prompt future resolves. Keep the chat busy until the later
+            // TurnCompleted event so a queued prompt cannot race the runtime.
+            WorkerEvent::Cancelled => {
+                self.phase = WorkerPhase::Running;
             }
             WorkerEvent::Closing => self.phase = WorkerPhase::Closing,
             WorkerEvent::Closed => self.phase = WorkerPhase::Closed,
@@ -380,6 +802,9 @@ impl ChatState {
                 ChatRole::System,
                 format!("{key} set to {value}"),
             )),
+            RuntimeEvent::SessionConfigured { config_options } => {
+                self.set_config_options(&config_options)
+            }
             RuntimeEvent::SessionStarted { resumed, .. } => self.entries.push(ChatEntry::plain(
                 seq,
                 ChatRole::System,
@@ -480,6 +905,13 @@ impl ChatState {
                     self.entries.push(ChatEntry::plan(seq, lines));
                 }
             }
+            SessionUpdate::AvailableCommandsUpdate(update) => {
+                self.agent_commands = update.available_commands;
+                self.rebuild_command_choices();
+            }
+            SessionUpdate::ConfigOptionUpdate(update) => {
+                self.set_config_options(&update.config_options);
+            }
             _ => {}
         }
     }
@@ -498,6 +930,152 @@ impl ChatState {
         entry.message_id = message_id;
         self.entries.push(entry);
     }
+}
+
+fn input_byte_index(input: &str, char_index: usize) -> usize {
+    input
+        .char_indices()
+        .nth(char_index)
+        .map_or(input.len(), |(index, _)| index)
+}
+
+fn matching_indices<T>(
+    values: &[T],
+    query: &str,
+    fields: impl Fn(&T) -> (&str, Option<&str>),
+) -> Vec<usize> {
+    let query = query.to_lowercase();
+    let prefix = values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            fields(value)
+                .0
+                .to_lowercase()
+                .starts_with(&query)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if !prefix.is_empty() {
+        return prefix;
+    }
+    values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            let (primary, secondary) = fields(value);
+            (primary.to_lowercase().contains(&query)
+                || secondary.is_some_and(|secondary| secondary.to_lowercase().contains(&query)))
+            .then_some(index)
+        })
+        .collect()
+}
+
+fn builtin_command_choices() -> Vec<CommandChoice> {
+    [
+        ("help", "show available Hel and agent commands", None),
+        (
+            "detach",
+            "return to the dashboard without stopping the worker",
+            None,
+        ),
+        (
+            "checkpoint",
+            "checkpoint the current session",
+            Some("reason"),
+        ),
+        ("model", "change the active model while idle", Some("value")),
+        (
+            "effort",
+            "change the active reasoning effort while idle",
+            Some("value"),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, description, input_hint)| CommandChoice {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        input_hint: input_hint.map(str::to_owned),
+        source: CommandSource::Hel,
+    })
+    .collect()
+}
+
+fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> {
+    let command = prompt.strip_prefix('/')?;
+    let (name, args) = command
+        .split_once(char::is_whitespace)
+        .map_or((command, ""), |(name, args)| (name, args.trim()));
+    let command = match name {
+        "help" => LocalCommand::Help,
+        "detach" => LocalCommand::Detach,
+        "checkpoint" => LocalCommand::Checkpoint,
+        "model" => LocalCommand::Model,
+        "effort" => LocalCommand::Effort,
+        _ => return None,
+    };
+    Some((command, args))
+}
+
+fn config_values(options: &[SessionConfigOption], key: &str) -> Vec<ConfigValueChoice> {
+    let option = match key {
+        "model" => options
+            .iter()
+            .find(|option| option.id.to_string() == "model")
+            .or_else(|| {
+                options.iter().find(|option| {
+                    option.category == Some(SessionConfigOptionCategory::Model)
+                        && !matches!(
+                            option.id.to_string().as_str(),
+                            "effort" | "reasoning_effort"
+                        )
+                })
+            }),
+        "effort" => options
+            .iter()
+            .find(|option| option.category == Some(SessionConfigOptionCategory::ThoughtLevel))
+            .or_else(|| {
+                options.iter().find(|option| {
+                    matches!(
+                        option.id.to_string().as_str(),
+                        "effort" | "reasoning_effort"
+                    )
+                })
+            }),
+        _ => None,
+    };
+    let Some(option) = option else {
+        return Vec::new();
+    };
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return Vec::new();
+    };
+    let choices = match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect::<Vec<_>>(),
+        SessionConfigSelectOptions::Grouped(groups) => {
+            groups.iter().flat_map(|group| &group.options).collect()
+        }
+        _ => Vec::new(),
+    };
+    choices
+        .into_iter()
+        .map(|choice| ConfigValueChoice {
+            value: choice.value.to_string(),
+            name: choice.name.clone(),
+            description: choice.description.clone(),
+        })
+        .collect()
+}
+
+fn queued_prompt_preview(prompt: &str) -> String {
+    const WIDTH: usize = 72;
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= WIDTH {
+        return collapsed;
+    }
+    let mut preview = collapsed.chars().take(WIDTH - 1).collect::<String>();
+    preview.push('…');
+    preview
 }
 
 fn tool_status(status: &ToolCallStatus) -> ToolStatus {
@@ -582,20 +1160,41 @@ pub async fn run_chat(
     loop {
         while let Ok(update) = voice_updates_rx.try_recv() {
             match update {
-                VoiceUpdate::Partial(text) => chat.input = append_dictation(&voice_prefix, &text),
+                VoiceUpdate::Partial(text) => {
+                    chat.set_input(append_dictation(&voice_prefix, &text))
+                }
                 VoiceUpdate::Status(status) => chat.set_notice(status),
                 VoiceUpdate::Finished(result) => {
                     chat.voice_active = false;
                     voice_cancel = None;
                     match result {
                         Ok(text) => {
-                            chat.input = append_dictation(&voice_prefix, &text);
+                            chat.set_input(append_dictation(&voice_prefix, &text));
                             chat.notice = None;
                         }
                         Err(error) => {
                             chat.set_notice(crate::speech::dictation_error_message(&error))
                         }
                     }
+                }
+            }
+        }
+        if chat.phase == WorkerPhase::Idle
+            && let Some(queued) = chat.queued_prompts.pop_front()
+        {
+            match client.prompt(queued.text.clone(), Vec::new()).await {
+                Ok(_) => chat.mark_prompt_submitted(),
+                Err(error) => {
+                    let dropped = chat.queued_prompts.len();
+                    chat.queued_prompts.clear();
+                    chat.set_input(queued.text);
+                    chat.set_notice(if dropped == 0 {
+                        format!("Queued prompt failed: {error:#}")
+                    } else {
+                        format!(
+                            "Queued prompt failed: {error:#}; dropped {dropped} later prompt(s)"
+                        )
+                    });
                 }
             }
         }
@@ -611,9 +1210,12 @@ pub async fn run_chat(
                     ChatAction::None => None,
                     ChatAction::Prompt(text) => match client.prompt(text.clone(), Vec::new()).await
                     {
-                        Ok(_) => None,
+                        Ok(_) => {
+                            chat.mark_prompt_submitted();
+                            None
+                        }
                         Err(error) => {
-                            chat.input = text;
+                            chat.set_input(text);
                             Some(error)
                         }
                     },
@@ -621,8 +1223,10 @@ pub async fn run_chat(
                         client.set_config(key, value).await.err()
                     }
                     ChatAction::Cancel => client.cancel().await.err(),
-                    ChatAction::Checkpoint => client
-                        .checkpoint(Some("manual chat checkpoint".into()))
+                    ChatAction::Checkpoint(reason) => client
+                        .checkpoint(Some(
+                            reason.unwrap_or_else(|| "manual chat checkpoint".into()),
+                        ))
                         .await
                         .err(),
                     ChatAction::ToggleVoice => {
@@ -669,21 +1273,6 @@ pub async fn run_chat(
     }
 }
 
-fn slash_config(prompt: &str) -> Option<(&str, &str)> {
-    for key in ["model", "effort"] {
-        let command = format!("/{key}");
-        if prompt == command {
-            return Some((key, ""));
-        }
-        if let Some(value) = prompt.strip_prefix(&command)
-            && value.starts_with(char::is_whitespace)
-        {
-            return Some((key, value.trim()));
-        }
-    }
-    None
-}
-
 pub fn render(frame: &mut Frame, chat: &mut ChatState) {
     let area = frame.area();
     let outer = Block::default()
@@ -692,37 +1281,207 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
+    let visible_queued = chat.queued_prompts.len().min(3) as u16;
+    let prompt_height = 4u16.saturating_add(visible_queued);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(5),
-            Constraint::Length(4),
+            Constraint::Length(prompt_height),
             Constraint::Length(1),
         ])
         .split(inner);
     render_transcript(frame, chunks[0], chat);
-    let prompt_title = match chat.phase {
-        WorkerPhase::Idle => " Prompt ",
-        WorkerPhase::Running => " Running (Ctrl-C cancels) ",
-        WorkerPhase::Closing => " Closing ",
-        WorkerPhase::Closed => " Closed ",
+    let queued = chat.queued_prompts.len();
+    let prompt_title = match (chat.phase, queued) {
+        (WorkerPhase::Idle, 0) => " Prompt ".to_owned(),
+        (WorkerPhase::Idle, queued) => format!(" Prompt · {queued} queued "),
+        (WorkerPhase::Running, 0) => " Running · Ctrl-C cancels ".to_owned(),
+        (WorkerPhase::Running, queued) => {
+            format!(" Running · {queued} queued · Ctrl-C cancels ")
+        }
+        (WorkerPhase::Closing, _) => " Closing ".to_owned(),
+        (WorkerPhase::Closed, _) => " Closed ".to_owned(),
     };
+    let prompt_block = Block::default().borders(Borders::ALL).title(prompt_title);
+    let prompt_inner = prompt_block.inner(chunks[1]);
+    let mut prompt_lines = chat
+        .queued_prompts
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .enumerate()
+        .map(|(index, queued)| {
+            Line::from(Span::styled(
+                truncate_to_width(
+                    &format!(
+                        "queued {}: {}",
+                        index + 1,
+                        queued_prompt_preview(&queued.text)
+                    ),
+                    usize::from(prompt_inner.width),
+                ),
+                Style::default().fg(Color::DarkGray),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let queue_rows = prompt_lines.len();
+    prompt_lines.extend(
+        chat.input
+            .split('\n')
+            .map(|line| Line::raw(line.to_owned())),
+    );
     frame.render_widget(
-        Paragraph::new(chat.input.as_str())
+        Paragraph::new(prompt_lines)
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(prompt_title)),
+            .block(prompt_block),
         chunks[1],
+    );
+    set_input_cursor(
+        frame,
+        prompt_inner,
+        &chat.input,
+        chat.input_cursor,
+        queue_rows,
     );
     let default_footer = if chat.voice_active {
         "Listening… Ctrl-V stop · Esc back (worker keeps running)"
     } else {
-        "Enter send · Shift-Enter newline · Ctrl-R raw/rich · Ctrl-V dictate · Ctrl-P checkpoint · Esc back"
+        "Enter send/queue · Shift-Enter newline · Alt-Up edit queued · Ctrl-C cancel · Ctrl-P checkpoint · Esc dashboard"
     };
     let footer = chat.notice.as_deref().unwrap_or(default_footer);
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
+    render_autocomplete(frame, chunks[1], chat);
+}
+
+fn set_input_cursor(frame: &mut Frame, area: Rect, input: &str, cursor: usize, queue_rows: usize) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = usize::from(area.width);
+    let mut row = queue_rows;
+    let mut column = 0usize;
+    for character in input.chars().take(cursor) {
+        if character == '\n' {
+            row += 1;
+            column = 0;
+        } else {
+            column += 1;
+            if column >= width {
+                row += 1;
+                column = 0;
+            }
+        }
+    }
+    if row < usize::from(area.height) {
+        frame.set_cursor_position((
+            area.x + column.min(width.saturating_sub(1)) as u16,
+            area.y + row as u16,
+        ));
+    }
+}
+
+fn render_autocomplete(frame: &mut Frame, prompt_area: Rect, chat: &ChatState) {
+    let Some(autocomplete) = chat.autocomplete.as_ref() else {
+        return;
+    };
+    let visible = autocomplete.matches.len().min(8);
+    if visible == 0 {
+        return;
+    }
+    let height = (visible as u16).saturating_add(2);
+    let area = Rect::new(
+        prompt_area.x,
+        prompt_area.y.saturating_sub(height),
+        prompt_area.width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let title = match autocomplete.kind {
+        AutocompleteKind::Commands => " commands · ↑/↓ select · Tab/Enter accept ",
+        AutocompleteKind::ConfigValues { .. } => " values · ↑/↓ select · Tab/Enter accept ",
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let start = autocomplete
+        .selected
+        .saturating_sub(visible.saturating_sub(1));
+    let items = autocomplete.matches[start..]
+        .iter()
+        .take(visible)
+        .enumerate()
+        .filter_map(|(offset, index)| {
+            let selected = start + offset == autocomplete.selected;
+            autocomplete_row(chat, autocomplete.kind, *index).map(|row| {
+                ListItem::new(truncate_to_width(&row, usize::from(inner.width))).style(
+                    if selected {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(items), inner);
+}
+
+fn autocomplete_row(chat: &ChatState, kind: AutocompleteKind, index: usize) -> Option<String> {
+    match kind {
+        AutocompleteKind::Commands => {
+            let command = chat.command_choices.get(index)?;
+            let hint = command
+                .input_hint
+                .as_deref()
+                .map(|hint| format!(" <{hint}>"))
+                .unwrap_or_default();
+            let source = match command.source {
+                CommandSource::Hel => "hel",
+                CommandSource::Agent => "agent",
+            };
+            Some(format!(
+                "/{}{hint}  — {} [{source}]",
+                command.name, command.description
+            ))
+        }
+        AutocompleteKind::ConfigValues { key: "model" } => {
+            config_value_row(chat.model_values.get(index)?)
+        }
+        AutocompleteKind::ConfigValues { key: "effort" } => {
+            config_value_row(chat.effort_values.get(index)?)
+        }
+        AutocompleteKind::ConfigValues { .. } => None,
+    }
+}
+
+fn config_value_row(choice: &ConfigValueChoice) -> Option<String> {
+    let description = choice
+        .description
+        .as_deref()
+        .filter(|description| !description.trim().is_empty())
+        .map(|description| format!(" — {description}"))
+        .unwrap_or_default();
+    Some(format!("{} ({}){description}", choice.name, choice.value))
+}
+
+fn truncate_to_width(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let mut truncated = text.chars().take(width - 1).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 enum VoiceUpdate {
@@ -1075,7 +1834,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_submits_only_while_idle() {
+    fn enter_sends_while_idle_and_queues_while_running() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.handle_key(key(KeyCode::Char('h')));
         chat.handle_key(key(KeyCode::Char('i')));
@@ -1094,6 +1853,71 @@ mod tests {
         let mut chat = ChatState::new(&running, &[]);
         chat.handle_key(key(KeyCode::Char('x')));
         assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
+        assert_eq!(chat.queued_prompts.len(), 1);
+        assert_eq!(chat.queued_prompts[0].text, "x");
+        assert!(chat.entries.is_empty());
+    }
+
+    #[test]
+    fn submitting_a_prompt_clears_a_stale_queue_notice() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_notice("Queued 1: next");
+
+        chat.mark_prompt_submitted();
+
+        assert_eq!(chat.phase, WorkerPhase::Running);
+        assert!(chat.notice.is_none());
+    }
+
+    #[test]
+    fn control_c_only_cancels_an_active_turn_and_escape_detaches() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        let control_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(chat.handle_key(control_c), ChatAction::None);
+        assert_eq!(chat.handle_key(key(KeyCode::Esc)), ChatAction::Back);
+
+        chat.phase = WorkerPhase::Running;
+        assert_eq!(chat.handle_key(control_c), ChatAction::Cancel);
+    }
+
+    #[test]
+    fn cancellation_waits_for_turn_completion_before_queue_can_drain() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.phase = WorkerPhase::Running;
+        chat.queued_prompts.push_back(QueuedPrompt {
+            text: "next".into(),
+        });
+        chat.apply_event(&SequencedEvent {
+            seq: 1,
+            request_id: Some("cancel".into()),
+            event: WorkerEvent::Cancelled,
+        });
+        assert_eq!(chat.phase, WorkerPhase::Running);
+
+        chat.apply_event(&SequencedEvent {
+            seq: 2,
+            request_id: None,
+            event: WorkerEvent::TurnCompleted,
+        });
+        assert_eq!(chat.phase, WorkerPhase::Idle);
+        assert_eq!(chat.queued_prompts.front().unwrap().text, "next");
+    }
+
+    #[test]
+    fn alt_up_recovers_the_latest_queued_prompt_for_editing() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.queued_prompts.push_back(QueuedPrompt {
+            text: "first".into(),
+        });
+        chat.queued_prompts.push_back(QueuedPrompt {
+            text: "second".into(),
+        });
+
+        chat.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+
+        assert_eq!(chat.input, "second");
+        assert_eq!(chat.queued_prompts.len(), 1);
+        assert_eq!(chat.queued_prompts[0].text, "first");
     }
 
     #[test]
@@ -1125,6 +1949,97 @@ mod tests {
 
         assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
         assert_eq!(chat.notice.as_deref(), Some("usage: /model <value>"));
+    }
+
+    #[test]
+    fn local_command_parser_requires_an_exact_command_boundary() {
+        assert_eq!(
+            parse_local_command("/checkpoint before refactor"),
+            Some((LocalCommand::Checkpoint, "before refactor"))
+        );
+        assert_eq!(parse_local_command("/checkpointing"), None);
+        assert_eq!(parse_local_command("explain /checkpoint"), None);
+    }
+
+    #[test]
+    fn autocomplete_merges_agent_commands_without_overriding_hel_commands() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.apply_session_update(
+            1,
+            &serde_json::json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {"name": "review", "description": "agent review", "input": {"hint": "scope"}},
+                    {"name": "help", "description": "agent help"}
+                ]
+            }),
+        );
+        assert!(
+            chat.command_choices.iter().any(|command| {
+                command.name == "review" && command.source == CommandSource::Agent
+            })
+        );
+        assert_eq!(
+            chat.command_choices
+                .iter()
+                .filter(|command| command.name == "help")
+                .count(),
+            1
+        );
+
+        chat.set_input("/rev".into());
+        assert!(chat.accept_autocomplete());
+        assert_eq!(chat.input, "/review ");
+    }
+
+    #[test]
+    fn config_value_autocomplete_uses_advertised_acp_choices() {
+        use agent_client_protocol::schema::v1::{
+            SessionConfigSelectOption, SessionConfigSelectOptions,
+        };
+
+        let options = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "auto",
+                SessionConfigSelectOptions::Ungrouped(vec![
+                    SessionConfigSelectOption::new("auto", "Auto"),
+                    SessionConfigSelectOption::new("gpt-5.6-luna", "Luna"),
+                ]),
+            )
+            .category(SessionConfigOptionCategory::Model),
+        ];
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_config_options(&options);
+        chat.set_input("/model lun".into());
+
+        assert!(chat.accept_autocomplete());
+        assert_eq!(chat.input, "/model gpt-5.6-luna");
+    }
+
+    #[test]
+    fn editor_supports_cursor_insertion_deletion_and_prompt_history() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("ac".into());
+        chat.handle_key(key(KeyCode::Left));
+        chat.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(chat.input, "abc");
+        chat.handle_key(key(KeyCode::Backspace));
+        assert_eq!(chat.input, "ac");
+        chat.handle_key(key(KeyCode::Delete));
+        assert_eq!(chat.input, "a");
+
+        chat.set_input("remember me".into());
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::Prompt("remember me".into())
+        );
+        chat.phase = WorkerPhase::Idle;
+        chat.handle_key(key(KeyCode::Up));
+        assert_eq!(chat.input, "remember me");
+        chat.handle_key(key(KeyCode::Down));
+        assert!(chat.input.is_empty());
     }
 
     #[test]
@@ -1303,7 +2218,7 @@ mod tests {
         assert_eq!(chat.scroll_top, 20);
         assert!(chat.follow_bottom);
         chat.handle_key(key(KeyCode::PageUp));
-        chat.handle_key(key(KeyCode::End));
+        chat.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
         assert!(chat.follow_bottom);
     }
 

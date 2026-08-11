@@ -310,6 +310,7 @@ mod unix {
         match event {
             RuntimeEvent::Connected { .. } => "connected",
             RuntimeEvent::SessionStarted { .. } => "session_started",
+            RuntimeEvent::SessionConfigured { .. } => "session_configured",
             RuntimeEvent::SessionUpdate { .. } => "session_update",
             RuntimeEvent::PermissionAutoApproved { .. } => "permission_auto_approved",
             RuntimeEvent::PromptFinished { .. } => "prompt_finished",

@@ -327,10 +327,11 @@ impl DashboardState {
                     detail.agent_text_stream_open = false;
                     detail.current_turn_started_at = Some(observed_at_epoch_seconds);
                 }
-                WorkerEvent::TurnCompleted | WorkerEvent::Cancelled => {
+                WorkerEvent::TurnCompleted => {
                     detail.agent_text_stream_open = false;
                     detail.current_turn_started_at = None;
                 }
+                WorkerEvent::Cancelled => detail.agent_text_stream_open = false,
                 WorkerEvent::Adapter { payload, .. } => {
                     if let Some(activity) = activity_from_adapter(payload) {
                         if activity.kind == ActivityKind::AgentText {
