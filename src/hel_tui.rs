@@ -12,8 +12,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState,
-    Wrap,
+    Block, BorderType, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState,
+    Paragraph, Row, Table, TableState, Wrap,
 };
 
 use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
@@ -62,8 +62,29 @@ pub enum DashboardAction {
         title: String,
     },
     RefreshQuotas,
+    OpenImport,
+    ImportSession {
+        profile_id: String,
+        session_id: String,
+        title: String,
+    },
     OpenConfig,
     QuitDetach,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportSessionOption {
+    pub session_id: String,
+    pub title: String,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportProfileOption {
+    pub profile_id: String,
+    pub harness_kind: HarnessKind,
+    pub sessions: Vec<ImportSessionOption>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +169,24 @@ enum Mode {
     New(NewWizard),
     Resume(ResumeWizard),
     Rename(RenameEditor),
+    Import(ImportDialog),
     Confirm(Confirmation),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportPane {
+    Profiles,
+    Sessions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportDialog {
+    discovery_id: u64,
+    profiles: Vec<ImportProfileOption>,
+    profile_index: usize,
+    session_index: usize,
+    pane: ImportPane,
+    loading: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +354,41 @@ impl DashboardState {
         });
     }
 
+    pub fn show_import_dialog(&mut self, discovery_id: u64, profiles: Vec<ImportProfileOption>) {
+        self.mode = Mode::Import(ImportDialog {
+            discovery_id,
+            profiles,
+            profile_index: 0,
+            session_index: 0,
+            pane: ImportPane::Profiles,
+            loading: true,
+        });
+    }
+
+    pub fn apply_import_profiles(&mut self, discovery_id: u64, profiles: Vec<ImportProfileOption>) {
+        let Mode::Import(dialog) = &mut self.mode else {
+            return;
+        };
+        if dialog.discovery_id != discovery_id {
+            return;
+        }
+        let selected_profile = dialog
+            .profiles
+            .get(dialog.profile_index)
+            .map(|profile| profile.profile_id.clone());
+        dialog.profiles = profiles;
+        dialog.profile_index = selected_profile
+            .and_then(|selected| {
+                dialog
+                    .profiles
+                    .iter()
+                    .position(|profile| profile.profile_id == selected)
+            })
+            .unwrap_or(0);
+        dialog.session_index = 0;
+        dialog.loading = false;
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return DashboardAction::None;
@@ -330,6 +403,7 @@ impl DashboardState {
             Mode::New(wizard) => self.handle_new_key(key.code, wizard),
             Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
             Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
+            Mode::Import(dialog) => self.handle_import_key(key.code, dialog),
             Mode::Confirm(confirmation) => self.handle_confirmation_key(key.code, confirmation),
         }
     }
@@ -366,6 +440,7 @@ impl DashboardState {
                 self.begin_new();
                 DashboardAction::None
             }
+            KeyCode::Char('i') => DashboardAction::OpenImport,
             KeyCode::Char('r') => {
                 if self.focus == Focus::Quotas {
                     DashboardAction::RefreshQuotas
@@ -392,6 +467,85 @@ impl DashboardState {
             }
             KeyCode::Enter | KeyCode::Char('o') => self.open_or_resume(),
             _ => DashboardAction::None,
+        }
+    }
+
+    fn handle_import_key(&mut self, code: KeyCode, mut dialog: ImportDialog) -> DashboardAction {
+        match code {
+            KeyCode::Esc => {
+                self.cancel_modal();
+                DashboardAction::None
+            }
+            KeyCode::Left | KeyCode::BackTab => {
+                dialog.pane = ImportPane::Profiles;
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                dialog.pane = ImportPane::Sessions;
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                match dialog.pane {
+                    ImportPane::Profiles => {
+                        move_index(&mut dialog.profile_index, dialog.profiles.len(), -1);
+                        dialog.session_index = 0;
+                    }
+                    ImportPane::Sessions => {
+                        let len = dialog
+                            .profiles
+                            .get(dialog.profile_index)
+                            .map_or(0, |profile| profile.sessions.len());
+                        move_index(&mut dialog.session_index, len, -1);
+                    }
+                }
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                match dialog.pane {
+                    ImportPane::Profiles => {
+                        move_index(&mut dialog.profile_index, dialog.profiles.len(), 1);
+                        dialog.session_index = 0;
+                    }
+                    ImportPane::Sessions => {
+                        let len = dialog
+                            .profiles
+                            .get(dialog.profile_index)
+                            .map_or(0, |profile| profile.sessions.len());
+                        move_index(&mut dialog.session_index, len, 1);
+                    }
+                }
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Enter if dialog.pane == ImportPane::Profiles => {
+                dialog.pane = ImportPane::Sessions;
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Enter => {
+                let Some(profile) = dialog.profiles.get(dialog.profile_index) else {
+                    self.mode = Mode::Import(dialog);
+                    return DashboardAction::None;
+                };
+                let Some(session) = profile.sessions.get(dialog.session_index) else {
+                    self.mode = Mode::Import(dialog);
+                    return DashboardAction::None;
+                };
+                let action = DashboardAction::ImportSession {
+                    profile_id: profile.profile_id.clone(),
+                    session_id: session.session_id.clone(),
+                    title: session.title.clone(),
+                };
+                self.cancel_modal();
+                action
+            }
+            _ => {
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
         }
     }
 
@@ -1188,9 +1342,114 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
         Mode::New(wizard) => render_new_wizard(frame, area, dashboard, wizard),
         Mode::Resume(wizard) => render_resume_wizard(frame, area, dashboard, wizard),
         Mode::Rename(editor) => render_rename_editor(frame, area, editor),
+        Mode::Import(dialog) => render_import_dialog(frame, area, dialog),
         Mode::Confirm(confirmation) => render_confirmation(frame, area, confirmation),
         Mode::Dashboard => {}
     }
+}
+
+fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
+    let popup = centered_rect(82, 22, area);
+    frame.render_widget(Clear, popup);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" Import native session ");
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .split(inner);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .split(rows[0]);
+
+    let profile_items = dialog
+        .profiles
+        .iter()
+        .map(|profile| {
+            ListItem::new(format!(
+                "{}  {}",
+                profile.profile_id,
+                harness_label(profile.harness_kind)
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut profile_state = ListState::default()
+        .with_selected((!dialog.profiles.is_empty()).then_some(dialog.profile_index));
+    frame.render_stateful_widget(
+        List::new(profile_items)
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(focus_border(dialog.pane == ImportPane::Profiles))
+                    .title(" Profiles "),
+            ),
+        panes[0],
+        &mut profile_state,
+    );
+
+    let selected_profile = dialog.profiles.get(dialog.profile_index);
+    let session_items = if dialog.loading {
+        vec![ListItem::new("Scanning native sessions…")]
+    } else {
+        selected_profile
+            .map(|profile| {
+                if let Some(error) = &profile.error {
+                    vec![ListItem::new(format!("Unavailable: {error}"))]
+                } else if profile.sessions.is_empty() {
+                    vec![ListItem::new("No native sessions found")]
+                } else {
+                    profile
+                        .sessions
+                        .iter()
+                        .map(|session| {
+                            ListItem::new(vec![
+                                Line::styled(
+                                    truncate_text(
+                                        &session.title,
+                                        panes[1].width.saturating_sub(4) as usize,
+                                    ),
+                                    Style::default().add_modifier(Modifier::BOLD),
+                                ),
+                                Line::styled(
+                                    session.details.clone(),
+                                    Style::default().fg(Color::Gray),
+                                ),
+                            ])
+                        })
+                        .collect()
+                }
+            })
+            .unwrap_or_default()
+    };
+    let selectable_sessions =
+        !dialog.loading && selected_profile.is_some_and(|profile| !profile.sessions.is_empty());
+    let mut session_state =
+        ListState::default().with_selected(selectable_sessions.then_some(dialog.session_index));
+    frame.render_stateful_widget(
+        List::new(session_items)
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(focus_border(dialog.pane == ImportPane::Sessions))
+                    .title(" Native sessions · newest first "),
+            ),
+        panes[1],
+        &mut session_state,
+    );
+
+    frame.render_widget(
+        Paragraph::new("←/→ pane · ↑/↓ select · Enter import · Esc cancel")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Gray)),
+        rows[1],
+    );
 }
 
 fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
@@ -1367,8 +1626,14 @@ fn session_values(
     let checkpoint = session
         .checkpoint
         .as_ref()
-        .map(|checkpoint| checkpoint.created_at.as_str())
-        .unwrap_or("never");
+        .map(|checkpoint| {
+            if session.state.is_active() {
+                checkpoint_age(now_epoch_seconds, &checkpoint.created_at)
+            } else {
+                checkpoint.created_at.clone()
+            }
+        })
+        .unwrap_or_else(|| "never".into());
     let clock = crate::usage_format::format_turn_clock(
         now_epoch_seconds,
         detail.and_then(|detail| detail.current_turn_started_at),
@@ -1378,7 +1643,7 @@ fn session_values(
         clock,
         session.last_profile.clone(),
         session_target(config, session),
-        checkpoint.to_string(),
+        checkpoint,
         session_name(session).to_string(),
     )
 }
@@ -1437,9 +1702,26 @@ fn archived_session_row(
     now_epoch_seconds: u64,
     config: &HelConfig,
 ) -> Row<'static> {
-    let (clock, profile, target, checkpoint, session_name) =
+    let (_clock, profile, target, checkpoint, session_name) =
         session_values(session, None, now_epoch_seconds, config);
-    Row::new([clock, profile, target, checkpoint, session_name])
+    Row::new([String::new(), profile, target, checkpoint, session_name])
+}
+
+fn checkpoint_age(now_epoch_seconds: u64, checkpointed_at: &str) -> String {
+    let Ok(checkpointed_at) = chrono::DateTime::parse_from_rfc3339(checkpointed_at) else {
+        return "unknown".into();
+    };
+    let checkpointed_at = checkpointed_at.timestamp().max(0) as u64;
+    let age = now_epoch_seconds.saturating_sub(checkpointed_at);
+    if age < 60 {
+        format!("{age}s")
+    } else if age < 3_600 {
+        format!("{}m", age / 60)
+    } else if age < 86_400 {
+        format!("{}h", age / 3_600)
+    } else {
+        format!("{}d", age / 86_400)
+    }
 }
 
 fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
@@ -1520,7 +1802,7 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
 
 fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     let text = dashboard.notice.as_deref().unwrap_or(
-        "n new · Enter open/resume · r rename · p checkpoint · c close · u quota · Tab pane · q detach",
+        "n new · i import · r rename · p checkpoint · c close · u quota · Tab pane · q detach",
     );
     let style = if dashboard.notice.is_some() {
         Style::default().fg(Color::Yellow)
@@ -2461,6 +2743,115 @@ mod tests {
     }
 
     #[test]
+    fn import_dialog_selects_a_session_from_the_chosen_profile() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('i'))),
+            DashboardAction::OpenImport
+        );
+        let profiles = vec![
+            ImportProfileOption {
+                profile_id: "codex-1".into(),
+                harness_kind: HarnessKind::Codex,
+                sessions: vec![ImportSessionOption {
+                    session_id: "codex-session".into(),
+                    title: "Codex title".into(),
+                    details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
+                }],
+                error: None,
+            },
+            ImportProfileOption {
+                profile_id: "claude-1".into(),
+                harness_kind: HarnessKind::Claude,
+                sessions: vec![ImportSessionOption {
+                    session_id: "claude-session".into(),
+                    title: "Claude title".into(),
+                    details: "4m ago · master · 2.0MB · ~/Projects/hel".into(),
+                }],
+                error: None,
+            },
+        ];
+        dashboard.show_import_dialog(1, profiles.clone());
+        dashboard.apply_import_profiles(1, profiles);
+
+        dashboard.handle_key(key(KeyCode::Down));
+        dashboard.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ImportSession {
+                profile_id: "claude-1".into(),
+                session_id: "claude-session".into(),
+                title: "Claude title".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn import_dialog_renders_profile_and_session_panes() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        let profiles = vec![ImportProfileOption {
+            profile_id: "codex-1".into(),
+            harness_kind: HarnessKind::Codex,
+            sessions: vec![ImportSessionOption {
+                session_id: "native-session-1".into(),
+                title: "Native session title".into(),
+                details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
+            }],
+            error: None,
+        }];
+        dashboard.show_import_dialog(1, profiles.clone());
+        dashboard.apply_import_profiles(1, profiles);
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Profiles"));
+        assert!(rendered.contains("Native sessions"));
+        assert!(rendered.contains("codex-1"));
+        assert!(rendered.contains("Native session title"));
+        assert!(rendered.contains("1.0MB"));
+        assert!(rendered.contains("~/Projects/hel"));
+    }
+
+    #[test]
+    fn import_dialog_shows_profiles_while_sessions_are_still_loading() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.show_import_dialog(
+            7,
+            vec![ImportProfileOption {
+                profile_id: "codex-1".into(),
+                harness_kind: HarnessKind::Codex,
+                sessions: Vec::new(),
+                error: None,
+            }],
+        );
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("codex-1"));
+        assert!(rendered.contains("Scanning native sessions"));
+    }
+
+    #[test]
     fn resume_profile_step_marks_cross_harness_profiles_as_lossy() {
         let mut dashboard = dashboard_with_session(archived_session());
         dashboard.handle_key(key(KeyCode::Enter));
@@ -2526,6 +2917,40 @@ mod tests {
         assert!(rendered.contains("ACP pretty name"));
         assert!(!rendered.contains("native-1"));
         assert!(!rendered.contains("Raise the dead"));
+    }
+
+    #[test]
+    fn archived_sessions_leave_the_turn_clock_cell_blank() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Turn clock"));
+        assert!(rendered.contains("2026-08-09T01:00:00Z"));
+        assert!(!rendered.contains("idle"));
+    }
+
+    #[test]
+    fn active_checkpoint_age_uses_compact_seconds_minutes_hours_and_days() {
+        let checkpointed_at = "2026-08-09T01:00:00Z";
+        let base = chrono::DateTime::parse_from_rfc3339(checkpointed_at)
+            .unwrap()
+            .timestamp() as u64;
+
+        assert_eq!(checkpoint_age(base + 12, checkpointed_at), "12s");
+        assert_eq!(checkpoint_age(base + 8 * 60, checkpointed_at), "8m");
+        assert_eq!(checkpoint_age(base + 3 * 3_600, checkpointed_at), "3h");
+        assert_eq!(checkpoint_age(base + 2 * 86_400, checkpointed_at), "2d");
     }
 
     #[test]
