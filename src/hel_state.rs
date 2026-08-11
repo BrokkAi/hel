@@ -480,7 +480,8 @@ mod tests {
                     primary_repo: "hel".into(),
                     repositories: vec![ProjectRepository {
                         id: "hel".into(),
-                        github: "BrokkAi/hel".into(),
+                        github: Some("BrokkAi/hel".into()),
+                        local: None,
                         destination: PathBuf::from("hel"),
                         git_ref: None,
                     }],

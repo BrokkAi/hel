@@ -1,23 +1,28 @@
 //! Controller-side lifecycle transitions and canonical-to-backend conversion.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
 use crate::hel_archive::{
-    BundleManifest, PayloadRole, SessionManifest, TargetManifest, read_archive_verified,
+    ArchiveInput, BundleManifest, GitCollectionSpec, PayloadRole, SessionManifest, SystemGit,
+    TargetManifest, collect_git_snapshot, read_archive_verified, write_archive_atomic,
 };
 use crate::hel_checkpoint::{
     CheckpointExportSpec, CheckpointRepositorySpec, CheckpointRestoreSpec, CheckpointTransfer,
-    export_command, restore_command,
+    RepositoryRestoreSpec, export_command, restore_command,
 };
 use crate::hel_config::{
     AwsAddressSource, HelConfig, ProjectBundle, SshConnection, TargetTemplate, data_dir,
     sessions_dir,
 };
+use crate::hel_git_proxy::{GitBrokerSpec, broker_is_alive};
+use crate::hel_local_git::{canonical_repository, dirty_local_repositories};
 use crate::hel_state::{
     CheckpointMetadata, HelState, SessionRecord, SessionState, TargetLocator, new_session_id,
     normalize_session_title,
@@ -92,15 +97,46 @@ impl Controller {
         title: impl Into<String>,
         additional_mounts: Vec<AdditionalMount>,
     ) -> Result<String> {
+        self.register_session_with_mounts_allow_dirty(
+            profile_id,
+            bundle_id,
+            target_id,
+            title,
+            additional_mounts,
+            false,
+        )
+    }
+
+    pub fn register_session_with_mounts_allow_dirty(
+        &mut self,
+        profile_id: &str,
+        bundle_id: &str,
+        target_id: &str,
+        title: impl Into<String>,
+        additional_mounts: Vec<AdditionalMount>,
+        allow_dirty_local: bool,
+    ) -> Result<String> {
         let profile = self
             .config
             .profiles
             .get(profile_id)
             .with_context(|| format!("unknown profile {profile_id:?}"))?;
-        self.config
+        let bundle = self
+            .config
             .bundles
             .get(bundle_id)
             .with_context(|| format!("unknown bundle {bundle_id:?}"))?;
+        let dirty = dirty_local_repositories(bundle)?;
+        if !allow_dirty_local && !dirty.is_empty() {
+            let repositories = dirty
+                .iter()
+                .map(|repository| format!("{} ({})", repository.path.display(), repository.summary))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "local repositories have uncommitted changes: {repositories}; explicit confirmation is required"
+            );
+        }
         let template = self
             .config
             .targets
@@ -289,6 +325,7 @@ impl Controller {
         executor: &impl CommandExecutor,
     ) -> Result<Option<String>> {
         let (backend, worker_root) = self.prepare_worker_files(session_id, executor, true)?;
+        self.connect_local_repositories(session_id, &backend, &worker_root, executor)?;
         start_worker(executor, &backend, &worker_root)?;
         match handshake_worker(&hel_targets::reconnect_plan(&backend, session_id)?.commands[0])
             .await
@@ -376,6 +413,147 @@ impl Controller {
             &profile_stage,
         )?;
         Ok((backend, worker_root))
+    }
+
+    fn connect_local_repositories(
+        &self,
+        session_id: &str,
+        backend: &hel_targets::TargetLocator,
+        worker_root: &str,
+        executor: &impl CommandExecutor,
+    ) -> Result<()> {
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?;
+        let bundle = self
+            .config
+            .bundles
+            .get(&session.bundle_id)
+            .context("session bundle is missing")?;
+        let local = bundle
+            .repositories
+            .iter()
+            .filter_map(|repository| repository.local.as_ref().map(|path| (repository, path)))
+            .collect::<Vec<_>>();
+        if local.is_empty() {
+            return Ok(());
+        }
+
+        let absolute_worker_root =
+            absolute_target_path(executor, backend, session_id, worker_root)?;
+        let repositories = local
+            .iter()
+            .map(|(repository, path)| Ok((repository.id.clone(), canonical_repository(path)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        ensure_git_broker(session_id, backend, repositories)?;
+
+        let workspace_root = match backend {
+            hel_targets::TargetLocator::LocalPodman { .. }
+            | hel_targets::TargetLocator::AppleContainer { .. }
+            | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_owned(),
+            hel_targets::TargetLocator::AwsEc2 { workspace, .. }
+            | hel_targets::TargetLocator::SshBare { workspace, .. } => workspace.clone(),
+        };
+        let mut missing = Vec::new();
+        for &(repository, source) in &local {
+            local_branch(source)?;
+            let destination = format!(
+                "{workspace_root}/{}",
+                repository.destination.to_string_lossy()
+            );
+            let origin = local_origin_url(&absolute_worker_root, &repository.id);
+            for (args, purpose) in [
+                (
+                    vec![
+                        "git".into(),
+                        "-C".into(),
+                        destination.clone(),
+                        "config".into(),
+                        "protocol.ext.allow".into(),
+                        "always".into(),
+                    ],
+                    "enable the confined local Git transport",
+                ),
+                (
+                    vec![
+                        "git".into(),
+                        "-C".into(),
+                        destination.clone(),
+                        "config".into(),
+                        "remote.origin.url".into(),
+                        origin,
+                    ],
+                    "configure local Git origin",
+                ),
+                (
+                    vec![
+                        "git".into(),
+                        "-C".into(),
+                        destination.clone(),
+                        "config".into(),
+                        "remote.origin.fetch".into(),
+                        "+refs/heads/*:refs/remotes/origin/*".into(),
+                    ],
+                    "configure local Git fetch refspec",
+                ),
+            ] {
+                execute_checked(
+                    executor,
+                    hel_targets::command_on_locator(backend, session_id, args, purpose)?,
+                )?;
+            }
+            let has_head = executor.execute(&hel_targets::command_on_locator(
+                backend,
+                session_id,
+                vec![
+                    "git".into(),
+                    "-C".into(),
+                    destination.clone(),
+                    "rev-parse".into(),
+                    "--verify".into(),
+                    "HEAD".into(),
+                ],
+                "inspect local Git bootstrap state",
+            )?)?;
+            if has_head.status != 0 {
+                missing.push((repository, source));
+            }
+        }
+        if !missing.is_empty() {
+            restore_local_repository_seed(
+                executor,
+                backend,
+                session,
+                bundle,
+                &workspace_root,
+                worker_root,
+                &missing,
+            )?;
+        }
+        for (repository, _) in local {
+            let destination = format!(
+                "{workspace_root}/{}",
+                repository.destination.to_string_lossy()
+            );
+            execute_checked(
+                executor,
+                hel_targets::command_on_locator(
+                    backend,
+                    session_id,
+                    vec![
+                        "git".into(),
+                        "-C".into(),
+                        destination.clone(),
+                        "fetch".into(),
+                        "origin".into(),
+                    ],
+                    "fetch local Git origin",
+                )?,
+            )?;
+        }
+        Ok(())
     }
 
     /// Collect the dead worker's exit record and log tail for a session whose
@@ -512,6 +690,12 @@ impl Controller {
             execute_checked(
                 &ProcessExecutor,
                 restore_command(&backend, session_id, &remote_spec)?,
+            )?;
+            self.connect_local_repositories(
+                session_id,
+                &backend,
+                &worker_root,
+                &ProcessExecutor,
             )?;
             start_worker(&ProcessExecutor, &backend, &worker_root)?;
             handshake_worker(&hel_targets::reconnect_plan(&backend, session_id)?.commands[0])
@@ -680,11 +864,19 @@ impl Controller {
                 .map(|repository| CheckpointRepositorySpec {
                     id: repository.id.clone(),
                     relative_destination: repository.destination.clone(),
-                    base_commit: repository
-                        .git_ref
-                        .as_deref()
-                        .map(|git_ref| format!("origin/{git_ref}"))
-                        .unwrap_or_else(|| "origin/HEAD".into()),
+                    base_commit: if repository.is_local() {
+                        "refs/hel/base".into()
+                    } else {
+                        repository
+                            .git_ref
+                            .as_deref()
+                            .map(|git_ref| format!("origin/{git_ref}"))
+                            .unwrap_or_else(|| "origin/HEAD".into())
+                    },
+                    full_history: repository.is_local(),
+                    origin_override: repository
+                        .is_local()
+                        .then(|| format!("hel-local:{}", repository.id)),
                 })
                 .collect(),
             output_path: target_path(&remote_archive),
@@ -1155,7 +1347,7 @@ fn backend_bundle(bundle: &ProjectBundle) -> Result<ProjectBundleSpec> {
             .repositories
             .iter()
             .map(|repository| RepositorySpec {
-                url: github_url(&repository.github),
+                url: repository.github.as_deref().map(github_url),
                 destination: repository.destination.to_string_lossy().into_owned(),
                 git_ref: repository.git_ref.clone(),
             })
@@ -1518,6 +1710,238 @@ fn backend_locator(
             }
         }
     })
+}
+
+fn absolute_target_path(
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+    path: &str,
+) -> Result<String> {
+    if path.starts_with('/') {
+        return Ok(path.to_owned());
+    }
+    let output = execute_checked(
+        executor,
+        hel_targets::command_on_locator(
+            locator,
+            session_id,
+            vec!["pwd".into()],
+            "resolve target home directory",
+        )?,
+    )?;
+    let directory = String::from_utf8(output.stdout).context("decode target working directory")?;
+    let directory = directory.trim_end_matches(['\r', '\n', '/']);
+    if directory.is_empty() || !directory.starts_with('/') {
+        bail!("target returned an invalid working directory {directory:?}");
+    }
+    Ok(format!("{directory}/{path}"))
+}
+
+fn local_branch(repository: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .current_dir(repository)
+        .output()
+        .with_context(|| format!("read current branch in {}", repository.display()))?;
+    if !output.status.success() {
+        bail!(
+            "local repository {} must have a branch checked out before Hel can expose it as origin",
+            repository.display()
+        );
+    }
+    let branch = String::from_utf8(output.stdout).context("decode local Git branch")?;
+    let branch = branch.trim().to_owned();
+    if branch.is_empty() {
+        bail!("local repository has an empty current branch");
+    }
+    Ok(branch)
+}
+
+fn local_origin_url(worker_root: &str, repository_id: &str) -> String {
+    fn ext_argument(value: &str) -> String {
+        value.replace('%', "%%").replace(' ', "% ")
+    }
+    format!(
+        "ext::{}/hel worker git-proxy --root {} --repository {} %S",
+        ext_argument(worker_root),
+        ext_argument(worker_root),
+        repository_id,
+    )
+}
+
+fn restore_local_repository_seed(
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    session: &SessionRecord,
+    bundle: &ProjectBundle,
+    workspace_root: &str,
+    worker_root: &str,
+    repositories: &[(&crate::hel_config::ProjectRepository, &PathBuf)],
+) -> Result<()> {
+    let snapshots = repositories
+        .iter()
+        .map(|(repository, source)| {
+            collect_git_snapshot(
+                &SystemGit,
+                source,
+                &GitCollectionSpec {
+                    id: repository.id.clone(),
+                    relative_destination: repository.destination.clone(),
+                    base_commit: "HEAD".into(),
+                    full_history: true,
+                    origin_override: Some(format!("hel-local:{}", repository.id)),
+                },
+            )
+            .with_context(|| format!("snapshot local repository {:?}", repository.id))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let staging = data_dir().join("git-seeds");
+    std::fs::create_dir_all(&staging)?;
+    let archive_path = staging.join(format!("{}.hel.zip", session.id));
+    write_archive_atomic(
+        &archive_path,
+        &ArchiveInput {
+            session: SessionManifest {
+                id: session.id.clone(),
+                title: session.title.clone(),
+                harness_kind: session.harness_kind,
+                profile_id: session.last_profile.clone(),
+                native_session_id: session.native_session_id.clone().unwrap_or_default(),
+                created_at: session.created_at.clone(),
+                checkpointed_at: now(),
+                hel_version: env!("CARGO_PKG_VERSION").into(),
+                worker_version: env!("CARGO_PKG_VERSION").into(),
+                adapter_version: "acp-v1".into(),
+            },
+            target: TargetManifest {
+                template_id: session.target_template_id.clone(),
+                target_kind: target_kind(locator).into(),
+                details: Default::default(),
+            },
+            bundle: BundleManifest {
+                id: session.bundle_id.clone(),
+                primary_repository: bundle.primary_repo.clone(),
+            },
+            canonical_events: Vec::new(),
+            native_artifacts: Vec::new(),
+            repositories: snapshots,
+        },
+    )?;
+
+    let remote_archive = format!("{worker_root}/local-seed.hel.zip");
+    let remote_spec = format!("{worker_root}/local-seed.json");
+    let target_path = |path: &str| match locator {
+        hel_targets::TargetLocator::AwsEc2 { .. } | hel_targets::TargetLocator::SshBare { .. } => {
+            PathBuf::from(format!("~/{path}"))
+        }
+        _ => PathBuf::from(path),
+    };
+    let spec = RepositoryRestoreSpec {
+        archive_path: target_path(&remote_archive),
+        workspace_root: target_path(workspace_root),
+    };
+    let local_spec = staging.join(format!("{}.json", session.id));
+    crate::hel_config::atomic_write(&local_spec, &serde_json::to_vec_pretty(&spec)?)?;
+    upload_checkpoint_spec(
+        executor,
+        locator,
+        &session.id,
+        &archive_path,
+        &remote_archive,
+    )?;
+    upload_checkpoint_spec(executor, locator, &session.id, &local_spec, &remote_spec)?;
+    execute_checked(
+        executor,
+        hel_targets::command_on_locator(
+            locator,
+            &session.id,
+            vec![
+                format!("{worker_root}/hel"),
+                "worker".into(),
+                "restore-repositories".into(),
+                "--spec".into(),
+                remote_spec,
+            ],
+            "restore local repository bootstrap",
+        )?,
+    )?;
+    Ok(())
+}
+
+fn ensure_git_broker(
+    session_id: &str,
+    locator: &hel_targets::TargetLocator,
+    repositories: BTreeMap<String, PathBuf>,
+) -> Result<()> {
+    let directory = data_dir().join("git-brokers");
+    std::fs::create_dir_all(&directory)?;
+    let spec_path = directory.join(format!("{session_id}.json"));
+    let ready_path = directory.join(format!("{session_id}.ready"));
+    let pid_path = directory.join(format!("{session_id}.pid"));
+    let log_path = directory.join(format!("{session_id}.log"));
+    let spec = GitBrokerSpec {
+        session_id: session_id.to_owned(),
+        bridge: hel_targets::git_bridge_command(locator, session_id)?,
+        repositories,
+        ready_path: ready_path.clone(),
+        pid_path: pid_path.clone(),
+    };
+    if broker_is_alive(&pid_path) {
+        if GitBrokerSpec::read(&spec_path).is_ok_and(|existing| existing == spec)
+            && ready_path.exists()
+        {
+            return Ok(());
+        }
+        bail!(
+            "a different local Git broker is still active for session {session_id}; close its target before reconnecting"
+        );
+    }
+    let _ = std::fs::remove_file(&ready_path);
+    spec.write(&spec_path)?;
+
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open Git broker log {}", log_path.display()))?;
+    let stderr = log.try_clone()?;
+    let executable = std::env::current_exe().context("locate Hel controller executable")?;
+    let mut command = Command::new(executable);
+    command
+        .args(["broker", "--spec"])
+        .arg(&spec_path)
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(stderr);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().context("start local Git broker")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if ready_path.exists() && broker_is_alive(&pid_path) {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().context("poll local Git broker")? {
+            bail!(
+                "local Git broker exited with {status}; see {}",
+                log_path.display()
+            );
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out starting local Git broker; see {}",
+                log_path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn execute_checked(executor: &impl CommandExecutor, command: CommandSpec) -> Result<CommandOutput> {
@@ -2318,7 +2742,8 @@ mod tests {
             primary_repo: "app".into(),
             repositories: vec![ProjectRepository {
                 id: "app".into(),
-                github: "example/app".into(),
+                github: Some("example/app".into()),
+                local: None,
                 destination: PathBuf::from("services/app"),
                 git_ref: Some("main".into()),
             }],
@@ -2326,8 +2751,8 @@ mod tests {
         let backend = backend_bundle(&bundle).unwrap();
         assert_eq!(backend.primary, "services/app");
         assert_eq!(
-            backend.repositories[0].url,
-            "https://github.com/example/app.git"
+            backend.repositories[0].url.as_deref(),
+            Some("https://github.com/example/app.git")
         );
     }
 

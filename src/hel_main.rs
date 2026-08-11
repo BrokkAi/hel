@@ -49,12 +49,21 @@ enum Command {
     /// Internal target-side worker commands.
     #[command(hide = true)]
     Worker(WorkerArgs),
+    /// Internal controller-side local Git broker.
+    #[command(hide = true)]
+    Broker(BrokerArgs),
     /// Diagnose platform and configuration prerequisites.
     Doctor(DoctorArgs),
     /// Discover local agent homes and create an initial Hel configuration.
     Setup(SetupArgs),
     /// Adopt a native coding-agent session as an archived Hel session.
     Import(ImportArgs),
+}
+
+#[derive(Debug, Args)]
+struct BrokerArgs {
+    #[arg(long)]
+    spec: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -108,6 +117,9 @@ struct CodexImportArgs {
     /// Title displayed in Hel's dashboard.
     #[arg(long)]
     title: Option<String>,
+    /// Proceed after acknowledging dirty configured local repositories.
+    #[arg(long)]
+    allow_dirty_local: bool,
 }
 
 #[derive(Debug, Args)]
@@ -129,6 +141,9 @@ struct KimiImportArgs {
     /// Title displayed in Hel's dashboard.
     #[arg(long)]
     title: Option<String>,
+    /// Proceed after acknowledging dirty configured local repositories.
+    #[arg(long)]
+    allow_dirty_local: bool,
 }
 
 #[derive(Debug, Args)]
@@ -150,6 +165,9 @@ struct ClaudeImportArgs {
     /// Title displayed in Hel's dashboard.
     #[arg(long)]
     title: Option<String>,
+    /// Proceed after acknowledging dirty configured local repositories.
+    #[arg(long)]
+    allow_dirty_local: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -263,6 +281,24 @@ enum WorkerCommand {
         #[arg(long)]
         spec: PathBuf,
     },
+    /// Restore controller-side local repository bootstrap snapshots.
+    RestoreRepositories {
+        #[arg(long)]
+        spec: PathBuf,
+    },
+    /// Bridge controller Git services to this worker over stdio.
+    GitBridge {
+        #[arg(long)]
+        root: PathBuf,
+    },
+    /// Expose one bridged repository as a Git ext transport.
+    GitProxy {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        repository: String,
+        service: String,
+    },
 }
 
 /// Record why a worker died where the controller can find it. The daemon's
@@ -315,7 +351,17 @@ async fn main() -> Result<()> {
             WorkerCommand::RestoreCheckpoint { spec } => {
                 hel::hel_checkpoint::restore_from_spec_file(&spec)
             }
+            WorkerCommand::RestoreRepositories { spec } => {
+                hel::hel_checkpoint::restore_repositories_from_spec_file(&spec)
+            }
+            WorkerCommand::GitBridge { root } => hel::hel_git_proxy::run_worker_bridge(&root).await,
+            WorkerCommand::GitProxy {
+                root,
+                repository,
+                service,
+            } => hel::hel_git_proxy::run_worker_proxy(&root, &repository, &service).await,
         },
+        Some(Command::Broker(args)) => hel::hel_git_proxy::run_broker(&args.spec).await,
         Some(Command::Doctor(args)) => doctor(args),
         Some(Command::Setup(args)) => setup(args),
         Some(Command::Import(args)) => import(args),
@@ -369,7 +415,11 @@ fn import_claude(args: ClaudeImportArgs) -> Result<()> {
         BundleResolution::Existing(bundle_id) => bundle_id,
         BundleResolution::Synthesized { id, bundle } => {
             let repository = bundle.primary().expect("synthesized bundle has a primary");
-            if !confirm_synthesized_bundle(&id, &repository.github, &repository.destination)? {
+            if !confirm_synthesized_bundle(
+                &id,
+                &repository.source_label(),
+                &repository.destination,
+            )? {
                 println!("Import cancelled; no Hel files were changed.");
                 return Ok(());
             }
@@ -377,6 +427,16 @@ fn import_claude(args: ClaudeImportArgs) -> Result<()> {
             id
         }
     };
+    if !confirm_dirty_local_bundle(
+        config
+            .bundles
+            .get(&bundle_id)
+            .expect("resolved bundle exists"),
+        args.allow_dirty_local,
+    )? {
+        println!("Import cancelled; no Hel files were changed.");
+        return Ok(());
+    }
     let imported = import_claude_session(
         &config,
         &mut state,
@@ -428,6 +488,16 @@ fn import_codex(args: CodexImportArgs) -> Result<()> {
     else {
         return Ok(());
     };
+    if !confirm_dirty_local_bundle(
+        config
+            .bundles
+            .get(&bundle_id)
+            .expect("resolved bundle exists"),
+        args.allow_dirty_local,
+    )? {
+        println!("Import cancelled; no Hel files were changed.");
+        return Ok(());
+    }
     let imported = import_codex_session(
         &config,
         &mut state,
@@ -476,6 +546,16 @@ fn import_kimi(args: KimiImportArgs) -> Result<()> {
     else {
         return Ok(());
     };
+    if !confirm_dirty_local_bundle(
+        config
+            .bundles
+            .get(&bundle_id)
+            .expect("resolved bundle exists"),
+        args.allow_dirty_local,
+    )? {
+        println!("Import cancelled; no Hel files were changed.");
+        return Ok(());
+    }
     let imported = import_kimi_session(
         &config,
         &mut state,
@@ -510,7 +590,11 @@ fn resolve_import_bundle(
         BundleResolution::Existing(bundle_id) => Ok(Some(bundle_id)),
         BundleResolution::Synthesized { id, bundle } => {
             let repository = bundle.primary().expect("synthesized bundle has a primary");
-            if !confirm_synthesized_bundle(&id, &repository.github, &repository.destination)? {
+            if !confirm_synthesized_bundle(
+                &id,
+                &repository.source_label(),
+                &repository.destination,
+            )? {
                 println!("Import cancelled; no Hel files were changed.");
                 return Ok(None);
             }
@@ -522,13 +606,47 @@ fn resolve_import_bundle(
 
 fn confirm_synthesized_bundle(
     bundle_id: &str,
-    github: &str,
+    source: &str,
     destination: &std::path::Path,
 ) -> Result<bool> {
     print!(
-        "No configured bundle matches this repository. Create bundle {bundle_id:?} for {github} at {}? [y/N]: ",
+        "No configured bundle matches this repository. Create bundle {bundle_id:?} for {source} at {}? [y/N]: ",
         destination.display()
     );
+    use std::io::Write as _;
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn confirm_dirty_local_bundle(
+    bundle: &hel::hel_config::ProjectBundle,
+    allowed: bool,
+) -> Result<bool> {
+    let dirty = hel::hel_local_git::dirty_local_repositories(bundle)?;
+    if dirty.is_empty() || allowed {
+        return Ok(true);
+    }
+    eprintln!("Configured local repositories are not clean:");
+    for repository in &dirty {
+        eprintln!(
+            "  {} ({}) — {}",
+            repository.id,
+            repository.path.display(),
+            repository.summary
+        );
+    }
+    eprintln!(
+        "The dirty state will be checkpointed, but pushes to a checked-out local branch will be rejected until its worktree is clean."
+    );
+    if !io::stdin().is_terminal() {
+        bail!("pass --allow-dirty-local to acknowledge dirty local repositories");
+    }
+    print!("Proceed? [y/N]: ");
     use std::io::Write as _;
     io::stdout().flush()?;
     let mut answer = String::new();
@@ -1278,14 +1396,52 @@ async fn run_dashboard() -> Result<()> {
                 bundle_id,
                 target_template_id,
                 additional_mounts,
+                allow_dirty_local,
             } => {
+                if !allow_dirty_local {
+                    let dirty = controller
+                        .config
+                        .bundles
+                        .get(&bundle_id)
+                        .with_context(|| format!("unknown bundle {bundle_id:?}"))
+                        .and_then(hel::hel_local_git::dirty_local_repositories);
+                    match dirty {
+                        Ok(dirty) if !dirty.is_empty() => {
+                            let repositories = dirty
+                                .into_iter()
+                                .map(|repository| {
+                                    format!("{}: {}", repository.path.display(), repository.summary)
+                                })
+                                .collect();
+                            dashboard.show_dirty_local_confirmation(
+                                DashboardAction::CreateSession {
+                                    profile_id,
+                                    bundle_id,
+                                    target_template_id,
+                                    additional_mounts,
+                                    allow_dirty_local: false,
+                                },
+                                repositories,
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            dashboard.set_notice(format!(
+                                "Could not inspect local repository: {error:#}"
+                            ));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 let title = format!("{bundle_id} via {profile_id}");
-                match controller.register_session_with_mounts(
+                match controller.register_session_with_mounts_allow_dirty(
                     &profile_id,
                     &bundle_id,
                     &target_template_id,
                     title,
                     additional_mounts,
+                    allow_dirty_local,
                 ) {
                     Ok(session_id) => {
                         dashboard.set_state(controller.state.clone());
@@ -1707,7 +1863,7 @@ fn resolve_background_import_bundle(
             Ok(BackgroundBundleResolution::NeedsConfirmation(
                 ImportBundlePrompt {
                     bundle_id: id,
-                    github: repository.github.clone(),
+                    github: repository.source_label(),
                     destination: repository.destination.display().to_string(),
                 },
             ))

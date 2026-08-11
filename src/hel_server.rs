@@ -207,6 +207,10 @@ impl ViewerSnapshot {
                     .map(|repository| ViewerRepository {
                         id: repository.id.clone(),
                         github: repository.github.clone(),
+                        local: repository
+                            .local
+                            .as_ref()
+                            .map(|path| path.to_string_lossy().into_owned()),
                         destination: repository.destination.to_string_lossy().into_owned(),
                     })
                     .collect(),
@@ -280,7 +284,8 @@ pub struct ViewerBundle {
 #[serde(deny_unknown_fields)]
 pub struct ViewerRepository {
     pub id: String,
-    pub github: String,
+    pub github: Option<String>,
+    pub local: Option<String>,
     pub destination: String,
 }
 
@@ -849,7 +854,8 @@ mod tests {
                     primary_repo: "hel".into(),
                     repositories: vec![ProjectRepository {
                         id: "hel".into(),
-                        github: "owner/hel".into(),
+                        github: Some("owner/hel".into()),
+                        local: None,
                         destination: "hel".into(),
                         git_ref: None,
                     }],

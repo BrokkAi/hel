@@ -121,6 +121,12 @@ id = "shared"
 github = "your-org/shared"
 destination = "shared"
 
+# Declare exactly one of `github` or `local` for each repository.
+[[bundles.hel.repositories]]
+id = "private-local"
+local = "/home/me/src/private-local"
+destination = "private-local"
+
 [targets.podman]
 kind = "local-podman"
 image = "ghcr.io/your-org/agent-dev:latest"
@@ -166,6 +172,20 @@ Each target starts from a full clone. Container and EC2 resources are unnamed
 templates: closing a session first writes and verifies a `.hel.zip` checkpoint,
 then deletes that exact resource. Named SSH machines persist, but Hel removes
 the exact per-session workspace after the same verified checkpoint.
+
+A repository configured with `local` is bootstrapped from the controller
+checkout, including its full commit history, index, worktree changes, and
+nonignored untracked files. Hel then configures a real `origin` in the worker
+using a background, per-session Git protocol bridge over the existing target
+transport. `git fetch`, `git pull`, and normal fast-forward `git push origin`
+therefore operate directly on the configured controller checkout; no inbound
+port or writable host mount is exposed. Pushes to the checked-out controller
+branch use Git's `updateInstead` safety checks and are rejected while that
+checkout is dirty. Force pushes, ref deletion, and receive hooks are disabled.
+The controller checkout must remain available while the session is live.
+
+Local repositories that use Git LFS are not currently supported by this
+bridge. Use a normal network remote for those repositories.
 
 Profiles point at controller-side homes. Hel copies only a harness-specific
 allowlist into a fresh target-side home and sets `CODEX_HOME`,

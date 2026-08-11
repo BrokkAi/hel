@@ -42,6 +42,7 @@ pub enum DashboardAction {
         bundle_id: String,
         target_template_id: String,
         additional_mounts: Vec<AdditionalMount>,
+        allow_dirty_local: bool,
     },
     CompleteMountSource {
         target_template_id: String,
@@ -167,9 +168,21 @@ struct RenameEditor {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Confirmation {
-    Close { session_id: String },
-    CloseFailed { session_id: String, error: String },
-    ForceDestroy { session_id: String, typed: String },
+    DirtyLocal {
+        action: DashboardAction,
+        repositories: Vec<String>,
+    },
+    Close {
+        session_id: String,
+    },
+    CloseFailed {
+        session_id: String,
+        error: String,
+    },
+    ForceDestroy {
+        session_id: String,
+        typed: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,6 +516,17 @@ impl DashboardState {
             bundle_id,
             github,
             destination,
+        });
+    }
+
+    pub fn show_dirty_local_confirmation(
+        &mut self,
+        action: DashboardAction,
+        repositories: Vec<String>,
+    ) {
+        self.mode = Mode::Confirm(Confirmation::DirtyLocal {
+            action,
+            repositories,
         });
     }
 
@@ -969,6 +993,7 @@ impl DashboardState {
             bundle_id: nth_key(&self.config.bundles, wizard.bundle),
             target_template_id: nth_key(&self.config.targets, wizard.target),
             additional_mounts: wizard.mounts.mounts.clone(),
+            allow_dirty_local: false,
         };
         self.cancel_modal();
         action
@@ -1063,6 +1088,32 @@ impl DashboardState {
         confirmation: Confirmation,
     ) -> DashboardAction {
         match confirmation {
+            Confirmation::DirtyLocal {
+                mut action,
+                repositories,
+            } => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    if let DashboardAction::CreateSession {
+                        allow_dirty_local, ..
+                    } = &mut action
+                    {
+                        *allow_dirty_local = true;
+                    }
+                    self.cancel_modal();
+                    action
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.cancel_modal();
+                    DashboardAction::None
+                }
+                _ => {
+                    self.mode = Mode::Confirm(Confirmation::DirtyLocal {
+                        action,
+                        repositories,
+                    });
+                    DashboardAction::None
+                }
+            },
             Confirmation::Close { session_id } => match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.cancel_modal();
@@ -1536,7 +1587,7 @@ fn render_import_bundle_confirmation(
             Line::raw("No configured bundle matches this repository."),
             Line::raw(""),
             Line::raw(format!("Bundle: {}", confirmation.bundle_id)),
-            Line::raw(format!("GitHub: {}", confirmation.github)),
+            Line::raw(format!("Source: {}", confirmation.github)),
             Line::raw(format!("Destination: {}", confirmation.destination)),
             Line::raw(""),
             Line::raw("Press y/Enter to create it, or n/Esc to cancel."),
@@ -2408,6 +2459,9 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
     let popup = centered_rect(
         72,
         match confirmation {
+            Confirmation::DirtyLocal { repositories, .. } => {
+                (repositories.len() as u16 + 8).clamp(10, 18)
+            }
             Confirmation::CloseFailed { .. } => 12,
             Confirmation::Close { .. } | Confirmation::ForceDestroy { .. } => 9,
         },
@@ -2415,6 +2469,21 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
     );
     frame.render_widget(Clear, popup);
     let (title, lines) = match confirmation {
+        Confirmation::DirtyLocal { repositories, .. } => {
+            let mut lines = vec![
+                Line::raw("The initial worker will include these uncommitted changes:"),
+                Line::raw(""),
+            ];
+            lines.extend(repositories.iter().map(|repository| {
+                Line::styled(repository.clone(), Style::default().fg(Color::Yellow))
+            }));
+            lines.extend([
+                Line::raw(""),
+                Line::raw("Pushes back to origin are rejected until the local checkout is clean."),
+                Line::raw("Press y/Enter to continue, or n/Esc to cancel."),
+            ]);
+            (" Local repository has uncommitted changes ", lines)
+        }
         Confirmation::Close { session_id } => (
             " Close and archive session? ",
             vec![
@@ -2601,7 +2670,8 @@ mod tests {
                     primary_repo: "hel".into(),
                     repositories: vec![ProjectRepository {
                         id: "hel".into(),
-                        github: "BrokkAi/hel".into(),
+                        github: Some("BrokkAi/hel".into()),
+                        local: None,
                         destination: PathBuf::from("hel"),
                         git_ref: None,
                     }],
@@ -2922,6 +2992,7 @@ mod tests {
                 bundle_id: "hel".into(),
                 target_template_id: "podman".into(),
                 additional_mounts: vec![],
+                allow_dirty_local: false,
             }
         );
     }
@@ -2951,6 +3022,7 @@ mod tests {
                     source: "/opt/cache".into(),
                     destination: "/mnt/cache".into(),
                 }],
+                allow_dirty_local: false,
             }
         );
     }
@@ -3542,7 +3614,8 @@ mod tests {
             .repositories
             .push(ProjectRepository {
                 id: "anvil".into(),
-                github: "BrokkAi/anvil".into(),
+                github: Some("BrokkAi/anvil".into()),
+                local: None,
                 destination: "anvil".into(),
                 git_ref: None,
             });

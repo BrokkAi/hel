@@ -126,7 +126,11 @@ pub struct ProjectRepository {
     /// Stable name within the bundle, used by `primary_repo`.
     pub id: String,
     /// GitHub HTTPS or SSH URL (or `owner/repository` shorthand).
-    pub github: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<String>,
+    /// Absolute controller-side Git repository exposed through Hel's Git proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<PathBuf>,
     /// Safe relative path beneath the target's bundle root.
     pub destination: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,9 +163,35 @@ impl ProjectBundle {
                     repository.id
                 );
             }
-            if !is_github_source(&repository.github) {
+            if repository.github.is_some() == repository.local.is_some() {
+                bail!(
+                    "bundle {bundle_id:?} repository {:?} must declare exactly one of `github` or `local`",
+                    repository.id,
+                );
+            }
+            if repository
+                .github
+                .as_deref()
+                .is_some_and(|source| !is_github_source(source))
+            {
                 bail!(
                     "bundle {bundle_id:?} repository {:?} is not a supported GitHub source",
+                    repository.id,
+                );
+            }
+            if repository
+                .local
+                .as_deref()
+                .is_some_and(|path| !path.is_absolute())
+            {
+                bail!(
+                    "bundle {bundle_id:?} repository {:?} local path must be absolute",
+                    repository.id,
+                );
+            }
+            if repository.local.is_some() && repository.git_ref.is_some() {
+                bail!(
+                    "bundle {bundle_id:?} repository {:?} cannot use `git_ref` with `local`",
                     repository.id,
                 );
             }
@@ -206,6 +236,19 @@ impl ProjectBundle {
         self.repositories
             .iter()
             .find(|repository| repository.id == self.primary_repo)
+    }
+}
+
+impl ProjectRepository {
+    pub fn source_label(&self) -> String {
+        self.github
+            .clone()
+            .or_else(|| self.local.as_ref().map(|path| path.display().to_string()))
+            .unwrap_or_else(|| "invalid repository source".into())
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.local.is_some()
     }
 }
 
@@ -601,7 +644,8 @@ mod tests {
                     primary_repo: "app".into(),
                     repositories: vec![ProjectRepository {
                         id: "app".into(),
-                        github: "BrokkAi/hel".into(),
+                        github: Some("BrokkAi/hel".into()),
+                        local: None,
                         destination: PathBuf::from("app"),
                         git_ref: None,
                     }],
@@ -643,7 +687,8 @@ mod tests {
         let bundle = config.bundles.get_mut("hel").unwrap();
         bundle.repositories.push(ProjectRepository {
             id: "docs".into(),
-            github: "BrokkAi/docs".into(),
+            github: Some("BrokkAi/docs".into()),
+            local: None,
             destination: PathBuf::from("app"),
             git_ref: None,
         });
@@ -673,13 +718,48 @@ mod tests {
     fn bundle_rejects_non_github_sources() {
         let mut config = sample_config();
         config.bundles.get_mut("hel").unwrap().repositories[0].github =
-            "https://example.com/owner/repo".into();
+            Some("https://example.com/owner/repo".into());
         assert!(
             config
                 .validate()
                 .unwrap_err()
                 .to_string()
                 .contains("not a supported GitHub source")
+        );
+    }
+
+    #[test]
+    fn bundle_accepts_one_absolute_local_source() {
+        let mut config = sample_config();
+        {
+            let repository = &mut config.bundles.get_mut("hel").unwrap().repositories[0];
+            repository.github = None;
+            repository.local = Some(PathBuf::from("/home/test/src/app"));
+        }
+        config.validate().unwrap();
+
+        config.bundles.get_mut("hel").unwrap().repositories[0].local =
+            Some(PathBuf::from("relative/app"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("absolute")
+        );
+    }
+
+    #[test]
+    fn bundle_requires_exactly_one_repository_source() {
+        let mut config = sample_config();
+        config.bundles.get_mut("hel").unwrap().repositories[0].local =
+            Some(PathBuf::from("/home/test/src/app"));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one")
         );
     }
 

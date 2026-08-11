@@ -301,7 +301,8 @@ pub fn build_config(
                 primary_repo: repository_id.clone(),
                 repositories: vec![ProjectRepository {
                     id: repository_id.clone(),
-                    github: repository.source(),
+                    github: Some(repository.source()),
+                    local: None,
                     destination: PathBuf::from(repository_id),
                     git_ref: None,
                 }],
@@ -724,8 +725,10 @@ mod tests {
         assert!(config.profiles.contains_key("codex"));
         assert!(config.profiles.contains_key("codex-2"));
         assert_eq!(
-            config.bundles["current-repository"].repositories[0].github,
-            "BrokkAi/hel"
+            config.bundles["current-repository"].repositories[0]
+                .github
+                .as_deref(),
+            Some("BrokkAi/hel")
         );
         assert!(matches!(
             config.targets["podman"],

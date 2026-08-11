@@ -1543,15 +1543,39 @@ pub fn resolve_bundle(
         return Ok(BundleResolution::Existing(bundle_id.to_owned()));
     }
 
-    let origin = git_text(cwd, ["remote", "get-url", "origin"])?;
-    let github = github_repository_from_origin(&origin).context(
-        "the original cwd's Git origin is not a GitHub repository; pass --bundle for a configured bundle",
-    )?;
-    if let Some(id) = configured_bundle_for_origin(config, &github) {
-        return Ok(BundleResolution::Existing(id));
+    let primary_path = PathBuf::from(git_text(cwd, ["rev-parse", "--show-toplevel"])?);
+    let primary_path = fs::canonicalize(&primary_path).unwrap_or(primary_path);
+    let origin = git_optional_text(cwd, ["remote", "get-url", "origin"])?;
+    if let Some(github) = origin.as_deref().and_then(github_repository_from_origin) {
+        if let Some(id) = configured_bundle_for_origin(config, &github) {
+            return Ok(BundleResolution::Existing(id));
+        }
+
+        let repository_id = setup_style_id(&github.repository);
+        let bundle_id = unique_bundle_id(config, &repository_id);
+        return Ok(BundleResolution::Synthesized {
+            id: bundle_id,
+            bundle: ProjectBundle {
+                primary_repo: repository_id.clone(),
+                repositories: vec![ProjectRepository {
+                    id: repository_id.clone(),
+                    github: Some(format!("{}/{}", github.owner, github.repository)),
+                    local: None,
+                    destination: PathBuf::from(repository_id),
+                    git_ref: None,
+                }],
+            },
+        });
     }
 
-    let repository_id = setup_style_id(&github.repository);
+    if let Some(id) = configured_bundle_for_local(config, &primary_path) {
+        return Ok(BundleResolution::Existing(id));
+    }
+    let repository_name = primary_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("repository");
+    let repository_id = setup_style_id(repository_name);
     let bundle_id = unique_bundle_id(config, &repository_id);
     Ok(BundleResolution::Synthesized {
         id: bundle_id,
@@ -1559,7 +1583,8 @@ pub fn resolve_bundle(
             primary_repo: repository_id.clone(),
             repositories: vec![ProjectRepository {
                 id: repository_id.clone(),
-                github: format!("{}/{}", github.owner, github.repository),
+                github: None,
+                local: Some(primary_path),
                 destination: PathBuf::from(repository_id),
                 git_ref: None,
             }],
@@ -1575,8 +1600,17 @@ pub fn configured_bundle_for_origin(
 ) -> Option<String> {
     config.bundles.iter().find_map(|(id, bundle)| {
         let primary = bundle.primary()?;
-        let configured = github_repository_from_origin(&primary.github)?;
+        let configured = github_repository_from_origin(primary.github.as_deref()?)?;
         same_github_repository(&configured, origin).then(|| id.clone())
+    })
+}
+
+pub fn configured_bundle_for_local(config: &HelConfig, local: &Path) -> Option<String> {
+    let local = fs::canonicalize(local).unwrap_or_else(|_| local.to_path_buf());
+    config.bundles.iter().find_map(|(id, bundle)| {
+        let configured = bundle.primary()?.local.as_ref()?;
+        let configured = fs::canonicalize(configured).unwrap_or_else(|_| configured.to_path_buf());
+        (configured == local).then(|| id.clone())
     })
 }
 
@@ -1946,7 +1980,9 @@ fn collect_local_repositories(
         // identical to the configured bundle.
         .par_iter()
         .map(|repository| {
-            let path = if repository.id == primary.id {
+            let path = if let Some(local) = &repository.local {
+                fs::canonicalize(local).unwrap_or_else(|_| local.clone())
+            } else if repository.id == primary.id {
                 primary_path.clone()
             } else {
                 workspace_root.join(&repository.destination)
@@ -1957,7 +1993,7 @@ fn collect_local_repositories(
                 repository.id,
                 path.display()
             );
-            let base_commit = import_base_commit(&path)?;
+            let (base_commit, full_history) = import_base_commit(&path)?;
             collect_git_snapshot(
                 &git,
                 &path,
@@ -1968,6 +2004,10 @@ fn collect_local_repositories(
                     // checkout and the tracked remote, so unpushed commits
                     // are included in the committed delta bundle.
                     base_commit,
+                    full_history,
+                    origin_override: repository
+                        .is_local()
+                        .then(|| format!("hel-local:{}", repository.id)),
                 },
             )
             .with_context(|| format!("collect local repository {:?}", repository.id))
@@ -2038,7 +2078,7 @@ fn import_profile_id(
     Ok(requested.to_owned())
 }
 
-fn import_base_commit(path: &Path) -> Result<String> {
+fn import_base_commit(path: &Path) -> Result<(String, bool)> {
     let upstream = git_optional_text(path, ["rev-parse", "--verify", "--quiet", "@{upstream}"])?
         .or(git_optional_text(
             path,
@@ -2053,9 +2093,9 @@ fn import_base_commit(path: &Path) -> Result<String> {
         // A repository without remote refs cannot tell us which ancestry a
         // newly provisioned clone has. Preserve the previous HEAD-only
         // behavior; normal tracked checkouts take the bundle-preserving path.
-        return git_text(path, ["rev-parse", "HEAD"]);
+        return Ok((git_text(path, ["rev-parse", "HEAD"])?, true));
     };
-    git_text(path, ["merge-base", "HEAD", &upstream])
+    Ok((git_text(path, ["merge-base", "HEAD", &upstream])?, false))
 }
 
 fn git_optional_text<const N: usize>(cwd: &Path, arguments: [&str; N]) -> Result<Option<String>> {
@@ -2253,7 +2293,8 @@ mod tests {
                 primary_repo: "hel".into(),
                 repositories: vec![ProjectRepository {
                     id: "hel".into(),
-                    github: "BrokkAi/hel".into(),
+                    github: Some("BrokkAi/hel".into()),
+                    local: None,
                     destination: "hel".into(),
                     git_ref: None,
                 }],
@@ -2278,13 +2319,15 @@ mod tests {
             repositories: vec![
                 ProjectRepository {
                     id: "worker".into(),
-                    github: "example/worker".into(),
+                    github: Some("example/worker".into()),
+                    local: None,
                     destination: "worker".into(),
                     git_ref: None,
                 },
                 ProjectRepository {
                     id: "app".into(),
-                    github: "example/app".into(),
+                    github: Some("example/app".into()),
+                    local: None,
                     destination: "app".into(),
                     git_ref: None,
                 },

@@ -355,7 +355,9 @@ impl CommandPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositorySpec {
-    pub url: String,
+    /// Clone URL for network-backed repositories. `None` creates an empty
+    /// repository which a verified local snapshot restores later.
+    pub url: Option<String>,
     pub destination: String,
     pub git_ref: Option<String>,
 }
@@ -375,7 +377,11 @@ impl ProjectBundleSpec {
         let mut destinations = std::collections::BTreeSet::new();
         for repository in &self.repositories {
             validate_relative_path(&repository.destination)?;
-            if repository.url.trim().is_empty() || repository.url.starts_with('-') {
+            if repository
+                .url
+                .as_deref()
+                .is_some_and(|url| url.trim().is_empty() || url.starts_with('-'))
+            {
                 bail!("invalid repository URL");
             }
             if !destinations.insert(&repository.destination) {
@@ -754,6 +760,58 @@ pub fn reconnect_plan(locator: &TargetLocator, session_id: &str) -> Result<Comma
     })
 }
 
+/// Run the target-side half of the local Git bridge over the same trusted
+/// execution boundary Hel uses for worker control.
+pub fn git_bridge_command(locator: &TargetLocator, session_id: &str) -> Result<CommandSpec> {
+    let root = worker_root(locator, session_id)?;
+    let binary = format!("{root}/hel");
+    command_on_locator(
+        locator,
+        session_id,
+        vec![
+            binary,
+            "worker".into(),
+            "git-bridge".into(),
+            "--root".into(),
+            root,
+        ],
+        "bridge local Git repositories",
+    )
+}
+
+/// Wrap an argv vector for execution at a provisioned session target.
+pub fn command_on_locator(
+    locator: &TargetLocator,
+    session_id: &str,
+    args: Vec<String>,
+    purpose: impl Into<String>,
+) -> Result<CommandSpec> {
+    verify_locator(locator, session_id)?;
+    if args.is_empty() {
+        bail!("target command must not be empty");
+    }
+    let command = match locator {
+        TargetLocator::LocalPodman { container_id } => container_exec("podman", container_id, args),
+        TargetLocator::AppleContainer { container_id } => {
+            container_exec("container", container_id, args)
+        }
+        TargetLocator::AwsEc2 { ssh, .. } | TargetLocator::SshBare { ssh, .. } => {
+            ssh_command_owned(ssh, args)
+        }
+        TargetLocator::SshPodman { ssh, container_id } => {
+            let mut remote = vec![
+                "podman".to_owned(),
+                "exec".to_owned(),
+                "-i".to_owned(),
+                container_id.to_owned(),
+            ];
+            remote.extend(args);
+            ssh_command_owned(ssh, remote)
+        }
+    };
+    Ok(command.purpose(purpose))
+}
+
 pub fn worker_root(locator: &TargetLocator, session_id: &str) -> Result<String> {
     verify_locator(locator, session_id)?;
     Ok(match locator {
@@ -905,13 +963,21 @@ fn clone_commands(
         .purpose("create bundle workspace"),
     ];
     for repository in &bundle.repositories {
+        let destination = format!("{workspace}/{}", repository.destination);
+        let Some(url) = &repository.url else {
+            commands.push(
+                wrap(vec!["git".into(), "init".into(), "--".into(), destination])
+                    .purpose(format!("initialize {}", repository.destination)),
+            );
+            continue;
+        };
         let mut args = vec!["git".to_owned(), "clone".to_owned()];
         if let Some(git_ref) = &repository.git_ref {
             args.extend(["--branch".to_owned(), git_ref.clone()]);
         }
         args.push("--".to_owned());
-        args.push(repository.url.clone());
-        args.push(format!("{workspace}/{}", repository.destination));
+        args.push(url.clone());
+        args.push(destination);
         commands.push(wrap(args).purpose(format!("clone {}", repository.destination)));
     }
     commands
@@ -1224,12 +1290,12 @@ mod tests {
             primary: "app".to_owned(),
             repositories: vec![
                 RepositorySpec {
-                    url: "git@github.com:example/app.git".to_owned(),
+                    url: Some("git@github.com:example/app.git".to_owned()),
                     destination: "app".to_owned(),
                     git_ref: Some("main".to_owned()),
                 },
                 RepositorySpec {
-                    url: "https://github.com/example/lib.git".to_owned(),
+                    url: Some("https://github.com/example/lib.git".to_owned()),
                     destination: "libs/lib".to_owned(),
                     git_ref: None,
                 },

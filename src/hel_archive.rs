@@ -63,6 +63,10 @@ pub struct RepositoryMetadata {
     pub relative_destination: PathBuf,
     pub origin: String,
     pub base_commit: String,
+    /// The committed bundle includes the base commit and is sufficient to
+    /// populate an empty repository.
+    #[serde(default)]
+    pub full_history: bool,
     pub head_commit: String,
     pub branch: Option<String>,
 }
@@ -858,6 +862,8 @@ pub struct GitCollectionSpec {
     pub id: String,
     pub relative_destination: PathBuf,
     pub base_commit: String,
+    pub full_history: bool,
+    pub origin_override: Option<String>,
 }
 
 pub fn collect_git_snapshot(
@@ -869,11 +875,17 @@ pub fn collect_git_snapshot(
     validate_archive_relative_path(&spec.relative_destination)?;
     ensure!(!spec.base_commit.trim().is_empty(), "base commit is empty");
 
-    let origin = redact_origin_credentials(&git_text(
-        runner,
-        repository,
-        ["remote", "get-url", "origin"],
-    )?)?;
+    let origin = if let Some(origin) = &spec.origin_override {
+        origin.clone()
+    } else {
+        let output = run_git(runner, repository, ["remote", "get-url", "origin"], &[])?;
+        if output.status == 0 {
+            redact_origin_credentials(&trim_output(&output.stdout, "read Git origin")?)?
+        } else {
+            String::new()
+        }
+    };
+    let base_commit = git_text(runner, repository, ["rev-parse", &spec.base_commit])?;
     let head_commit = git_text(runner, repository, ["rev-parse", "HEAD"])?;
     let branch_output = run_git(
         runner,
@@ -891,11 +903,7 @@ pub fn collect_git_snapshot(
     let count = git_text(
         runner,
         repository,
-        [
-            "rev-list",
-            "--count",
-            &format!("{}..HEAD", spec.base_commit),
-        ],
+        ["rev-list", "--count", &format!("{base_commit}..HEAD")],
     )?
     .parse::<u64>()
     .context("parse committed delta count")?;
@@ -906,19 +914,21 @@ pub fn collect_git_snapshot(
         || {
             rayon::join(
                 || {
-                    if count == 0 {
+                    if spec.full_history {
+                        git_bytes(
+                            runner,
+                            repository,
+                            ["bundle", "create", "-", "HEAD"],
+                            &[],
+                            "create full Git bundle",
+                        )
+                    } else if count == 0 {
                         Ok(Vec::new())
                     } else {
                         git_bytes(
                             runner,
                             repository,
-                            [
-                                "bundle",
-                                "create",
-                                "-",
-                                "HEAD",
-                                &format!("^{}", spec.base_commit),
-                            ],
+                            ["bundle", "create", "-", "HEAD", &format!("^{base_commit}")],
                             &[],
                             "create committed delta bundle",
                         )
@@ -969,7 +979,8 @@ pub fn collect_git_snapshot(
             id: spec.id.clone(),
             relative_destination: spec.relative_destination.clone(),
             origin,
-            base_commit: spec.base_commit.clone(),
+            base_commit,
+            full_history: spec.full_history,
             head_commit,
             branch,
         },
@@ -1001,6 +1012,19 @@ pub fn restore_git_snapshot(
                 stdin: Vec::new(),
             },
             "fetch committed delta bundle",
+        )?;
+    }
+    if snapshot.metadata.full_history {
+        git_bytes(
+            runner,
+            repository,
+            [
+                "update-ref",
+                "refs/hel/base",
+                &snapshot.metadata.base_commit,
+            ],
+            &[],
+            "record Hel repository base",
         )?;
     }
     let checkout_target = if snapshot.committed_bundle.is_empty() {
@@ -1454,6 +1478,7 @@ mod tests {
                 relative_destination: PathBuf::from(id),
                 origin: format!("https://github.com/example/{id}.git"),
                 base_commit: "a".repeat(40),
+                full_history: false,
                 head_commit: "b".repeat(40),
                 branch: Some("feature/hel".to_string()),
             },
@@ -1649,6 +1674,8 @@ mod tests {
                 id: "repo".into(),
                 relative_destination: PathBuf::from("repo"),
                 base_commit: "a".repeat(40),
+                full_history: false,
+                origin_override: None,
             },
         )
         .unwrap();
@@ -1663,7 +1690,7 @@ mod tests {
             .map(|entry| entry.unwrap().path().unwrap().into_owned())
             .collect();
         assert_eq!(paths, vec![PathBuf::from("note.txt")]);
-        assert_eq!(runner.commands().len(), 7);
+        assert_eq!(runner.commands().len(), 8);
     }
 
     #[test]
@@ -1686,6 +1713,8 @@ mod tests {
                         id: "repo".into(),
                         relative_destination: PathBuf::from("repo"),
                         base_commit: "a".repeat(40),
+                        full_history: false,
+                        origin_override: None,
                     },
                 )
             })
@@ -1694,7 +1723,7 @@ mod tests {
         assert_eq!(snapshot.committed_bundle, b"bundle");
         assert_eq!(snapshot.staged_patch, b"staged");
         assert_eq!(snapshot.unstaged_patch, b"unstaged");
-        assert_eq!(runner.commands().len(), 8);
+        assert_eq!(runner.commands().len(), 9);
     }
 
     #[test]
@@ -1757,6 +1786,8 @@ mod tests {
                 id: "repo".into(),
                 relative_destination: PathBuf::from("repo"),
                 base_commit: base.clone(),
+                full_history: false,
+                origin_override: None,
             },
         )
         .unwrap();

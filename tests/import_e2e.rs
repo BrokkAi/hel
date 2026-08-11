@@ -89,7 +89,8 @@ async fn imported_claude_session_resumes_natively_async() -> anyhow::Result<()> 
             primary_repo: "scratch".into(),
             repositories: vec![ProjectRepository {
                 id: "scratch".into(),
-                github: repository,
+                github: Some(repository),
+                local: None,
                 destination: "scratch".into(),
                 git_ref: None,
             }],
@@ -219,7 +220,8 @@ async fn imported_kimi_session_resumes_natively_async() -> anyhow::Result<()> {
                 primary_repo: "kimi-source".into(),
                 repositories: vec![ProjectRepository {
                     id: "kimi-source".into(),
-                    github: repository,
+                    github: Some(repository),
+                    local: None,
                     destination: "kimi-source".into(),
                     git_ref: None,
                 }],
@@ -395,7 +397,8 @@ async fn imported_codex_session_resumes_natively_async() -> anyhow::Result<()> {
                 primary_repo: "codex-source".into(),
                 repositories: vec![ProjectRepository {
                     id: "codex-source".into(),
-                    github: repository,
+                    github: Some(repository),
+                    local: None,
                     destination: "codex-source".into(),
                     git_ref: None,
                 }],

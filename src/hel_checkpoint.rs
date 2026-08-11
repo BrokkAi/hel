@@ -36,6 +36,10 @@ pub struct CheckpointRepositorySpec {
     pub id: String,
     pub relative_destination: PathBuf,
     pub base_commit: String,
+    #[serde(default)]
+    pub full_history: bool,
+    #[serde(default)]
+    pub origin_override: Option<String>,
 }
 
 /// Uploaded target-side input. It contains provenance and paths, never secrets.
@@ -99,6 +103,22 @@ pub struct CheckpointRestoreSpec {
     pub restore_native: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryRestoreSpec {
+    pub archive_path: PathBuf,
+    pub workspace_root: PathBuf,
+}
+
+pub fn restore_repositories_from_spec_file(path: &Path) -> Result<()> {
+    let body = fs::read(path)
+        .with_context(|| format!("read repository restore spec {}", path.display()))?;
+    let mut spec: RepositoryRestoreSpec = serde_json::from_slice(&body)
+        .with_context(|| format!("parse repository restore spec {}", path.display()))?;
+    spec.archive_path = resolve_target_path(&spec.archive_path)?;
+    spec.workspace_root = resolve_target_path(&spec.workspace_root)?;
+    restore_repositories(&spec.archive_path, &spec.workspace_root, &SystemGit)
+}
+
 pub fn restore_from_spec_file(path: &Path) -> Result<()> {
     let body = fs::read(path)
         .with_context(|| format!("read checkpoint restore spec {}", path.display()))?;
@@ -114,37 +134,7 @@ pub fn restore_from_spec_file(path: &Path) -> Result<()> {
 pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunner) -> Result<()> {
     ensure!(spec.workspace_root.is_dir(), "restore workspace is missing");
     let archive = read_archive_verified(&spec.archive_path)?;
-    for repository in &archive.manifest.repositories {
-        let id = &repository.metadata.id;
-        let snapshot = RepositorySnapshot {
-            metadata: repository.metadata.clone(),
-            committed_bundle: archive
-                .payload_by_role(&PayloadRole::GitBundle {
-                    repository_id: id.clone(),
-                })?
-                .to_vec(),
-            staged_patch: archive
-                .payload_by_role(&PayloadRole::GitStagedPatch {
-                    repository_id: id.clone(),
-                })?
-                .to_vec(),
-            unstaged_patch: archive
-                .payload_by_role(&PayloadRole::GitUnstagedPatch {
-                    repository_id: id.clone(),
-                })?
-                .to_vec(),
-            untracked_tar: archive
-                .payload_by_role(&PayloadRole::GitUntrackedTar {
-                    repository_id: id.clone(),
-                })?
-                .to_vec(),
-        };
-        let path = spec
-            .workspace_root
-            .join(&repository.metadata.relative_destination);
-        restore_git_snapshot(git, &path, &snapshot)
-            .with_context(|| format!("restore repository {id:?}"))?;
-    }
+    restore_repositories_from_archive(&archive, &spec.workspace_root, git)?;
 
     fs::create_dir_all(&spec.worker_root)?;
     crate::hel_worker::clear_native_session_identity(&spec.worker_root)?;
@@ -182,6 +172,53 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
             let destination = spec.harness_home.join(relative_path);
             write_private_file(&destination, &native_data, descriptor.mode)?;
         }
+    }
+    Ok(())
+}
+
+pub fn restore_repositories(
+    archive_path: &Path,
+    workspace_root: &Path,
+    git: &dyn GitCommandRunner,
+) -> Result<()> {
+    ensure!(workspace_root.is_dir(), "restore workspace is missing");
+    let archive = read_archive_verified(archive_path)?;
+    restore_repositories_from_archive(&archive, workspace_root, git)
+}
+
+fn restore_repositories_from_archive(
+    archive: &crate::hel_archive::VerifiedArchive,
+    workspace_root: &Path,
+    git: &dyn GitCommandRunner,
+) -> Result<()> {
+    for repository in &archive.manifest.repositories {
+        let id = &repository.metadata.id;
+        let snapshot = RepositorySnapshot {
+            metadata: repository.metadata.clone(),
+            committed_bundle: archive
+                .payload_by_role(&PayloadRole::GitBundle {
+                    repository_id: id.clone(),
+                })?
+                .to_vec(),
+            staged_patch: archive
+                .payload_by_role(&PayloadRole::GitStagedPatch {
+                    repository_id: id.clone(),
+                })?
+                .to_vec(),
+            unstaged_patch: archive
+                .payload_by_role(&PayloadRole::GitUnstagedPatch {
+                    repository_id: id.clone(),
+                })?
+                .to_vec(),
+            untracked_tar: archive
+                .payload_by_role(&PayloadRole::GitUntrackedTar {
+                    repository_id: id.clone(),
+                })?
+                .to_vec(),
+        };
+        let path = workspace_root.join(&repository.metadata.relative_destination);
+        restore_git_snapshot(git, &path, &snapshot)
+            .with_context(|| format!("restore repository {id:?}"))?;
     }
     Ok(())
 }
@@ -451,6 +488,8 @@ pub fn export_checkpoint_with_git(
                     id: repository.id.clone(),
                     relative_destination: repository.relative_destination.clone(),
                     base_commit: repository.base_commit.clone(),
+                    full_history: repository.full_history,
+                    origin_override: repository.origin_override.clone(),
                 },
             )
             .with_context(|| format!("repository '{}'", repository.id))
@@ -1502,6 +1541,7 @@ mod tests {
                 relative_destination: "app".into(),
                 origin: "owner/app".into(),
                 base_commit: "a".repeat(40),
+                full_history: false,
                 head_commit: "a".repeat(40),
                 branch: Some("main".into()),
             },
@@ -1529,6 +1569,7 @@ mod tests {
                 relative_destination: "app".into(),
                 origin: "owner/app".into(),
                 base_commit: "a".repeat(40),
+                full_history: false,
                 head_commit: "a".repeat(40),
                 branch: Some("main".into()),
             },
@@ -1679,6 +1720,8 @@ mod tests {
                     id: "app".into(),
                     relative_destination: "app".into(),
                     base_commit: base,
+                    full_history: false,
+                    origin_override: None,
                 }],
                 output_path: output.clone(),
             },
@@ -1744,6 +1787,8 @@ mod tests {
             id: "worker".into(),
             relative_destination: "worker".into(),
             base_commit: base,
+            full_history: false,
+            origin_override: None,
         });
 
         export_checkpoint(&spec).unwrap();
