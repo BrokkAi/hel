@@ -147,6 +147,7 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
     }
 
     fs::create_dir_all(&spec.worker_root)?;
+    crate::hel_worker::clear_native_session_identity(&spec.worker_root)?;
     let events = archive.payload_by_role(&PayloadRole::CanonicalEvents)?;
     let _ = verify_canonical_payload(events)?;
     write_private_file(&spec.worker_root.join("events.jsonl"), events, 0o600)?;
@@ -550,7 +551,7 @@ pub fn collect_native_artifacts(
     output.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     ensure!(
         allow_empty || !output.is_empty(),
-        "no allowlisted native session artifacts found"
+        "no session artifacts found"
     );
     let total = output
         .iter()
@@ -1351,7 +1352,7 @@ mod tests {
         let error = collect_native_artifacts(HarnessKind::Codex, temp.path(), NATIVE, false)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("no allowlisted native session artifacts"));
+        assert_eq!(error, "no session artifacts found");
         let artifacts =
             collect_native_artifacts(HarnessKind::Codex, temp.path(), NATIVE, true).unwrap();
         assert!(artifacts.is_empty());
