@@ -23,8 +23,8 @@ use crate::hel_acp::RuntimeEvent;
 use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot};
 use crate::hel_worker_client::WorkerClient;
 use rendering::{
-    LogicalLine, TranscriptRenderMode, markdown_lines, raw_lines, sanitize_terminal_text,
-    wrap_styled_line,
+    LogicalLine, TranscriptRenderMode, ellipsize_styled_line, markdown_lines, raw_lines,
+    sanitize_terminal_text, wrap_styled_line,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -801,6 +801,41 @@ fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatState) {
 const ROLE_GUTTER: &str = "│ ";
 const ROLE_GUTTER_WIDTH: usize = 2;
 
+pub(crate) fn render_agent_message_preview(
+    source: &str,
+    width: usize,
+    maximum_lines: usize,
+) -> Vec<Line<'static>> {
+    if width == 0 || maximum_lines == 0 {
+        return Vec::new();
+    }
+    let agent_style = Style::default().fg(Color::Green);
+    let content_width = width.saturating_sub(ROLE_GUTTER_WIDTH).max(1);
+    let mut lines = markdown_lines(
+        &sanitize_terminal_text(source),
+        Style::default(),
+        agent_style,
+        content_width,
+    )
+    .into_iter()
+    .flat_map(|logical| wrap_styled_line(logical.line, content_width, logical.continuation_indent))
+    .map(|line| {
+        if line_is_empty(&line) {
+            Line::from("")
+        } else {
+            with_role_gutter(line, agent_style)
+        }
+    })
+    .collect::<Vec<_>>();
+    if lines.len() > maximum_lines {
+        lines.truncate(maximum_lines);
+        if let Some(last) = lines.last_mut() {
+            *last = ellipsize_styled_line(std::mem::take(last), width);
+        }
+    }
+    lines
+}
+
 /// Render the complete transcript into already-wrapped visual rows. Keeping
 /// layout separate from painting makes scrolling a count of actual terminal
 /// rows rather than logical message lines.
@@ -1051,6 +1086,34 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn agent_preview_clips_after_four_rendered_rows() {
+        let lines = render_agent_message_preview(
+            "**one** two three four five six seven eight nine ten eleven twelve",
+            12,
+            4,
+        );
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.len(), 4);
+        assert!(rendered[0].starts_with(ROLE_GUTTER));
+        assert!(rendered[3].ends_with('…'));
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
+        );
     }
 
     #[test]

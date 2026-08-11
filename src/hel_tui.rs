@@ -8,14 +8,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState,
-    Paragraph, Row, Table, TableState, Wrap,
+    Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 
+use crate::hel_chat::render_agent_message_preview;
 use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use crate::hel_quota::ProfileQuota;
 #[cfg(test)]
@@ -25,6 +26,9 @@ use crate::hel_targets::{AdditionalMount, default_mount_destination, path_comple
 use crate::hel_worker::{SequencedEvent, WorkerEvent};
 
 const FORCE_CONFIRMATION: &str = "DESTROY";
+const ACTIVE_MESSAGE_LINES: usize = 4;
+const ACTIVE_SESSION_ROW_HEIGHT: u16 = ACTIVE_MESSAGE_LINES as u16 + 1;
+const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
 
 /// A side effect requested by the dashboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,8 +232,9 @@ struct SessionDetail {
     current_turn_started_at: Option<u64>,
     last_agent_text_at: Option<u64>,
     agent_text_stream_open: bool,
+    last_agent_message_id: Option<String>,
+    last_agent_message: Option<String>,
     unread_agent_message_sequences: Vec<u64>,
-    activity: Option<SessionActivity>,
 }
 
 /// Stateful, renderable projection of controller configuration and state.
@@ -333,15 +338,26 @@ impl DashboardState {
                 WorkerEvent::Adapter { payload, .. } => {
                     if let Some(activity) = activity_from_adapter(payload) {
                         if activity.kind == ActivityKind::AgentText {
-                            if !detail.agent_text_stream_open && event.seq > viewed_through {
+                            let message_id = adapter_message_id(payload);
+                            let continues_message = detail.agent_text_stream_open
+                                && detail.last_agent_message_id == message_id;
+                            if !continues_message && event.seq > viewed_through {
                                 detail.unread_agent_message_sequences.push(event.seq);
                             }
+                            if continues_message {
+                                detail
+                                    .last_agent_message
+                                    .get_or_insert_default()
+                                    .push_str(&activity.text);
+                            } else {
+                                detail.last_agent_message = Some(activity.text);
+                            }
+                            detail.last_agent_message_id = message_id;
                             detail.agent_text_stream_open = true;
                             detail.last_agent_text_at = Some(observed_at_epoch_seconds);
                         } else {
                             detail.agent_text_stream_open = false;
                         }
-                        update_activity(detail, activity);
                     } else {
                         detail.agent_text_stream_open = false;
                     }
@@ -1361,28 +1377,12 @@ fn activity_from_adapter(payload: &serde_json::Value) -> Option<SessionActivity>
     }
 }
 
-fn update_activity(detail: &mut SessionDetail, activity: SessionActivity) {
-    if let Some(previous) = detail.activity.as_mut()
-        && previous.kind == activity.kind
-        && matches!(
-            activity.kind,
-            ActivityKind::Thinking | ActivityKind::AgentText
-        )
-    {
-        previous.text.push_str(&activity.text);
-        previous.text = truncate_text(&previous.text, 512);
-        return;
-    }
-    detail.activity = Some(activity);
-}
-
-fn activity_label(activity: &SessionActivity) -> String {
-    let label = match activity.kind {
-        ActivityKind::Thinking => "thinking",
-        ActivityKind::AgentText => "agent",
-        ActivityKind::ToolCall => "tool",
-    };
-    format!("{label}: {}", collapse_whitespace(&activity.text))
+fn adapter_message_id(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("update")
+        .and_then(|update| update.get("messageId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 fn truncate_text(text: &str, width: usize) -> String {
@@ -1692,12 +1692,22 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let archived_height = (archived.len() as u16 + 3)
+    let active_minimum_height = (SESSION_TABLE_CHROME_HEIGHT
+        + if active.is_empty() {
+            0
+        } else {
+            ACTIVE_SESSION_ROW_HEIGHT
+        })
+    .min(area.height.saturating_sub(3));
+    let archived_height = (archived.len() as u16 + SESSION_TABLE_CHROME_HEIGHT)
         .max(3)
-        .min(area.height.saturating_sub(3).max(3));
+        .min(area.height.saturating_sub(active_minimum_height).max(3));
     let panes = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(archived_height)])
+        .constraints([
+            Constraint::Min(active_minimum_height),
+            Constraint::Length(archived_height),
+        ])
         .split(area);
     let active_rows = active.iter().map(|session| {
         active_session_row(
@@ -1728,39 +1738,50 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
     frame.render_stateful_widget(active_table, panes[0], &mut active_state);
     let active_offset = active_state.offset();
     for (visible_index, session) in active.iter().skip(active_offset).enumerate() {
-        let detail_y = panes[0].y + 3 + visible_index as u16 * 3;
+        let detail_y = panes[0].y
+            + SESSION_TABLE_CHROME_HEIGHT
+            + visible_index as u16 * ACTIVE_SESSION_ROW_HEIGHT;
         if detail_y >= panes[0].bottom().saturating_sub(1) {
             break;
         }
-        let Some(activity) = dashboard
+        let Some(message) = dashboard
             .session_details
             .get(&session.id)
-            .and_then(|detail| detail.activity.as_ref())
-            .map(activity_label)
+            .and_then(|detail| detail.last_agent_message.as_deref())
         else {
             continue;
         };
         let selected = dashboard.focus == Focus::Active
             && active_offset + visible_index == dashboard.session_index;
         let style = if selected {
-            Style::default().fg(Color::Gray).bg(Color::DarkGray)
+            Style::default().bg(Color::DarkGray)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default()
         };
+        let preview_width = panes[0].width.saturating_sub(4);
         frame.render_widget(
-            Paragraph::new(truncate_text(
-                &activity,
-                panes[0].width.saturating_sub(4) as usize,
+            Paragraph::new(render_agent_message_preview(
+                message,
+                usize::from(preview_width),
+                ACTIVE_MESSAGE_LINES,
             ))
             .style(style),
             Rect::new(
                 panes[0].x + 3,
                 detail_y,
-                panes[0].width.saturating_sub(4),
-                1,
+                preview_width,
+                ACTIVE_MESSAGE_LINES as u16,
             ),
         );
     }
+    render_session_scrollbar(
+        frame,
+        panes[0],
+        active.len(),
+        active_offset,
+        usize::from(panes[0].height.saturating_sub(SESSION_TABLE_CHROME_HEIGHT))
+            / usize::from(ACTIVE_SESSION_ROW_HEIGHT),
+    );
 
     let archived_rows = archived
         .iter()
@@ -1786,6 +1807,36 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
             .filter(|index| *index < archived.len()),
     );
     frame.render_stateful_widget(archived_table, panes[1], &mut archived_state);
+    render_session_scrollbar(
+        frame,
+        panes[1],
+        archived.len(),
+        archived_state.offset(),
+        usize::from(panes[1].height.saturating_sub(SESSION_TABLE_CHROME_HEIGHT)),
+    );
+}
+
+fn render_session_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    content_length: usize,
+    position: usize,
+    viewport_content_length: usize,
+) {
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .thumb_style(Style::default().fg(Color::Gray))
+        .track_style(Style::default().fg(Color::DarkGray));
+    let mut state = ScrollbarState::new(content_length)
+        .position(position)
+        .viewport_content_length(viewport_content_length.max(1));
+    frame.render_stateful_widget(
+        scrollbar,
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut state,
+    );
 }
 
 fn focus_border(focused: bool) -> BorderType {
@@ -1904,7 +1955,7 @@ fn active_session_row(
         Cell::from(checkpoint),
         Cell::from(session_name_line(session_name, unread_count)),
     ])
-    .height(3)
+    .height(ACTIVE_SESSION_ROW_HEIGHT)
 }
 
 fn archived_session_row(
@@ -3217,29 +3268,26 @@ mod tests {
     }
 
     #[test]
-    fn activity_snippet_collapses_newlines_to_spaces_when_rendered() {
+    fn active_session_renders_the_complete_last_agent_message() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         dashboard.apply_worker_events(
             "session-1",
-            &[SequencedEvent {
-                seq: 1,
-                request_id: None,
-                event: WorkerEvent::Adapter {
-                    kind: "session_update".into(),
-                    payload: serde_json::json!({
-                        "type": "session_update",
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": { "text": "a b\nc" }
-                        }
-                    }),
-                },
-            }],
+            &[
+                adapter_text_event(1, "agent_message_chunk", "**a b**\n"),
+                adapter_text_event(2, "agent_message_chunk", "c"),
+                adapter_text_event(3, "agent_thought_chunk", "later thought"),
+            ],
             100,
         );
-        let backend = TestBackend::new(120, 24);
+        assert_eq!(
+            dashboard.session_details["session-1"]
+                .last_agent_message
+                .as_deref(),
+            Some("**a b**\nc")
+        );
+        let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
@@ -3252,7 +3300,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.contains("agent: a b c"));
+        assert!(rendered.contains("a b"));
+        assert!(rendered.contains('c'));
+        assert!(!rendered.contains("later thought"));
         assert!(rendered.contains("Turn clock"));
         assert!(rendered.contains("Profile"));
         assert!(rendered.contains("Target"));
@@ -3264,9 +3314,46 @@ mod tests {
     }
 
     #[test]
+    fn active_and_archived_session_panes_show_scrollbars() {
+        let mut sessions = BTreeMap::new();
+        for index in 0..6 {
+            let mut session = archived_session();
+            session.id = format!("active-{index:02}");
+            session.state = SessionState::Running;
+            sessions.insert(session.id.clone(), session);
+        }
+        for index in 0..20 {
+            let mut session = archived_session();
+            session.id = format!("archived-{index:02}");
+            sessions.insert(session.id.clone(), session);
+        }
+        let state = HelState {
+            version: STATE_VERSION,
+            sessions,
+            mount_history: BTreeMap::new(),
+        };
+        let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let symbols = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>();
+
+        assert!(symbols.iter().filter(|symbol| **symbol == "▲").count() >= 2);
+        assert!(symbols.iter().filter(|symbol| **symbol == "▼").count() >= 2);
+    }
+
+    #[test]
     fn archived_sessions_leave_the_turn_clock_cell_blank() {
         let mut dashboard = dashboard_with_session(archived_session());
-        let backend = TestBackend::new(120, 24);
+        let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
