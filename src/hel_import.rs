@@ -2677,7 +2677,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(located.native_session_id, format!("session_{id}"));
-        assert_eq!(located.session_path, session);
+        assert_eq!(
+            located.session_path.canonicalize().unwrap(),
+            session.canonicalize().unwrap()
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@ const auditedStandaloneNotices = new Set(["cfg_aliases/NOTICES.md"]);
 const auditedLinksPackages = new Set([
   "alsa-sys",
   "bzip2-sys",
+  "libsqlite3-sys",
   "prettyplease",
   // rayon-core uses `links` only to prevent multiple versions; its build
   // script does not link or ship a native library.
@@ -204,6 +205,29 @@ async function sherpaNativePayload(metadata) {
   };
 }
 
+async function sqliteNativePayload(metadata) {
+  const packageInfo = resolvedPackage(metadata, "libsqlite3-sys", "0.35.0");
+  const amalgamation = await readFile(
+    path.join(packageRoot(packageInfo), "sqlite3", "sqlite3.c"),
+    "utf8",
+  );
+  const sqliteVersion = "3.50.2";
+  if (!amalgamation.includes(`SQLite\n** version ${sqliteVersion}`)) {
+    throw new Error(
+      `libsqlite3-sys does not contain the audited SQLite ${sqliteVersion} amalgamation`,
+    );
+  }
+  return {
+    component: `SQLite ${sqliteVersion} amalgamation`,
+    source: `${packageUrl(packageInfo)} (sqlite3/sqlite3.c)`,
+    scope: "statically linked into hel by libsqlite3-sys with its bundled feature",
+    text: [
+      "SQLite is dedicated to the public domain.",
+      "https://www.sqlite.org/copyright.html",
+    ].join("\n"),
+  };
+}
+
 async function embeddedFontsNotice() {
   await checkedInLegalFile("licenses/OFL-1.1.md");
   return {
@@ -274,6 +298,7 @@ async function main() {
       "bzip2/libbzip2 1.0.8",
       "used while unpacking sherpa-onnx native libraries during the voice-worker build",
     ),
+    await sqliteNativePayload(metadata),
     await sherpaNativePayload(metadata),
     await embeddedFontsNotice(),
   ];
