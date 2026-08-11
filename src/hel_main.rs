@@ -218,6 +218,23 @@ enum WorkerPollPayload {
     },
 }
 
+struct WarmWorker {
+    spec: CommandSpec,
+    client: WorkerClient,
+    bootstrap: hel::hel_worker_client::WorkerBootstrap,
+}
+
+enum WorkerPollCommand {
+    Checkout {
+        session_id: String,
+        reply: tokio::sync::oneshot::Sender<Option<WarmWorker>>,
+    },
+    Checkin {
+        session_id: String,
+        worker: Option<Box<WarmWorker>>,
+    },
+}
+
 /// Consecutive failed polls before a running session is declared unreachable.
 /// One failure is routinely a transient exec hiccup.
 const WORKER_POLL_FAILURE_THRESHOLD: u32 = 3;
@@ -759,14 +776,17 @@ fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPollTarget> {
 fn spawn_dashboard_worker_poller() -> (
     tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
     tokio::sync::mpsc::Receiver<WorkerPollUpdate>,
+    tokio::sync::mpsc::Sender<WorkerPollCommand>,
 ) {
     let (targets_tx, mut targets_rx) = tokio::sync::watch::channel(Vec::<WorkerPollTarget>::new());
     let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(64);
+    let (commands_tx, mut commands_rx) = tokio::sync::mpsc::channel(8);
     tokio::spawn(async move {
         let mut targets: std::collections::BTreeMap<String, WorkerPollTarget> =
             std::collections::BTreeMap::new();
-        let mut clients: std::collections::BTreeMap<String, (CommandSpec, WorkerClient)> =
+        let mut clients: std::collections::BTreeMap<String, WarmWorker> =
             std::collections::BTreeMap::new();
+        let mut checked_out = std::collections::BTreeSet::new();
         let mut failures: std::collections::BTreeMap<String, (u32, String)> =
             std::collections::BTreeMap::new();
         let mut interval = tokio::time::interval(WORKER_POLL_INTERVAL);
@@ -774,8 +794,25 @@ fn spawn_dashboard_worker_poller() -> (
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if !poll_dashboard_workers(&targets, &mut clients, &mut failures, &updates_tx).await {
+                    if !poll_dashboard_workers(&targets, &mut clients, &checked_out, &mut failures, &updates_tx).await {
                         break;
+                    }
+                }
+                command = commands_rx.recv() => {
+                    match command {
+                        Some(WorkerPollCommand::Checkout { session_id, reply }) => {
+                            checked_out.insert(session_id.clone());
+                            let _ = reply.send(clients.remove(&session_id));
+                        }
+                        Some(WorkerPollCommand::Checkin { session_id, worker }) => {
+                            checked_out.remove(&session_id);
+                            if let Some(worker) = worker
+                                && targets.get(&session_id).is_some_and(|target| target.spec == worker.spec)
+                            {
+                                clients.insert(session_id, *worker);
+                            }
+                        }
+                        None => break,
                     }
                 }
                 changed = targets_rx.changed() => {
@@ -788,32 +825,40 @@ fn spawn_dashboard_worker_poller() -> (
                         .cloned()
                         .map(|target| (target.session_id.clone(), target))
                         .collect();
-                    clients.retain(|id, (spec, _)| {
-                        targets.get(id).is_some_and(|target| spec == &target.spec)
+                    clients.retain(|id, worker| {
+                        targets.get(id).is_some_and(|target| target.spec == worker.spec)
                     });
+                    checked_out.retain(|id| targets.contains_key(id));
                 }
             }
         }
     });
-    (targets_tx, updates_rx)
+    (targets_tx, updates_rx, commands_tx)
 }
 
 async fn poll_dashboard_workers(
     targets: &std::collections::BTreeMap<String, WorkerPollTarget>,
-    clients: &mut std::collections::BTreeMap<String, (CommandSpec, WorkerClient)>,
+    clients: &mut std::collections::BTreeMap<String, WarmWorker>,
+    checked_out: &std::collections::BTreeSet<String>,
     failures: &mut std::collections::BTreeMap<String, (u32, String)>,
     updates: &tokio::sync::mpsc::Sender<WorkerPollUpdate>,
 ) -> bool {
     for target in targets.values() {
+        if checked_out.contains(&target.session_id) {
+            continue;
+        }
         let synced = match clients.get_mut(&target.session_id) {
-            Some((spec, client)) if spec == &target.spec => {
-                Some(tokio::time::timeout(WORKER_POLL_TIMEOUT, client.sync()).await)
+            Some(worker) if worker.spec == target.spec => {
+                Some(tokio::time::timeout(WORKER_POLL_TIMEOUT, worker.client.sync()).await)
             }
             _ => None,
         };
         let failure = match synced {
             Some(Ok(Ok(events))) => {
                 failures.remove(&target.session_id);
+                if let Some(worker) = clients.get_mut(&target.session_id) {
+                    worker.bootstrap.events.extend(events.iter().cloned());
+                }
                 if !events.is_empty()
                     && updates
                         .send(WorkerPollUpdate {
@@ -840,13 +885,21 @@ async fn poll_dashboard_workers(
                     let mut client =
                         WorkerClient::connect(&target.spec, &target.session_id).await?;
                     let bootstrap = client.bootstrap().await?;
-                    Ok::<_, anyhow::Error>((client, bootstrap.events))
+                    Ok::<_, anyhow::Error>((client, bootstrap))
                 })
                 .await;
                 match connected {
-                    Ok(Ok((client, events))) => {
+                    Ok(Ok((client, bootstrap))) => {
                         failures.remove(&target.session_id);
-                        clients.insert(target.session_id.clone(), (target.spec.clone(), client));
+                        let events = bootstrap.events.clone();
+                        clients.insert(
+                            target.session_id.clone(),
+                            WarmWorker {
+                                spec: target.spec.clone(),
+                                client,
+                                bootstrap,
+                            },
+                        );
                         if !events.is_empty()
                             && updates
                                 .send(WorkerPollUpdate {
@@ -1013,7 +1066,8 @@ async fn run_dashboard() -> Result<()> {
     }
     let (quota_profiles_tx, mut quota_updates_rx) = spawn_dashboard_quota_refresher();
     request_dashboard_quota_refresh(&controller, &mut dashboard, &quota_profiles_tx);
-    let (worker_targets_tx, mut worker_updates_rx) = spawn_dashboard_worker_poller();
+    let (worker_targets_tx, mut worker_updates_rx, worker_commands_tx) =
+        spawn_dashboard_worker_poller();
     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
     let (import_updates_tx, mut import_updates_rx) =
         tokio::sync::mpsc::channel::<(u64, ImportProfileOption)>(32);
@@ -1262,16 +1316,68 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
             DashboardAction::Open { session_id } => {
-                let result = async {
-                    let spec = controller.reconnect_command(&session_id)?;
-                    let client = WorkerClient::connect(&spec, &session_id).await?;
-                    hel::hel_chat::run_chat(&mut terminal.terminal, client).await
-                }
-                .await;
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                worker_commands_tx
+                    .send(WorkerPollCommand::Checkout {
+                        session_id: session_id.clone(),
+                        reply: reply_tx,
+                    })
+                    .await
+                    .context("dashboard worker poller stopped")?;
+                let warm = reply_rx.await.context("dashboard worker poller stopped")?;
+                let result = match warm {
+                    Some(worker) => {
+                        let spec = worker.spec;
+                        hel::hel_chat::run_chat(
+                            &mut terminal.terminal,
+                            worker.client,
+                            Some(worker.bootstrap),
+                        )
+                        .await
+                        .map(|(exit, client, bootstrap)| {
+                            (
+                                exit,
+                                Some(WarmWorker {
+                                    spec,
+                                    client,
+                                    bootstrap,
+                                }),
+                            )
+                        })
+                    }
+                    None => {
+                        async {
+                            let spec = controller.reconnect_command(&session_id)?;
+                            let client = WorkerClient::connect(&spec, &session_id).await?;
+                            let (exit, client, bootstrap) =
+                                hel::hel_chat::run_chat(&mut terminal.terminal, client, None)
+                                    .await?;
+                            Ok((
+                                exit,
+                                Some(WarmWorker {
+                                    spec,
+                                    client,
+                                    bootstrap,
+                                }),
+                            ))
+                        }
+                        .await
+                    }
+                };
                 match result {
-                    Ok(hel::hel_chat::ChatExit::Detached {
-                        last_seen_event_sequence,
-                    }) => {
+                    Ok((
+                        hel::hel_chat::ChatExit::Detached {
+                            last_seen_event_sequence,
+                        },
+                        worker,
+                    )) => {
+                        worker_commands_tx
+                            .send(WorkerPollCommand::Checkin {
+                                session_id: session_id.clone(),
+                                worker: worker.map(Box::new),
+                            })
+                            .await
+                            .context("dashboard worker poller stopped")?;
                         let read_result = controller
                             .mark_session_viewed_through(&session_id, last_seen_event_sequence);
                         dashboard.set_state(controller.state.clone());
@@ -1285,6 +1391,13 @@ async fn run_dashboard() -> Result<()> {
                         }
                     }
                     Err(error) => {
+                        worker_commands_tx
+                            .send(WorkerPollCommand::Checkin {
+                                session_id: session_id.clone(),
+                                worker: None,
+                            })
+                            .await
+                            .context("dashboard worker poller stopped")?;
                         dashboard.set_notice(format!("Could not open session: {error:#}"))
                     }
                 }

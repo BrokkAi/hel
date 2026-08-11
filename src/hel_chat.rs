@@ -23,7 +23,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::hel_acp::RuntimeEvent;
 use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot};
-use crate::hel_worker_client::WorkerClient;
+use crate::hel_worker_client::{WorkerBootstrap, WorkerClient};
 use rendering::{
     LogicalLine, TranscriptRenderMode, markdown_lines, raw_lines, sanitize_terminal_text,
     wrap_styled_line,
@@ -1150,8 +1150,12 @@ fn tool_location_details(locations: &[ToolCallLocation]) -> Vec<String> {
 pub async fn run_chat(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut client: WorkerClient,
-) -> Result<ChatExit> {
-    let bootstrap = client.bootstrap().await?;
+    bootstrap: Option<WorkerBootstrap>,
+) -> Result<(ChatExit, WorkerClient, WorkerBootstrap)> {
+    let mut bootstrap = match bootstrap {
+        Some(bootstrap) => bootstrap,
+        None => client.bootstrap().await?,
+    };
     let mut chat = ChatState::new(&bootstrap.snapshot, &bootstrap.events);
     let (voice_updates_tx, mut voice_updates_rx) =
         tokio::sync::mpsc::unbounded_channel::<VoiceUpdate>();
@@ -1254,10 +1258,13 @@ pub async fn run_chat(
                             let _ = cancel.send(());
                         }
                         let last_seen_event_sequence = chat.latest_seq();
-                        client.detach().await?;
-                        return Ok(ChatExit::Detached {
-                            last_seen_event_sequence,
-                        });
+                        return Ok((
+                            ChatExit::Detached {
+                                last_seen_event_sequence,
+                            },
+                            client,
+                            bootstrap,
+                        ));
                     }
                 };
                 if let Some(error) = result {
@@ -1267,7 +1274,10 @@ pub async fn run_chat(
             pending = event::poll(Duration::from_millis(0))?;
         }
         match client.sync().await {
-            Ok(events) => chat.apply_events(&events),
+            Ok(events) => {
+                chat.apply_events(&events);
+                bootstrap.events.extend(events);
+            }
             Err(error) => chat.set_notice(format!("connection lost: {error:#}")),
         }
     }
