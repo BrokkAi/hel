@@ -558,7 +558,6 @@ dependencies = [
  "shell-words",
  "signal-hook",
  "similar",
- "soup3",
  "tao",
  "tar",
  "tempfile",

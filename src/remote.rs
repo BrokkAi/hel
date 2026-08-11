@@ -8538,12 +8538,8 @@ fn bind_desktop_listener() -> Result<(TcpListener, SocketAddr)> {
 /// Everything the desktop shell needs to open a window against the app-owned
 /// server: where to point the webview, which certificate to pin, and the
 /// bootstrap cookie that signs the viewer in without the viewer-code screen.
-// Server-only and Android builds compile the desktop runtime without the
-// `mj app` command that consumes it.
-#[cfg_attr(
-    not(all(feature = "desktop-app", not(target_os = "android"))),
-    allow(dead_code)
-)]
+// Consumed by the `mj app` CLI wiring in #727.
+#[allow(dead_code)]
 pub(crate) struct DesktopServerHandle {
     pub origin: Url,
     /// DER encoding of the served certificate, for `desktop::DesktopShellOptions`.
@@ -8640,10 +8636,8 @@ async fn prepare_desktop_runtime(
     ))
 }
 
-#[cfg_attr(
-    not(all(feature = "desktop-app", not(target_os = "android"))),
-    allow(dead_code)
-)]
+// Consumed by the `mj app` CLI wiring in #727.
+#[allow(dead_code)]
 pub(crate) struct DesktopServerOptions {
     pub history_days: u32,
     pub cwd: PathBuf,
@@ -8656,10 +8650,8 @@ pub(crate) struct DesktopServerOptions {
 /// Desktop-mode counterpart of [`run_server`]: same configuration resolution,
 /// workspace roots, and session manager, but bound to an OS-assigned loopback
 /// port with per-launch in-memory secrets and isolated on-disk state.
-#[cfg_attr(
-    not(all(feature = "desktop-app", not(target_os = "android"))),
-    allow(dead_code)
-)]
+// Consumed by the `mj app` CLI wiring in #727.
+#[allow(dead_code)]
 pub(crate) async fn prepare_desktop_server(
     options: DesktopServerOptions,
 ) -> Result<(
