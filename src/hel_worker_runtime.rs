@@ -14,8 +14,8 @@ mod unix {
     use crate::hel_acp::{self, CommandRequest, LaunchSpec, RuntimeEvent};
     use crate::hel_config::HarnessKind;
     use crate::hel_worker::{
-        DurableWorker, RequestEnvelope, ResponseBody, ResponseEnvelope, ResponsePayload,
-        WorkerRequest,
+        DurableWorker, ErrorCode, PROTOCOL_VERSION, ProtocolError, RequestEnvelope, ResponseBody,
+        ResponseEnvelope, ResponsePayload, WorkerRequest,
     };
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +153,14 @@ mod unix {
             let envelope: RequestEnvelope =
                 serde_json::from_str(&line).context("decode worker request")?;
             let request = envelope.request.clone();
+            if let WorkerRequest::Compact { text } = request {
+                let response = compact_response(envelope, text, &commands).await;
+                let mut encoded = serde_json::to_vec(&response)?;
+                encoded.push(b'\n');
+                writer.write_all(&encoded).await?;
+                writer.flush().await?;
+                continue;
+            }
             let response = worker
                 .lock()
                 .expect("worker state lock poisoned")
@@ -170,6 +178,66 @@ mod unix {
             }
         }
         Ok(())
+    }
+
+    async fn compact_response(
+        envelope: RequestEnvelope,
+        text: String,
+        commands: &mpsc::Sender<CommandRequest>,
+    ) -> ResponseEnvelope {
+        let body = if envelope.protocol_version != PROTOCOL_VERSION {
+            ResponseBody::Error {
+                error: ProtocolError {
+                    code: ErrorCode::IncompatibleProtocol,
+                    message: format!(
+                        "request uses protocol {}, worker requires {}",
+                        envelope.protocol_version, PROTOCOL_VERSION
+                    ),
+                    retryable: false,
+                },
+            }
+        } else if text.trim().is_empty() {
+            ResponseBody::Error {
+                error: ProtocolError {
+                    code: ErrorCode::InvalidRequest,
+                    message: "compaction prompt is empty".into(),
+                    retryable: false,
+                },
+            }
+        } else {
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            match commands
+                .send(CommandRequest::Compact {
+                    prompt: text,
+                    response: response_tx,
+                })
+                .await
+            {
+                Ok(()) => match response_rx.await {
+                    Ok(Ok(text)) => ResponseBody::Ok {
+                        payload: ResponsePayload::Compacted { text },
+                    },
+                    Ok(Err(message)) => runtime_compaction_error(&message),
+                    Err(_) => runtime_compaction_error("ACP runtime stopped"),
+                },
+                Err(_) => runtime_compaction_error("ACP runtime stopped"),
+            }
+        };
+        ResponseEnvelope {
+            request_id: envelope.request_id,
+            protocol_version: PROTOCOL_VERSION,
+            body,
+        }
+    }
+
+    fn runtime_compaction_error(message: &str) -> ResponseBody {
+        ResponseBody::Error {
+            error: ProtocolError {
+                code: ErrorCode::Internal,
+                message: message.into(),
+                retryable: false,
+            },
+        }
     }
 
     fn accepted(response: &ResponseEnvelope) -> bool {

@@ -97,6 +97,8 @@ home = "/home/me/.codex-1"
 [profiles.codex-2]
 kind = "codex"
 home = "/home/me/.codex-2"
+# Optional conservative byte budget used only for cross-harness compaction.
+context_window_bytes = 262144
 
 [profiles.claude-1]
 kind = "claude"

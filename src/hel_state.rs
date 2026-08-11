@@ -166,6 +166,14 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
+    /// User-visible session name, independent of the initial prompt stored in `title`.
+    pub fn display_title(&self) -> &str {
+        self.session_title_override
+            .as_deref()
+            .or(self.acp_session_title.as_deref())
+            .unwrap_or(&self.id)
+    }
+
     fn validate(&self, map_id: &str) -> Result<()> {
         validate_id("session", &self.id)?;
         if self.id != map_id {
@@ -459,6 +467,7 @@ mod tests {
                 HarnessProfile {
                     model: None,
                     reasoning_effort: None,
+                    context_window_bytes: None,
                     kind: HarnessKind::Codex,
                     home: PathBuf::from("/home/test/.codex"),
                     executable: None,

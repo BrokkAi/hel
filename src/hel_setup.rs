@@ -283,6 +283,7 @@ pub fn build_config(
                 environment: BTreeMap::new(),
                 model: None,
                 reasoning_effort: None,
+                context_window_bytes: None,
             },
         );
     }

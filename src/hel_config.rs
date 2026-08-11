@@ -61,6 +61,10 @@ pub struct HarnessProfile {
     /// Reasoning-effort override (Codex `model_reasoning_effort`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Conservative byte budget for cross-harness transcript compaction.
+    /// Bytes avoid pretending Hel has an accurate tokenizer for every model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_bytes: Option<usize>,
 }
 
 impl HarnessProfile {
@@ -105,6 +109,12 @@ impl HarnessProfile {
             && effort.trim().is_empty()
         {
             bail!("profile {id:?} has an empty `reasoning_effort` override");
+        }
+        if self
+            .context_window_bytes
+            .is_some_and(|bytes| bytes < 32 * 1024)
+        {
+            bail!("profile {id:?}: `context_window_bytes` must be at least 32768");
         }
         Ok(())
     }
@@ -578,6 +588,7 @@ mod tests {
                 HarnessProfile {
                     model: None,
                     reasoning_effort: None,
+                    context_window_bytes: None,
                     kind: HarnessKind::Codex,
                     home: PathBuf::from("/home/test/.codex-one"),
                     executable: None,

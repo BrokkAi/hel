@@ -735,6 +735,7 @@ fn collect_native_tree(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
+    let relative = path.strip_prefix(home)?;
     let selected = match harness {
         HarnessKind::Codex => {
             (name.contains(session_id)
@@ -742,9 +743,8 @@ fn collect_native_tree(
                 || (name.ends_with(".jsonl") && codex_rollout_has_session_id(path, session_id))
         }
         HarnessKind::Claude => inside || name == format!("{session_id}.jsonl"),
-        HarnessKind::Kimi => inside,
+        HarnessKind::Kimi => inside && kimi_session_artifact(relative, session_id),
     };
-    let relative = path.strip_prefix(home)?;
     if !selected || secret_like_path(relative) {
         return Ok(());
     }
@@ -759,6 +759,26 @@ fn collect_native_tree(
         mode: file_mode(&metadata),
     });
     Ok(())
+}
+
+fn kimi_session_artifact(relative: &Path, session_id: &str) -> bool {
+    let components = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(component) => component.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(session_index) = components.iter().position(|component| {
+        *component == session_id || *component == format!("session_{session_id}")
+    }) else {
+        return false;
+    };
+    matches!(&components[session_index + 1..], ["state.json"])
+        || matches!(
+            &components[session_index + 1..],
+            ["agents", _, "wire.jsonl"]
+        )
 }
 
 fn codex_rollout_has_session_id(path: &Path, session_id: &str) -> bool {
@@ -1372,6 +1392,19 @@ mod tests {
         fs::create_dir_all(session.join("agents/main")).unwrap();
         fs::write(session.join("state.json"), b"state").unwrap();
         fs::write(session.join("agents/main/wire.jsonl"), b"events").unwrap();
+        fs::create_dir_all(session.join("agents/main/tasks/bash-noise")).unwrap();
+        fs::write(
+            session.join("agents/main/tasks/bash-noise/output.log"),
+            b"tool output",
+        )
+        .unwrap();
+        fs::write(
+            session.join("agents/main/wire.jsonl.bak-before-edit"),
+            b"backup",
+        )
+        .unwrap();
+        fs::create_dir_all(session.join("logs")).unwrap();
+        fs::write(session.join("logs/kimi-code.log"), b"log").unwrap();
         fs::write(session.join("credentials.json"), b"secret").unwrap();
         let other = temp.path().join("sessions/workspace/other");
         fs::create_dir_all(&other).unwrap();
@@ -1407,6 +1440,10 @@ mod tests {
                 .relative_path
                 .to_string_lossy()
                 .contains("credentials")
+        }));
+        assert!(artifacts.iter().all(|artifact| {
+            let path = artifact.relative_path.to_string_lossy();
+            !path.contains("tasks") && !path.contains(".bak") && !path.contains("logs")
         }));
     }
 

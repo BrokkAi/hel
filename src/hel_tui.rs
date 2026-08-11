@@ -12,7 +12,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap,
+    Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState,
+    Wrap,
 };
 
 use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
@@ -67,7 +68,8 @@ pub enum DashboardAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
-    Sessions,
+    Active,
+    Archived,
     Quotas,
 }
 
@@ -197,7 +199,7 @@ impl DashboardState {
             session_details: BTreeMap::new(),
             session_index: 0,
             quota_index: 0,
-            focus: Focus::Sessions,
+            focus: Focus::Active,
             mode: Mode::Dashboard,
             notice: None,
         };
@@ -335,11 +337,12 @@ impl DashboardState {
     fn handle_dashboard_key(&mut self, code: KeyCode) -> DashboardAction {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => DashboardAction::QuitDetach,
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.focus = match self.focus {
-                    Focus::Sessions => Focus::Quotas,
-                    Focus::Quotas => Focus::Sessions,
-                };
+            KeyCode::Tab => {
+                self.cycle_focus(false);
+                DashboardAction::None
+            }
+            KeyCode::BackTab => {
+                self.cycle_focus(true);
                 DashboardAction::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -883,7 +886,12 @@ impl DashboardState {
     }
 
     fn selected_session(&self) -> Option<&SessionRecord> {
-        self.ordered_sessions().get(self.session_index).copied()
+        let session = self.ordered_sessions().get(self.session_index).copied()?;
+        match self.focus {
+            Focus::Active if session.state.is_active() => Some(session),
+            Focus::Archived if !session.state.is_active() => Some(session),
+            Focus::Active | Focus::Archived | Focus::Quotas => None,
+        }
     }
 
     fn ordered_sessions(&self) -> Vec<&SessionRecord> {
@@ -930,15 +938,22 @@ impl DashboardState {
     }
 
     fn focus_len(&self) -> usize {
+        let (active, archived) =
+            partition_sessions(self.state.sessions.values(), &self.session_details);
         match self.focus {
-            Focus::Sessions => self.state.sessions.len(),
+            Focus::Active => active.len(),
+            Focus::Archived => archived.len(),
             Focus::Quotas => self.config.profiles.len(),
         }
     }
 
     fn set_selection(&mut self, index: usize) {
+        let active_len = partition_sessions(self.state.sessions.values(), &self.session_details)
+            .0
+            .len();
         match self.focus {
-            Focus::Sessions => self.session_index = index,
+            Focus::Active => self.session_index = index,
+            Focus::Archived => self.session_index = active_len + index,
             Focus::Quotas => self.quota_index = index,
         }
     }
@@ -946,15 +961,59 @@ impl DashboardState {
     fn move_selection(&mut self, delta: isize) {
         let len = self.focus_len();
         match self.focus {
-            Focus::Sessions => move_index(&mut self.session_index, len, delta),
+            Focus::Active => move_index(&mut self.session_index, len, delta),
+            Focus::Archived => {
+                let active_len =
+                    partition_sessions(self.state.sessions.values(), &self.session_details)
+                        .0
+                        .len();
+                let mut index = self.session_index.saturating_sub(active_len);
+                move_index(&mut index, len, delta);
+                self.session_index = active_len + index;
+            }
             Focus::Quotas => move_index(&mut self.quota_index, len, delta),
         }
     }
 
+    fn cycle_focus(&mut self, reverse: bool) {
+        self.focus = match (self.focus, reverse) {
+            (Focus::Active, false) | (Focus::Quotas, true) => Focus::Archived,
+            (Focus::Archived, false) | (Focus::Active, true) => Focus::Quotas,
+            (Focus::Quotas, false) | (Focus::Archived, true) => Focus::Active,
+        };
+        let active_len = partition_sessions(self.state.sessions.values(), &self.session_details)
+            .0
+            .len();
+        match self.focus {
+            Focus::Active => {
+                self.session_index = self.session_index.min(active_len.saturating_sub(1));
+            }
+            Focus::Archived => self.session_index = self.session_index.max(active_len),
+            Focus::Quotas => {}
+        }
+    }
+
     fn clamp_selections(&mut self) {
-        self.session_index = self
-            .session_index
-            .min(self.state.sessions.len().saturating_sub(1));
+        let (active, archived) =
+            partition_sessions(self.state.sessions.values(), &self.session_details);
+        if self.focus == Focus::Active && active.is_empty() && !archived.is_empty() {
+            self.focus = Focus::Archived;
+        } else if self.focus == Focus::Archived && archived.is_empty() && !active.is_empty() {
+            self.focus = Focus::Active;
+        }
+        self.session_index = match self.focus {
+            Focus::Active => self.session_index.min(active.len().saturating_sub(1)),
+            Focus::Archived => {
+                active.len()
+                    + self
+                        .session_index
+                        .saturating_sub(active.len())
+                        .min(archived.len().saturating_sub(1))
+            }
+            Focus::Quotas => self
+                .session_index
+                .min(self.state.sessions.len().saturating_sub(1)),
+        };
         self.quota_index = self
             .quota_index
             .min(self.config.profiles.len().saturating_sub(1));
@@ -1181,8 +1240,6 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(archived_height)])
         .split(area);
-    let selected_archived = dashboard.session_index >= active.len();
-
     let active_rows = active.iter().map(|session| {
         active_session_row(
             session,
@@ -1190,16 +1247,20 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
             now_epoch_seconds,
         )
     });
+    let active_focused = dashboard.focus == Focus::Active;
     let active_table = Table::new(active_rows, session_column_constraints())
         .header(session_header())
-        .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-        .highlight_symbol("› ")
+        .row_highlight_style(if active_focused {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        } else {
+            Style::default()
+        })
+        .highlight_symbol(if active_focused { "› " } else { "  " })
+        .highlight_spacing(HighlightSpacing::Always)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(focus_border(
-                    dashboard.focus == Focus::Sessions && !selected_archived,
-                ))
+                .border_type(focus_border(active_focused))
                 .title(" Active "),
         );
     let mut active_state = TableState::default()
@@ -1219,11 +1280,12 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         else {
             continue;
         };
-        let selected = active_offset + visible_index == dashboard.session_index;
+        let selected = dashboard.focus == Focus::Active
+            && active_offset + visible_index == dashboard.session_index;
         let style = if selected {
             Style::default().fg(Color::Gray).bg(Color::DarkGray)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(Color::DarkGray)
         };
         frame.render_widget(
             Paragraph::new(truncate_text(
@@ -1243,21 +1305,24 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
     let archived_rows = archived
         .iter()
         .map(|session| archived_session_row(session, now_epoch_seconds));
+    let archived_focused = dashboard.focus == Focus::Archived;
     let archived_table = Table::new(archived_rows, session_column_constraints())
         .header(session_header())
-        .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-        .highlight_symbol("› ")
+        .row_highlight_style(if archived_focused {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        } else {
+            Style::default()
+        })
+        .highlight_symbol(if archived_focused { "› " } else { "  " })
+        .highlight_spacing(HighlightSpacing::Always)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(focus_border(
-                    dashboard.focus == Focus::Sessions && selected_archived,
-                ))
+                .border_type(focus_border(archived_focused))
                 .title(" Archived "),
         );
     let mut archived_state = TableState::default().with_selected(
-        selected_archived
-            .then(|| dashboard.session_index.saturating_sub(active.len()))
+        Some(dashboard.session_index.saturating_sub(active.len()))
             .filter(|index| *index < archived.len()),
     );
     frame.render_stateful_widget(archived_table, panes[1], &mut archived_state);
@@ -1317,12 +1382,7 @@ fn session_values(
 }
 
 fn session_name(session: &SessionRecord) -> &str {
-    session
-        .session_title_override
-        .as_deref()
-        .or(session.acp_session_title.as_deref())
-        .or(session.native_session_id.as_deref())
-        .unwrap_or_default()
+    session.display_title()
 }
 
 fn session_name_line(session_name: String, unread_count: usize) -> Line<'static> {
@@ -1398,10 +1458,11 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         Span::raw(" Profile Quotas "),
         Span::styled(
             format!("({refresh_status}) "),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::DarkGray),
         ),
     ]);
-    let border_type = if dashboard.focus == Focus::Quotas {
+    let quotas_focused = dashboard.focus == Focus::Quotas;
+    let border_type = if quotas_focused {
         BorderType::Double
     } else {
         BorderType::Plain
@@ -1419,8 +1480,13 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         Row::new(["Profile", "Harness", "Access", "Quota / reset / error"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
-    .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-    .highlight_symbol("› ")
+    .row_highlight_style(if quotas_focused {
+        Style::default().bg(Color::DarkGray).fg(Color::White)
+    } else {
+        Style::default()
+    })
+    .highlight_symbol(if quotas_focused { "› " } else { "  " })
+    .highlight_spacing(HighlightSpacing::Always)
     .block(
         Block::default()
             .borders(Borders::ALL)
@@ -1882,6 +1948,7 @@ mod tests {
                     HarnessProfile {
                         model: None,
                         reasoning_effort: None,
+                        context_window_bytes: None,
                         kind: HarnessKind::Claude,
                         home: PathBuf::from("/profiles/claude"),
                         executable: None,
@@ -1893,6 +1960,7 @@ mod tests {
                     HarnessProfile {
                         model: None,
                         reasoning_effort: None,
+                        context_window_bytes: None,
                         kind: HarnessKind::Codex,
                         home: PathBuf::from("/profiles/codex"),
                         executable: None,
@@ -1904,6 +1972,7 @@ mod tests {
                     HarnessProfile {
                         model: None,
                         reasoning_effort: None,
+                        context_window_bytes: None,
                         kind: HarnessKind::Codex,
                         home: PathBuf::from("/profiles/codex-two"),
                         executable: None,
@@ -1996,7 +2065,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_pane_includes_terminal_sessions_without_losing_selection_order() {
+    fn archived_pane_includes_terminal_sessions_with_pane_local_navigation() {
         let mut running = archived_session();
         running.id = "session-0".into();
         running.state = SessionState::Running;
@@ -2031,6 +2100,13 @@ mod tests {
 
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         dashboard.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            dashboard
+                .selected_session()
+                .map(|session| session.id.as_str()),
+            Some("session-0")
+        );
+        dashboard.handle_key(key(KeyCode::Tab));
         assert_eq!(
             dashboard
                 .selected_session()
@@ -2272,15 +2348,82 @@ mod tests {
     }
 
     #[test]
-    fn session_name_prefers_override_then_acp_title_then_uuid() {
+    fn session_name_prefers_override_then_acp_title_then_hel_uuid() {
         let mut session = archived_session();
         assert_eq!(session_name(&session), "ACP pretty name");
 
         session.acp_session_title = None;
-        assert_eq!(session_name(&session), "native-1");
+        assert_eq!(session_name(&session), "session-1");
 
         session.session_title_override = Some("My name".into());
         assert_eq!(session_name(&session), "My name");
+
+        session.session_title_override = None;
+        session.native_session_id = None;
+        assert_eq!(session_name(&session), "session-1");
+        assert_ne!(session_name(&session), session.title);
+    }
+
+    #[test]
+    fn dashboard_navigation_keeps_three_distinct_panes() {
+        let mut active = archived_session();
+        active.id = "session-0".into();
+        active.state = SessionState::Running;
+        let archived = archived_session();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions: BTreeMap::from([
+                    (active.id.clone(), active),
+                    (archived.id.clone(), archived),
+                ]),
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+
+        assert_eq!(dashboard.focus, Focus::Active);
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-0");
+        dashboard.handle_key(key(KeyCode::Down));
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-0");
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Archived);
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-1");
+        dashboard.handle_key(key(KeyCode::Down));
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-1");
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Quotas);
+        assert!(dashboard.selected_session().is_none());
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Active);
+
+        dashboard.handle_key(key(KeyCode::BackTab));
+        assert_eq!(dashboard.focus, Focus::Quotas);
+        dashboard.handle_key(key(KeyCode::BackTab));
+        assert_eq!(dashboard.focus, Focus::Archived);
+    }
+
+    #[test]
+    fn closing_last_active_session_moves_focus_to_archived_then_cycles_all_panes() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        assert_eq!(dashboard.focus, Focus::Active);
+
+        let mut state = dashboard.state.clone();
+        state.sessions.get_mut("session-1").unwrap().state = SessionState::Archived;
+        dashboard.set_state(state);
+        assert_eq!(dashboard.focus, Focus::Archived);
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Quotas);
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Active);
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Archived);
     }
 
     #[test]
@@ -2439,6 +2582,62 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("╔ Profile Quotas"));
         assert!(!rendered.contains("[focused]"));
+    }
+
+    #[test]
+    fn only_focused_pane_draws_caret_without_shifting_session_columns() {
+        let mut active = archived_session();
+        active.id = "session-0".into();
+        active.state = SessionState::Running;
+        let archived = archived_session();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions: BTreeMap::from([
+                    (active.id.clone(), active),
+                    (archived.id.clone(), archived),
+                ]),
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        let backend = TestBackend::new(120, 28);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        for expected_focus in [Focus::Active, Focus::Archived, Focus::Quotas] {
+            assert_eq!(dashboard.focus, expected_focus);
+            terminal
+                .draw(|frame| render(frame, &mut dashboard))
+                .expect("draw dashboard");
+            let buffer = terminal.backend().buffer();
+            let lines = (buffer.area.y..buffer.area.bottom())
+                .map(|y| {
+                    (buffer.area.x..buffer.area.right())
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                lines
+                    .iter()
+                    .flat_map(|line| line.chars())
+                    .filter(|character| *character == '›')
+                    .count(),
+                1
+            );
+            let name_columns = lines
+                .iter()
+                .filter_map(|line| {
+                    line.find("ACP pretty name")
+                        .map(|byte| line[..byte].chars().count())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(name_columns.len(), 2);
+            assert_eq!(name_columns[0], name_columns[1]);
+
+            dashboard.handle_key(key(KeyCode::Tab));
+        }
     }
 
     #[test]

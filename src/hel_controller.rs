@@ -444,9 +444,12 @@ impl Controller {
             bail!("resuming a session with additional mounts requires a container-backed target");
         }
         let same_harness = profile.kind == archive.manifest.session.harness_kind;
-        let conversion_context = (!same_harness)
-            .then(|| conversion_context(&archive))
-            .transpose()?;
+        let canonical_events = archive.payload_by_role(&PayloadRole::CanonicalEvents)?;
+        let source_latest_seq = canonical_latest_sequence(canonical_events)?;
+        let context_bytes = profile
+            .context_window_bytes
+            .unwrap_or(crate::hel_compaction::DEFAULT_CONTEXT_BYTES);
+        let portable_events = (!same_harness).then(|| canonical_events.to_vec());
 
         let record = self.state.sessions.get_mut(session_id).unwrap();
         record.harness_kind = profile.kind;
@@ -510,16 +513,46 @@ impl Controller {
             start_worker(&ProcessExecutor, &backend, &worker_root)?;
             handshake_worker(&hel_targets::reconnect_plan(&backend, session_id)?.commands[0])
                 .await?;
-            self.mark_worker_connected(
-                session_id,
-                same_harness.then(|| archive.manifest.session.native_session_id.clone()),
-            )?;
-            if let Some(context) = conversion_context {
-                let spec = self.reconnect_command(session_id)?;
-                let mut client = WorkerClient::connect(&spec, session_id).await?;
-                client.prompt(context, Vec::new()).await?;
-                client.detach().await?;
+            let spec = self.reconnect_command(session_id)?;
+            let mut client = WorkerClient::connect(&spec, session_id).await?;
+            let (native_session_id, resumed) =
+                wait_for_session_started(&mut client, source_latest_seq).await?;
+            if same_harness {
+                if !resumed {
+                    bail!("same-harness resume started a fresh ACP session instead of loading the copied native session");
+                }
+                if native_session_id != archive.manifest.session.native_session_id {
+                    bail!(
+                        "ACP loaded native session {native_session_id}, expected {}",
+                        archive.manifest.session.native_session_id
+                    );
+                }
+            } else {
+                if resumed {
+                    bail!("cross-harness resume unexpectedly loaded a native source session");
+                }
+                let events = portable_events
+                    .as_deref()
+                    .context("cross-harness resume is missing canonical events")?;
+                let context = crate::hel_compaction::compact_events(
+                    events,
+                    context_bytes,
+                    &mut client,
+                )
+                .await?;
+                client
+                    .prompt(
+                        context,
+                        vec![crate::hel_worker::Attachment {
+                            name: "cross-harness-handoff".into(),
+                            media_type: crate::hel_compaction::HANDOFF_MEDIA_TYPE.into(),
+                            reference: "synthetic".into(),
+                        }],
+                    )
+                    .await?;
             }
+            self.mark_worker_connected(session_id, Some(native_session_id))?;
+            client.detach().await?;
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -806,6 +839,49 @@ fn native_session_id_from_events(events: &[crate::hel_worker::SequencedEvent]) -
     })
 }
 
+fn canonical_latest_sequence(bytes: &[u8]) -> Result<u64> {
+    let mut latest = 0;
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let event: crate::hel_worker::SequencedEvent = serde_json::from_slice(line)?;
+        latest = latest.max(event.seq);
+    }
+    Ok(latest)
+}
+
+async fn wait_for_session_started(
+    client: &mut WorkerClient,
+    mut cursor: u64,
+) -> Result<(String, bool)> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let events = client.replay_after(cursor).await?;
+        for event in events {
+            cursor = cursor.max(event.seq);
+            let WorkerEvent::Adapter { payload, .. } = event.event else {
+                continue;
+            };
+            match serde_json::from_value::<crate::hel_acp::RuntimeEvent>(payload) {
+                Ok(crate::hel_acp::RuntimeEvent::SessionStarted {
+                    native_session_id,
+                    resumed,
+                    ..
+                }) => return Ok((native_session_id, resumed)),
+                Ok(crate::hel_acp::RuntimeEvent::Stopped) => {
+                    bail!("ACP runtime stopped before starting its session")
+                }
+                _ => {}
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("ACP runtime did not report session startup");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerBinaryAvailability {
     Local {
@@ -983,77 +1059,6 @@ fn validate_worker_sha256(expected_sha256: &str) -> Result<()> {
         bail!("HEL_WORKER_SHA256 must be a 64-character hexadecimal digest");
     }
     Ok(())
-}
-
-fn conversion_context(archive: &crate::hel_archive::VerifiedArchive) -> Result<String> {
-    let bytes = archive.payload_by_role(&PayloadRole::CanonicalEvents)?;
-    conversion_context_from_events(bytes)
-}
-
-fn conversion_context_from_events(bytes: &[u8]) -> Result<String> {
-    let mut entries = Vec::new();
-    let mut assistant_text = String::new();
-    for line in bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        let event: crate::hel_worker::SequencedEvent = serde_json::from_slice(line)?;
-        match event.event {
-            WorkerEvent::PromptAccepted { text, .. } => {
-                flush_assistant_entry(&mut entries, &mut assistant_text);
-                entries.push(format!("USER:\n{text}"));
-            }
-            WorkerEvent::Adapter { payload, .. } => {
-                if let Some(text) = agent_message_chunk_text(payload) {
-                    assistant_text.push_str(&text);
-                } else {
-                    flush_assistant_entry(&mut entries, &mut assistant_text);
-                }
-            }
-            _ => flush_assistant_entry(&mut entries, &mut assistant_text),
-        }
-    }
-    flush_assistant_entry(&mut entries, &mut assistant_text);
-    let mut used = 0usize;
-    let selected = entries
-        .iter()
-        .rev()
-        .take_while(|entry| {
-            used = used.saturating_add(entry.len());
-            used <= 512 * 1024
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let transcript = selected.into_iter().rev().collect::<Vec<_>>().join("\n\n");
-    Ok(format!(
-        "You are continuing a coding session previously run by another ACP harness. Treat the restored workspace as authoritative. Here is the recent canonical transcript for continuity; do not repeat completed work unless verification requires it.\n\n{transcript}"
-    ))
-}
-
-fn flush_assistant_entry(entries: &mut Vec<String>, assistant_text: &mut String) {
-    if !assistant_text.is_empty() {
-        entries.push(format!("ASSISTANT:\n{assistant_text}"));
-        assistant_text.clear();
-    }
-}
-
-fn agent_message_chunk_text(payload: serde_json::Value) -> Option<String> {
-    let crate::hel_acp::RuntimeEvent::SessionUpdate { update } =
-        serde_json::from_value(payload).ok()?
-    else {
-        return None;
-    };
-    (update
-        .get("sessionUpdate")
-        .and_then(serde_json::Value::as_str)
-        == Some("agent_message_chunk"))
-    .then(|| {
-        update
-            .pointer("/content/text")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned)
-    })
-    .flatten()
 }
 
 fn target_kind(locator: &hel_targets::TargetLocator) -> &'static str {
@@ -2213,86 +2218,6 @@ mod tests {
     }
 
     #[test]
-    fn conversion_context_coalesces_agent_messages_and_skips_non_transcript_updates() {
-        let session_update = |update| WorkerEvent::Adapter {
-            kind: "session_update".into(),
-            payload: serde_json::to_value(crate::hel_acp::RuntimeEvent::SessionUpdate { update })
-                .unwrap(),
-        };
-        let events = [
-            WorkerEvent::PromptAccepted {
-                request_id: "prompt-1".into(),
-                text: "Inspect the checkout.".into(),
-                attachments: vec![],
-            },
-            session_update(serde_json::json!({
-                "sessionUpdate": "agent_message_chunk",
-                "content": {"text": "I inspected "},
-            })),
-            session_update(serde_json::json!({
-                "sessionUpdate": "agent_message_chunk",
-                "content": {"text": "the checkout."},
-            })),
-            session_update(serde_json::json!({
-                "sessionUpdate": "agent_thought_chunk",
-                "content": {"text": "private reasoning"},
-            })),
-            session_update(serde_json::json!({
-                "sessionUpdate": "tool_call",
-                "title": "run tests",
-            })),
-            WorkerEvent::Adapter {
-                kind: "warning".into(),
-                payload: serde_json::to_value(crate::hel_acp::RuntimeEvent::Warning {
-                    message: "transient warning".into(),
-                })
-                .unwrap(),
-            },
-            session_update(serde_json::json!({
-                "sessionUpdate": "agent_message_chunk",
-                "content": {"text": "The build passes."},
-            })),
-            session_update(serde_json::json!({
-                "sessionUpdate": "tool_update",
-                "status": "completed",
-            })),
-        ];
-        let mut canonical_events = Vec::new();
-        for (index, event) in events.into_iter().enumerate() {
-            serde_json::to_writer(
-                &mut canonical_events,
-                &crate::hel_worker::SequencedEvent {
-                    seq: (index + 1) as u64,
-                    request_id: None,
-                    event,
-                },
-            )
-            .unwrap();
-            canonical_events.push(b'\n');
-        }
-
-        let context = conversion_context_from_events(&canonical_events).unwrap();
-        let (_, transcript) = context.split_once("\n\n").unwrap();
-
-        assert_eq!(
-            transcript,
-            "USER:\nInspect the checkout.\n\nASSISTANT:\nI inspected the checkout.\n\nASSISTANT:\nThe build passes."
-        );
-        for excluded in [
-            "agent_message_chunk",
-            "agent_thought_chunk",
-            "private reasoning",
-            "tool_call",
-            "run tests",
-            "tool_update",
-            "transient warning",
-            "PREVIOUS AGENT UPDATE",
-        ] {
-            assert!(!context.contains(excluded), "context included {excluded:?}");
-        }
-    }
-
-    #[test]
     fn stage_profile_applies_codex_model_and_effort_overrides() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2308,6 +2233,7 @@ mod tests {
             environment: std::collections::BTreeMap::new(),
             model: Some("gpt-5.6-terra".into()),
             reasoning_effort: Some("xhigh".into()),
+            context_window_bytes: None,
         };
         stage_profile(&profile, staged.path()).unwrap();
         let staged_config: toml::Table = std::fs::read_to_string(staged.path().join("config.toml"))
@@ -2354,6 +2280,7 @@ mod tests {
                 environment: std::collections::BTreeMap::new(),
                 model: None,
                 reasoning_effort: None,
+                context_window_bytes: None,
             };
 
             stage_profile(&profile, staged.path()).unwrap();
@@ -2382,6 +2309,7 @@ mod tests {
             environment: std::collections::BTreeMap::new(),
             model: None,
             reasoning_effort: None,
+            context_window_bytes: None,
         };
 
         stage_profile(&profile, staged.path()).unwrap();

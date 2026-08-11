@@ -66,6 +66,7 @@ async fn imported_claude_session_resumes_natively_async() -> anyhow::Result<()> 
                 environment: BTreeMap::new(),
                 model: None,
                 reasoning_effort: None,
+                context_window_bytes: None,
             },
         )]),
         bundles: BTreeMap::new(),
@@ -209,6 +210,7 @@ async fn imported_kimi_session_resumes_natively_async() -> anyhow::Result<()> {
                 environment: BTreeMap::new(),
                 model: None,
                 reasoning_effort: None,
+                context_window_bytes: None,
             },
         )]),
         bundles: BTreeMap::from([(
@@ -384,6 +386,7 @@ async fn imported_codex_session_resumes_natively_async() -> anyhow::Result<()> {
                 environment: BTreeMap::new(),
                 model: None,
                 reasoning_effort: None,
+                context_window_bytes: None,
             },
         )]),
         bundles: BTreeMap::from([(

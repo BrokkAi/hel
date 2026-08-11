@@ -399,6 +399,7 @@ pub fn read_claude_transcript(path: &Path) -> Result<ClaudeTranscript> {
         .with_context(|| format!("read Claude session {}", path.display()))?;
     let mut cwd = None;
     let mut events = Vec::new();
+    let mut saw_raw_user = false;
 
     for (index, line) in body.lines().enumerate() {
         if line.trim().is_empty() {
@@ -419,6 +420,23 @@ pub fn read_claude_transcript(path: &Path) -> Result<ClaudeTranscript> {
         {
             continue;
         }
+        let compaction_boundary = record.get("type").and_then(Value::as_str) == Some("system")
+            && matches!(
+                record.get("subtype").and_then(Value::as_str),
+                Some("compact_boundary" | "compaction")
+            );
+        let compaction_summary = record
+            .get("isCompactSummary")
+            .or_else(|| record.pointer("/message/isCompactSummary"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if compaction_boundary || compaction_summary {
+            ensure!(
+                saw_raw_user,
+                "Claude session contains a compaction artifact before recoverable raw history"
+            );
+            continue;
+        }
         match record.get("type").and_then(Value::as_str) {
             Some("user") => {
                 let Some(text) = record
@@ -437,6 +455,7 @@ pub fn read_claude_transcript(path: &Path) -> Result<ClaudeTranscript> {
                         attachments: Vec::new(),
                     },
                 );
+                saw_raw_user = true;
             }
             Some("assistant") => {
                 let Some(content) = record.pointer("/message/content").and_then(Value::as_array)
@@ -499,6 +518,7 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
         .with_context(|| format!("read Codex session {}", path.display()))?;
     let mut cwd = None;
     let mut events = Vec::new();
+    let mut saw_raw_user = false;
     for (index, line) in body.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -512,6 +532,23 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
                 .and_then(Value::as_str)
                 .filter(|cwd| !cwd.trim().is_empty())
                 .map(PathBuf::from);
+        }
+        let record_type = record.get("type").and_then(Value::as_str);
+        let payload_type = record.pointer("/payload/type").and_then(Value::as_str);
+        let compaction_artifact = matches!(
+            record_type,
+            Some("compacted" | "context_compaction" | "compaction_summary")
+        ) || (record_type == Some("response_item")
+            && matches!(
+                payload_type,
+                Some("compaction" | "compaction_summary" | "context_compaction")
+            ));
+        if compaction_artifact {
+            ensure!(
+                saw_raw_user,
+                "Codex session contains a compaction artifact before recoverable raw history"
+            );
+            continue;
         }
         if record.get("type").and_then(Value::as_str) != Some("event_msg") {
             continue;
@@ -534,6 +571,7 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
                         attachments: Vec::new(),
                     },
                 );
+                saw_raw_user = true;
             }
             Some("agent_message") => {
                 let Some(text) = record
@@ -596,6 +634,7 @@ pub fn read_kimi_transcript(session_path: &Path) -> Result<KimiTranscript> {
     let body = fs::read_to_string(&wire_path)
         .with_context(|| format!("read Kimi wire stream {}", wire_path.display()))?;
     let mut events = Vec::new();
+    let mut saw_raw_user = false;
     for (index, line) in body.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -607,8 +646,18 @@ pub fn read_kimi_transcript(session_path: &Path) -> Result<KimiTranscript> {
                 index + 1
             )
         })?;
+        if matches!(
+            record.get("type").and_then(Value::as_str),
+            Some("context.compaction" | "context.compacted" | "compaction")
+        ) {
+            ensure!(
+                saw_raw_user,
+                "Kimi session contains a compaction artifact before recoverable raw history"
+            );
+            continue;
+        }
         match record.get("type").and_then(Value::as_str) {
-            Some("turn.prompt")
+            Some("turn.prompt" | "turn.steer")
                 if record.pointer("/origin/kind").and_then(Value::as_str) == Some("user") =>
             {
                 finish_imported_turn(&mut events);
@@ -632,6 +681,7 @@ pub fn read_kimi_transcript(session_path: &Path) -> Result<KimiTranscript> {
                             attachments: Vec::new(),
                         },
                     );
+                    saw_raw_user = true;
                 }
             }
             Some("context.append_loop_event")
@@ -1407,6 +1457,65 @@ mod tests {
     }
 
     #[test]
+    fn codex_import_omits_compaction_blobs_but_requires_prior_raw_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rollout.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/work/app"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"compaction","encrypted_content":"opaque"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert!(
+            read_codex_transcript(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("before recoverable raw history")
+        );
+
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/work/app"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"raw prompt"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"compaction","encrypted_content":"opaque"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let transcript = read_codex_transcript(&path).unwrap();
+        assert_eq!(transcript.events.len(), 2);
+    }
+
+    #[test]
+    fn claude_import_rejects_a_compaction_summary_without_raw_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"system","subtype":"compact_boundary","cwd":"/work/app"}"#,
+                "\n",
+                r#"{"type":"user","isCompactSummary":true,"message":{"content":"summary"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert!(
+            read_claude_transcript(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("before recoverable raw history")
+        );
+    }
+
+    #[test]
     fn codex_locator_uses_rollout_id_when_session_id_names_a_parent() {
         let directory = tempfile::tempdir().unwrap();
         let rollout = directory
@@ -1446,6 +1555,10 @@ mod tests {
                 "\n",
                 r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"first reply"}}}"#,
                 "\n",
+                r#"{"type":"turn.steer","origin":{"kind":"user"},"input":[{"type":"text","text":"follow up"}]}"#,
+                "\n",
+                r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"second reply"}}}"#,
+                "\n",
             ),
         )
         .unwrap();
@@ -1462,6 +1575,18 @@ mod tests {
         );
         assert!(matches!(
             transcript.events[2].event,
+            WorkerEvent::TurnCompleted
+        ));
+        assert!(matches!(
+            &transcript.events[3].event,
+            WorkerEvent::PromptAccepted { text, .. } if text == "follow up"
+        ));
+        assert_eq!(
+            agent_text(&transcript.events[4].event).as_deref(),
+            Some("second reply")
+        );
+        assert!(matches!(
+            transcript.events[5].event,
             WorkerEvent::TurnCompleted
         ));
     }

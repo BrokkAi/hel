@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
@@ -13,14 +14,14 @@ use agent_client_protocol::schema::v1::{
     InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigValueId, SessionId, SessionNotification, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, TextContent,
+    SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, TextContent,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::hel_config::HarnessKind;
@@ -36,9 +37,36 @@ pub struct LaunchSpec {
     pub harness: HarnessKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProductionCompactionConfig {
+    model: &'static str,
+    effort_option: &'static str,
+    effort: &'static str,
+}
+
+fn production_compaction_config(harness: HarnessKind) -> Option<ProductionCompactionConfig> {
+    match harness {
+        HarnessKind::Codex => Some(ProductionCompactionConfig {
+            model: "gpt-5.6-luna",
+            effort_option: "reasoning_effort",
+            effort: "high",
+        }),
+        HarnessKind::Claude => Some(ProductionCompactionConfig {
+            model: "sonnet 5",
+            effort_option: "effort",
+            effort: "high",
+        }),
+        HarnessKind::Kimi => None,
+    }
+}
+
 #[derive(Debug)]
 pub enum CommandRequest {
     Prompt(String),
+    Compact {
+        prompt: String,
+        response: oneshot::Sender<std::result::Result<String, String>>,
+    },
     Cancel,
     Close,
 }
@@ -111,10 +139,25 @@ where
 {
     let notification_events = events.clone();
     let permission_events = events.clone();
+    let scratch_outputs = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
+    let notification_scratch_outputs = scratch_outputs.clone();
     Client
         .builder()
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
+                let scratch_id = notification.session_id.to_string();
+                let mut scratch = notification_scratch_outputs
+                    .lock()
+                    .expect("scratch output lock poisoned");
+                if let Some(output) = scratch.get_mut(&scratch_id) {
+                    if let SessionUpdate::AgentMessageChunk(chunk) = &notification.update
+                        && let ContentBlock::Text(text) = &chunk.content
+                    {
+                        output.push_str(&text.text);
+                    }
+                    return Ok(());
+                }
+                drop(scratch);
                 let update = serde_json::to_value(notification.update).unwrap_or_else(
                     |error| serde_json::json!({"serialization_error": error.to_string()}),
                 );
@@ -153,7 +196,7 @@ where
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
-            drive_connection(connection, &spec, &mut requests, &events)
+            drive_connection(connection, &spec, &mut requests, &events, scratch_outputs)
                 .await
                 .map_err(|error| {
                     agent_client_protocol::Error::internal_error()
@@ -169,6 +212,7 @@ async fn drive_connection(
     spec: &LaunchSpec,
     requests: &mut mpsc::Receiver<CommandRequest>,
     events: &mpsc::UnboundedSender<RuntimeEvent>,
+    scratch_outputs: Arc<Mutex<BTreeMap<String, String>>>,
 ) -> Result<()> {
     let mut meta = serde_json::Map::new();
     meta.insert("terminal_output".into(), serde_json::Value::Bool(true));
@@ -203,31 +247,19 @@ async fn drive_connection(
     });
 
     let loaded_session = if let Some(existing) = &spec.resume_session {
-        // A session that never ran a prompt may have no harness-side history
-        // (Codex writes its rollout lazily), so a failed load falls back to a
-        // fresh native session instead of killing the worker.
-        match connection
+        let loaded = connection
             .send_request(
                 LoadSessionRequest::new(SessionId::from(existing.clone()), spec.cwd.clone())
                     .additional_directories(spec.additional_directories.clone()),
             )
             .block_task()
             .await
-        {
-            Ok(loaded) => Some((
-                SessionId::from(existing.clone()),
-                loaded.config_options,
-                loaded.modes,
-            )),
-            Err(error) => {
-                let _ = events.send(RuntimeEvent::Warning {
-                    message: format!(
-                        "could not load ACP session {existing}; starting a fresh session: {error:#}"
-                    ),
-                });
-                None
-            }
-        }
+            .with_context(|| format!("load ACP session {existing}"))?;
+        Some((
+            SessionId::from(existing.clone()),
+            loaded.config_options,
+            loaded.modes,
+        ))
     } else {
         None
     };
@@ -305,9 +337,21 @@ async fn drive_connection(
                                     message: "a prompt is already running".into(),
                                 });
                             }
+                            Some(CommandRequest::Compact { response, .. }) => {
+                                let _ = response.send(Err(
+                                    "cannot compact while the destination prompt is running".into(),
+                                ));
+                            }
                         }
                     }
                 }
+            }
+            CommandRequest::Compact { prompt, response } => {
+                let result =
+                    compact_in_scratch_session(&connection, spec, prompt, &scratch_outputs)
+                        .await
+                        .map_err(|error| format!("{error:#}"));
+                let _ = response.send(result);
             }
             CommandRequest::Cancel => {
                 connection.send_notification(CancelNotification::new(session_id.clone()))?;
@@ -321,6 +365,121 @@ async fn drive_connection(
             }
         }
     }
+    Ok(())
+}
+
+async fn compact_in_scratch_session(
+    connection: &ConnectionTo<Agent>,
+    spec: &LaunchSpec,
+    prompt: String,
+    scratch_outputs: &Arc<Mutex<BTreeMap<String, String>>>,
+) -> Result<String> {
+    let created = connection
+        .send_request(
+            NewSessionRequest::new(spec.cwd.clone())
+                .additional_directories(spec.additional_directories.clone()),
+        )
+        .block_task()
+        .await
+        .context("create scratch ACP session")?;
+    let session_id = created.session_id;
+    enforce_unrestricted_mode(
+        connection,
+        &session_id,
+        spec.harness.unrestricted_mode(),
+        created.config_options.as_deref().unwrap_or_default(),
+        created.modes.as_ref(),
+    )
+    .await?;
+    configure_production_compactor(
+        connection,
+        &session_id,
+        spec.harness,
+        created.config_options.unwrap_or_default(),
+    )
+    .await?;
+    scratch_outputs
+        .lock()
+        .expect("scratch output lock poisoned")
+        .insert(session_id.to_string(), String::new());
+    let prompt_result = connection
+        .send_request(PromptRequest::new(
+            session_id.clone(),
+            vec![ContentBlock::Text(TextContent::new(prompt))],
+        ))
+        .block_task()
+        .await;
+    let _ = connection
+        .send_request(CloseSessionRequest::new(session_id.clone()))
+        .block_task()
+        .await;
+    let output = scratch_outputs
+        .lock()
+        .expect("scratch output lock poisoned")
+        .remove(&session_id.to_string())
+        .unwrap_or_default();
+    prompt_result.context("run scratch ACP compaction prompt")?;
+    if output.trim().is_empty() {
+        bail!("scratch ACP compaction returned no agent text");
+    }
+    Ok(output)
+}
+
+async fn configure_production_compactor(
+    connection: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    harness: HarnessKind,
+    options: Vec<SessionConfigOption>,
+) -> Result<()> {
+    let Some(config) = production_compaction_config(harness) else {
+        return Ok(());
+    };
+    let model_option = options
+        .iter()
+        .find(|option| {
+            option.id.to_string() == "model"
+                || option.category == Some(SessionConfigOptionCategory::Model)
+        })
+        .context("ACP bridge does not expose a model selector for compaction")?;
+    let response = connection
+        .send_request(SetSessionConfigOptionRequest::new(
+            session_id.clone(),
+            model_option.id.clone(),
+            SessionConfigValueId::new(config.model.to_owned()),
+        ))
+        .block_task()
+        .await
+        .with_context(|| format!("select production compaction model {}", config.model))?;
+    let effort_option = response
+        .config_options
+        .iter()
+        .find(|option| option.id.to_string() == config.effort_option)
+        .with_context(|| {
+            format!(
+                "ACP bridge does not expose compaction effort option {:?}",
+                config.effort_option
+            )
+        })?;
+    ensure!(
+        select_contains(&effort_option.kind, config.effort),
+        "ACP compaction model {} does not support effort {}",
+        config.model,
+        config.effort
+    );
+    connection
+        .send_request(SetSessionConfigOptionRequest::new(
+            session_id.clone(),
+            effort_option.id.clone(),
+            SessionConfigValueId::new(config.effort.to_owned()),
+        ))
+        .block_task()
+        .await
+        .with_context(|| {
+            format!(
+                "select production compaction effort {} for {}",
+                config.effort, config.model
+            )
+        })?;
     Ok(())
 }
 
@@ -412,5 +571,26 @@ mod tests {
                 )]),
             ));
         assert!(select_contains(&grouped, "bypassPermissions"));
+    }
+
+    #[test]
+    fn production_compactors_are_fixed_independently_of_target_profiles() {
+        assert_eq!(
+            production_compaction_config(HarnessKind::Codex),
+            Some(ProductionCompactionConfig {
+                model: "gpt-5.6-luna",
+                effort_option: "reasoning_effort",
+                effort: "high",
+            })
+        );
+        assert_eq!(
+            production_compaction_config(HarnessKind::Claude),
+            Some(ProductionCompactionConfig {
+                model: "sonnet 5",
+                effort_option: "effort",
+                effort: "high",
+            })
+        );
+        assert_eq!(production_compaction_config(HarnessKind::Kimi), None);
     }
 }
