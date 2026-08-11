@@ -111,26 +111,16 @@ fn normalize_reset_text_at(value: &str, now: DateTime<FixedOffset>) -> Option<St
     Some(format_reset_label(reset))
 }
 
-/// Render a session's current-turn or idle clock from wall-clock seconds.
+/// Render a session's current-turn clock, without aging idle sessions.
 pub(crate) fn format_turn_clock(
     now_epoch_seconds: u64,
     current_turn_started_at: Option<u64>,
-    last_turn_completed_at: Option<u64>,
 ) -> String {
     if let Some(started_at) = current_turn_started_at {
         let elapsed = now_epoch_seconds.saturating_sub(started_at);
         return format!("turn {:02}:{:02}", elapsed / 60, elapsed % 60);
     }
-    let Some(completed_at) = last_turn_completed_at else {
-        return "idle".to_string();
-    };
-    let elapsed = now_epoch_seconds.saturating_sub(completed_at);
-    match elapsed {
-        0..=59 => format!("idle {elapsed}s"),
-        60..=3_599 => format!("idle {}m", elapsed / 60),
-        3_600..=86_399 => format!("idle {}h {}m", elapsed / 3_600, (elapsed % 3_600) / 60),
-        _ => format!("idle {}d {}h", elapsed / 86_400, (elapsed % 86_400) / 3_600),
-    }
+    "idle".to_string()
 }
 
 /// Pure formatter split from local-zone discovery for deterministic tests.
@@ -200,9 +190,8 @@ mod tests {
     }
 
     #[test]
-    fn turn_clock_formats_running_and_idle_periods() {
-        assert_eq!(format_turn_clock(500, Some(375), None), "turn 02:05");
-        assert_eq!(format_turn_clock(5_000, None, Some(4_280)), "idle 12m");
-        assert_eq!(format_turn_clock(5_000, None, None), "idle");
+    fn turn_clock_formats_running_periods_without_aging_idle_sessions() {
+        assert_eq!(format_turn_clock(500, Some(375)), "turn 02:05");
+        assert_eq!(format_turn_clock(5_000, None), "idle");
     }
 }

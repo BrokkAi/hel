@@ -226,7 +226,6 @@ struct SessionActivity {
 struct SessionDetail {
     last_event_sequence: u64,
     current_turn_started_at: Option<u64>,
-    last_turn_completed_at: Option<u64>,
     last_agent_text_at: Option<u64>,
     agent_text_stream_open: bool,
     unread_agent_message_sequences: Vec<u64>,
@@ -330,7 +329,6 @@ impl DashboardState {
                 WorkerEvent::TurnCompleted | WorkerEvent::Cancelled => {
                     detail.agent_text_stream_open = false;
                     detail.current_turn_started_at = None;
-                    detail.last_turn_completed_at = Some(observed_at_epoch_seconds);
                 }
                 WorkerEvent::Adapter { payload, .. } => {
                     if let Some(activity) = activity_from_adapter(payload) {
@@ -1798,7 +1796,6 @@ fn session_values(
     let clock = crate::usage_format::format_turn_clock(
         now_epoch_seconds,
         detail.and_then(|detail| detail.current_turn_started_at),
-        detail.and_then(|detail| detail.last_turn_completed_at),
     );
     (
         clock,
