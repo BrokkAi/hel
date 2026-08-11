@@ -411,6 +411,33 @@ pub(super) fn wrap_styled_line(
     wrap_styled_graphemes(line, width, continuation_indent)
 }
 
+pub(super) fn ellipsize_styled_line(line: Line<'static>, width: usize) -> Line<'static> {
+    let width = width.max(1);
+    let content_width = width.saturating_sub(1);
+    let mut spans = Vec::new();
+    let mut used = 0;
+
+    'spans: for span in line.spans {
+        let mut content = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = display_width(grapheme);
+            if used + grapheme_width > content_width {
+                if !content.is_empty() {
+                    spans.push(Span::styled(content, span.style));
+                }
+                break 'spans;
+            }
+            content.push_str(grapheme);
+            used += grapheme_width;
+        }
+        if !content.is_empty() {
+            spans.push(Span::styled(content, span.style));
+        }
+    }
+    spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+    Line::from(spans)
+}
+
 fn wrap_single_span(
     line: Line<'static>,
     width: usize,
