@@ -17,9 +17,9 @@ use hel::hel_import::{
     BundleResolution, ClaudeImportRequest, ClaudeSessionSelection, CodexImportRequest,
     CodexSessionSelection, KimiImportRequest, KimiSessionSelection, claude_config_home,
     codex_config_home, import_claude_session, import_codex_session, import_kimi_session,
-    kimi_config_home, list_claude_sessions, list_codex_sessions, list_kimi_sessions,
-    locate_claude_session, locate_codex_session, locate_kimi_session, read_claude_transcript,
-    read_codex_transcript, read_kimi_transcript, resolve_bundle,
+    kimi_config_home, locate_claude_session, locate_codex_session, locate_kimi_session,
+    read_claude_transcript, read_codex_transcript, read_kimi_transcript, resolve_bundle,
+    scan_claude_sessions, scan_codex_sessions, scan_kimi_sessions,
 };
 use hel::hel_quota::{ProfileQuota, QuotaManager};
 use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapshot};
@@ -341,13 +341,13 @@ fn import(args: ImportArgs) -> Result<()> {
 fn import_claude(args: ClaudeImportArgs) -> Result<()> {
     let claude_home = claude_config_home()?;
     let selection = match args.session {
-        Some(session) => ClaudeSessionSelection::Session(session),
+        Some(session) => ClaudeSessionSelection::NativeSessionId(session),
         None => ClaudeSessionSelection::Latest,
     };
     let source = locate_claude_session(&claude_home, &selection)?;
     println!(
         "Selected Claude session {} at {}",
-        source.session_id,
+        source.native_session_id,
         source.jsonl_path.display()
     );
     let transcript = read_claude_transcript(&source.jsonl_path)?;
@@ -400,13 +400,13 @@ fn import_claude(args: ClaudeImportArgs) -> Result<()> {
 fn import_codex(args: CodexImportArgs) -> Result<()> {
     let codex_home = codex_config_home()?;
     let selection = match args.session {
-        Some(session) => CodexSessionSelection::Session(session),
+        Some(session) => CodexSessionSelection::NativeSessionId(session),
         None => CodexSessionSelection::Latest,
     };
     let source = locate_codex_session(&codex_home, &selection)?;
     println!(
         "Selected Codex session {} at {}",
-        source.session_id,
+        source.native_session_id,
         source.jsonl_path.display()
     );
     let transcript = read_codex_transcript(&source.jsonl_path)?;
@@ -448,13 +448,13 @@ fn import_codex(args: CodexImportArgs) -> Result<()> {
 fn import_kimi(args: KimiImportArgs) -> Result<()> {
     let kimi_home = kimi_config_home()?;
     let selection = match args.session {
-        Some(session) => KimiSessionSelection::Session(session),
+        Some(session) => KimiSessionSelection::NativeSessionId(session),
         None => KimiSessionSelection::Latest,
     };
     let source = locate_kimi_session(&kimi_home, &selection)?;
     println!(
         "Selected Kimi session {} at {}",
-        source.session_id,
+        source.native_session_id,
         source.session_path.display()
     );
     let transcript = read_kimi_transcript(&source.session_path)?;
@@ -973,6 +973,42 @@ fn apply_worker_poll_update(
     Ok(())
 }
 
+#[derive(Clone)]
+struct PendingDashboardImport {
+    profile_id: String,
+    native_session_id: String,
+    display_title: String,
+}
+
+struct ImportBundlePrompt {
+    bundle_id: String,
+    github: String,
+    destination: String,
+}
+
+struct DashboardImportSuccess {
+    harness: &'static str,
+    session_id: String,
+    controller: Controller,
+}
+
+enum DashboardImportTaskResult {
+    NeedsBundle(ImportBundlePrompt),
+    Imported(DashboardImportSuccess),
+}
+
+enum DashboardImportUpdate {
+    Progress {
+        step: usize,
+        total: Option<usize>,
+        message: String,
+    },
+    Finished {
+        pending: PendingDashboardImport,
+        result: Result<DashboardImportTaskResult>,
+    },
+}
+
 async fn run_dashboard() -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         println!("Welcome to Hel.");
@@ -1006,7 +1042,10 @@ async fn run_dashboard() -> Result<()> {
     let (worker_targets_tx, mut worker_updates_rx) = spawn_dashboard_worker_poller();
     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
     let (import_updates_tx, mut import_updates_rx) =
-        tokio::sync::mpsc::channel::<(u64, Vec<ImportProfileOption>)>(1);
+        tokio::sync::mpsc::channel::<(u64, Vec<ImportProfileOption>)>(8);
+    let (import_task_tx, mut import_task_rx) =
+        tokio::sync::mpsc::channel::<DashboardImportUpdate>(8);
+    let mut pending_import = None;
     let mut import_discovery_id = 0_u64;
     let termination = hel::termination::Coordinator::install().token();
 
@@ -1024,6 +1063,73 @@ async fn run_dashboard() -> Result<()> {
         }
         while let Ok((discovery_id, profiles)) = import_updates_rx.try_recv() {
             dashboard.apply_import_profiles(discovery_id, profiles);
+        }
+        while let Ok(update) = import_task_rx.try_recv() {
+            match update {
+                DashboardImportUpdate::Progress {
+                    step,
+                    total,
+                    message,
+                } => dashboard.update_import_progress(step, total, message),
+                DashboardImportUpdate::Finished { pending, result } => match result {
+                    Ok(DashboardImportTaskResult::NeedsBundle(prompt)) => {
+                        pending_import = Some(pending);
+                        dashboard.show_import_bundle_confirmation(
+                            prompt.bundle_id,
+                            prompt.github,
+                            prompt.destination,
+                        );
+                    }
+                    Ok(DashboardImportTaskResult::Imported(mut imported)) => {
+                        let applied = (|| -> Result<()> {
+                            let session = imported
+                                .controller
+                                .state
+                                .sessions
+                                .remove(&imported.session_id)
+                                .context("import worker did not return its new session")?;
+                            let bundle = imported
+                                .controller
+                                .config
+                                .bundles
+                                .get(&session.bundle_id)
+                                .cloned()
+                                .context("import worker did not return its session bundle")?;
+                            controller
+                                .config
+                                .bundles
+                                .insert(session.bundle_id.clone(), bundle);
+                            controller
+                                .state
+                                .sessions
+                                .insert(session.id.clone(), session);
+                            controller.config.save()?;
+                            controller.state.save()?;
+                            Ok(())
+                        })();
+                        dashboard.finish_import();
+                        match applied {
+                            Ok(()) => {
+                                dashboard.set_config(controller.config.clone());
+                                dashboard.set_state(controller.state.clone());
+                                worker_targets_tx
+                                    .send_replace(dashboard_worker_targets(&controller));
+                                dashboard.set_notice(format!(
+                                    "Imported {} session {}.",
+                                    imported.harness, pending.native_session_id
+                                ));
+                            }
+                            Err(error) => {
+                                dashboard.set_notice(format!("Import failed: {error:#}"));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        dashboard.finish_import();
+                        dashboard.set_notice(format!("Import failed: {error:#}"));
+                    }
+                },
+            }
         }
         terminal
             .terminal
@@ -1076,27 +1182,36 @@ async fn run_dashboard() -> Result<()> {
                 let updates = import_updates_tx.clone();
                 let discovery_id = import_discovery_id;
                 tokio::task::spawn_blocking(move || {
-                    let profiles = discover_import_sessions(&config);
-                    let _ = updates.blocking_send((discovery_id, profiles));
+                    discover_import_sessions(&config, |profiles| {
+                        let _ = updates.blocking_send((discovery_id, profiles));
+                    });
                 });
             }
             DashboardAction::ImportSession {
                 profile_id,
-                session_id,
-                title,
+                native_session_id,
+                display_title,
             } => {
-                terminal.suspend()?;
-                let import_result =
-                    import_session_from_profile(&mut controller, &profile_id, &session_id, &title);
-                terminal.resume()?;
-                match import_result {
-                    Ok(harness) => {
-                        dashboard.set_config(controller.config.clone());
-                        dashboard.set_state(controller.state.clone());
-                        worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
-                        dashboard.set_notice(format!("Imported {harness} session {session_id}."));
-                    }
-                    Err(error) => dashboard.set_notice(format!("Import failed: {error:#}")),
+                let pending = PendingDashboardImport {
+                    profile_id,
+                    native_session_id,
+                    display_title,
+                };
+                dashboard.show_import_progress(pending.display_title.clone());
+                spawn_dashboard_import(&controller, pending, false, import_task_tx.clone());
+            }
+            DashboardAction::ConfirmImportBundle { accepted } => {
+                let Some(pending) = pending_import.take() else {
+                    dashboard.finish_import();
+                    dashboard.set_notice("Import confirmation expired.");
+                    continue;
+                };
+                if accepted {
+                    dashboard.show_import_progress(pending.display_title.clone());
+                    spawn_dashboard_import(&controller, pending, true, import_task_tx.clone());
+                } else {
+                    dashboard.finish_import();
+                    dashboard.set_notice("Import cancelled; no Hel files were changed.");
                 }
             }
             DashboardAction::RenameSession { session_id, title } => {
@@ -1314,94 +1429,84 @@ fn close_progress_notice(session_id: &str, elapsed: Duration, frame: usize) -> S
     )
 }
 
-fn discover_import_sessions(config: &HelConfig) -> Vec<ImportProfileOption> {
-    config
-        .profiles
-        .iter()
-        .map(|(profile_id, profile)| {
-            let discovered = match profile.kind {
-                hel::hel_config::HarnessKind::Codex => {
-                    list_codex_sessions(&profile.home).map(|sessions| {
-                        sessions
-                            .into_iter()
-                            .map(|session| {
-                                (
-                                    session.session_id,
-                                    session.title,
-                                    session.modified_at,
-                                    session.git_branch,
-                                    session.size_bytes,
-                                    session.cwd,
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    })
+fn discover_import_sessions(config: &HelConfig, mut publish: impl FnMut(Vec<ImportProfileOption>)) {
+    let mut profiles = import_profile_placeholders(config);
+    for index in 0..profiles.len() {
+        let profile_id = profiles[index].profile_id.clone();
+        let Some(profile) = config.profiles.get(&profile_id) else {
+            continue;
+        };
+        let home = profile.home.clone();
+        let discovered = match profile.kind {
+            hel::hel_config::HarnessKind::Codex => scan_codex_sessions(&home, |progress| {
+                profiles[index].scan_progress = Some((progress.scanned, progress.total));
+                if let Some(session) = progress.session {
+                    profiles[index].sessions.push(import_session_option(
+                        session.native_session_id,
+                        session.title,
+                        session.modified_at,
+                        session.git_branch,
+                        session.size_bytes,
+                        session.cwd,
+                    ));
                 }
-                hel::hel_config::HarnessKind::Claude => {
-                    list_claude_sessions(&profile.home).map(|sessions| {
-                        sessions
-                            .into_iter()
-                            .map(|session| {
-                                (
-                                    session.session_id,
-                                    session.title,
-                                    session.modified_at,
-                                    session.git_branch,
-                                    session.size_bytes,
-                                    session.cwd,
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    })
+                publish(profiles.clone());
+            }),
+            hel::hel_config::HarnessKind::Claude => scan_claude_sessions(&home, |progress| {
+                profiles[index].scan_progress = Some((progress.scanned, progress.total));
+                if let Some(session) = progress.session {
+                    profiles[index].sessions.push(import_session_option(
+                        session.native_session_id,
+                        session.title,
+                        session.modified_at,
+                        session.git_branch,
+                        session.size_bytes,
+                        session.cwd,
+                    ));
                 }
-                hel::hel_config::HarnessKind::Kimi => {
-                    list_kimi_sessions(&profile.home).map(|sessions| {
-                        sessions
-                            .into_iter()
-                            .map(|session| {
-                                (
-                                    session.session_id,
-                                    session.title,
-                                    session.modified_at,
-                                    session.git_branch,
-                                    session.size_bytes,
-                                    session.cwd,
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    })
+                publish(profiles.clone());
+            }),
+            hel::hel_config::HarnessKind::Kimi => scan_kimi_sessions(&home, |progress| {
+                profiles[index].scan_progress = Some((progress.scanned, progress.total));
+                if let Some(session) = progress.session {
+                    profiles[index].sessions.push(import_session_option(
+                        session.native_session_id,
+                        session.title,
+                        session.modified_at,
+                        session.git_branch,
+                        session.size_bytes,
+                        session.cwd,
+                    ));
                 }
-            };
-            let (sessions, error) = match discovered {
-                Ok(sessions) => (
-                    sessions
-                        .into_iter()
-                        .map(|(session_id, title, modified_at, branch, size, cwd)| {
-                            ImportSessionOption {
-                                session_id,
-                                title,
-                                details: format!(
-                                    "{} · {} · {} · {}",
-                                    system_time_age(modified_at),
-                                    branch,
-                                    format_byte_size(size),
-                                    display_home_relative(&cwd),
-                                ),
-                            }
-                        })
-                        .collect(),
-                    None,
-                ),
-                Err(error) => (Vec::new(), Some(format!("{error:#}"))),
-            };
-            ImportProfileOption {
-                profile_id: profile_id.clone(),
-                harness_kind: profile.kind,
-                sessions,
-                error,
-            }
-        })
-        .collect()
+                publish(profiles.clone());
+            }),
+        };
+        if let Err(error) = discovered {
+            profiles[index].error = Some(format!("{error:#}"));
+            publish(profiles.clone());
+        }
+    }
+}
+
+fn import_session_option(
+    native_session_id: String,
+    title: String,
+    modified_at: SystemTime,
+    branch: String,
+    size: u64,
+    cwd: PathBuf,
+) -> ImportSessionOption {
+    ImportSessionOption {
+        native_session_id,
+        title,
+        details: format!(
+            "{} · {} · {} · {}",
+            system_time_age(modified_at),
+            branch,
+            format_byte_size(size),
+            display_home_relative(&cwd),
+        ),
+    }
 }
 
 fn import_profile_placeholders(config: &HelConfig) -> Vec<ImportProfileOption> {
@@ -1412,6 +1517,7 @@ fn import_profile_placeholders(config: &HelConfig) -> Vec<ImportProfileOption> {
             profile_id: profile_id.clone(),
             harness_kind: profile.kind,
             sessions: Vec::new(),
+            scan_progress: None,
             error: None,
         })
         .collect()
@@ -1450,12 +1556,73 @@ fn display_home_relative(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+fn spawn_dashboard_import(
+    controller: &Controller,
+    pending: PendingDashboardImport,
+    allow_synthesized_bundle: bool,
+    updates: tokio::sync::mpsc::Sender<DashboardImportUpdate>,
+) {
+    let worker_controller = Controller {
+        config: controller.config.clone(),
+        state: controller.state.clone(),
+    };
+    tokio::task::spawn_blocking(move || {
+        let result = import_session_from_profile(
+            worker_controller,
+            &pending.profile_id,
+            &pending.native_session_id,
+            &pending.display_title,
+            allow_synthesized_bundle,
+            |step, total, message| {
+                let _ = updates.blocking_send(DashboardImportUpdate::Progress {
+                    step,
+                    total,
+                    message: message.into(),
+                });
+            },
+        );
+        let _ = updates.blocking_send(DashboardImportUpdate::Finished { pending, result });
+    });
+}
+
+enum BackgroundBundleResolution {
+    Ready(String),
+    NeedsConfirmation(ImportBundlePrompt),
+}
+
+fn resolve_background_import_bundle(
+    config: &mut HelConfig,
+    cwd: &std::path::Path,
+    allow_synthesized_bundle: bool,
+) -> Result<BackgroundBundleResolution> {
+    match resolve_bundle(config, cwd, None)? {
+        BundleResolution::Existing(bundle_id) => Ok(BackgroundBundleResolution::Ready(bundle_id)),
+        BundleResolution::Synthesized { id, bundle } if allow_synthesized_bundle => {
+            config.bundles.insert(id.clone(), bundle);
+            Ok(BackgroundBundleResolution::Ready(id))
+        }
+        BundleResolution::Synthesized { id, bundle } => {
+            let repository = bundle.primary().expect("synthesized bundle has a primary");
+            Ok(BackgroundBundleResolution::NeedsConfirmation(
+                ImportBundlePrompt {
+                    bundle_id: id,
+                    github: repository.github.clone(),
+                    destination: repository.destination.display().to_string(),
+                },
+            ))
+        }
+    }
+}
+
 fn import_session_from_profile(
-    controller: &mut Controller,
+    mut controller: Controller,
     profile_id: &str,
-    session_id: &str,
-    title: &str,
-) -> Result<&'static str> {
+    native_session_id: &str,
+    display_title: &str,
+    allow_synthesized_bundle: bool,
+    mut report: impl FnMut(usize, Option<usize>, &str),
+) -> Result<DashboardImportTaskResult> {
+    report(1, None, "Locating native session…");
     let profile = controller
         .config
         .profiles
@@ -1466,15 +1633,22 @@ fn import_session_from_profile(
         hel::hel_config::HarnessKind::Codex => {
             let source = locate_codex_session(
                 &profile.home,
-                &CodexSessionSelection::Session(session_id.into()),
+                &CodexSessionSelection::NativeSessionId(native_session_id.into()),
             )?;
             let transcript = read_codex_transcript(&source.jsonl_path)?;
-            let Some(bundle_id) =
-                resolve_import_bundle(&mut controller.config, &transcript.cwd, None)?
-            else {
-                bail!("import cancelled");
+            report(2, Some(4), "Native session parsed.");
+            let bundle_id = match resolve_background_import_bundle(
+                &mut controller.config,
+                &transcript.cwd,
+                allow_synthesized_bundle,
+            )? {
+                BackgroundBundleResolution::Ready(bundle_id) => bundle_id,
+                BackgroundBundleResolution::NeedsConfirmation(prompt) => {
+                    return Ok(DashboardImportTaskResult::NeedsBundle(prompt));
+                }
             };
-            import_codex_session(
+            report(3, Some(4), "Building and verifying archive…");
+            let imported = import_codex_session(
                 &controller.config,
                 &mut controller.state,
                 CodexImportRequest {
@@ -1483,26 +1657,38 @@ fn import_session_from_profile(
                     transcript: &transcript,
                     bundle_id: &bundle_id,
                     profile_id: Some(profile_id),
-                    title: Some(title),
+                    title: Some(display_title),
                     archive_directory: &sessions_dir(),
                 },
             )?;
-            controller.config.save()?;
-            controller.state.save()?;
-            Ok("Codex")
+            report(4, Some(4), "Finalizing imported session…");
+            Ok(DashboardImportTaskResult::Imported(
+                DashboardImportSuccess {
+                    harness: "Codex",
+                    session_id: imported.session_id,
+                    controller,
+                },
+            ))
         }
         hel::hel_config::HarnessKind::Claude => {
             let source = locate_claude_session(
                 &profile.home,
-                &ClaudeSessionSelection::Session(session_id.into()),
+                &ClaudeSessionSelection::NativeSessionId(native_session_id.into()),
             )?;
             let transcript = read_claude_transcript(&source.jsonl_path)?;
-            let Some(bundle_id) =
-                resolve_import_bundle(&mut controller.config, &transcript.cwd, None)?
-            else {
-                bail!("import cancelled");
+            report(2, Some(4), "Native session parsed.");
+            let bundle_id = match resolve_background_import_bundle(
+                &mut controller.config,
+                &transcript.cwd,
+                allow_synthesized_bundle,
+            )? {
+                BackgroundBundleResolution::Ready(bundle_id) => bundle_id,
+                BackgroundBundleResolution::NeedsConfirmation(prompt) => {
+                    return Ok(DashboardImportTaskResult::NeedsBundle(prompt));
+                }
             };
-            import_claude_session(
+            report(3, Some(4), "Building and verifying archive…");
+            let imported = import_claude_session(
                 &controller.config,
                 &mut controller.state,
                 ClaudeImportRequest {
@@ -1511,26 +1697,38 @@ fn import_session_from_profile(
                     transcript: &transcript,
                     bundle_id: &bundle_id,
                     profile_id: Some(profile_id),
-                    title: Some(title),
+                    title: Some(display_title),
                     archive_directory: &sessions_dir(),
                 },
             )?;
-            controller.config.save()?;
-            controller.state.save()?;
-            Ok("Claude")
+            report(4, Some(4), "Finalizing imported session…");
+            Ok(DashboardImportTaskResult::Imported(
+                DashboardImportSuccess {
+                    harness: "Claude",
+                    session_id: imported.session_id,
+                    controller,
+                },
+            ))
         }
         hel::hel_config::HarnessKind::Kimi => {
             let source = locate_kimi_session(
                 &profile.home,
-                &KimiSessionSelection::Session(session_id.into()),
+                &KimiSessionSelection::NativeSessionId(native_session_id.into()),
             )?;
             let transcript = read_kimi_transcript(&source.session_path)?;
-            let Some(bundle_id) =
-                resolve_import_bundle(&mut controller.config, &transcript.cwd, None)?
-            else {
-                bail!("import cancelled");
+            report(2, Some(4), "Native session parsed.");
+            let bundle_id = match resolve_background_import_bundle(
+                &mut controller.config,
+                &transcript.cwd,
+                allow_synthesized_bundle,
+            )? {
+                BackgroundBundleResolution::Ready(bundle_id) => bundle_id,
+                BackgroundBundleResolution::NeedsConfirmation(prompt) => {
+                    return Ok(DashboardImportTaskResult::NeedsBundle(prompt));
+                }
             };
-            import_kimi_session(
+            report(3, Some(4), "Building and verifying archive…");
+            let imported = import_kimi_session(
                 &controller.config,
                 &mut controller.state,
                 KimiImportRequest {
@@ -1539,13 +1737,18 @@ fn import_session_from_profile(
                     transcript: &transcript,
                     bundle_id: &bundle_id,
                     profile_id: Some(profile_id),
-                    title: Some(title),
+                    title: Some(display_title),
                     archive_directory: &sessions_dir(),
                 },
             )?;
-            controller.config.save()?;
-            controller.state.save()?;
-            Ok("Kimi")
+            report(4, Some(4), "Finalizing imported session…");
+            Ok(DashboardImportTaskResult::Imported(
+                DashboardImportSuccess {
+                    harness: "Kimi",
+                    session_id: imported.session_id,
+                    controller,
+                },
+            ))
         }
     }
 }
