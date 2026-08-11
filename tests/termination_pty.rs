@@ -174,8 +174,8 @@ image = "ubuntu:24.04"
         .stdin(Stdio::from(duplicate(slave.as_raw_fd())))
         .stdout(Stdio::from(duplicate(slave.as_raw_fd())))
         .stderr(Stdio::from(duplicate(slave.as_raw_fd())))
-        .env("XDG_CONFIG_HOME", &config_root)
-        .env("XDG_DATA_HOME", storage.path().join("data"));
+        .env("HEL_CONFIG_DIR", config_root.join("hel"))
+        .env("HEL_DATA_DIR", storage.path().join("data/hel"));
     // Libtest may alter its signal mask. A real `hel` invocation should start
     // with SIGTERM unmasked, so establish that condition across exec.
     unsafe {

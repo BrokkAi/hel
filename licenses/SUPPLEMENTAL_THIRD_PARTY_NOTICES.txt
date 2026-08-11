@@ -1,4 +1,4 @@
-MJOLNIR SUPPLEMENTAL THIRD-PARTY NOTICES
+HEL SUPPLEMENTAL THIRD-PARTY NOTICES
 
 This file supplements THIRD_PARTY_LICENSES.html. Cargo package metadata
 does not enumerate standalone NOTICE files, embedded web fonts, or every
@@ -6,7 +6,7 @@ license in native source and prebuilt static-library payloads.
 
 The sections below are generated from Cargo.lock, exact installed crate
 sources, and a reviewed inventory of the non-Cargo assets shipped by
-official Mjolnir archives.
+official Hel archives.
 
 ================================================================================
 cfg_aliases third-party attribution
@@ -93,25 +93,11 @@ bzip2/libbzip2 version 1.0.8 of 13 July 2019
 --------------------------------------------------------------------------
 
 ================================================================================
-SQLite 3.46.0
-================================================================================
-
-Source: https://crates.io/crates/libsqlite3-sys/0.30.1 (sqlite3/sqlite3.c)
-Inclusion: compiled from the bundled SQLite amalgamation
-
-The author disclaims copyright to this source code.  In place of
-a legal notice, here is a blessing:
-
-   May you do good and not evil.
-   May you find forgiveness for yourself and forgive others.
-   May you share freely, never taking more than you give.
-
-================================================================================
 sherpa-onnx native static payload 1.13.3
 ================================================================================
 
 Source: https://crates.io/crates/sherpa-onnx-sys/1.13.3
-Inclusion: statically linked into mj-voice-worker on Linux, macOS, and Windows
+Inclusion: statically linked into hel-voice-worker on Linux, macOS, and Windows
 
 The sherpa-onnx-sys build downloads a native archive that contains only static libraries, without legal files. The linked payload was audited against these exact upstream revisions:
 
@@ -142,7 +128,7 @@ Embedded web fonts
 ================================================================================
 
 Source: src/fonts/*.woff2
-Inclusion: embedded in the mj binary and served by the remote viewer
+Inclusion: embedded in the hel binary and served by the remote viewer
 
 The following font software is licensed under the SIL Open Font License 1.1. The complete terms are in OFL-1.1.md.
 

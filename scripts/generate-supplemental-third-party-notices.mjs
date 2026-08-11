@@ -21,8 +21,10 @@ const auditedStandaloneNotices = new Set(["cfg_aliases/NOTICES.md"]);
 const auditedLinksPackages = new Set([
   "alsa-sys",
   "bzip2-sys",
-  "libsqlite3-sys",
   "prettyplease",
+  // rayon-core uses `links` only to prevent multiple versions; its build
+  // script does not link or ship a native library.
+  "rayon-core",
   "ring",
   "sherpa-onnx-sys",
   "wasm-bindgen-shared",
@@ -157,32 +159,6 @@ async function checkedInLegalFile(relativePath) {
   return relativePath;
 }
 
-async function sqliteNotice(metadata) {
-  const packageInfo = resolvedPackage(metadata, "libsqlite3-sys", "0.30.1");
-  const relativePath = "sqlite3/sqlite3.c";
-  const source = await readFile(
-    path.join(packageRoot(packageInfo), relativePath),
-    "utf8",
-  );
-  const version = source.match(/^#define SQLITE_VERSION\s+"([^"]+)"/m)?.[1];
-  const notice = source.match(
-    /^\*\* The author disclaims copyright to this source code\. +In place of\n\*\* a legal notice, here is a blessing:\n\*\*\n\*\*    May you do good and not evil\.\n\*\*    May you find forgiveness for yourself and forgive others\.\n\*\*    May you share freely, never taking more than you give\./m,
-  )?.[0];
-  if (!version || !notice) {
-    throw new Error("could not find SQLite version and public-domain notice");
-  }
-  const text = notice
-    .split("\n")
-    .map((line) => line.replace(/^\*\* ?/, ""))
-    .join("\n");
-  return {
-    component: `SQLite ${version}`,
-    source: `${packageUrl(packageInfo)} (${relativePath})`,
-    scope: "compiled from the bundled SQLite amalgamation",
-    text,
-  };
-}
-
 async function sherpaNativePayload(metadata) {
   const packageInfo = resolvedPackage(metadata, "sherpa-onnx-sys", "1.13.3");
   const legalFiles = [
@@ -199,7 +175,7 @@ async function sherpaNativePayload(metadata) {
   return {
     component: `sherpa-onnx native static payload ${packageInfo.version}`,
     source: packageUrl(packageInfo),
-    scope: "statically linked into mj-voice-worker on Linux, macOS, and Windows",
+    scope: "statically linked into hel-voice-worker on Linux, macOS, and Windows",
     text: [
       "The sherpa-onnx-sys build downloads a native archive that contains only static libraries, without legal files. The linked payload was audited against these exact upstream revisions:",
       "",
@@ -233,7 +209,7 @@ async function embeddedFontsNotice() {
   return {
     component: "Embedded web fonts",
     source: "src/fonts/*.woff2",
-    scope: "embedded in the mj binary and served by the remote viewer",
+    scope: "embedded in the hel binary and served by the remote viewer",
     text: [
       "The following font software is licensed under the SIL Open Font License 1.1. The complete terms are in OFL-1.1.md.",
       "",
@@ -249,7 +225,7 @@ async function embeddedFontsNotice() {
 
 function render(sections) {
   const lines = [
-    "MJOLNIR SUPPLEMENTAL THIRD-PARTY NOTICES",
+    "HEL SUPPLEMENTAL THIRD-PARTY NOTICES",
     "",
     "This file supplements THIRD_PARTY_LICENSES.html. Cargo package metadata",
     "does not enumerate standalone NOTICE files, embedded web fonts, or every",
@@ -257,7 +233,7 @@ function render(sections) {
     "",
     "The sections below are generated from Cargo.lock, exact installed crate",
     "sources, and a reviewed inventory of the non-Cargo assets shipped by",
-    "official Mjolnir archives.",
+    "official Hel archives.",
   ];
 
   for (const section of sections) {
@@ -298,7 +274,6 @@ async function main() {
       "bzip2/libbzip2 1.0.8",
       "used while unpacking sherpa-onnx native libraries during the voice-worker build",
     ),
-    await sqliteNotice(metadata),
     await sherpaNativePayload(metadata),
     await embeddedFontsNotice(),
   ];

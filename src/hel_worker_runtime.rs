@@ -1,61 +1,68 @@
 //! Target-side daemon and stdio proxy for the durable worker protocol.
 
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::hel_config::HarnessKind;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerLaunchConfig {
+    pub session_id: String,
+    pub harness: HarnessKind,
+    pub bridge_command: PathBuf,
+    #[serde(default)]
+    pub bridge_args: Vec<String>,
+    #[serde(default)]
+    pub environment: std::collections::BTreeMap<String, String>,
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub additional_directories: Vec<PathBuf>,
+    pub native_session_id: Option<String>,
+}
+
+impl WorkerLaunchConfig {
+    pub fn read(path: &Path) -> Result<Self> {
+        let body = std::fs::read(path)
+            .with_context(|| format!("read worker launch config {}", path.display()))?;
+        serde_json::from_slice(&body)
+            .with_context(|| format!("parse worker launch config {}", path.display()))
+    }
+
+    pub fn write(&self, path: &Path) -> Result<()> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let body = serde_json::to_vec_pretty(self)?;
+        std::fs::write(path, body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 mod unix {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use anyhow::{Context, Result, bail};
-    use serde::{Deserialize, Serialize};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::mpsc;
 
+    use super::WorkerLaunchConfig;
     use crate::hel_acp::{self, CommandRequest, LaunchSpec, RuntimeEvent};
-    use crate::hel_config::HarnessKind;
     use crate::hel_worker::{
         DurableWorker, ErrorCode, PROTOCOL_VERSION, ProtocolError, RequestEnvelope, ResponseBody,
         ResponseEnvelope, ResponsePayload, WorkerRequest,
     };
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct WorkerLaunchConfig {
-        pub session_id: String,
-        pub harness: HarnessKind,
-        pub bridge_command: PathBuf,
-        #[serde(default)]
-        pub bridge_args: Vec<String>,
-        #[serde(default)]
-        pub environment: std::collections::BTreeMap<String, String>,
-        pub cwd: PathBuf,
-        #[serde(default)]
-        pub additional_directories: Vec<PathBuf>,
-        pub native_session_id: Option<String>,
-    }
-
-    impl WorkerLaunchConfig {
-        pub fn read(path: &Path) -> Result<Self> {
-            let body = std::fs::read(path)
-                .with_context(|| format!("read worker launch config {}", path.display()))?;
-            serde_json::from_slice(&body)
-                .with_context(|| format!("parse worker launch config {}", path.display()))
-        }
-
-        pub fn write(&self, path: &Path) -> Result<()> {
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            std::fs::create_dir_all(parent)?;
-            let body = serde_json::to_vec_pretty(self)?;
-            std::fs::write(path, body)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-            }
-            Ok(())
-        }
-    }
-
-    pub async fn run_daemon(root: PathBuf, config: WorkerLaunchConfig) -> Result<()> {
+    pub async fn run_daemon(root: PathBuf, mut config: WorkerLaunchConfig) -> Result<()> {
+        super::resolve_relative_harness_home(&mut config, &std::env::current_dir()?);
         std::fs::create_dir_all(&root)
             .with_context(|| format!("create worker root {}", root.display()))?;
         let socket = root.join("control.sock");
@@ -331,11 +338,19 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{WorkerLaunchConfig, proxy, run_daemon};
+fn resolve_relative_harness_home(config: &mut WorkerLaunchConfig, base: &Path) {
+    let key = config.harness.home_env();
+    let Some(value) = config.environment.get_mut(key) else {
+        return;
+    };
+    let path = Path::new(value);
+    if path.is_relative() {
+        *value = base.join(path).to_string_lossy().into_owned();
+    }
+}
 
-#[cfg(not(unix))]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct WorkerLaunchConfig;
+#[cfg(unix)]
+pub use unix::{proxy, run_daemon};
 
 #[cfg(not(unix))]
 pub async fn run_daemon(
@@ -348,4 +363,47 @@ pub async fn run_daemon(
 #[cfg(not(unix))]
 pub async fn proxy(_root: std::path::PathBuf) -> anyhow::Result<()> {
     anyhow::bail!("target workers require Unix")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn launch_config(profile_home: &str) -> WorkerLaunchConfig {
+        WorkerLaunchConfig {
+            session_id: "session".into(),
+            harness: HarnessKind::Codex,
+            bridge_command: "codex-acp".into(),
+            bridge_args: Vec::new(),
+            environment: BTreeMap::from([("CODEX_HOME".into(), profile_home.into())]),
+            cwd: ".local/share/hel/workspaces/session/repo".into(),
+            additional_directories: Vec::new(),
+            native_session_id: None,
+        }
+    }
+
+    #[test]
+    fn relative_harness_home_is_resolved_before_bridge_changes_directory() {
+        let mut config = launch_config(".local/share/hel/profiles/session");
+
+        resolve_relative_harness_home(&mut config, Path::new("/home/ubuntu"));
+
+        assert_eq!(
+            config.environment["CODEX_HOME"],
+            "/home/ubuntu/.local/share/hel/profiles/session"
+        );
+    }
+
+    #[test]
+    fn absolute_harness_home_is_preserved() {
+        let mut config = launch_config("/var/lib/hel/profiles/session");
+
+        resolve_relative_harness_home(&mut config, Path::new("/home/ubuntu"));
+
+        assert_eq!(
+            config.environment["CODEX_HOME"],
+            "/var/lib/hel/profiles/session"
+        );
+    }
 }

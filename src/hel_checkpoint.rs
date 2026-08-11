@@ -402,6 +402,8 @@ fn write_private_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o700))?;
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     Ok(())
 }
 
@@ -1247,12 +1249,16 @@ fn restrict_permissions(path: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
