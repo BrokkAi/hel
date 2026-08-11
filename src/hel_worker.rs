@@ -19,6 +19,8 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Serialized bytes of events allowed in one replay response, well under
 /// `MAX_FRAME_BYTES` to leave room for the envelope.
 pub const REPLAY_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+const NATIVE_SESSION_IDENTITY_VERSION: u32 = 1;
+const NATIVE_SESSION_IDENTITY_FILE: &str = "native-session.json";
 
 /// Trim a replay to the byte budget. Returns the events to send and the
 /// sequence the client is current through: the last included event's seq, or
@@ -257,6 +259,13 @@ pub struct SequencedEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeSessionIdentity {
+    version: u32,
+    native_session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum WorkerEvent {
     PromptAccepted {
@@ -286,6 +295,7 @@ pub struct DurableWorker {
     worker_version: String,
     snapshot: WorkerSnapshot,
     events: Vec<SequencedEvent>,
+    native_session_id: Option<String>,
 }
 
 impl DurableWorker {
@@ -328,11 +338,13 @@ impl DurableWorker {
             apply_event(&mut snapshot, event)?;
         }
 
+        let native_session_id = read_native_session_identity(&root)?;
         let worker = Self {
             root,
             worker_version: worker_version.into(),
             snapshot,
             events,
+            native_session_id,
         };
         if !snapshot_path.exists() || snapshot_seq < logged_seq {
             worker.persist_snapshot()?;
@@ -342,6 +354,22 @@ impl DurableWorker {
 
     pub fn snapshot(&self) -> &WorkerSnapshot {
         &self.snapshot
+    }
+
+    /// Native ACP identity persisted by the worker after session startup.
+    /// This is intentionally separate from canonical history: restoring a
+    /// cross-harness archive must not make the destination load the source
+    /// harness's native session.
+    pub fn native_session_id(&self) -> Option<&str> {
+        self.native_session_id.as_deref()
+    }
+
+    /// Recover identities written by workers that predate native-session.json.
+    /// Prefer the newest identity that accepted a prompt. This repairs the
+    /// legacy failure mode where a daemon restart appended a newer, empty
+    /// session_started event after the real session.
+    pub fn recover_native_session_id_from_events(&self) -> Option<String> {
+        recover_native_session_id(&self.events)
     }
 
     pub fn events_after(&self, after_seq: u64) -> Result<Vec<SequencedEvent>> {
@@ -369,6 +397,27 @@ impl DurableWorker {
                 payload,
             },
         )
+    }
+
+    /// Durably bind this logical worker to the native ACP session that
+    /// actually started. Recording the canonical event first leaves a safe
+    /// migration path if the identity-file write is interrupted.
+    pub fn record_native_session_started(
+        &mut self,
+        kind: impl Into<String>,
+        payload: Value,
+        native_session_id: &str,
+    ) -> Result<u64> {
+        validate_identifier(native_session_id, "native session ID")?;
+        let seq = self.record_adapter_event(kind, payload)?;
+        let identity = NativeSessionIdentity {
+            version: NATIVE_SESSION_IDENTITY_VERSION,
+            native_session_id: native_session_id.to_owned(),
+        };
+        let body = serde_json::to_vec_pretty(&identity)?;
+        crate::hel_config::atomic_write(&self.root.join(NATIVE_SESSION_IDENTITY_FILE), &body)?;
+        self.native_session_id = Some(native_session_id.to_owned());
+        Ok(seq)
     }
 
     pub fn record_turn_completed(&mut self) -> Result<u64> {
@@ -628,6 +677,37 @@ impl DurableWorker {
     }
 }
 
+/// Recover the native identity from canonical history written by older
+/// workers. This is also used by checkpoint repair when controller state lacks
+/// the ID. A newer session with no accepted prompt is an empty restart, not a
+/// replacement for an older session that contains the actual work.
+pub(crate) fn recover_native_session_id(events: &[SequencedEvent]) -> Option<String> {
+    let mut candidates = Vec::<(String, bool)>::new();
+    for event in events {
+        match &event.event {
+            WorkerEvent::Adapter { kind, payload } if kind == "session_started" => {
+                let Some(id) = payload.get("native_session_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if validate_identifier(id, "native session ID").is_ok() {
+                    candidates.push((id.to_owned(), false));
+                }
+            }
+            WorkerEvent::PromptAccepted { .. } => {
+                if let Some((_, prompted)) = candidates.last_mut() {
+                    *prompted = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    candidates
+        .iter()
+        .rev()
+        .find_map(|(id, prompted)| prompted.then(|| id.clone()))
+        .or_else(|| candidates.last().map(|(id, _)| id.clone()))
+}
+
 fn apply_event(snapshot: &mut WorkerSnapshot, event: &SequencedEvent) -> Result<()> {
     if event.seq != snapshot.latest_seq + 1 {
         bail!(
@@ -721,6 +801,37 @@ fn load_event_log(path: &Path) -> Result<Vec<SequencedEvent>> {
         }
     }
     Ok(events)
+}
+
+fn read_native_session_identity(root: &Path) -> Result<Option<String>> {
+    let path = root.join(NATIVE_SESSION_IDENTITY_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let body = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let identity: NativeSessionIdentity =
+        serde_json::from_slice(&body).with_context(|| format!("parse {}", path.display()))?;
+    if identity.version != NATIVE_SESSION_IDENTITY_VERSION {
+        bail!(
+            "unsupported native session identity version {}",
+            identity.version
+        );
+    }
+    validate_identifier(&identity.native_session_id, "native session ID")?;
+    Ok(Some(identity.native_session_id))
+}
+
+pub(crate) fn clear_native_session_identity(root: &Path) -> Result<()> {
+    let path = root.join(NATIVE_SESSION_IDENTITY_FILE);
+    match fs::remove_file(&path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            File::open(root)?.sync_all()?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
 }
 
 fn validate_event_sequence(events: &[SequencedEvent]) -> Result<()> {
@@ -948,6 +1059,64 @@ mod tests {
         assert_eq!(worker.snapshot.phase, WorkerPhase::Idle);
         assert_eq!(worker.snapshot.latest_seq, 3);
         assert_eq!(worker.events_after(1).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn native_session_identity_survives_worker_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let native = "019feb39-865b-7392-b358-96932c672a42";
+        {
+            let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+            worker
+                .record_native_session_started(
+                    "session_started",
+                    serde_json::json!({
+                        "type": "session_started",
+                        "native_session_id": native,
+                        "resumed": false,
+                    }),
+                    native,
+                )
+                .unwrap();
+        }
+
+        let worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(worker.native_session_id(), Some(native));
+    }
+
+    #[test]
+    fn legacy_identity_recovery_ignores_newer_unprompted_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = "019feb39-865b-7392-b358-96932c672a42";
+        let empty_restart = "019feb5d-0047-7f21-88c5-814eb58b7992";
+        let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        for native_session_id in [original, empty_restart] {
+            worker
+                .record_adapter_event(
+                    "session_started",
+                    serde_json::json!({
+                        "type": "session_started",
+                        "native_session_id": native_session_id,
+                        "resumed": false,
+                    }),
+                )
+                .unwrap();
+            if native_session_id == original {
+                accepted(&worker.handle(request(
+                    "prompt-before-restart",
+                    WorkerRequest::Prompt {
+                        text: "do work".into(),
+                        attachments: vec![],
+                    },
+                )));
+                worker.record_turn_completed().unwrap();
+            }
+        }
+
+        assert_eq!(
+            worker.recover_native_session_id_from_events().as_deref(),
+            Some(original)
+        );
     }
 
     #[test]

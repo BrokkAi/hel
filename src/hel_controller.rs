@@ -288,7 +288,7 @@ impl Controller {
         session_id: &str,
         executor: &impl CommandExecutor,
     ) -> Result<Option<String>> {
-        let (backend, worker_root) = self.prepare_worker_files(session_id, executor)?;
+        let (backend, worker_root) = self.prepare_worker_files(session_id, executor, true)?;
         start_worker(executor, &backend, &worker_root)?;
         match handshake_worker(&hel_targets::reconnect_plan(&backend, session_id)?.commands[0])
             .await
@@ -307,6 +307,7 @@ impl Controller {
         &self,
         session_id: &str,
         executor: &impl CommandExecutor,
+        recover_native_session: bool,
     ) -> Result<(hel_targets::TargetLocator, String)> {
         let session = self
             .state
@@ -354,6 +355,7 @@ impl Controller {
             cwd: PathBuf::from(&workspace.0),
             additional_directories: workspace.1.into_iter().map(PathBuf::from).collect(),
             native_session_id: session.native_session_id.clone(),
+            recover_native_session,
         };
 
         let staging = tempfile::tempdir().context("create worker staging directory")?;
@@ -466,7 +468,8 @@ impl Controller {
         let result = async {
             self.provision_session_with(session_id, &ProcessExecutor)
                 .await?;
-            let (backend, worker_root) = self.prepare_worker_files(session_id, &ProcessExecutor)?;
+            let (backend, worker_root) =
+                self.prepare_worker_files(session_id, &ProcessExecutor, same_harness)?;
             let harness_home = target_profile_home(&backend, session_id);
             let workspace_root = match &backend {
                 hel_targets::TargetLocator::LocalPodman { .. }
@@ -624,10 +627,8 @@ impl Controller {
             .checkpoint(Some("controller archive checkpoint".into()))
             .await?;
         let bootstrap = client.bootstrap().await?;
-        let native_session_id = session
-            .native_session_id
-            .clone()
-            .or_else(|| native_session_id_from_events(&bootstrap.events))
+        let native_session_id = native_session_id_from_events(&bootstrap.events)
+            .or_else(|| session.native_session_id.clone())
             .context("harness did not report its native session ID")?;
         client.detach().await?;
 
@@ -826,17 +827,7 @@ fn preflight_target(template: &TargetTemplate, executor: &impl CommandExecutor) 
 }
 
 fn native_session_id_from_events(events: &[crate::hel_worker::SequencedEvent]) -> Option<String> {
-    events.iter().rev().find_map(|event| {
-        let WorkerEvent::Adapter { payload, .. } = &event.event else {
-            return None;
-        };
-        match serde_json::from_value::<crate::hel_acp::RuntimeEvent>(payload.clone()).ok()? {
-            crate::hel_acp::RuntimeEvent::SessionStarted {
-                native_session_id, ..
-            } => Some(native_session_id),
-            _ => None,
-        }
-    })
+    crate::hel_worker::recover_native_session_id(events)
 }
 
 fn canonical_latest_sequence(bytes: &[u8]) -> Result<u64> {

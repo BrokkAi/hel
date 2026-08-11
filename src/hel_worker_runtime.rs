@@ -20,6 +20,15 @@ pub struct WorkerLaunchConfig {
     #[serde(default)]
     pub additional_directories: Vec<PathBuf>,
     pub native_session_id: Option<String>,
+    /// Recover a legacy native identity from canonical events when neither
+    /// the controller nor the worker has persisted one. Cross-harness resume
+    /// disables this because restored history belongs to the source harness.
+    #[serde(default = "default_recover_native_session")]
+    pub recover_native_session: bool,
+}
+
+const fn default_recover_native_session() -> bool {
+    true
 }
 
 impl WorkerLaunchConfig {
@@ -81,11 +90,10 @@ mod unix {
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         }
 
-        let worker = Arc::new(Mutex::new(DurableWorker::open(
-            &root,
-            &config.session_id,
-            env!("CARGO_PKG_VERSION"),
-        )?));
+        let durable_worker =
+            DurableWorker::open(&root, &config.session_id, env!("CARGO_PKG_VERSION"))?;
+        let resume_session = select_resume_session(&config, &durable_worker);
+        let worker = Arc::new(Mutex::new(durable_worker));
         let (acp_commands_tx, acp_commands_rx) = mpsc::channel(32);
         let (acp_events_tx, mut acp_events_rx) = mpsc::unbounded_channel();
         let acp_spec = LaunchSpec {
@@ -94,7 +102,7 @@ mod unix {
             environment: config.environment,
             cwd: config.cwd,
             additional_directories: config.additional_directories,
-            resume_session: config.native_session_id,
+            resume_session,
             harness: config.harness,
         };
         let mut acp_task = tokio::spawn(hel_acp::run(acp_spec, acp_commands_rx, acp_events_tx));
@@ -104,7 +112,18 @@ mod unix {
             while let Some(event) = acp_events_rx.recv().await {
                 let value = serde_json::to_value(&event)?;
                 let mut worker = event_worker.lock().expect("worker state lock poisoned");
-                worker.record_adapter_event(runtime_event_kind(&event), value)?;
+                if let RuntimeEvent::SessionStarted {
+                    native_session_id, ..
+                } = &event
+                {
+                    worker.record_native_session_started(
+                        runtime_event_kind(&event),
+                        value,
+                        native_session_id,
+                    )?;
+                } else {
+                    worker.record_adapter_event(runtime_event_kind(&event), value)?;
+                }
                 match event {
                     RuntimeEvent::PromptFinished { .. } => {
                         worker.record_turn_completed()?;
@@ -144,6 +163,22 @@ mod unix {
         }
         let _ = std::fs::remove_file(socket);
         Ok(())
+    }
+
+    pub(super) fn select_resume_session(
+        config: &WorkerLaunchConfig,
+        worker: &crate::hel_worker::DurableWorker,
+    ) -> Option<String> {
+        if let Some(native_session_id) = &config.native_session_id {
+            return Some(native_session_id.clone());
+        }
+        if let Some(native_session_id) = worker.native_session_id() {
+            return Some(native_session_id.to_owned());
+        }
+        if !config.recover_native_session {
+            return None;
+        }
+        worker.recover_native_session_id_from_events()
     }
 
     async fn serve_client(
@@ -387,6 +422,7 @@ mod tests {
             cwd: ".local/share/hel/workspaces/session/repo".into(),
             additional_directories: Vec::new(),
             native_session_id: None,
+            recover_native_session: true,
         }
     }
 
@@ -411,6 +447,107 @@ mod tests {
         assert_eq!(
             config.environment["CODEX_HOME"],
             "/var/lib/hel/profiles/session"
+        );
+    }
+
+    #[test]
+    fn legacy_launch_config_enables_event_identity_recovery() {
+        let mut value = serde_json::to_value(launch_config("/profile")).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("recover_native_session");
+
+        let config: WorkerLaunchConfig = serde_json::from_value(value).unwrap();
+        assert!(config.recover_native_session);
+    }
+
+    #[test]
+    fn persisted_native_identity_is_reused_for_every_harness() {
+        let native = "019feb39-865b-7392-b358-96932c672a42";
+        for harness in [HarnessKind::Codex, HarnessKind::Claude, HarnessKind::Kimi] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut worker = crate::hel_worker::DurableWorker::open(
+                temp.path(),
+                "018f9dd2-a3b4-7c8d-9000-123456789abc",
+                "1.0.0",
+            )
+            .unwrap();
+            worker
+                .record_native_session_started(
+                    "session_started",
+                    serde_json::json!({
+                        "type": "session_started",
+                        "native_session_id": native,
+                        "resumed": false,
+                    }),
+                    native,
+                )
+                .unwrap();
+            let mut config = launch_config("/var/lib/hel/profiles/session");
+            config.harness = harness;
+
+            assert_eq!(
+                unix::select_resume_session(&config, &worker).as_deref(),
+                Some(native),
+                "{harness:?} must resume the worker-owned native identity"
+            );
+        }
+    }
+
+    #[test]
+    fn intentional_fresh_session_ignores_restored_native_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let native = "019feb39-865b-7392-b358-96932c672a42";
+        let mut worker = crate::hel_worker::DurableWorker::open(
+            temp.path(),
+            "018f9dd2-a3b4-7c8d-9000-123456789abc",
+            "1.0.0",
+        )
+        .unwrap();
+        worker
+            .record_adapter_event(
+                "session_started",
+                serde_json::json!({
+                    "type": "session_started",
+                    "native_session_id": native,
+                    "resumed": false,
+                }),
+            )
+            .unwrap();
+        let mut config = launch_config("/var/lib/hel/profiles/session");
+        config.recover_native_session = false;
+
+        assert_eq!(unix::select_resume_session(&config, &worker), None);
+    }
+
+    #[test]
+    fn fresh_session_policy_reuses_identity_after_destination_starts() {
+        let temp = tempfile::tempdir().unwrap();
+        let native = "019feb39-865b-7392-b358-96932c672a42";
+        let mut worker = crate::hel_worker::DurableWorker::open(
+            temp.path(),
+            "018f9dd2-a3b4-7c8d-9000-123456789abc",
+            "1.0.0",
+        )
+        .unwrap();
+        worker
+            .record_native_session_started(
+                "session_started",
+                serde_json::json!({
+                    "type": "session_started",
+                    "native_session_id": native,
+                    "resumed": false,
+                }),
+                native,
+            )
+            .unwrap();
+        let mut config = launch_config("/var/lib/hel/profiles/session");
+        config.recover_native_session = false;
+
+        assert_eq!(
+            unix::select_resume_session(&config, &worker).as_deref(),
+            Some(native)
         );
     }
 }
