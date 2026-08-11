@@ -26,6 +26,7 @@ pub enum ChatExit {
 pub enum ChatAction {
     None,
     Prompt(String),
+    SetConfig { key: String, value: String },
     Cancel,
     Checkpoint,
     ToggleVoice,
@@ -163,6 +164,17 @@ impl ChatState {
                 let prompt = self.input.trim().to_owned();
                 if prompt.is_empty() || self.phase != WorkerPhase::Idle {
                     ChatAction::None
+                } else if let Some((key, value)) = slash_config(&prompt) {
+                    self.input.clear();
+                    if value.is_empty() {
+                        self.set_notice(format!("usage: /{key} <value>"));
+                        ChatAction::None
+                    } else {
+                        ChatAction::SetConfig {
+                            key: key.to_owned(),
+                            value: value.to_owned(),
+                        }
+                    }
                 } else {
                     self.input.clear();
                     ChatAction::Prompt(prompt)
@@ -237,6 +249,11 @@ impl ChatState {
                 seq,
                 ChatRole::System,
                 format!("warning: {message}"),
+            )),
+            RuntimeEvent::ConfigApplied { key, value } => self.entries.push(ChatEntry::plain(
+                seq,
+                ChatRole::System,
+                format!("{key} set to {value}"),
             )),
             RuntimeEvent::SessionStarted { resumed, .. } => self.entries.push(ChatEntry::plain(
                 seq,
@@ -400,6 +417,9 @@ pub async fn run_chat(
                             Some(error)
                         }
                     },
+                    ChatAction::SetConfig { key, value } => {
+                        client.set_config(key, value).await.err()
+                    }
                     ChatAction::Cancel => client.cancel().await.err(),
                     ChatAction::Checkpoint => client
                         .checkpoint(Some("manual chat checkpoint".into()))
@@ -447,6 +467,21 @@ pub async fn run_chat(
             Err(error) => chat.set_notice(format!("connection lost: {error:#}")),
         }
     }
+}
+
+fn slash_config(prompt: &str) -> Option<(&str, &str)> {
+    for key in ["model", "effort"] {
+        let command = format!("/{key}");
+        if prompt == command {
+            return Some((key, ""));
+        }
+        if let Some(value) = prompt.strip_prefix(&command)
+            && value.starts_with(char::is_whitespace)
+        {
+            return Some((key, value.trim()));
+        }
+    }
+    None
 }
 
 pub fn render(frame: &mut Frame, chat: &ChatState) {
@@ -1090,6 +1125,37 @@ mod tests {
         let mut chat = ChatState::new(&running, &[]);
         chat.handle_key(key(KeyCode::Char('x')));
         assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
+    }
+
+    #[test]
+    fn model_and_effort_slash_commands_change_live_session_config() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.input = "/model gpt-5.6-luna".into();
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::SetConfig {
+                key: "model".into(),
+                value: "gpt-5.6-luna".into(),
+            }
+        );
+
+        chat.input = "/effort xhigh".into();
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::SetConfig {
+                key: "effort".into(),
+                value: "xhigh".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn config_slash_command_without_value_shows_usage() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.input = "/model".into();
+
+        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
+        assert_eq!(chat.notice.as_deref(), Some("usage: /model <value>"));
     }
 
     #[test]

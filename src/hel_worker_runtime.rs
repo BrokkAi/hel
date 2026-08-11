@@ -259,6 +259,12 @@ mod unix {
     fn acp_command(request: WorkerRequest) -> Option<CommandRequest> {
         match request {
             WorkerRequest::Prompt { text, .. } => Some(CommandRequest::Prompt(text)),
+            WorkerRequest::SetConfig { key, value } => {
+                value.as_str().map(|value| CommandRequest::SetConfig {
+                    key,
+                    value: value.to_owned(),
+                })
+            }
             WorkerRequest::Cancel => Some(CommandRequest::Cancel),
             WorkerRequest::Close => Some(CommandRequest::Close),
             _ => None,
@@ -273,6 +279,7 @@ mod unix {
             RuntimeEvent::PermissionAutoApproved { .. } => "permission_auto_approved",
             RuntimeEvent::PromptFinished { .. } => "prompt_finished",
             RuntimeEvent::Warning { .. } => "warning",
+            RuntimeEvent::ConfigApplied { .. } => "config_applied",
             RuntimeEvent::Stopped => "stopped",
         }
     }

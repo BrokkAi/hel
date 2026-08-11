@@ -170,6 +170,14 @@ impl WorkerClient {
         self.accepted(WorkerRequest::Cancel).await
     }
 
+    pub async fn set_config(&mut self, key: String, value: String) -> Result<u64> {
+        self.accepted(WorkerRequest::SetConfig {
+            key,
+            value: serde_json::Value::String(value),
+        })
+        .await
+    }
+
     pub async fn checkpoint(&mut self, reason: Option<String>) -> Result<u64> {
         self.accepted(WorkerRequest::Checkpoint { reason }).await
     }

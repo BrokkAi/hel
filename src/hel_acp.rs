@@ -63,6 +63,10 @@ fn production_compaction_config(harness: HarnessKind) -> Option<ProductionCompac
 #[derive(Debug)]
 pub enum CommandRequest {
     Prompt(String),
+    SetConfig {
+        key: String,
+        value: String,
+    },
     Compact {
         prompt: String,
         response: oneshot::Sender<std::result::Result<String, String>>,
@@ -95,6 +99,10 @@ pub enum RuntimeEvent {
     },
     Warning {
         message: String,
+    },
+    ConfigApplied {
+        key: String,
+        value: String,
     },
     Stopped,
 }
@@ -292,6 +300,7 @@ async fn drive_connection(
         modes.as_ref(),
     )
     .await?;
+    let mut config_options = config_options.unwrap_or_default();
     let _ = events.send(RuntimeEvent::SessionStarted {
         native_session_id: session_id.to_string(),
         resumed,
@@ -337,12 +346,37 @@ async fn drive_connection(
                                     message: "a prompt is already running".into(),
                                 });
                             }
+                            Some(CommandRequest::SetConfig { .. }) => {
+                                let _ = events.send(RuntimeEvent::Warning {
+                                    message: "model and effort can only be changed while the agent is idle".into(),
+                                });
+                            }
                             Some(CommandRequest::Compact { response, .. }) => {
                                 let _ = response.send(Err(
                                     "cannot compact while the destination prompt is running".into(),
                                 ));
                             }
                         }
+                    }
+                }
+            }
+            CommandRequest::SetConfig { key, value } => {
+                match set_session_config(
+                    &connection,
+                    &session_id,
+                    &mut config_options,
+                    &key,
+                    &value,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let _ = events.send(RuntimeEvent::ConfigApplied { key, value });
+                    }
+                    Err(error) => {
+                        let _ = events.send(RuntimeEvent::Warning {
+                            message: format!("{error:#}"),
+                        });
                     }
                 }
             }
@@ -366,6 +400,64 @@ async fn drive_connection(
         }
     }
     Ok(())
+}
+
+async fn set_session_config(
+    connection: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    options: &mut Vec<SessionConfigOption>,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let option = find_session_config_option(options, key)
+        .with_context(|| format!("ACP bridge does not expose a {key} selector"))?;
+    ensure!(
+        select_contains(&option.kind, value),
+        "{value:?} is not an available {key} value"
+    );
+    let response = connection
+        .send_request(SetSessionConfigOptionRequest::new(
+            session_id.clone(),
+            option.id.clone(),
+            SessionConfigValueId::new(value.to_owned()),
+        ))
+        .block_task()
+        .await
+        .with_context(|| format!("set session {key} to {value}"))?;
+    *options = response.config_options;
+    Ok(())
+}
+
+fn find_session_config_option<'a>(
+    options: &'a [SessionConfigOption],
+    key: &str,
+) -> Option<&'a SessionConfigOption> {
+    match key {
+        "model" => options
+            .iter()
+            .find(|option| option.id.to_string() == "model")
+            .or_else(|| {
+                options.iter().find(|option| {
+                    option.category == Some(SessionConfigOptionCategory::Model)
+                        && !matches!(
+                            option.id.to_string().as_str(),
+                            "effort" | "reasoning_effort"
+                        )
+                })
+            }),
+        "effort" => options
+            .iter()
+            .find(|option| option.category == Some(SessionConfigOptionCategory::ThoughtLevel))
+            .or_else(|| {
+                options.iter().find(|option| {
+                    matches!(
+                        option.id.to_string().as_str(),
+                        "effort" | "reasoning_effort"
+                    )
+                })
+            }),
+        _ => None,
+    }
 }
 
 async fn compact_in_scratch_session(
@@ -592,5 +684,39 @@ mod tests {
             })
         );
         assert_eq!(production_compaction_config(HarnessKind::Kimi), None);
+    }
+
+    #[test]
+    fn live_config_finds_model_and_anvil_reasoning_effort_separately() {
+        let model = SessionConfigOption::select(
+            "model",
+            "Model",
+            "gpt-5.6-sol",
+            vec![SessionConfigSelectOption::new("gpt-5.6-sol", "Sol")],
+        )
+        .category(SessionConfigOptionCategory::Model);
+        let effort = SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning effort",
+            "high",
+            vec![SessionConfigSelectOption::new("high", "High")],
+        )
+        .category(SessionConfigOptionCategory::Model);
+        let options = vec![model, effort];
+
+        assert_eq!(
+            find_session_config_option(&options, "model")
+                .unwrap()
+                .id
+                .to_string(),
+            "model"
+        );
+        assert_eq!(
+            find_session_config_option(&options, "effort")
+                .unwrap()
+                .id
+                .to_string(),
+            "reasoning_effort"
+        );
     }
 }
