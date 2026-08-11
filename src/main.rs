@@ -2837,12 +2837,7 @@ fn isolated_subagent_role_from_home(
         .prefix(&format!("mj-{label}-codex-"))
         .tempdir()
         .with_context(|| format!("create isolated Codex home for {label}"))?;
-    for name in [
-        "auth.json",
-        "config.toml",
-        "models_cache.json",
-        "version.json",
-    ] {
+    for name in ["config.toml", "models_cache.json", "version.json"] {
         let from = source.join(name);
         if from.is_file() {
             std::fs::copy(&from, isolated.path().join(name)).with_context(|| {
@@ -2850,17 +2845,49 @@ fn isolated_subagent_role_from_home(
             })?;
         }
     }
-    if !isolated.path().join("auth.json").exists() {
+    let source_auth = source.join("auth.json");
+    if !source_auth.is_file() {
         anyhow::bail!(
             "Codex is available but {} has no auth.json; sign in from /mjconfig",
             source.display()
         );
     }
+    // Credentials must stay shared, never snapshotted: OpenAI rotates refresh
+    // tokens, so a private copy goes stale as soon as any other process
+    // refreshes or the user signs in again, and the seat then fails every
+    // request with "refresh token was revoked" until the session restarts.
+    // Codex rewrites auth.json in place, so a symlink keeps the seat on the
+    // live grant in both directions.
+    share_auth_json(&source_auth, &isolated.path().join("auth.json"), label)?;
     role.launch.env.insert(
         "CODEX_HOME".to_string(),
         isolated.path().display().to_string(),
     );
     Ok((role, Some(isolated)))
+}
+
+/// Codex rewrites auth.json in place, so a symlink — or a same-volume hard
+/// link on Windows, where symlinks need developer mode or elevation — behaves
+/// exactly like the real file. The plain copy is a last resort that reopens
+/// the stale-credential window.
+fn share_auth_json(source: &Path, target: &Path, label: &str) -> Result<()> {
+    let source = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&source, target);
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(&source, target)
+        .or_else(|_| std::fs::hard_link(&source, target))
+        .or_else(|_| std::fs::copy(&source, target).map(|_| ()));
+    #[cfg(not(any(unix, windows)))]
+    let linked = std::fs::copy(&source, target).map(|_| ());
+    linked.with_context(|| {
+        format!(
+            "share {} with the isolated {label} Codex home",
+            source.display()
+        )
+    })
 }
 
 fn isolated_subagent_roles(
@@ -4706,7 +4733,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_side_role_uses_an_isolated_copy_of_login_state() {
+    fn codex_side_role_isolates_config_but_shares_live_login_state() {
         let source = tempfile::tempdir().expect("source home");
         std::fs::write(source.path().join("auth.json"), "auth").expect("auth");
         std::fs::write(source.path().join("config.toml"), "config").expect("config");
@@ -4720,13 +4747,35 @@ mod tests {
             PathBuf::from(prepared.launch.env.get("CODEX_HOME").expect("CODEX_HOME"));
         assert_eq!(isolated_home, guard.path());
         assert_eq!(
-            std::fs::read_to_string(isolated_home.join("auth.json")).expect("copied auth"),
+            std::fs::read_to_string(isolated_home.join("auth.json")).expect("shared auth"),
             "auth"
         );
         assert_eq!(
             std::fs::read_to_string(isolated_home.join("config.toml")).expect("copied config"),
             "config"
         );
+        // Config edits must stay private to the seat...
+        std::fs::write(isolated_home.join("config.toml"), "seat config").expect("seat config");
+        assert_eq!(
+            std::fs::read_to_string(source.path().join("config.toml")).expect("source config"),
+            "config"
+        );
+        #[cfg(unix)]
+        {
+            // ...but a re-login that rewrites the real auth.json in place must
+            // reach the running seat, and a token the seat's codex refreshes
+            // must land in the real home rather than dying with the temp dir.
+            std::fs::write(source.path().join("auth.json"), "relogin").expect("relogin");
+            assert_eq!(
+                std::fs::read_to_string(isolated_home.join("auth.json")).expect("shared auth"),
+                "relogin"
+            );
+            std::fs::write(isolated_home.join("auth.json"), "rotated").expect("rotate");
+            assert_eq!(
+                std::fs::read_to_string(source.path().join("auth.json")).expect("source auth"),
+                "rotated"
+            );
+        }
     }
 
     #[test]
