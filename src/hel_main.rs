@@ -341,13 +341,13 @@ fn import(args: ImportArgs) -> Result<()> {
 fn import_claude(args: ClaudeImportArgs) -> Result<()> {
     let claude_home = claude_config_home()?;
     let selection = match args.session {
-        Some(session) => ClaudeSessionSelection::Session(session),
+        Some(session) => ClaudeSessionSelection::NativeSessionId(session),
         None => ClaudeSessionSelection::Latest,
     };
     let source = locate_claude_session(&claude_home, &selection)?;
     println!(
         "Selected Claude session {} at {}",
-        source.session_id,
+        source.native_session_id,
         source.jsonl_path.display()
     );
     let transcript = read_claude_transcript(&source.jsonl_path)?;
@@ -400,13 +400,13 @@ fn import_claude(args: ClaudeImportArgs) -> Result<()> {
 fn import_codex(args: CodexImportArgs) -> Result<()> {
     let codex_home = codex_config_home()?;
     let selection = match args.session {
-        Some(session) => CodexSessionSelection::Session(session),
+        Some(session) => CodexSessionSelection::NativeSessionId(session),
         None => CodexSessionSelection::Latest,
     };
     let source = locate_codex_session(&codex_home, &selection)?;
     println!(
         "Selected Codex session {} at {}",
-        source.session_id,
+        source.native_session_id,
         source.jsonl_path.display()
     );
     let transcript = read_codex_transcript(&source.jsonl_path)?;
@@ -448,13 +448,13 @@ fn import_codex(args: CodexImportArgs) -> Result<()> {
 fn import_kimi(args: KimiImportArgs) -> Result<()> {
     let kimi_home = kimi_config_home()?;
     let selection = match args.session {
-        Some(session) => KimiSessionSelection::Session(session),
+        Some(session) => KimiSessionSelection::NativeSessionId(session),
         None => KimiSessionSelection::Latest,
     };
     let source = locate_kimi_session(&kimi_home, &selection)?;
     println!(
         "Selected Kimi session {} at {}",
-        source.session_id,
+        source.native_session_id,
         source.session_path.display()
     );
     let transcript = read_kimi_transcript(&source.session_path)?;
@@ -976,8 +976,8 @@ fn apply_worker_poll_update(
 #[derive(Clone)]
 struct PendingDashboardImport {
     profile_id: String,
-    session_id: String,
-    title: String,
+    native_session_id: String,
+    display_title: String,
 }
 
 struct ImportBundlePrompt {
@@ -1116,7 +1116,7 @@ async fn run_dashboard() -> Result<()> {
                                     .send_replace(dashboard_worker_targets(&controller));
                                 dashboard.set_notice(format!(
                                     "Imported {} session {}.",
-                                    imported.harness, pending.session_id
+                                    imported.harness, pending.native_session_id
                                 ));
                             }
                             Err(error) => {
@@ -1189,15 +1189,15 @@ async fn run_dashboard() -> Result<()> {
             }
             DashboardAction::ImportSession {
                 profile_id,
-                session_id,
-                title,
+                native_session_id,
+                display_title,
             } => {
                 let pending = PendingDashboardImport {
                     profile_id,
-                    session_id,
-                    title,
+                    native_session_id,
+                    display_title,
                 };
-                dashboard.show_import_progress(pending.title.clone());
+                dashboard.show_import_progress(pending.display_title.clone());
                 spawn_dashboard_import(&controller, pending, false, import_task_tx.clone());
             }
             DashboardAction::ConfirmImportBundle { accepted } => {
@@ -1207,7 +1207,7 @@ async fn run_dashboard() -> Result<()> {
                     continue;
                 };
                 if accepted {
-                    dashboard.show_import_progress(pending.title.clone());
+                    dashboard.show_import_progress(pending.display_title.clone());
                     spawn_dashboard_import(&controller, pending, true, import_task_tx.clone());
                 } else {
                     dashboard.finish_import();
@@ -1442,7 +1442,7 @@ fn discover_import_sessions(config: &HelConfig, mut publish: impl FnMut(Vec<Impo
                 profiles[index].scan_progress = Some((progress.scanned, progress.total));
                 if let Some(session) = progress.session {
                     profiles[index].sessions.push(import_session_option(
-                        session.session_id,
+                        session.native_session_id,
                         session.title,
                         session.modified_at,
                         session.git_branch,
@@ -1456,7 +1456,7 @@ fn discover_import_sessions(config: &HelConfig, mut publish: impl FnMut(Vec<Impo
                 profiles[index].scan_progress = Some((progress.scanned, progress.total));
                 if let Some(session) = progress.session {
                     profiles[index].sessions.push(import_session_option(
-                        session.session_id,
+                        session.native_session_id,
                         session.title,
                         session.modified_at,
                         session.git_branch,
@@ -1470,7 +1470,7 @@ fn discover_import_sessions(config: &HelConfig, mut publish: impl FnMut(Vec<Impo
                 profiles[index].scan_progress = Some((progress.scanned, progress.total));
                 if let Some(session) = progress.session {
                     profiles[index].sessions.push(import_session_option(
-                        session.session_id,
+                        session.native_session_id,
                         session.title,
                         session.modified_at,
                         session.git_branch,
@@ -1489,7 +1489,7 @@ fn discover_import_sessions(config: &HelConfig, mut publish: impl FnMut(Vec<Impo
 }
 
 fn import_session_option(
-    session_id: String,
+    native_session_id: String,
     title: String,
     modified_at: SystemTime,
     branch: String,
@@ -1497,7 +1497,7 @@ fn import_session_option(
     cwd: PathBuf,
 ) -> ImportSessionOption {
     ImportSessionOption {
-        session_id,
+        native_session_id,
         title,
         details: format!(
             "{} · {} · {} · {}",
@@ -1570,8 +1570,8 @@ fn spawn_dashboard_import(
         let result = import_session_from_profile(
             worker_controller,
             &pending.profile_id,
-            &pending.session_id,
-            &pending.title,
+            &pending.native_session_id,
+            &pending.display_title,
             allow_synthesized_bundle,
             |step, total, message| {
                 let _ = updates.blocking_send(DashboardImportUpdate::Progress {
@@ -1617,8 +1617,8 @@ fn resolve_background_import_bundle(
 fn import_session_from_profile(
     mut controller: Controller,
     profile_id: &str,
-    session_id: &str,
-    title: &str,
+    native_session_id: &str,
+    display_title: &str,
     allow_synthesized_bundle: bool,
     mut report: impl FnMut(usize, Option<usize>, &str),
 ) -> Result<DashboardImportTaskResult> {
@@ -1633,7 +1633,7 @@ fn import_session_from_profile(
         hel::hel_config::HarnessKind::Codex => {
             let source = locate_codex_session(
                 &profile.home,
-                &CodexSessionSelection::Session(session_id.into()),
+                &CodexSessionSelection::NativeSessionId(native_session_id.into()),
             )?;
             let transcript = read_codex_transcript(&source.jsonl_path)?;
             report(2, Some(4), "Native session parsed.");
@@ -1657,7 +1657,7 @@ fn import_session_from_profile(
                     transcript: &transcript,
                     bundle_id: &bundle_id,
                     profile_id: Some(profile_id),
-                    title: Some(title),
+                    title: Some(display_title),
                     archive_directory: &sessions_dir(),
                 },
             )?;
@@ -1673,7 +1673,7 @@ fn import_session_from_profile(
         hel::hel_config::HarnessKind::Claude => {
             let source = locate_claude_session(
                 &profile.home,
-                &ClaudeSessionSelection::Session(session_id.into()),
+                &ClaudeSessionSelection::NativeSessionId(native_session_id.into()),
             )?;
             let transcript = read_claude_transcript(&source.jsonl_path)?;
             report(2, Some(4), "Native session parsed.");
@@ -1697,7 +1697,7 @@ fn import_session_from_profile(
                     transcript: &transcript,
                     bundle_id: &bundle_id,
                     profile_id: Some(profile_id),
-                    title: Some(title),
+                    title: Some(display_title),
                     archive_directory: &sessions_dir(),
                 },
             )?;
@@ -1713,7 +1713,7 @@ fn import_session_from_profile(
         hel::hel_config::HarnessKind::Kimi => {
             let source = locate_kimi_session(
                 &profile.home,
-                &KimiSessionSelection::Session(session_id.into()),
+                &KimiSessionSelection::NativeSessionId(native_session_id.into()),
             )?;
             let transcript = read_kimi_transcript(&source.session_path)?;
             report(2, Some(4), "Native session parsed.");
@@ -1737,7 +1737,7 @@ fn import_session_from_profile(
                     transcript: &transcript,
                     bundle_id: &bundle_id,
                     profile_id: Some(profile_id),
-                    title: Some(title),
+                    title: Some(display_title),
                     archive_directory: &sessions_dir(),
                 },
             )?;

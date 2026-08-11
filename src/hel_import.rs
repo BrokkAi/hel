@@ -28,7 +28,7 @@ use crate::hel_worker::{SequencedEvent, WorkerEvent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeSessionSelection {
-    Session(String),
+    NativeSessionId(String),
     Latest,
 }
 
@@ -37,7 +37,7 @@ pub type KimiSessionSelection = ClaudeSessionSelection;
 
 #[derive(Debug, Clone)]
 pub struct LocatedClaudeSession {
-    pub session_id: String,
+    pub native_session_id: String,
     pub jsonl_path: PathBuf,
     pub modified_at: SystemTime,
     pub title: String,
@@ -50,7 +50,7 @@ pub type LocatedCodexSession = LocatedClaudeSession;
 
 #[derive(Debug, Clone)]
 pub struct LocatedKimiSession {
-    pub session_id: String,
+    pub native_session_id: String,
     pub session_path: PathBuf,
     pub modified_at: SystemTime,
     pub title: String,
@@ -75,7 +75,7 @@ struct FileScanCandidate {
 
 #[derive(Debug)]
 struct KimiScanCandidate {
-    session_id: String,
+    native_session_id: String,
     session_path: PathBuf,
     modified_at: SystemTime,
 }
@@ -236,7 +236,7 @@ pub fn scan_codex_sessions(
                         .get(&session_id)
                         .cloned()
                         .unwrap_or_else(|| session_id.clone()),
-                    session_id,
+                    native_session_id: session_id,
                     jsonl_path: candidate.path,
                     modified_at: candidate.modified_at,
                     cwd,
@@ -370,12 +370,12 @@ pub fn locate_kimi_session(
     let candidates = list_kimi_sessions(home)?;
     let sessions = home.join("sessions");
     match selection {
-        KimiSessionSelection::Session(session_id) => candidates
+        KimiSessionSelection::NativeSessionId(native_session_id) => candidates
             .into_iter()
-            .find(|candidate| candidate.session_id == *session_id)
+            .find(|candidate| candidate.native_session_id == *native_session_id)
             .with_context(|| {
                 format!(
-                    "Kimi session {session_id:?} was not found under {}",
+                    "Kimi session {native_session_id:?} was not found under {}",
                     sessions.display()
                 )
             }),
@@ -432,7 +432,7 @@ pub fn scan_kimi_sessions(
             };
             validate_id("Kimi session", session_id)?;
             candidates.push(KimiScanCandidate {
-                session_id: session_id.to_owned(),
+                native_session_id: session_id.to_owned(),
                 session_path,
                 modified_at: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             });
@@ -457,13 +457,13 @@ pub fn scan_kimi_sessions(
             .as_ref()
             .map(|transcript| transcript.cwd.clone())
             .unwrap_or_default();
-        let session_id = candidate.session_id;
+        let native_session_id = candidate.native_session_id;
         let session = LocatedKimiSession {
             title: transcript
                 .as_ref()
                 .and_then(|transcript| first_prompt_title(&transcript.events))
-                .unwrap_or_else(|| session_id.clone()),
-            session_id,
+                .unwrap_or_else(|| native_session_id.clone()),
+            native_session_id,
             session_path: candidate.session_path,
             modified_at: candidate.modified_at,
             git_branch: git_branch_or_head(&cwd),
@@ -485,17 +485,17 @@ fn select_jsonl_session(
     harness: &str,
 ) -> Result<LocatedCodexSession> {
     match selection {
-        CodexSessionSelection::Session(session_id) => {
-            validate_id(&format!("{harness} session"), session_id)?;
+        CodexSessionSelection::NativeSessionId(native_session_id) => {
+            validate_id(&format!("{harness} session"), native_session_id)?;
             candidates
                 .into_iter()
-                .filter(|candidate| candidate.session_id == *session_id)
+                .filter(|candidate| candidate.native_session_id == *native_session_id)
                 .max_by(|left, right| {
                     left.modified_at
                         .cmp(&right.modified_at)
                         .then_with(|| left.jsonl_path.cmp(&right.jsonl_path))
                 })
-                .with_context(|| format!("{harness} session {session_id:?} was not found"))
+                .with_context(|| format!("{harness} session {native_session_id:?} was not found"))
         }
         CodexSessionSelection::Latest => candidates
             .into_iter()
@@ -517,19 +517,21 @@ pub fn locate_claude_session(
     let candidates = list_claude_sessions(home)?;
     let projects = home.join("projects");
     match selection {
-        ClaudeSessionSelection::Session(session_id) => {
-            validate_id("Claude session", session_id)?;
+        ClaudeSessionSelection::NativeSessionId(native_session_id) => {
+            validate_id("Claude session", native_session_id)?;
             let mut matches = candidates
                 .into_iter()
-                .filter(|candidate| candidate.session_id == *session_id)
+                .filter(|candidate| candidate.native_session_id == *native_session_id)
                 .collect::<Vec<_>>();
             match matches.len() {
                 0 => bail!(
-                    "Claude session {session_id:?} was not found under {}",
+                    "Claude session {native_session_id:?} was not found under {}",
                     projects.display()
                 ),
                 1 => Ok(matches.remove(0)),
-                _ => bail!("Claude session {session_id:?} occurs in multiple project directories"),
+                _ => bail!(
+                    "Claude session {native_session_id:?} occurs in multiple project directories"
+                ),
             }
         }
         ClaudeSessionSelection::Latest => candidates
@@ -621,7 +623,7 @@ pub fn scan_claude_sessions(
             scanned: index + 1,
             total,
             session: Some(LocatedClaudeSession {
-                session_id,
+                native_session_id: session_id,
                 jsonl_path: candidate.path,
                 modified_at: candidate.modified_at,
                 title,
@@ -1185,11 +1187,15 @@ pub fn import_claude_session(
         Some(title) if !title.trim().is_empty() => title.to_owned(),
         Some(_) => bail!("import title must not be empty"),
         None => harness_session_title(&transcript.events)
-            .unwrap_or_else(|| format!("Imported Claude session {}", source.session_id)),
+            .unwrap_or_else(|| format!("Imported Claude session {}", source.native_session_id)),
     };
     let repositories = collect_local_repositories(bundle, &transcript.cwd)?;
-    let native_artifacts =
-        collect_native_artifacts(HarnessKind::Claude, claude_home, &source.session_id, false)?;
+    let native_artifacts = collect_native_artifacts(
+        HarnessKind::Claude,
+        claude_home,
+        &source.native_session_id,
+        false,
+    )?;
     let canonical_events = encode_events(&transcript.events)?;
     let session_id = new_session_id()?;
     let timestamp = timestamp();
@@ -1209,7 +1215,7 @@ pub fn import_claude_session(
                 title: title.clone(),
                 harness_kind: HarnessKind::Claude,
                 profile_id: profile_id.clone(),
-                native_session_id: source.session_id.clone(),
+                native_session_id: source.native_session_id.clone(),
                 created_at: timestamp.clone(),
                 checkpointed_at: timestamp.clone(),
                 hel_version: env!("CARGO_PKG_VERSION").into(),
@@ -1248,7 +1254,7 @@ pub fn import_claude_session(
             additional_mounts: Vec::new(),
             state: SessionState::Archived,
             target: None,
-            native_session_id: Some(source.session_id.clone()),
+            native_session_id: Some(source.native_session_id.clone()),
             acp_session_title: None,
             session_title_override,
             created_at: timestamp.clone(),
@@ -1260,7 +1266,7 @@ pub fn import_claude_session(
     );
     Ok(ImportedClaudeSession {
         session_id,
-        native_session_id: source.session_id.clone(),
+        native_session_id: source.native_session_id.clone(),
         source_jsonl: source.jsonl_path.clone(),
         source_cwd: transcript.cwd.clone(),
         bundle_id: bundle_id.to_owned(),
@@ -1288,7 +1294,7 @@ pub fn import_codex_session(
         NativeImportRequest {
             harness: HarnessKind::Codex,
             harness_home: codex_home,
-            native_session_id: &source.session_id,
+            native_session_id: &source.native_session_id,
             source_path: &source.jsonl_path,
             transcript,
             bundle_id,
@@ -1319,7 +1325,7 @@ pub fn import_kimi_session(
         NativeImportRequest {
             harness: HarnessKind::Kimi,
             harness_home: kimi_home,
-            native_session_id: &source.session_id,
+            native_session_id: &source.native_session_id,
             source_path: &source.session_path,
             transcript,
             bundle_id,
@@ -1892,10 +1898,13 @@ mod tests {
 
         let located = locate_codex_session(
             directory.path(),
-            &CodexSessionSelection::Session("019feb6c-6b55-7111-a210-6d85ee0772cd".into()),
+            &CodexSessionSelection::NativeSessionId("019feb6c-6b55-7111-a210-6d85ee0772cd".into()),
         )
         .unwrap();
-        assert_eq!(located.session_id, "019feb6c-6b55-7111-a210-6d85ee0772cd");
+        assert_eq!(
+            located.native_session_id,
+            "019feb6c-6b55-7111-a210-6d85ee0772cd"
+        );
         assert_eq!(located.jsonl_path, rollout);
     }
 
@@ -2048,10 +2057,10 @@ mod tests {
 
         let located = locate_kimi_session(
             directory.path(),
-            &KimiSessionSelection::Session(format!("session_{id}")),
+            &KimiSessionSelection::NativeSessionId(format!("session_{id}")),
         )
         .unwrap();
-        assert_eq!(located.session_id, format!("session_{id}"));
+        assert_eq!(located.native_session_id, format!("session_{id}"));
         assert_eq!(located.session_path, session);
     }
 

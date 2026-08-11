@@ -65,8 +65,8 @@ pub enum DashboardAction {
     OpenImport,
     ImportSession {
         profile_id: String,
-        session_id: String,
-        title: String,
+        native_session_id: String,
+        display_title: String,
     },
     ConfirmImportBundle {
         accepted: bool,
@@ -77,7 +77,7 @@ pub enum DashboardAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportSessionOption {
-    pub session_id: String,
+    pub native_session_id: String,
     pub title: String,
     pub details: String,
 }
@@ -399,7 +399,7 @@ impl DashboardState {
             .profiles
             .get(dialog.profile_index)
             .and_then(|profile| profile.sessions.get(dialog.session_index))
-            .map(|session| session.session_id.clone());
+            .map(|session| session.native_session_id.clone());
         dialog.profiles = profiles;
         dialog.profile_index = selected_profile
             .and_then(|selected| {
@@ -418,7 +418,7 @@ impl DashboardState {
             .and_then(|selected| {
                 sessions
                     .iter()
-                    .position(|session| session.session_id == selected)
+                    .position(|session| session.native_session_id == selected)
             })
             .unwrap_or_else(|| dialog.session_index.min(sessions.len().saturating_sub(1)));
     }
@@ -623,8 +623,8 @@ impl DashboardState {
                 };
                 let action = DashboardAction::ImportSession {
                     profile_id: profile.profile_id.clone(),
-                    session_id: session.session_id.clone(),
-                    title: session.title.clone(),
+                    native_session_id: session.native_session_id.clone(),
+                    display_title: session.title.clone(),
                 };
                 self.cancel_modal();
                 action
@@ -2915,7 +2915,7 @@ mod tests {
                 profile_id: "codex-1".into(),
                 harness_kind: HarnessKind::Codex,
                 sessions: vec![ImportSessionOption {
-                    session_id: "codex-session".into(),
+                    native_session_id: "codex-session".into(),
                     title: "Codex title".into(),
                     details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
                 }],
@@ -2926,7 +2926,7 @@ mod tests {
                 profile_id: "claude-1".into(),
                 harness_kind: HarnessKind::Claude,
                 sessions: vec![ImportSessionOption {
-                    session_id: "claude-session".into(),
+                    native_session_id: "claude-session".into(),
                     title: "Claude title".into(),
                     details: "4m ago · master · 2.0MB · ~/Projects/hel".into(),
                 }],
@@ -2943,8 +2943,8 @@ mod tests {
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::ImportSession {
                 profile_id: "claude-1".into(),
-                session_id: "claude-session".into(),
-                title: "Claude title".into(),
+                native_session_id: "claude-session".into(),
+                display_title: "Claude title".into(),
             }
         );
     }
@@ -2953,8 +2953,8 @@ mod tests {
     fn incremental_import_results_preserve_the_selected_session() {
         let mut dashboard = dashboard_with_session(archived_session());
         let session = |id: &str| ImportSessionOption {
-            session_id: id.into(),
-            title: format!("Session {id}"),
+            native_session_id: id.into(),
+            title: "Same title".into(),
             details: "just now · master · 1.0KB · ~/Projects/hel".into(),
         };
         let profile = |sessions: Vec<ImportSessionOption>, progress| ImportProfileOption {
@@ -2982,8 +2982,8 @@ mod tests {
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::ImportSession {
                 profile_id: "codex-1".into(),
-                session_id: "b".into(),
-                title: "Session b".into(),
+                native_session_id: "b".into(),
+                display_title: "Same title".into(),
             }
         );
     }
@@ -2995,7 +2995,7 @@ mod tests {
             profile_id: "codex-1".into(),
             harness_kind: HarnessKind::Codex,
             sessions: vec![ImportSessionOption {
-                session_id: "native-session-1".into(),
+                native_session_id: "native-session-1".into(),
                 title: "Native session title".into(),
                 details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
             }],
@@ -3033,7 +3033,7 @@ mod tests {
             profile_id: "codex-1".into(),
             harness_kind: HarnessKind::Codex,
             sessions: vec![ImportSessionOption {
-                session_id: "native-session-1".into(),
+                native_session_id: "native-session-1".into(),
                 title: "Native session title".into(),
                 details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
             }],
