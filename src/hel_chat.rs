@@ -23,7 +23,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::hel_acp::RuntimeEvent;
 use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot};
-use crate::hel_worker_client::{WorkerBootstrap, WorkerClient};
+use crate::hel_worker_client::WorkerClient;
 use rendering::{
     LogicalLine, TranscriptRenderMode, markdown_lines, raw_lines, sanitize_terminal_text,
     wrap_styled_line,
@@ -309,6 +309,23 @@ impl ChatState {
             self.apply_event(event);
             self.latest_seq = event.seq;
         }
+    }
+
+    fn reset_interaction(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+        self.prompt_history.clear();
+        self.history_index = None;
+        self.history_draft.clear();
+        self.queued_prompts.clear();
+        self.autocomplete = None;
+        self.scroll_top = 0;
+        self.follow_bottom = true;
+        self.last_content_height = 0;
+        self.last_viewport_height = 0;
+        self.render_mode = TranscriptRenderMode::Rich;
+        self.notice = None;
+        self.voice_active = false;
     }
 
     fn set_input(&mut self, input: String) {
@@ -1150,13 +1167,15 @@ fn tool_location_details(locations: &[ToolCallLocation]) -> Vec<String> {
 pub async fn run_chat(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut client: WorkerClient,
-    bootstrap: Option<WorkerBootstrap>,
-) -> Result<(ChatExit, WorkerClient, WorkerBootstrap)> {
-    let mut bootstrap = match bootstrap {
-        Some(bootstrap) => bootstrap,
-        None => client.bootstrap().await?,
+    chat: Option<ChatState>,
+) -> Result<(ChatExit, WorkerClient, ChatState)> {
+    let mut chat = match chat {
+        Some(chat) => chat,
+        None => {
+            let bootstrap = client.bootstrap().await?;
+            ChatState::new(&bootstrap.snapshot, &bootstrap.events)
+        }
     };
-    let mut chat = ChatState::new(&bootstrap.snapshot, &bootstrap.events);
     let (voice_updates_tx, mut voice_updates_rx) =
         tokio::sync::mpsc::unbounded_channel::<VoiceUpdate>();
     let mut voice_cancel: Option<std::sync::mpsc::Sender<()>> = None;
@@ -1258,12 +1277,13 @@ pub async fn run_chat(
                             let _ = cancel.send(());
                         }
                         let last_seen_event_sequence = chat.latest_seq();
+                        chat.reset_interaction();
                         return Ok((
                             ChatExit::Detached {
                                 last_seen_event_sequence,
                             },
                             client,
-                            bootstrap,
+                            chat,
                         ));
                     }
                 };
@@ -1276,7 +1296,6 @@ pub async fn run_chat(
         match client.sync().await {
             Ok(events) => {
                 chat.apply_events(&events);
-                bootstrap.events.extend(events);
             }
             Err(error) => chat.set_notice(format!("connection lost: {error:#}")),
         }
@@ -1835,6 +1854,35 @@ mod tests {
         assert_eq!(append_dictation("please", "fix this"), "please fix this");
         assert_eq!(append_dictation("", "fix this"), "fix this");
         assert_eq!(append_dictation("please ", ""), "please");
+    }
+
+    #[test]
+    fn reset_interaction_preserves_projected_transcript_and_render_cache() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries
+            .push(ChatEntry::plain(1, ChatRole::Agent, "cached response"));
+        let _ = transcript_text(&mut chat, 80);
+        chat.set_input("draft".into());
+        chat.prompt_history.push("previous".into());
+        chat.queued_prompts.push_back(QueuedPrompt {
+            text: "queued".into(),
+        });
+        chat.scroll_top = 4;
+        chat.follow_bottom = false;
+        chat.notice = Some("temporary".into());
+        chat.voice_active = true;
+
+        chat.reset_interaction();
+
+        assert_eq!(chat.entries.len(), 1);
+        assert!(chat.render_cache.entries[0].is_some());
+        assert!(chat.input.is_empty());
+        assert!(chat.prompt_history.is_empty());
+        assert!(chat.queued_prompts.is_empty());
+        assert_eq!(chat.scroll_top, 0);
+        assert!(chat.follow_bottom);
+        assert!(chat.notice.is_none());
+        assert!(!chat.voice_active);
     }
 
     #[test]

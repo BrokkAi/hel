@@ -221,7 +221,7 @@ enum WorkerPollPayload {
 struct WarmWorker {
     spec: CommandSpec,
     client: WorkerClient,
-    bootstrap: hel::hel_worker_client::WorkerBootstrap,
+    chat: hel::hel_chat::ChatState,
 }
 
 enum WorkerPollCommand {
@@ -857,7 +857,7 @@ async fn poll_dashboard_workers(
             Some(Ok(Ok(events))) => {
                 failures.remove(&target.session_id);
                 if let Some(worker) = clients.get_mut(&target.session_id) {
-                    worker.bootstrap.events.extend(events.iter().cloned());
+                    worker.chat.apply_events(&events);
                 }
                 if !events.is_empty()
                     && updates
@@ -892,12 +892,14 @@ async fn poll_dashboard_workers(
                     Ok(Ok((client, bootstrap))) => {
                         failures.remove(&target.session_id);
                         let events = bootstrap.events.clone();
+                        let chat =
+                            hel::hel_chat::ChatState::new(&bootstrap.snapshot, &bootstrap.events);
                         clients.insert(
                             target.session_id.clone(),
                             WarmWorker {
                                 spec: target.spec.clone(),
                                 client,
-                                bootstrap,
+                                chat,
                             },
                         );
                         if !events.is_empty()
@@ -1331,35 +1333,19 @@ async fn run_dashboard() -> Result<()> {
                         hel::hel_chat::run_chat(
                             &mut terminal.terminal,
                             worker.client,
-                            Some(worker.bootstrap),
+                            Some(worker.chat),
                         )
                         .await
-                        .map(|(exit, client, bootstrap)| {
-                            (
-                                exit,
-                                Some(WarmWorker {
-                                    spec,
-                                    client,
-                                    bootstrap,
-                                }),
-                            )
-                        })
+                        .map(|(exit, client, chat)| (exit, Some(WarmWorker { spec, client, chat })))
                     }
                     None => {
                         async {
                             let spec = controller.reconnect_command(&session_id)?;
                             let client = WorkerClient::connect(&spec, &session_id).await?;
-                            let (exit, client, bootstrap) =
+                            let (exit, client, chat) =
                                 hel::hel_chat::run_chat(&mut terminal.terminal, client, None)
                                     .await?;
-                            Ok((
-                                exit,
-                                Some(WarmWorker {
-                                    spec,
-                                    client,
-                                    bootstrap,
-                                }),
-                            ))
+                            Ok((exit, Some(WarmWorker { spec, client, chat })))
                         }
                         .await
                     }
