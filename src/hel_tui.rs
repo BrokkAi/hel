@@ -1837,6 +1837,9 @@ fn session_values(
     let clock = crate::usage_format::format_turn_clock(
         now_epoch_seconds,
         detail.and_then(|detail| detail.current_turn_started_at),
+        detail
+            .and_then(|detail| detail.last_agent_text_at)
+            .or_else(|| session_updated_at_epoch_seconds(session)),
     );
     (
         clock,
@@ -1845,6 +1848,14 @@ fn session_values(
         checkpoint,
         session_name(session).to_string(),
     )
+}
+
+fn session_updated_at_epoch_seconds(session: &SessionRecord) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(&session.updated_at)
+        .ok()?
+        .timestamp()
+        .try_into()
+        .ok()
 }
 
 fn session_target(config: &HelConfig, session: &SessionRecord) -> String {
@@ -3284,6 +3295,19 @@ mod tests {
         assert_eq!(checkpoint_age(base + 8 * 60, checkpointed_at), "8m");
         assert_eq!(checkpoint_age(base + 3 * 3_600, checkpointed_at), "3h");
         assert_eq!(checkpoint_age(base + 2 * 86_400, checkpointed_at), "2d");
+    }
+
+    #[test]
+    fn active_idle_clock_uses_the_last_agent_activity_age() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let detail = SessionDetail {
+            last_agent_text_at: Some(1_000),
+            ..SessionDetail::default()
+        };
+
+        let (clock, _, _, _, _) = session_values(&session, Some(&detail), 1_480, &config());
+        assert_eq!(clock, "8m ago");
     }
 
     #[test]
