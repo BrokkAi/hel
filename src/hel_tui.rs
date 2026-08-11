@@ -1245,6 +1245,7 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
             session,
             dashboard.session_details.get(&session.id),
             now_epoch_seconds,
+            &dashboard.config,
         )
     });
     let active_focused = dashboard.focus == Focus::Active;
@@ -1304,7 +1305,7 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
 
     let archived_rows = archived
         .iter()
-        .map(|session| archived_session_row(session, now_epoch_seconds));
+        .map(|session| archived_session_row(session, now_epoch_seconds, &dashboard.config));
     let archived_focused = dashboard.focus == Focus::Archived;
     let archived_table = Table::new(archived_rows, session_column_constraints())
         .header(session_header())
@@ -1338,9 +1339,9 @@ fn focus_border(focused: bool) -> BorderType {
 
 fn session_column_constraints() -> [Constraint; 5] {
     [
+        Constraint::Length(11),
         Constraint::Length(14),
-        Constraint::Length(18),
-        Constraint::Length(18),
+        Constraint::Length(32),
         Constraint::Length(21),
         Constraint::Min(24),
     ]
@@ -1361,6 +1362,7 @@ fn session_values(
     session: &SessionRecord,
     detail: Option<&SessionDetail>,
     now_epoch_seconds: u64,
+    config: &HelConfig,
 ) -> (String, String, String, String, String) {
     let checkpoint = session
         .checkpoint
@@ -1375,10 +1377,23 @@ fn session_values(
     (
         clock,
         session.last_profile.clone(),
-        session.target_template_id.clone(),
+        session_target(config, session),
         checkpoint.to_string(),
         session_name(session).to_string(),
     )
+}
+
+fn session_target(config: &HelConfig, session: &SessionRecord) -> String {
+    let Some(bundle) = config.bundles.get(&session.bundle_id) else {
+        return session.target_template_id.clone();
+    };
+    let project_dirs = bundle
+        .repositories
+        .iter()
+        .map(|repository| repository.destination.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{}: {project_dirs}", session.target_template_id)
 }
 
 fn session_name(session: &SessionRecord) -> &str {
@@ -1402,9 +1417,10 @@ fn active_session_row(
     session: &SessionRecord,
     detail: Option<&SessionDetail>,
     now_epoch_seconds: u64,
+    config: &HelConfig,
 ) -> Row<'static> {
     let (clock, profile, target, checkpoint, session_name) =
-        session_values(session, detail, now_epoch_seconds);
+        session_values(session, detail, now_epoch_seconds, config);
     let unread_count = detail.map_or(0, |detail| detail.unread_agent_message_sequences.len());
     Row::new([
         Cell::from(clock),
@@ -1416,9 +1432,13 @@ fn active_session_row(
     .height(3)
 }
 
-fn archived_session_row(session: &SessionRecord, now_epoch_seconds: u64) -> Row<'static> {
+fn archived_session_row(
+    session: &SessionRecord,
+    now_epoch_seconds: u64,
+    config: &HelConfig,
+) -> Row<'static> {
     let (clock, profile, target, checkpoint, session_name) =
-        session_values(session, None, now_epoch_seconds);
+        session_values(session, None, now_epoch_seconds, config);
     Row::new([clock, profile, target, checkpoint, session_name])
 }
 
@@ -2506,6 +2526,27 @@ mod tests {
         assert!(rendered.contains("ACP pretty name"));
         assert!(!rendered.contains("native-1"));
         assert!(!rendered.contains("Raise the dead"));
+    }
+
+    #[test]
+    fn target_cell_combines_infrastructure_and_project_directories() {
+        let mut config = config();
+        config
+            .bundles
+            .get_mut("hel")
+            .unwrap()
+            .repositories
+            .push(ProjectRepository {
+                id: "anvil".into(),
+                github: "BrokkAi/anvil".into(),
+                destination: "anvil".into(),
+                git_ref: None,
+            });
+
+        assert_eq!(
+            session_target(&config, &archived_session()),
+            "podman: hel, anvil"
+        );
     }
 
     #[test]
