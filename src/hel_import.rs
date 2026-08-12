@@ -1,7 +1,7 @@
 //! Import native harness sessions into Hel's durable archive format.
 //
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -123,6 +123,8 @@ struct CodexSessionMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeTranscript {
     pub cwd: PathBuf,
+    /// Files reliably reported as edited by the native harness.
+    pub edited_paths: Vec<PathBuf>,
     pub events: Vec<SequencedEvent>,
 }
 
@@ -137,6 +139,48 @@ pub enum BundleResolution {
         id: String,
         bundle: ProjectBundle,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEditTargets {
+    pub git_roots: Vec<PathBuf>,
+    pub non_git_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportSafetyIssues {
+    pub dirty_git_roots: Vec<(PathBuf, String)>,
+    pub omitted_non_git_dirs: Vec<PathBuf>,
+}
+
+pub fn import_safety_issues(targets: &SessionEditTargets) -> Result<ImportSafetyIssues> {
+    let mut dirty_git_roots = Vec::new();
+    for root in &targets.git_roots {
+        let output = Command::new("git")
+            .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+            .current_dir(root)
+            .output()
+            .with_context(|| format!("inspect Git status in {}", root.display()))?;
+        ensure!(
+            output.status.success(),
+            "could not inspect Git status in {}",
+            root.display()
+        );
+        let lines = String::from_utf8_lossy(&output.stdout).lines().count();
+        if lines > 0 {
+            dirty_git_roots.push((
+                root.clone(),
+                format!(
+                    "{lines} changed or untracked path{}",
+                    if lines == 1 { "" } else { "s" }
+                ),
+            ));
+        }
+    }
+    Ok(ImportSafetyIssues {
+        dirty_git_roots,
+        omitted_non_git_dirs: targets.non_git_dirs.clone(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1288,7 +1332,12 @@ pub fn read_claude_transcript(path: &Path) -> Result<ClaudeTranscript> {
         "Claude session cwd is not absolute: {}",
         cwd.display()
     );
-    Ok(ClaudeTranscript { cwd, events })
+    let edited_paths = claude_edited_paths(path)?;
+    Ok(ClaudeTranscript {
+        cwd,
+        edited_paths,
+        events,
+    })
 }
 
 /// Project a Codex rollout into the canonical transcript used by Hel chat.
@@ -1298,6 +1347,7 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
     let mut cwd = None;
     let mut history_mode = None;
     let mut events = Vec::new();
+    let mut edited_paths = BTreeSet::new();
     let mut saw_user = false;
     for (index, line) in body.lines().enumerate() {
         if line.trim().is_empty() {
@@ -1328,6 +1378,18 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
         }
         if record.get("type").and_then(Value::as_str) != Some("event_msg") {
             continue;
+        }
+        if record.pointer("/payload/type").and_then(Value::as_str) == Some("item_completed")
+            && record.pointer("/payload/item/type").and_then(Value::as_str) == Some("FileChange")
+            && record
+                .pointer("/payload/item/status")
+                .and_then(Value::as_str)
+                == Some("completed")
+            && let Some(changes) = record
+                .pointer("/payload/item/changes")
+                .and_then(Value::as_object)
+        {
+            edited_paths.extend(changes.keys().map(PathBuf::from));
         }
         match record.pointer("/payload/type").and_then(Value::as_str) {
             Some("item_completed")
@@ -1389,7 +1451,11 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
         "Codex session cwd is not absolute: {}",
         cwd.display()
     );
-    Ok(CodexTranscript { cwd, events })
+    Ok(CodexTranscript {
+        cwd,
+        edited_paths: edited_paths.into_iter().collect(),
+        events,
+    })
 }
 
 fn codex_completed_item_text(record: &Value) -> Option<String> {
@@ -1506,7 +1572,174 @@ pub fn read_kimi_transcript(session_path: &Path) -> Result<KimiTranscript> {
         }
     }
     finish_imported_turn(&mut events);
-    Ok(KimiTranscript { cwd, events })
+    let edited_paths = kimi_edited_paths(session_path)?;
+    Ok(KimiTranscript {
+        cwd,
+        edited_paths,
+        events,
+    })
+}
+
+fn claude_edited_paths(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = vec![path.to_path_buf()];
+    if let (Some(parent), Some(session_id)) = (
+        path.parent(),
+        path.file_stem().and_then(|value| value.to_str()),
+    ) {
+        let subagents = parent.join(session_id).join("subagents");
+        if subagents.is_dir() {
+            collect_files_named(&subagents, "jsonl", &mut files)?;
+        }
+    }
+    let mut edited = BTreeSet::new();
+    for file in files {
+        let body = fs::read_to_string(&file)?;
+        let mut calls = BTreeMap::<String, PathBuf>::new();
+        let mut completed = BTreeSet::new();
+        for line in body.lines().filter(|line| !line.trim().is_empty()) {
+            let record: Value = serde_json::from_str(line)?;
+            if record.get("type").and_then(Value::as_str) == Some("file-history-delta") {
+                let Some(tracking) = record.get("trackingPath").and_then(Value::as_str) else {
+                    continue;
+                };
+                let tracking = PathBuf::from(tracking);
+                let path = if tracking.is_absolute() {
+                    tracking
+                } else if let Some(parent) = record
+                    .pointer("/backup/realParentDir")
+                    .and_then(Value::as_str)
+                {
+                    PathBuf::from(parent).join(
+                        tracking
+                            .file_name()
+                            .expect("non-empty tracking path has a file name"),
+                    )
+                } else {
+                    tracking
+                };
+                edited.insert(path);
+            }
+            if record.get("type").and_then(Value::as_str) == Some("assistant") {
+                for block in record
+                    .pointer("/message/content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if block.get("type").and_then(Value::as_str) != Some("tool_use")
+                        || !matches!(
+                            block.get("name").and_then(Value::as_str),
+                            Some("Edit" | "Write" | "NotebookEdit")
+                        )
+                    {
+                        continue;
+                    }
+                    let Some(id) = block.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if let Some(path) = block
+                        .pointer("/input/file_path")
+                        .or_else(|| block.pointer("/input/notebook_path"))
+                        .or_else(|| block.pointer("/input/path"))
+                        .and_then(Value::as_str)
+                    {
+                        calls.insert(id.to_owned(), PathBuf::from(path));
+                    }
+                }
+            }
+            if record.get("type").and_then(Value::as_str) == Some("user") {
+                for block in record
+                    .pointer("/message/content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if block.get("type").and_then(Value::as_str) == Some("tool_result")
+                        && block.get("is_error").and_then(Value::as_bool) != Some(true)
+                        && let Some(id) = block.get("tool_use_id").and_then(Value::as_str)
+                    {
+                        completed.insert(id.to_owned());
+                    }
+                }
+            }
+        }
+        edited.extend(
+            calls
+                .into_iter()
+                .filter(|(id, _)| completed.contains(id))
+                .map(|(_, path)| path),
+        );
+    }
+    Ok(edited.into_iter().collect())
+}
+
+fn kimi_edited_paths(session_path: &Path) -> Result<Vec<PathBuf>> {
+    let agents = session_path.join("agents");
+    if !agents.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    collect_files_named(&agents, "jsonl", &mut files)?;
+    let mut edited = BTreeSet::new();
+    for file in files {
+        let body = fs::read_to_string(file)?;
+        let mut calls = BTreeMap::<String, PathBuf>::new();
+        let mut completed = BTreeSet::new();
+        for line in body.lines().filter(|line| !line.trim().is_empty()) {
+            let record: Value = serde_json::from_str(line)?;
+            if record.get("type").and_then(Value::as_str) != Some("context.append_loop_event") {
+                continue;
+            }
+            let event = &record["event"];
+            if event.get("type").and_then(Value::as_str) == Some("tool.call")
+                && matches!(
+                    event.get("name").and_then(Value::as_str),
+                    Some("Edit" | "Write")
+                )
+                && let (Some(id), Some(path)) = (
+                    event.get("toolCallId").and_then(Value::as_str),
+                    event
+                        .pointer("/args/path")
+                        .or_else(|| event.pointer("/args/file_path"))
+                        .and_then(Value::as_str),
+                )
+            {
+                calls.insert(id.to_owned(), PathBuf::from(path));
+            }
+            if event.get("type").and_then(Value::as_str) == Some("tool.result")
+                && event.pointer("/result/isError").and_then(Value::as_bool) != Some(true)
+                && let Some(id) = event.get("toolCallId").and_then(Value::as_str)
+            {
+                completed.insert(id.to_owned());
+            }
+        }
+        edited.extend(
+            calls
+                .into_iter()
+                .filter(|(id, _)| completed.contains(id))
+                .map(|(_, path)| path),
+        );
+    }
+    Ok(edited.into_iter().collect())
+}
+
+fn collect_files_named(root: &Path, extension: &str, output: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_files_named(&path, extension, output)?;
+        } else if metadata.is_file()
+            && path.extension().and_then(|value| value.to_str()) == Some(extension)
+        {
+            output.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn finish_imported_turn(events: &mut Vec<SequencedEvent>) {
@@ -1528,68 +1761,206 @@ fn push_event(events: &mut Vec<SequencedEvent>, event: WorkerEvent) {
     });
 }
 
-/// Find a configured bundle by its primary GitHub repository, or describe a
-/// one-repository bundle that can be added after the CLI asks for consent.
+pub fn session_edit_targets(
+    transcript: &ClaudeTranscript,
+    profile_home: &Path,
+) -> Result<SessionEditTargets> {
+    let profile_home =
+        fs::canonicalize(profile_home).unwrap_or_else(|_| profile_home.to_path_buf());
+    let mut paths = transcript
+        .edited_paths
+        .iter()
+        .map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                transcript.cwd.join(path)
+            }
+        })
+        .filter(|path| !path.starts_with(&profile_home))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        paths.push(transcript.cwd.clone());
+    }
+
+    let cwd_root = git_root_for_path(&transcript.cwd)?.with_context(|| {
+        format!(
+            "session cwd is not in a usable Git worktree: {}",
+            transcript.cwd.display()
+        )
+    })?;
+    let mut git_roots = BTreeSet::from([cwd_root]);
+    let mut non_git_dirs = BTreeSet::new();
+    for path in paths {
+        if let Some(root) = git_root_for_path(&path)? {
+            git_roots.insert(root);
+        } else {
+            non_git_dirs.insert(edited_directory(&path));
+        }
+    }
+    Ok(SessionEditTargets {
+        git_roots: git_roots.into_iter().collect(),
+        non_git_dirs: non_git_dirs.into_iter().collect(),
+    })
+}
+
+fn edited_directory(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().unwrap_or(path).to_path_buf()
+    }
+}
+
+fn git_root_for_path(path: &Path) -> Result<Option<PathBuf>> {
+    let mut probe = edited_directory(path);
+    while !probe.is_dir() {
+        if !probe.pop() {
+            return Ok(None);
+        }
+    }
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&probe)
+        .output()
+        .with_context(|| format!("start git in {}", probe.display()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let root = String::from_utf8(output.stdout).context("decode Git repository root")?;
+    let root = PathBuf::from(root.trim());
+    Ok(Some(fs::canonicalize(&root).unwrap_or(root)))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum RepositoryIdentity {
+    Github(String, String),
+    Local(PathBuf),
+}
+
+fn root_identity(root: &Path) -> Result<RepositoryIdentity> {
+    let origin = git_optional_text(root, ["remote", "get-url", "origin"])?;
+    if let Some(github) = origin.as_deref().and_then(github_repository_from_origin) {
+        return Ok(RepositoryIdentity::Github(
+            github.owner.to_ascii_lowercase(),
+            github.repository.to_ascii_lowercase(),
+        ));
+    }
+    Ok(RepositoryIdentity::Local(
+        fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
+    ))
+}
+
+fn configured_repository_identity(repository: &ProjectRepository) -> Option<RepositoryIdentity> {
+    if let Some(source) = repository.github.as_deref() {
+        let github = github_repository_from_origin(source)?;
+        return Some(RepositoryIdentity::Github(
+            github.owner.to_ascii_lowercase(),
+            github.repository.to_ascii_lowercase(),
+        ));
+    }
+    repository.local.as_ref().map(|path| {
+        RepositoryIdentity::Local(fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+    })
+}
+
+/// Reuse an exact configured bundle or synthesize one from all detected roots.
 pub fn resolve_bundle(
     config: &HelConfig,
     cwd: &Path,
+    targets: &SessionEditTargets,
     requested_bundle: Option<&str>,
 ) -> Result<BundleResolution> {
+    let cwd_root = git_root_for_path(cwd)?.context("session cwd is not in a Git worktree")?;
+    let primary_identity = root_identity(&cwd_root)?;
+    let detected = targets
+        .git_roots
+        .iter()
+        .map(|root| root_identity(root))
+        .collect::<Result<BTreeSet<_>>>()?;
+
     if let Some(bundle_id) = requested_bundle {
+        let bundle = config
+            .bundles
+            .get(bundle_id)
+            .with_context(|| format!("unknown bundle {bundle_id:?}"))?;
         ensure!(
-            config.bundles.contains_key(bundle_id),
-            "unknown bundle {bundle_id:?}"
+            bundle_matches(bundle, &detected, &primary_identity),
+            "bundle {bundle_id:?} does not exactly match the session's edited Git roots and cwd primary repository"
         );
         return Ok(BundleResolution::Existing(bundle_id.to_owned()));
     }
-
-    let primary_path = PathBuf::from(git_text(cwd, ["rev-parse", "--show-toplevel"])?);
-    let primary_path = fs::canonicalize(&primary_path).unwrap_or(primary_path);
-    let origin = git_optional_text(cwd, ["remote", "get-url", "origin"])?;
-    if let Some(github) = origin.as_deref().and_then(github_repository_from_origin) {
-        if let Some(id) = configured_bundle_for_origin(config, &github) {
-            return Ok(BundleResolution::Existing(id));
-        }
-
-        let repository_id = setup_style_id(&github.repository);
-        let bundle_id = unique_bundle_id(config, &repository_id);
-        return Ok(BundleResolution::Synthesized {
-            id: bundle_id,
-            bundle: ProjectBundle {
-                primary_repo: repository_id.clone(),
-                repositories: vec![ProjectRepository {
-                    id: repository_id.clone(),
-                    github: Some(format!("{}/{}", github.owner, github.repository)),
-                    local: None,
-                    destination: PathBuf::from(repository_id),
-                    git_ref: None,
-                }],
-            },
-        });
-    }
-
-    if let Some(id) = configured_bundle_for_local(config, &primary_path) {
+    if let Some(id) = config.bundles.iter().find_map(|(id, bundle)| {
+        bundle_matches(bundle, &detected, &primary_identity).then(|| id.clone())
+    }) {
         return Ok(BundleResolution::Existing(id));
     }
-    let repository_name = primary_path
+
+    let primary_name = cwd_root
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("repository");
-    let repository_id = setup_style_id(repository_name);
-    let bundle_id = unique_bundle_id(config, &repository_id);
+    let bundle_id = unique_bundle_id(config, &setup_style_id(primary_name));
+    let mut used_ids = BTreeSet::new();
+    let mut repositories = Vec::new();
+    let mut primary_repo = None;
+    let mut roots = targets.git_roots.clone();
+    roots.sort_by_key(|root| root != &cwd_root);
+    for root in roots {
+        let base = setup_style_id(
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("repository"),
+        );
+        let mut id = base.clone();
+        for suffix in 2_u32.. {
+            if used_ids.insert(id.clone()) {
+                break;
+            }
+            id = format!("{base}-{suffix}");
+        }
+        if root == cwd_root {
+            primary_repo = Some(id.clone());
+        }
+        let origin = git_optional_text(&root, ["remote", "get-url", "origin"])?;
+        let github = origin
+            .as_deref()
+            .and_then(github_repository_from_origin)
+            .map(|source| format!("{}/{}", source.owner, source.repository));
+        repositories.push(ProjectRepository {
+            id: id.clone(),
+            local: github.is_none().then_some(root),
+            github,
+            destination: PathBuf::from(id),
+            git_ref: None,
+        });
+    }
     Ok(BundleResolution::Synthesized {
         id: bundle_id,
         bundle: ProjectBundle {
-            primary_repo: repository_id.clone(),
-            repositories: vec![ProjectRepository {
-                id: repository_id.clone(),
-                github: None,
-                local: Some(primary_path),
-                destination: PathBuf::from(repository_id),
-                git_ref: None,
-            }],
+            primary_repo: primary_repo.context("detected roots omitted the cwd repository")?,
+            repositories,
         },
     })
+}
+
+fn bundle_matches(
+    bundle: &ProjectBundle,
+    detected: &BTreeSet<RepositoryIdentity>,
+    primary: &RepositoryIdentity,
+) -> bool {
+    let identities = bundle
+        .repositories
+        .iter()
+        .filter_map(configured_repository_identity)
+        .collect::<BTreeSet<_>>();
+    identities.len() == bundle.repositories.len()
+        && &identities == detected
+        && bundle
+            .primary()
+            .and_then(configured_repository_identity)
+            .as_ref()
+            == Some(primary)
 }
 
 /// Return the matching configured bundle for an origin. It accepts setup's
@@ -1677,7 +2048,8 @@ pub fn import_claude_session(
         None => harness_session_title(&transcript.events)
             .unwrap_or_else(|| format!("Imported Claude session {}", source.native_session_id)),
     };
-    let repositories = collect_local_repositories(bundle, &transcript.cwd)?;
+    let targets = session_edit_targets(transcript, claude_home)?;
+    let repositories = collect_local_repositories(bundle, &transcript.cwd, &targets.git_roots)?;
     let native_artifacts = collect_native_artifacts(
         HarnessKind::Claude,
         claude_home,
@@ -1862,7 +2234,8 @@ fn import_native_session(
             )
         }),
     };
-    let repositories = collect_local_repositories(bundle, &transcript.cwd)?;
+    let targets = session_edit_targets(transcript, harness_home)?;
+    let repositories = collect_local_repositories(bundle, &transcript.cwd, &targets.git_roots)?;
     let native_artifacts =
         collect_import_native_artifacts(harness, harness_home, native_session_id, source_path)?;
     let canonical_events = encode_events(&transcript.events)?;
@@ -1966,13 +2339,28 @@ fn default_import_target_id(config: &HelConfig) -> String {
 
 fn collect_local_repositories(
     bundle: &ProjectBundle,
-    cwd: &Path,
+    _cwd: &Path,
+    detected_roots: &[PathBuf],
 ) -> Result<Vec<crate::hel_archive::RepositorySnapshot>> {
-    let primary = bundle
-        .primary()
-        .context("bundle primary repository is missing")?;
-    let primary_path = PathBuf::from(git_text(cwd, ["rev-parse", "--show-toplevel"])?);
-    let workspace_root = workspace_root_for_primary(&primary_path, &primary.destination);
+    let detected = detected_roots
+        .iter()
+        .map(|root| Ok((root_identity(root)?, root.clone())))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let repository_paths = bundle
+        .repositories
+        .iter()
+        .map(|repository| {
+            let identity = configured_repository_identity(repository)
+                .with_context(|| format!("repository {:?} has no usable source", repository.id))?;
+            let path = detected.get(&identity).cloned().with_context(|| {
+                format!(
+                    "repository {:?} was not detected in the native session",
+                    repository.id
+                )
+            })?;
+            Ok((repository.id.clone(), path))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     let git = SystemGit;
     bundle
         .repositories
@@ -1980,13 +2368,10 @@ fn collect_local_repositories(
         // identical to the configured bundle.
         .par_iter()
         .map(|repository| {
-            let path = if let Some(local) = &repository.local {
-                fs::canonicalize(local).unwrap_or_else(|_| local.clone())
-            } else if repository.id == primary.id {
-                primary_path.clone()
-            } else {
-                workspace_root.join(&repository.destination)
-            };
+            let path = repository_paths
+                .get(&repository.id)
+                .expect("repository paths cover the validated bundle")
+                .clone();
             ensure!(
                 path.is_dir(),
                 "local repository {:?} is missing at {}",
@@ -2013,20 +2398,6 @@ fn collect_local_repositories(
             .with_context(|| format!("collect local repository {:?}", repository.id))
         })
         .collect()
-}
-
-fn workspace_root_for_primary(primary_path: &Path, destination: &Path) -> PathBuf {
-    let mut root = primary_path.to_path_buf();
-    for _ in 0..destination.components().count() {
-        if !root.pop() {
-            return primary_path.parent().unwrap_or(primary_path).to_path_buf();
-        }
-    }
-    if root.join(destination) == primary_path {
-        root
-    } else {
-        primary_path.parent().unwrap_or(primary_path).to_path_buf()
-    }
 }
 
 fn encode_events(events: &[SequencedEvent]) -> Result<Vec<u8>> {
@@ -2230,6 +2601,178 @@ mod tests {
     }
 
     #[test]
+    fn session_targets_include_edited_roots_and_keep_cwd_primary() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        let sibling = directory.path().join("sibling");
+        initialize_repository(&app, "app");
+        initialize_repository(&sibling, "sibling");
+        let transcript = ClaudeTranscript {
+            cwd: app.clone(),
+            edited_paths: vec![sibling.join("src/lib.rs")],
+            events: Vec::new(),
+        };
+
+        let targets = session_edit_targets(&transcript, &directory.path().join("profile")).unwrap();
+        assert_eq!(targets.git_roots.len(), 2);
+        assert!(targets.git_roots.contains(&fs::canonicalize(app).unwrap()));
+        assert!(
+            targets
+                .git_roots
+                .contains(&fs::canonicalize(sibling).unwrap())
+        );
+        assert!(targets.non_git_dirs.is_empty());
+    }
+
+    #[test]
+    fn codex_extracts_only_completed_file_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rollout.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/work/app","history_mode":"paginated"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"text":"edit"}]}}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"FileChange","status":"completed","changes":{"/work/a.txt":{"type":"add"}}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"FileChange","status":"failed","changes":{"/work/b.txt":{"type":"add"}}}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let transcript = read_codex_transcript(&path).unwrap();
+        assert_eq!(transcript.edited_paths, [PathBuf::from("/work/a.txt")]);
+    }
+
+    #[test]
+    fn claude_prefers_file_history_and_accepts_successful_edit_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","cwd":"/work/app","message":{"content":"edit"}}"#,
+                "\n",
+                r#"{"type":"file-history-delta","trackingPath":"src/lib.rs","backup":{"realParentDir":"/work/app/src"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"ok","name":"Write","input":{"file_path":"relative.txt"}},{"type":"tool_use","id":"bad","name":"Edit","input":{"file_path":"bad.txt"}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"ok","content":"done"},{"type":"tool_result","tool_use_id":"bad","is_error":true,"content":"failed"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let transcript = read_claude_transcript(&path).unwrap();
+        assert_eq!(
+            transcript.edited_paths,
+            [
+                PathBuf::from("/work/app/src/lib.rs"),
+                PathBuf::from("relative.txt")
+            ]
+        );
+    }
+
+    #[test]
+    fn kimi_extracts_successful_edits_from_all_agents() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("agents/main")).unwrap();
+        fs::write(
+            directory.path().join("agents/main/wire.jsonl"),
+            concat!(
+                r#"{"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"ok","name":"Write","args":{"path":"one.txt"}}}"#,
+                "\n",
+                r#"{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"ok","result":{"output":"done"}}}"#,
+                "\n",
+                r#"{"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"bad","name":"Edit","args":{"path":"bad.txt"}}}"#,
+                "\n",
+                r#"{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"bad","result":{"isError":true}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            kimi_edited_paths(directory.path()).unwrap(),
+            [PathBuf::from("one.txt")]
+        );
+    }
+
+    #[test]
+    fn resolve_bundle_requires_an_exact_root_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        let sibling = directory.path().join("sibling");
+        initialize_repository(&app, "app");
+        initialize_repository(&sibling, "sibling");
+        let targets = SessionEditTargets {
+            git_roots: vec![
+                fs::canonicalize(&app).unwrap(),
+                fs::canonicalize(&sibling).unwrap(),
+            ],
+            non_git_dirs: Vec::new(),
+        };
+        let config = HelConfig::default();
+        let BundleResolution::Synthesized { bundle, .. } =
+            resolve_bundle(&config, &app, &targets, None).unwrap()
+        else {
+            panic!("expected synthesized bundle");
+        };
+        assert_eq!(bundle.repositories.len(), 2);
+        assert_eq!(bundle.primary_repo, "app");
+
+        let mut config = HelConfig::default();
+        config.bundles.insert("multi".into(), bundle);
+        assert_eq!(
+            resolve_bundle(&config, &app, &targets, None).unwrap(),
+            BundleResolution::Existing("multi".into())
+        );
+        let app_only = SessionEditTargets {
+            git_roots: vec![fs::canonicalize(&app).unwrap()],
+            non_git_dirs: Vec::new(),
+        };
+        assert!(resolve_bundle(&config, &app, &app_only, Some("multi")).is_err());
+    }
+
+    #[test]
+    fn edit_targets_filter_profile_state_and_report_non_git_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        let profile = directory.path().join("profile");
+        let outside = directory.path().join("notes");
+        initialize_repository(&app, "app");
+        fs::create_dir_all(&profile).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let transcript = ClaudeTranscript {
+            cwd: app.clone(),
+            edited_paths: vec![profile.join("memory.md"), outside.join("draft.md")],
+            events: Vec::new(),
+        };
+
+        let targets = session_edit_targets(&transcript, &profile).unwrap();
+        assert_eq!(targets.git_roots, [fs::canonicalize(app).unwrap()]);
+        assert_eq!(targets.non_git_dirs, [outside]);
+    }
+
+    #[test]
+    fn import_safety_reports_dirty_roots_and_non_git_omissions() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        initialize_repository(&app, "app");
+        fs::write(app.join("README.md"), "dirty").unwrap();
+        let omitted = directory.path().join("notes");
+        let issues = import_safety_issues(&SessionEditTargets {
+            git_roots: vec![app.clone()],
+            non_git_dirs: vec![omitted.clone()],
+        })
+        .unwrap();
+
+        assert_eq!(issues.dirty_git_roots.len(), 1);
+        assert_eq!(issues.dirty_git_roots[0].0, app);
+        assert_eq!(issues.omitted_non_git_dirs, [omitted]);
+    }
+
+    #[test]
     fn projects_jsonl_projects_user_and_assistant_text_in_source_order() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("session.jsonl");
@@ -2334,7 +2877,9 @@ mod tests {
             ],
         };
 
-        let snapshots = collect_local_repositories(&bundle, &app).unwrap();
+        let snapshots =
+            collect_local_repositories(&bundle, &app, &[app.clone(), workspace.join("worker")])
+                .unwrap();
         let ids = snapshots
             .iter()
             .map(|snapshot| snapshot.metadata.id.as_str())

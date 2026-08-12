@@ -17,9 +17,10 @@ use hel::hel_import::{
     BundleResolution, ClaudeImportRequest, ClaudeSessionSelection, CodexImportRequest,
     CodexSessionSelection, KimiImportRequest, KimiSessionSelection, claude_config_home,
     codex_config_home, import_claude_session, import_codex_session, import_kimi_session,
-    kimi_config_home, locate_claude_session, locate_codex_session, locate_kimi_session,
-    read_claude_transcript, read_codex_transcript, read_kimi_transcript, resolve_bundle,
-    scan_claude_sessions, scan_codex_sessions, scan_kimi_sessions,
+    import_safety_issues, kimi_config_home, locate_claude_session, locate_codex_session,
+    locate_kimi_session, read_claude_transcript, read_codex_transcript, read_kimi_transcript,
+    resolve_bundle, scan_claude_sessions, scan_codex_sessions, scan_kimi_sessions,
+    session_edit_targets,
 };
 use hel::hel_quota::{ProfileQuota, QuotaManager, QuotaRefreshRequest};
 use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapshot};
@@ -119,9 +120,12 @@ struct CodexImportArgs {
     /// Title displayed in Hel's dashboard.
     #[arg(long)]
     title: Option<String>,
-    /// Proceed after acknowledging dirty configured local repositories.
-    #[arg(long)]
+    /// Proceed after acknowledging dirty detected Git roots.
+    #[arg(long = "allow-dirty", visible_alias = "allow-dirty-local")]
     allow_dirty_local: bool,
+    /// Proceed after acknowledging edited non-Git directories will be omitted.
+    #[arg(long)]
+    allow_omitted_non_git: bool,
 }
 
 #[derive(Debug, Args)]
@@ -143,9 +147,12 @@ struct KimiImportArgs {
     /// Title displayed in Hel's dashboard.
     #[arg(long)]
     title: Option<String>,
-    /// Proceed after acknowledging dirty configured local repositories.
-    #[arg(long)]
+    /// Proceed after acknowledging dirty detected Git roots.
+    #[arg(long = "allow-dirty", visible_alias = "allow-dirty-local")]
     allow_dirty_local: bool,
+    /// Proceed after acknowledging edited non-Git directories will be omitted.
+    #[arg(long)]
+    allow_omitted_non_git: bool,
 }
 
 #[derive(Debug, Args)]
@@ -167,9 +174,12 @@ struct ClaudeImportArgs {
     /// Title displayed in Hel's dashboard.
     #[arg(long)]
     title: Option<String>,
-    /// Proceed after acknowledging dirty configured local repositories.
-    #[arg(long)]
+    /// Proceed after acknowledging dirty detected Git roots.
+    #[arg(long = "allow-dirty", visible_alias = "allow-dirty-local")]
     allow_dirty_local: bool,
+    /// Proceed after acknowledging edited non-Git directories will be omitted.
+    #[arg(long)]
+    allow_omitted_non_git: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -426,30 +436,10 @@ fn import_claude(args: ClaudeImportArgs) -> Result<()> {
     let mut config = HelConfig::load()?;
     let mut state = HelState::load()?;
     state.validate_against_config(&config)?;
-    let resolution = resolve_bundle(&config, &transcript.cwd, args.bundle.as_deref())?;
-    let bundle_id = match resolution {
-        BundleResolution::Existing(bundle_id) => bundle_id,
-        BundleResolution::Synthesized { id, bundle } => {
-            let repository = bundle.primary().expect("synthesized bundle has a primary");
-            if !confirm_synthesized_bundle(
-                &id,
-                &repository.source_label(),
-                &repository.destination,
-            )? {
-                println!("Import cancelled; no Hel files were changed.");
-                return Ok(());
-            }
-            config.bundles.insert(id.clone(), bundle);
-            id
-        }
-    };
-    if !confirm_dirty_local_bundle(
-        config
-            .bundles
-            .get(&bundle_id)
-            .expect("resolved bundle exists"),
-        args.allow_dirty_local,
-    )? {
+    let targets = session_edit_targets(&transcript, &claude_home)?;
+    let bundle_id =
+        resolve_import_bundle(&mut config, &transcript, &targets, args.bundle.as_deref())?;
+    if !confirm_import_safety(&targets, args.allow_dirty_local, args.allow_omitted_non_git)? {
         println!("Import cancelled; no Hel files were changed.");
         return Ok(());
     }
@@ -499,18 +489,10 @@ fn import_codex(args: CodexImportArgs) -> Result<()> {
     let mut config = HelConfig::load()?;
     let mut state = HelState::load()?;
     state.validate_against_config(&config)?;
-    let Some(bundle_id) =
-        resolve_import_bundle(&mut config, &transcript.cwd, args.bundle.as_deref())?
-    else {
-        return Ok(());
-    };
-    if !confirm_dirty_local_bundle(
-        config
-            .bundles
-            .get(&bundle_id)
-            .expect("resolved bundle exists"),
-        args.allow_dirty_local,
-    )? {
+    let targets = session_edit_targets(&transcript, &codex_home)?;
+    let bundle_id =
+        resolve_import_bundle(&mut config, &transcript, &targets, args.bundle.as_deref())?;
+    if !confirm_import_safety(&targets, args.allow_dirty_local, args.allow_omitted_non_git)? {
         println!("Import cancelled; no Hel files were changed.");
         return Ok(());
     }
@@ -557,18 +539,10 @@ fn import_kimi(args: KimiImportArgs) -> Result<()> {
     let mut config = HelConfig::load()?;
     let mut state = HelState::load()?;
     state.validate_against_config(&config)?;
-    let Some(bundle_id) =
-        resolve_import_bundle(&mut config, &transcript.cwd, args.bundle.as_deref())?
-    else {
-        return Ok(());
-    };
-    if !confirm_dirty_local_bundle(
-        config
-            .bundles
-            .get(&bundle_id)
-            .expect("resolved bundle exists"),
-        args.allow_dirty_local,
-    )? {
+    let targets = session_edit_targets(&transcript, &kimi_home)?;
+    let bundle_id =
+        resolve_import_bundle(&mut config, &transcript, &targets, args.bundle.as_deref())?;
+    if !confirm_import_safety(&targets, args.allow_dirty_local, args.allow_omitted_non_git)? {
         println!("Import cancelled; no Hel files were changed.");
         return Ok(());
     }
@@ -599,68 +573,50 @@ fn import_kimi(args: KimiImportArgs) -> Result<()> {
 
 fn resolve_import_bundle(
     config: &mut HelConfig,
-    cwd: &std::path::Path,
+    transcript: &hel::hel_import::ClaudeTranscript,
+    targets: &hel::hel_import::SessionEditTargets,
     requested_bundle: Option<&str>,
-) -> Result<Option<String>> {
-    match resolve_bundle(config, cwd, requested_bundle)? {
-        BundleResolution::Existing(bundle_id) => Ok(Some(bundle_id)),
+) -> Result<String> {
+    match resolve_bundle(config, &transcript.cwd, targets, requested_bundle)? {
+        BundleResolution::Existing(bundle_id) => Ok(bundle_id),
         BundleResolution::Synthesized { id, bundle } => {
-            let repository = bundle.primary().expect("synthesized bundle has a primary");
-            if !confirm_synthesized_bundle(
-                &id,
-                &repository.source_label(),
-                &repository.destination,
-            )? {
-                println!("Import cancelled; no Hel files were changed.");
-                return Ok(None);
-            }
             config.bundles.insert(id.clone(), bundle);
-            Ok(Some(id))
+            Ok(id)
         }
     }
 }
 
-fn confirm_synthesized_bundle(
-    bundle_id: &str,
-    source: &str,
-    destination: &std::path::Path,
+fn confirm_import_safety(
+    targets: &hel::hel_import::SessionEditTargets,
+    allow_dirty: bool,
+    allow_omitted_non_git: bool,
 ) -> Result<bool> {
-    print!(
-        "No configured bundle matches this repository. Create bundle {bundle_id:?} for {source} at {}? [y/N]: ",
-        destination.display()
-    );
-    use std::io::Write as _;
-    io::stdout().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
-
-fn confirm_dirty_local_bundle(
-    bundle: &hel::hel_config::ProjectBundle,
-    allowed: bool,
-) -> Result<bool> {
-    let dirty = hel::hel_local_git::dirty_local_repositories(bundle)?;
-    if dirty.is_empty() || allowed {
+    let issues = import_safety_issues(targets)?;
+    let needs_dirty = !issues.dirty_git_roots.is_empty() && !allow_dirty;
+    let needs_omitted = !issues.omitted_non_git_dirs.is_empty() && !allow_omitted_non_git;
+    if !needs_dirty && !needs_omitted {
         return Ok(true);
     }
-    eprintln!("Configured local repositories are not clean:");
-    for repository in &dirty {
-        eprintln!(
-            "  {} ({}) — {}",
-            repository.id,
-            repository.path.display(),
-            repository.summary
-        );
+    if needs_dirty {
+        eprintln!("These Git roots are dirty; Hel will archive their complete current state:");
+        for (root, summary) in &issues.dirty_git_roots {
+            eprintln!("  {} — {summary}", root.display());
+        }
     }
-    eprintln!(
-        "The dirty state will be checkpointed, but pushes to a checked-out local branch will be rejected until its worktree is clean."
-    );
+    if needs_omitted {
+        eprintln!("These edited directories are outside Git and cannot be included:");
+        for directory in &issues.omitted_non_git_dirs {
+            eprintln!("  {}", directory.display());
+        }
+    }
     if !io::stdin().is_terminal() {
-        bail!("pass --allow-dirty-local to acknowledge dirty local repositories");
+        let flags = match (needs_dirty, needs_omitted) {
+            (true, true) => "--allow-dirty and --allow-omitted-non-git",
+            (true, false) => "--allow-dirty",
+            (false, true) => "--allow-omitted-non-git",
+            (false, false) => unreachable!(),
+        };
+        bail!("pass {flags} to acknowledge import safety warnings");
     }
     print!("Proceed? [y/N]: ");
     use std::io::Write as _;
@@ -1306,9 +1262,8 @@ struct PendingDashboardImport {
 }
 
 struct ImportBundlePrompt {
-    bundle_id: String,
-    github: String,
-    destination: String,
+    dirty_git_roots: Vec<String>,
+    omitted_non_git_dirs: Vec<String>,
 }
 
 struct DashboardImportSuccess {
@@ -1413,9 +1368,8 @@ async fn run_dashboard() -> Result<()> {
                     Ok(DashboardImportTaskResult::NeedsBundle(prompt)) => {
                         pending_import = Some(pending);
                         dashboard.show_import_bundle_confirmation(
-                            prompt.bundle_id,
-                            prompt.github,
-                            prompt.destination,
+                            prompt.dirty_git_roots,
+                            prompt.omitted_non_git_dirs,
                         );
                     }
                     Ok(DashboardImportTaskResult::Imported(mut imported)) => {
@@ -2033,7 +1987,7 @@ fn display_home_relative(path: &std::path::Path) -> String {
 fn spawn_dashboard_import(
     controller: &Controller,
     pending: PendingDashboardImport,
-    allow_synthesized_bundle: bool,
+    safety_accepted: bool,
     updates: tokio::sync::mpsc::Sender<DashboardImportUpdate>,
 ) {
     let worker_controller = Controller {
@@ -2046,7 +2000,7 @@ fn spawn_dashboard_import(
             &pending.profile_id,
             &pending.native_session_id,
             &pending.display_title,
-            allow_synthesized_bundle,
+            safety_accepted,
             |step, total, message| {
                 let _ = updates.blocking_send(DashboardImportUpdate::Progress {
                     step,
@@ -2066,26 +2020,38 @@ enum BackgroundBundleResolution {
 
 fn resolve_background_import_bundle(
     config: &mut HelConfig,
-    cwd: &std::path::Path,
-    allow_synthesized_bundle: bool,
+    transcript: &hel::hel_import::ClaudeTranscript,
+    profile_home: &std::path::Path,
+    safety_accepted: bool,
 ) -> Result<BackgroundBundleResolution> {
-    match resolve_bundle(config, cwd, None)? {
-        BundleResolution::Existing(bundle_id) => Ok(BackgroundBundleResolution::Ready(bundle_id)),
-        BundleResolution::Synthesized { id, bundle } if allow_synthesized_bundle => {
-            config.bundles.insert(id.clone(), bundle);
-            Ok(BackgroundBundleResolution::Ready(id))
-        }
+    let targets = session_edit_targets(transcript, profile_home)?;
+    let bundle_id = match resolve_bundle(config, &transcript.cwd, &targets, None)? {
+        BundleResolution::Existing(bundle_id) => bundle_id,
         BundleResolution::Synthesized { id, bundle } => {
-            let repository = bundle.primary().expect("synthesized bundle has a primary");
-            Ok(BackgroundBundleResolution::NeedsConfirmation(
-                ImportBundlePrompt {
-                    bundle_id: id,
-                    github: repository.source_label(),
-                    destination: repository.destination.display().to_string(),
-                },
-            ))
+            config.bundles.insert(id.clone(), bundle);
+            id
         }
+    };
+    let issues = import_safety_issues(&targets)?;
+    if !safety_accepted
+        && (!issues.dirty_git_roots.is_empty() || !issues.omitted_non_git_dirs.is_empty())
+    {
+        return Ok(BackgroundBundleResolution::NeedsConfirmation(
+            ImportBundlePrompt {
+                dirty_git_roots: issues
+                    .dirty_git_roots
+                    .into_iter()
+                    .map(|(root, summary)| format!("{} — {summary}", root.display()))
+                    .collect(),
+                omitted_non_git_dirs: issues
+                    .omitted_non_git_dirs
+                    .into_iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+            },
+        ));
     }
+    Ok(BackgroundBundleResolution::Ready(bundle_id))
 }
 
 fn import_session_from_profile(
@@ -2093,7 +2059,7 @@ fn import_session_from_profile(
     profile_id: &str,
     native_session_id: &str,
     display_title: &str,
-    allow_synthesized_bundle: bool,
+    safety_accepted: bool,
     mut report: impl FnMut(usize, Option<usize>, &str),
 ) -> Result<DashboardImportTaskResult> {
     report(1, None, "Locating native session…");
@@ -2113,8 +2079,9 @@ fn import_session_from_profile(
             report(2, Some(4), "Native session parsed.");
             let bundle_id = match resolve_background_import_bundle(
                 &mut controller.config,
-                &transcript.cwd,
-                allow_synthesized_bundle,
+                &transcript,
+                &profile.home,
+                safety_accepted,
             )? {
                 BackgroundBundleResolution::Ready(bundle_id) => bundle_id,
                 BackgroundBundleResolution::NeedsConfirmation(prompt) => {
@@ -2153,8 +2120,9 @@ fn import_session_from_profile(
             report(2, Some(4), "Native session parsed.");
             let bundle_id = match resolve_background_import_bundle(
                 &mut controller.config,
-                &transcript.cwd,
-                allow_synthesized_bundle,
+                &transcript,
+                &profile.home,
+                safety_accepted,
             )? {
                 BackgroundBundleResolution::Ready(bundle_id) => bundle_id,
                 BackgroundBundleResolution::NeedsConfirmation(prompt) => {
@@ -2193,8 +2161,9 @@ fn import_session_from_profile(
             report(2, Some(4), "Native session parsed.");
             let bundle_id = match resolve_background_import_bundle(
                 &mut controller.config,
-                &transcript.cwd,
-                allow_synthesized_bundle,
+                &transcript,
+                &profile.home,
+                safety_accepted,
             )? {
                 BackgroundBundleResolution::Ready(bundle_id) => bundle_id,
                 BackgroundBundleResolution::NeedsConfirmation(prompt) => {

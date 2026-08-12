@@ -209,9 +209,8 @@ struct ImportProgress {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ImportBundleConfirmation {
-    bundle_id: String,
-    github: String,
-    destination: String,
+    dirty_git_roots: Vec<String>,
+    omitted_non_git_dirs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,14 +520,12 @@ impl DashboardState {
 
     pub fn show_import_bundle_confirmation(
         &mut self,
-        bundle_id: String,
-        github: String,
-        destination: String,
+        dirty_git_roots: Vec<String>,
+        omitted_non_git_dirs: Vec<String>,
     ) {
         self.mode = Mode::ConfirmImportBundle(ImportBundleConfirmation {
-            bundle_id,
-            github,
-            destination,
+            dirty_git_roots,
+            omitted_non_git_dirs,
         });
     }
 
@@ -1593,24 +1590,47 @@ fn render_import_bundle_confirmation(
     area: Rect,
     confirmation: &ImportBundleConfirmation,
 ) {
-    let popup = centered_rect(72, 10, area);
+    let height =
+        (confirmation.dirty_git_roots.len() + confirmation.omitted_non_git_dirs.len() + 10) as u16;
+    let popup = centered_rect(76, height.clamp(12, 24), area);
     frame.render_widget(Clear, popup);
+    let mut lines = Vec::new();
+    if !confirmation.dirty_git_roots.is_empty() {
+        lines.push(Line::raw(
+            "These Git roots are dirty; Hel will archive their complete current state:",
+        ));
+        lines.extend(
+            confirmation
+                .dirty_git_roots
+                .iter()
+                .map(|root| Line::styled(root.clone(), Style::default().fg(Color::Yellow))),
+        );
+    }
+    if !confirmation.omitted_non_git_dirs.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::raw(
+            "These edited directories are outside Git and cannot be included:",
+        ));
+        lines.extend(
+            confirmation.omitted_non_git_dirs.iter().map(|directory| {
+                Line::styled(directory.clone(), Style::default().fg(Color::Yellow))
+            }),
+        );
+    }
+    lines.extend([
+        Line::raw(""),
+        Line::raw("Press y/Enter to continue, or n/Esc to cancel."),
+    ]);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::raw("No configured bundle matches this repository."),
-            Line::raw(""),
-            Line::raw(format!("Bundle: {}", confirmation.bundle_id)),
-            Line::raw(format!("Source: {}", confirmation.github)),
-            Line::raw(format!("Destination: {}", confirmation.destination)),
-            Line::raw(""),
-            Line::raw("Press y/Enter to create it, or n/Esc to cancel."),
-        ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Create bundle for imported session? "),
-        )
-        .wrap(Wrap { trim: true }),
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Import safety warning "),
+            )
+            .wrap(Wrap { trim: true }),
         popup,
     );
 }
