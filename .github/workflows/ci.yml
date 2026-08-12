@@ -5,6 +5,10 @@ on:
     branches: [ 'master', 'ci/**' ]
   pull_request: {}
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   licenses:
     name: Dependency licenses
