@@ -219,6 +219,15 @@ caches. SSH and GPG keys, GitHub CLI and package-registry credentials, cloud
 configuration, shell dotfiles, editor configuration, and toolchain state are
 not transferred automatically.
 
+The dashboard's Deployment Capacity pane groups configured local and SSH
+targets by host and shows current CPU and RAM utilization. Multiple target
+definitions may share a host; their IDs appear together in that host's row.
+SSH aliases remain separate because Hel groups by the exact configured host
+string. AWS EC2 targets remain one row per template and show the total logical
+cores, RAM, and workspace-filesystem capacity of currently allocated
+instances, or `on demand` when none are running. Capacity refreshes every 30
+seconds; a failed refresh leaves the previous sample visible as stale.
+
 The first-run dialog intentionally creates one local target and, when started
 inside a GitHub checkout, one-repository bundle. Advanced configurations remain
 TOML-first: edit `config.toml` directly to add profiles, virtual monorepos, SSH

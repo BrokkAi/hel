@@ -21,7 +21,8 @@ use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use crate::hel_quota::ProfileQuota;
 use crate::hel_state::{HelState, SessionRecord, SessionState};
 use crate::hel_targets::{
-    AdditionalMount, SessionResourceUsage, default_mount_destination, path_completion,
+    AdditionalMount, DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage,
+    SessionResourceUsage, default_mount_destination, path_completion,
 };
 use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase};
 
@@ -106,6 +107,7 @@ pub struct ImportProfileOption {
 enum Focus {
     Active,
     Archived,
+    Capacity,
     Quotas,
 }
 
@@ -260,6 +262,15 @@ struct SessionDetail {
     resource_usage: Option<SessionResourceUsage>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapacityDetail {
+    target: DeploymentCapacityTarget,
+    usage: Option<DeploymentCapacityUsage>,
+    sampled_at_epoch_seconds: Option<u64>,
+    on_demand: bool,
+    failed: bool,
+}
+
 /// Stateful, renderable projection of controller configuration and state.
 pub struct DashboardState {
     config: HelConfig,
@@ -267,7 +278,9 @@ pub struct DashboardState {
     quotas: BTreeMap<String, ProfileQuota>,
     quota_refreshing: BTreeSet<String>,
     session_details: BTreeMap<String, SessionDetail>,
+    capacity_details: BTreeMap<String, CapacityDetail>,
     session_index: usize,
+    capacity_index: usize,
     quota_index: usize,
     focus: Focus,
     mode: Mode,
@@ -282,7 +295,9 @@ impl DashboardState {
             quotas,
             quota_refreshing: BTreeSet::new(),
             session_details: BTreeMap::new(),
+            capacity_details: BTreeMap::new(),
             session_index: 0,
+            capacity_index: 0,
             quota_index: 0,
             focus: Focus::Active,
             mode: Mode::Dashboard,
@@ -426,6 +441,53 @@ impl DashboardState {
             .entry(session_id.to_string())
             .or_default()
             .resource_usage = Some(usage);
+    }
+
+    pub fn set_deployment_capacity_targets(&mut self, targets: Vec<DeploymentCapacityTarget>) {
+        let mut previous = std::mem::take(&mut self.capacity_details);
+        self.capacity_details = targets
+            .into_iter()
+            .map(|target| {
+                let id = target.id.clone();
+                let detail = previous.remove(&id).map_or(
+                    CapacityDetail {
+                        target: target.clone(),
+                        usage: None,
+                        sampled_at_epoch_seconds: None,
+                        on_demand: false,
+                        failed: false,
+                    },
+                    |mut detail| {
+                        detail.target = target;
+                        detail
+                    },
+                );
+                (id, detail)
+            })
+            .collect();
+        self.capacity_index = self
+            .capacity_index
+            .min(self.capacity_details.len().saturating_sub(1));
+    }
+
+    pub fn apply_deployment_capacity(
+        &mut self,
+        target_id: &str,
+        result: std::result::Result<Option<DeploymentCapacityUsage>, String>,
+        sampled_at_epoch_seconds: u64,
+    ) {
+        let Some(detail) = self.capacity_details.get_mut(target_id) else {
+            return;
+        };
+        match result {
+            Ok(usage) => {
+                detail.on_demand = usage.is_none();
+                detail.usage = usage;
+                detail.sampled_at_epoch_seconds = Some(sampled_at_epoch_seconds);
+                detail.failed = false;
+            }
+            Err(_) => detail.failed = true,
+        }
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
@@ -1317,7 +1379,7 @@ impl DashboardState {
         match self.focus {
             Focus::Active if session.state.is_active() => Some(session),
             Focus::Archived if !session.state.is_active() => Some(session),
-            Focus::Active | Focus::Archived | Focus::Quotas => None,
+            Focus::Active | Focus::Archived | Focus::Capacity | Focus::Quotas => None,
         }
     }
 
@@ -1370,6 +1432,7 @@ impl DashboardState {
         match self.focus {
             Focus::Active => active.len(),
             Focus::Archived => archived.len(),
+            Focus::Capacity => self.capacity_details.len(),
             Focus::Quotas => self.config.profiles.len(),
         }
     }
@@ -1381,6 +1444,7 @@ impl DashboardState {
         match self.focus {
             Focus::Active => self.session_index = index,
             Focus::Archived => self.session_index = active_len + index,
+            Focus::Capacity => self.capacity_index = index,
             Focus::Quotas => self.quota_index = index,
         }
     }
@@ -1398,6 +1462,7 @@ impl DashboardState {
                 move_index(&mut index, len, delta);
                 self.session_index = active_len + index;
             }
+            Focus::Capacity => move_index(&mut self.capacity_index, len, delta),
             Focus::Quotas => move_index(&mut self.quota_index, len, delta),
         }
     }
@@ -1414,6 +1479,7 @@ impl DashboardState {
         let current = match self.focus {
             Focus::Active => self.session_index,
             Focus::Archived => self.session_index.saturating_sub(active_len),
+            Focus::Capacity => self.capacity_index,
             Focus::Quotas => self.quota_index,
         };
         let next = if delta.is_negative() {
@@ -1428,8 +1494,9 @@ impl DashboardState {
 
     fn cycle_focus(&mut self, reverse: bool) {
         self.focus = match (self.focus, reverse) {
-            (Focus::Active, false) | (Focus::Quotas, true) => Focus::Archived,
-            (Focus::Archived, false) | (Focus::Active, true) => Focus::Quotas,
+            (Focus::Active, false) | (Focus::Capacity, true) => Focus::Archived,
+            (Focus::Archived, false) | (Focus::Quotas, true) => Focus::Capacity,
+            (Focus::Capacity, false) | (Focus::Active, true) => Focus::Quotas,
             (Focus::Quotas, false) | (Focus::Archived, true) => Focus::Active,
         };
         let active_len = partition_sessions(self.state.sessions.values(), &self.session_details)
@@ -1440,6 +1507,7 @@ impl DashboardState {
                 self.session_index = self.session_index.min(active_len.saturating_sub(1));
             }
             Focus::Archived => self.session_index = self.session_index.max(active_len),
+            Focus::Capacity => {}
             Focus::Quotas => {}
         }
     }
@@ -1461,6 +1529,9 @@ impl DashboardState {
                         .saturating_sub(active.len())
                         .min(archived.len().saturating_sub(1))
             }
+            Focus::Capacity => self
+                .session_index
+                .min(self.state.sessions.len().saturating_sub(1)),
             Focus::Quotas => self
                 .session_index
                 .min(self.state.sessions.len().saturating_sub(1)),
@@ -1468,6 +1539,9 @@ impl DashboardState {
         self.quota_index = self
             .quota_index
             .min(self.config.profiles.len().saturating_sub(1));
+        self.capacity_index = self
+            .capacity_index
+            .min(self.capacity_details.len().saturating_sub(1));
     }
 }
 
@@ -1605,6 +1679,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
+            Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Length(2),
         ])
@@ -1628,8 +1703,9 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     } else {
         render_sessions(frame, layout[1], dashboard);
     }
-    render_quotas(frame, layout[2], dashboard);
-    render_footer(frame, layout[3], dashboard);
+    render_capacity(frame, layout[2], dashboard);
+    render_quotas(frame, layout[3], dashboard);
+    render_footer(frame, layout[4], dashboard);
 
     match &dashboard.mode {
         Mode::New(wizard) => render_new_wizard(frame, area, dashboard, wizard),
@@ -2085,10 +2161,10 @@ fn session_column_constraints() -> [Constraint; 6] {
     [
         Constraint::Length(10),
         Constraint::Length(14),
-        Constraint::Length(20),
+        Constraint::Length(18),
         Constraint::Length(14),
-        Constraint::Length(28),
-        Constraint::Min(23),
+        Constraint::Length(34),
+        Constraint::Min(18),
     ]
 }
 
@@ -2172,7 +2248,11 @@ fn resource_summary(usage: &SessionResourceUsage) -> String {
         ),
         _ => format!("M {}", format_resource_bytes(usage.memory_current_bytes)),
     };
-    let mut resources = vec![memory];
+    let mut resources = Vec::new();
+    if let Some(cpu) = usage.cpu_percent {
+        resources.push(format!("C {cpu}%"));
+    }
+    resources.push(memory);
     if let Some(swap) = usage.swap_current_bytes.filter(|swap| *swap > 0) {
         resources.push(format!("S {}", format_resource_bytes(swap)));
     }
@@ -2298,6 +2378,88 @@ fn checkpoint_time_display(checkpointed_at: &str) -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
+fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let rows = dashboard.capacity_details.values().map(|detail| {
+        let capacity = match (&detail.target.kind, &detail.usage) {
+            (DeploymentCapacityKind::Host, Some(usage)) => {
+                let memory_percent = if usage.memory_total_bytes == 0 {
+                    0
+                } else {
+                    (u128::from(usage.memory_used_bytes) * 100
+                        / u128::from(usage.memory_total_bytes))
+                    .min(100)
+                };
+                format!(
+                    "{}% CPU · {memory_percent}% RAM",
+                    usage.cpu_percent.unwrap_or(0)
+                )
+            }
+            (DeploymentCapacityKind::AwsFleet, Some(usage)) => format!(
+                "{} cores · {} RAM · {} disk",
+                usage.logical_cores,
+                format_resource_bytes(usage.memory_total_bytes),
+                format_resource_bytes(usage.disk_total_bytes.unwrap_or(0))
+            ),
+            (DeploymentCapacityKind::AwsFleet, None) if detail.on_demand => "on demand".into(),
+            _ => "unavailable".into(),
+        };
+        let status = match (detail.failed, detail.sampled_at_epoch_seconds) {
+            (true, Some(sampled)) => format!("stale {}", refresh_age(now, sampled)),
+            (true, None) => "unavailable".into(),
+            (false, Some(sampled)) => refresh_age(now, sampled),
+            (false, None) => "sampling…".into(),
+        };
+        Row::new([
+            detail.target.host.clone(),
+            detail.target.target_ids.join(", "),
+            capacity,
+            status,
+        ])
+    });
+    let focused = dashboard.focus == Focus::Capacity;
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(18),
+            Constraint::Percentage(30),
+            Constraint::Percentage(36),
+            Constraint::Percentage(16),
+        ],
+    )
+    .header(
+        Row::new(["Host / fleet", "Targets", "Capacity", "Sample"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .row_highlight_style(if focused {
+        Style::default().bg(Color::DarkGray).fg(Color::White)
+    } else {
+        Style::default()
+    })
+    .highlight_symbol(if focused { "› " } else { "  " })
+    .highlight_spacing(HighlightSpacing::Always)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(focus_border(focused))
+            .title(" Deployment Capacity "),
+    );
+    let mut state = TableState::default().with_selected(
+        (!dashboard.capacity_details.is_empty()).then_some(dashboard.capacity_index),
+    );
+    frame.render_stateful_widget(table, area, &mut state);
+    render_session_scrollbar(
+        frame,
+        area,
+        dashboard.capacity_details.len(),
+        state.offset(),
+        usize::from(area.height.saturating_sub(SESSION_TABLE_CHROME_HEIGHT)),
+    );
+}
+
 fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2382,6 +2544,7 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
         Focus::Archived => {
             "n new · i import · r rename · x delete permanently · u quota · Tab pane · q detach"
         }
+        Focus::Capacity => "n new · i import · u quota · Tab pane · q detach",
         Focus::Quotas => "n new · i import · r refresh · u quota · Tab pane · q detach",
     };
     let text = dashboard.notice.as_deref().unwrap_or(actions);
@@ -2969,6 +3132,18 @@ mod tests {
         )
     }
 
+    fn test_capacity_target() -> DeploymentCapacityTarget {
+        DeploymentCapacityTarget {
+            id: "local".into(),
+            host: "local".into(),
+            target_ids: vec!["podman".into()],
+            kind: DeploymentCapacityKind::Host,
+            local: true,
+            probes: Vec::new(),
+            probe_error: None,
+        }
+    }
+
     fn adapter_text_event(seq: u64, kind: &str, text: &str) -> SequencedEvent {
         SequencedEvent {
             seq,
@@ -3303,6 +3478,7 @@ mod tests {
     #[test]
     fn resume_can_convert_to_another_harness() {
         let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Up));
         dashboard.handle_key(key(KeyCode::Enter));
@@ -3362,7 +3538,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_navigation_keeps_three_distinct_panes() {
+    fn dashboard_navigation_keeps_four_distinct_panes() {
         let mut active = archived_session();
         active.id = "session-0".into();
         active.state = SessionState::Running;
@@ -3379,6 +3555,7 @@ mod tests {
             },
             BTreeMap::new(),
         );
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
 
         assert_eq!(dashboard.focus, Focus::Active);
         assert_eq!(dashboard.selected_session().unwrap().id, "session-0");
@@ -3391,6 +3568,9 @@ mod tests {
         dashboard.handle_key(key(KeyCode::Down));
         assert_eq!(dashboard.selected_session().unwrap().id, "session-1");
 
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Capacity);
+        assert!(dashboard.selected_session().is_none());
         dashboard.handle_key(key(KeyCode::Tab));
         assert_eq!(dashboard.focus, Focus::Quotas);
         assert!(dashboard.selected_session().is_none());
@@ -3400,7 +3580,46 @@ mod tests {
         dashboard.handle_key(key(KeyCode::BackTab));
         assert_eq!(dashboard.focus, Focus::Quotas);
         dashboard.handle_key(key(KeyCode::BackTab));
+        assert_eq!(dashboard.focus, Focus::Capacity);
+        dashboard.handle_key(key(KeyCode::BackTab));
         assert_eq!(dashboard.focus, Focus::Archived);
+    }
+
+    #[test]
+    fn capacity_pane_renders_grouped_host_load_and_keeps_stale_sample() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        let mut target = test_capacity_target();
+        target.target_ids = vec!["podman".into(), "mac-container".into()];
+        dashboard.set_deployment_capacity_targets(vec![target]);
+        dashboard.apply_deployment_capacity(
+            "local",
+            Ok(Some(DeploymentCapacityUsage {
+                cpu_percent: Some(37),
+                memory_used_bytes: 3,
+                memory_total_bytes: 4,
+                logical_cores: 8,
+                disk_total_bytes: None,
+            })),
+            1,
+        );
+        dashboard.apply_deployment_capacity("local", Err("probe failed".into()), 2);
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("podman, mac-container"));
+        assert!(rendered.contains("37% CPU · 75% RAM"));
+        assert!(rendered.contains("stale"));
     }
 
     #[test]
@@ -3439,6 +3658,7 @@ mod tests {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
         assert_eq!(dashboard.focus, Focus::Active);
 
         let mut state = dashboard.state.clone();
@@ -3446,6 +3666,8 @@ mod tests {
         dashboard.set_state(state);
         assert_eq!(dashboard.focus, Focus::Archived);
 
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(dashboard.focus, Focus::Capacity);
         dashboard.handle_key(key(KeyCode::Tab));
         assert_eq!(dashboard.focus, Focus::Quotas);
         dashboard.handle_key(key(KeyCode::Tab));
@@ -3818,6 +4040,7 @@ mod tests {
         dashboard.apply_resource_usage(
             "session-1",
             SessionResourceUsage {
+                cpu_percent: Some(37),
                 memory_current_bytes: 1_073_741_824,
                 memory_limit_bytes: Some(2_147_483_648),
                 swap_current_bytes: Some(4_096),
@@ -3861,7 +4084,7 @@ mod tests {
         assert!(rendered.contains("Target"));
         assert!(rendered.contains("Checkpoint"));
         assert!(rendered.contains("Resources"));
-        assert!(rendered.contains("M 50% · S 4.0K · D 8.0K"));
+        assert!(rendered.contains("C 37% · M 50% · S 4.0K · D 8.0K"));
         assert!(rendered.contains("Session name"));
         assert!(rendered.contains("ACP pretty name"));
         assert!(!rendered.contains("native-1"));
@@ -4164,7 +4387,8 @@ mod tests {
     #[test]
     fn focused_panes_use_double_borders_without_focus_title_text() {
         let mut dashboard = dashboard_with_session(archived_session());
-        let backend = TestBackend::new(120, 24);
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
@@ -4179,6 +4403,19 @@ mod tests {
         assert!(rendered.contains("╔ Archived"));
         assert!(rendered.contains("┌ Active"));
         assert!(!rendered.contains("[focused]"));
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("╔ Deployment Capacity"));
 
         dashboard.handle_key(key(KeyCode::Tab));
         terminal
@@ -4213,10 +4450,16 @@ mod tests {
             },
             BTreeMap::new(),
         );
-        let backend = TestBackend::new(120, 28);
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
-        for expected_focus in [Focus::Active, Focus::Archived, Focus::Quotas] {
+        for expected_focus in [
+            Focus::Active,
+            Focus::Archived,
+            Focus::Capacity,
+            Focus::Quotas,
+        ] {
             assert_eq!(dashboard.focus, expected_focus);
             terminal
                 .draw(|frame| render(frame, &mut dashboard))

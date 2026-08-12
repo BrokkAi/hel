@@ -30,7 +30,8 @@ use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapsh
 use hel::hel_setup::{SetupOutcome, run_setup_dialog};
 use hel::hel_state::{HelState, SessionState, harness_session_title};
 use hel::hel_targets::{
-    CommandOutput, CommandSpec, ProcessExecutor, SessionResourceProbe, SessionResourceUsage,
+    CommandOutput, CommandSpec, DeploymentCapacityKind, DeploymentCapacityTarget,
+    DeploymentCapacityUsage, ProcessExecutor, SessionResourceProbe, SessionResourceUsage,
 };
 use hel::hel_tui::{
     DashboardAction, DashboardState, ImportProfileOption, ImportSessionOption, render,
@@ -224,6 +225,7 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WORKER_POLL_TIMEOUT: Duration = Duration::from_secs(3);
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const RESOURCE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
+const CAPACITY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 enum QuotaUpdate {
@@ -281,6 +283,13 @@ struct ResourcePollTarget {
 struct ResourcePollUpdate {
     session_id: String,
     usage: SessionResourceUsage,
+}
+
+#[derive(Debug)]
+struct CapacityPollUpdate {
+    target_id: String,
+    result: std::result::Result<Option<DeploymentCapacityUsage>, String>,
+    sampled_at_epoch_seconds: u64,
 }
 
 /// Consecutive failed polls before a running session is declared unreachable.
@@ -1003,11 +1012,159 @@ async fn collect_session_resource_usage(
     probe: &SessionResourceProbe,
 ) -> Result<SessionResourceUsage> {
     let memory = execute_resource_command(&probe.memory).await?;
-    let disk = execute_resource_command(&probe.disk).await.ok();
+    let disk = match &probe.disk {
+        Some(command) => execute_resource_command(command).await.ok(),
+        None => None,
+    };
     hel::hel_targets::parse_resource_usage(
         &memory.stdout,
         disk.as_ref().map(|output| output.stdout.as_slice()),
     )
+}
+
+fn spawn_dashboard_capacity_poller() -> (
+    tokio::sync::watch::Sender<Vec<DeploymentCapacityTarget>>,
+    tokio::sync::mpsc::Receiver<CapacityPollUpdate>,
+) {
+    let (targets_tx, mut targets_rx) =
+        tokio::sync::watch::channel(Vec::<DeploymentCapacityTarget>::new());
+    let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        let mut targets = Vec::new();
+        let mut interval = tokio::time::interval(CAPACITY_POLL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    schedule_capacity_samples(&targets, &updates_tx);
+                }
+                changed = targets_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    targets = targets_rx.borrow_and_update().clone();
+                    schedule_capacity_samples(&targets, &updates_tx);
+                }
+            }
+        }
+    });
+    (targets_tx, updates_rx)
+}
+
+fn schedule_capacity_samples(
+    targets: &[DeploymentCapacityTarget],
+    updates: &tokio::sync::mpsc::Sender<CapacityPollUpdate>,
+) {
+    for target in targets.iter().cloned() {
+        let updates = updates.clone();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(RESOURCE_POLL_TIMEOUT, collect_capacity(&target))
+                .await
+                .map_err(|_| "capacity probe timed out".to_string())
+                .and_then(|result| result.map_err(|error| format!("{error:#}")));
+            let _ = updates
+                .send(CapacityPollUpdate {
+                    target_id: target.id,
+                    result,
+                    sampled_at_epoch_seconds: current_epoch_seconds(),
+                })
+                .await;
+        });
+    }
+}
+
+async fn collect_capacity(
+    target: &DeploymentCapacityTarget,
+) -> Result<Option<DeploymentCapacityUsage>> {
+    if let Some(error) = &target.probe_error {
+        anyhow::bail!("capacity probe is unavailable: {error}");
+    }
+    if target.local {
+        return tokio::task::spawn_blocking(collect_local_capacity)
+            .await
+            .context("join local capacity probe")?
+            .map(Some);
+    }
+    match target.kind {
+        DeploymentCapacityKind::Host => {
+            let mut last_error = None;
+            for command in &target.probes {
+                match execute_resource_command(command).await {
+                    Ok(output) => {
+                        return hel::hel_targets::parse_host_capacity(&output.stdout).map(Some);
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no host probe is configured")))
+        }
+        DeploymentCapacityKind::AwsFleet => {
+            if target.probes.is_empty() {
+                return Ok(None);
+            }
+            let mut tasks = tokio::task::JoinSet::new();
+            for command in target.probes.clone() {
+                tasks.spawn(async move {
+                    let output = execute_resource_command(&command).await?;
+                    hel::hel_targets::parse_aws_allocated_capacity(&output.stdout)
+                });
+            }
+            let mut usages = Vec::new();
+            while let Some(result) = tasks.join_next().await {
+                usages.push(result.context("join EC2 capacity probe")??);
+            }
+            aggregate_aws_capacity(&usages).map(Some)
+        }
+    }
+}
+
+fn aggregate_aws_capacity(usages: &[DeploymentCapacityUsage]) -> Result<DeploymentCapacityUsage> {
+    let mut total = DeploymentCapacityUsage {
+        cpu_percent: None,
+        memory_used_bytes: 0,
+        memory_total_bytes: 0,
+        logical_cores: 0,
+        disk_total_bytes: Some(0),
+    };
+    for usage in usages {
+        total.memory_total_bytes = total
+            .memory_total_bytes
+            .checked_add(usage.memory_total_bytes)
+            .context("aggregate EC2 RAM overflow")?;
+        total.logical_cores = total
+            .logical_cores
+            .checked_add(usage.logical_cores)
+            .context("aggregate EC2 core count overflow")?;
+        total.disk_total_bytes = Some(
+            total
+                .disk_total_bytes
+                .unwrap_or(0)
+                .checked_add(usage.disk_total_bytes.unwrap_or(0))
+                .context("aggregate EC2 disk overflow")?,
+        );
+    }
+    Ok(total)
+}
+
+fn collect_local_capacity() -> Result<DeploymentCapacityUsage> {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    system.refresh_cpu_all();
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    system.refresh_cpu_usage();
+    Ok(DeploymentCapacityUsage {
+        cpu_percent: Some(system.global_cpu_usage().round().clamp(0.0, 100.0) as u8),
+        memory_used_bytes: system
+            .total_memory()
+            .saturating_sub(system.available_memory()),
+        memory_total_bytes: system.total_memory(),
+        logical_cores: system
+            .cpus()
+            .len()
+            .try_into()
+            .context("logical CPU count overflow")?,
+        disk_total_bytes: None,
+    })
 }
 
 async fn execute_resource_command(command: &CommandSpec) -> Result<CommandOutput> {
@@ -1356,7 +1513,11 @@ async fn run_dashboard() -> Result<()> {
         spawn_dashboard_worker_poller();
     let (resource_targets_tx, resource_triggers_tx, mut resource_updates_rx) =
         spawn_dashboard_resource_poller();
+    let (capacity_targets_tx, mut capacity_updates_rx) = spawn_dashboard_capacity_poller();
     refresh_dashboard_poll_targets(&controller, &worker_targets_tx, &resource_targets_tx);
+    let capacity_targets = controller.deployment_capacity_targets();
+    capacity_targets_tx.send_replace(capacity_targets.clone());
+    dashboard.set_deployment_capacity_targets(capacity_targets);
     let (import_updates_tx, mut import_updates_rx) =
         tokio::sync::mpsc::channel::<(u64, ImportProfileOption)>(32);
     let (import_task_tx, mut import_task_rx) =
@@ -1368,6 +1529,11 @@ async fn run_dashboard() -> Result<()> {
     let termination = hel::termination::Coordinator::install().token();
 
     loop {
+        let capacity_targets = controller.deployment_capacity_targets();
+        if *capacity_targets_tx.borrow() != capacity_targets {
+            capacity_targets_tx.send_replace(capacity_targets.clone());
+            dashboard.set_deployment_capacity_targets(capacity_targets);
+        }
         while let Ok(update) = quota_updates_rx.try_recv() {
             match update {
                 QuotaUpdate::Refreshing(ids) => dashboard.begin_quota_refresh(ids),
@@ -1388,6 +1554,13 @@ async fn run_dashboard() -> Result<()> {
         }
         while let Ok(update) = resource_updates_rx.try_recv() {
             dashboard.apply_resource_usage(&update.session_id, update.usage);
+        }
+        while let Ok(update) = capacity_updates_rx.try_recv() {
+            dashboard.apply_deployment_capacity(
+                &update.target_id,
+                update.result,
+                update.sampled_at_epoch_seconds,
+            );
         }
         while let Ok((discovery_id, profile)) = import_updates_rx.try_recv() {
             dashboard.apply_import_profile(discovery_id, profile);
@@ -2553,6 +2726,36 @@ mod tests {
             Some(&started),
             started + RESOURCE_POLL_INTERVAL,
         ));
+    }
+
+    #[test]
+    fn capacity_samples_refresh_every_thirty_seconds() {
+        assert_eq!(CAPACITY_POLL_INTERVAL, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn aws_capacity_sums_live_instance_allocations() {
+        let total = aggregate_aws_capacity(&[
+            DeploymentCapacityUsage {
+                cpu_percent: None,
+                memory_used_bytes: 0,
+                memory_total_bytes: 8,
+                logical_cores: 2,
+                disk_total_bytes: Some(100),
+            },
+            DeploymentCapacityUsage {
+                cpu_percent: None,
+                memory_used_bytes: 0,
+                memory_total_bytes: 16,
+                logical_cores: 4,
+                disk_total_bytes: Some(200),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(total.memory_total_bytes, 24);
+        assert_eq!(total.logical_cores, 6);
+        assert_eq!(total.disk_total_bytes, Some(300));
     }
 
     #[test]

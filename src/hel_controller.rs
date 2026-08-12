@@ -611,6 +611,84 @@ impl Controller {
         hel_targets::resource_probe(&backend, session_id)
     }
 
+    pub fn deployment_capacity_targets(&self) -> Vec<hel_targets::DeploymentCapacityTarget> {
+        use hel_targets::{DeploymentCapacityKind, DeploymentCapacityTarget};
+
+        let mut local_ids = Vec::new();
+        let mut ssh_hosts: BTreeMap<String, (Vec<String>, Vec<CommandSpec>)> = BTreeMap::new();
+        let mut targets = Vec::new();
+        for (target_id, template) in &self.config.targets {
+            match template {
+                TargetTemplate::LocalPodman { .. } | TargetTemplate::AppleContainer { .. } => {
+                    local_ids.push(target_id.clone());
+                }
+                TargetTemplate::SshBare { ssh, .. } | TargetTemplate::SshPodman { ssh, .. } => {
+                    let entry = ssh_hosts.entry(ssh.host.clone()).or_default();
+                    entry.0.push(target_id.clone());
+                    let command = hel_targets::ssh_host_capacity_command(&backend_ssh(ssh));
+                    if !entry.1.contains(&command) {
+                        entry.1.push(command);
+                    }
+                }
+                TargetTemplate::AwsEc2 { .. } => {
+                    let mut probes = Vec::new();
+                    let mut probe_error = None;
+                    for session in self.state.sessions.values().filter(|session| {
+                        session.target_template_id == *target_id
+                            && session.state.is_active()
+                            && session.target.is_some()
+                    }) {
+                        let result = backend_locator(
+                            session.target.as_ref().expect("filtered target"),
+                            session,
+                            &self.config,
+                        )
+                        .and_then(|locator| {
+                            hel_targets::aws_allocated_capacity_command(&locator, &session.id)
+                        });
+                        match result {
+                            Ok(command) => probes.push(command),
+                            Err(error) => probe_error = Some(format!("{error:#}")),
+                        }
+                    }
+                    targets.push(DeploymentCapacityTarget {
+                        id: format!("aws:{target_id}"),
+                        host: target_id.clone(),
+                        target_ids: vec![target_id.clone()],
+                        kind: DeploymentCapacityKind::AwsFleet,
+                        local: false,
+                        probes,
+                        probe_error,
+                    });
+                }
+            }
+        }
+        if !local_ids.is_empty() {
+            targets.push(DeploymentCapacityTarget {
+                id: "local".into(),
+                host: "local".into(),
+                target_ids: local_ids,
+                kind: DeploymentCapacityKind::Host,
+                local: true,
+                probes: Vec::new(),
+                probe_error: None,
+            });
+        }
+        targets.extend(ssh_hosts.into_iter().map(|(host, (target_ids, probes))| {
+            DeploymentCapacityTarget {
+                id: format!("ssh:{host}"),
+                host,
+                target_ids,
+                kind: DeploymentCapacityKind::Host,
+                local: false,
+                probes,
+                probe_error: None,
+            }
+        }));
+        targets.sort_by(|left, right| left.id.cmp(&right.id));
+        targets
+    }
+
     /// Resume an archived logical session on any configured profile and
     /// target. Cross-harness resume restores Git and canonical history, starts
     /// a fresh native session, and supplies the prior transcript as its first
@@ -2972,6 +3050,84 @@ mod tests {
         };
         assert!(container.extra_run_args.contains(&"--cpus=4".into()));
         assert!(container.extra_run_args.contains(&"A=b c".into()));
+    }
+
+    #[test]
+    fn deployment_capacity_groups_local_and_same_host_targets() {
+        let container = || ConfigContainer {
+            image: "dev:1".into(),
+            platform: None,
+            cpus: None,
+            memory: None,
+            environment: BTreeMap::new(),
+        };
+        let ssh = |host: &str| SshConnection {
+            host: host.into(),
+            user: Some("builder".into()),
+            identity_file: None,
+            extra_args: Vec::new(),
+        };
+        let config = HelConfig {
+            version: crate::hel_config::CONFIG_VERSION,
+            profiles: BTreeMap::new(),
+            bundles: BTreeMap::new(),
+            targets: BTreeMap::from([
+                (
+                    "apple".into(),
+                    TargetTemplate::AppleContainer {
+                        container: container(),
+                    },
+                ),
+                (
+                    "local".into(),
+                    TargetTemplate::LocalPodman {
+                        container: container(),
+                    },
+                ),
+                (
+                    "bare".into(),
+                    TargetTemplate::SshBare {
+                        ssh: ssh("builder"),
+                        workspace_prefix: ".local/share/hel/workspaces".into(),
+                    },
+                ),
+                (
+                    "remote-container".into(),
+                    TargetTemplate::SshPodman {
+                        ssh: ssh("builder"),
+                        container: container(),
+                    },
+                ),
+                (
+                    "alias".into(),
+                    TargetTemplate::SshBare {
+                        ssh: ssh("builder-alias"),
+                        workspace_prefix: ".local/share/hel/workspaces".into(),
+                    },
+                ),
+            ]),
+        };
+        let controller = Controller {
+            config,
+            state: HelState::default(),
+        };
+
+        let targets = controller.deployment_capacity_targets();
+
+        assert_eq!(targets.len(), 3);
+        let local = targets.iter().find(|target| target.id == "local").unwrap();
+        assert_eq!(local.target_ids, ["apple", "local"]);
+        let builder = targets
+            .iter()
+            .find(|target| target.id == "ssh:builder")
+            .unwrap();
+        assert_eq!(builder.target_ids, ["bare", "remote-container"]);
+        assert_eq!(builder.probes.len(), 1);
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.id == "ssh:builder-alias")
+        );
     }
 
     struct PreflightExecutor {

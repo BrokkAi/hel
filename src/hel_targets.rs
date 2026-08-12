@@ -83,6 +83,7 @@ pub struct CommandOutput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionResourceUsage {
+    pub cpu_percent: Option<u8>,
     pub memory_current_bytes: u64,
     pub memory_limit_bytes: Option<u64>,
     pub swap_current_bytes: Option<u64>,
@@ -93,7 +94,35 @@ pub struct SessionResourceUsage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionResourceProbe {
     pub memory: CommandSpec,
-    pub disk: CommandSpec,
+    pub disk: Option<CommandSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentCapacityKind {
+    Host,
+    AwsFleet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentCapacityTarget {
+    pub id: String,
+    pub host: String,
+    pub target_ids: Vec<String>,
+    pub kind: DeploymentCapacityKind,
+    pub local: bool,
+    /// Alternative commands for a host, or one command per live AWS instance.
+    pub probes: Vec<CommandSpec>,
+    /// Prevents a partial AWS fleet sample when one live instance cannot be probed yet.
+    pub probe_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentCapacityUsage {
+    pub cpu_percent: Option<u8>,
+    pub memory_used_bytes: u64,
+    pub memory_total_bytes: u64,
+    pub logical_cores: u64,
+    pub disk_total_bytes: Option<u64>,
 }
 
 /// An additional host directory made available to a single container session.
@@ -827,16 +856,35 @@ pub fn command_on_locator(
     Ok(command.purpose(purpose))
 }
 
-const CGROUP_MEMORY_USAGE_SCRIPT: &str = r#"
+const CGROUP_RESOURCE_USAGE_SCRIPT: &str = r#"
 for file in memory.current memory.max memory.swap.current memory.swap.max; do
     path="/sys/fs/cgroup/$file"
     if [ -r "$path" ]; then
         printf "%s=%s\n" "$file" "$(cat "$path")"
     fi
 done
+if [ -r /sys/fs/cgroup/cpu.stat ]; then
+    before=$(awk '/^usage_usec / { print $2 }' /sys/fs/cgroup/cpu.stat)
+    sleep 0.25
+    after=$(awk '/^usage_usec / { print $2 }' /sys/fs/cgroup/cpu.stat)
+    set -- $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || printf 'max 100000')
+    if [ "$1" = max ]; then
+        cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')
+    else
+        cores=$(awk -v quota="$1" -v period="$2" 'BEGIN { print quota / period }')
+    fi
+    awk -v used="$((after - before))" -v cores="$cores" \
+        'BEGIN { if (cores > 0) printf "cpu.percent=%.0f\n", used / 250000 / cores * 100 }'
+fi
 "#;
 
-const HOST_MEMORY_USAGE_SCRIPT: &str = r#"
+const HOST_RESOURCE_USAGE_SCRIPT: &str = r#"
+read_cpu() { awk '/^cpu / { total=0; for (i=2; i<=NF; i++) total += $i; print total, $5 + $6 }' /proc/stat; }
+set -- $(read_cpu); total_before=$1; idle_before=$2
+sleep 0.25
+set -- $(read_cpu); total_after=$1; idle_after=$2
+awk -v total="$((total_after - total_before))" -v idle="$((idle_after - idle_before))" \
+    'BEGIN { if (total > 0) printf "cpu.percent=%.0f\n", (total - idle) * 100 / total }'
 awk '
     /^MemTotal:/ { memory_total = $2 }
     /^MemAvailable:/ { memory_available = $2 }
@@ -849,6 +897,13 @@ awk '
         printf "memory.swap.max=%.0f\n", swap_total * 1024
     }
 ' /proc/meminfo
+printf 'logical.cores=%s\n' "$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)"
+"#;
+
+const AWS_ALLOCATED_CAPACITY_SCRIPT: &str = r#"
+awk '/^MemTotal:/ { printf "memory.total=%.0f\n", $2 * 1024 }' /proc/meminfo
+printf 'logical.cores=%s\n' "$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)"
+df -B1 -P -- "$1" | awk 'NR == 2 { print "disk.total=" $2 }'
 "#;
 
 const AWS_SESSION_DISK_USAGE_SCRIPT: &str = r#"
@@ -862,21 +917,23 @@ pub fn resource_probe(locator: &TargetLocator, session_id: &str) -> Result<Sessi
             container_exec(
                 "podman",
                 container_id,
-                ["sh", "-c", CGROUP_MEMORY_USAGE_SCRIPT],
+                ["sh", "-c", CGROUP_RESOURCE_USAGE_SCRIPT],
             )
-            .purpose("sample local Podman container memory"),
-            CommandSpec::new(
-                "podman",
-                [
-                    "container",
-                    "inspect",
-                    "--size",
-                    "--format",
-                    "{{.SizeRw}}",
-                    container_id,
-                ],
-            )
-            .purpose("sample local Podman container writable disk"),
+            .purpose("sample local Podman container resources"),
+            Some(
+                CommandSpec::new(
+                    "podman",
+                    [
+                        "container",
+                        "inspect",
+                        "--size",
+                        "--format",
+                        "{{.SizeRw}}",
+                        container_id,
+                    ],
+                )
+                .purpose("sample local Podman container writable disk"),
+            ),
         ),
         TargetLocator::SshPodman { ssh, container_id } => (
             ssh_command(
@@ -887,48 +944,59 @@ pub fn resource_probe(locator: &TargetLocator, session_id: &str) -> Result<Sessi
                     container_id,
                     "sh",
                     "-c",
-                    CGROUP_MEMORY_USAGE_SCRIPT,
+                    CGROUP_RESOURCE_USAGE_SCRIPT,
                 ],
             )
-            .purpose("sample remote Podman container memory"),
-            ssh_command(
-                ssh,
-                [
-                    "podman",
-                    "container",
-                    "inspect",
-                    "--size",
-                    "--format",
-                    "{{.SizeRw}}",
-                    container_id,
-                ],
-            )
-            .purpose("sample remote Podman container writable disk"),
+            .purpose("sample remote Podman container resources"),
+            Some(
+                ssh_command(
+                    ssh,
+                    [
+                        "podman",
+                        "container",
+                        "inspect",
+                        "--size",
+                        "--format",
+                        "{{.SizeRw}}",
+                        container_id,
+                    ],
+                )
+                .purpose("sample remote Podman container writable disk"),
+            ),
         ),
         TargetLocator::AwsEc2 { ssh, workspace, .. } => {
             let worker_root = worker_root(locator, session_id)?;
             let profile_root = format!(".local/share/hel/profiles/{session_id}");
             (
-                ssh_command(ssh, ["sh", "-c", HOST_MEMORY_USAGE_SCRIPT])
-                    .purpose("sample EC2 session memory"),
-                ssh_command(
-                    ssh,
-                    [
-                        "sh",
-                        "-c",
-                        AWS_SESSION_DISK_USAGE_SCRIPT,
-                        "sh",
-                        workspace.as_str(),
-                        worker_root.as_str(),
-                        profile_root.as_str(),
-                    ],
-                )
-                .purpose("sample EC2 session disk"),
+                ssh_command(ssh, ["sh", "-c", HOST_RESOURCE_USAGE_SCRIPT])
+                    .purpose("sample EC2 session resources"),
+                Some(
+                    ssh_command(
+                        ssh,
+                        [
+                            "sh",
+                            "-c",
+                            AWS_SESSION_DISK_USAGE_SCRIPT,
+                            "sh",
+                            workspace.as_str(),
+                            worker_root.as_str(),
+                            profile_root.as_str(),
+                        ],
+                    )
+                    .purpose("sample EC2 session disk"),
+                ),
             )
         }
-        TargetLocator::AppleContainer { .. } | TargetLocator::SshBare { .. } => {
-            bail!("resource sampling is unsupported for this target")
-        }
+        TargetLocator::AppleContainer { container_id } => (
+            container_exec(
+                "container",
+                container_id,
+                ["sh", "-c", CGROUP_RESOURCE_USAGE_SCRIPT],
+            )
+            .purpose("sample Apple container resources"),
+            None,
+        ),
+        TargetLocator::SshBare { .. } => bail!("resource sampling is unsupported for this target"),
     };
     Ok(SessionResourceProbe { memory, disk })
 }
@@ -969,14 +1037,100 @@ pub fn parse_resource_usage(
         .flatten();
     let writable_disk_bytes =
         disk_output.and_then(|output| String::from_utf8_lossy(output).trim().parse().ok());
+    let cpu_percent = values
+        .get("cpu.percent")
+        .map(|value| parse_percent(value))
+        .transpose()?;
 
     Ok(SessionResourceUsage {
+        cpu_percent,
         memory_current_bytes,
         memory_limit_bytes,
         swap_current_bytes,
         swap_limit_bytes,
         writable_disk_bytes,
     })
+}
+
+pub fn ssh_host_capacity_command(ssh: &SshTarget) -> CommandSpec {
+    ssh_command(ssh, ["sh", "-c", HOST_RESOURCE_USAGE_SCRIPT])
+        .purpose("sample deployment host capacity")
+}
+
+pub fn aws_allocated_capacity_command(
+    locator: &TargetLocator,
+    session_id: &str,
+) -> Result<CommandSpec> {
+    let TargetLocator::AwsEc2 { workspace, .. } = locator else {
+        bail!("AWS allocated-capacity probes require an EC2 locator");
+    };
+    command_on_locator(
+        locator,
+        session_id,
+        vec![
+            "sh".into(),
+            "-c".into(),
+            AWS_ALLOCATED_CAPACITY_SCRIPT.into(),
+            "sh".into(),
+            workspace.clone(),
+        ],
+        "sample EC2 allocated capacity",
+    )
+}
+
+pub fn parse_host_capacity(output: &[u8]) -> Result<DeploymentCapacityUsage> {
+    let values = parse_key_values(output);
+    let total = parse_required_u64(&values, "memory.max")?;
+    Ok(DeploymentCapacityUsage {
+        cpu_percent: Some(parse_percent(required_value(&values, "cpu.percent")?)?),
+        memory_used_bytes: parse_required_u64(&values, "memory.current")?,
+        memory_total_bytes: total,
+        logical_cores: parse_required_u64(&values, "logical.cores")?,
+        disk_total_bytes: None,
+    })
+}
+
+pub fn parse_aws_allocated_capacity(output: &[u8]) -> Result<DeploymentCapacityUsage> {
+    let values = parse_key_values(output);
+    let memory_total_bytes = parse_required_u64(&values, "memory.total")?;
+    Ok(DeploymentCapacityUsage {
+        cpu_percent: None,
+        memory_used_bytes: 0,
+        memory_total_bytes,
+        logical_cores: parse_required_u64(&values, "logical.cores")?,
+        disk_total_bytes: Some(parse_required_u64(&values, "disk.total")?),
+    })
+}
+
+fn parse_key_values(output: &[u8]) -> BTreeMap<String, String> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.trim().to_owned()))
+        .collect()
+}
+
+fn required_value<'a>(values: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str> {
+    values
+        .get(key)
+        .map(String::as_str)
+        .with_context(|| format!("capacity probe did not expose {key}"))
+}
+
+fn parse_required_u64(values: &BTreeMap<String, String>, key: &str) -> Result<u64> {
+    required_value(values, key)?
+        .parse()
+        .with_context(|| format!("capacity probe reported invalid {key}"))
+}
+
+fn parse_percent(value: &str) -> Result<u8> {
+    let value: f64 = value
+        .parse()
+        .with_context(|| format!("invalid percentage {value:?}"))?;
+    if !value.is_finite() {
+        bail!("invalid percentage {value:?}");
+    }
+    Ok(value.round().clamp(0.0, 100.0) as u8)
 }
 
 fn parse_cgroup_counter(value: &str) -> Result<Option<u64>> {
@@ -1812,10 +1966,12 @@ mod tests {
                 .unwrap()
                 .contains("memory.swap.current")
         );
-        assert_eq!(probe.disk.program, "ssh");
+        assert_eq!(probe.disk.as_ref().unwrap().program, "ssh");
         assert!(
             probe
                 .disk
+                .as_ref()
+                .unwrap()
                 .args
                 .last()
                 .unwrap()
@@ -1837,10 +1993,12 @@ mod tests {
 
         assert_eq!(probe.memory.program, "ssh");
         assert!(probe.memory.args.last().unwrap().contains("MemAvailable"));
-        assert_eq!(probe.disk.program, "ssh");
+        assert_eq!(probe.disk.as_ref().unwrap().program, "ssh");
         assert!(
             probe
                 .disk
+                .as_ref()
+                .unwrap()
                 .args
                 .last()
                 .unwrap()
@@ -1851,16 +2009,41 @@ mod tests {
     #[test]
     fn parses_cgroup_memory_swap_and_writable_disk_usage() {
         let usage = parse_resource_usage(
-            b"memory.current=1073741824\nmemory.max=2147483648\nmemory.swap.current=4096\nmemory.swap.max=max\n",
+            b"cpu.percent=37.4\nmemory.current=1073741824\nmemory.max=2147483648\nmemory.swap.current=4096\nmemory.swap.max=max\n",
             Some(b"8192\n"),
         )
         .unwrap();
 
+        assert_eq!(usage.cpu_percent, Some(37));
         assert_eq!(usage.memory_current_bytes, 1_073_741_824);
         assert_eq!(usage.memory_limit_bytes, Some(2_147_483_648));
         assert_eq!(usage.swap_current_bytes, Some(4_096));
         assert_eq!(usage.swap_limit_bytes, None);
         assert_eq!(usage.writable_disk_bytes, Some(8_192));
+    }
+
+    #[test]
+    fn parses_host_and_aws_capacity_outputs() {
+        let host = parse_host_capacity(
+            b"cpu.percent=62.6\nmemory.current=300\nmemory.max=1000\nlogical.cores=8\n",
+        )
+        .unwrap();
+        assert_eq!(host.cpu_percent, Some(63));
+        assert_eq!(host.memory_used_bytes, 300);
+        assert_eq!(host.memory_total_bytes, 1_000);
+        assert_eq!(host.logical_cores, 8);
+
+        let aws = parse_aws_allocated_capacity(
+            b"memory.total=34359738368\nlogical.cores=16\ndisk.total=214748364800\n",
+        )
+        .unwrap();
+        assert_eq!(aws.cpu_percent, None);
+        assert_eq!(aws.memory_total_bytes, 34_359_738_368);
+        assert_eq!(aws.logical_cores, 16);
+        assert_eq!(aws.disk_total_bytes, Some(214_748_364_800));
+
+        assert!(parse_host_capacity(b"cpu.percent=nan\n").is_err());
+        assert!(parse_aws_allocated_capacity(b"memory.total=nope\n").is_err());
     }
 
     #[test]
