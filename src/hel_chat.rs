@@ -12,7 +12,9 @@ use agent_client_protocol::schema::v1::{
     SessionConfigSelectOptions, SessionUpdate, ToolCallContent, ToolCallLocation, ToolCallStatus,
 };
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -31,6 +33,8 @@ use rendering::{
     LogicalLine, TranscriptRenderMode, append_omitted_character_count, display_width,
     line_character_count, markdown_lines, raw_lines, sanitize_terminal_text, wrap_styled_line,
 };
+
+const MOUSE_SCROLL_ROWS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatExit {
@@ -1214,27 +1218,11 @@ impl ChatState {
                 ChatAction::None
             }
             KeyCode::PageUp => {
-                let page = self.last_viewport_height.max(1);
-                if self.follow_bottom {
-                    self.scroll_top = self
-                        .last_content_height
-                        .saturating_sub(self.last_viewport_height);
-                }
-                self.follow_bottom = false;
-                self.scroll_top = self.scroll_top.saturating_sub(page);
+                self.scroll_history_up(self.last_viewport_height.max(1));
                 ChatAction::None
             }
             KeyCode::PageDown => {
-                let maximum = self
-                    .last_content_height
-                    .saturating_sub(self.last_viewport_height);
-                self.scroll_top = self
-                    .scroll_top
-                    .saturating_add(self.last_viewport_height.max(1));
-                if self.scroll_top >= maximum {
-                    self.scroll_top = maximum;
-                    self.follow_bottom = true;
-                }
+                self.scroll_history_down(self.last_viewport_height.max(1));
                 ChatAction::None
             }
             KeyCode::Home => {
@@ -1246,6 +1234,35 @@ impl ChatState {
                 ChatAction::None
             }
             _ => ChatAction::None,
+        }
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_history_up(MOUSE_SCROLL_ROWS),
+            MouseEventKind::ScrollDown => self.scroll_history_down(MOUSE_SCROLL_ROWS),
+            _ => {}
+        }
+    }
+
+    fn scroll_history_up(&mut self, rows: usize) {
+        if self.follow_bottom {
+            self.scroll_top = self
+                .last_content_height
+                .saturating_sub(self.last_viewport_height);
+        }
+        self.follow_bottom = false;
+        self.scroll_top = self.scroll_top.saturating_sub(rows);
+    }
+
+    fn scroll_history_down(&mut self, rows: usize) {
+        let maximum = self
+            .last_content_height
+            .saturating_sub(self.last_viewport_height);
+        self.scroll_top = self.scroll_top.saturating_add(rows);
+        if self.scroll_top >= maximum {
+            self.scroll_top = maximum;
+            self.follow_bottom = true;
         }
     }
 
@@ -1781,8 +1798,15 @@ pub async fn run_chat(
         // character would lag the trailing Enter by minutes.
         let mut pending = event::poll(Duration::from_millis(150))?;
         while pending {
-            if let Event::Key(key) = event::read()? {
-                let action = chat.handle_key(key);
+            let action = match event::read()? {
+                Event::Key(key) => Some(chat.handle_key(key)),
+                Event::Mouse(mouse) => {
+                    chat.handle_mouse(mouse);
+                    None
+                }
+                _ => None,
+            };
+            if let Some(action) = action {
                 let result = match action {
                     ChatAction::None => None,
                     ChatAction::Prompt(text) => match client.prompt(text.clone(), Vec::new()).await
@@ -2600,6 +2624,15 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     fn ctrl(character: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
     }
@@ -3233,6 +3266,21 @@ mod tests {
         assert!(chat.follow_bottom);
         chat.handle_key(key(KeyCode::PageUp));
         chat.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+        assert!(chat.follow_bottom);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_chat_history_and_resumes_following_at_bottom() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.last_content_height = 30;
+        chat.last_viewport_height = 10;
+
+        chat.handle_mouse(mouse(MouseEventKind::ScrollUp));
+        assert_eq!(chat.scroll_top, 17);
+        assert!(!chat.follow_bottom);
+
+        chat.handle_mouse(mouse(MouseEventKind::ScrollDown));
+        assert_eq!(chat.scroll_top, 20);
         assert!(chat.follow_bottom);
     }
 

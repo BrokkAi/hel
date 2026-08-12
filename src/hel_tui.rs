@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -28,6 +28,7 @@ use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase};
 const FORCE_CONFIRMATION: &str = "DESTROY";
 const ACTIVE_MESSAGE_LINES: usize = 4;
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
+const MOUSE_SCROLL_ROWS: isize = 3;
 const IMPORT_STALL_WARNING_AFTER: Duration = Duration::from_secs(10);
 
 /// A side effect requested by the dashboard.
@@ -603,6 +604,17 @@ impl DashboardState {
                 _ => DashboardAction::None,
             },
             Mode::Confirm(confirmation) => self.handle_confirmation_key(key.code, confirmation),
+        }
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if !matches!(self.mode, Mode::Dashboard) {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_selection(-MOUSE_SCROLL_ROWS),
+            MouseEventKind::ScrollDown => self.scroll_selection(MOUSE_SCROLL_ROWS),
+            _ => {}
         }
     }
 
@@ -1388,6 +1400,30 @@ impl DashboardState {
             }
             Focus::Quotas => move_index(&mut self.quota_index, len, delta),
         }
+    }
+
+    fn scroll_selection(&mut self, delta: isize) {
+        let len = self.focus_len();
+        if len == 0 {
+            self.set_selection(0);
+            return;
+        }
+        let active_len = partition_sessions(self.state.sessions.values(), &self.session_details)
+            .0
+            .len();
+        let current = match self.focus {
+            Focus::Active => self.session_index,
+            Focus::Archived => self.session_index.saturating_sub(active_len),
+            Focus::Quotas => self.quota_index,
+        };
+        let next = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current
+                .saturating_add(delta as usize)
+                .min(len.saturating_sub(1))
+        };
+        self.set_selection(next);
     }
 
     fn cycle_focus(&mut self, reverse: bool) {
@@ -2815,6 +2851,15 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     fn config() -> HelConfig {
         HelConfig {
             version: CONFIG_VERSION,
@@ -3356,6 +3401,37 @@ mod tests {
         assert_eq!(dashboard.focus, Focus::Quotas);
         dashboard.handle_key(key(KeyCode::BackTab));
         assert_eq!(dashboard.focus, Focus::Archived);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_focused_dashboard_pane() {
+        let sessions = (0..5)
+            .map(|index| {
+                let mut session = archived_session();
+                session.id = format!("session-{index}");
+                session.state = SessionState::Running;
+                (session.id.clone(), session)
+            })
+            .collect();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+
+        dashboard.handle_mouse(mouse(MouseEventKind::ScrollDown));
+        assert_eq!(dashboard.session_index, 3);
+        dashboard.handle_mouse(mouse(MouseEventKind::ScrollUp));
+        assert_eq!(dashboard.session_index, 0);
+
+        dashboard.focus = Focus::Quotas;
+        dashboard.handle_mouse(mouse(MouseEventKind::ScrollDown));
+        assert_eq!(dashboard.quota_index, 2);
+        assert_eq!(dashboard.session_index, 0);
     }
 
     #[test]
