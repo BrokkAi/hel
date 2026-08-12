@@ -404,6 +404,17 @@ impl Controller {
             .context("reconnect plan is empty")
     }
 
+    pub fn resource_probe(&self, session_id: &str) -> Result<hel_targets::SessionResourceProbe> {
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?;
+        let locator = session.target.as_ref().context("session has no target")?;
+        let backend = backend_locator(locator, session, &self.config)?;
+        hel_targets::resource_probe(&backend, session_id)
+    }
+
     /// Resume an archived logical session on any configured profile and
     /// target. Cross-harness resume restores Git and canonical history, starts
     /// a fresh native session, and supplies the prior transcript as its first

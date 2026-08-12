@@ -25,8 +25,8 @@ use crate::hel_acp::RuntimeEvent;
 use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot};
 use crate::hel_worker_client::WorkerClient;
 use rendering::{
-    LogicalLine, TranscriptRenderMode, ellipsize_styled_line, markdown_lines, raw_lines,
-    sanitize_terminal_text, wrap_styled_line,
+    LogicalLine, TranscriptRenderMode, append_omitted_character_count, line_character_count,
+    markdown_lines, raw_lines, sanitize_terminal_text, wrap_styled_line,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1587,9 +1587,24 @@ pub(crate) fn render_agent_message_preview(
     })
     .collect::<Vec<_>>();
     if lines.len() > maximum_lines {
+        let omitted_characters = lines[maximum_lines..]
+            .iter()
+            .map(|line| {
+                line_character_count(line).saturating_sub(if !line_is_empty(line) {
+                    ROLE_GUTTER_WIDTH
+                } else {
+                    0
+                })
+            })
+            .sum();
         lines.truncate(maximum_lines);
         if let Some(last) = lines.last_mut() {
-            *last = ellipsize_styled_line(std::mem::take(last), width);
+            *last = append_omitted_character_count(
+                std::mem::take(last),
+                width,
+                omitted_characters,
+                agent_style,
+            );
         }
     }
     lines
@@ -1848,7 +1863,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_preview_clips_after_four_rendered_rows() {
+    fn agent_preview_reports_omitted_character_count_after_four_rendered_rows() {
         let lines = render_agent_message_preview(
             "**one** two three four five six seven eight nine ten eleven twelve",
             12,
@@ -1866,7 +1881,12 @@ mod tests {
 
         assert_eq!(rendered.len(), 4);
         assert!(rendered[0].starts_with(ROLE_GUTTER));
-        assert!(rendered[3].ends_with('…'));
+        assert_eq!(lines[3].spans.last().unwrap().content, "[31 more]");
+        assert!(!rendered[3].contains('…'));
+        assert_eq!(
+            lines[3].spans.last().and_then(|span| span.style.fg),
+            Some(Color::Green)
+        );
         assert!(
             lines[0]
                 .spans

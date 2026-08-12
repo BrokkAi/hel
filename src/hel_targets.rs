@@ -81,6 +81,21 @@ pub struct CommandOutput {
     pub stderr: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionResourceUsage {
+    pub memory_current_bytes: u64,
+    pub memory_limit_bytes: Option<u64>,
+    pub swap_current_bytes: Option<u64>,
+    pub swap_limit_bytes: Option<u64>,
+    pub writable_disk_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionResourceProbe {
+    pub memory: CommandSpec,
+    pub disk: CommandSpec,
+}
+
 /// An additional host directory made available to a single container session.
 ///
 /// The runtime selects the isolation mode: Podman uses a copy-on-write overlay
@@ -752,6 +767,167 @@ pub fn reconnect_plan(locator: &TargetLocator, session_id: &str) -> Result<Comma
         description: format!("reconnect Hel session {session_id}"),
         commands: vec![command],
     })
+}
+
+const CGROUP_MEMORY_USAGE_SCRIPT: &str = r#"
+for file in memory.current memory.max memory.swap.current memory.swap.max; do
+    path="/sys/fs/cgroup/$file"
+    if [ -r "$path" ]; then
+        printf "%s=%s\n" "$file" "$(cat "$path")"
+    fi
+done
+"#;
+
+const HOST_MEMORY_USAGE_SCRIPT: &str = r#"
+awk '
+    /^MemTotal:/ { memory_total = $2 }
+    /^MemAvailable:/ { memory_available = $2 }
+    /^SwapTotal:/ { swap_total = $2 }
+    /^SwapFree:/ { swap_free = $2 }
+    END {
+        printf "memory.current=%.0f\n", (memory_total - memory_available) * 1024
+        printf "memory.max=%.0f\n", memory_total * 1024
+        printf "memory.swap.current=%.0f\n", (swap_total - swap_free) * 1024
+        printf "memory.swap.max=%.0f\n", swap_total * 1024
+    }
+' /proc/meminfo
+"#;
+
+const AWS_SESSION_DISK_USAGE_SCRIPT: &str = r#"
+du -s -B1 -- "$@" 2>/dev/null | awk '{ total += $1 } END { print total + 0 }'
+"#;
+
+pub fn resource_probe(locator: &TargetLocator, session_id: &str) -> Result<SessionResourceProbe> {
+    verify_locator(locator, session_id)?;
+    let (memory, disk) = match locator {
+        TargetLocator::LocalPodman { container_id } => (
+            container_exec(
+                "podman",
+                container_id,
+                ["sh", "-c", CGROUP_MEMORY_USAGE_SCRIPT],
+            )
+            .purpose("sample local Podman container memory"),
+            CommandSpec::new(
+                "podman",
+                [
+                    "container",
+                    "inspect",
+                    "--size",
+                    "--format",
+                    "{{.SizeRw}}",
+                    container_id,
+                ],
+            )
+            .purpose("sample local Podman container writable disk"),
+        ),
+        TargetLocator::SshPodman { ssh, container_id } => (
+            ssh_command(
+                ssh,
+                [
+                    "podman",
+                    "exec",
+                    container_id,
+                    "sh",
+                    "-c",
+                    CGROUP_MEMORY_USAGE_SCRIPT,
+                ],
+            )
+            .purpose("sample remote Podman container memory"),
+            ssh_command(
+                ssh,
+                [
+                    "podman",
+                    "container",
+                    "inspect",
+                    "--size",
+                    "--format",
+                    "{{.SizeRw}}",
+                    container_id,
+                ],
+            )
+            .purpose("sample remote Podman container writable disk"),
+        ),
+        TargetLocator::AwsEc2 { ssh, workspace, .. } => {
+            let worker_root = worker_root(locator, session_id)?;
+            let profile_root = format!(".local/share/hel/profiles/{session_id}");
+            (
+                ssh_command(ssh, ["sh", "-c", HOST_MEMORY_USAGE_SCRIPT])
+                    .purpose("sample EC2 session memory"),
+                ssh_command(
+                    ssh,
+                    [
+                        "sh",
+                        "-c",
+                        AWS_SESSION_DISK_USAGE_SCRIPT,
+                        "sh",
+                        workspace.as_str(),
+                        worker_root.as_str(),
+                        profile_root.as_str(),
+                    ],
+                )
+                .purpose("sample EC2 session disk"),
+            )
+        }
+        TargetLocator::AppleContainer { .. } | TargetLocator::SshBare { .. } => {
+            bail!("resource sampling is unsupported for this target")
+        }
+    };
+    Ok(SessionResourceProbe { memory, disk })
+}
+
+pub fn parse_resource_usage(
+    memory_output: &[u8],
+    disk_output: Option<&[u8]>,
+) -> Result<SessionResourceUsage> {
+    let mut values = BTreeMap::new();
+    let memory_text = String::from_utf8_lossy(memory_output);
+    for line in memory_text.lines() {
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        values.insert(name, value.trim());
+    }
+
+    let memory_current_bytes = parse_cgroup_counter(
+        values
+            .get("memory.current")
+            .context("resource probe did not expose memory.current")?,
+    )?
+    .context("resource probe reported memory.current as unlimited")?;
+    let memory_limit_bytes = values
+        .get("memory.max")
+        .map(|value| parse_cgroup_counter(value))
+        .transpose()?
+        .flatten();
+    let swap_current_bytes = values
+        .get("memory.swap.current")
+        .map(|value| parse_cgroup_counter(value))
+        .transpose()?
+        .flatten();
+    let swap_limit_bytes = values
+        .get("memory.swap.max")
+        .map(|value| parse_cgroup_counter(value))
+        .transpose()?
+        .flatten();
+    let writable_disk_bytes =
+        disk_output.and_then(|output| String::from_utf8_lossy(output).trim().parse().ok());
+
+    Ok(SessionResourceUsage {
+        memory_current_bytes,
+        memory_limit_bytes,
+        swap_current_bytes,
+        swap_limit_bytes,
+        writable_disk_bytes,
+    })
+}
+
+fn parse_cgroup_counter(value: &str) -> Result<Option<u64>> {
+    if value == "max" {
+        return Ok(None);
+    }
+    Ok(Some(value.parse().with_context(|| {
+        format!("invalid memory counter {value:?}")
+    })?))
 }
 
 pub fn worker_root(locator: &TargetLocator, session_id: &str) -> Result<String> {
@@ -1550,6 +1726,75 @@ mod tests {
                 .flat_map(|command| &command.args)
                 .any(|arg| arg.contains("CONTAINER_HOST") || arg == "--remote")
         );
+    }
+
+    #[test]
+    fn remote_podman_resource_probe_uses_ssh_and_container_cgroups() {
+        let locator = TargetLocator::SshPodman {
+            ssh: ssh(),
+            container_id: resource_name(SESSION).unwrap(),
+        };
+
+        let probe = resource_probe(&locator, SESSION).unwrap();
+
+        assert_eq!(probe.memory.program, "ssh");
+        assert!(
+            probe
+                .memory
+                .args
+                .last()
+                .unwrap()
+                .contains("memory.swap.current")
+        );
+        assert_eq!(probe.disk.program, "ssh");
+        assert!(
+            probe
+                .disk
+                .args
+                .last()
+                .unwrap()
+                .contains("'podman' 'container' 'inspect' '--size'")
+        );
+    }
+
+    #[test]
+    fn ec2_resource_probe_reads_host_pressure_and_session_disk() {
+        let locator = TargetLocator::AwsEc2 {
+            profile: "default".to_owned(),
+            region: "us-east-1".to_owned(),
+            instance_id: "i-0123456789abcdef0".to_owned(),
+            ssh: ssh(),
+            workspace: format!(".local/share/hel/workspaces/{SESSION}"),
+        };
+
+        let probe = resource_probe(&locator, SESSION).unwrap();
+
+        assert_eq!(probe.memory.program, "ssh");
+        assert!(probe.memory.args.last().unwrap().contains("MemAvailable"));
+        assert_eq!(probe.disk.program, "ssh");
+        assert!(
+            probe
+                .disk
+                .args
+                .last()
+                .unwrap()
+                .contains(&format!(".local/share/hel/workspaces/{SESSION}"))
+        );
+    }
+
+    #[test]
+    fn parses_cgroup_memory_swap_and_writable_disk_usage() {
+        let usage = parse_resource_usage(
+            b"memory.current=1073741824\nmemory.max=2147483648\nmemory.swap.current=4096\nmemory.swap.max=max\n",
+            Some(b"8192\n"),
+        )
+        .unwrap();
+
+        assert_eq!(usage.memory_current_bytes, 1_073_741_824);
+        assert_eq!(usage.memory_limit_bytes, Some(2_147_483_648));
+        assert_eq!(usage.swap_current_bytes, Some(4_096));
+        assert_eq!(usage.swap_limit_bytes, None);
+        assert_eq!(usage.writable_disk_bytes, Some(8_192));
     }
 
     #[test]

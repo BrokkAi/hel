@@ -411,31 +411,66 @@ pub(super) fn wrap_styled_line(
     wrap_styled_graphemes(line, width, continuation_indent)
 }
 
-pub(super) fn ellipsize_styled_line(line: Line<'static>, width: usize) -> Line<'static> {
-    let width = width.max(1);
-    let content_width = width.saturating_sub(1);
-    let mut spans = Vec::new();
-    let mut used = 0;
+pub(super) fn line_character_count(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum()
+}
 
-    'spans: for span in line.spans {
+fn styled_line_prefix(line: &Line<'static>, width: usize) -> (Vec<Span<'static>>, usize) {
+    let mut spans = Vec::new();
+    let mut used_width = 0;
+    let mut kept_characters = 0;
+
+    'spans: for span in &line.spans {
         let mut content = String::new();
         for grapheme in span.content.graphemes(true) {
             let grapheme_width = display_width(grapheme);
-            if used + grapheme_width > content_width {
+            if used_width + grapheme_width > width {
                 if !content.is_empty() {
                     spans.push(Span::styled(content, span.style));
                 }
                 break 'spans;
             }
             content.push_str(grapheme);
-            used += grapheme_width;
+            used_width += grapheme_width;
+            kept_characters += grapheme.chars().count();
         }
         if !content.is_empty() {
             spans.push(Span::styled(content, span.style));
         }
     }
-    spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
-    Line::from(spans)
+    (spans, kept_characters)
+}
+
+pub(super) fn append_omitted_character_count(
+    line: Line<'static>,
+    width: usize,
+    additional_omitted_characters: usize,
+    style: Style,
+) -> Line<'static> {
+    let line_characters = line_character_count(&line);
+    let mut omitted_characters = additional_omitted_characters;
+
+    loop {
+        let marker = format!("[{omitted_characters} more]");
+        let marker_width = display_width(&marker);
+        let prefix_width = width.saturating_sub(marker_width.saturating_add(1));
+        let (_, kept_characters) = styled_line_prefix(&line, prefix_width);
+        let next_omitted = additional_omitted_characters + line_characters - kept_characters;
+        if next_omitted != omitted_characters {
+            omitted_characters = next_omitted;
+            continue;
+        }
+
+        let (mut spans, _) = styled_line_prefix(&line, prefix_width);
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(marker, style));
+        return Line::from(spans);
+    }
 }
 
 fn wrap_single_span(

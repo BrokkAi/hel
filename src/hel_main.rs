@@ -25,7 +25,9 @@ use hel::hel_quota::{ProfileQuota, QuotaManager, QuotaRefreshRequest};
 use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapshot};
 use hel::hel_setup::{SetupOutcome, run_setup_dialog};
 use hel::hel_state::{HelState, SessionState, harness_session_title};
-use hel::hel_targets::{CommandSpec, ProcessExecutor};
+use hel::hel_targets::{
+    CommandOutput, CommandSpec, ProcessExecutor, SessionResourceProbe, SessionResourceUsage,
+};
 use hel::hel_tui::{
     DashboardAction, DashboardState, ImportProfileOption, ImportSessionOption, render,
 };
@@ -189,6 +191,8 @@ struct WorkerArgs {
 const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WORKER_POLL_TIMEOUT: Duration = Duration::from_secs(3);
+const RESOURCE_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const RESOURCE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
 enum QuotaUpdate {
@@ -216,6 +220,18 @@ enum WorkerPollPayload {
     Unreachable {
         detail: String,
     },
+}
+
+#[derive(Debug, Clone)]
+struct ResourcePollTarget {
+    session_id: String,
+    probe: SessionResourceProbe,
+}
+
+#[derive(Debug)]
+struct ResourcePollUpdate {
+    session_id: String,
+    usage: SessionResourceUsage,
 }
 
 /// Consecutive failed polls before a running session is declared unreachable.
@@ -756,6 +772,166 @@ fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPollTarget> {
         .collect()
 }
 
+fn dashboard_resource_targets(controller: &Controller) -> Vec<ResourcePollTarget> {
+    controller
+        .state
+        .sessions
+        .values()
+        .filter(|session| session.state.is_active() && session.target.is_some())
+        .filter_map(|session| {
+            controller
+                .resource_probe(&session.id)
+                .ok()
+                .map(|probe| ResourcePollTarget {
+                    session_id: session.id.clone(),
+                    probe,
+                })
+        })
+        .collect()
+}
+
+fn refresh_dashboard_poll_targets(
+    controller: &Controller,
+    worker_targets_tx: &tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
+    resource_targets_tx: &tokio::sync::watch::Sender<Vec<ResourcePollTarget>>,
+) {
+    worker_targets_tx.send_replace(dashboard_worker_targets(controller));
+    resource_targets_tx.send_replace(dashboard_resource_targets(controller));
+}
+
+fn spawn_dashboard_resource_poller() -> (
+    tokio::sync::watch::Sender<Vec<ResourcePollTarget>>,
+    tokio::sync::mpsc::Sender<String>,
+    tokio::sync::mpsc::Receiver<ResourcePollUpdate>,
+) {
+    let (targets_tx, mut targets_rx) =
+        tokio::sync::watch::channel(Vec::<ResourcePollTarget>::new());
+    let (triggers_tx, mut triggers_rx) = tokio::sync::mpsc::channel(64);
+    let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        let mut targets = std::collections::BTreeMap::new();
+        let mut last_started = std::collections::BTreeMap::new();
+        let mut interval = tokio::time::interval(RESOURCE_POLL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let due = targets.values().cloned().collect::<Vec<_>>();
+                    for target in due {
+                        schedule_resource_sample(target, &mut last_started, &updates_tx);
+                    }
+                }
+                changed = targets_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    targets = targets_rx
+                        .borrow_and_update()
+                        .iter()
+                        .cloned()
+                        .map(|target| (target.session_id.clone(), target))
+                        .collect();
+                    last_started.retain(|session_id, _| targets.contains_key(session_id));
+                    let due = targets.values().cloned().collect::<Vec<_>>();
+                    for target in due {
+                        schedule_resource_sample(target, &mut last_started, &updates_tx);
+                    }
+                }
+                session_id = triggers_rx.recv() => {
+                    let Some(session_id) = session_id else {
+                        break;
+                    };
+                    if let Some(target) = targets.get(&session_id).cloned() {
+                        schedule_resource_sample(target, &mut last_started, &updates_tx);
+                    }
+                }
+            }
+        }
+    });
+    (targets_tx, triggers_tx, updates_rx)
+}
+
+fn resource_sample_is_due(
+    last_started: Option<&tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> bool {
+    last_started.is_none_or(|started| now.duration_since(*started) >= RESOURCE_POLL_INTERVAL)
+}
+
+fn schedule_resource_sample(
+    target: ResourcePollTarget,
+    last_started: &mut std::collections::BTreeMap<String, tokio::time::Instant>,
+    updates: &tokio::sync::mpsc::Sender<ResourcePollUpdate>,
+) {
+    let now = tokio::time::Instant::now();
+    if !resource_sample_is_due(last_started.get(&target.session_id), now) {
+        return;
+    }
+    last_started.insert(target.session_id.clone(), now);
+    let updates = updates.clone();
+    tokio::spawn(async move {
+        let usage = tokio::time::timeout(
+            RESOURCE_POLL_TIMEOUT,
+            collect_session_resource_usage(&target.probe),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
+        let Some(usage) = usage else {
+            return;
+        };
+        let _ = updates
+            .send(ResourcePollUpdate {
+                session_id: target.session_id,
+                usage,
+            })
+            .await;
+    });
+}
+
+async fn collect_session_resource_usage(
+    probe: &SessionResourceProbe,
+) -> Result<SessionResourceUsage> {
+    let memory = execute_resource_command(&probe.memory).await?;
+    let disk = execute_resource_command(&probe.disk).await.ok();
+    hel::hel_targets::parse_resource_usage(
+        &memory.stdout,
+        disk.as_ref().map(|output| output.stdout.as_slice()),
+    )
+}
+
+async fn execute_resource_command(command: &CommandSpec) -> Result<CommandOutput> {
+    let mut process = tokio::process::Command::new(&command.program);
+    process
+        .args(&command.args)
+        .envs(&command.env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = process
+        .spawn()
+        .with_context(|| format!("start {} for {}", command.program, command.purpose))?;
+    let output = child
+        .wait_with_output()
+        .await
+        .with_context(|| format!("wait for {}", command.purpose))?;
+    let command_output = CommandOutput {
+        status: output.status.code().unwrap_or(-1),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    };
+    if command_output.status != 0 {
+        bail!(
+            "{} failed with status {}: {}",
+            command.purpose,
+            command_output.status,
+            String::from_utf8_lossy(&command_output.stderr).trim()
+        );
+    }
+    Ok(command_output)
+}
+
 fn spawn_dashboard_worker_poller() -> (
     tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
     tokio::sync::mpsc::Receiver<WorkerPollUpdate>,
@@ -910,7 +1086,8 @@ fn apply_worker_poll_update(
     controller: &mut Controller,
     dashboard: &mut DashboardState,
     update: WorkerPollUpdate,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut latest_message_updated = false;
     match update.payload {
         WorkerPollPayload::Events(events) => {
             if let Some(title) = harness_session_title(&events)
@@ -921,7 +1098,8 @@ fn apply_worker_poll_update(
                 controller.state.save()?;
                 dashboard.set_state(controller.state.clone());
             }
-            dashboard.apply_worker_events(&update.session_id, &events, current_epoch_seconds());
+            latest_message_updated =
+                dashboard.apply_worker_events(&update.session_id, &events, current_epoch_seconds());
         }
         WorkerPollPayload::Unreachable { detail } => {
             let diagnosis = controller.diagnose_worker(&update.session_id);
@@ -944,7 +1122,7 @@ fn apply_worker_poll_update(
             ));
         }
     }
-    Ok(())
+    Ok(latest_message_updated)
 }
 
 #[derive(Clone)]
@@ -1014,7 +1192,9 @@ async fn run_dashboard() -> Result<()> {
     let (quota_profiles_tx, mut quota_updates_rx) = spawn_dashboard_quota_refresher();
     request_dashboard_quota_refresh(&controller, &mut dashboard, &quota_profiles_tx);
     let (worker_targets_tx, mut worker_updates_rx) = spawn_dashboard_worker_poller();
-    worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+    let (resource_targets_tx, resource_triggers_tx, mut resource_updates_rx) =
+        spawn_dashboard_resource_poller();
+    refresh_dashboard_poll_targets(&controller, &worker_targets_tx, &resource_targets_tx);
     let (import_updates_tx, mut import_updates_rx) =
         tokio::sync::mpsc::channel::<(u64, ImportProfileOption)>(32);
     let (import_task_tx, mut import_task_rx) =
@@ -1031,9 +1211,19 @@ async fn run_dashboard() -> Result<()> {
             }
         }
         while let Ok(update) = worker_updates_rx.try_recv() {
-            if let Err(error) = apply_worker_poll_update(&mut controller, &mut dashboard, update) {
-                dashboard.set_notice(format!("Could not save harness title: {error:#}"));
+            let session_id = update.session_id.clone();
+            match apply_worker_poll_update(&mut controller, &mut dashboard, update) {
+                Ok(true) => {
+                    let _ = resource_triggers_tx.try_send(session_id);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    dashboard.set_notice(format!("Could not save harness title: {error:#}"));
+                }
             }
+        }
+        while let Ok(update) = resource_updates_rx.try_recv() {
+            dashboard.apply_resource_usage(&update.session_id, update.usage);
         }
         while let Ok((discovery_id, profile)) = import_updates_rx.try_recv() {
             dashboard.apply_import_profile(discovery_id, profile);
@@ -1086,8 +1276,11 @@ async fn run_dashboard() -> Result<()> {
                             Ok(()) => {
                                 dashboard.set_config(controller.config.clone());
                                 dashboard.set_state(controller.state.clone());
-                                worker_targets_tx
-                                    .send_replace(dashboard_worker_targets(&controller));
+                                refresh_dashboard_poll_targets(
+                                    &controller,
+                                    &worker_targets_tx,
+                                    &resource_targets_tx,
+                                );
                                 dashboard.set_notice(format!(
                                     "Imported {} session {}.",
                                     imported.harness, pending.native_session_id
@@ -1135,7 +1328,11 @@ async fn run_dashboard() -> Result<()> {
                             &mut dashboard,
                             &quota_profiles_tx,
                         );
-                        worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                        refresh_dashboard_poll_targets(
+                            &controller,
+                            &worker_targets_tx,
+                            &resource_targets_tx,
+                        );
                         dashboard
                             .set_notice("Setup complete. Press n to start your first session.");
                     }
@@ -1254,7 +1451,11 @@ async fn run_dashboard() -> Result<()> {
                             }
                         }
                         dashboard.set_state(controller.state.clone());
-                        worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                        refresh_dashboard_poll_targets(
+                            &controller,
+                            &worker_targets_tx,
+                            &resource_targets_tx,
+                        );
                     }
                     Err(error) => {
                         dashboard.set_notice(format!("Could not create session: {error:#}"))
@@ -1320,7 +1521,11 @@ async fn run_dashboard() -> Result<()> {
                     Err(error) => dashboard.set_notice(format!("Resume failed: {error:#}")),
                 }
                 dashboard.set_state(controller.state.clone());
-                worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                refresh_dashboard_poll_targets(
+                    &controller,
+                    &worker_targets_tx,
+                    &resource_targets_tx,
+                );
             }
             DashboardAction::Checkpoint { session_id } => {
                 match controller.checkpoint_session(&session_id).await {
@@ -1332,7 +1537,11 @@ async fn run_dashboard() -> Result<()> {
                     Err(error) => dashboard.set_notice(format!("Checkpoint failed: {error:#}")),
                 }
                 dashboard.set_state(controller.state.clone());
-                worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                refresh_dashboard_poll_targets(
+                    &controller,
+                    &worker_targets_tx,
+                    &resource_targets_tx,
+                );
             }
             DashboardAction::Close { session_id } => {
                 let (returned_controller, result) = close_session_with_redraw(
@@ -1351,7 +1560,11 @@ async fn run_dashboard() -> Result<()> {
                     }
                 }
                 dashboard.set_state(controller.state.clone());
-                worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                refresh_dashboard_poll_targets(
+                    &controller,
+                    &worker_targets_tx,
+                    &resource_targets_tx,
+                );
             }
             DashboardAction::ForceDestroy { session_id } => {
                 match controller.force_destroy(&session_id, &ProcessExecutor) {
@@ -1362,7 +1575,11 @@ async fn run_dashboard() -> Result<()> {
                     Err(error) => dashboard.set_notice(format!("Destroy failed: {error:#}")),
                 }
                 dashboard.set_state(controller.state.clone());
-                worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                refresh_dashboard_poll_targets(
+                    &controller,
+                    &worker_targets_tx,
+                    &resource_targets_tx,
+                );
             }
         }
     }
@@ -1815,6 +2032,19 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_samples_are_throttled_to_one_per_minute() {
+        let started = tokio::time::Instant::now();
+        assert!(!resource_sample_is_due(
+            Some(&started),
+            started + Duration::from_secs(59),
+        ));
+        assert!(resource_sample_is_due(
+            Some(&started),
+            started + RESOURCE_POLL_INTERVAL,
+        ));
+    }
 
     #[test]
     fn short_session_ids_are_safe() {
