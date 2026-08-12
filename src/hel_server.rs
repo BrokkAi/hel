@@ -183,7 +183,6 @@ impl ViewerSnapshot {
             .map(|(id, profile)| ViewerProfile {
                 id: id.clone(),
                 harness_kind: harness_kind_name(profile.kind).into(),
-                unrestricted_mode: profile.unrestricted_mode().into(),
                 quota: None,
             })
             .collect();
@@ -248,7 +247,6 @@ pub struct ViewerSession {
 pub struct ViewerProfile {
     pub id: String,
     pub harness_kind: String,
-    pub unrestricted_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<ViewerQuota>,
 }
@@ -809,7 +807,7 @@ const VIEWER_HTML: &str = r##"<!doctype html>
 const login=document.querySelector('#login'),app=document.querySelector('#app'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),actionError=document.querySelector('#action-error');
 async function request(url,options={}){const response=await fetch(url,{...options,headers:{'content-type':'application/json',...(options.headers||{})}});if(response.status===401)throw new Error('unauthorized');if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||response.statusText)}return response.status===204?null:response.json()}
 function options(items,selected){return items.map(x=>`<option value="${escapeAttr(x.id)}" ${x.id===selected?'selected':''}>${escapeHtml(x.id)}</option>`).join('')}
-async function refresh(){try{const s=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(s.profiles);if(!newBundle.value)newBundle.innerHTML=options(s.bundles);if(!newTarget.value)newTarget.innerHTML=options(s.targets);sessions.innerHTML=s.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span> ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)}</p><div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}">Open</button><button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button data-action="checkpoint" data-id="${escapeAttr(x.id)}">Checkpoint</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Close</button></div><form class="prompt row" data-id="${escapeAttr(x.id)}"><textarea placeholder="Message the agent"></textarea><button>Send</button></form></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=s.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)} · <span class="pill">${escapeHtml(p.unrestricted_mode)}</span><br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${s.targets.length} targets · ${s.bundles.length} bundles</p>`}catch(e){if(e.message==='unauthorized'){login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}}}
+async function refresh(){try{const s=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(s.profiles);if(!newBundle.value)newBundle.innerHTML=options(s.bundles);if(!newTarget.value)newTarget.innerHTML=options(s.targets);sessions.innerHTML=s.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span> ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)}</p><div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}">Open</button><button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button data-action="checkpoint" data-id="${escapeAttr(x.id)}">Checkpoint</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Close</button></div><form class="prompt row" data-id="${escapeAttr(x.id)}"><textarea placeholder="Message the agent"></textarea><button>Send</button></form></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=s.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${s.targets.length} targets · ${s.bundles.length} bundles</p>`}catch(e){if(e.message==='unauthorized'){login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}}}
 document.querySelector('#login-form').onsubmit=async e=>{e.preventDefault();try{await request('/auth/session',{method:'POST',body:JSON.stringify({code:document.querySelector('#code').value})});document.querySelector('#login-error').textContent='';refresh()}catch(err){document.querySelector('#login-error').textContent=err.message}};
 logout.onclick=async()=>{await request('/auth/session',{method:'DELETE'});location.reload()};
 newForm.onsubmit=async e=>{e.preventDefault();try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'new',title:document.querySelector('#new-title').value,profile_id:newProfile.value,bundle_id:newBundle.value,target_id:newTarget.value})});document.querySelector('#new-title').value='';actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
@@ -885,6 +883,7 @@ mod tests {
                     last_profile: "codex-1".into(),
                     bundle_id: "hel".into(),
                     target_template_id: "podman".into(),
+                    resource_allocation: None,
                     additional_mounts: vec![],
                     state: SessionState::Running,
                     target: None,

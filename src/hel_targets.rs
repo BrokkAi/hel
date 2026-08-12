@@ -462,6 +462,7 @@ pub struct AwsTemplate {
     pub region: String,
     pub launch_template: String,
     pub launch_template_version: Option<String>,
+    pub instance_type: Option<String>,
     pub ssh: SshTarget,
 }
 
@@ -634,6 +635,9 @@ pub fn provision_plan(
                 "--launch-template".to_owned(),
                 launch,
             ];
+            if let Some(instance_type) = &aws.instance_type {
+                args.extend(["--instance-type".to_owned(), instance_type.clone()]);
+            }
             args.extend(managed_resource_identity_args(
                 ManagedResourceKind::Ec2Instance,
                 session_id,
@@ -2104,12 +2108,19 @@ mod tests {
             region: "us-east-2".to_owned(),
             launch_template: "hel-dev".to_owned(),
             launch_template_version: Some("3".to_owned()),
+            instance_type: Some("m8i-flex.2xlarge".into()),
             ssh: ssh(),
         });
         let provision = provision_plan(&template, SESSION, &bundle(), &[]).unwrap();
         assert_eq!(provision.commands.len(), 1);
         assert!(provision.commands[0].args.windows(2).any(|args| args
             == managed_resource_identity_args(ManagedResourceKind::Ec2Instance, SESSION)));
+        assert!(
+            provision.commands[0]
+                .args
+                .windows(2)
+                .any(|args| { args == ["--instance-type", "m8i-flex.2xlarge"] })
+        );
         let close = close_plan(
             &TargetLocator::AwsEc2 {
                 profile: "work".to_owned(),

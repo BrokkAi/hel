@@ -67,6 +67,38 @@ pub enum TargetLocator {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum SessionResourceAllocation {
+    Container {
+        cpus: u64,
+        memory_bytes: u64,
+    },
+    AwsEc2 {
+        instance_type: String,
+        vcpus: u64,
+        memory_bytes: u64,
+    },
+}
+
+impl SessionResourceAllocation {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Container { cpus, memory_bytes } if *cpus == 0 || *memory_bytes == 0 => {
+                bail!("container resource allocation must have non-zero CPU and memory")
+            }
+            Self::AwsEc2 {
+                instance_type,
+                vcpus,
+                memory_bytes,
+            } if instance_type.trim().is_empty() || *vcpus == 0 || *memory_bytes == 0 => {
+                bail!("EC2 resource allocation must have an instance type, CPU, and memory")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 impl TargetLocator {
     fn validate(&self, session_id: &str) -> Result<()> {
         match self {
@@ -144,6 +176,8 @@ pub struct SessionRecord {
     pub last_profile: String,
     pub bundle_id: String,
     pub target_template_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_allocation: Option<SessionResourceAllocation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_mounts: Vec<AdditionalMount>,
     pub state: SessionState,
@@ -185,6 +219,9 @@ impl SessionRecord {
         validate_id("profile", &self.last_profile)?;
         validate_id("bundle", &self.bundle_id)?;
         validate_id("target template", &self.target_template_id)?;
+        if let Some(allocation) = &self.resource_allocation {
+            allocation.validate()?;
+        }
         validate_additional_mounts(&self.additional_mounts)?;
         if self.title.trim().is_empty() {
             bail!("session {:?} has an empty title", self.id);
@@ -446,6 +483,7 @@ mod tests {
             last_profile: "codex-1".into(),
             bundle_id: "hel".into(),
             target_template_id: "podman".into(),
+            resource_allocation: None,
             additional_mounts: vec![AdditionalMount {
                 source: PathBuf::from("/home/test/cache"),
                 destination: PathBuf::from("/mnt/cache"),

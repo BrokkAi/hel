@@ -10,10 +10,13 @@ use chrono::Utc;
 use rusqlite::{Connection, Transaction, params};
 
 use crate::hel_config::{HarnessKind, data_dir};
-use crate::hel_state::{CheckpointMetadata, HelState, SessionRecord, SessionState, TargetLocator};
+use crate::hel_state::{
+    CheckpointMetadata, HelState, SessionRecord, SessionResourceAllocation, SessionState,
+    TargetLocator,
+};
 use crate::hel_targets::AdditionalMount;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryScope {
@@ -145,6 +148,16 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 2 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE sessions ADD COLUMN resource_allocation TEXT;
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 2;
+             COMMIT;",
+        )?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -170,7 +183,7 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
         "SELECT s.session_id, s.title, s.harness_kind, s.last_profile, c.bundle_id,
                 s.target_template_id, s.state, s.native_session_id, s.acp_session_title,
                 s.session_title_override, c.created_at, s.updated_at,
-                s.last_viewed_event_sequence, s.last_error
+                s.last_viewed_event_sequence, s.last_error, s.resource_allocation
          FROM sessions s JOIN session_contexts c USING(session_id)
          ORDER BY s.session_id",
     )?;
@@ -182,6 +195,17 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
             last_profile: row.get(3)?,
             bundle_id: row.get(4)?,
             target_template_id: row.get(5)?,
+            resource_allocation: row
+                .get::<_, Option<String>>(14)?
+                .map(|json| serde_json::from_str::<SessionResourceAllocation>(&json))
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        14,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
             additional_mounts: Vec::new(),
             state: parse_session_state(&row.get::<_, String>(6)?),
             target: None,
@@ -270,8 +294,8 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
         "INSERT INTO sessions(
              session_id, title, harness_kind, last_profile, target_template_id, state,
              native_session_id, acp_session_title, session_title_override, updated_at,
-             last_viewed_event_sequence, last_error
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+             last_viewed_event_sequence, last_error, resource_allocation
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
             session.id,
             session.title,
@@ -285,6 +309,11 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
             session.updated_at,
             session.last_viewed_event_sequence,
             session.last_error,
+            session
+                .resource_allocation
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
         ],
     )?;
     if let Some(target) = &session.target {
@@ -720,6 +749,10 @@ mod tests {
             last_profile: "codex".into(),
             bundle_id: bundle.into(),
             target_template_id: "local".into(),
+            resource_allocation: Some(SessionResourceAllocation::Container {
+                cpus: 8,
+                memory_bytes: 32 * 1024 * 1024 * 1024,
+            }),
             additional_mounts: vec![AdditionalMount {
                 source: PathBuf::from("/host/cache"),
                 destination: PathBuf::from("/mnt/cache"),

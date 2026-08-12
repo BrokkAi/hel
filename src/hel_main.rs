@@ -1,7 +1,7 @@
 //! Hel: a session control plane for ACP coding agents.
 
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,21 +13,22 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use hel::hel_config::{HelConfig, config_path, sessions_dir};
-use hel::hel_controller::Controller;
+use hel::hel_config::{HelConfig, ProjectBundle, ProjectRepository, config_path, sessions_dir};
+use hel::hel_controller::{Controller, SessionLaunchOptions};
 use hel::hel_import::{
     BundleResolution, ClaudeImportRequest, ClaudeSessionSelection, CodexImportRequest,
     CodexSessionSelection, ImportArchiveProgress, ImportControl, KimiImportRequest,
-    KimiSessionSelection, claude_config_home, codex_config_home, import_claude_session,
-    import_claude_session_with_control, import_codex_session, import_codex_session_with_control,
-    import_kimi_session, import_kimi_session_with_control, import_safety_issues, kimi_config_home,
+    KimiSessionSelection, claude_config_home, codex_config_home, configured_bundle_for_local,
+    configured_bundle_for_origin, import_claude_session, import_claude_session_with_control,
+    import_codex_session, import_codex_session_with_control, import_kimi_session,
+    import_kimi_session_with_control, import_safety_issues, kimi_config_home,
     locate_claude_session, locate_codex_session, locate_kimi_session, read_claude_transcript,
     read_codex_transcript, read_kimi_transcript, resolve_bundle, scan_claude_sessions,
     scan_codex_sessions, scan_kimi_sessions, session_edit_targets,
 };
 use hel::hel_quota::{ProfileQuota, QuotaManager, QuotaRefreshRequest};
 use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapshot};
-use hel::hel_setup::{SetupOutcome, run_setup_dialog};
+use hel::hel_setup::{SetupOutcome, github_repository_from_origin, run_setup_dialog};
 use hel::hel_state::{HelState, SessionState, harness_session_title};
 use hel::hel_targets::{
     CommandOutput, CommandSpec, DeploymentCapacityKind, DeploymentCapacityTarget,
@@ -1970,6 +1971,7 @@ async fn run_dashboard() -> Result<()> {
                 target_template_id,
                 additional_mounts,
                 allow_dirty_local,
+                resource_allocation,
             } => {
                 if !allow_dirty_local {
                     let dirty = controller
@@ -1993,6 +1995,7 @@ async fn run_dashboard() -> Result<()> {
                                     target_template_id,
                                     additional_mounts,
                                     allow_dirty_local: false,
+                                    resource_allocation,
                                 },
                                 repositories,
                             );
@@ -2008,13 +2011,16 @@ async fn run_dashboard() -> Result<()> {
                     }
                 }
                 let title = format!("{bundle_id} via {profile_id}");
-                match controller.register_session_with_mounts_allow_dirty(
+                match controller.register_session_with_resources(
                     &profile_id,
                     &bundle_id,
                     &target_template_id,
                     title,
-                    additional_mounts,
-                    allow_dirty_local,
+                    SessionLaunchOptions {
+                        additional_mounts,
+                        allow_dirty_local,
+                        resource_allocation,
+                    },
                 ) {
                     Ok(session_id) => {
                         dashboard.set_state(controller.state.clone());
@@ -2165,6 +2171,7 @@ async fn run_dashboard() -> Result<()> {
                 session_id,
                 profile_id,
                 target_template_id,
+                resource_allocation,
             } => {
                 dashboard.set_notice(resume_progress_notice(
                     &session_id,
@@ -2175,7 +2182,12 @@ async fn run_dashboard() -> Result<()> {
                     .terminal
                     .draw(|frame| render(frame, &mut dashboard))?;
                 match controller
-                    .resume_session(&session_id, &profile_id, &target_template_id)
+                    .resume_session_with_resources(
+                        &session_id,
+                        &profile_id,
+                        &target_template_id,
+                        resource_allocation,
+                    )
                     .await
                 {
                     Ok(()) => {
@@ -2236,6 +2248,32 @@ async fn run_dashboard() -> Result<()> {
                     &worker_targets_tx,
                     &resource_targets_tx,
                 );
+            }
+            DashboardAction::ResolveAwsResourceOptions { target_template_id } => {
+                let result = controller
+                    .resolve_aws_resource_options(&target_template_id, &ProcessExecutor)
+                    .map_err(|error| format!("{error:#}"));
+                dashboard.apply_aws_resource_options(&target_template_id, result);
+            }
+            DashboardAction::CreateBundle { source } => {
+                match create_quick_bundle(&mut controller.config, &source) {
+                    Ok(bundle_id) => {
+                        controller.config.save()?;
+                        let followup =
+                            dashboard.apply_created_bundle(controller.config.clone(), &bundle_id);
+                        if let DashboardAction::ResolveAwsResourceOptions { target_template_id } =
+                            followup
+                        {
+                            let result = controller
+                                .resolve_aws_resource_options(&target_template_id, &ProcessExecutor)
+                                .map_err(|error| format!("{error:#}"));
+                            dashboard.apply_aws_resource_options(&target_template_id, result);
+                        }
+                    }
+                    Err(error) => {
+                        dashboard.set_notice(format!("Could not create bundle: {error:#}"))
+                    }
+                }
             }
             DashboardAction::ForceDestroy { session_id } => {
                 match controller.force_destroy(&session_id, &ProcessExecutor) {
@@ -2811,6 +2849,76 @@ fn configuration_needs_setup(config: &hel::hel_config::HelConfig) -> bool {
     config.profiles.is_empty() && config.bundles.is_empty() && config.targets.is_empty()
 }
 
+fn create_quick_bundle(config: &mut HelConfig, source: &str) -> Result<String> {
+    let source = source.trim();
+    if source.is_empty() {
+        bail!("repository source cannot be empty");
+    }
+    let candidate = Path::new(source);
+    let (name, github, local) = if candidate.exists() {
+        let root = hel::hel_local_git::canonical_repository(candidate)?;
+        if let Some(existing) = configured_bundle_for_local(config, &root) {
+            return Ok(existing);
+        }
+        let name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("local repository has no usable directory name")?
+            .to_owned();
+        (name, None, Some(root))
+    } else {
+        if candidate.is_absolute() || source.starts_with('.') || source.starts_with('~') {
+            bail!("local repository path {source:?} does not exist");
+        }
+        let repository = github_repository_from_origin(source)
+            .with_context(|| format!("{source:?} is not a GitHub owner/repository or URL"))?;
+        if let Some(existing) = configured_bundle_for_origin(config, &repository) {
+            return Ok(existing);
+        }
+        let name = repository.repository.clone();
+        let github = format!("{}/{}", repository.owner, repository.repository);
+        (name, Some(github), None)
+    };
+    let repository_id = quick_config_id(&name);
+    let mut bundle_id = repository_id.clone();
+    for suffix in 2_u32.. {
+        if !config.bundles.contains_key(&bundle_id) {
+            break;
+        }
+        bundle_id = format!("{repository_id}-{suffix}");
+    }
+    config.bundles.insert(
+        bundle_id.clone(),
+        ProjectBundle {
+            primary_repo: repository_id.clone(),
+            repositories: vec![ProjectRepository {
+                id: repository_id.clone(),
+                github,
+                local,
+                destination: PathBuf::from(repository_id),
+                git_ref: None,
+            }],
+        },
+    );
+    config.validate()?;
+    Ok(bundle_id)
+}
+
+fn quick_config_id(value: &str) -> String {
+    let id = value
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+        .take(64)
+        .collect::<String>();
+    if id.is_empty() || matches!(id.as_str(), "." | "..") {
+        "repository".into()
+    } else {
+        id
+    }
+}
+
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
 }
@@ -2917,6 +3025,33 @@ mod tests {
     fn short_session_ids_are_safe() {
         assert_eq!(short_id("0123456789"), "01234567");
         assert_eq!(short_id("tiny"), "tiny");
+    }
+
+    #[test]
+    fn quick_github_bundle_uses_collision_suffix_and_reuses_matching_source() {
+        let mut config = HelConfig::default();
+        config.bundles.insert(
+            "app".into(),
+            ProjectBundle {
+                primary_repo: "app".into(),
+                repositories: vec![ProjectRepository {
+                    id: "app".into(),
+                    github: Some("other/app".into()),
+                    local: None,
+                    destination: "app".into(),
+                    git_ref: None,
+                }],
+            },
+        );
+
+        let created =
+            create_quick_bundle(&mut config, "https://github.com/example/app.git").unwrap();
+        assert_eq!(created, "app-2");
+        assert_eq!(
+            create_quick_bundle(&mut config, "example/app").unwrap(),
+            "app-2"
+        );
+        assert_eq!(config.bundles.len(), 2);
     }
 
     #[test]

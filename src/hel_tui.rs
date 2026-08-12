@@ -19,7 +19,7 @@ use ratatui::widgets::{
 use crate::hel_chat::{TranscriptSnapshot, render_agent_message_preview};
 use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use crate::hel_quota::ProfileQuota;
-use crate::hel_state::{HelState, SessionRecord, SessionState};
+use crate::hel_state::{HelState, SessionRecord, SessionResourceAllocation, SessionState};
 use crate::hel_targets::{
     AdditionalMount, DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage,
     SessionResourceUsage, default_mount_destination, path_completion,
@@ -27,6 +27,8 @@ use crate::hel_targets::{
 use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase};
 
 const FORCE_CONFIRMATION: &str = "DESTROY";
+const BASELINE_CPUS: u64 = 8;
+const BASELINE_MEMORY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const ACTIVE_MESSAGE_LINES: usize = 4;
 const SELECTED_TRANSCRIPT_LINES: usize = 10;
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
@@ -46,6 +48,7 @@ pub enum DashboardAction {
         target_template_id: String,
         additional_mounts: Vec<AdditionalMount>,
         allow_dirty_local: bool,
+        resource_allocation: Option<SessionResourceAllocation>,
     },
     CompleteMountSource {
         target_template_id: String,
@@ -55,6 +58,13 @@ pub enum DashboardAction {
         session_id: String,
         profile_id: String,
         target_template_id: String,
+        resource_allocation: Option<SessionResourceAllocation>,
+    },
+    ResolveAwsResourceOptions {
+        target_template_id: String,
+    },
+    CreateBundle {
+        source: String,
     },
     Checkpoint {
         session_id: String,
@@ -118,6 +128,7 @@ enum WizardStep {
     Bundle,
     Target,
     Mounts,
+    NewBundle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +138,10 @@ struct NewWizard {
     bundle: usize,
     target: usize,
     mounts: MountWizard,
+    new_bundle_source: String,
+    resource_allocation: Option<SessionResourceAllocation>,
+    aws_options: BTreeMap<String, Vec<SessionResourceAllocation>>,
+    sizing_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +181,9 @@ struct ResumeWizard {
     step: WizardStep,
     profile: usize,
     target: usize,
+    resource_allocation: Option<SessionResourceAllocation>,
+    aws_options: BTreeMap<String, Vec<SessionResourceAllocation>>,
+    sizing_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -489,6 +507,42 @@ impl DashboardState {
                 detail.failed = false;
             }
             Err(_) => detail.failed = true,
+        }
+        let affected_targets = detail.target.target_ids.clone();
+        let limits = detail
+            .usage
+            .as_ref()
+            .map(|usage| (usage.logical_cores, usage.memory_total_bytes));
+        if let Some(limits) = limits {
+            match &mut self.mode {
+                Mode::New(wizard) => {
+                    let selected = nth_key(&self.config.targets, wizard.target);
+                    if affected_targets.contains(&selected)
+                        && let Some(SessionResourceAllocation::Container { cpus, memory_bytes }) =
+                            &wizard.resource_allocation
+                    {
+                        let (cpus, memory_bytes) =
+                            clamp_resources(*cpus, *memory_bytes, Some(limits));
+                        wizard.resource_allocation =
+                            Some(SessionResourceAllocation::Container { cpus, memory_bytes });
+                        wizard.sizing_error = None;
+                    }
+                }
+                Mode::Resume(wizard) => {
+                    let selected = nth_key(&self.config.targets, wizard.target);
+                    if affected_targets.contains(&selected)
+                        && let Some(SessionResourceAllocation::Container { cpus, memory_bytes }) =
+                            &wizard.resource_allocation
+                    {
+                        let (cpus, memory_bytes) =
+                            clamp_resources(*cpus, *memory_bytes, Some(limits));
+                        wizard.resource_allocation =
+                            Some(SessionResourceAllocation::Container { cpus, memory_bytes });
+                        wizard.sizing_error = None;
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -908,21 +962,75 @@ impl DashboardState {
         if wizard.step == WizardStep::Mounts {
             return self.handle_mount_key(code, wizard);
         }
-        let len = match wizard.step {
-            WizardStep::Profile => self.config.profiles.len(),
-            WizardStep::Bundle => self.config.bundles.len(),
-            WizardStep::Target => self.config.targets.len(),
-            WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
-        };
-        if matches!(code, KeyCode::Up | KeyCode::Char('k')) {
-            move_index(wizard.active_index_mut(), len, -1);
+        if wizard.step == WizardStep::NewBundle {
+            return match code {
+                KeyCode::Backspace if wizard.new_bundle_source.is_empty() => {
+                    wizard.step = WizardStep::Bundle;
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
+                KeyCode::Backspace => {
+                    wizard.new_bundle_source.pop();
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
+                KeyCode::Enter if wizard.new_bundle_source.trim().is_empty() => {
+                    self.notice = Some("Repository source cannot be empty.".into());
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
+                KeyCode::Enter => {
+                    let source = wizard.new_bundle_source.trim().to_owned();
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::CreateBundle { source }
+                }
+                KeyCode::Char(character) => {
+                    wizard.new_bundle_source.push(character);
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
+                _ => {
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
+            };
+        }
+        if wizard.step == WizardStep::Target
+            && matches!(
+                code,
+                KeyCode::Char('+') | KeyCode::Char('-') | KeyCode::Char('r')
+            )
+        {
+            self.adjust_new_resources(&mut wizard, code);
             self.mode = Mode::New(wizard);
             return DashboardAction::None;
         }
+        let len = match wizard.step {
+            WizardStep::Profile => self.config.profiles.len(),
+            WizardStep::Bundle => self.config.bundles.len() + 1,
+            WizardStep::Target => self.config.targets.len(),
+            WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
+            WizardStep::NewBundle => unreachable!("bundle input is handled above"),
+        };
+        if matches!(code, KeyCode::Up | KeyCode::Char('k')) {
+            move_index(wizard.active_index_mut(), len, -1);
+            let action = if wizard.step == WizardStep::Target {
+                self.prepare_new_target(&mut wizard)
+            } else {
+                DashboardAction::None
+            };
+            self.mode = Mode::New(wizard);
+            return action;
+        }
         if matches!(code, KeyCode::Down | KeyCode::Char('j')) {
             move_index(wizard.active_index_mut(), len, 1);
+            let action = if wizard.step == WizardStep::Target {
+                self.prepare_new_target(&mut wizard)
+            } else {
+                DashboardAction::None
+            };
             self.mode = Mode::New(wizard);
-            return DashboardAction::None;
+            return action;
         }
         if matches!(code, KeyCode::Backspace | KeyCode::Left) {
             wizard.step = match wizard.step {
@@ -935,6 +1043,7 @@ impl DashboardState {
                 WizardStep::Mounts => {
                     unreachable!("mount input is handled before picker navigation")
                 }
+                WizardStep::NewBundle => unreachable!("bundle input is handled above"),
             };
             self.mode = Mode::New(wizard);
             return DashboardAction::None;
@@ -951,9 +1060,16 @@ impl DashboardState {
                 DashboardAction::None
             }
             WizardStep::Bundle => {
+                if wizard.bundle == self.config.bundles.len() {
+                    wizard.step = WizardStep::NewBundle;
+                    wizard.new_bundle_source.clear();
+                    self.mode = Mode::New(wizard);
+                    return DashboardAction::None;
+                }
                 wizard.step = WizardStep::Target;
+                let action = self.prepare_new_target(&mut wizard);
                 self.mode = Mode::New(wizard);
-                DashboardAction::None
+                action
             }
             WizardStep::Target => {
                 let target_template_id = nth_key(&self.config.targets, wizard.target);
@@ -962,6 +1078,18 @@ impl DashboardState {
                     .targets
                     .get(&target_template_id)
                     .expect("selected target index is present in config");
+                if matches!(target, TargetTemplate::AwsEc2 { .. })
+                    && wizard.resource_allocation.is_none()
+                {
+                    self.notice = Some(
+                        wizard
+                            .sizing_error
+                            .clone()
+                            .unwrap_or_else(|| "EC2 sizes are still loading.".into()),
+                    );
+                    self.mode = Mode::New(wizard);
+                    return DashboardAction::None;
+                }
                 if let Some(host) = mount_history_host(target) {
                     wizard.step = WizardStep::Mounts;
                     wizard.mounts = MountWizard::new(
@@ -978,6 +1106,7 @@ impl DashboardState {
                 }
             }
             WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
+            WizardStep::NewBundle => unreachable!("bundle input is handled above"),
         }
     }
 
@@ -1128,9 +1257,168 @@ impl DashboardState {
             target_template_id: nth_key(&self.config.targets, wizard.target),
             additional_mounts: wizard.mounts.mounts.clone(),
             allow_dirty_local: false,
+            resource_allocation: wizard.resource_allocation.clone(),
         };
         self.cancel_modal();
         action
+    }
+
+    pub fn apply_created_bundle(&mut self, config: HelConfig, bundle_id: &str) -> DashboardAction {
+        let Mode::New(mut wizard) = self.mode.clone() else {
+            return DashboardAction::None;
+        };
+        self.config = config;
+        let Some(index) = self.config.bundles.keys().position(|id| id == bundle_id) else {
+            self.notice = Some(format!("Created bundle {bundle_id:?} was not found."));
+            return DashboardAction::None;
+        };
+        wizard.bundle = index;
+        wizard.step = WizardStep::Target;
+        let action = self.prepare_new_target(&mut wizard);
+        self.mode = Mode::New(wizard);
+        action
+    }
+
+    pub fn apply_aws_resource_options(
+        &mut self,
+        target_id: &str,
+        result: std::result::Result<Vec<SessionResourceAllocation>, String>,
+    ) {
+        match self.mode.clone() {
+            Mode::New(mut wizard) => {
+                if nth_key(&self.config.targets, wizard.target) != target_id {
+                    return;
+                }
+                apply_aws_options(
+                    target_id,
+                    result,
+                    &mut wizard.aws_options,
+                    &mut wizard.resource_allocation,
+                    &mut wizard.sizing_error,
+                    None,
+                );
+                self.mode = Mode::New(wizard);
+            }
+            Mode::Resume(mut wizard) => {
+                if nth_key(&self.config.targets, wizard.target) != target_id {
+                    return;
+                }
+                let previous = self
+                    .state
+                    .sessions
+                    .get(&wizard.session_id)
+                    .and_then(|session| session.resource_allocation.as_ref());
+                apply_aws_options(
+                    target_id,
+                    result,
+                    &mut wizard.aws_options,
+                    &mut wizard.resource_allocation,
+                    &mut wizard.sizing_error,
+                    previous,
+                );
+                self.mode = Mode::Resume(wizard);
+            }
+            _ => {}
+        }
+    }
+
+    fn prepare_new_target(&self, wizard: &mut NewWizard) -> DashboardAction {
+        self.prepare_target(
+            wizard.target,
+            &wizard.aws_options,
+            &mut wizard.resource_allocation,
+            &mut wizard.sizing_error,
+            None,
+        )
+    }
+
+    fn prepare_resume_target(&self, wizard: &mut ResumeWizard) -> DashboardAction {
+        let previous = self
+            .state
+            .sessions
+            .get(&wizard.session_id)
+            .and_then(|session| session.resource_allocation.as_ref());
+        self.prepare_target(
+            wizard.target,
+            &wizard.aws_options,
+            &mut wizard.resource_allocation,
+            &mut wizard.sizing_error,
+            previous,
+        )
+    }
+
+    fn prepare_target(
+        &self,
+        target_index: usize,
+        aws_options: &BTreeMap<String, Vec<SessionResourceAllocation>>,
+        allocation: &mut Option<SessionResourceAllocation>,
+        sizing_error: &mut Option<String>,
+        previous: Option<&SessionResourceAllocation>,
+    ) -> DashboardAction {
+        let target_id = nth_key(&self.config.targets, target_index);
+        let target = &self.config.targets[&target_id];
+        *sizing_error = None;
+        match target {
+            TargetTemplate::LocalPodman { .. }
+            | TargetTemplate::AppleContainer { .. }
+            | TargetTemplate::SshPodman { .. } => {
+                let limits = self.host_limits(&target_id);
+                if limits.is_none() {
+                    *sizing_error = Some("host totals unavailable; + disabled".into());
+                }
+                let (cpus, memory_bytes) = match previous {
+                    Some(SessionResourceAllocation::Container { cpus, memory_bytes }) => {
+                        clamp_resources(*cpus, *memory_bytes, limits)
+                    }
+                    _ => clamp_resources(BASELINE_CPUS, BASELINE_MEMORY_BYTES, limits),
+                };
+                *allocation = Some(SessionResourceAllocation::Container { cpus, memory_bytes });
+                DashboardAction::None
+            }
+            TargetTemplate::AwsEc2 { .. } => {
+                if let Some(options) = aws_options.get(&target_id) {
+                    *allocation = preferred_aws_option(options, previous).cloned();
+                    DashboardAction::None
+                } else {
+                    *allocation = None;
+                    DashboardAction::ResolveAwsResourceOptions {
+                        target_template_id: target_id,
+                    }
+                }
+            }
+            TargetTemplate::SshBare { .. } => {
+                *allocation = None;
+                DashboardAction::None
+            }
+        }
+    }
+
+    fn host_limits(&self, target_id: &str) -> Option<(u64, u64)> {
+        self.capacity_details
+            .values()
+            .find(|detail| detail.target.target_ids.iter().any(|id| id == target_id))
+            .and_then(|detail| detail.usage.as_ref())
+            .map(|usage| (usage.logical_cores, usage.memory_total_bytes))
+    }
+
+    fn adjust_new_resources(&self, wizard: &mut NewWizard, code: KeyCode) {
+        let target_id = nth_key(&self.config.targets, wizard.target);
+        adjust_resources(
+            &mut wizard.resource_allocation,
+            wizard.aws_options.get(&target_id),
+            self.host_limits(&target_id),
+            code,
+        );
+    }
+
+    fn adjust_resume_resources(&self, wizard: &mut ResumeWizard, code: KeyCode) {
+        let target_id = nth_key(&self.config.targets, wizard.target);
+        adjust_resources(
+            &mut wizard.resource_allocation,
+            wizard.aws_options.get(&target_id),
+            self.host_limits(&target_id),
+            code,
+        );
     }
 
     /// Apply a completion response only when the source text has not changed
@@ -1161,21 +1449,42 @@ impl DashboardState {
             return DashboardAction::None;
         }
         let profiles = self.compatible_profiles(&wizard.session_id);
+        if wizard.step == WizardStep::Target
+            && matches!(
+                code,
+                KeyCode::Char('+') | KeyCode::Char('-') | KeyCode::Char('r')
+            )
+        {
+            self.adjust_resume_resources(&mut wizard, code);
+            self.mode = Mode::Resume(wizard);
+            return DashboardAction::None;
+        }
         let len = match wizard.step {
             WizardStep::Profile => profiles.len(),
             WizardStep::Target => self.config.targets.len(),
             WizardStep::Bundle => unreachable!("resume does not select a bundle"),
             WizardStep::Mounts => unreachable!("resume does not select mounts"),
+            WizardStep::NewBundle => unreachable!("resume does not create bundles"),
         };
         if matches!(code, KeyCode::Up | KeyCode::Char('k')) {
             move_index(wizard.active_index_mut(), len, -1);
+            let action = if wizard.step == WizardStep::Target {
+                self.prepare_resume_target(&mut wizard)
+            } else {
+                DashboardAction::None
+            };
             self.mode = Mode::Resume(wizard);
-            return DashboardAction::None;
+            return action;
         }
         if matches!(code, KeyCode::Down | KeyCode::Char('j')) {
             move_index(wizard.active_index_mut(), len, 1);
+            let action = if wizard.step == WizardStep::Target {
+                self.prepare_resume_target(&mut wizard)
+            } else {
+                DashboardAction::None
+            };
             self.mode = Mode::Resume(wizard);
-            return DashboardAction::None;
+            return action;
         }
         if matches!(code, KeyCode::Backspace | KeyCode::Left) {
             match wizard.step {
@@ -1186,6 +1495,7 @@ impl DashboardState {
                 }
                 WizardStep::Bundle => unreachable!("resume does not select a bundle"),
                 WizardStep::Mounts => unreachable!("resume does not select mounts"),
+                WizardStep::NewBundle => unreachable!("resume does not create bundles"),
             }
             return DashboardAction::None;
         }
@@ -1196,23 +1506,41 @@ impl DashboardState {
         match wizard.step {
             WizardStep::Profile => {
                 wizard.step = WizardStep::Target;
+                let action = self.prepare_resume_target(&mut wizard);
                 self.mode = Mode::Resume(wizard);
-                DashboardAction::None
+                action
             }
             WizardStep::Target => {
+                let target_id = nth_key(&self.config.targets, wizard.target);
+                if matches!(
+                    self.config.targets[&target_id],
+                    TargetTemplate::AwsEc2 { .. }
+                ) && wizard.resource_allocation.is_none()
+                {
+                    self.notice = Some(
+                        wizard
+                            .sizing_error
+                            .clone()
+                            .unwrap_or_else(|| "EC2 sizes are still loading.".into()),
+                    );
+                    self.mode = Mode::Resume(wizard);
+                    return DashboardAction::None;
+                }
                 let action = DashboardAction::ResumeSession {
                     session_id: wizard.session_id,
                     profile_id: profiles
                         .get(wizard.profile)
                         .map(|(id, _)| (*id).clone())
                         .expect("resume wizard is only opened with a compatible profile"),
-                    target_template_id: nth_key(&self.config.targets, wizard.target),
+                    target_template_id: target_id,
+                    resource_allocation: wizard.resource_allocation,
                 };
                 self.cancel_modal();
                 action
             }
             WizardStep::Bundle => unreachable!("resume does not select a bundle"),
             WizardStep::Mounts => unreachable!("resume does not select mounts"),
+            WizardStep::NewBundle => unreachable!("resume does not create bundles"),
         }
     }
 
@@ -1324,11 +1652,8 @@ impl DashboardState {
     }
 
     fn begin_new(&mut self) {
-        if self.config.profiles.is_empty()
-            || self.config.bundles.is_empty()
-            || self.config.targets.is_empty()
-        {
-            self.notice = Some("Configure at least one profile, bundle, and target first.".into());
+        if self.config.profiles.is_empty() || self.config.targets.is_empty() {
+            self.notice = Some("Configure at least one profile and target first.".into());
             return;
         }
         self.mode = Mode::New(NewWizard {
@@ -1337,6 +1662,10 @@ impl DashboardState {
             bundle: 0,
             target: 0,
             mounts: MountWizard::new(Vec::new()),
+            new_bundle_source: String::new(),
+            resource_allocation: None,
+            aws_options: BTreeMap::new(),
+            sizing_error: None,
         });
     }
 
@@ -1366,6 +1695,9 @@ impl DashboardState {
             step: WizardStep::Profile,
             profile,
             target: 0,
+            resource_allocation: None,
+            aws_options: BTreeMap::new(),
+            sizing_error: None,
         });
     }
 
@@ -1418,17 +1750,11 @@ impl DashboardState {
                 .map(ProfileQuota::compact)
                 .unwrap_or_else(|| "refreshing".to_string())
         };
-        format!(
-            "{id}  {}  [{}]  ·  {quota}",
-            harness_label(harness),
-            harness.unrestricted_mode(),
-        )
+        format!("{id}  {}  ·  {quota}", harness_label(harness))
     }
 
     fn config_is_empty(&self) -> bool {
-        self.config.profiles.is_empty()
-            || self.config.bundles.is_empty()
-            || self.config.targets.is_empty()
+        self.config.profiles.is_empty() || self.config.targets.is_empty()
     }
 
     fn cancel_modal(&mut self) {
@@ -1585,6 +1911,108 @@ fn partition_sessions<'a>(
     (active, archived)
 }
 
+fn clamp_resources(cpus: u64, memory_bytes: u64, limits: Option<(u64, u64)>) -> (u64, u64) {
+    let Some((max_cpus, max_memory)) = limits else {
+        return (cpus.max(1), memory_bytes.max(1));
+    };
+    (
+        cpus.min(max_cpus.max(1)),
+        memory_bytes.min(max_memory.max(1)),
+    )
+}
+
+fn preferred_aws_option<'a>(
+    options: &'a [SessionResourceAllocation],
+    previous: Option<&SessionResourceAllocation>,
+) -> Option<&'a SessionResourceAllocation> {
+    if let Some(SessionResourceAllocation::AwsEc2 { instance_type, .. }) = previous
+        && let Some(option) = options.iter().find(|option| {
+            matches!(option, SessionResourceAllocation::AwsEc2 { instance_type: candidate, .. } if candidate == instance_type)
+        })
+    {
+        return Some(option);
+    }
+    options.iter().find(|option| allocation_cpus(option) == 8)
+}
+
+fn apply_aws_options(
+    target_id: &str,
+    result: std::result::Result<Vec<SessionResourceAllocation>, String>,
+    options_by_target: &mut BTreeMap<String, Vec<SessionResourceAllocation>>,
+    allocation: &mut Option<SessionResourceAllocation>,
+    sizing_error: &mut Option<String>,
+    previous: Option<&SessionResourceAllocation>,
+) {
+    match result {
+        Ok(options) => {
+            *allocation = preferred_aws_option(&options, previous).cloned();
+            options_by_target.insert(target_id.to_owned(), options);
+            *sizing_error = None;
+        }
+        Err(error) => {
+            *allocation = None;
+            *sizing_error = Some(error);
+        }
+    }
+}
+
+fn allocation_cpus(allocation: &SessionResourceAllocation) -> u64 {
+    match allocation {
+        SessionResourceAllocation::Container { cpus, .. } => *cpus,
+        SessionResourceAllocation::AwsEc2 { vcpus, .. } => *vcpus,
+    }
+}
+
+fn adjust_resources(
+    allocation: &mut Option<SessionResourceAllocation>,
+    aws_options: Option<&Vec<SessionResourceAllocation>>,
+    limits: Option<(u64, u64)>,
+    code: KeyCode,
+) {
+    let Some(current) = allocation.clone() else {
+        return;
+    };
+    match current {
+        SessionResourceAllocation::Container { cpus, memory_bytes } => {
+            let next = match code {
+                KeyCode::Char('r') => clamp_resources(BASELINE_CPUS, BASELINE_MEMORY_BYTES, limits),
+                KeyCode::Char('+') => {
+                    let Some((max_cpus, max_memory)) = limits else {
+                        return;
+                    };
+                    (
+                        cpus.saturating_mul(2).min(max_cpus.max(1)),
+                        memory_bytes.saturating_mul(2).min(max_memory.max(1)),
+                    )
+                }
+                KeyCode::Char('-') if cpus > 1 => (cpus / 2, (memory_bytes / 2).max(1)),
+                _ => return,
+            };
+            *allocation = Some(SessionResourceAllocation::Container {
+                cpus: next.0,
+                memory_bytes: next.1,
+            });
+        }
+        SessionResourceAllocation::AwsEc2 { vcpus, .. } => {
+            let Some(options) = aws_options else {
+                return;
+            };
+            let desired = match code {
+                KeyCode::Char('+') => vcpus.saturating_mul(2),
+                KeyCode::Char('-') if vcpus > 1 => vcpus / 2,
+                KeyCode::Char('r') => BASELINE_CPUS,
+                _ => return,
+            };
+            if let Some(next) = options
+                .iter()
+                .find(|option| allocation_cpus(option) == desired)
+            {
+                *allocation = Some(next.clone());
+            }
+        }
+    }
+}
+
 fn checkpoint_time(session: &SessionRecord) -> Option<chrono::DateTime<chrono::FixedOffset>> {
     session
         .checkpoint
@@ -1659,6 +2087,7 @@ impl NewWizard {
             WizardStep::Bundle => &mut self.bundle,
             WizardStep::Target => &mut self.target,
             WizardStep::Mounts => unreachable!("mount input has no picker index"),
+            WizardStep::NewBundle => unreachable!("bundle input has no picker index"),
         }
     }
 }
@@ -1670,6 +2099,7 @@ impl ResumeWizard {
             WizardStep::Target => &mut self.target,
             WizardStep::Bundle => unreachable!("resume does not select a bundle"),
             WizardStep::Mounts => unreachable!("resume does not select mounts"),
+            WizardStep::NewBundle => unreachable!("resume does not create bundles"),
         }
     }
 }
@@ -1971,7 +2401,6 @@ fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
 fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     let missing = [
         (dashboard.config.profiles.is_empty(), "a harness profile"),
-        (dashboard.config.bundles.is_empty(), "a project bundle"),
         (dashboard.config.targets.is_empty(), "a target template"),
     ]
     .into_iter()
@@ -2512,7 +2941,6 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         Row::new([
             Cell::from(id.clone()),
             Cell::from(harness_label(profile.kind)),
-            Cell::from(profile.unrestricted_mode()),
             Cell::from(usage),
         ])
     });
@@ -2545,12 +2973,11 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         [
             Constraint::Percentage(14),
             Constraint::Percentage(12),
-            Constraint::Percentage(18),
-            Constraint::Percentage(56),
+            Constraint::Percentage(74),
         ],
     )
     .header(
-        Row::new(["Profile", "Harness", "Access", "Quota / reset / error"])
+        Row::new(["Profile", "Harness", "Quota / reset / error"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .row_highlight_style(if quotas_focused {
@@ -2601,6 +3028,31 @@ fn render_new_wizard(
         render_mount_wizard(frame, area, dashboard, wizard);
         return;
     }
+    if wizard.step == WizardStep::NewBundle {
+        let popup = centered_rect(76, 8, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::raw("Local Git path or GitHub owner/repository:"),
+                Line::raw(""),
+                Line::styled(
+                    format!("> {}", wizard.new_bundle_source),
+                    Style::default().bg(Color::DarkGray).fg(Color::White),
+                ),
+                Line::styled(
+                    "Enter create · Backspace to return",
+                    Style::default().fg(Color::Gray),
+                ),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" New repository bundle "),
+            ),
+            popup,
+        );
+        return;
+    }
     let (title, choices, selected) = match wizard.step {
         WizardStep::Profile => (
             " New session · 1/3 profile ",
@@ -2619,6 +3071,7 @@ fn render_new_wizard(
                 .bundles
                 .iter()
                 .map(|(id, bundle)| format!("{id}  {} repositories", bundle.repositories.len()))
+                .chain(["New repository…".to_owned()])
                 .collect(),
             wizard.bundle,
         ),
@@ -2628,20 +3081,29 @@ fn render_new_wizard(
                 .config
                 .targets
                 .iter()
-                .map(|(id, target)| format!("{id}  {}", target_label(target)))
+                .map(|(id, target)| {
+                    let size = if id == &nth_key(&dashboard.config.targets, wizard.target) {
+                        resource_allocation_label(
+                            wizard.resource_allocation.as_ref(),
+                            wizard.sizing_error.as_deref(),
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!("{id}  {}{size}", target_label(target))
+                })
                 .collect(),
             wizard.target,
         ),
         WizardStep::Mounts => unreachable!("mount input was rendered above"),
+        WizardStep::NewBundle => unreachable!("bundle input was rendered above"),
     };
-    render_picker(
-        frame,
-        area,
-        title,
-        choices,
-        selected,
-        &["Enter next · ← back · Esc cancel"],
-    );
+    let help = if wizard.step == WizardStep::Target {
+        "+ double · - halve · r reset 8 CPU / 32 GiB · Enter next · ← back · Esc cancel"
+    } else {
+        "Enter next · ← back · Esc cancel"
+    };
+    render_picker(frame, area, title, choices, selected, &[help]);
 }
 
 fn render_mount_wizard(
@@ -2800,13 +3262,24 @@ fn render_resume_wizard(
                 .config
                 .targets
                 .iter()
-                .map(|(id, target)| format!("{id}  {}", target_label(target)))
+                .map(|(id, target)| {
+                    let size = if id == &nth_key(&dashboard.config.targets, wizard.target) {
+                        resource_allocation_label(
+                            wizard.resource_allocation.as_ref(),
+                            wizard.sizing_error.as_deref(),
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!("{id}  {}{size}", target_label(target))
+                })
                 .collect(),
             wizard.target,
-            &["Enter next · ← back · Esc cancel"][..],
+            &["+ double · - halve · r reset 8 CPU / 32 GiB · Enter next · ← back · Esc cancel"][..],
         ),
         WizardStep::Bundle => unreachable!("resume does not select a bundle"),
         WizardStep::Mounts => unreachable!("resume does not select mounts"),
+        WizardStep::NewBundle => unreachable!("resume does not create bundles"),
     };
     render_picker(frame, area, title, choices, selected, help);
 }
@@ -3009,6 +3482,30 @@ fn target_label(target: &TargetTemplate) -> &'static str {
     }
 }
 
+fn resource_allocation_label(
+    allocation: Option<&SessionResourceAllocation>,
+    error: Option<&str>,
+) -> String {
+    let allocation = match allocation {
+        Some(SessionResourceAllocation::Container { cpus, memory_bytes }) => {
+            format!(" · {cpus} CPU / {}", format_resource_bytes(*memory_bytes))
+        }
+        Some(SessionResourceAllocation::AwsEc2 {
+            instance_type,
+            vcpus,
+            memory_bytes,
+        }) => format!(
+            " · {instance_type} · {vcpus} CPU / {}",
+            format_resource_bytes(*memory_bytes)
+        ),
+        None => " · fixed/default resources".into(),
+    };
+    match error {
+        Some(error) => format!("{allocation} · {error}"),
+        None => allocation,
+    }
+}
+
 fn mount_history_host(target: &TargetTemplate) -> Option<&str> {
     match target {
         TargetTemplate::LocalPodman { .. } | TargetTemplate::AppleContainer { .. } => Some("local"),
@@ -3136,6 +3633,7 @@ mod tests {
             last_profile: "codex-1".into(),
             bundle_id: "hel".into(),
             target_template_id: "podman".into(),
+            resource_allocation: None,
             additional_mounts: vec![],
             state: SessionState::Archived,
             target: None,
@@ -3493,6 +3991,29 @@ mod tests {
                 target_template_id: "podman".into(),
                 additional_mounts: vec![],
                 allow_dirty_local: false,
+                resource_allocation: Some(SessionResourceAllocation::Container {
+                    cpus: BASELINE_CPUS,
+                    memory_bytes: BASELINE_MEMORY_BYTES,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn new_session_can_request_a_repository_when_no_bundle_exists() {
+        let mut config = config();
+        config.bundles.clear();
+        let mut dashboard = DashboardState::new(config, HelState::default(), BTreeMap::new());
+        dashboard.handle_key(key(KeyCode::Char('n')));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        for character in "example/new-repo".chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::CreateBundle {
+                source: "example/new-repo".into(),
             }
         );
     }
@@ -3523,6 +4044,10 @@ mod tests {
                     destination: "/mnt/cache".into(),
                 }],
                 allow_dirty_local: false,
+                resource_allocation: Some(SessionResourceAllocation::Container {
+                    cpus: BASELINE_CPUS,
+                    memory_bytes: BASELINE_MEMORY_BYTES,
+                }),
             }
         );
     }
@@ -3540,6 +4065,10 @@ mod tests {
                 session_id: "session-1".into(),
                 profile_id: "claude-1".into(),
                 target_template_id: "podman".into(),
+                resource_allocation: Some(SessionResourceAllocation::Container {
+                    cpus: BASELINE_CPUS,
+                    memory_bytes: BASELINE_MEMORY_BYTES,
+                }),
             }
         );
     }
@@ -4452,6 +4981,60 @@ mod tests {
     }
 
     #[test]
+    fn container_size_controls_clamp_independently_halves_current_ratio_and_reset() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 8,
+            memory_bytes: 32 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('+'));
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('+'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 32,
+                memory_bytes: 64 * gib,
+            })
+        );
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 16,
+                memory_bytes: 32 * gib,
+            })
+        );
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('r'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 8,
+                memory_bytes: 32 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn ec2_size_controls_use_exact_doubling_steps() {
+        let options = [8_u64, 16, 32]
+            .into_iter()
+            .map(|vcpus| SessionResourceAllocation::AwsEc2 {
+                instance_type: format!("family.{vcpus}"),
+                vcpus,
+                memory_bytes: vcpus * 4 * 1024 * 1024 * 1024,
+            })
+            .collect::<Vec<_>>();
+        let mut allocation = Some(options[0].clone());
+        adjust_resources(&mut allocation, Some(&options), None, KeyCode::Char('+'));
+        assert_eq!(allocation_cpus(allocation.as_ref().unwrap()), 16);
+        adjust_resources(&mut allocation, Some(&options), None, KeyCode::Char('r'));
+        assert_eq!(allocation_cpus(allocation.as_ref().unwrap()), 8);
+    }
+
+    #[test]
     fn failed_close_dialog_offers_retry_or_explicit_force_destroy() {
         let mut session = archived_session();
         session.state = SessionState::Running;
@@ -4700,5 +5283,7 @@ mod tests {
         assert!(rendered.contains("unavailable: offline"));
         assert!(rendered.contains("Profile Quotas (refreshed"));
         assert!(!rendered.contains("Refreshed"));
+        assert!(!rendered.contains("Access"));
+        assert!(!rendered.contains("agent-full-access"));
     }
 }
