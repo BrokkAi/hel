@@ -2,6 +2,8 @@
 
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -15,11 +17,13 @@ use hel::hel_config::{HelConfig, config_path, sessions_dir};
 use hel::hel_controller::Controller;
 use hel::hel_import::{
     BundleResolution, ClaudeImportRequest, ClaudeSessionSelection, CodexImportRequest,
-    CodexSessionSelection, KimiImportRequest, KimiSessionSelection, claude_config_home,
-    codex_config_home, import_claude_session, import_codex_session, import_kimi_session,
-    kimi_config_home, locate_claude_session, locate_codex_session, locate_kimi_session,
-    read_claude_transcript, read_codex_transcript, read_kimi_transcript, resolve_bundle,
-    scan_claude_sessions, scan_codex_sessions, scan_kimi_sessions,
+    CodexSessionSelection, ImportArchiveProgress, ImportControl, KimiImportRequest,
+    KimiSessionSelection, claude_config_home, codex_config_home, import_claude_session,
+    import_claude_session_with_control, import_codex_session, import_codex_session_with_control,
+    import_kimi_session, import_kimi_session_with_control, kimi_config_home, locate_claude_session,
+    locate_codex_session, locate_kimi_session, read_claude_transcript, read_codex_transcript,
+    read_kimi_transcript, resolve_bundle, scan_claude_sessions, scan_codex_sessions,
+    scan_kimi_sessions,
 };
 use hel::hel_quota::{ProfileQuota, QuotaManager, QuotaRefreshRequest};
 use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapshot};
@@ -1320,18 +1324,26 @@ struct DashboardImportSuccess {
 enum DashboardImportTaskResult {
     NeedsBundle(ImportBundlePrompt),
     Imported(DashboardImportSuccess),
+    Cancelled,
 }
 
 enum DashboardImportUpdate {
     Progress {
+        task_id: u64,
         step: usize,
         total: Option<usize>,
         message: String,
     },
     Finished {
+        task_id: u64,
         pending: PendingDashboardImport,
         result: Result<DashboardImportTaskResult>,
     },
+}
+
+struct ActiveDashboardImport {
+    task_id: u64,
+    cancelled: Arc<AtomicBool>,
 }
 
 async fn run_dashboard() -> Result<()> {
@@ -1375,6 +1387,8 @@ async fn run_dashboard() -> Result<()> {
         tokio::sync::mpsc::channel::<DashboardImportUpdate>(8);
     let mut pending_import = None;
     let mut import_discovery_id = 0_u64;
+    let mut next_import_task_id = 0_u64;
+    let mut active_import: Option<ActiveDashboardImport> = None;
     let termination = hel::termination::Coordinator::install().token();
 
     loop {
@@ -1405,71 +1419,96 @@ async fn run_dashboard() -> Result<()> {
         while let Ok(update) = import_task_rx.try_recv() {
             match update {
                 DashboardImportUpdate::Progress {
+                    task_id,
                     step,
                     total,
                     message,
-                } => dashboard.update_import_progress(step, total, message),
-                DashboardImportUpdate::Finished { pending, result } => match result {
-                    Ok(DashboardImportTaskResult::NeedsBundle(prompt)) => {
-                        pending_import = Some(pending);
-                        dashboard.show_import_bundle_confirmation(
-                            prompt.bundle_id,
-                            prompt.github,
-                            prompt.destination,
-                        );
+                } => {
+                    if active_import
+                        .as_ref()
+                        .is_some_and(|active| active.task_id == task_id)
+                    {
+                        dashboard.update_import_progress(step, total, message);
                     }
-                    Ok(DashboardImportTaskResult::Imported(mut imported)) => {
-                        let applied = (|| -> Result<()> {
-                            let session = imported
-                                .controller
-                                .state
-                                .sessions
-                                .remove(&imported.session_id)
-                                .context("import worker did not return its new session")?;
-                            let bundle = imported
-                                .controller
-                                .config
-                                .bundles
-                                .get(&session.bundle_id)
-                                .cloned()
-                                .context("import worker did not return its session bundle")?;
-                            controller
-                                .config
-                                .bundles
-                                .insert(session.bundle_id.clone(), bundle);
-                            controller
-                                .state
-                                .sessions
-                                .insert(session.id.clone(), session);
-                            controller.config.save()?;
-                            controller.state.save()?;
-                            Ok(())
-                        })();
-                        dashboard.finish_import();
-                        match applied {
-                            Ok(()) => {
-                                dashboard.set_config(controller.config.clone());
-                                dashboard.set_state(controller.state.clone());
-                                refresh_dashboard_poll_targets(
-                                    &controller,
-                                    &worker_targets_tx,
-                                    &resource_targets_tx,
-                                );
-                                dashboard.set_notice(format!(
-                                    "Imported {} session {}.",
-                                    imported.harness, pending.native_session_id
-                                ));
-                            }
-                            Err(error) => {
-                                dashboard.set_notice(format!("Import failed: {error:#}"));
+                }
+                DashboardImportUpdate::Finished {
+                    task_id,
+                    pending,
+                    result,
+                } => {
+                    if active_import
+                        .as_ref()
+                        .is_none_or(|active| active.task_id != task_id)
+                    {
+                        continue;
+                    }
+                    active_import = None;
+                    match result {
+                        Ok(DashboardImportTaskResult::NeedsBundle(prompt)) => {
+                            pending_import = Some(pending);
+                            dashboard.show_import_bundle_confirmation(
+                                prompt.bundle_id,
+                                prompt.github,
+                                prompt.destination,
+                            );
+                        }
+                        Ok(DashboardImportTaskResult::Imported(mut imported)) => {
+                            let applied = (|| -> Result<()> {
+                                let session = imported
+                                    .controller
+                                    .state
+                                    .sessions
+                                    .remove(&imported.session_id)
+                                    .context("import worker did not return its new session")?;
+                                let bundle = imported
+                                    .controller
+                                    .config
+                                    .bundles
+                                    .get(&session.bundle_id)
+                                    .cloned()
+                                    .context("import worker did not return its session bundle")?;
+                                controller
+                                    .config
+                                    .bundles
+                                    .insert(session.bundle_id.clone(), bundle);
+                                controller
+                                    .state
+                                    .sessions
+                                    .insert(session.id.clone(), session);
+                                controller.config.save()?;
+                                controller.state.save()?;
+                                Ok(())
+                            })();
+                            dashboard.finish_import();
+                            match applied {
+                                Ok(()) => {
+                                    dashboard.set_config(controller.config.clone());
+                                    dashboard.set_state(controller.state.clone());
+                                    refresh_dashboard_poll_targets(
+                                        &controller,
+                                        &worker_targets_tx,
+                                        &resource_targets_tx,
+                                    );
+                                    dashboard.set_notice(format!(
+                                        "Imported {} session {}.",
+                                        imported.harness, pending.native_session_id
+                                    ));
+                                }
+                                Err(error) => {
+                                    dashboard.set_notice(format!("Import failed: {error:#}"));
+                                }
                             }
                         }
+                        Ok(DashboardImportTaskResult::Cancelled) => {
+                            dashboard.finish_import();
+                            dashboard.set_notice("Import cancelled; no Hel files were changed.");
+                        }
+                        Err(error) => {
+                            dashboard.finish_import();
+                            dashboard.set_notice(format!("Import failed: {error:#}"));
+                        }
                     }
-                    Err(error) => {
-                        dashboard.finish_import();
-                        dashboard.set_notice(format!("Import failed: {error:#}"));
-                    }
-                },
+                }
             }
         }
         terminal
@@ -1552,7 +1591,28 @@ async fn run_dashboard() -> Result<()> {
                     display_title,
                 };
                 dashboard.show_import_progress(pending.display_title.clone());
-                spawn_dashboard_import(&controller, pending, false, import_task_tx.clone());
+                next_import_task_id = next_import_task_id.wrapping_add(1);
+                let cancelled = Arc::new(AtomicBool::new(false));
+                active_import = Some(ActiveDashboardImport {
+                    task_id: next_import_task_id,
+                    cancelled: cancelled.clone(),
+                });
+                spawn_dashboard_import(
+                    &controller,
+                    pending,
+                    false,
+                    next_import_task_id,
+                    cancelled,
+                    import_task_tx.clone(),
+                );
+            }
+            DashboardAction::CancelImport => {
+                if let Some(active) = active_import.take() {
+                    active.cancelled.store(true, Ordering::Release);
+                    dashboard.finish_import();
+                    dashboard
+                        .set_notice("Import cancellation requested; no Hel state will be changed.");
+                }
             }
             DashboardAction::ConfirmImportBundle { accepted } => {
                 let Some(pending) = pending_import.take() else {
@@ -1562,7 +1622,20 @@ async fn run_dashboard() -> Result<()> {
                 };
                 if accepted {
                     dashboard.show_import_progress(pending.display_title.clone());
-                    spawn_dashboard_import(&controller, pending, true, import_task_tx.clone());
+                    next_import_task_id = next_import_task_id.wrapping_add(1);
+                    let cancelled = Arc::new(AtomicBool::new(false));
+                    active_import = Some(ActiveDashboardImport {
+                        task_id: next_import_task_id,
+                        cancelled: cancelled.clone(),
+                    });
+                    spawn_dashboard_import(
+                        &controller,
+                        pending,
+                        true,
+                        next_import_task_id,
+                        cancelled,
+                        import_task_tx.clone(),
+                    );
                 } else {
                     dashboard.finish_import();
                     dashboard.set_notice("Import cancelled; no Hel files were changed.");
@@ -2034,6 +2107,8 @@ fn spawn_dashboard_import(
     controller: &Controller,
     pending: PendingDashboardImport,
     allow_synthesized_bundle: bool,
+    task_id: u64,
+    cancelled: Arc<AtomicBool>,
     updates: tokio::sync::mpsc::Sender<DashboardImportUpdate>,
 ) {
     let worker_controller = Controller {
@@ -2041,27 +2116,105 @@ fn spawn_dashboard_import(
         state: controller.state.clone(),
     };
     tokio::task::spawn_blocking(move || {
-        let result = import_session_from_profile(
+        let last_detail_update = Mutex::new(Instant::now() - Duration::from_secs(1));
+        let report = |step: usize, total: Option<usize>, message: &str, force: bool| {
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            if force {
+                let _ = updates.blocking_send(DashboardImportUpdate::Progress {
+                    task_id,
+                    step,
+                    total,
+                    message: message.into(),
+                });
+                return;
+            }
+            let mut last_update = last_detail_update.lock().expect("import progress lock");
+            let now = Instant::now();
+            if now.duration_since(*last_update) < Duration::from_millis(250) {
+                return;
+            }
+            if updates
+                .try_send(DashboardImportUpdate::Progress {
+                    task_id,
+                    step,
+                    total,
+                    message: message.into(),
+                })
+                .is_ok()
+            {
+                *last_update = now;
+            }
+        };
+        let mut result = import_session_from_profile(
             worker_controller,
             &pending.profile_id,
             &pending.native_session_id,
             &pending.display_title,
             allow_synthesized_bundle,
-            |step, total, message| {
-                let _ = updates.blocking_send(DashboardImportUpdate::Progress {
-                    step,
-                    total,
-                    message: message.into(),
-                });
-            },
+            &cancelled,
+            report,
         );
-        let _ = updates.blocking_send(DashboardImportUpdate::Finished { pending, result });
+        if cancelled.load(Ordering::Acquire) {
+            if let Ok(DashboardImportTaskResult::Imported(imported)) = &result
+                && let Some(path) = imported
+                    .controller
+                    .state
+                    .sessions
+                    .get(&imported.session_id)
+                    .and_then(|session| session.checkpoint.as_ref())
+                    .map(|checkpoint| checkpoint.archive_path.clone())
+            {
+                let _ = std::fs::remove_file(path);
+            }
+            result = Ok(DashboardImportTaskResult::Cancelled);
+        }
+        let _ = updates.blocking_send(DashboardImportUpdate::Finished {
+            task_id,
+            pending,
+            result,
+        });
     });
 }
 
 enum BackgroundBundleResolution {
     Ready(String),
     NeedsConfirmation(ImportBundlePrompt),
+}
+
+fn report_import_archive_progress(
+    progress: ImportArchiveProgress,
+    report: &(impl Fn(usize, Option<usize>, &str, bool) + Sync),
+) {
+    match progress {
+        ImportArchiveProgress::Repository { current, total, id } => report(
+            current,
+            Some(total),
+            &format!("Snapshotting repository {current}/{total}: {id}"),
+            true,
+        ),
+        ImportArchiveProgress::UntrackedFile {
+            repository_id,
+            current,
+            total,
+            path,
+        } => report(
+            current,
+            Some(total),
+            &format!(
+                "Repository {repository_id}: archiving untracked file {current}/{total}: {}",
+                path.display()
+            ),
+            current == 1 || current == total,
+        ),
+        ImportArchiveProgress::WritingArchive => report(
+            1,
+            None,
+            "Writing, syncing, and verifying the archive…",
+            true,
+        ),
+    }
 }
 
 fn resolve_background_import_bundle(
@@ -2094,9 +2247,10 @@ fn import_session_from_profile(
     native_session_id: &str,
     display_title: &str,
     allow_synthesized_bundle: bool,
-    mut report: impl FnMut(usize, Option<usize>, &str),
+    cancelled: &AtomicBool,
+    report: impl Fn(usize, Option<usize>, &str, bool) + Sync,
 ) -> Result<DashboardImportTaskResult> {
-    report(1, None, "Locating native session…");
+    report(1, None, "Locating native session…", true);
     let profile = controller
         .config
         .profiles
@@ -2110,7 +2264,7 @@ fn import_session_from_profile(
                 &CodexSessionSelection::NativeSessionId(native_session_id.into()),
             )?;
             let transcript = read_codex_transcript(&source.jsonl_path)?;
-            report(2, Some(4), "Native session parsed.");
+            report(2, Some(4), "Native session parsed.", true);
             let bundle_id = match resolve_background_import_bundle(
                 &mut controller.config,
                 &transcript.cwd,
@@ -2121,8 +2275,12 @@ fn import_session_from_profile(
                     return Ok(DashboardImportTaskResult::NeedsBundle(prompt));
                 }
             };
-            report(3, Some(4), "Building and verifying archive…");
-            let imported = import_codex_session(
+            let archive_progress = |progress| report_import_archive_progress(progress, &report);
+            let control = ImportControl {
+                cancelled,
+                progress: &archive_progress,
+            };
+            let imported = import_codex_session_with_control(
                 &controller.config,
                 &mut controller.state,
                 CodexImportRequest {
@@ -2134,8 +2292,9 @@ fn import_session_from_profile(
                     title: Some(display_title),
                     archive_directory: &sessions_dir(),
                 },
+                &control,
             )?;
-            report(4, Some(4), "Finalizing imported session…");
+            report(4, Some(4), "Finalizing imported session…", true);
             Ok(DashboardImportTaskResult::Imported(
                 DashboardImportSuccess {
                     harness: "Codex",
@@ -2150,7 +2309,7 @@ fn import_session_from_profile(
                 &ClaudeSessionSelection::NativeSessionId(native_session_id.into()),
             )?;
             let transcript = read_claude_transcript(&source.jsonl_path)?;
-            report(2, Some(4), "Native session parsed.");
+            report(2, Some(4), "Native session parsed.", true);
             let bundle_id = match resolve_background_import_bundle(
                 &mut controller.config,
                 &transcript.cwd,
@@ -2161,8 +2320,12 @@ fn import_session_from_profile(
                     return Ok(DashboardImportTaskResult::NeedsBundle(prompt));
                 }
             };
-            report(3, Some(4), "Building and verifying archive…");
-            let imported = import_claude_session(
+            let archive_progress = |progress| report_import_archive_progress(progress, &report);
+            let control = ImportControl {
+                cancelled,
+                progress: &archive_progress,
+            };
+            let imported = import_claude_session_with_control(
                 &controller.config,
                 &mut controller.state,
                 ClaudeImportRequest {
@@ -2174,8 +2337,9 @@ fn import_session_from_profile(
                     title: Some(display_title),
                     archive_directory: &sessions_dir(),
                 },
+                &control,
             )?;
-            report(4, Some(4), "Finalizing imported session…");
+            report(4, Some(4), "Finalizing imported session…", true);
             Ok(DashboardImportTaskResult::Imported(
                 DashboardImportSuccess {
                     harness: "Claude",
@@ -2190,7 +2354,7 @@ fn import_session_from_profile(
                 &KimiSessionSelection::NativeSessionId(native_session_id.into()),
             )?;
             let transcript = read_kimi_transcript(&source.session_path)?;
-            report(2, Some(4), "Native session parsed.");
+            report(2, Some(4), "Native session parsed.", true);
             let bundle_id = match resolve_background_import_bundle(
                 &mut controller.config,
                 &transcript.cwd,
@@ -2201,8 +2365,12 @@ fn import_session_from_profile(
                     return Ok(DashboardImportTaskResult::NeedsBundle(prompt));
                 }
             };
-            report(3, Some(4), "Building and verifying archive…");
-            let imported = import_kimi_session(
+            let archive_progress = |progress| report_import_archive_progress(progress, &report);
+            let control = ImportControl {
+                cancelled,
+                progress: &archive_progress,
+            };
+            let imported = import_kimi_session_with_control(
                 &controller.config,
                 &mut controller.state,
                 KimiImportRequest {
@@ -2214,8 +2382,9 @@ fn import_session_from_profile(
                     title: Some(display_title),
                     archive_directory: &sessions_dir(),
                 },
+                &control,
             )?;
-            report(4, Some(4), "Finalizing imported session…");
+            report(4, Some(4), "Finalizing imported session…", true);
             Ok(DashboardImportTaskResult::Imported(
                 DashboardImportSuccess {
                     harness: "Kimi",

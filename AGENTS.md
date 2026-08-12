@@ -12,6 +12,36 @@ The instruction "commit" means that you must commit on the current branch. It do
 
 Stage and commit only the files that you changed. Do not run `git add -A`. Do not include unrelated working-tree changes in the commit.
 
+## Engineering Guidance
+
+Continue when there is a clear next step toward the requested goal. Do not stop
+for unnecessary approval.
+
+Prefer behavior tests that prove the advertised interface. Do not add tests that
+only duplicate implementation lists or internal construction order.
+
+Do not create a new workspace crate only to reorganize code. Create one only
+when a clear dependency, compilation, publication, or ownership boundary
+requires it.
+
+Fix the source of a problem. Do not add a narrow fallback that hides a failure
+in the primary design.
+
+Keep file and path handling independent of the operating system. Use `Path` and
+`PathBuf`; normalize path text only at protocol or rendering boundaries.
+
+Do not silently discard errors from spawned threads, tasks, or Rayon work.
+Propagate or report failures with useful context.
+
+Before adding a helper that interprets paths, strings, or shared data shapes,
+search for an existing helper. Put shared interpretation in one location.
+
+Keep small single-use types and computations near the code that uses them.
+Prefer hand-written test fakes over mocking or dependency-injection frameworks.
+
+Do not redirect Cargo or other build output into `/tmp`. If sandbox restrictions
+block normal build storage, run the build outside the sandbox.
+
 Unit tests are colocated in module-level `#[cfg(test)]` blocks. `tests/` holds only the PTY termination test and the `tests/e2e/` shell/expect harness.
 
 ## Coding Style & Naming Conventions

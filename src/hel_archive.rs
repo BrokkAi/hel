@@ -866,10 +866,28 @@ pub struct GitCollectionSpec {
     pub origin_override: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitSnapshotProgress {
+    UntrackedFile {
+        current: usize,
+        total: usize,
+        path: PathBuf,
+    },
+}
+
 pub fn collect_git_snapshot(
     runner: &dyn GitCommandRunner,
     repository: &Path,
     spec: &GitCollectionSpec,
+) -> Result<RepositorySnapshot> {
+    collect_git_snapshot_with_progress(runner, repository, spec, &|_| Ok(()))
+}
+
+pub fn collect_git_snapshot_with_progress(
+    runner: &dyn GitCommandRunner,
+    repository: &Path,
+    spec: &GitCollectionSpec,
+    progress: &(dyn Fn(GitSnapshotProgress) -> Result<()> + Sync),
 ) -> Result<RepositorySnapshot> {
     validate_component(&spec.id, "repository id")?;
     validate_archive_relative_path(&spec.relative_destination)?;
@@ -964,7 +982,7 @@ pub fn collect_git_snapshot(
                         &[],
                         "list nonignored untracked files",
                     )?;
-                    build_untracked_tar(repository, &untracked)
+                    build_untracked_tar(repository, &untracked, progress)
                 },
             )
         },
@@ -1145,14 +1163,20 @@ fn git_failure(action: &str, output: &GitOutput) -> anyhow::Error {
     )
 }
 
-fn build_untracked_tar(repository: &Path, nul_paths: &[u8]) -> Result<Vec<u8>> {
+fn build_untracked_tar(
+    repository: &Path,
+    nul_paths: &[u8],
+    progress: &(dyn Fn(GitSnapshotProgress) -> Result<()> + Sync),
+) -> Result<Vec<u8>> {
+    let paths = nul_paths
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    let total = paths.len();
     let mut output = Vec::new();
     {
         let mut builder = tar::Builder::new(&mut output);
-        for raw_path in nul_paths
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-        {
+        for (index, raw_path) in paths.into_iter().enumerate() {
             let relative = path_from_git_bytes(raw_path)?;
             validate_archive_relative_path(&relative)?;
             // In addition to Git's ignore rules, skip conventional credential
@@ -1160,6 +1184,11 @@ fn build_untracked_tar(repository: &Path, nul_paths: &[u8]) -> Result<Vec<u8>> {
             if ensure_not_secret_path(&relative).is_err() {
                 continue;
             }
+            progress(GitSnapshotProgress::UntrackedFile {
+                current: index + 1,
+                total,
+                path: relative.clone(),
+            })?;
             let source = repository.join(&relative);
             ensure_no_symlink_ancestors(repository, &relative)?;
             let metadata = fs::symlink_metadata(&source)
@@ -1610,7 +1639,7 @@ mod tests {
         let paths = b"scripts/tool\0scripts/current\0".to_vec();
         #[cfg(not(unix))]
         let paths = b"scripts/tool\0".to_vec();
-        let tar = build_untracked_tar(source.path(), &paths).unwrap();
+        let tar = build_untracked_tar(source.path(), &paths, &|_| Ok(())).unwrap();
         validate_untracked_tar(&tar).unwrap();
 
         let destination = tempfile::tempdir().unwrap();
@@ -1635,6 +1664,25 @@ mod tests {
                 PathBuf::from("tool")
             );
         }
+    }
+
+    #[test]
+    fn untracked_tar_progress_can_cancel_before_opening_the_next_file() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("first.txt"), b"first").unwrap();
+        let paths = b"first.txt\0missing.txt\0";
+        let seen = std::sync::Mutex::new(Vec::new());
+
+        let error = build_untracked_tar(source.path(), paths, &|progress| {
+            let GitSnapshotProgress::UntrackedFile { current, total, .. } = progress;
+            seen.lock().unwrap().push((current, total));
+            ensure!(current < 2, "cancelled by test");
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled by test"));
+        assert_eq!(*seen.lock().unwrap(), vec![(1, 2), (2, 2)]);
     }
 
     #[test]

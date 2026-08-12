@@ -4,7 +4,7 @@
 //! Input is reduced to [`DashboardAction`] values for the controller to run.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -31,6 +31,7 @@ const FORCE_CONFIRMATION: &str = "DESTROY";
 const ACTIVE_MESSAGE_LINES: usize = 4;
 const ACTIVE_SESSION_ROW_HEIGHT: u16 = ACTIVE_MESSAGE_LINES as u16 + 1;
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
+const IMPORT_STALL_WARNING_AFTER: Duration = Duration::from_secs(10);
 
 /// A side effect requested by the dashboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +76,7 @@ pub enum DashboardAction {
         native_session_id: String,
         display_title: String,
     },
+    CancelImport,
     ConfirmImportBundle {
         accepted: bool,
     },
@@ -205,6 +207,7 @@ struct ImportProgress {
     step: usize,
     total: Option<usize>,
     message: String,
+    last_updated: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -507,6 +510,7 @@ impl DashboardState {
             step: 1,
             total: None,
             message: "Locating native session…".into(),
+            last_updated: Instant::now(),
         });
     }
 
@@ -517,6 +521,7 @@ impl DashboardState {
         progress.step = step;
         progress.total = total;
         progress.message = message;
+        progress.last_updated = Instant::now();
     }
 
     pub fn show_import_bundle_confirmation(
@@ -562,7 +567,10 @@ impl DashboardState {
             Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
             Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
             Mode::Import(dialog) => self.handle_import_key(key.code, dialog),
-            Mode::Importing(_) => DashboardAction::None,
+            Mode::Importing(_) => match key.code {
+                KeyCode::Esc => DashboardAction::CancelImport,
+                _ => DashboardAction::None,
+            },
             Mode::ConfirmImportBundle(_) => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     DashboardAction::ConfirmImportBundle { accepted: true }
@@ -1561,11 +1569,26 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
 }
 
 fn render_import_progress(frame: &mut Frame, area: Rect, progress: &ImportProgress) {
-    let popup = centered_rect(68, 8, area);
+    let popup = centered_rect(76, 10, area);
     frame.render_widget(Clear, popup);
     let total = progress
         .total
         .map_or_else(|| "?".into(), |total| total.to_string());
+    let stalled_for = progress.last_updated.elapsed();
+    let status = if stalled_for >= IMPORT_STALL_WARNING_AFTER {
+        Line::styled(
+            format!(
+                "No progress for {}s; the filesystem may be stalled.",
+                stalled_for.as_secs()
+            ),
+            Style::default().fg(Color::Yellow),
+        )
+    } else {
+        Line::styled(
+            "The dashboard remains responsive while the import runs.",
+            Style::default().fg(Color::Gray),
+        )
+    };
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
@@ -1574,13 +1597,11 @@ fn render_import_progress(frame: &mut Frame, area: Rect, progress: &ImportProgre
             ),
             Line::raw(""),
             Line::raw(progress.message.clone()),
-            Line::styled(
-                "The dashboard remains responsive while the import runs.",
-                Style::default().fg(Color::Gray),
-            ),
+            status,
+            Line::styled("Esc cancels this import.", Style::default().fg(Color::Gray)),
         ])
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " Importing session · step {}/{total} ",
+            " Importing session · progress {}/{total} ",
             progress.step
         )))
         .wrap(Wrap { trim: true }),
@@ -3460,7 +3481,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Importing session · step 1/?"));
+        assert!(rendered.contains("Importing session · progress 1/?"));
 
         dashboard.update_import_progress(2, Some(4), "Native session parsed.".into());
         terminal
@@ -3473,8 +3494,28 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Importing session · step 2/4"));
+        assert!(rendered.contains("Importing session · progress 2/4"));
         assert!(rendered.contains("Native session parsed."));
+
+        let Mode::Importing(progress) = &mut dashboard.mode else {
+            panic!("expected import progress");
+        };
+        progress.last_updated = Instant::now() - IMPORT_STALL_WARNING_AFTER;
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw stalled import progress");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("filesystem may be stalled"));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Esc)),
+            DashboardAction::CancelImport
+        );
     }
 
     #[test]
