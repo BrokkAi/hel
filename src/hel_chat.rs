@@ -1291,7 +1291,7 @@ impl ChatState {
                 ChatRole::System,
                 format!("warning: {message}"),
             )),
-            RuntimeEvent::ConfigApplied { key, value } => self.entries.push(ChatEntry::plain(
+            RuntimeEvent::ConfigApplied { key, value, .. } => self.entries.push(ChatEntry::plain(
                 seq,
                 ChatRole::System,
                 format!("{key} set to {value}"),

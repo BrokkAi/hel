@@ -37,7 +37,9 @@ use hel::hel_tui::{
 };
 use hel::hel_worker::SequencedEvent;
 use hel::hel_worker_client::WorkerClient;
-use hel::hel_worker_runtime::{WorkerLaunchConfig, proxy, run_daemon};
+use hel::hel_worker_runtime::{
+    AcpSupervisorSpec, WorkerLaunchConfig, proxy, run_acp_supervisor, run_daemon,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -64,6 +66,45 @@ enum Command {
     Setup(SetupArgs),
     /// Adopt a native coding-agent session as an archived Hel session.
     Import(ImportArgs),
+    /// Find, adopt, or explicitly destroy managed workers missing from state.
+    Recover(RecoverArgs),
+}
+
+#[derive(Debug, Args)]
+struct RecoverArgs {
+    #[command(subcommand)]
+    command: RecoverCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum RecoverCommand {
+    /// List managed worker resources not present in controller state.
+    Scan {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Probe a managed worker and add it back to controller state.
+    Adopt {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        target: String,
+        /// Required only for current-v1 workers created before ownership markers.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Required only for current-v1 workers created before ownership markers.
+        #[arg(long)]
+        bundle: Option<String>,
+    },
+    /// Destroy an untracked managed resource after exact-ID confirmation.
+    Destroy {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        confirm: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -245,6 +286,7 @@ struct WorkerPollUpdate {
 
 #[derive(Debug)]
 enum WorkerPollPayload {
+    Connected,
     Events(Vec<SequencedEvent>),
     /// The worker failed several consecutive polls; the session needs
     /// attention and a diagnosis.
@@ -299,6 +341,11 @@ enum WorkerCommand {
     Proxy {
         #[arg(long)]
         root: PathBuf,
+    },
+    /// Supervise the ACP bridge process tree for a worker daemon.
+    AcpSupervisor {
+        #[arg(long)]
+        spec: PathBuf,
     },
     /// Build a target-side archive for verified controller transfer.
     ExportCheckpoint {
@@ -372,6 +419,9 @@ async fn main() -> Result<()> {
                 result
             }
             WorkerCommand::Proxy { root } => proxy(root).await,
+            WorkerCommand::AcpSupervisor { spec } => {
+                run_acp_supervisor(AcpSupervisorSpec::read(&spec)?).await
+            }
             WorkerCommand::ExportCheckpoint { spec } => {
                 let checkpoint = hel::hel_checkpoint::export_from_spec_file(&spec)?;
                 println!("{}", serde_json::to_string(&checkpoint)?);
@@ -394,6 +444,62 @@ async fn main() -> Result<()> {
         Some(Command::Doctor(args)) => doctor(args),
         Some(Command::Setup(args)) => setup(args),
         Some(Command::Import(args)) => import(args),
+        Some(Command::Recover(args)) => recover(args).await,
+    }
+}
+
+async fn recover(args: RecoverArgs) -> Result<()> {
+    let mut controller = Controller::load()?;
+    match args.command {
+        RecoverCommand::Scan { json } => {
+            let scan = controller.scan_orphan_workers(&ProcessExecutor);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&scan)?);
+            } else {
+                for candidate in &scan.candidates {
+                    let metadata = if candidate.ownership.is_some() {
+                        "ownership verified"
+                    } else {
+                        "v1 resource; profile and bundle unknown"
+                    };
+                    println!(
+                        "{}\t{}\t{}",
+                        candidate.session_id, candidate.target_template_id, metadata
+                    );
+                }
+                for warning in &scan.warnings {
+                    eprintln!("warning: {warning}");
+                }
+            }
+            Ok(())
+        }
+        RecoverCommand::Adopt {
+            session,
+            target,
+            profile,
+            bundle,
+        } => {
+            controller
+                .adopt_orphan_worker(
+                    &session,
+                    &target,
+                    profile.as_deref(),
+                    bundle.as_deref(),
+                    &ProcessExecutor,
+                )
+                .await?;
+            println!("adopted worker {session}");
+            Ok(())
+        }
+        RecoverCommand::Destroy {
+            session,
+            target,
+            confirm,
+        } => {
+            controller.destroy_orphan_worker(&session, &target, &confirm, &ProcessExecutor)?;
+            println!("destroyed orphan worker resource {session}");
+            Ok(())
+        }
     }
 }
 
@@ -1123,9 +1229,20 @@ async fn poll_dashboard_workers(
         };
         let failure = match synced {
             Some(Ok(Ok(events))) => {
-                failures.remove(&target.session_id);
+                let recovered = failures.remove(&target.session_id).is_some();
                 if let Some(worker) = clients.get_mut(&target.session_id) {
                     worker.chat.apply_events(&events);
+                }
+                if recovered
+                    && updates
+                        .send(WorkerPollUpdate {
+                            session_id: target.session_id.clone(),
+                            payload: WorkerPollPayload::Connected,
+                        })
+                        .await
+                        .is_err()
+                {
+                    return false;
                 }
                 if !events.is_empty()
                     && updates
@@ -1170,6 +1287,16 @@ async fn poll_dashboard_workers(
                                 chat,
                             },
                         );
+                        if updates
+                            .send(WorkerPollUpdate {
+                                session_id: target.session_id.clone(),
+                                payload: WorkerPollPayload::Connected,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return false;
+                        }
                         if !events.is_empty()
                             && updates
                                 .send(WorkerPollUpdate {
@@ -1236,6 +1363,20 @@ fn apply_worker_poll_update(
 ) -> Result<bool> {
     let mut latest_message_updated = false;
     match update.payload {
+        WorkerPollPayload::Connected => {
+            if let Some(session) = controller.state.sessions.get_mut(&update.session_id)
+                && session.state == SessionState::Error
+                && session
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|message| message.starts_with("worker unreachable:"))
+            {
+                session.state = SessionState::Running;
+                session.last_error = None;
+                controller.state.save()?;
+                dashboard.set_state(controller.state.clone());
+            }
+        }
         WorkerPollPayload::Events(events) => {
             if let Some(title) = harness_session_title(&events)
                 && let Some(session) = controller.state.sessions.get_mut(&update.session_id)
@@ -1254,14 +1395,6 @@ fn apply_worker_poll_update(
             if let Some(diagnosis) = diagnosis {
                 message.push_str("; ");
                 message.push_str(&diagnosis);
-            }
-            if let Some(session) = controller.state.sessions.get_mut(&update.session_id)
-                && session.state == SessionState::Running
-            {
-                session.state = SessionState::Error;
-                session.last_error = Some(message.clone());
-                controller.state.save()?;
-                dashboard.set_state(controller.state.clone());
             }
             dashboard.set_notice(format!(
                 "Session {}: {message}",

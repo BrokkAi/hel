@@ -106,6 +106,21 @@ pub enum WorkerRequest {
 }
 
 impl WorkerRequest {
+    pub(crate) const fn method_name(&self) -> &'static str {
+        match self {
+            Self::Hello { .. } => "hello",
+            Self::Status => "status",
+            Self::Snapshot => "snapshot",
+            Self::Subscribe { .. } => "subscribe",
+            Self::Prompt { .. } => "prompt",
+            Self::Compact { .. } => "compact",
+            Self::Cancel => "cancel",
+            Self::SetConfig { .. } => "set_config",
+            Self::Checkpoint { .. } => "checkpoint",
+            Self::Close => "close",
+        }
+    }
+
     fn is_mutating(&self) -> bool {
         matches!(
             self,
@@ -170,6 +185,14 @@ pub struct ProtocolError {
     pub code: ErrorCode,
     pub message: String,
     pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ProtocolErrorDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProtocolErrorDetail {
+    UnsupportedMethod { method: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,12 +239,29 @@ pub struct WorkerSnapshot {
     pub config: BTreeMap<String, Value>,
     #[serde(default)]
     handled_requests: BTreeMap<String, HandledRequest>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    dispatches: BTreeMap<String, DispatchRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct HandledRequest {
     request: WorkerRequest,
     payload: ResponsePayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DispatchState {
+    Pending,
+    InFlight,
+    Completed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DispatchRecord {
+    request: WorkerRequest,
+    state: DispatchState,
 }
 
 impl WorkerSnapshot {
@@ -234,6 +274,7 @@ impl WorkerSnapshot {
             active_prompt: None,
             config: BTreeMap::new(),
             handled_requests: BTreeMap::new(),
+            dispatches: BTreeMap::new(),
         }
     }
 
@@ -339,7 +380,7 @@ impl DurableWorker {
         }
 
         let native_session_id = read_native_session_identity(&root)?;
-        let worker = Self {
+        let mut worker = Self {
             root,
             worker_version: worker_version.into(),
             snapshot,
@@ -349,6 +390,7 @@ impl DurableWorker {
         if !snapshot_path.exists() || snapshot_seq < logged_seq {
             worker.persist_snapshot()?;
         }
+        worker.recover_dispatches()?;
         Ok(worker)
     }
 
@@ -427,7 +469,9 @@ impl DurableWorker {
                 self.snapshot.phase
             );
         }
-        self.append_event(None, WorkerEvent::TurnCompleted)
+        let seq = self.append_event(None, WorkerEvent::TurnCompleted)?;
+        self.complete_prompt_dispatches()?;
+        Ok(seq)
     }
 
     pub fn record_closed(&mut self) -> Result<u64> {
@@ -437,7 +481,34 @@ impl DurableWorker {
                 self.snapshot.phase
             );
         }
-        self.append_event(None, WorkerEvent::Closed)
+        let seq = self.append_event(None, WorkerEvent::Closed)?;
+        self.complete_dispatches_matching(|request| matches!(request, WorkerRequest::Close))?;
+        Ok(seq)
+    }
+
+    /// Durably claim commands before handing them to the ACP runtime.  A
+    /// proxy response is independent from this ledger, so losing the response
+    /// cannot suppress or duplicate runtime execution.
+    pub fn claim_pending_dispatches(&mut self) -> Result<Vec<(String, WorkerRequest)>> {
+        let mut claimed = Vec::new();
+        for (request_id, dispatch) in &mut self.snapshot.dispatches {
+            if dispatch.state == DispatchState::Pending {
+                dispatch.state = DispatchState::InFlight;
+                claimed.push((request_id.clone(), dispatch.request.clone()));
+            }
+        }
+        if !claimed.is_empty() {
+            self.persist_snapshot()?;
+        }
+        Ok(claimed)
+    }
+
+    pub fn complete_dispatch(&mut self, request_id: &str) -> Result<()> {
+        let Some(dispatch) = self.snapshot.dispatches.get_mut(request_id) else {
+            return Ok(());
+        };
+        dispatch.state = DispatchState::Completed;
+        self.persist_snapshot()
     }
 
     pub fn handle(&mut self, envelope: RequestEnvelope) -> ResponseEnvelope {
@@ -449,11 +520,18 @@ impl DurableWorker {
                     code: ErrorCode::Internal,
                     message: format!("{error:#}"),
                     retryable: true,
+                    detail: None,
                 },
             });
+        let protocol_version = match &body {
+            ResponseBody::Ok {
+                payload: ResponsePayload::Hello { negotiated, .. },
+            } => *negotiated,
+            _ => PROTOCOL_VERSION,
+        };
         ResponseEnvelope {
             request_id,
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version,
             body,
         }
     }
@@ -627,6 +705,15 @@ impl DurableWorker {
                     payload: payload.clone(),
                 },
             );
+            if runtime_bound_request(&envelope.request) {
+                self.snapshot.dispatches.insert(
+                    envelope.request_id.clone(),
+                    DispatchRecord {
+                        request: envelope.request.clone(),
+                        state: DispatchState::Pending,
+                    },
+                );
+            }
             self.persist_snapshot()?;
         }
         Ok(ResponseBody::Ok { payload })
@@ -675,6 +762,110 @@ impl DurableWorker {
         File::open(&self.root)?.sync_all()?;
         Ok(())
     }
+
+    fn recover_dispatches(&mut self) -> Result<()> {
+        // Current-baseline workers may have persisted accepted runtime
+        // mutations without a dispatch ledger.  Reconstruct only operations
+        // that are safe to repeat.  An active prompt is ambiguous and must
+        // never be automatically replayed.
+        for (request_id, handled) in self.snapshot.handled_requests.clone() {
+            if self.snapshot.dispatches.contains_key(&request_id) {
+                continue;
+            }
+            if matches!(
+                handled.request,
+                WorkerRequest::SetConfig { .. } | WorkerRequest::Close
+            ) {
+                self.snapshot.dispatches.insert(
+                    request_id,
+                    DispatchRecord {
+                        request: handled.request,
+                        state: DispatchState::Pending,
+                    },
+                );
+            }
+        }
+
+        let has_prompt_dispatch = self
+            .snapshot
+            .dispatches
+            .values()
+            .any(|dispatch| matches!(dispatch.request, WorkerRequest::Prompt { .. }));
+        let mut interrupted_prompt = self.snapshot.active_prompt.is_some() && !has_prompt_dispatch;
+        for dispatch in self.snapshot.dispatches.values_mut() {
+            if dispatch.state != DispatchState::InFlight {
+                continue;
+            }
+            match dispatch.request {
+                WorkerRequest::Prompt { .. } => {
+                    dispatch.state = DispatchState::Interrupted;
+                    interrupted_prompt = true;
+                }
+                WorkerRequest::Cancel => dispatch.state = DispatchState::Completed,
+                WorkerRequest::SetConfig { .. } | WorkerRequest::Close => {
+                    dispatch.state = DispatchState::Pending;
+                }
+                _ => dispatch.state = DispatchState::Completed,
+            }
+        }
+        self.persist_snapshot()?;
+
+        if interrupted_prompt {
+            self.record_adapter_event(
+                "dispatch_interrupted",
+                serde_json::json!({
+                    "type": "warning",
+                    "message": "the worker restarted while a prompt may have been in flight; it was not replayed"
+                }),
+            )?;
+            if self.snapshot.phase == WorkerPhase::Running {
+                self.append_event(None, WorkerEvent::TurnCompleted)?;
+            }
+            self.complete_prompt_dispatches()?;
+        }
+        Ok(())
+    }
+
+    fn complete_prompt_dispatches(&mut self) -> Result<()> {
+        self.complete_dispatches_matching(|request| {
+            matches!(
+                request,
+                WorkerRequest::Prompt { .. } | WorkerRequest::Cancel
+            )
+        })
+    }
+
+    fn complete_dispatches_matching(
+        &mut self,
+        predicate: impl Fn(&WorkerRequest) -> bool,
+    ) -> Result<()> {
+        let mut changed = false;
+        for dispatch in self.snapshot.dispatches.values_mut() {
+            if predicate(&dispatch.request)
+                && matches!(
+                    dispatch.state,
+                    DispatchState::Pending | DispatchState::InFlight
+                )
+            {
+                dispatch.state = DispatchState::Completed;
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist_snapshot()?;
+        }
+        Ok(())
+    }
+}
+
+fn runtime_bound_request(request: &WorkerRequest) -> bool {
+    matches!(
+        request,
+        WorkerRequest::Prompt { .. }
+            | WorkerRequest::Cancel
+            | WorkerRequest::SetConfig { .. }
+            | WorkerRequest::Close
+    )
 }
 
 /// Recover the native identity from canonical history written by older
@@ -884,7 +1075,39 @@ fn super_error(code: ErrorCode, message: impl Into<String>, retryable: bool) -> 
             code,
             message: message.into(),
             retryable,
+            detail: None,
         },
+    }
+}
+
+pub fn unsupported_method_response(
+    request_id: String,
+    protocol_version: u32,
+    method: String,
+) -> ResponseEnvelope {
+    ResponseEnvelope {
+        request_id,
+        protocol_version,
+        body: ResponseBody::Error {
+            error: ProtocolError {
+                code: ErrorCode::InvalidRequest,
+                message: format!("worker does not support method {method:?}"),
+                retryable: false,
+                detail: Some(ProtocolErrorDetail::UnsupportedMethod { method }),
+            },
+        },
+    }
+}
+
+pub fn invalid_request_response(
+    request_id: String,
+    protocol_version: u32,
+    message: String,
+) -> ResponseEnvelope {
+    ResponseEnvelope {
+        request_id,
+        protocol_version,
+        body: super_error(ErrorCode::InvalidRequest, message, false),
     }
 }
 
@@ -1013,6 +1236,119 @@ mod tests {
             serde_json::from_slice::<ResponseEnvelope>(&output).unwrap(),
             response
         );
+    }
+
+    #[test]
+    fn current_v1_wire_shapes_match_frozen_fixtures() {
+        let hello = request(
+            "hello-1",
+            WorkerRequest::Hello {
+                client_version: "1.2.3".into(),
+                supported: VersionRange::CURRENT,
+            },
+        );
+        let response = ResponseEnvelope {
+            request_id: "hello-1".into(),
+            protocol_version: PROTOCOL_VERSION,
+            body: ResponseBody::Ok {
+                payload: ResponsePayload::Hello {
+                    negotiated: 1,
+                    worker_version: "1.0.0".into(),
+                    session_id: SESSION.into(),
+                },
+            },
+        };
+        let event = SequencedEvent {
+            seq: 1,
+            request_id: Some("prompt-1".into()),
+            event: WorkerEvent::PromptAccepted {
+                request_id: "prompt-1".into(),
+                text: "fix it".into(),
+                attachments: Vec::new(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&hello).unwrap(),
+            include_str!("../tests/fixtures/worker-v1/hello-request.json").trim()
+        );
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            include_str!("../tests/fixtures/worker-v1/hello-response.json").trim()
+        );
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            include_str!("../tests/fixtures/worker-v1/prompt-event.json").trim()
+        );
+    }
+
+    #[test]
+    fn unknown_methods_are_structured_fail_on_use_errors() {
+        let response = unsupported_method_response(
+            "future-1".into(),
+            PROTOCOL_VERSION,
+            "future_action".into(),
+        );
+        assert!(matches!(
+            response.body,
+            ResponseBody::Error {
+                error: ProtocolError {
+                    code: ErrorCode::InvalidRequest,
+                    retryable: false,
+                    detail: Some(ProtocolErrorDetail::UnsupportedMethod { ref method }),
+                    ..
+                }
+            } if method == "future_action"
+        ));
+    }
+
+    #[test]
+    fn pending_dispatch_survives_restart_and_is_claimed_once() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+            accepted(&worker.handle(request(
+                "prompt-pending",
+                WorkerRequest::Prompt {
+                    text: "once".into(),
+                    attachments: Vec::new(),
+                },
+            )));
+        }
+        let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(
+            worker.claim_pending_dispatches().unwrap(),
+            vec![(
+                "prompt-pending".into(),
+                WorkerRequest::Prompt {
+                    text: "once".into(),
+                    attachments: Vec::new(),
+                }
+            )]
+        );
+        assert!(worker.claim_pending_dispatches().unwrap().is_empty());
+    }
+
+    #[test]
+    fn in_flight_prompt_becomes_visible_interruption_instead_of_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+            accepted(&worker.handle(request(
+                "prompt-in-flight",
+                WorkerRequest::Prompt {
+                    text: "maybe ran".into(),
+                    attachments: Vec::new(),
+                },
+            )));
+            assert_eq!(worker.claim_pending_dispatches().unwrap().len(), 1);
+        }
+        let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert!(worker.claim_pending_dispatches().unwrap().is_empty());
+        assert_eq!(worker.snapshot().phase, WorkerPhase::Idle);
+        assert!(worker.events_after(0).unwrap().iter().any(|event| matches!(
+            &event.event,
+            WorkerEvent::Adapter { kind, .. } if kind == "dispatch_interrupted"
+        )));
     }
 
     #[test]

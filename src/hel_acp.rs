@@ -62,8 +62,12 @@ fn production_compaction_config(harness: HarnessKind) -> Option<ProductionCompac
 
 #[derive(Debug)]
 pub enum CommandRequest {
-    Prompt(String),
+    Prompt {
+        request_id: String,
+        text: String,
+    },
     SetConfig {
+        request_id: String,
         key: String,
         value: String,
     },
@@ -71,8 +75,12 @@ pub enum CommandRequest {
         prompt: String,
         response: oneshot::Sender<std::result::Result<String, String>>,
     },
-    Cancel,
-    Close,
+    Cancel {
+        request_id: String,
+    },
+    Close {
+        request_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,12 +106,16 @@ pub enum RuntimeEvent {
         option_name: String,
     },
     PromptFinished {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        request_id: String,
         stop_reason: String,
     },
     Warning {
         message: String,
     },
     ConfigApplied {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        request_id: String,
         key: String,
         value: String,
     },
@@ -133,8 +145,18 @@ pub async fn run(
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
 
     let result = drive(transport, spec, requests, events.clone()).await;
-    let _ = child.kill().await;
-    let _ = child.wait().await;
+    // Dropping the transport closes the supervisor's stdin. Give it time to
+    // terminate and reap the complete bridge process group before killing the
+    // supervisor itself as a last resort.
+    match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
+        Ok(waited) => {
+            let _ = waited;
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
     let _ = events.send(RuntimeEvent::Stopped);
     result
 }
@@ -315,7 +337,7 @@ async fn drive_connection(
 
     while let Some(request) = requests.recv().await {
         match request {
-            CommandRequest::Prompt(text) => {
+            CommandRequest::Prompt { request_id, text } => {
                 if text.trim().is_empty() {
                     continue;
                 }
@@ -331,15 +353,16 @@ async fn drive_connection(
                         response = &mut prompt => {
                             let response = response.context("send ACP prompt")?;
                             let _ = events.send(RuntimeEvent::PromptFinished {
+                                request_id,
                                 stop_reason: format!("{:?}", response.stop_reason),
                             });
                             break;
                         }
                         command = requests.recv() => match command {
-                            Some(CommandRequest::Cancel) => {
+                            Some(CommandRequest::Cancel { .. }) => {
                                 connection.send_notification(CancelNotification::new(session_id.clone()))?;
                             }
-                            Some(CommandRequest::Close) | None => {
+                            Some(CommandRequest::Close { .. }) | None => {
                                 connection.send_notification(CancelNotification::new(session_id.clone()))?;
                                 let _ = connection
                                     .send_request(CloseSessionRequest::new(session_id.clone()))
@@ -347,7 +370,7 @@ async fn drive_connection(
                                     .await;
                                 return Ok(());
                             }
-                            Some(CommandRequest::Prompt(_)) => {
+                            Some(CommandRequest::Prompt { .. }) => {
                                 let _ = events.send(RuntimeEvent::Warning {
                                     message: "a prompt is already running".into(),
                                 });
@@ -366,7 +389,11 @@ async fn drive_connection(
                     }
                 }
             }
-            CommandRequest::SetConfig { key, value } => {
+            CommandRequest::SetConfig {
+                request_id,
+                key,
+                value,
+            } => {
                 match set_session_config(
                     &connection,
                     &session_id,
@@ -377,7 +404,11 @@ async fn drive_connection(
                 .await
                 {
                     Ok(()) => {
-                        let _ = events.send(RuntimeEvent::ConfigApplied { key, value });
+                        let _ = events.send(RuntimeEvent::ConfigApplied {
+                            request_id,
+                            key,
+                            value,
+                        });
                         let _ = events.send(RuntimeEvent::SessionConfigured {
                             config_options: config_options.clone(),
                         });
@@ -396,10 +427,10 @@ async fn drive_connection(
                         .map_err(|error| format!("{error:#}"));
                 let _ = response.send(result);
             }
-            CommandRequest::Cancel => {
+            CommandRequest::Cancel { .. } => {
                 connection.send_notification(CancelNotification::new(session_id.clone()))?;
             }
-            CommandRequest::Close => {
+            CommandRequest::Close { .. } => {
                 let _ = connection
                     .send_request(CloseSessionRequest::new(session_id.clone()))
                     .block_task()

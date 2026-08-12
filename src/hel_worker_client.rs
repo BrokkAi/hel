@@ -27,6 +27,7 @@ pub struct WorkerClient {
     connection_nonce: u64,
     protocol_version: u32,
     session_id: String,
+    worker_version: String,
     latest_seq: u64,
 }
 
@@ -68,19 +69,20 @@ impl WorkerClient {
             connection_nonce: u64::from_le_bytes(nonce_bytes),
             protocol_version: PROTOCOL_VERSION,
             session_id: String::new(),
+            worker_version: String::new(),
             latest_seq: 0,
         };
 
         let response = client
-            .call(WorkerRequest::Hello {
+            .call_hello(WorkerRequest::Hello {
                 client_version: env!("CARGO_PKG_VERSION").to_owned(),
                 supported: VersionRange::CURRENT,
             })
             .await?;
         let ResponsePayload::Hello {
             negotiated,
+            worker_version,
             session_id,
-            ..
         } = response
         else {
             bail!("worker returned an unexpected hello response")
@@ -88,8 +90,16 @@ impl WorkerClient {
         if session_id != expected_session_id {
             bail!("worker belongs to session {session_id}, not {expected_session_id}");
         }
+        if VersionRange::CURRENT.negotiate(VersionRange {
+            min: negotiated,
+            max: negotiated,
+        }) != Some(negotiated)
+        {
+            bail!("worker negotiated unsupported protocol {negotiated}");
+        }
         client.protocol_version = negotiated;
         client.session_id = session_id;
+        client.worker_version = worker_version;
         Ok(client)
     }
 
@@ -99,6 +109,27 @@ impl WorkerClient {
 
     pub fn latest_seq(&self) -> u64 {
         self.latest_seq
+    }
+
+    pub fn worker_version(&self) -> &str {
+        &self.worker_version
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    /// Lightweight fail-on-use guard for future UI operations. New methods
+    /// declare only their minimum protocol; no capability matrix is needed.
+    pub fn require_protocol(&self, operation: &str, minimum: u32) -> Result<()> {
+        if self.protocol_version < minimum {
+            bail!(
+                "{operation} requires worker protocol {minimum}, but worker {} negotiated protocol {}; update or restart that worker to use this operation",
+                self.worker_version,
+                self.protocol_version
+            );
+        }
+        Ok(())
     }
 
     /// Fetch a coherent snapshot and the complete canonical transcript.
@@ -212,6 +243,7 @@ impl WorkerClient {
     }
 
     async fn call(&mut self, request: WorkerRequest) -> Result<ResponsePayload> {
+        let operation = request.method_name();
         let request_id = self.request_id();
         let envelope = RequestEnvelope {
             request_id: request_id.clone(),
@@ -238,7 +270,32 @@ impl WorkerClient {
         if line.len() > MAX_FRAME_BYTES {
             bail!("worker response frame is too large");
         }
-        decode_response(&line, &request_id, self.protocol_version)
+        decode_response(&line, &request_id, self.protocol_version).with_context(|| {
+            format!(
+                "worker {} could not perform {operation}",
+                self.worker_version
+            )
+        })
+    }
+
+    async fn call_hello(&mut self, request: WorkerRequest) -> Result<ResponsePayload> {
+        let request_id = self.request_id();
+        let envelope = RequestEnvelope {
+            request_id: request_id.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            request,
+        };
+        let mut frame = serde_json::to_vec(&envelope)?;
+        frame.push(b'\n');
+        self.input.write_all(&frame).await?;
+        self.input.flush().await?;
+        let line = self
+            .output
+            .next_line()
+            .await
+            .context("read worker hello response")?
+            .ok_or_else(|| anyhow!("worker proxy disconnected"))?;
+        decode_hello_response(&line, &request_id)
     }
 
     fn request_id(&mut self) -> String {
@@ -276,6 +333,36 @@ fn decode_response(line: &str, request_id: &str, protocol: u32) -> Result<Respon
         ResponseBody::Ok { payload } => Ok(payload),
         ResponseBody::Error { error } => Err(anyhow!(
             "worker rejected request ({:?}): {}",
+            error.code,
+            error.message
+        )),
+    }
+}
+
+fn decode_hello_response(line: &str, request_id: &str) -> Result<ResponsePayload> {
+    let response: ResponseEnvelope =
+        serde_json::from_str(line).context("decode worker hello response")?;
+    if response.request_id != request_id {
+        bail!(
+            "worker response ID mismatch: expected {request_id}, got {}",
+            response.request_id
+        );
+    }
+    match response.body {
+        ResponseBody::Ok {
+            payload: payload @ ResponsePayload::Hello { negotiated, .. },
+        } => {
+            if response.protocol_version != negotiated {
+                bail!(
+                    "worker hello envelope uses protocol {}, negotiated {negotiated}",
+                    response.protocol_version
+                );
+            }
+            Ok(payload)
+        }
+        ResponseBody::Ok { .. } => bail!("worker returned an unexpected hello response"),
+        ResponseBody::Error { error } => Err(anyhow!(
+            "worker rejected hello ({:?}): {}",
             error.code,
             error.message
         )),
@@ -327,11 +414,29 @@ mod tests {
                     code: ErrorCode::InvalidState,
                     message: "busy".into(),
                     retryable: false,
+                    detail: None,
                 },
             },
         };
         let encoded = serde_json::to_string(&response).unwrap();
         let error = decode_response(&encoded, "r1", PROTOCOL_VERSION).unwrap_err();
         assert!(error.to_string().contains("busy"));
+    }
+
+    #[test]
+    fn frozen_v1_hello_response_bootstraps_the_current_client() {
+        let payload = decode_hello_response(
+            include_str!("../tests/fixtures/worker-v1/hello-response.json").trim(),
+            "hello-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            payload,
+            ResponsePayload::Hello {
+                negotiated: 1,
+                worker_version,
+                ..
+            } if worker_version == "1.0.0"
+        ));
     }
 }
