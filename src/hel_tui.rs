@@ -1124,7 +1124,7 @@ impl DashboardState {
     fn create_session_action(&mut self, wizard: &NewWizard) -> DashboardAction {
         let action = DashboardAction::CreateSession {
             profile_id: nth_key(&self.config.profiles, wizard.profile),
-            bundle_id: nth_key(&self.config.bundles, wizard.bundle),
+            bundle_id: nth_bundle_key(&self.config, &self.state, wizard.bundle),
             target_template_id: nth_key(&self.config.targets, wizard.target),
             additional_mounts: wizard.mounts.mounts.clone(),
             allow_dirty_local: false,
@@ -2614,11 +2614,12 @@ fn render_new_wizard(
         ),
         WizardStep::Bundle => (
             " New session · 2/3 project bundle ",
-            dashboard
-                .config
-                .bundles
-                .iter()
-                .map(|(id, bundle)| format!("{id}  {} repositories", bundle.repositories.len()))
+            bundle_ids_by_recent_creation(&dashboard.config, &dashboard.state)
+                .into_iter()
+                .map(|id| {
+                    let bundle = &dashboard.config.bundles[id];
+                    format!("{id}  {} repositories", bundle.repositories.len())
+                })
                 .collect(),
             wizard.bundle,
         ),
@@ -2989,6 +2990,45 @@ fn nth_key<T>(map: &BTreeMap<String, T>, index: usize) -> String {
         .nth(index)
         .cloned()
         .expect("wizard is only opened for non-empty configuration")
+}
+
+fn nth_bundle_key(config: &HelConfig, state: &HelState, index: usize) -> String {
+    bundle_ids_by_recent_creation(config, state)
+        .get(index)
+        .expect("wizard is only opened for non-empty configuration")
+        .to_string()
+}
+
+fn bundle_ids_by_recent_creation<'a>(config: &'a HelConfig, state: &HelState) -> Vec<&'a str> {
+    let mut latest_created_at = BTreeMap::<&str, i64>::new();
+    for session in state.sessions.values() {
+        if !config.bundles.contains_key(&session.bundle_id) {
+            continue;
+        }
+        let Some(created_at) = chrono::DateTime::parse_from_rfc3339(&session.created_at)
+            .ok()
+            .map(|timestamp| timestamp.timestamp_millis())
+        else {
+            continue;
+        };
+        latest_created_at
+            .entry(&session.bundle_id)
+            .and_modify(|latest| *latest = (*latest).max(created_at))
+            .or_insert(created_at);
+    }
+
+    let mut bundle_ids = config
+        .bundles
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    bundle_ids.sort_by(|left, right| {
+        latest_created_at
+            .get(right)
+            .cmp(&latest_created_at.get(left))
+            .then_with(|| left.cmp(right))
+    });
+    bundle_ids
 }
 
 fn harness_label(kind: HarnessKind) -> &'static str {
@@ -3490,6 +3530,47 @@ mod tests {
             DashboardAction::CreateSession {
                 profile_id: "codex-1".into(),
                 bundle_id: "hel".into(),
+                target_template_id: "podman".into(),
+                additional_mounts: vec![],
+                allow_dirty_local: false,
+            }
+        );
+    }
+
+    #[test]
+    fn new_session_bundles_are_ordered_by_latest_session_creation() {
+        let mut config = config();
+        let bundle = config.bundles["hel"].clone();
+        config.bundles.insert("alpha-unused".into(), bundle.clone());
+        config.bundles.insert("zebra-recent".into(), bundle);
+
+        let mut older = archived_session();
+        older.id = "older".into();
+        older.created_at = "2026-08-10T12:00:00Z".into();
+        let mut recent = archived_session();
+        recent.id = "recent".into();
+        recent.bundle_id = "zebra-recent".into();
+        recent.created_at = "2026-08-11T12:00:00Z".into();
+        let state = HelState {
+            version: STATE_VERSION,
+            sessions: BTreeMap::from([(older.id.clone(), older), (recent.id.clone(), recent)]),
+            mount_history: BTreeMap::new(),
+        };
+        assert_eq!(
+            bundle_ids_by_recent_creation(&config, &state),
+            vec!["zebra-recent", "hel", "alpha-unused"]
+        );
+
+        let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
+        dashboard.handle_key(key(KeyCode::Char('n')));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::CreateSession {
+                profile_id: "claude-1".into(),
+                bundle_id: "zebra-recent".into(),
                 target_template_id: "podman".into(),
                 additional_mounts: vec![],
                 allow_dirty_local: false,
