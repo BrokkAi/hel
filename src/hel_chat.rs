@@ -20,13 +20,15 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::hel_acp::RuntimeEvent;
+use crate::hel_database::{HistoryScope, PromptHistoryEntry};
 use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot};
 use crate::hel_worker_client::WorkerClient;
 use rendering::{
-    LogicalLine, TranscriptRenderMode, append_omitted_character_count, line_character_count,
-    markdown_lines, raw_lines, sanitize_terminal_text, wrap_styled_line,
+    LogicalLine, TranscriptRenderMode, append_omitted_character_count, display_width,
+    line_character_count, markdown_lines, raw_lines, sanitize_terminal_text, wrap_styled_line,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +93,17 @@ struct Autocomplete {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QueuedPrompt {
     text: String,
+}
+
+#[derive(Debug, Clone)]
+struct HistorySearch {
+    original_input: String,
+    original_cursor: usize,
+    query: String,
+    scope: HistoryScope,
+    matches: Vec<PromptHistoryEntry>,
+    selected: Option<usize>,
+    unavailable: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +237,7 @@ impl Default for TranscriptRenderCache {
 
 pub struct ChatState {
     session_id: String,
+    bundle_id: Option<String>,
     phase: WorkerPhase,
     latest_seq: u64,
     entries: Vec<ChatEntry>,
@@ -232,6 +246,9 @@ pub struct ChatState {
     prompt_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
+    kill_buffer: String,
+    preferred_column: Option<usize>,
+    history_search: Option<HistorySearch>,
     queued_prompts: VecDeque<QueuedPrompt>,
     agent_commands: Vec<AvailableCommand>,
     command_choices: Vec<CommandChoice>,
@@ -252,6 +269,7 @@ impl ChatState {
     pub fn new(snapshot: &WorkerSnapshot, events: &[SequencedEvent]) -> Self {
         let mut state = Self {
             session_id: snapshot.session_id.clone(),
+            bundle_id: None,
             phase: snapshot.phase,
             latest_seq: 0,
             entries: Vec::new(),
@@ -260,6 +278,9 @@ impl ChatState {
             prompt_history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
+            kill_buffer: String::new(),
+            preferred_column: None,
+            history_search: None,
             queued_prompts: VecDeque::new(),
             agent_commands: Vec::new(),
             command_choices: builtin_command_choices(),
@@ -282,6 +303,21 @@ impl ChatState {
 
     pub fn phase(&self) -> WorkerPhase {
         self.phase
+    }
+
+    pub fn set_history_context(&mut self, bundle_id: impl Into<String>) {
+        self.bundle_id = Some(bundle_id.into());
+    }
+
+    fn record_accepted_prompt(&mut self, sequence: u64, text: &str) {
+        let Some(bundle_id) = self.bundle_id.as_deref() else {
+            return;
+        };
+        if let Err(error) =
+            crate::hel_database::record_prompt(&self.session_id, bundle_id, sequence, None, text)
+        {
+            self.set_notice(format!("Prompt sent, but history was not saved: {error:#}"));
+        }
     }
 
     pub fn latest_seq(&self) -> u64 {
@@ -317,6 +353,8 @@ impl ChatState {
         self.prompt_history.clear();
         self.history_index = None;
         self.history_draft.clear();
+        self.preferred_column = None;
+        self.history_search = None;
         self.queued_prompts.clear();
         self.autocomplete = None;
         self.scroll_top = 0;
@@ -330,8 +368,9 @@ impl ChatState {
 
     fn set_input(&mut self, input: String) {
         self.input = input;
-        self.input_cursor = self.input.chars().count();
+        self.input_cursor = self.input.len();
         self.history_index = None;
+        self.preferred_column = None;
         self.update_autocomplete();
     }
 
@@ -340,10 +379,10 @@ impl ChatState {
     }
 
     fn insert_character(&mut self, character: char) {
-        let byte = input_byte_index(&self.input, self.input_cursor);
-        self.input.insert(byte, character);
-        self.input_cursor += 1;
+        self.input.insert(self.input_cursor, character);
+        self.input_cursor += character.len_utf8();
         self.history_index = None;
+        self.preferred_column = None;
         self.update_autocomplete();
     }
 
@@ -351,31 +390,326 @@ impl ChatState {
         if self.input_cursor == 0 {
             return;
         }
-        let start = input_byte_index(&self.input, self.input_cursor - 1);
-        let end = input_byte_index(&self.input, self.input_cursor);
-        self.input.replace_range(start..end, "");
-        self.input_cursor -= 1;
+        let start = previous_grapheme_boundary(&self.input, self.input_cursor);
+        self.input.replace_range(start..self.input_cursor, "");
+        self.input_cursor = start;
         self.history_index = None;
+        self.preferred_column = None;
         self.update_autocomplete();
     }
 
     fn delete(&mut self) {
-        if self.input_cursor >= self.input.chars().count() {
+        if self.input_cursor >= self.input.len() {
             return;
         }
-        let start = input_byte_index(&self.input, self.input_cursor);
-        let end = input_byte_index(&self.input, self.input_cursor + 1);
-        self.input.replace_range(start..end, "");
+        let end = next_grapheme_boundary(&self.input, self.input_cursor);
+        self.input.replace_range(self.input_cursor..end, "");
         self.history_index = None;
+        self.preferred_column = None;
         self.update_autocomplete();
     }
 
     fn move_input_cursor(&mut self, delta: isize) {
-        self.input_cursor = self
-            .input_cursor
-            .saturating_add_signed(delta)
-            .min(self.input.chars().count());
+        self.input_cursor = if delta.is_negative() {
+            previous_grapheme_boundary(&self.input, self.input_cursor)
+        } else {
+            next_grapheme_boundary(&self.input, self.input_cursor)
+        };
+        self.preferred_column = None;
         self.update_autocomplete();
+    }
+
+    fn line_start(&self) -> usize {
+        self.input[..self.input_cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1)
+    }
+
+    fn line_end(&self) -> usize {
+        self.input[self.input_cursor..]
+            .find('\n')
+            .map_or(self.input.len(), |index| self.input_cursor + index)
+    }
+
+    fn move_to_line_start(&mut self, cross_boundary: bool) {
+        let start = self.line_start();
+        self.input_cursor = if cross_boundary && self.input_cursor == start && start > 0 {
+            self.input[..start - 1]
+                .rfind('\n')
+                .map_or(0, |index| index + 1)
+        } else {
+            start
+        };
+        self.preferred_column = None;
+        self.update_autocomplete();
+    }
+
+    fn move_to_line_end(&mut self, cross_boundary: bool) {
+        let end = self.line_end();
+        self.input_cursor = if cross_boundary && self.input_cursor == end && end < self.input.len()
+        {
+            let next = end + 1;
+            self.input[next..]
+                .find('\n')
+                .map_or(self.input.len(), |index| next + index)
+        } else {
+            end
+        };
+        self.preferred_column = None;
+        self.update_autocomplete();
+    }
+
+    fn move_vertical(&mut self, direction: isize) {
+        let start = self.line_start();
+        let column = self
+            .preferred_column
+            .unwrap_or_else(|| self.input[start..self.input_cursor].graphemes(true).count());
+        let target_start = if direction.is_negative() {
+            if start == 0 {
+                self.input_cursor = 0;
+                self.preferred_column = None;
+                self.update_autocomplete();
+                return;
+            }
+            self.input[..start - 1]
+                .rfind('\n')
+                .map_or(0, |index| index + 1)
+        } else {
+            let end = self.line_end();
+            if end == self.input.len() {
+                self.input_cursor = self.input.len();
+                self.preferred_column = None;
+                self.update_autocomplete();
+                return;
+            }
+            end + 1
+        };
+        let target_end = self.input[target_start..]
+            .find('\n')
+            .map_or(self.input.len(), |index| target_start + index);
+        self.input_cursor = self.input[target_start..target_end]
+            .grapheme_indices(true)
+            .nth(column)
+            .map_or(target_end, |(offset, _)| target_start + offset);
+        self.preferred_column = Some(column);
+        self.update_autocomplete();
+    }
+
+    fn previous_word_start(&self) -> usize {
+        let prefix = &self.input[..self.input_cursor];
+        let trimmed = prefix.trim_end_matches(char::is_whitespace);
+        if trimmed.is_empty() {
+            return 0;
+        }
+        let run_start = trimmed
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+            .map_or(0, |(index, character)| index + character.len_utf8());
+        let run = &trimmed[run_start..];
+        let mut start = run_start + run.len();
+        let mut class = None;
+        for (index, character) in run.char_indices().rev() {
+            let next_class = word_class(character);
+            if class.is_some_and(|class| class != next_class) {
+                break;
+            }
+            class = Some(next_class);
+            start = run_start + index;
+        }
+        start
+    }
+
+    fn next_word_end(&self) -> usize {
+        let suffix = &self.input[self.input_cursor..];
+        let Some(non_space) = suffix.find(|character: char| !character.is_whitespace()) else {
+            return self.input.len();
+        };
+        let run = &suffix[non_space..];
+        let mut end = 0;
+        let mut class = None;
+        for (index, character) in run.char_indices() {
+            if character.is_whitespace() {
+                break;
+            }
+            let next_class = word_class(character);
+            if class.is_some_and(|class| class != next_class) {
+                break;
+            }
+            class = Some(next_class);
+            end = index + character.len_utf8();
+        }
+        self.input_cursor + non_space + end
+    }
+
+    fn move_word(&mut self, direction: isize) {
+        self.input_cursor = if direction.is_negative() {
+            self.previous_word_start()
+        } else {
+            self.next_word_end()
+        };
+        self.preferred_column = None;
+        self.update_autocomplete();
+    }
+
+    fn kill_range(&mut self, range: std::ops::Range<usize>) {
+        if range.is_empty() {
+            return;
+        }
+        self.kill_buffer = self.input[range.clone()].to_owned();
+        self.input.replace_range(range.clone(), "");
+        self.input_cursor = range.start;
+        self.history_index = None;
+        self.preferred_column = None;
+        self.update_autocomplete();
+    }
+
+    fn kill_to_line_start(&mut self) {
+        let start = self.line_start();
+        if start == self.input_cursor && start > 0 {
+            self.kill_range(start - 1..start);
+        } else {
+            self.kill_range(start..self.input_cursor);
+        }
+    }
+
+    fn kill_to_line_end(&mut self) {
+        let end = self.line_end();
+        if end == self.input_cursor && end < self.input.len() {
+            self.kill_range(end..end + 1);
+        } else {
+            self.kill_range(self.input_cursor..end);
+        }
+    }
+
+    fn yank(&mut self) {
+        if self.kill_buffer.is_empty() {
+            return;
+        }
+        let text = self.kill_buffer.clone();
+        self.input.insert_str(self.input_cursor, &text);
+        self.input_cursor += text.len();
+        self.history_index = None;
+        self.update_autocomplete();
+    }
+
+    fn begin_history_search(&mut self) {
+        self.autocomplete = None;
+        self.history_search = Some(HistorySearch {
+            original_input: self.input.clone(),
+            original_cursor: self.input_cursor,
+            query: String::new(),
+            scope: HistoryScope::Project,
+            matches: Vec::new(),
+            selected: None,
+            unavailable: None,
+        });
+    }
+
+    fn refresh_history_search(&mut self) {
+        let Some(search) = self.history_search.as_ref() else {
+            return;
+        };
+        let query = search.query.clone();
+        let scope = search.scope;
+        let original = (search.original_input.clone(), search.original_cursor);
+        let result = if query.is_empty() {
+            Ok(Vec::new())
+        } else if let Some(bundle_id) = self.bundle_id.as_deref() {
+            crate::hel_database::search_prompts(&self.session_id, bundle_id, scope, &query)
+        } else {
+            Ok(self
+                .prompt_history
+                .iter()
+                .rev()
+                .enumerate()
+                .filter(|(_, text)| text.to_lowercase().contains(&query.to_lowercase()))
+                .map(|(index, text)| PromptHistoryEntry {
+                    id: -(index as i64) - 1,
+                    session_id: self.session_id.clone(),
+                    text: text.clone(),
+                })
+                .collect())
+        };
+        match result {
+            Ok(matches) => {
+                if let Some(search) = self.history_search.as_mut() {
+                    search.matches = matches;
+                    search.selected = (!search.matches.is_empty()).then_some(0);
+                    search.unavailable = None;
+                }
+                if let Some(text) = self
+                    .history_search
+                    .as_ref()
+                    .and_then(|search| search.matches.first())
+                    .map(|entry| entry.text.clone())
+                {
+                    self.input_cursor = text.len();
+                    self.input = text;
+                } else {
+                    self.input = original.0;
+                    self.input_cursor = original.1;
+                }
+            }
+            Err(error) => {
+                self.input = original.0;
+                self.input_cursor = original.1;
+                self.history_search = None;
+                self.notice = Some(format!("History unavailable: {error:#}"));
+                self.update_autocomplete();
+            }
+        }
+    }
+
+    fn step_history_search(&mut self, direction: isize) {
+        let Some(search) = self.history_search.as_mut() else {
+            return;
+        };
+        if search.matches.is_empty() {
+            return;
+        }
+        let current = search.selected.unwrap_or(0);
+        let next = if direction.is_negative() {
+            current.saturating_sub(1)
+        } else {
+            (current + 1).min(search.matches.len() - 1)
+        };
+        search.selected = Some(next);
+        self.input = search.matches[next].text.clone();
+        self.input_cursor = self.input.len();
+    }
+
+    fn cycle_history_scope(&mut self) {
+        let Some(search) = self.history_search.as_mut() else {
+            return;
+        };
+        search.scope = match search.scope {
+            HistoryScope::Project => HistoryScope::Session,
+            HistoryScope::Session => HistoryScope::All,
+            HistoryScope::All => HistoryScope::Project,
+        };
+        self.refresh_history_search();
+    }
+
+    fn cancel_history_search(&mut self) {
+        let Some(search) = self.history_search.take() else {
+            return;
+        };
+        self.input = search.original_input;
+        self.input_cursor = search.original_cursor;
+        self.update_autocomplete();
+    }
+
+    fn accept_history_search(&mut self) {
+        if self
+            .history_search
+            .as_ref()
+            .is_some_and(|search| search.selected.is_some())
+        {
+            self.history_search = None;
+            self.history_index = None;
+            self.update_autocomplete();
+        }
     }
 
     fn move_autocomplete(&mut self, delta: isize) {
@@ -424,7 +758,7 @@ impl ChatState {
     }
 
     fn update_autocomplete(&mut self) {
-        if self.input_cursor != self.input.chars().count() {
+        if self.history_search.is_some() || self.input_cursor != self.input.len() {
             self.autocomplete = None;
             return;
         }
@@ -503,25 +837,47 @@ impl ChatState {
     }
 
     fn move_history(&mut self, delta: isize) {
-        if self.prompt_history.is_empty() {
+        let history = if let Some(bundle_id) = self.bundle_id.as_deref() {
+            crate::hel_database::search_prompts(
+                &self.session_id,
+                bundle_id,
+                HistoryScope::Project,
+                "",
+            )
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .rev()
+                    .map(|entry| entry.text)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|error| {
+                self.notice = Some(format!("History unavailable: {error:#}"));
+                self.prompt_history.clone()
+            })
+        } else {
+            self.prompt_history.clone()
+        };
+        if history.is_empty() {
             return;
         }
         let next = match (self.history_index, delta.is_negative()) {
             (None, true) => {
                 self.history_draft.clone_from(&self.input);
-                Some(self.prompt_history.len() - 1)
+                Some(history.len() - 1)
             }
             (None, false) => None,
             (Some(index), true) => Some(index.saturating_sub(1)),
-            (Some(index), false) if index + 1 < self.prompt_history.len() => Some(index + 1),
+            (Some(index), false) if index + 1 < history.len() => Some(index + 1),
             (Some(_), false) => None,
         };
         self.history_index = next;
         let input = next
-            .and_then(|index| self.prompt_history.get(index).cloned())
+            .and_then(|index| history.get(index).cloned())
             .unwrap_or_else(|| self.history_draft.clone());
         self.input = input;
-        self.input_cursor = self.input.chars().count();
+        self.input_cursor = self.input.len();
+        self.preferred_column = None;
         self.update_autocomplete();
     }
 
@@ -631,16 +987,158 @@ impl ChatState {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return ChatAction::None;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        let (code, modifiers) = normalize_key(key.code, key.modifiers);
+
+        if self.history_search.is_some() {
+            if modifiers.contains(KeyModifiers::ALT) && code == KeyCode::Char('r') {
+                self.cycle_history_scope();
+                return ChatAction::None;
+            }
+            if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('r')
+                || code == KeyCode::Up
+            {
+                self.step_history_search(1);
+                return ChatAction::None;
+            }
+            if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('s')
+                || code == KeyCode::Down
+            {
+                self.step_history_search(-1);
+                return ChatAction::None;
+            }
+            if code == KeyCode::Esc
+                || modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c')
+            {
+                self.cancel_history_search();
+                return ChatAction::None;
+            }
+            if code == KeyCode::Enter {
+                self.accept_history_search();
+                return ChatAction::None;
+            }
+            if code == KeyCode::Backspace
+                || modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('h')
+            {
+                if let Some(search) = self.history_search.as_mut() {
+                    let end = search.query.len();
+                    let start = previous_grapheme_boundary(&search.query, end);
+                    search.query.replace_range(start..end, "");
+                }
+                self.refresh_history_search();
+                return ChatAction::None;
+            }
+            if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('u') {
+                if let Some(search) = self.history_search.as_mut() {
+                    search.query.clear();
+                }
+                self.refresh_history_search();
+                return ChatAction::None;
+            }
+            if let KeyCode::Char(character) = code
+                && !character.is_ascii_control()
+                && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                if let Some(search) = self.history_search.as_mut() {
+                    search.query.push(character);
+                }
+                self.refresh_history_search();
+            }
+            return ChatAction::None;
+        }
+
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
             return if self.phase == WorkerPhase::Running {
                 ChatAction::Cancel
             } else {
                 ChatAction::None
             };
         }
-        match key.code {
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            match code {
+                KeyCode::Char('r') => {
+                    self.begin_history_search();
+                    return ChatAction::None;
+                }
+                KeyCode::Char('t') => {
+                    self.render_mode = self.render_mode.toggled();
+                    self.notice = Some(
+                        match self.render_mode {
+                            TranscriptRenderMode::Rich => "Rich transcript rendering enabled",
+                            TranscriptRenderMode::Raw => "Raw transcript source enabled",
+                        }
+                        .into(),
+                    );
+                    return ChatAction::None;
+                }
+                KeyCode::Char('v') => return ChatAction::ToggleVoice,
+                KeyCode::Char('a') => self.move_to_line_start(true),
+                KeyCode::Char('e') => self.move_to_line_end(true),
+                KeyCode::Char('b') => self.move_input_cursor(-1),
+                KeyCode::Char('f') => self.move_input_cursor(1),
+                KeyCode::Char('h') => self.backspace(),
+                KeyCode::Char('d') => self.delete(),
+                KeyCode::Char('u') => self.kill_to_line_start(),
+                KeyCode::Char('k') => self.kill_to_line_end(),
+                KeyCode::Char('w') => {
+                    let start = self.previous_word_start();
+                    self.kill_range(start..self.input_cursor);
+                }
+                KeyCode::Char('y') => self.yank(),
+                KeyCode::Char('j') | KeyCode::Char('m') => self.insert_character('\n'),
+                KeyCode::Char('p') => {
+                    if self.input.is_empty() || self.history_index.is_some() {
+                        self.move_history(-1);
+                    } else {
+                        self.move_vertical(-1);
+                    }
+                }
+                KeyCode::Char('n') => {
+                    if self.history_index.is_some() {
+                        self.move_history(1);
+                    } else {
+                        self.move_vertical(1);
+                    }
+                }
+                KeyCode::Left => self.move_word(-1),
+                KeyCode::Right => self.move_word(1),
+                KeyCode::Backspace => {
+                    let start = self.previous_word_start();
+                    self.kill_range(start..self.input_cursor);
+                }
+                KeyCode::Delete => {
+                    let end = self.next_word_end();
+                    self.kill_range(self.input_cursor..end);
+                }
+                KeyCode::Home => {
+                    self.scroll_top = 0;
+                    self.follow_bottom = false;
+                }
+                KeyCode::End => self.follow_bottom = true,
+                _ => {}
+            }
+            return ChatAction::None;
+        }
+        if modifiers.contains(KeyModifiers::ALT) {
+            match code {
+                KeyCode::Char('b') | KeyCode::Left => self.move_word(-1),
+                KeyCode::Char('f') | KeyCode::Right => self.move_word(1),
+                KeyCode::Char('d') | KeyCode::Delete => {
+                    let end = self.next_word_end();
+                    self.kill_range(self.input_cursor..end);
+                }
+                KeyCode::Backspace => {
+                    let start = self.previous_word_start();
+                    self.kill_range(start..self.input_cursor);
+                }
+                KeyCode::Enter => self.insert_character('\n'),
+                KeyCode::Up if !self.queued_prompts.is_empty() => self.edit_latest_queued_prompt(),
+                _ => {}
+            }
+            return ChatAction::None;
+        }
+        match code {
             KeyCode::Esc => ChatAction::Back,
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => {
                 self.insert_character('\n');
                 ChatAction::None
             }
@@ -663,35 +1161,10 @@ impl ChatState {
                 self.accept_autocomplete();
                 ChatAction::None
             }
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ChatAction::Checkpoint(None)
-            }
-            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ChatAction::ToggleVoice
-            }
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.render_mode = self.render_mode.toggled();
-                self.notice = Some(
-                    match self.render_mode {
-                        TranscriptRenderMode::Rich => "Rich transcript rendering enabled",
-                        TranscriptRenderMode::Raw => "Raw transcript source enabled",
-                    }
-                    .into(),
-                );
-                ChatAction::None
-            }
             KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.insert_character(character);
-                ChatAction::None
-            }
-            KeyCode::Up
-                if key.modifiers.contains(KeyModifiers::ALT) && !self.queued_prompts.is_empty() =>
-            {
-                self.edit_latest_queued_prompt();
                 ChatAction::None
             }
             KeyCode::Up if self.autocomplete.is_some() => {
@@ -703,16 +1176,23 @@ impl ChatState {
                 ChatAction::None
             }
             KeyCode::Up => {
-                self.move_history(-1);
+                if self.input.is_empty() || self.history_index.is_some() {
+                    self.move_history(-1);
+                } else {
+                    self.move_vertical(-1);
+                }
                 ChatAction::None
             }
             KeyCode::Down => {
-                self.move_history(1);
+                if self.history_index.is_some() {
+                    self.move_history(1);
+                } else {
+                    self.move_vertical(1);
+                }
                 ChatAction::None
             }
             KeyCode::Left
-                if key.modifiers.contains(KeyModifiers::SHIFT)
-                    && !self.queued_prompts.is_empty() =>
+                if modifiers.contains(KeyModifiers::SHIFT) && !self.queued_prompts.is_empty() =>
             {
                 self.edit_latest_queued_prompt();
                 ChatAction::None
@@ -749,23 +1229,12 @@ impl ChatState {
                 }
                 ChatAction::None
             }
-            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.scroll_top = 0;
-                self.follow_bottom = false;
-                ChatAction::None
-            }
-            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.follow_bottom = true;
-                ChatAction::None
-            }
             KeyCode::Home => {
-                self.input_cursor = 0;
-                self.update_autocomplete();
+                self.move_to_line_start(false);
                 ChatAction::None
             }
             KeyCode::End => {
-                self.input_cursor = self.input.chars().count();
-                self.update_autocomplete();
+                self.move_to_line_end(false);
                 ChatAction::None
             }
             _ => ChatAction::None,
@@ -949,11 +1418,43 @@ impl ChatState {
     }
 }
 
-fn input_byte_index(input: &str, char_index: usize) -> usize {
-    input
-        .char_indices()
-        .nth(char_index)
-        .map_or(input.len(), |(index, _)| index)
+fn previous_grapheme_boundary(input: &str, cursor: usize) -> usize {
+    input[..cursor]
+        .grapheme_indices(true)
+        .next_back()
+        .map_or(0, |(index, _)| index)
+}
+
+fn next_grapheme_boundary(input: &str, cursor: usize) -> usize {
+    input[cursor..]
+        .grapheme_indices(true)
+        .nth(1)
+        .map_or(input.len(), |(index, _)| cursor + index)
+}
+
+fn word_class(character: char) -> bool {
+    const SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
+    SEPARATORS.contains(character)
+}
+
+fn normalize_key(code: KeyCode, mut modifiers: KeyModifiers) -> (KeyCode, KeyModifiers) {
+    let KeyCode::Char(character) = code else {
+        return (code, modifiers);
+    };
+    if modifiers.is_empty() {
+        let value = u32::from(character);
+        if (1..=26).contains(&value)
+            && let Some(control) = char::from_u32(value - 1 + u32::from('a'))
+        {
+            modifiers.insert(KeyModifiers::CONTROL);
+            return (KeyCode::Char(control), modifiers);
+        }
+    }
+    if character.is_ascii_uppercase() {
+        modifiers.insert(KeyModifiers::SHIFT);
+        return (KeyCode::Char(character.to_ascii_lowercase()), modifiers);
+    }
+    (code, modifiers)
 }
 
 fn matching_indices<T>(
@@ -1168,6 +1669,7 @@ pub async fn run_chat(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut client: WorkerClient,
     chat: Option<ChatState>,
+    bundle_id: &str,
 ) -> Result<(ChatExit, WorkerClient, ChatState)> {
     let mut chat = match chat {
         Some(chat) => chat,
@@ -1176,6 +1678,7 @@ pub async fn run_chat(
             ChatState::new(&bootstrap.snapshot, &bootstrap.events)
         }
     };
+    chat.set_history_context(bundle_id);
     let (voice_updates_tx, mut voice_updates_rx) =
         tokio::sync::mpsc::unbounded_channel::<VoiceUpdate>();
     let mut voice_cancel: Option<std::sync::mpsc::Sender<()>> = None;
@@ -1206,7 +1709,10 @@ pub async fn run_chat(
             && let Some(queued) = chat.queued_prompts.pop_front()
         {
             match client.prompt(queued.text.clone(), Vec::new()).await {
-                Ok(_) => chat.mark_prompt_submitted(),
+                Ok(sequence) => {
+                    chat.record_accepted_prompt(sequence, &queued.text);
+                    chat.mark_prompt_submitted();
+                }
                 Err(error) => {
                     let dropped = chat.queued_prompts.len();
                     chat.queued_prompts.clear();
@@ -1233,7 +1739,8 @@ pub async fn run_chat(
                     ChatAction::None => None,
                     ChatAction::Prompt(text) => match client.prompt(text.clone(), Vec::new()).await
                     {
-                        Ok(_) => {
+                        Ok(sequence) => {
+                            chat.record_accepted_prompt(sequence, &text);
                             chat.mark_prompt_submitted();
                             None
                         }
@@ -1311,7 +1818,14 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
     let visible_queued = chat.queued_prompts.len().min(3) as u16;
-    let prompt_height = 4u16.saturating_add(visible_queued);
+    let prompt_width = usize::from(inner.width.saturating_sub(2)).max(1);
+    let input_rows = input_visual_rows(&chat.input, prompt_width) as u16;
+    let desired_prompt_height = input_rows
+        .saturating_add(visible_queued)
+        .saturating_add(2)
+        .max(4);
+    let maximum_prompt_height = inner.height.saturating_sub(6).max(3);
+    let prompt_height = desired_prompt_height.min(maximum_prompt_height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1356,62 +1870,217 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
         })
         .collect::<Vec<_>>();
     let queue_rows = prompt_lines.len();
-    prompt_lines.extend(
+    prompt_lines.extend(if let Some(search) = chat.history_search.as_ref() {
+        highlighted_input_lines(&chat.input, &search.query)
+    } else {
         chat.input
             .split('\n')
-            .map(|line| Line::raw(line.to_owned())),
-    );
+            .map(|line| Line::raw(line.to_owned()))
+            .collect()
+    });
+    let cursor_row =
+        input_cursor_visual_position(&chat.input, chat.input_cursor, prompt_width).1 + queue_rows;
+    let content_height = usize::from(prompt_inner.height).max(1);
+    let input_scroll = cursor_row.saturating_add(1).saturating_sub(content_height);
     frame.render_widget(
         Paragraph::new(prompt_lines)
             .wrap(Wrap { trim: false })
+            .scroll((input_scroll as u16, 0))
             .block(prompt_block),
         chunks[1],
     );
-    set_input_cursor(
-        frame,
-        prompt_inner,
-        &chat.input,
-        chat.input_cursor,
-        queue_rows,
-    );
+    if chat.history_search.is_none() {
+        set_input_cursor(
+            frame,
+            prompt_inner,
+            &chat.input,
+            chat.input_cursor,
+            queue_rows,
+            input_scroll,
+        );
+    }
     let default_footer = if chat.voice_active {
         "Listening… Ctrl-V stop · Esc back (worker keeps running)"
     } else {
-        "Enter send/queue · Shift-Enter newline · Alt-Up edit queued · Ctrl-C cancel · Ctrl-P checkpoint · Esc dashboard"
+        "Enter send/queue · Shift-Enter newline · Ctrl-R history · Ctrl-T transcript · /checkpoint · Esc dashboard"
     };
-    let footer = chat.notice.as_deref().unwrap_or(default_footer);
+    let search_footer = chat.history_search.as_ref().map(history_search_footer);
+    let footer = search_footer
+        .as_deref()
+        .or(chat.notice.as_deref())
+        .unwrap_or(default_footer);
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
+    if let Some(search) = chat.history_search.as_ref()
+        && chunks[2].width > 0
+    {
+        let prefix = format!("reverse-i-search [{}]: ", history_scope_name(search.scope));
+        let column = display_width(&prefix) + display_width(&search.query);
+        frame.set_cursor_position((
+            chunks[2].x + column.min(usize::from(chunks[2].width.saturating_sub(1))) as u16,
+            chunks[2].y,
+        ));
+    }
     render_autocomplete(frame, chunks[1], chat);
 }
 
-fn set_input_cursor(frame: &mut Frame, area: Rect, input: &str, cursor: usize, queue_rows: usize) {
+fn set_input_cursor(
+    frame: &mut Frame,
+    area: Rect,
+    input: &str,
+    cursor: usize,
+    queue_rows: usize,
+    scroll: usize,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let width = usize::from(area.width);
-    let mut row = queue_rows;
-    let mut column = 0usize;
-    for character in input.chars().take(cursor) {
-        if character == '\n' {
-            row += 1;
-            column = 0;
-        } else {
-            column += 1;
-            if column >= width {
-                row += 1;
-                column = 0;
-            }
-        }
-    }
+    let (column, input_row) = input_cursor_visual_position(input, cursor, width);
+    let row = queue_rows.saturating_add(input_row).saturating_sub(scroll);
     if row < usize::from(area.height) {
         frame.set_cursor_position((
             area.x + column.min(width.saturating_sub(1)) as u16,
             area.y + row as u16,
         ));
     }
+}
+
+fn input_visual_rows(input: &str, width: usize) -> usize {
+    input_cursor_visual_position(input, input.len(), width).1 + 1
+}
+
+fn input_cursor_visual_position(input: &str, cursor: usize, width: usize) -> (usize, usize) {
+    let width = width.max(1);
+    let mut row = 0;
+    let mut column = 0;
+    for grapheme in input[..cursor].graphemes(true) {
+        if grapheme == "\n" {
+            row += 1;
+            column = 0;
+            continue;
+        }
+        let grapheme_width = display_width(grapheme).max(1);
+        if column + grapheme_width > width {
+            row += 1;
+            column = 0;
+        }
+        column += grapheme_width;
+        if column >= width {
+            row += 1;
+            column = 0;
+        }
+    }
+    (column, row)
+}
+
+fn history_scope_name(scope: HistoryScope) -> &'static str {
+    match scope {
+        HistoryScope::Project => "project",
+        HistoryScope::Session => "session",
+        HistoryScope::All => "all projects",
+    }
+}
+
+fn history_search_footer(search: &HistorySearch) -> String {
+    let mut footer = format!(
+        "reverse-i-search [{}]: {}",
+        history_scope_name(search.scope),
+        search.query
+    );
+    if let Some(error) = search.unavailable.as_deref() {
+        footer.push_str(&format!("  unavailable: {error}"));
+    } else if !search.query.is_empty() && search.matches.is_empty() {
+        footer.push_str("  no match");
+    } else if let Some(selected) = search.selected {
+        footer.push_str(&format!(
+            "  {}/{} · Enter accept · Esc cancel · Alt-R scope",
+            selected + 1,
+            search.matches.len()
+        ));
+    } else {
+        footer.push_str("  type to search · Alt-R scope · Esc cancel");
+    }
+    footer
+}
+
+fn highlighted_input_lines(input: &str, query: &str) -> Vec<Line<'static>> {
+    let ranges = case_insensitive_match_ranges(input, query);
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    for line in input.split('\n') {
+        let line_end = line_start + line.len();
+        let mut spans = Vec::new();
+        let mut cursor = line_start;
+        for range in ranges
+            .iter()
+            .filter(|range| range.start < line_end && range.end > line_start)
+        {
+            let start = range.start.max(line_start);
+            let end = range.end.min(line_end);
+            if cursor < start {
+                spans.push(Span::raw(input[cursor..start].to_owned()));
+            }
+            spans.push(Span::styled(
+                input[start..end].to_owned(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            cursor = end;
+        }
+        if cursor < line_end {
+            spans.push(Span::raw(input[cursor..line_end].to_owned()));
+        }
+        lines.push(Line::from(spans));
+        line_start = line_end.saturating_add(1);
+    }
+    lines
+}
+
+fn case_insensitive_match_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let query = query
+        .chars()
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let mut folded = String::new();
+    let mut spans = Vec::new();
+    for (start, character) in text.char_indices() {
+        let original = start..start + character.len_utf8();
+        for lower in character.to_lowercase() {
+            let folded_start = folded.len();
+            folded.push(lower);
+            spans.push((folded_start..folded.len(), original.clone()));
+        }
+    }
+    let mut ranges = Vec::new();
+    let mut from = 0;
+    while from <= folded.len()
+        && let Some(relative) = folded[from..].find(&query)
+    {
+        let start = from + relative;
+        let end = start + query.len();
+        let first = spans
+            .iter()
+            .find(|(range, _)| range.end > start && range.start < end)
+            .map(|(_, original)| original.start);
+        let last = spans
+            .iter()
+            .rev()
+            .find(|(range, _)| range.end > start && range.start < end)
+            .map(|(_, original)| original.end);
+        if let (Some(first), Some(last)) = (first, last) {
+            ranges.push(first..last);
+        }
+        from = end;
+    }
+    ranges
 }
 
 fn render_autocomplete(frame: &mut Frame, prompt_area: Rect, chat: &ChatState) {
@@ -1879,6 +2548,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn ctrl(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
+    }
+
     fn transcript_text(chat: &mut ChatState, width: u16) -> Vec<String> {
         transcript_lines(chat, width)
             .into_iter()
@@ -2181,6 +2854,84 @@ mod tests {
         assert_eq!(chat.input, "remember me");
         chat.handle_key(key(KeyCode::Down));
         assert!(chat.input.is_empty());
+    }
+
+    #[test]
+    fn readline_line_movement_kill_and_yank_match_codex() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("alpha beta\ngamma".into());
+        chat.handle_key(ctrl('a'));
+        assert_eq!(&chat.input[chat.input_cursor..], "gamma");
+        chat.handle_key(ctrl('a'));
+        assert_eq!(chat.input_cursor, 0);
+        chat.handle_key(ctrl('e'));
+        assert_eq!(&chat.input[..chat.input_cursor], "alpha beta");
+        chat.handle_key(ctrl('k'));
+        assert_eq!(chat.input, "alpha betagamma");
+        chat.handle_key(ctrl('y'));
+        assert_eq!(chat.input, "alpha beta\ngamma");
+    }
+
+    #[test]
+    fn readline_word_edits_and_grapheme_cursor_are_atomic() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("one two 👩‍💻".into());
+        chat.handle_key(key(KeyCode::Left));
+        assert_eq!(&chat.input[chat.input_cursor..], "👩‍💻");
+        chat.handle_key(ctrl('w'));
+        assert_eq!(chat.input, "one 👩‍💻");
+        chat.handle_key(ctrl('y'));
+        assert_eq!(chat.input, "one two 👩‍💻");
+        chat.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(&chat.input[chat.input_cursor..], "two 👩‍💻");
+    }
+
+    #[test]
+    fn reverse_search_previews_steps_accepts_and_restores_draft() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.prompt_history = vec!["fix parser".into(), "fix renderer".into()];
+        chat.set_input("unfinished".into());
+        chat.handle_key(ctrl('r'));
+        chat.handle_key(key(KeyCode::Char('f')));
+        chat.handle_key(key(KeyCode::Char('i')));
+        chat.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(chat.input, "fix renderer");
+        chat.handle_key(ctrl('r'));
+        assert_eq!(chat.input, "fix parser");
+        chat.handle_key(key(KeyCode::Esc));
+        assert_eq!(chat.input, "unfinished");
+
+        chat.handle_key(ctrl('r'));
+        for character in "renderer".chars() {
+            chat.handle_key(key(KeyCode::Char(character)));
+        }
+        chat.handle_key(key(KeyCode::Enter));
+        assert_eq!(chat.input, "fix renderer");
+        assert!(chat.history_search.is_none());
+    }
+
+    #[test]
+    fn reverse_search_accepts_raw_control_events_and_alt_r_cycles_scope() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.handle_key(key(KeyCode::Char('\u{12}')));
+        assert!(chat.history_search.is_some());
+        chat.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert_eq!(
+            chat.history_search.as_ref().unwrap().scope,
+            HistoryScope::Session
+        );
+        chat.handle_key(ctrl('c'));
+        assert!(chat.history_search.is_none());
+    }
+
+    #[test]
+    fn control_t_replaces_control_r_as_raw_transcript_toggle() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.handle_key(ctrl('t'));
+        assert_eq!(chat.render_mode, TranscriptRenderMode::Raw);
+        chat.handle_key(ctrl('r'));
+        assert_eq!(chat.render_mode, TranscriptRenderMode::Raw);
+        assert!(chat.history_search.is_some());
     }
 
     #[test]

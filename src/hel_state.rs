@@ -327,10 +327,15 @@ impl HelState {
     }
 
     pub fn load() -> Result<Self> {
-        Self::load_from(&state_path())
+        crate::hel_database::migrate_legacy_state()?;
+        crate::hel_database::load_state()
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
+        Self::load_json_from(path)
+    }
+
+    pub(crate) fn load_json_from(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -342,7 +347,7 @@ impl HelState {
     }
 
     pub fn save(&self) -> Result<()> {
-        self.save_to(&state_path())
+        crate::hel_database::save_state(self)
     }
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
