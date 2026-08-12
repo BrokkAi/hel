@@ -65,6 +65,9 @@ pub enum DashboardAction {
     ForceDestroy {
         session_id: String,
     },
+    DeleteArchived {
+        session_id: String,
+    },
     RenameSession {
         session_id: String,
         title: String,
@@ -186,6 +189,9 @@ enum Confirmation {
     ForceDestroy {
         session_id: String,
         typed: String,
+    },
+    DeleteArchived {
+        session_id: String,
     },
 }
 
@@ -627,15 +633,23 @@ impl DashboardState {
             }
             KeyCode::Char('u') => DashboardAction::RefreshQuotas,
             KeyCode::Char('e') if self.config_is_empty() => DashboardAction::OpenConfig,
-            KeyCode::Char('p') => self
+            KeyCode::Char('p') if self.focus == Focus::Active => self
                 .selected_session()
                 .map(|session| DashboardAction::Checkpoint {
                     session_id: session.id.clone(),
                 })
                 .unwrap_or(DashboardAction::None),
-            KeyCode::Char('c') => {
+            KeyCode::Char('c') if self.focus == Focus::Active => {
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(Confirmation::Close {
+                        session_id: session.id.clone(),
+                    });
+                }
+                DashboardAction::None
+            }
+            KeyCode::Char('x') if self.focus == Focus::Archived => {
+                if let Some(session) = self.selected_session() {
+                    self.mode = Mode::Confirm(Confirmation::DeleteArchived {
                         session_id: session.id.clone(),
                     });
                 }
@@ -1139,6 +1153,17 @@ impl DashboardState {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.cancel_modal();
                     DashboardAction::Close { session_id }
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.cancel_modal();
+                    DashboardAction::None
+                }
+                _ => DashboardAction::None,
+            },
+            Confirmation::DeleteArchived { session_id } => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.cancel_modal();
+                    DashboardAction::DeleteArchived { session_id }
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.cancel_modal();
@@ -2250,9 +2275,16 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
-    let text = dashboard.notice.as_deref().unwrap_or(
-        "n new · i import · r rename · p checkpoint · c close · u quota · Tab pane · q detach",
-    );
+    let actions = match dashboard.focus {
+        Focus::Active => {
+            "n new · i import · r rename · p checkpoint · c close · u quota · Tab pane · q detach"
+        }
+        Focus::Archived => {
+            "n new · i import · r rename · x delete permanently · u quota · Tab pane · q detach"
+        }
+        Focus::Quotas => "n new · i import · r refresh · u quota · Tab pane · q detach",
+    };
+    let text = dashboard.notice.as_deref().unwrap_or(actions);
     let style = if dashboard.notice.is_some() {
         Style::default().fg(Color::Yellow)
     } else {
@@ -2548,7 +2580,9 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
                 (repositories.len() as u16 + 8).clamp(10, 18)
             }
             Confirmation::CloseFailed { .. } => 12,
-            Confirmation::Close { .. } | Confirmation::ForceDestroy { .. } => 9,
+            Confirmation::Close { .. }
+            | Confirmation::ForceDestroy { .. }
+            | Confirmation::DeleteArchived { .. } => 9,
         },
         area,
     );
@@ -2576,6 +2610,15 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
                 Line::raw(""),
                 Line::raw("Hel will verify the checkpoint before destroying the target."),
                 Line::raw("Press y/Enter to close, or n/Esc to cancel."),
+            ],
+        ),
+        Confirmation::DeleteArchived { session_id } => (
+            " Permanently delete archived session? ",
+            vec![
+                Line::raw(format!("Session: {session_id}")),
+                Line::raw(""),
+                Line::raw("Hel will permanently delete the checkpoint archive and session record."),
+                Line::raw("Press y/Enter to delete, or n/Esc to cancel."),
             ],
         ),
         Confirmation::CloseFailed { session_id, error } => (
@@ -3767,7 +3810,9 @@ mod tests {
 
     #[test]
     fn failed_close_dialog_offers_retry_or_explicit_force_destroy() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
         dashboard.handle_key(key(KeyCode::Char('c')));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Char('y'))),
@@ -3805,6 +3850,46 @@ mod tests {
                 session_id: "session-1".into()
             }
         );
+    }
+
+    #[test]
+    fn archived_pane_replaces_checkpoint_and_close_with_permanent_delete() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        assert_eq!(dashboard.focus, Focus::Archived);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('p'))),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('c'))),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('x'))),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::DeleteArchived {
+                session_id: "session-1".into()
+            }
+        );
+
+        let mut dashboard = dashboard_with_session(archived_session());
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw archived actions");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("x delete permanently"));
+        assert!(!rendered.contains("p checkpoint"));
+        assert!(!rendered.contains("c close"));
     }
 
     #[test]

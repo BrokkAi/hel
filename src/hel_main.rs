@@ -1909,7 +1909,49 @@ async fn run_dashboard() -> Result<()> {
                     &resource_targets_tx,
                 );
             }
+            DashboardAction::DeleteArchived { session_id } => {
+                match delete_archived_session(&mut controller, &session_id) {
+                    Ok(()) => dashboard.set_notice(format!(
+                        "Permanently deleted archived session {}",
+                        short_id(&session_id)
+                    )),
+                    Err(error) => dashboard.set_notice(format!("Delete failed: {error:#}")),
+                }
+                dashboard.set_state(controller.state.clone());
+                refresh_dashboard_poll_targets(
+                    &controller,
+                    &worker_targets_tx,
+                    &resource_targets_tx,
+                );
+            }
         }
+    }
+    Ok(())
+}
+
+fn delete_archived_session(controller: &mut Controller, session_id: &str) -> Result<()> {
+    let session = controller.state.remove_archived_session(session_id)?;
+    let archive_path = session
+        .checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.archive_path.clone());
+    if let Some(archive_path) = &archive_path
+        && let Err(error) = std::fs::remove_file(archive_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        controller
+            .state
+            .sessions
+            .insert(session.id.clone(), session);
+        return Err(error)
+            .with_context(|| format!("delete checkpoint archive {}", archive_path.display()));
+    }
+    if let Err(error) = controller.state.save() {
+        controller
+            .state
+            .sessions
+            .insert(session.id.clone(), session);
+        return Err(error).context("save state after deleting archived session");
     }
     Ok(())
 }
