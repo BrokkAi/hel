@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
-use crossterm::event::{self, Event};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -1495,10 +1495,14 @@ async fn run_dashboard() -> Result<()> {
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let action = match event::read()? {
+            Event::Key(key) => dashboard.handle_key(key),
+            Event::Mouse(mouse) => {
+                dashboard.handle_mouse(mouse);
+                DashboardAction::None
+            }
+            _ => continue,
         };
-        let action = dashboard.handle_key(key);
         match action {
             DashboardAction::None => {}
             DashboardAction::QuitDetach => break,
@@ -2487,15 +2491,20 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("enable terminal raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+            .context("enter alternate screen and enable mouse capture")?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal })
     }
 
     fn suspend(&mut self) -> Result<()> {
         disable_raw_mode().context("disable terminal raw mode for setup")?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)
-            .context("leave alternate screen for setup")?;
+        execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )
+        .context("disable mouse capture and leave alternate screen for setup")?;
         self.terminal
             .show_cursor()
             .context("show cursor for setup")?;
@@ -2504,8 +2513,12 @@ impl TerminalGuard {
 
     fn resume(&mut self) -> Result<()> {
         enable_raw_mode().context("re-enable terminal raw mode after setup")?;
-        execute!(self.terminal.backend_mut(), EnterAlternateScreen)
-            .context("re-enter alternate screen after setup")?;
+        execute!(
+            self.terminal.backend_mut(),
+            EnterAlternateScreen,
+            EnableMouseCapture
+        )
+        .context("re-enter alternate screen and enable mouse capture after setup")?;
         self.terminal
             .clear()
             .context("clear dashboard after setup")?;
@@ -2516,7 +2529,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
