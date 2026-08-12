@@ -20,6 +20,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use similar::{ChangeTag, TextDiff};
 
 use crate::hel_acp::RuntimeEvent;
 use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot};
@@ -116,6 +117,7 @@ pub struct ChatEntry {
     tool_call_id: Option<String>,
     tool_status: Option<ToolStatus>,
     tool_content: Vec<String>,
+    tool_diffstats: Vec<String>,
     tool_locations: Vec<String>,
     plan: Vec<PlanLine>,
 }
@@ -131,6 +133,7 @@ impl ChatEntry {
             tool_call_id: None,
             tool_status: None,
             tool_content: Vec::new(),
+            tool_diffstats: Vec::new(),
             tool_locations: Vec::new(),
             plan: Vec::new(),
         }
@@ -151,6 +154,7 @@ impl ChatEntry {
             tool_call_id,
             tool_status: Some(tool_status),
             tool_content: Vec::new(),
+            tool_diffstats: Vec::new(),
             tool_locations: Vec::new(),
             plan: Vec::new(),
         }
@@ -166,6 +170,7 @@ impl ChatEntry {
             tool_call_id: None,
             tool_status: None,
             tool_content: Vec::new(),
+            tool_diffstats: Vec::new(),
             tool_locations: Vec::new(),
             plan,
         }
@@ -631,7 +636,10 @@ impl ChatState {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return ChatAction::None;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
+            return ChatAction::Back;
+        }
+        if key.code == KeyCode::Esc {
             return if self.phase == WorkerPhase::Running {
                 ChatAction::Cancel
             } else {
@@ -639,7 +647,6 @@ impl ChatState {
             };
         }
         match key.code {
-            KeyCode::Esc => ChatAction::Back,
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.insert_character('\n');
                 ChatAction::None
@@ -870,6 +877,7 @@ impl ChatState {
                     tool_status(&call.status),
                 );
                 entry.tool_content = tool_content_details(&call.content);
+                entry.tool_diffstats = tool_diffstats(&call.content);
                 entry.tool_locations = tool_location_details(&call.locations);
                 self.entries.push(entry);
             }
@@ -890,6 +898,7 @@ impl ChatState {
                 }
                 if let Some(content) = update.fields.content {
                     entry.tool_content = tool_content_details(&content);
+                    entry.tool_diffstats = tool_diffstats(&content);
                 }
                 if let Some(locations) = update.fields.locations {
                     entry.tool_locations = tool_location_details(&locations);
@@ -937,10 +946,22 @@ impl ChatState {
         let text = sanitize_terminal_text(text);
         if let Some(last) = self.entries.last_mut()
             && last.role == role
-            && last.message_id == message_id
+            && (role == ChatRole::Thought || last.message_id == message_id)
         {
             last.touch(seq);
-            last.text.push_str(&text);
+            if role == ChatRole::Thought
+                && last.message_id != message_id
+                && !last.text.is_empty()
+                && !text.is_empty()
+            {
+                while last.text.ends_with('\n') {
+                    last.text.pop();
+                }
+                last.text.push('\n');
+                last.text.push_str(text.trim_start_matches('\n'));
+            } else {
+                last.text.push_str(&text);
+            }
             return;
         }
         let mut entry = ChatEntry::plain(seq, role, text);
@@ -1135,7 +1156,7 @@ fn tool_content_details(content: &[ToolCallContent]) -> Vec<String> {
     for item in content {
         let detail = match item {
             ToolCallContent::Content(content) => content_block_text(&content.content),
-            ToolCallContent::Diff(diff) => Some(format!("changed {}", diff.path.display())),
+            ToolCallContent::Diff(diff) => Some(format_diffstat(diff)),
             ToolCallContent::Terminal(terminal) => {
                 Some(format!("terminal {}", terminal.terminal_id))
             }
@@ -1149,6 +1170,32 @@ fn tool_content_details(content: &[ToolCallContent]) -> Vec<String> {
         }
     }
     details
+}
+
+fn tool_diffstats(content: &[ToolCallContent]) -> Vec<String> {
+    content
+        .iter()
+        .filter_map(|item| match item {
+            ToolCallContent::Diff(diff) => Some(format_diffstat(diff)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn format_diffstat(diff: &agent_client_protocol::schema::v1::Diff) -> String {
+    let old_text = diff.old_text.as_deref().unwrap_or_default();
+    let changes = TextDiff::from_lines(old_text, &diff.new_text);
+    let (insertions, deletions) =
+        changes
+            .iter_all_changes()
+            .fold((0, 0), |(insertions, deletions), change| {
+                match change.tag() {
+                    ChangeTag::Insert => (insertions + 1, deletions),
+                    ChangeTag::Delete => (insertions, deletions + 1),
+                    ChangeTag::Equal => (insertions, deletions),
+                }
+            });
+    format!("{}  +{insertions} −{deletions}", diff.path.display())
 }
 
 fn tool_location_details(locations: &[ToolCallLocation]) -> Vec<String> {
@@ -1325,9 +1372,9 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
     let prompt_title = match (chat.phase, queued) {
         (WorkerPhase::Idle, 0) => " Prompt ".to_owned(),
         (WorkerPhase::Idle, queued) => format!(" Prompt · {queued} queued "),
-        (WorkerPhase::Running, 0) => " Running · Ctrl-C cancels ".to_owned(),
+        (WorkerPhase::Running, 0) => " Running · Esc cancels ".to_owned(),
         (WorkerPhase::Running, queued) => {
-            format!(" Running · {queued} queued · Ctrl-C cancels ")
+            format!(" Running · {queued} queued · Esc cancels ")
         }
         (WorkerPhase::Closing, _) => " Closing ".to_owned(),
         (WorkerPhase::Closed, _) => " Closed ".to_owned(),
@@ -1375,9 +1422,9 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
         queue_rows,
     );
     let default_footer = if chat.voice_active {
-        "Listening… Ctrl-V stop · Esc back (worker keeps running)"
+        "Listening… Ctrl-V stop · Ctrl-G dashboard"
     } else {
-        "Enter send/queue · Shift-Enter newline · Alt-Up edit queued · Ctrl-C cancel · Ctrl-P checkpoint · Esc dashboard"
+        "Enter send/queue · Shift-Enter newline · Alt-Up edit queued · Esc cancel · Ctrl-P checkpoint · Ctrl-G dashboard"
     };
     let footer = chat.notice.as_deref().unwrap_or(default_footer);
     frame.render_widget(
@@ -1744,10 +1791,14 @@ fn entry_logical_lines(
         .take(8)
         .cloned()
         .collect::<Vec<_>>();
-    let source = if mode == TranscriptRenderMode::Raw && !details.is_empty() {
-        format!("{}\n{}", entry.text, details.join("\n"))
-    } else {
-        entry.text.clone()
+    let source = match mode {
+        TranscriptRenderMode::Raw if !details.is_empty() => {
+            format!("{}\n{}", entry.text, details.join("\n"))
+        }
+        TranscriptRenderMode::Rich if !entry.tool_diffstats.is_empty() => {
+            format!("{}\n{}", entry.text, entry.tool_diffstats.join("\n"))
+        }
+        _ => entry.text.clone(),
     };
     match mode {
         TranscriptRenderMode::Rich => {
@@ -1969,9 +2020,10 @@ mod tests {
     }
 
     #[test]
-    fn escape_detaches_without_emitting_close() {
+    fn control_g_detaches_without_emitting_close() {
         let mut chat = ChatState::new(&snapshot(), &[]);
-        assert_eq!(chat.handle_key(key(KeyCode::Esc)), ChatAction::Back);
+        let control_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(chat.handle_key(control_g), ChatAction::Back);
     }
 
     #[test]
@@ -2011,14 +2063,17 @@ mod tests {
     }
 
     #[test]
-    fn control_c_only_cancels_an_active_turn_and_escape_detaches() {
+    fn escape_only_cancels_an_active_turn_and_control_g_detaches() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         let control_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let control_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         assert_eq!(chat.handle_key(control_c), ChatAction::None);
-        assert_eq!(chat.handle_key(key(KeyCode::Esc)), ChatAction::Back);
+        assert_eq!(chat.handle_key(key(KeyCode::Esc)), ChatAction::None);
+        assert_eq!(chat.handle_key(control_g), ChatAction::Back);
 
         chat.phase = WorkerPhase::Running;
-        assert_eq!(chat.handle_key(control_c), ChatAction::Cancel);
+        assert_eq!(chat.handle_key(key(KeyCode::Esc)), ChatAction::Cancel);
+        assert_eq!(chat.handle_key(control_c), ChatAction::None);
     }
 
     #[test]
@@ -2326,6 +2381,72 @@ mod tests {
     }
 
     #[test]
+    fn acp_diffs_render_diffstats_and_replacement_updates_replace_them() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.apply_session_update(
+            1,
+            &serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "edit-lib",
+                "title": "Edit src/lib.rs",
+                "status": "in_progress",
+                "content": [{
+                    "type": "diff",
+                    "path": "/workspace/src/lib.rs",
+                    "oldText": "alpha\n",
+                    "newText": "alpha\nbeta\n"
+                }]
+            }),
+        );
+
+        assert_eq!(
+            transcript_text(&mut chat, 80),
+            [
+                "● Tool · running",
+                "│ Edit src/lib.rs",
+                "│ /workspace/src/lib.rs  +1 −0",
+                ""
+            ]
+        );
+
+        chat.apply_session_update(
+            2,
+            &serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "edit-lib",
+                "status": "completed",
+                "content": [{
+                    "type": "diff",
+                    "path": "/workspace/src/lib.rs",
+                    "oldText": "alpha\n",
+                    "newText": "gamma\n"
+                }]
+            }),
+        );
+
+        assert_eq!(
+            chat.entries[0].tool_diffstats,
+            ["/workspace/src/lib.rs  +1 −1"]
+        );
+        assert_eq!(
+            transcript_text(&mut chat, 80),
+            [
+                "✓ Tool · done",
+                "│ Edit src/lib.rs",
+                "│ /workspace/src/lib.rs  +1 −1",
+                ""
+            ]
+        );
+    }
+
+    #[test]
+    fn acp_new_file_diff_counts_each_inserted_line() {
+        let diff = agent_client_protocol::schema::v1::Diff::new("/workspace/new.txt", "one\ntwo\n");
+
+        assert_eq!(format_diffstat(&diff), "/workspace/new.txt  +2 −0");
+    }
+
+    #[test]
     fn transcript_blocks_keep_role_headers_and_wrapped_body_indented() {
         let entry = ChatEntry::plain(1, ChatRole::User, "alpha beta gamma");
         let mut chat = ChatState::new(&snapshot(), &[]);
@@ -2389,6 +2510,36 @@ mod tests {
         assert_eq!(chat.entries.len(), 2);
         assert_eq!(chat.entries[0].text, "first");
         assert_eq!(chat.entries[1].text, "second");
+    }
+
+    #[test]
+    fn adjacent_thought_messages_coalesce_without_an_extra_separator() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        for (seq, id, text) in [(1, "one", "first thought"), (2, "two", "second thought")] {
+            chat.apply_session_update(
+                seq,
+                &serde_json::json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "messageId": id,
+                    "content": {"type": "text", "text": text}
+                }),
+            );
+        }
+
+        assert_eq!(chat.entries.len(), 1);
+        assert_eq!(chat.entries[0].text, "first thought\nsecond thought");
+        let rendered = transcript_text(&mut chat, 80);
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.contains("Thinking"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered,
+            ["○ Thinking", "│ first thought", "│ second thought", ""]
+        );
     }
 
     #[test]

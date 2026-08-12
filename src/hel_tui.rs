@@ -19,9 +19,7 @@ use ratatui::widgets::{
 use crate::hel_chat::render_agent_message_preview;
 use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use crate::hel_quota::ProfileQuota;
-#[cfg(test)]
-use crate::hel_state::SessionState;
-use crate::hel_state::{HelState, SessionRecord};
+use crate::hel_state::{HelState, SessionRecord, SessionState};
 use crate::hel_targets::{
     AdditionalMount, SessionResourceUsage, default_mount_destination, path_completion,
 };
@@ -29,7 +27,6 @@ use crate::hel_worker::{SequencedEvent, WorkerEvent};
 
 const FORCE_CONFIRMATION: &str = "DESTROY";
 const ACTIVE_MESSAGE_LINES: usize = 4;
-const ACTIVE_SESSION_ROW_HEIGHT: u16 = ACTIVE_MESSAGE_LINES as u16 + 1;
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
 const IMPORT_STALL_WARNING_AFTER: Duration = Duration::from_secs(10);
 
@@ -386,8 +383,6 @@ impl DashboardState {
                         } else {
                             detail.agent_text_stream_open = false;
                         }
-                    } else {
-                        detail.agent_text_stream_open = false;
                     }
                 }
                 WorkerEvent::ConfigChanged { .. }
@@ -1868,12 +1863,20 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let active_minimum_height = (SESSION_TABLE_CHROME_HEIGHT
-        + if active.is_empty() {
-            0
-        } else {
-            ACTIVE_SESSION_ROW_HEIGHT
+    let preview_width = area.width.saturating_sub(4);
+    let active_previews = active
+        .iter()
+        .map(|session| {
+            active_message_preview(
+                dashboard.session_details.get(&session.id),
+                usize::from(preview_width),
+            )
         })
+        .collect::<Vec<_>>();
+    let active_minimum_height = (SESSION_TABLE_CHROME_HEIGHT
+        + active_previews
+            .first()
+            .map_or(0, |preview| preview.len() as u16 + 1))
     .min(area.height.saturating_sub(3));
     let archived_height = (archived.len() as u16 + SESSION_TABLE_CHROME_HEIGHT)
         .max(3)
@@ -1885,14 +1888,19 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
             Constraint::Length(archived_height),
         ])
         .split(area);
-    let active_rows = active.iter().map(|session| {
-        active_session_row(
-            session,
-            dashboard.session_details.get(&session.id),
-            now_epoch_seconds,
-            &dashboard.config,
-        )
-    });
+    let preview_width = panes[0].width.saturating_sub(4);
+    let active_rows = active
+        .iter()
+        .zip(&active_previews)
+        .map(|(session, preview)| {
+            active_session_row(
+                session,
+                dashboard.session_details.get(&session.id),
+                now_epoch_seconds,
+                &dashboard.config,
+                preview.len() as u16 + 1,
+            )
+        });
     let active_focused = dashboard.focus == Focus::Active;
     let active_table = Table::new(active_rows, session_column_constraints())
         .header(session_header())
@@ -1913,50 +1921,40 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         .with_selected((dashboard.session_index < active.len()).then_some(dashboard.session_index));
     frame.render_stateful_widget(active_table, panes[0], &mut active_state);
     let active_offset = active_state.offset();
-    for (visible_index, session) in active.iter().skip(active_offset).enumerate() {
-        let detail_y = panes[0].y
-            + SESSION_TABLE_CHROME_HEIGHT
-            + visible_index as u16 * ACTIVE_SESSION_ROW_HEIGHT;
+    let mut row_y = panes[0].y + SESSION_TABLE_CHROME_HEIGHT;
+    let mut visible_sessions = 0;
+    for (index, _session) in active.iter().enumerate().skip(active_offset) {
+        let preview = &active_previews[index];
+        let detail_y = row_y;
         if detail_y >= panes[0].bottom().saturating_sub(1) {
             break;
         }
-        let Some(message) = dashboard
-            .session_details
-            .get(&session.id)
-            .and_then(|detail| detail.last_agent_message.as_deref())
-        else {
-            continue;
-        };
-        let selected = dashboard.focus == Focus::Active
-            && active_offset + visible_index == dashboard.session_index;
+        visible_sessions += 1;
+        let selected = dashboard.focus == Focus::Active && index == dashboard.session_index;
         let style = if selected {
             Style::default().bg(Color::DarkGray)
         } else {
             Style::default()
         };
-        let preview_width = panes[0].width.saturating_sub(4);
-        frame.render_widget(
-            Paragraph::new(render_agent_message_preview(
-                message,
-                usize::from(preview_width),
-                ACTIVE_MESSAGE_LINES,
-            ))
-            .style(style),
-            Rect::new(
-                panes[0].x + 3,
-                detail_y,
-                preview_width,
-                ACTIVE_MESSAGE_LINES as u16,
-            ),
-        );
+        if !preview.is_empty() {
+            frame.render_widget(
+                Paragraph::new(preview.clone()).style(style),
+                Rect::new(
+                    panes[0].x + 3,
+                    detail_y,
+                    preview_width,
+                    preview.len() as u16,
+                ),
+            );
+        }
+        row_y = row_y.saturating_add(preview.len() as u16 + 1);
     }
     render_session_scrollbar(
         frame,
         panes[0],
         active.len(),
         active_offset,
-        usize::from(panes[0].height.saturating_sub(SESSION_TABLE_CHROME_HEIGHT))
-            / usize::from(ACTIVE_SESSION_ROW_HEIGHT),
+        visible_sessions,
     );
 
     let archived_rows = archived
@@ -2025,7 +2023,7 @@ fn focus_border(focused: bool) -> BorderType {
 
 fn session_column_constraints() -> [Constraint; 6] {
     [
-        Constraint::Length(11),
+        Constraint::Length(10),
         Constraint::Length(14),
         Constraint::Length(20),
         Constraint::Length(14),
@@ -2063,13 +2061,18 @@ fn session_values(
             }
         })
         .unwrap_or_else(|| "never".into());
-    let clock = crate::usage_format::format_turn_clock(
-        now_epoch_seconds,
-        detail.and_then(|detail| detail.current_turn_started_at),
-        detail
-            .and_then(|detail| detail.last_agent_text_at)
-            .or_else(|| session_updated_at_epoch_seconds(session)),
-    );
+    let clock = if session.state == SessionState::Provisioning {
+        let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
+        format!("Launch {}s", now_epoch_seconds.saturating_sub(started_at))
+    } else {
+        crate::usage_format::format_turn_clock(
+            now_epoch_seconds,
+            detail.and_then(|detail| detail.current_turn_started_at),
+            detail
+                .and_then(|detail| detail.last_agent_text_at)
+                .or_else(|| session_updated_at_epoch_seconds(session)),
+        )
+    };
     (
         clock,
         session.last_profile.clone(),
@@ -2167,11 +2170,19 @@ fn session_name_line(session_name: String, unread_count: usize) -> Line<'static>
     Line::from(spans)
 }
 
+fn active_message_preview(detail: Option<&SessionDetail>, width: usize) -> Vec<Line<'static>> {
+    detail
+        .and_then(|detail| detail.last_agent_message.as_deref())
+        .map(|message| render_agent_message_preview(message, width, ACTIVE_MESSAGE_LINES))
+        .unwrap_or_default()
+}
+
 fn active_session_row(
     session: &SessionRecord,
     detail: Option<&SessionDetail>,
     now_epoch_seconds: u64,
     config: &HelConfig,
+    height: u16,
 ) -> Row<'static> {
     let (clock, profile, target, checkpoint, resources, session_name) =
         session_values(session, detail, now_epoch_seconds, config);
@@ -2184,7 +2195,7 @@ fn active_session_row(
         Cell::from(resources),
         Cell::from(session_name_line(session_name, unread_count)),
     ])
-    .height(ACTIVE_SESSION_ROW_HEIGHT)
+    .height(height)
 }
 
 fn archived_session_row(
@@ -3120,6 +3131,42 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_adapter_updates_do_not_truncate_the_streamed_agent_response() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        let unrelated = SequencedEvent {
+            seq: 2,
+            request_id: None,
+            event: WorkerEvent::Adapter {
+                kind: "usage_update".into(),
+                payload: serde_json::json!({
+                    "type": "usage_update",
+                    "used": 42
+                }),
+            },
+        };
+
+        dashboard.apply_worker_events(
+            "session-1",
+            &[
+                adapter_text_event(1, "agent_message_chunk", "The container lacked "),
+                unrelated,
+                adapter_text_event(3, "agent_message_chunk", "uv, so validation used Python "),
+                adapter_text_event(4, "agent_message_chunk", "3 directly."),
+            ],
+            100,
+        );
+
+        assert_eq!(
+            dashboard.session_details["session-1"]
+                .last_agent_message
+                .as_deref(),
+            Some("The container lacked uv, so validation used Python 3 directly.")
+        );
+    }
+
+    #[test]
     fn new_session_wizard_returns_all_three_choices() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
         assert_eq!(
@@ -3722,7 +3769,7 @@ mod tests {
     }
 
     #[test]
-    fn active_and_archived_session_panes_show_scrollbars() {
+    fn overflowing_session_pane_shows_a_scrollbar() {
         let mut sessions = BTreeMap::new();
         for index in 0..6 {
             let mut session = archived_session();
@@ -3741,6 +3788,17 @@ mod tests {
             mount_history: BTreeMap::new(),
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
+        for index in 0..6 {
+            dashboard.apply_worker_events(
+                &format!("active-{index:02}"),
+                &[adapter_text_event(
+                    1,
+                    "agent_message_chunk",
+                    "one\ntwo\nthree\nfour",
+                )],
+                100,
+            );
+        }
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -3754,8 +3812,10 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<Vec<_>>();
 
-        assert!(symbols.iter().filter(|symbol| **symbol == "▲").count() >= 2);
-        assert!(symbols.iter().filter(|symbol| **symbol == "▼").count() >= 2);
+        let up = symbols.iter().filter(|symbol| **symbol == "▲").count();
+        let down = symbols.iter().filter(|symbol| **symbol == "▼").count();
+        assert!(up >= 1, "expected an upper arrow, rendered {up}");
+        assert!(down >= 1, "expected a lower arrow, rendered {down}");
     }
 
     #[test]
@@ -3826,6 +3886,35 @@ mod tests {
 
         let (clock, _, _, _, _, _) = session_values(&session, Some(&detail), 1_480, &config());
         assert_eq!(clock, "8m ago");
+    }
+
+    #[test]
+    fn active_message_preview_uses_only_the_rendered_lines_it_needs() {
+        let short = SessionDetail {
+            last_agent_message: Some("one line".into()),
+            ..SessionDetail::default()
+        };
+        assert_eq!(active_message_preview(Some(&short), 80).len(), 1);
+
+        let long = SessionDetail {
+            last_agent_message: Some("one\ntwo\nthree\nfour\nfive".into()),
+            ..SessionDetail::default()
+        };
+        assert_eq!(
+            active_message_preview(Some(&long), 80).len(),
+            ACTIVE_MESSAGE_LINES
+        );
+        assert!(active_message_preview(None, 80).is_empty());
+    }
+
+    #[test]
+    fn provisioning_clock_uses_elapsed_seconds_since_state_update() {
+        let mut session = archived_session();
+        session.state = SessionState::Provisioning;
+        session.updated_at = "1970-01-01T00:16:40Z".into();
+
+        let (clock, _, _, _, _, _) = session_values(&session, None, 1_012, &config());
+        assert_eq!(clock, "Launch 12s");
     }
 
     #[test]

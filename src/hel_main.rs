@@ -1672,7 +1672,31 @@ async fn run_dashboard() -> Result<()> {
                         terminal
                             .terminal
                             .draw(|frame| render(frame, &mut dashboard))?;
-                        match controller.provision_session(&session_id).await {
+                        let mut provisioning_controller = Controller {
+                            config: controller.config.clone(),
+                            state: controller.state.clone(),
+                        };
+                        let provisioning_session_id = session_id.clone();
+                        let mut provisioning = tokio::spawn(async move {
+                            let result = provisioning_controller
+                                .provision_session(&provisioning_session_id)
+                                .await;
+                            (provisioning_controller, result)
+                        });
+                        let (updated_controller, provision_result) = loop {
+                            tokio::select! {
+                                result = &mut provisioning => {
+                                    break result.context("provisioning task failed")?;
+                                }
+                                _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                                    terminal
+                                        .terminal
+                                        .draw(|frame| render(frame, &mut dashboard))?;
+                                }
+                            }
+                        };
+                        controller = updated_controller;
+                        match provision_result {
                             Ok(()) => {
                                 dashboard.set_notice(format!(
                                     "Target ready for {}; connecting worker",
