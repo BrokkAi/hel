@@ -691,7 +691,7 @@ fn blob_to_path(bytes: &[u8]) -> PathBuf {
     let wide = bytes
         .chunks_exact(2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .collect();
+        .collect::<Vec<_>>();
     PathBuf::from(std::ffi::OsString::from_wide(&wide))
 }
 

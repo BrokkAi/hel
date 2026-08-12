@@ -1812,7 +1812,10 @@ pub fn session_edit_targets(
                 transcript.cwd.join(path)
             }
         })
-        .filter(|path| !path.starts_with(&profile_home))
+        .filter(|path| {
+            let comparable = canonicalize_existing_ancestor(path);
+            !comparable.starts_with(&profile_home)
+        })
         .collect::<Vec<_>>();
     if paths.is_empty() {
         paths.push(transcript.cwd.clone());
@@ -1837,6 +1840,27 @@ pub fn session_edit_targets(
         git_roots: git_roots.into_iter().collect(),
         non_git_dirs: non_git_dirs.into_iter().collect(),
     })
+}
+
+fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = fs::canonicalize(existing) {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(name) = existing.file_name() else {
+            return path.to_path_buf();
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            return path.to_path_buf();
+        };
+        existing = parent;
+    }
 }
 
 fn edited_directory(path: &Path) -> PathBuf {
@@ -2888,6 +2912,36 @@ mod tests {
         let targets = session_edit_targets(&transcript, &profile).unwrap();
         assert_eq!(targets.git_roots, [fs::canonicalize(app).unwrap()]);
         assert_eq!(targets.non_git_dirs, [outside]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_targets_compare_profile_paths_after_resolving_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let actual = directory.path().join("actual");
+        let alias = directory.path().join("alias");
+        let app = actual.join("app");
+        let profile = actual.join("profile");
+        let outside = actual.join("notes");
+        initialize_repository(&app, "app");
+        fs::create_dir_all(&profile).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&actual, &alias).unwrap();
+        let transcript = ClaudeTranscript {
+            cwd: alias.join("app"),
+            edited_paths: vec![
+                alias.join("profile/memory.md"),
+                alias.join("notes/draft.md"),
+            ],
+            events: Vec::new(),
+        };
+
+        let targets = session_edit_targets(&transcript, &alias.join("profile")).unwrap();
+
+        assert_eq!(targets.git_roots, [fs::canonicalize(app).unwrap()]);
+        assert_eq!(targets.non_git_dirs, [alias.join("notes")]);
     }
 
     #[test]
