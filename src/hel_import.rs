@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -14,8 +15,8 @@ use rayon::prelude::*;
 use serde_json::{Value, json};
 
 use crate::hel_archive::{
-    ArchiveInput, BundleManifest, GitCollectionSpec, SystemGit, TargetManifest,
-    collect_git_snapshot, write_archive_atomic,
+    ArchiveInput, BundleManifest, GitCollectionSpec, GitSnapshotProgress, SystemGit,
+    TargetManifest, collect_git_snapshot_with_progress, write_archive_atomic,
 };
 use crate::hel_checkpoint::{collect_import_native_artifacts, collect_native_artifacts};
 use crate::hel_config::{
@@ -195,6 +196,40 @@ pub struct ImportedClaudeSession {
 
 pub type ImportedCodexSession = ImportedClaudeSession;
 pub type ImportedKimiSession = ImportedClaudeSession;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportArchiveProgress {
+    Repository {
+        current: usize,
+        total: usize,
+        id: String,
+    },
+    UntrackedFile {
+        repository_id: String,
+        current: usize,
+        total: usize,
+        path: PathBuf,
+    },
+    WritingArchive,
+}
+
+pub struct ImportControl<'a> {
+    pub cancelled: &'a AtomicBool,
+    pub progress: &'a (dyn Fn(ImportArchiveProgress) + Sync),
+}
+
+impl ImportControl<'_> {
+    fn check_cancelled(&self) -> Result<()> {
+        ensure!(!self.cancelled.load(Ordering::Acquire), "import cancelled");
+        Ok(())
+    }
+
+    fn report(&self, progress: ImportArchiveProgress) -> Result<()> {
+        self.check_cancelled()?;
+        (self.progress)(progress);
+        Ok(())
+    }
+}
 
 pub struct ClaudeImportRequest<'a> {
     pub claude_home: &'a Path,
@@ -2028,6 +2063,24 @@ pub fn import_claude_session(
     state: &mut HelState,
     request: ClaudeImportRequest<'_>,
 ) -> Result<ImportedClaudeSession> {
+    import_claude_session_inner(config, state, request, None)
+}
+
+pub fn import_claude_session_with_control(
+    config: &HelConfig,
+    state: &mut HelState,
+    request: ClaudeImportRequest<'_>,
+    control: &ImportControl<'_>,
+) -> Result<ImportedClaudeSession> {
+    import_claude_session_inner(config, state, request, Some(control))
+}
+
+fn import_claude_session_inner(
+    config: &HelConfig,
+    state: &mut HelState,
+    request: ClaudeImportRequest<'_>,
+    control: Option<&ImportControl<'_>>,
+) -> Result<ImportedClaudeSession> {
     let ClaudeImportRequest {
         claude_home,
         source,
@@ -2049,7 +2102,7 @@ pub fn import_claude_session(
             .unwrap_or_else(|| format!("Imported Claude session {}", source.native_session_id)),
     };
     let targets = session_edit_targets(transcript, claude_home)?;
-    let repositories = collect_local_repositories(bundle, &transcript.cwd, &targets.git_roots)?;
+    let repositories = collect_local_repositories(bundle, &targets.git_roots, control)?;
     let native_artifacts = collect_native_artifacts(
         HarnessKind::Claude,
         claude_home,
@@ -2062,6 +2115,9 @@ pub fn import_claude_session(
     let profile_id = import_profile_id(config, profile_id, HarnessKind::Claude, claude_home)?;
     let target_id = default_import_target_id(config);
     let archive_path = archive_directory.join(format!("{session_id}.hel.zip"));
+    if let Some(control) = control {
+        control.report(ImportArchiveProgress::WritingArchive)?;
+    }
     let verified = write_archive_atomic(
         &archive_path,
         &ArchiveInput {
@@ -2091,6 +2147,12 @@ pub fn import_claude_session(
             repositories,
         },
     )?;
+    if let Some(control) = control
+        && let Err(error) = control.check_cancelled()
+    {
+        let _ = fs::remove_file(&archive_path);
+        return Err(error);
+    }
     let checkpoint = CheckpointMetadata {
         archive_path: archive_path.clone(),
         sha256: verified.archive_sha256,
@@ -2134,6 +2196,24 @@ pub fn import_codex_session(
     state: &mut HelState,
     request: CodexImportRequest<'_>,
 ) -> Result<ImportedCodexSession> {
+    import_codex_session_inner(config, state, request, None)
+}
+
+pub fn import_codex_session_with_control(
+    config: &HelConfig,
+    state: &mut HelState,
+    request: CodexImportRequest<'_>,
+    control: &ImportControl<'_>,
+) -> Result<ImportedCodexSession> {
+    import_codex_session_inner(config, state, request, Some(control))
+}
+
+fn import_codex_session_inner(
+    config: &HelConfig,
+    state: &mut HelState,
+    request: CodexImportRequest<'_>,
+    control: Option<&ImportControl<'_>>,
+) -> Result<ImportedCodexSession> {
     let CodexImportRequest {
         codex_home,
         source,
@@ -2157,6 +2237,7 @@ pub fn import_codex_session(
             title,
             archive_directory,
         },
+        control,
     )
 }
 
@@ -2164,6 +2245,24 @@ pub fn import_kimi_session(
     config: &HelConfig,
     state: &mut HelState,
     request: KimiImportRequest<'_>,
+) -> Result<ImportedKimiSession> {
+    import_kimi_session_inner(config, state, request, None)
+}
+
+pub fn import_kimi_session_with_control(
+    config: &HelConfig,
+    state: &mut HelState,
+    request: KimiImportRequest<'_>,
+    control: &ImportControl<'_>,
+) -> Result<ImportedKimiSession> {
+    import_kimi_session_inner(config, state, request, Some(control))
+}
+
+fn import_kimi_session_inner(
+    config: &HelConfig,
+    state: &mut HelState,
+    request: KimiImportRequest<'_>,
+    control: Option<&ImportControl<'_>>,
 ) -> Result<ImportedKimiSession> {
     let KimiImportRequest {
         kimi_home,
@@ -2188,6 +2287,7 @@ pub fn import_kimi_session(
             title,
             archive_directory,
         },
+        control,
     )
 }
 
@@ -2207,6 +2307,7 @@ fn import_native_session(
     config: &HelConfig,
     state: &mut HelState,
     request: NativeImportRequest<'_>,
+    control: Option<&ImportControl<'_>>,
 ) -> Result<ImportedClaudeSession> {
     let NativeImportRequest {
         harness,
@@ -2235,7 +2336,7 @@ fn import_native_session(
         }),
     };
     let targets = session_edit_targets(transcript, harness_home)?;
-    let repositories = collect_local_repositories(bundle, &transcript.cwd, &targets.git_roots)?;
+    let repositories = collect_local_repositories(bundle, &targets.git_roots, control)?;
     let native_artifacts =
         collect_import_native_artifacts(harness, harness_home, native_session_id, source_path)?;
     let canonical_events = encode_events(&transcript.events)?;
@@ -2244,6 +2345,9 @@ fn import_native_session(
     let profile_id = import_profile_id(config, profile_id, harness, harness_home)?;
     let target_id = default_import_target_id(config);
     let archive_path = archive_directory.join(format!("{session_id}.hel.zip"));
+    if let Some(control) = control {
+        control.report(ImportArchiveProgress::WritingArchive)?;
+    }
     let verified = write_archive_atomic(
         &archive_path,
         &ArchiveInput {
@@ -2276,6 +2380,12 @@ fn import_native_session(
             repositories,
         },
     )?;
+    if let Some(control) = control
+        && let Err(error) = control.check_cancelled()
+    {
+        let _ = fs::remove_file(&archive_path);
+        return Err(error);
+    }
     let checkpoint = CheckpointMetadata {
         archive_path: archive_path.clone(),
         sha256: verified.archive_sha256,
@@ -2339,8 +2449,8 @@ fn default_import_target_id(config: &HelConfig) -> String {
 
 fn collect_local_repositories(
     bundle: &ProjectBundle,
-    _cwd: &Path,
     detected_roots: &[PathBuf],
+    control: Option<&ImportControl<'_>>,
 ) -> Result<Vec<crate::hel_archive::RepositorySnapshot>> {
     let detected = detected_roots
         .iter()
@@ -2362,12 +2472,21 @@ fn collect_local_repositories(
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
     let git = SystemGit;
+    let repository_count = bundle.repositories.len();
     bundle
         .repositories
         // Indexed parallel iteration keeps repository and manifest order
         // identical to the configured bundle.
         .par_iter()
-        .map(|repository| {
+        .enumerate()
+        .map(|(index, repository)| {
+            if let Some(control) = control {
+                control.report(ImportArchiveProgress::Repository {
+                    current: index + 1,
+                    total: repository_count,
+                    id: repository.id.clone(),
+                })?;
+            }
             let path = repository_paths
                 .get(&repository.id)
                 .expect("repository paths cover the validated bundle")
@@ -2379,7 +2498,7 @@ fn collect_local_repositories(
                 path.display()
             );
             let (base_commit, full_history) = import_base_commit(&path)?;
-            collect_git_snapshot(
+            collect_git_snapshot_with_progress(
                 &git,
                 &path,
                 &GitCollectionSpec {
@@ -2393,6 +2512,23 @@ fn collect_local_repositories(
                     origin_override: repository
                         .is_local()
                         .then(|| format!("hel-local:{}", repository.id)),
+                },
+                &|progress| {
+                    let Some(control) = control else {
+                        return Ok(());
+                    };
+                    match progress {
+                        GitSnapshotProgress::UntrackedFile {
+                            current,
+                            total,
+                            path,
+                        } => control.report(ImportArchiveProgress::UntrackedFile {
+                            repository_id: repository.id.clone(),
+                            current,
+                            total,
+                            path,
+                        }),
+                    }
                 },
             )
             .with_context(|| format!("collect local repository {:?}", repository.id))
@@ -2878,7 +3014,7 @@ mod tests {
         };
 
         let snapshots =
-            collect_local_repositories(&bundle, &app, &[app.clone(), workspace.join("worker")])
+            collect_local_repositories(&bundle, &[app.clone(), workspace.join("worker")], None)
                 .unwrap();
         let ids = snapshots
             .iter()

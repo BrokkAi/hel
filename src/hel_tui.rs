@@ -4,7 +4,7 @@
 //! Input is reduced to [`DashboardAction`] values for the controller to run.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -31,6 +31,7 @@ const FORCE_CONFIRMATION: &str = "DESTROY";
 const ACTIVE_MESSAGE_LINES: usize = 4;
 const ACTIVE_SESSION_ROW_HEIGHT: u16 = ACTIVE_MESSAGE_LINES as u16 + 1;
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
+const IMPORT_STALL_WARNING_AFTER: Duration = Duration::from_secs(10);
 
 /// A side effect requested by the dashboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +65,9 @@ pub enum DashboardAction {
     ForceDestroy {
         session_id: String,
     },
+    DeleteArchived {
+        session_id: String,
+    },
     RenameSession {
         session_id: String,
         title: String,
@@ -75,6 +79,7 @@ pub enum DashboardAction {
         native_session_id: String,
         display_title: String,
     },
+    CancelImport,
     ConfirmImportBundle {
         accepted: bool,
     },
@@ -185,6 +190,9 @@ enum Confirmation {
         session_id: String,
         typed: String,
     },
+    DeleteArchived {
+        session_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +213,7 @@ struct ImportProgress {
     step: usize,
     total: Option<usize>,
     message: String,
+    last_updated: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -506,6 +515,7 @@ impl DashboardState {
             step: 1,
             total: None,
             message: "Locating native session…".into(),
+            last_updated: Instant::now(),
         });
     }
 
@@ -516,6 +526,7 @@ impl DashboardState {
         progress.step = step;
         progress.total = total;
         progress.message = message;
+        progress.last_updated = Instant::now();
     }
 
     pub fn show_import_bundle_confirmation(
@@ -559,7 +570,10 @@ impl DashboardState {
             Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
             Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
             Mode::Import(dialog) => self.handle_import_key(key.code, dialog),
-            Mode::Importing(_) => DashboardAction::None,
+            Mode::Importing(_) => match key.code {
+                KeyCode::Esc => DashboardAction::CancelImport,
+                _ => DashboardAction::None,
+            },
             Mode::ConfirmImportBundle(_) => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     DashboardAction::ConfirmImportBundle { accepted: true }
@@ -616,15 +630,23 @@ impl DashboardState {
             }
             KeyCode::Char('u') => DashboardAction::RefreshQuotas,
             KeyCode::Char('e') if self.config_is_empty() => DashboardAction::OpenConfig,
-            KeyCode::Char('p') => self
+            KeyCode::Char('p') if self.focus == Focus::Active => self
                 .selected_session()
                 .map(|session| DashboardAction::Checkpoint {
                     session_id: session.id.clone(),
                 })
                 .unwrap_or(DashboardAction::None),
-            KeyCode::Char('c') => {
+            KeyCode::Char('c') if self.focus == Focus::Active => {
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(Confirmation::Close {
+                        session_id: session.id.clone(),
+                    });
+                }
+                DashboardAction::None
+            }
+            KeyCode::Char('x') if self.focus == Focus::Archived => {
+                if let Some(session) = self.selected_session() {
+                    self.mode = Mode::Confirm(Confirmation::DeleteArchived {
                         session_id: session.id.clone(),
                     });
                 }
@@ -1135,6 +1157,17 @@ impl DashboardState {
                 }
                 _ => DashboardAction::None,
             },
+            Confirmation::DeleteArchived { session_id } => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.cancel_modal();
+                    DashboardAction::DeleteArchived { session_id }
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.cancel_modal();
+                    DashboardAction::None
+                }
+                _ => DashboardAction::None,
+            },
             Confirmation::CloseFailed { session_id, error } => match code {
                 KeyCode::Char('r') | KeyCode::Char('R') => {
                     self.cancel_modal();
@@ -1558,11 +1591,26 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
 }
 
 fn render_import_progress(frame: &mut Frame, area: Rect, progress: &ImportProgress) {
-    let popup = centered_rect(68, 8, area);
+    let popup = centered_rect(76, 10, area);
     frame.render_widget(Clear, popup);
     let total = progress
         .total
         .map_or_else(|| "?".into(), |total| total.to_string());
+    let stalled_for = progress.last_updated.elapsed();
+    let status = if stalled_for >= IMPORT_STALL_WARNING_AFTER {
+        Line::styled(
+            format!(
+                "No progress for {}s; the filesystem may be stalled.",
+                stalled_for.as_secs()
+            ),
+            Style::default().fg(Color::Yellow),
+        )
+    } else {
+        Line::styled(
+            "The dashboard remains responsive while the import runs.",
+            Style::default().fg(Color::Gray),
+        )
+    };
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
@@ -1571,13 +1619,11 @@ fn render_import_progress(frame: &mut Frame, area: Rect, progress: &ImportProgre
             ),
             Line::raw(""),
             Line::raw(progress.message.clone()),
-            Line::styled(
-                "The dashboard remains responsive while the import runs.",
-                Style::default().fg(Color::Gray),
-            ),
+            status,
+            Line::styled("Esc cancels this import.", Style::default().fg(Color::Gray)),
         ])
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " Importing session · step {}/{total} ",
+            " Importing session · progress {}/{total} ",
             progress.step
         )))
         .wrap(Wrap { trim: true }),
@@ -2249,9 +2295,16 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
-    let text = dashboard.notice.as_deref().unwrap_or(
-        "n new · i import · r rename · p checkpoint · c close · u quota · Tab pane · q detach",
-    );
+    let actions = match dashboard.focus {
+        Focus::Active => {
+            "n new · i import · r rename · p checkpoint · c close · u quota · Tab pane · q detach"
+        }
+        Focus::Archived => {
+            "n new · i import · r rename · x delete permanently · u quota · Tab pane · q detach"
+        }
+        Focus::Quotas => "n new · i import · r refresh · u quota · Tab pane · q detach",
+    };
+    let text = dashboard.notice.as_deref().unwrap_or(actions);
     let style = if dashboard.notice.is_some() {
         Style::default().fg(Color::Yellow)
     } else {
@@ -2547,7 +2600,9 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
                 (repositories.len() as u16 + 8).clamp(10, 18)
             }
             Confirmation::CloseFailed { .. } => 12,
-            Confirmation::Close { .. } | Confirmation::ForceDestroy { .. } => 9,
+            Confirmation::Close { .. }
+            | Confirmation::ForceDestroy { .. }
+            | Confirmation::DeleteArchived { .. } => 9,
         },
         area,
     );
@@ -2575,6 +2630,15 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
                 Line::raw(""),
                 Line::raw("Hel will verify the checkpoint before destroying the target."),
                 Line::raw("Press y/Enter to close, or n/Esc to cancel."),
+            ],
+        ),
+        Confirmation::DeleteArchived { session_id } => (
+            " Permanently delete archived session? ",
+            vec![
+                Line::raw(format!("Session: {session_id}")),
+                Line::raw(""),
+                Line::raw("Hel will permanently delete the checkpoint archive and session record."),
+                Line::raw("Press y/Enter to delete, or n/Esc to cancel."),
             ],
         ),
         Confirmation::CloseFailed { session_id, error } => (
@@ -3480,7 +3544,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Importing session · step 1/?"));
+        assert!(rendered.contains("Importing session · progress 1/?"));
 
         dashboard.update_import_progress(2, Some(4), "Native session parsed.".into());
         terminal
@@ -3493,8 +3557,28 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Importing session · step 2/4"));
+        assert!(rendered.contains("Importing session · progress 2/4"));
         assert!(rendered.contains("Native session parsed."));
+
+        let Mode::Importing(progress) = &mut dashboard.mode else {
+            panic!("expected import progress");
+        };
+        progress.last_updated = Instant::now() - IMPORT_STALL_WARNING_AFTER;
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw stalled import progress");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("filesystem may be stalled"));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Esc)),
+            DashboardAction::CancelImport
+        );
     }
 
     #[test]
@@ -3746,7 +3830,9 @@ mod tests {
 
     #[test]
     fn failed_close_dialog_offers_retry_or_explicit_force_destroy() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
         dashboard.handle_key(key(KeyCode::Char('c')));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Char('y'))),
@@ -3784,6 +3870,46 @@ mod tests {
                 session_id: "session-1".into()
             }
         );
+    }
+
+    #[test]
+    fn archived_pane_replaces_checkpoint_and_close_with_permanent_delete() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        assert_eq!(dashboard.focus, Focus::Archived);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('p'))),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('c'))),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('x'))),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::DeleteArchived {
+                session_id: "session-1".into()
+            }
+        );
+
+        let mut dashboard = dashboard_with_session(archived_session());
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw archived actions");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("x delete permanently"));
+        assert!(!rendered.contains("p checkpoint"));
+        assert!(!rendered.contains("c close"));
     }
 
     #[test]

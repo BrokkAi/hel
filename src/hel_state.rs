@@ -268,6 +268,20 @@ impl HelState {
         sources.truncate(20);
     }
 
+    pub fn remove_archived_session(&mut self, session_id: &str) -> Result<SessionRecord> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?;
+        if session.state.is_active() {
+            bail!("refusing to delete active session {session_id}");
+        }
+        Ok(self
+            .sessions
+            .remove(session_id)
+            .expect("session checked above"))
+    }
+
     /// Validate persisted foreign keys without preventing config entries from
     /// being renamed after a session is fully archived.
     pub fn validate_against_config(&self, config: &HelConfig) -> Result<()> {
@@ -575,6 +589,24 @@ mod tests {
         state
             .validate_against_config(&HelConfig::default())
             .unwrap();
+    }
+
+    #[test]
+    fn only_inactive_sessions_can_be_removed_from_the_archive() {
+        let mut state = sample_state();
+        assert!(
+            state
+                .remove_archived_session("0123456789abcdef")
+                .unwrap_err()
+                .to_string()
+                .contains("active session")
+        );
+        assert!(state.sessions.contains_key("0123456789abcdef"));
+
+        state.sessions.values_mut().next().unwrap().state = SessionState::Archived;
+        let removed = state.remove_archived_session("0123456789abcdef").unwrap();
+        assert_eq!(removed.id, "0123456789abcdef");
+        assert!(state.sessions.is_empty());
     }
 
     #[test]
