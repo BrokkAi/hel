@@ -13,6 +13,7 @@ pub mod hel_checkpoint;
 pub mod hel_compaction;
 pub mod hel_config;
 pub mod hel_controller;
+pub mod hel_database;
 pub mod hel_doctor;
 pub mod hel_git_proxy;
 pub mod hel_import;

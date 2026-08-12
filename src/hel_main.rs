@@ -762,9 +762,24 @@ async fn refresh_all_quotas(controller: &Controller, quotas: &mut QuotaManager) 
 }
 
 async fn worker_prompt(controller: &Controller, session_id: &str, text: String) -> Result<()> {
+    let bundle_id = controller
+        .state
+        .sessions
+        .get(session_id)
+        .with_context(|| format!("unknown session {session_id}"))?
+        .bundle_id
+        .clone();
     let spec = controller.reconnect_command(session_id)?;
     let mut client = WorkerClient::connect(&spec, session_id).await?;
-    client.prompt(text, Vec::new()).await?;
+    let sequence = client.prompt(text.clone(), Vec::new()).await?;
+    if let Err(error) =
+        hel::hel_database::record_prompt(session_id, &bundle_id, sequence, None, &text)
+    {
+        tracing::warn!(
+            session_id,
+            "prompt sent but history was not saved: {error:#}"
+        );
+    }
     client.detach().await
 }
 
@@ -1725,6 +1740,13 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
             DashboardAction::Open { session_id } => {
+                let bundle_id = controller
+                    .state
+                    .sessions
+                    .get(&session_id)
+                    .with_context(|| format!("unknown session {session_id}"))?
+                    .bundle_id
+                    .clone();
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 worker_commands_tx
                     .send(WorkerPollCommand::Checkout {
@@ -1741,6 +1763,7 @@ async fn run_dashboard() -> Result<()> {
                             &mut terminal.terminal,
                             worker.client,
                             Some(worker.chat),
+                            &bundle_id,
                         )
                         .await
                         .map(|(exit, client, chat)| (exit, Some(WarmWorker { spec, client, chat })))
@@ -1749,9 +1772,13 @@ async fn run_dashboard() -> Result<()> {
                         async {
                             let spec = controller.reconnect_command(&session_id)?;
                             let client = WorkerClient::connect(&spec, &session_id).await?;
-                            let (exit, client, chat) =
-                                hel::hel_chat::run_chat(&mut terminal.terminal, client, None)
-                                    .await?;
+                            let (exit, client, chat) = hel::hel_chat::run_chat(
+                                &mut terminal.terminal,
+                                client,
+                                None,
+                                &bundle_id,
+                            )
+                            .await?;
                             Ok((exit, Some(WarmWorker { spec, client, chat })))
                         }
                         .await
