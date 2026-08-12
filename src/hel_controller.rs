@@ -38,6 +38,23 @@ use crate::hel_worker::{
 use crate::hel_worker_client::WorkerClient;
 use crate::hel_worker_runtime::WorkerLaunchConfig;
 
+const INHERITED_GIT_SETTINGS: &[&str] = &[
+    "diff.algorithm",
+    "fetch.prune",
+    "fetch.prunetags",
+    "init.defaultbranch",
+    "merge.conflictstyle",
+    "pull.ff",
+    "pull.rebase",
+    "push.autosetupremote",
+    "push.default",
+    "rebase.autostash",
+    "rerere.autoupdate",
+    "rerere.enabled",
+    "user.email",
+    "user.name",
+];
+
 pub struct Controller {
     pub config: HelConfig,
     pub state: HelState,
@@ -412,6 +429,7 @@ impl Controller {
             &launch_path,
             &profile_stage,
         )?;
+        install_inherited_git_settings(executor, &backend, session_id)?;
         Ok((backend, worker_root))
     }
 
@@ -1968,6 +1986,89 @@ fn execute_checked(executor: &impl CommandExecutor, command: CommandSpec) -> Res
     Ok(output)
 }
 
+fn install_inherited_git_settings(
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+) -> Result<()> {
+    let settings = if matches!(locator, hel_targets::TargetLocator::SshBare { .. }) {
+        BTreeMap::new()
+    } else {
+        controller_git_settings()?
+    };
+    for command in inherited_git_setting_commands(locator, session_id, settings)? {
+        execute_checked(executor, command)?;
+    }
+    Ok(())
+}
+
+fn inherited_git_setting_commands(
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+    settings: BTreeMap<String, String>,
+) -> Result<Vec<CommandSpec>> {
+    if matches!(locator, hel_targets::TargetLocator::SshBare { .. }) {
+        return Ok(Vec::new());
+    }
+    settings
+        .into_iter()
+        .map(|(key, value)| {
+            hel_targets::command_on_locator(
+                locator,
+                session_id,
+                vec![
+                    "git".into(),
+                    "config".into(),
+                    "--global".into(),
+                    "--replace-all".into(),
+                    "--".into(),
+                    key.clone(),
+                    value,
+                ],
+                format!("inherit Git setting {key}"),
+            )
+        })
+        .collect()
+}
+
+fn controller_git_settings() -> Result<BTreeMap<String, String>> {
+    let output = match Command::new("git")
+        .args(["config", "--global", "--includes", "--null", "--list"])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error).context("read controller Git configuration"),
+    };
+    if !output.status.success() {
+        bail!(
+            "read controller Git configuration failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    parse_inherited_git_settings(&output.stdout)
+}
+
+fn parse_inherited_git_settings(output: &[u8]) -> Result<BTreeMap<String, String>> {
+    let mut settings = BTreeMap::new();
+    for entry in output
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let entry = std::str::from_utf8(entry).context("decode controller Git configuration")?;
+        let (key, value) = entry
+            .split_once('\n')
+            .with_context(|| format!("controller Git returned malformed entry {entry:?}"))?;
+        let key = key.to_ascii_lowercase();
+        if INHERITED_GIT_SETTINGS.contains(&key.as_str()) {
+            settings.insert(key, value.to_owned());
+        }
+    }
+    Ok(settings)
+}
+
 fn workspace_paths(
     locator: &hel_targets::TargetLocator,
     bundle: &ProjectBundle,
@@ -2745,6 +2846,92 @@ mod tests {
             HEL_CONTAINER_ENVIRONMENT
         );
         assert!(!home.path().join("SYSTEM.md").exists());
+    }
+
+    #[test]
+    fn inherited_git_settings_allow_only_portable_non_executable_values() {
+        let settings = parse_inherited_git_settings(
+            b"user.name\nAgent User\0USER.EMAIL\nagent@example.test\0pull.rebase\ntrue\0alias.deploy\n!ship\0credential.helper\nstore\0core.editor\nvim\0include.path\n/host/config\0user.name\nFinal User\0",
+        )
+        .unwrap();
+
+        assert_eq!(
+            settings,
+            BTreeMap::from([
+                ("pull.rebase".into(), "true".into()),
+                ("user.email".into(), "agent@example.test".into()),
+                ("user.name".into(), "Final User".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn inherited_git_settings_reject_malformed_or_non_utf8_output() {
+        assert!(parse_inherited_git_settings(b"user.name\0").is_err());
+        assert!(parse_inherited_git_settings(b"user.name\n\xff\0").is_err());
+    }
+
+    #[test]
+    fn inherited_git_settings_target_every_ephemeral_worker_but_ssh_bare() {
+        let ssh = SshTarget {
+            destination: "worker@example.test".into(),
+            ssh_args: vec!["-p".into(), "2222".into()],
+        };
+        let ephemeral = [
+            hel_targets::TargetLocator::LocalPodman {
+                container_id: "abcdef012345".into(),
+            },
+            hel_targets::TargetLocator::AppleContainer {
+                container_id: "abcdef012346".into(),
+            },
+            hel_targets::TargetLocator::AwsEc2 {
+                profile: "default".into(),
+                region: "us-east-1".into(),
+                instance_id: "i-1234567890abcdef0".into(),
+                ssh: ssh.clone(),
+                workspace: ".local/share/hel/workspaces/018f9dd2-a3b4-7c8d-9000-123456789abc"
+                    .into(),
+            },
+            hel_targets::TargetLocator::SshPodman {
+                ssh: ssh.clone(),
+                container_id: "abcdef012347".into(),
+            },
+        ];
+        for locator in ephemeral {
+            let commands = inherited_git_setting_commands(
+                &locator,
+                "018f9dd2-a3b4-7c8d-9000-123456789abc",
+                BTreeMap::from([("user.name".into(), "- Agent O'Brien 日本語".into())]),
+            )
+            .unwrap();
+            assert_eq!(commands.len(), 1);
+            assert!(
+                commands[0]
+                    .args
+                    .iter()
+                    .any(|argument| argument.contains("user.name"))
+            );
+            assert!(
+                commands[0]
+                    .args
+                    .iter()
+                    .any(|argument| argument.contains("- Agent O'"))
+            );
+        }
+
+        let persistent = hel_targets::TargetLocator::SshBare {
+            ssh,
+            workspace: "/srv/hel/018f9dd2-a3b4-7c8d-9000-123456789abc".into(),
+        };
+        assert!(
+            inherited_git_setting_commands(
+                &persistent,
+                "018f9dd2-a3b4-7c8d-9000-123456789abc",
+                BTreeMap::from([("user.name".into(), "Agent".into())]),
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]

@@ -199,6 +199,26 @@ service may instead set an `HEL_WORKER_URL` containing `{target}` plus its
 required `HEL_WORKER_SHA256`; Hel verifies the download before caching or
 executing it.
 
+Ephemeral workers inherit a conservative whitelist from the controller's
+effective global Git configuration: `user.name`, `user.email`,
+`init.defaultBranch`, `pull.ff`, `pull.rebase`, `push.default`,
+`push.autoSetupRemote`, `fetch.prune`, `fetch.pruneTags`, `rebase.autoStash`,
+`rerere.enabled`, `rerere.autoUpdate`, `merge.conflictStyle`, and
+`diff.algorithm`. Hel applies these settings after cloning, so they do not
+provide repository credentials, and repository-local configuration still
+wins. Named `ssh-bare` machines keep their own Git configuration. Hel does not
+copy Git aliases, credentials, URL rewrites, includes, LFS filters, signing
+settings, hooks, editor or pager commands, custom drivers, proxies,
+`safe.directory`, line-ending settings, or the controller's global excludes
+file.
+
+The harness homes are whitelists rather than complete dot-directory copies.
+For Claude, Hel copies `.credentials.json`, `settings.json`, `CLAUDE.md`,
+`skills/`, and `plugins/`; it does not copy transcripts, project history, or
+caches. SSH and GPG keys, GitHub CLI and package-registry credentials, cloud
+configuration, shell dotfiles, editor configuration, and toolchain state are
+not transferred automatically.
+
 The first-run dialog intentionally creates one local target and, when started
 inside a GitHub checkout, one-repository bundle. Advanced configurations remain
 TOML-first: edit `config.toml` directly to add profiles, virtual monorepos, SSH
