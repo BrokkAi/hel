@@ -30,6 +30,8 @@ const FORCE_CONFIRMATION: &str = "DESTROY";
 const ACTIVE_MESSAGE_LINES: usize = 4;
 const SELECTED_TRANSCRIPT_LINES: usize = 10;
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
+const DASHBOARD_FIXED_HEIGHT: u16 = 7;
+const DASHBOARD_PANE_COUNT: usize = 4;
 const MOUSE_SCROLL_ROWS: isize = 3;
 const IMPORT_STALL_WARNING_AFTER: Duration = Duration::from_secs(10);
 
@@ -1683,6 +1685,11 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
+    if !dashboard.config_is_empty() {
+        render_adaptive_dashboard(frame, area, inner, dashboard);
+        return;
+    }
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1707,11 +1714,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
         layout[0],
     );
 
-    if dashboard.config_is_empty() {
-        render_onboarding(frame, layout[1], dashboard);
-    } else {
-        render_sessions(frame, layout[1], dashboard);
-    }
+    render_onboarding(frame, layout[1], dashboard);
     render_capacity(frame, layout[2], dashboard);
     render_quotas(frame, layout[3], dashboard);
     render_footer(frame, layout[4], dashboard);
@@ -1728,6 +1731,260 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
         Mode::Confirm(confirmation) => render_confirmation(frame, area, confirmation),
         Mode::Dashboard => {}
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneHeights {
+    active: u16,
+    archived: u16,
+    capacity: u16,
+    quotas: u16,
+}
+
+impl PaneHeights {
+    fn as_array(self) -> [u16; DASHBOARD_PANE_COUNT] {
+        [self.active, self.archived, self.capacity, self.quotas]
+    }
+
+    fn from_array(heights: [u16; DASHBOARD_PANE_COUNT]) -> Self {
+        Self {
+            active: heights[0],
+            archived: heights[1],
+            capacity: heights[2],
+            quotas: heights[3],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneAllocation {
+    Fits(PaneHeights),
+    TooSmall { required_frame_height: u16 },
+}
+
+fn allocate_pane_heights(
+    frame_height: u16,
+    full: PaneHeights,
+    minimized: PaneHeights,
+    focus: Focus,
+) -> PaneAllocation {
+    let pane_space = frame_height.saturating_sub(DASHBOARD_FIXED_HEIGHT);
+    let full = full.as_array();
+    let minimized = minimized.as_array();
+    let minimum_total = minimized.iter().copied().fold(0_u16, u16::saturating_add);
+    if pane_space < minimum_total {
+        return PaneAllocation::TooSmall {
+            required_frame_height: DASHBOARD_FIXED_HEIGHT.saturating_add(minimum_total),
+        };
+    }
+
+    let full_total = full.iter().copied().fold(0_u16, u16::saturating_add);
+    let mut allocated = if full_total <= pane_space {
+        full
+    } else {
+        minimized
+    };
+    let allocated_total = allocated.iter().copied().fold(0_u16, u16::saturating_add);
+    let mut remaining = pane_space.saturating_sub(allocated_total);
+    if full_total > pane_space {
+        let focused = match focus {
+            Focus::Active => 0,
+            Focus::Archived => 1,
+            Focus::Capacity => 2,
+            Focus::Quotas => 3,
+        };
+        let growth = remaining.min(full[focused].saturating_sub(allocated[focused]));
+        allocated[focused] = allocated[focused].saturating_add(growth);
+        remaining = remaining.saturating_sub(growth);
+    }
+    allocated[0] = allocated[0].saturating_add(remaining);
+    PaneAllocation::Fits(PaneHeights::from_array(allocated))
+}
+
+fn render_adaptive_dashboard(
+    frame: &mut Frame,
+    frame_area: Rect,
+    inner: Rect,
+    dashboard: &mut DashboardState,
+) {
+    let preview_width = inner.width.saturating_sub(4);
+    let full_active_previews =
+        prepare_active_previews(dashboard, preview_width, SELECTED_TRANSCRIPT_LINES);
+    let (active_count, archived_count) = {
+        let (active, archived) = partition_sessions(
+            dashboard.state.sessions.values(),
+            &dashboard.session_details,
+        );
+        (active.len(), archived.len())
+    };
+    let active_row_heights = full_active_previews
+        .iter()
+        .map(|preview| preview.len() as u16 + 1)
+        .collect::<Vec<_>>();
+    let full = PaneHeights {
+        active: active_pane_height(&active_row_heights, active_count),
+        archived: plain_table_height(archived_count),
+        capacity: plain_table_height(dashboard.capacity_details.len()),
+        quotas: plain_table_height(dashboard.config.profiles.len()),
+    };
+    let minimized = PaneHeights {
+        active: if dashboard.focus == Focus::Active {
+            SESSION_TABLE_CHROME_HEIGHT
+        } else {
+            active_pane_height(&active_row_heights, active_count.min(2))
+        },
+        archived: focused_or_minimized_table_height(
+            dashboard.focus == Focus::Archived,
+            archived_count,
+        ),
+        capacity: focused_or_minimized_table_height(
+            dashboard.focus == Focus::Capacity,
+            dashboard.capacity_details.len(),
+        ),
+        quotas: focused_or_minimized_table_height(
+            dashboard.focus == Focus::Quotas,
+            dashboard.config.profiles.len(),
+        ),
+    };
+    let allocation = allocate_pane_heights(frame_area.height, full, minimized, dashboard.focus);
+    let PaneAllocation::Fits(heights) = allocation else {
+        let PaneAllocation::TooSmall {
+            required_frame_height,
+        } = allocation
+        else {
+            unreachable!()
+        };
+        render_terminal_too_small(frame, frame_area, required_frame_height);
+        return;
+    };
+
+    let fixed = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "Welcome to Hel.",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  ACP sessions, wherever they run."),
+        ]))
+        .alignment(Alignment::Center),
+        fixed[0],
+    );
+    let panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            heights
+                .as_array()
+                .into_iter()
+                .map(Constraint::Length)
+                .collect::<Vec<_>>(),
+        )
+        .split(fixed[1]);
+    let selected_lines = usize::from(
+        panes[0]
+            .height
+            .saturating_sub(SESSION_TABLE_CHROME_HEIGHT + 1),
+    )
+    .min(SELECTED_TRANSCRIPT_LINES);
+    let active_previews = prepare_active_previews(dashboard, preview_width, selected_lines);
+    render_sessions(frame, panes[0], panes[1], dashboard, &active_previews);
+    render_capacity(frame, panes[2], dashboard);
+    render_quotas(frame, panes[3], dashboard);
+    render_footer(frame, fixed[2], dashboard);
+
+    match &dashboard.mode {
+        Mode::New(wizard) => render_new_wizard(frame, frame_area, dashboard, wizard),
+        Mode::Resume(wizard) => render_resume_wizard(frame, frame_area, dashboard, wizard),
+        Mode::Rename(editor) => render_rename_editor(frame, frame_area, editor),
+        Mode::Import(dialog) => render_import_dialog(frame, frame_area, dialog),
+        Mode::Importing(progress) => render_import_progress(frame, frame_area, progress),
+        Mode::ConfirmImportBundle(confirmation) => {
+            render_import_bundle_confirmation(frame, frame_area, confirmation)
+        }
+        Mode::Confirm(confirmation) => render_confirmation(frame, frame_area, confirmation),
+        Mode::Dashboard => {}
+    }
+}
+
+fn plain_table_height(rows: usize) -> u16 {
+    SESSION_TABLE_CHROME_HEIGHT.saturating_add(rows.min(u16::MAX as usize) as u16)
+}
+
+fn focused_or_minimized_table_height(focused: bool, rows: usize) -> u16 {
+    if focused {
+        SESSION_TABLE_CHROME_HEIGHT
+    } else {
+        plain_table_height(rows.min(2))
+    }
+}
+
+fn active_pane_height(row_heights: &[u16], rows: usize) -> u16 {
+    let rows = rows.min(row_heights.len());
+    let row_height = row_heights[..rows]
+        .iter()
+        .copied()
+        .fold(0_u16, u16::saturating_add);
+    let spacers = rows.saturating_sub(1).min(u16::MAX as usize) as u16;
+    SESSION_TABLE_CHROME_HEIGHT
+        .saturating_add(row_height)
+        .saturating_add(spacers)
+}
+
+fn prepare_active_previews(
+    dashboard: &mut DashboardState,
+    preview_width: u16,
+    maximum_selected_lines: usize,
+) -> Vec<Vec<Line<'static>>> {
+    let active_ids = partition_sessions(
+        dashboard.state.sessions.values(),
+        &dashboard.session_details,
+    )
+    .0
+    .into_iter()
+    .map(|session| session.id.clone())
+    .collect::<Vec<_>>();
+    let selected_active = (dashboard.focus == Focus::Active)
+        .then_some(dashboard.session_index)
+        .filter(|index| *index < active_ids.len());
+    active_ids
+        .iter()
+        .enumerate()
+        .map(|(index, session_id)| {
+            let detail = dashboard.session_details.get_mut(session_id);
+            if selected_active == Some(index) {
+                active_transcript_tail(detail, preview_width, maximum_selected_lines)
+            } else {
+                active_message_preview(detail.as_deref(), usize::from(preview_width))
+            }
+        })
+        .collect()
+}
+
+fn render_terminal_too_small(frame: &mut Frame, area: Rect, required_height: u16) {
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                "Terminal too small",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(format!(
+                "Increase height to at least {required_height} rows (currently {}).",
+                area.height
+            )),
+        ])
+        .alignment(Alignment::Center),
+        area,
+    );
 }
 
 fn render_import_progress(frame: &mut Frame, area: Rect, progress: &ImportProgress) {
@@ -1999,7 +2256,13 @@ fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) 
     );
 }
 
-fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
+fn render_sessions(
+    frame: &mut Frame,
+    active_area: Rect,
+    archived_area: Rect,
+    dashboard: &mut DashboardState,
+    active_previews: &[Vec<Line<'static>>],
+) {
     let (active, archived) = partition_sessions(
         dashboard.state.sessions.values(),
         &dashboard.session_details,
@@ -2008,56 +2271,22 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let preview_width = area.width.saturating_sub(4);
-    let selected_active = (dashboard.focus == Focus::Active)
-        .then_some(dashboard.session_index)
-        .filter(|index| *index < active.len());
-    let maximum_selected_lines = usize::from(
-        area.height
-            .saturating_sub(3)
-            .saturating_sub(SESSION_TABLE_CHROME_HEIGHT + 1),
-    )
-    .min(SELECTED_TRANSCRIPT_LINES);
-    let active_previews = active
-        .iter()
-        .enumerate()
-        .map(|(index, session)| {
-            let detail = dashboard.session_details.get_mut(&session.id);
-            if selected_active == Some(index) {
-                active_transcript_tail(detail, preview_width, maximum_selected_lines)
-            } else {
-                active_message_preview(detail.as_deref(), usize::from(preview_width))
-            }
-        })
-        .collect::<Vec<_>>();
-    let selected_preview_height = selected_active
-        .and_then(|index| active_previews.get(index))
-        .map_or(0, |preview| preview.len() as u16 + 1);
-    let active_minimum_height =
-        (SESSION_TABLE_CHROME_HEIGHT + selected_preview_height).min(area.height.saturating_sub(3));
-    let archived_height = (archived.len() as u16 + SESSION_TABLE_CHROME_HEIGHT)
-        .max(3)
-        .min(area.height.saturating_sub(active_minimum_height).max(3));
-    let panes = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(active_minimum_height),
-            Constraint::Length(archived_height),
-        ])
-        .split(area);
-    let preview_width = panes[0].width.saturating_sub(4);
-    let active_rows = active
-        .iter()
-        .zip(&active_previews)
-        .map(|(session, preview)| {
-            active_session_row(
-                session,
-                dashboard.session_details.get(&session.id),
-                now_epoch_seconds,
-                &dashboard.config,
-                preview.len() as u16 + 1,
-            )
-        });
+    let preview_width = active_area.width.saturating_sub(4);
+    let active_rows =
+        active
+            .iter()
+            .zip(active_previews)
+            .enumerate()
+            .map(|(index, (session, preview))| {
+                active_session_row(
+                    session,
+                    dashboard.session_details.get(&session.id),
+                    now_epoch_seconds,
+                    &dashboard.config,
+                    preview.len() as u16 + 1,
+                    u16::from(index > 0),
+                )
+            });
     let active_focused = dashboard.focus == Focus::Active;
     let active_table = Table::new(active_rows, session_column_constraints())
         .header(session_header())
@@ -2076,14 +2305,15 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         );
     let mut active_state = TableState::default()
         .with_selected((dashboard.session_index < active.len()).then_some(dashboard.session_index));
-    frame.render_stateful_widget(active_table, panes[0], &mut active_state);
+    frame.render_stateful_widget(active_table, active_area, &mut active_state);
     let active_offset = active_state.offset();
-    let mut row_y = panes[0].y + SESSION_TABLE_CHROME_HEIGHT;
+    let mut row_y = active_area.y + SESSION_TABLE_CHROME_HEIGHT;
     let mut visible_sessions = 0;
     for (index, _session) in active.iter().enumerate().skip(active_offset) {
         let preview = &active_previews[index];
-        let detail_y = row_y;
-        if detail_y >= panes[0].bottom().saturating_sub(1) {
+        let spacer = u16::from(index > 0);
+        let detail_y = row_y.saturating_add(spacer);
+        if detail_y >= active_area.bottom().saturating_sub(1) {
             break;
         }
         visible_sessions += 1;
@@ -2093,22 +2323,22 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         } else {
             Style::default()
         };
-        if !preview.is_empty() {
+        let preview_height = active_area
+            .bottom()
+            .saturating_sub(1)
+            .saturating_sub(detail_y)
+            .min(preview.len() as u16);
+        if preview_height > 0 {
             frame.render_widget(
                 Paragraph::new(preview.clone()).style(style),
-                Rect::new(
-                    panes[0].x + 3,
-                    detail_y,
-                    preview_width,
-                    preview.len() as u16,
-                ),
+                Rect::new(active_area.x + 3, detail_y, preview_width, preview_height),
             );
         }
-        row_y = row_y.saturating_add(preview.len() as u16 + 1);
+        row_y = row_y.saturating_add(preview.len() as u16 + 1 + spacer);
     }
     render_session_scrollbar(
         frame,
-        panes[0],
+        active_area,
         active.len(),
         active_offset,
         visible_sessions,
@@ -2137,13 +2367,17 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         Some(dashboard.session_index.saturating_sub(active.len()))
             .filter(|index| *index < archived.len()),
     );
-    frame.render_stateful_widget(archived_table, panes[1], &mut archived_state);
+    frame.render_stateful_widget(archived_table, archived_area, &mut archived_state);
     render_session_scrollbar(
         frame,
-        panes[1],
+        archived_area,
         archived.len(),
         archived_state.offset(),
-        usize::from(panes[1].height.saturating_sub(SESSION_TABLE_CHROME_HEIGHT)),
+        usize::from(
+            archived_area
+                .height
+                .saturating_sub(SESSION_TABLE_CHROME_HEIGHT),
+        ),
     );
 }
 
@@ -2358,6 +2592,7 @@ fn active_session_row(
     now_epoch_seconds: u64,
     config: &HelConfig,
     height: u16,
+    top_margin: u16,
 ) -> Row<'static> {
     let (clock, profile, target, checkpoint, resources, session_name) =
         session_values(session, detail, now_epoch_seconds, config);
@@ -2371,6 +2606,7 @@ fn active_session_row(
         Cell::from(session_name_line(session_name, unread_count)),
     ])
     .height(height)
+    .top_margin(top_margin)
 }
 
 fn archived_session_row(
@@ -3206,6 +3442,155 @@ mod tests {
             },
             BTreeMap::new(),
         )
+    }
+
+    #[test]
+    fn pane_allocator_fills_complete_tables_then_gives_surplus_to_active() {
+        let allocation = allocate_pane_heights(
+            37,
+            PaneHeights {
+                active: 10,
+                archived: 5,
+                capacity: 5,
+                quotas: 5,
+            },
+            PaneHeights {
+                active: 4,
+                archived: 4,
+                capacity: 4,
+                quotas: 4,
+            },
+            Focus::Quotas,
+        );
+
+        assert_eq!(
+            allocation,
+            PaneAllocation::Fits(PaneHeights {
+                active: 15,
+                archived: 5,
+                capacity: 5,
+                quotas: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn pane_allocator_grows_focus_then_active_when_tables_do_not_fit() {
+        let full = PaneHeights {
+            active: 20,
+            archived: 10,
+            capacity: 10,
+            quotas: 10,
+        };
+        let minimized = PaneHeights {
+            active: 5,
+            archived: 5,
+            capacity: 5,
+            quotas: 5,
+        };
+        for (focus, expected) in [
+            (
+                Focus::Active,
+                PaneHeights {
+                    active: 20,
+                    archived: 5,
+                    capacity: 5,
+                    quotas: 5,
+                },
+            ),
+            (
+                Focus::Archived,
+                PaneHeights {
+                    active: 15,
+                    archived: 10,
+                    capacity: 5,
+                    quotas: 5,
+                },
+            ),
+            (
+                Focus::Capacity,
+                PaneHeights {
+                    active: 15,
+                    archived: 5,
+                    capacity: 10,
+                    quotas: 5,
+                },
+            ),
+            (
+                Focus::Quotas,
+                PaneHeights {
+                    active: 15,
+                    archived: 5,
+                    capacity: 5,
+                    quotas: 10,
+                },
+            ),
+        ] {
+            assert_eq!(
+                allocate_pane_heights(42, full, minimized, focus),
+                PaneAllocation::Fits(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn active_two_row_minimum_counts_header_rows_spacer_and_borders() {
+        assert_eq!(active_pane_height(&[5, 5], 2), 14);
+        assert_eq!(active_pane_height(&[5], 1), 8);
+        assert_eq!(active_pane_height(&[], 0), 3);
+    }
+
+    #[test]
+    fn pane_allocator_reports_content_sensitive_minimum_height() {
+        let heights = PaneHeights {
+            active: 5,
+            archived: 5,
+            capacity: 5,
+            quotas: 5,
+        };
+        assert_eq!(
+            allocate_pane_heights(26, heights, heights, Focus::Active),
+            PaneAllocation::TooSmall {
+                required_frame_height: 27,
+            }
+        );
+        assert!(matches!(
+            allocate_pane_heights(27, heights, heights, Focus::Active),
+            PaneAllocation::Fits(_)
+        ));
+    }
+
+    #[test]
+    fn dashboard_replaces_too_short_layout_with_required_height() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw short dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Terminal too small"));
+        assert!(rendered.contains("at least 21 rows (currently 20)"));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 21)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw exact minimum dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("Terminal too small"));
+        assert!(rendered.contains("Active"));
+        assert!(rendered.contains("Profile Quotas"));
     }
 
     fn test_capacity_target() -> DeploymentCapacityTarget {
