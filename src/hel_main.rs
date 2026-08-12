@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
-use crossterm::event::{self, Event};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -35,7 +35,7 @@ use hel::hel_targets::{
 use hel::hel_tui::{
     DashboardAction, DashboardState, ImportProfileOption, ImportSessionOption, render,
 };
-use hel::hel_worker::SequencedEvent;
+use hel::hel_worker::{SequencedEvent, WorkerPhase};
 use hel::hel_worker_client::WorkerClient;
 use hel::hel_worker_runtime::{
     AcpSupervisorSpec, WorkerLaunchConfig, proxy, run_acp_supervisor, run_daemon,
@@ -287,7 +287,11 @@ struct WorkerPollUpdate {
 #[derive(Debug)]
 enum WorkerPollPayload {
     Connected,
-    Events(Vec<SequencedEvent>),
+    Events {
+        events: Vec<SequencedEvent>,
+        phase: WorkerPhase,
+        transcript: hel::hel_chat::TranscriptSnapshot,
+    },
     /// The worker failed several consecutive polls; the session needs
     /// attention and a diagnosis.
     Unreachable {
@@ -1230,9 +1234,12 @@ async fn poll_dashboard_workers(
         let failure = match synced {
             Some(Ok(Ok(events))) => {
                 let recovered = failures.remove(&target.session_id).is_some();
-                if let Some(worker) = clients.get_mut(&target.session_id) {
-                    worker.chat.apply_events(&events);
-                }
+                let worker = clients
+                    .get_mut(&target.session_id)
+                    .expect("a successfully synced worker remains cached");
+                worker.chat.apply_events(&events);
+                let phase = worker.chat.phase();
+                let transcript = worker.chat.transcript_snapshot();
                 if recovered
                     && updates
                         .send(WorkerPollUpdate {
@@ -1248,7 +1255,11 @@ async fn poll_dashboard_workers(
                     && updates
                         .send(WorkerPollUpdate {
                             session_id: target.session_id.clone(),
-                            payload: WorkerPollPayload::Events(events),
+                            payload: WorkerPollPayload::Events {
+                                events,
+                                phase,
+                                transcript,
+                            },
                         })
                         .await
                         .is_err()
@@ -1279,6 +1290,8 @@ async fn poll_dashboard_workers(
                         let events = bootstrap.events.clone();
                         let chat =
                             hel::hel_chat::ChatState::new(&bootstrap.snapshot, &bootstrap.events);
+                        let phase = chat.phase();
+                        let transcript = chat.transcript_snapshot();
                         clients.insert(
                             target.session_id.clone(),
                             WarmWorker {
@@ -1297,14 +1310,17 @@ async fn poll_dashboard_workers(
                         {
                             return false;
                         }
-                        if !events.is_empty()
-                            && updates
-                                .send(WorkerPollUpdate {
-                                    session_id: target.session_id.clone(),
-                                    payload: WorkerPollPayload::Events(events),
-                                })
-                                .await
-                                .is_err()
+                        if updates
+                            .send(WorkerPollUpdate {
+                                session_id: target.session_id.clone(),
+                                payload: WorkerPollPayload::Events {
+                                    events,
+                                    phase,
+                                    transcript,
+                                },
+                            })
+                            .await
+                            .is_err()
                         {
                             return false;
                         }
@@ -1377,7 +1393,11 @@ fn apply_worker_poll_update(
                 dashboard.set_state(controller.state.clone());
             }
         }
-        WorkerPollPayload::Events(events) => {
+        WorkerPollPayload::Events {
+            events,
+            phase,
+            transcript,
+        } => {
             if let Some(title) = harness_session_title(&events)
                 && let Some(session) = controller.state.sessions.get_mut(&update.session_id)
                 && session.acp_session_title.as_deref() != Some(&title)
@@ -1386,8 +1406,13 @@ fn apply_worker_poll_update(
                 controller.state.save()?;
                 dashboard.set_state(controller.state.clone());
             }
-            latest_message_updated =
-                dashboard.apply_worker_events(&update.session_id, &events, current_epoch_seconds());
+            latest_message_updated = dashboard.apply_worker_update(
+                &update.session_id,
+                &events,
+                phase,
+                current_epoch_seconds(),
+            );
+            dashboard.apply_transcript(&update.session_id, transcript);
         }
         WorkerPollPayload::Unreachable { detail } => {
             let diagnosis = controller.diagnose_worker(&update.session_id);
@@ -1621,10 +1646,14 @@ async fn run_dashboard() -> Result<()> {
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let action = match event::read()? {
+            Event::Key(key) => dashboard.handle_key(key),
+            Event::Mouse(mouse) => {
+                dashboard.handle_mouse(mouse);
+                DashboardAction::None
+            }
+            _ => continue,
         };
-        let action = dashboard.handle_key(key);
         match action {
             DashboardAction::None => {}
             DashboardAction::QuitDetach => break,
@@ -1924,6 +1953,10 @@ async fn run_dashboard() -> Result<()> {
                         },
                         worker,
                     )) => {
+                        if let Some(worker) = worker.as_ref() {
+                            dashboard
+                                .apply_transcript(&session_id, worker.chat.transcript_snapshot());
+                        }
                         worker_commands_tx
                             .send(WorkerPollCommand::Checkin {
                                 session_id: session_id.clone(),
@@ -2613,15 +2646,20 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("enable terminal raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+            .context("enter alternate screen and enable mouse capture")?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal })
     }
 
     fn suspend(&mut self) -> Result<()> {
         disable_raw_mode().context("disable terminal raw mode for setup")?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)
-            .context("leave alternate screen for setup")?;
+        execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )
+        .context("disable mouse capture and leave alternate screen for setup")?;
         self.terminal
             .show_cursor()
             .context("show cursor for setup")?;
@@ -2630,8 +2668,12 @@ impl TerminalGuard {
 
     fn resume(&mut self) -> Result<()> {
         enable_raw_mode().context("re-enable terminal raw mode after setup")?;
-        execute!(self.terminal.backend_mut(), EnterAlternateScreen)
-            .context("re-enter alternate screen after setup")?;
+        execute!(
+            self.terminal.backend_mut(),
+            EnterAlternateScreen,
+            EnableMouseCapture
+        )
+        .context("re-enter alternate screen and enable mouse capture after setup")?;
         self.terminal
             .clear()
             .context("clear dashboard after setup")?;
@@ -2642,7 +2684,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }

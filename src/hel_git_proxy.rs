@@ -48,6 +48,7 @@ impl GitBrokerSpec {
     }
 }
 
+#[cfg(unix)]
 pub fn broker_is_alive(pid_path: &Path) -> bool {
     let Ok(pid) = std::fs::read_to_string(pid_path) else {
         return false;
@@ -57,6 +58,11 @@ pub fn broker_is_alive(pid_path: &Path) -> bool {
     };
     // Signal zero performs existence/permission checking without changing the process.
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+pub fn broker_is_alive(_pid_path: &Path) -> bool {
+    false
 }
 
 pub async fn run_broker(spec_path: &Path) -> Result<()> {

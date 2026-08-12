@@ -12,7 +12,9 @@ use agent_client_protocol::schema::v1::{
     SessionConfigSelectOptions, SessionUpdate, ToolCallContent, ToolCallLocation, ToolCallStatus,
 };
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -31,6 +33,8 @@ use rendering::{
     LogicalLine, TranscriptRenderMode, append_omitted_character_count, display_width,
     line_character_count, markdown_lines, raw_lines, sanitize_terminal_text, wrap_styled_line,
 };
+
+const MOUSE_SCROLL_ROWS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatExit {
@@ -230,6 +234,27 @@ struct TranscriptRenderCache {
     entries: Vec<Option<CachedEntry>>,
 }
 
+/// A read-only copy of the projected conversation that can be rendered by
+/// surfaces other than the interactive chat view.
+#[derive(Debug)]
+pub struct TranscriptSnapshot {
+    entries: Vec<ChatEntry>,
+    render_cache: TranscriptRenderCache,
+}
+
+impl TranscriptSnapshot {
+    pub(crate) fn rich_tail(&mut self, width: u16, maximum_lines: usize) -> Vec<Line<'static>> {
+        let lines = transcript_entry_lines(
+            &self.entries,
+            &mut self.render_cache,
+            width,
+            TranscriptRenderMode::Rich,
+        );
+        let start = lines.len().saturating_sub(maximum_lines);
+        lines.into_iter().skip(start).collect()
+    }
+}
+
 impl Default for TranscriptRenderCache {
     fn default() -> Self {
         Self {
@@ -336,6 +361,13 @@ impl ChatState {
 
     pub fn entries(&self) -> &[ChatEntry] {
         &self.entries
+    }
+
+    pub fn transcript_snapshot(&self) -> TranscriptSnapshot {
+        TranscriptSnapshot {
+            entries: self.entries.clone(),
+            render_cache: TranscriptRenderCache::default(),
+        }
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
@@ -1214,27 +1246,11 @@ impl ChatState {
                 ChatAction::None
             }
             KeyCode::PageUp => {
-                let page = self.last_viewport_height.max(1);
-                if self.follow_bottom {
-                    self.scroll_top = self
-                        .last_content_height
-                        .saturating_sub(self.last_viewport_height);
-                }
-                self.follow_bottom = false;
-                self.scroll_top = self.scroll_top.saturating_sub(page);
+                self.scroll_history_up(self.last_viewport_height.max(1));
                 ChatAction::None
             }
             KeyCode::PageDown => {
-                let maximum = self
-                    .last_content_height
-                    .saturating_sub(self.last_viewport_height);
-                self.scroll_top = self
-                    .scroll_top
-                    .saturating_add(self.last_viewport_height.max(1));
-                if self.scroll_top >= maximum {
-                    self.scroll_top = maximum;
-                    self.follow_bottom = true;
-                }
+                self.scroll_history_down(self.last_viewport_height.max(1));
                 ChatAction::None
             }
             KeyCode::Home => {
@@ -1246,6 +1262,35 @@ impl ChatState {
                 ChatAction::None
             }
             _ => ChatAction::None,
+        }
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_history_up(MOUSE_SCROLL_ROWS),
+            MouseEventKind::ScrollDown => self.scroll_history_down(MOUSE_SCROLL_ROWS),
+            _ => {}
+        }
+    }
+
+    fn scroll_history_up(&mut self, rows: usize) {
+        if self.follow_bottom {
+            self.scroll_top = self
+                .last_content_height
+                .saturating_sub(self.last_viewport_height);
+        }
+        self.follow_bottom = false;
+        self.scroll_top = self.scroll_top.saturating_sub(rows);
+    }
+
+    fn scroll_history_down(&mut self, rows: usize) {
+        let maximum = self
+            .last_content_height
+            .saturating_sub(self.last_viewport_height);
+        self.scroll_top = self.scroll_top.saturating_add(rows);
+        if self.scroll_top >= maximum {
+            self.scroll_top = maximum;
+            self.follow_bottom = true;
         }
     }
 
@@ -1781,8 +1826,15 @@ pub async fn run_chat(
         // character would lag the trailing Enter by minutes.
         let mut pending = event::poll(Duration::from_millis(150))?;
         while pending {
-            if let Event::Key(key) = event::read()? {
-                let action = chat.handle_key(key);
+            let action = match event::read()? {
+                Event::Key(key) => Some(chat.handle_key(key)),
+                Event::Mouse(mouse) => {
+                    chat.handle_mouse(mouse);
+                    None
+                }
+                _ => None,
+            };
+            if let Some(action) = action {
                 let result = match action {
                     ChatAction::None => None,
                     ChatAction::Prompt(text) => match client.prompt(text.clone(), Vec::new()).await
@@ -2360,21 +2412,35 @@ pub(crate) fn render_agent_message_preview(
 /// layout separate from painting makes scrolling a count of actual terminal
 /// rows rather than logical message lines.
 fn transcript_lines(chat: &mut ChatState, width: u16) -> Vec<Line<'static>> {
-    if chat.render_cache.width != width || chat.render_cache.mode != chat.render_mode {
-        chat.render_cache.width = width;
-        chat.render_cache.mode = chat.render_mode;
-        chat.render_cache.entries.clear();
+    transcript_entry_lines(
+        &chat.entries,
+        &mut chat.render_cache,
+        width,
+        chat.render_mode,
+    )
+}
+
+fn transcript_entry_lines(
+    entries: &[ChatEntry],
+    render_cache: &mut TranscriptRenderCache,
+    width: u16,
+    mode: TranscriptRenderMode,
+) -> Vec<Line<'static>> {
+    if render_cache.width != width || render_cache.mode != mode {
+        render_cache.width = width;
+        render_cache.mode = mode;
+        render_cache.entries.clear();
     }
-    chat.render_cache.entries.resize(chat.entries.len(), None);
+    render_cache.entries.resize(entries.len(), None);
     let mut lines = Vec::new();
-    for (index, entry) in chat.entries.iter().enumerate() {
-        let cached = chat.render_cache.entries[index]
+    for (index, entry) in entries.iter().enumerate() {
+        let cached = render_cache.entries[index]
             .as_ref()
             .filter(|cached| cached.revision == entry.revision)
             .map(|cached| cached.lines.clone());
         let entry_lines = cached.unwrap_or_else(|| {
-            let rendered = render_transcript_entry(entry, usize::from(width), chat.render_mode);
-            chat.render_cache.entries[index] = Some(CachedEntry {
+            let rendered = render_transcript_entry(entry, usize::from(width), mode);
+            render_cache.entries[index] = Some(CachedEntry {
                 revision: entry.revision,
                 lines: rendered.clone(),
             });
@@ -2600,12 +2666,33 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     fn ctrl(character: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
     }
 
     fn transcript_text(chat: &mut ChatState, width: u16) -> Vec<String> {
         transcript_lines(chat, width)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn line_text(lines: Vec<Line<'static>>) -> Vec<String> {
+        lines
             .into_iter()
             .map(|line| {
                 line.spans
@@ -3209,6 +3296,23 @@ mod tests {
     }
 
     #[test]
+    fn transcript_snapshot_tail_matches_rich_conversation_rows() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries
+            .push(ChatEntry::plain(1, ChatRole::User, "inspect the renderer"));
+        chat.entries.push(ChatEntry::plain(
+            2,
+            ChatRole::Agent,
+            "**Done.**\n\n- shared renderer\n- live tail",
+        ));
+        let expected = transcript_text(&mut chat, 32);
+        let expected = expected[expected.len().saturating_sub(6)..].to_vec();
+
+        let mut snapshot = chat.transcript_snapshot();
+        assert_eq!(line_text(snapshot.rich_tail(32, 6)), expected);
+    }
+
+    #[test]
     fn markdown_list_wrapping_uses_a_hanging_indent() {
         let entry = ChatEntry::plain(1, ChatRole::Agent, "- alpha beta gamma");
         let mut chat = ChatState::new(&snapshot(), &[]);
@@ -3233,6 +3337,21 @@ mod tests {
         assert!(chat.follow_bottom);
         chat.handle_key(key(KeyCode::PageUp));
         chat.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+        assert!(chat.follow_bottom);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_chat_history_and_resumes_following_at_bottom() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.last_content_height = 30;
+        chat.last_viewport_height = 10;
+
+        chat.handle_mouse(mouse(MouseEventKind::ScrollUp));
+        assert_eq!(chat.scroll_top, 17);
+        assert!(!chat.follow_bottom);
+
+        chat.handle_mouse(mouse(MouseEventKind::ScrollDown));
+        assert_eq!(chat.scroll_top, 20);
         assert!(chat.follow_bottom);
     }
 

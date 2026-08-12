@@ -111,29 +111,16 @@ fn normalize_reset_text_at(value: &str, now: DateTime<FixedOffset>) -> Option<St
     Some(format_reset_label(reset))
 }
 
-/// Render a session's current-turn clock or the age of its latest activity.
+/// Render a session's current-turn clock, leaving idle sessions blank.
 pub(crate) fn format_turn_clock(
     now_epoch_seconds: u64,
     current_turn_started_at: Option<u64>,
-    last_activity_at: Option<u64>,
 ) -> String {
     if let Some(started_at) = current_turn_started_at {
         let elapsed = now_epoch_seconds.saturating_sub(started_at);
         return format!("turn {:02}:{:02}", elapsed / 60, elapsed % 60);
     }
-    let Some(last_activity_at) = last_activity_at else {
-        return "unknown".to_string();
-    };
-    let elapsed = now_epoch_seconds.saturating_sub(last_activity_at);
-    if elapsed < 60 {
-        format!("{elapsed}s ago")
-    } else if elapsed < 3_600 {
-        format!("{}m ago", elapsed / 60)
-    } else if elapsed < 86_400 {
-        format!("{}h ago", elapsed / 3_600)
-    } else {
-        format!("{}d ago", elapsed / 86_400)
-    }
+    String::new()
 }
 
 /// Pure formatter split from local-zone discovery for deterministic tests.
@@ -203,12 +190,8 @@ mod tests {
     }
 
     #[test]
-    fn turn_clock_formats_running_periods_and_compact_idle_ages() {
-        assert_eq!(format_turn_clock(500, Some(375), Some(100)), "turn 02:05");
-        assert_eq!(format_turn_clock(5_000, None, Some(4_988)), "12s ago");
-        assert_eq!(format_turn_clock(5_000, None, Some(4_520)), "8m ago");
-        assert_eq!(format_turn_clock(15_000, None, Some(4_200)), "3h ago");
-        assert_eq!(format_turn_clock(3 * 86_400, None, Some(86_400)), "2d ago");
-        assert_eq!(format_turn_clock(5_000, None, None), "unknown");
+    fn turn_clock_formats_running_periods_and_leaves_idle_blank() {
+        assert_eq!(format_turn_clock(500, Some(375)), "turn 02:05");
+        assert_eq!(format_turn_clock(5_000, None), "");
     }
 }
