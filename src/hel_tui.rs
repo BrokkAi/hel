@@ -22,7 +22,9 @@ use crate::hel_quota::ProfileQuota;
 #[cfg(test)]
 use crate::hel_state::SessionState;
 use crate::hel_state::{HelState, SessionRecord};
-use crate::hel_targets::{AdditionalMount, default_mount_destination, path_completion};
+use crate::hel_targets::{
+    AdditionalMount, SessionResourceUsage, default_mount_destination, path_completion,
+};
 use crate::hel_worker::{SequencedEvent, WorkerEvent};
 
 const FORCE_CONFIRMATION: &str = "DESTROY";
@@ -249,6 +251,7 @@ struct SessionDetail {
     last_agent_message_id: Option<String>,
     last_agent_message: Option<String>,
     unread_agent_message_sequences: Vec<u64>,
+    resource_usage: Option<SessionResourceUsage>,
 }
 
 /// Stateful, renderable projection of controller configuration and state.
@@ -325,7 +328,8 @@ impl DashboardState {
         session_id: &str,
         events: &[SequencedEvent],
         observed_at_epoch_seconds: u64,
-    ) {
+    ) -> bool {
+        let mut updated_latest_message = false;
         let viewed_through = self
             .state
             .sessions
@@ -370,6 +374,7 @@ impl DashboardState {
                             detail.last_agent_message_id = message_id;
                             detail.agent_text_stream_open = true;
                             detail.last_agent_text_at = Some(observed_at_epoch_seconds);
+                            updated_latest_message = true;
                         } else {
                             detail.agent_text_stream_open = false;
                         }
@@ -385,6 +390,14 @@ impl DashboardState {
                 }
             }
         }
+        updated_latest_message
+    }
+
+    pub fn apply_resource_usage(&mut self, session_id: &str, usage: SessionResourceUsage) {
+        self.session_details
+            .entry(session_id.to_string())
+            .or_default()
+            .resource_usage = Some(usage);
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
@@ -1944,13 +1957,14 @@ fn focus_border(focused: bool) -> BorderType {
     }
 }
 
-fn session_column_constraints() -> [Constraint; 5] {
+fn session_column_constraints() -> [Constraint; 6] {
     [
         Constraint::Length(11),
         Constraint::Length(14),
-        Constraint::Length(32),
-        Constraint::Length(21),
-        Constraint::Min(24),
+        Constraint::Length(20),
+        Constraint::Length(14),
+        Constraint::Length(28),
+        Constraint::Min(23),
     ]
 }
 
@@ -1960,6 +1974,7 @@ fn session_header() -> Row<'static> {
         "Profile",
         "Target",
         "Checkpoint",
+        "Resources",
         "Session name",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD))
@@ -1970,7 +1985,7 @@ fn session_values(
     detail: Option<&SessionDetail>,
     now_epoch_seconds: u64,
     config: &HelConfig,
-) -> (String, String, String, String, String) {
+) -> (String, String, String, String, String, String) {
     let checkpoint = session
         .checkpoint
         .as_ref()
@@ -1994,6 +2009,10 @@ fn session_values(
         session.last_profile.clone(),
         session_target(config, session),
         checkpoint,
+        detail
+            .and_then(|detail| detail.resource_usage.as_ref())
+            .map(resource_summary)
+            .unwrap_or_else(|| "—".into()),
         session_name(session).to_string(),
     )
 }
@@ -2019,6 +2038,43 @@ fn session_target(config: &HelConfig, session: &SessionRecord) -> String {
     format!("{}: {project_dirs}", session.target_template_id)
 }
 
+fn resource_summary(usage: &SessionResourceUsage) -> String {
+    let memory = match usage.memory_limit_bytes {
+        Some(limit) if limit > 0 => format!(
+            "M {}%",
+            u128::from(usage.memory_current_bytes) * 100 / u128::from(limit)
+        ),
+        _ => format!("M {}", format_resource_bytes(usage.memory_current_bytes)),
+    };
+    let mut resources = vec![memory];
+    if let Some(swap) = usage.swap_current_bytes.filter(|swap| *swap > 0) {
+        resources.push(format!("S {}", format_resource_bytes(swap)));
+    }
+    if let Some(disk) = usage.writable_disk_bytes {
+        resources.push(format!("D {}", format_resource_bytes(disk)));
+    }
+    resources.join(" · ")
+}
+
+fn format_resource_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}K", bytes as f64 / KIB)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1}M", bytes as f64 / MIB)
+    } else if bytes < 1024_u64.pow(4) {
+        format!("{:.1}G", bytes as f64 / GIB)
+    } else {
+        format!("{:.1}T", bytes as f64 / TIB)
+    }
+}
+
 fn session_name(session: &SessionRecord) -> &str {
     session.display_title()
 }
@@ -2042,7 +2098,7 @@ fn active_session_row(
     now_epoch_seconds: u64,
     config: &HelConfig,
 ) -> Row<'static> {
-    let (clock, profile, target, checkpoint, session_name) =
+    let (clock, profile, target, checkpoint, resources, session_name) =
         session_values(session, detail, now_epoch_seconds, config);
     let unread_count = detail.map_or(0, |detail| detail.unread_agent_message_sequences.len());
     Row::new([
@@ -2050,6 +2106,7 @@ fn active_session_row(
         Cell::from(profile),
         Cell::from(target),
         Cell::from(checkpoint),
+        Cell::from(resources),
         Cell::from(session_name_line(session_name, unread_count)),
     ])
     .height(ACTIVE_SESSION_ROW_HEIGHT)
@@ -2060,9 +2117,16 @@ fn archived_session_row(
     now_epoch_seconds: u64,
     config: &HelConfig,
 ) -> Row<'static> {
-    let (_clock, profile, target, checkpoint, session_name) =
+    let (_clock, profile, target, checkpoint, _resources, session_name) =
         session_values(session, None, now_epoch_seconds, config);
-    Row::new([String::new(), profile, target, checkpoint, session_name])
+    Row::new([
+        String::new(),
+        profile,
+        target,
+        checkpoint,
+        String::new(),
+        session_name,
+    ])
 }
 
 fn checkpoint_age(now_epoch_seconds: u64, checkpointed_at: &str) -> String {
@@ -3465,10 +3529,42 @@ mod tests {
     }
 
     #[test]
+    fn agent_message_update_requests_a_resource_refresh() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+
+        assert!(dashboard.apply_worker_events(
+            "session-1",
+            &[adapter_text_event(1, "agent_message_chunk", "updated")],
+            100,
+        ));
+        assert!(!dashboard.apply_worker_events(
+            "session-1",
+            &[adapter_text_event(
+                2,
+                "agent_thought_chunk",
+                "not a message"
+            )],
+            101,
+        ));
+    }
+
+    #[test]
     fn active_session_renders_the_complete_last_agent_message() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
+        dashboard.apply_resource_usage(
+            "session-1",
+            SessionResourceUsage {
+                memory_current_bytes: 1_073_741_824,
+                memory_limit_bytes: Some(2_147_483_648),
+                swap_current_bytes: Some(4_096),
+                swap_limit_bytes: None,
+                writable_disk_bytes: Some(8_192),
+            },
+        );
         dashboard.apply_worker_events(
             "session-1",
             &[
@@ -3504,6 +3600,8 @@ mod tests {
         assert!(rendered.contains("Profile"));
         assert!(rendered.contains("Target"));
         assert!(rendered.contains("Checkpoint"));
+        assert!(rendered.contains("Resources"));
+        assert!(rendered.contains("M 50% · S 4.0K · D 8.0K"));
         assert!(rendered.contains("Session name"));
         assert!(rendered.contains("ACP pretty name"));
         assert!(!rendered.contains("native-1"));
@@ -3600,7 +3698,7 @@ mod tests {
             ..SessionDetail::default()
         };
 
-        let (clock, _, _, _, _) = session_values(&session, Some(&detail), 1_480, &config());
+        let (clock, _, _, _, _, _) = session_values(&session, Some(&detail), 1_480, &config());
         assert_eq!(clock, "8m ago");
     }
 
