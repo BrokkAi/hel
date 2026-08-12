@@ -35,7 +35,7 @@ use hel::hel_targets::{
 use hel::hel_tui::{
     DashboardAction, DashboardState, ImportProfileOption, ImportSessionOption, render,
 };
-use hel::hel_worker::SequencedEvent;
+use hel::hel_worker::{SequencedEvent, WorkerPhase};
 use hel::hel_worker_client::WorkerClient;
 use hel::hel_worker_runtime::{WorkerLaunchConfig, proxy, run_daemon};
 use ratatui::Terminal;
@@ -245,12 +245,13 @@ struct WorkerPollUpdate {
 
 #[derive(Debug)]
 enum WorkerPollPayload {
-    Events(Vec<SequencedEvent>),
+    Events {
+        events: Vec<SequencedEvent>,
+        phase: WorkerPhase,
+    },
     /// The worker failed several consecutive polls; the session needs
     /// attention and a diagnosis.
-    Unreachable {
-        detail: String,
-    },
+    Unreachable { detail: String },
 }
 
 struct WarmWorker {
@@ -1124,14 +1125,16 @@ async fn poll_dashboard_workers(
         let failure = match synced {
             Some(Ok(Ok(events))) => {
                 failures.remove(&target.session_id);
-                if let Some(worker) = clients.get_mut(&target.session_id) {
-                    worker.chat.apply_events(&events);
-                }
+                let worker = clients
+                    .get_mut(&target.session_id)
+                    .expect("a successfully synced worker remains cached");
+                worker.chat.apply_events(&events);
+                let phase = worker.chat.phase();
                 if !events.is_empty()
                     && updates
                         .send(WorkerPollUpdate {
                             session_id: target.session_id.clone(),
-                            payload: WorkerPollPayload::Events(events),
+                            payload: WorkerPollPayload::Events { events, phase },
                         })
                         .await
                         .is_err()
@@ -1162,6 +1165,7 @@ async fn poll_dashboard_workers(
                         let events = bootstrap.events.clone();
                         let chat =
                             hel::hel_chat::ChatState::new(&bootstrap.snapshot, &bootstrap.events);
+                        let phase = chat.phase();
                         clients.insert(
                             target.session_id.clone(),
                             WarmWorker {
@@ -1170,14 +1174,13 @@ async fn poll_dashboard_workers(
                                 chat,
                             },
                         );
-                        if !events.is_empty()
-                            && updates
-                                .send(WorkerPollUpdate {
-                                    session_id: target.session_id.clone(),
-                                    payload: WorkerPollPayload::Events(events),
-                                })
-                                .await
-                                .is_err()
+                        if updates
+                            .send(WorkerPollUpdate {
+                                session_id: target.session_id.clone(),
+                                payload: WorkerPollPayload::Events { events, phase },
+                            })
+                            .await
+                            .is_err()
                         {
                             return false;
                         }
@@ -1236,7 +1239,7 @@ fn apply_worker_poll_update(
 ) -> Result<bool> {
     let mut latest_message_updated = false;
     match update.payload {
-        WorkerPollPayload::Events(events) => {
+        WorkerPollPayload::Events { events, phase } => {
             if let Some(title) = harness_session_title(&events)
                 && let Some(session) = controller.state.sessions.get_mut(&update.session_id)
                 && session.acp_session_title.as_deref() != Some(&title)
@@ -1245,8 +1248,12 @@ fn apply_worker_poll_update(
                 controller.state.save()?;
                 dashboard.set_state(controller.state.clone());
             }
-            latest_message_updated =
-                dashboard.apply_worker_events(&update.session_id, &events, current_epoch_seconds());
+            latest_message_updated = dashboard.apply_worker_update(
+                &update.session_id,
+                &events,
+                phase,
+                current_epoch_seconds(),
+            );
         }
         WorkerPollPayload::Unreachable { detail } => {
             let diagnosis = controller.diagnose_worker(&update.session_id);

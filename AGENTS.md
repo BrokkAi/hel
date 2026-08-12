@@ -2,6 +2,11 @@
 
 # Git / version control
 
+After completing and validating requested implementation changes, commit them
+to the current branch without waiting for a separate request to commit. Treat
+committing as part of finishing the task unless the user explicitly says not
+to commit. Do not push unless the user explicitly asks.
+
 Commit directly to the current branch. This rule also applies when the current branch is `master`.
 
 Do not create a branch, change branches, rebase, or open a pull request unless the user gives an explicit instruction.

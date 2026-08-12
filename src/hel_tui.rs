@@ -23,7 +23,7 @@ use crate::hel_state::{HelState, SessionRecord, SessionState};
 use crate::hel_targets::{
     AdditionalMount, SessionResourceUsage, default_mount_destination, path_completion,
 };
-use crate::hel_worker::{SequencedEvent, WorkerEvent};
+use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase};
 
 const FORCE_CONFIRMATION: &str = "DESTROY";
 const ACTIVE_MESSAGE_LINES: usize = 4;
@@ -394,6 +394,30 @@ impl DashboardState {
             }
         }
         updated_latest_message
+    }
+
+    /// Apply transcript changes and reconcile transient state with the
+    /// worker's authoritative snapshot-derived phase.
+    pub fn apply_worker_update(
+        &mut self,
+        session_id: &str,
+        events: &[SequencedEvent],
+        phase: WorkerPhase,
+        observed_at_epoch_seconds: u64,
+    ) -> bool {
+        let updated = self.apply_worker_events(session_id, events, observed_at_epoch_seconds);
+        let detail = self
+            .session_details
+            .entry(session_id.to_string())
+            .or_default();
+        if phase == WorkerPhase::Running {
+            detail
+                .current_turn_started_at
+                .get_or_insert(observed_at_epoch_seconds);
+        } else {
+            detail.current_turn_started_at = None;
+        }
+        updated
     }
 
     pub fn apply_resource_usage(&mut self, session_id: &str, usage: SessionResourceUsage) {
@@ -2068,9 +2092,6 @@ fn session_values(
         crate::usage_format::format_turn_clock(
             now_epoch_seconds,
             detail.and_then(|detail| detail.current_turn_started_at),
-            detail
-                .and_then(|detail| detail.last_agent_text_at)
-                .or_else(|| session_updated_at_epoch_seconds(session)),
         )
     };
     (
@@ -2173,7 +2194,10 @@ fn session_name_line(session_name: String, unread_count: usize) -> Line<'static>
 fn active_message_preview(detail: Option<&SessionDetail>, width: usize) -> Vec<Line<'static>> {
     detail
         .and_then(|detail| detail.last_agent_message.as_deref())
-        .map(|message| render_agent_message_preview(message, width, ACTIVE_MESSAGE_LINES))
+        .map(|message| {
+            let single_line = message.lines().collect::<Vec<_>>().join(" ");
+            render_agent_message_preview(&single_line, width, ACTIVE_MESSAGE_LINES)
+        })
         .unwrap_or_default()
 }
 
@@ -3876,7 +3900,7 @@ mod tests {
     }
 
     #[test]
-    fn active_idle_clock_uses_the_last_agent_activity_age() {
+    fn active_idle_clock_is_blank() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let detail = SessionDetail {
@@ -3885,11 +3909,32 @@ mod tests {
         };
 
         let (clock, _, _, _, _, _) = session_values(&session, Some(&detail), 1_480, &config());
-        assert_eq!(clock, "8m ago");
+        assert_eq!(clock, "");
     }
 
     #[test]
-    fn active_message_preview_uses_only_the_rendered_lines_it_needs() {
+    fn worker_phase_clears_a_stale_replayed_turn_clock() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        let prompt = SequencedEvent {
+            seq: 1,
+            request_id: None,
+            event: WorkerEvent::PromptAccepted {
+                request_id: "request-1".into(),
+                text: "hello".into(),
+                attachments: Vec::new(),
+            },
+        };
+
+        dashboard.apply_worker_update("session-1", &[prompt], WorkerPhase::Idle, 1_000);
+
+        assert_eq!(
+            dashboard.session_details["session-1"].current_turn_started_at,
+            None
+        );
+    }
+
+    #[test]
+    fn active_message_preview_uses_only_the_wrapped_lines_it_needs() {
         let short = SessionDetail {
             last_agent_message: Some("one line".into()),
             ..SessionDetail::default()
@@ -3900,11 +3945,28 @@ mod tests {
             last_agent_message: Some("one\ntwo\nthree\nfour\nfive".into()),
             ..SessionDetail::default()
         };
-        assert_eq!(
-            active_message_preview(Some(&long), 80).len(),
-            ACTIVE_MESSAGE_LINES
-        );
+        assert_eq!(active_message_preview(Some(&long), 80).len(), 1);
         assert!(active_message_preview(None, 80).is_empty());
+    }
+
+    #[test]
+    fn active_message_preview_flattens_final_message_newlines_before_capping() {
+        let detail = SessionDetail {
+            last_agent_message: Some(
+                "Fixed and pushed.\n\nDuplicate LinkedIn URLs now use last-write-wins behavior.\n\nCommit: b6cb3e8 Keep the last duplicate connection record".into(),
+            ),
+            ..SessionDetail::default()
+        };
+
+        let rendered = active_message_preview(Some(&detail), 80)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(!rendered.contains("more]"));
+        assert!(rendered.contains("Fixed and pushed."));
+        assert!(rendered.contains("Commit: b6cb3e8"));
     }
 
     #[test]
