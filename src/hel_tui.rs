@@ -16,7 +16,7 @@ use ratatui::widgets::{
     Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 
-use crate::hel_chat::render_agent_message_preview;
+use crate::hel_chat::{TranscriptSnapshot, render_agent_message_preview};
 use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use crate::hel_quota::ProfileQuota;
 use crate::hel_state::{HelState, SessionRecord, SessionState};
@@ -28,6 +28,7 @@ use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase};
 
 const FORCE_CONFIRMATION: &str = "DESTROY";
 const ACTIVE_MESSAGE_LINES: usize = 4;
+const SELECTED_TRANSCRIPT_LINES: usize = 10;
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
 const MOUSE_SCROLL_ROWS: isize = 3;
 const IMPORT_STALL_WARNING_AFTER: Duration = Duration::from_secs(10);
@@ -250,7 +251,7 @@ struct SessionActivity {
     text: String,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default)]
 struct SessionDetail {
     last_event_sequence: u64,
     current_turn_started_at: Option<u64>,
@@ -260,6 +261,7 @@ struct SessionDetail {
     last_agent_message: Option<String>,
     unread_agent_message_sequences: Vec<u64>,
     resource_usage: Option<SessionResourceUsage>,
+    transcript: Option<TranscriptSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -488,6 +490,13 @@ impl DashboardState {
             }
             Err(_) => detail.failed = true,
         }
+    }
+
+    pub fn apply_transcript(&mut self, session_id: &str, transcript: TranscriptSnapshot) {
+        self.session_details
+            .entry(session_id.to_string())
+            .or_default()
+            .transcript = Some(transcript);
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
@@ -1679,7 +1688,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
-            Constraint::Length(7),
+            Constraint::Length(5),
             Constraint::Length(8),
             Constraint::Length(2),
         ])
@@ -2000,20 +2009,32 @@ fn render_sessions(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         .unwrap_or_default()
         .as_secs();
     let preview_width = area.width.saturating_sub(4);
+    let selected_active = (dashboard.focus == Focus::Active)
+        .then_some(dashboard.session_index)
+        .filter(|index| *index < active.len());
+    let maximum_selected_lines = usize::from(
+        area.height
+            .saturating_sub(3)
+            .saturating_sub(SESSION_TABLE_CHROME_HEIGHT + 1),
+    )
+    .min(SELECTED_TRANSCRIPT_LINES);
     let active_previews = active
         .iter()
-        .map(|session| {
-            active_message_preview(
-                dashboard.session_details.get(&session.id),
-                usize::from(preview_width),
-            )
+        .enumerate()
+        .map(|(index, session)| {
+            let detail = dashboard.session_details.get_mut(&session.id);
+            if selected_active == Some(index) {
+                active_transcript_tail(detail, preview_width, maximum_selected_lines)
+            } else {
+                active_message_preview(detail.as_deref(), usize::from(preview_width))
+            }
         })
         .collect::<Vec<_>>();
-    let active_minimum_height = (SESSION_TABLE_CHROME_HEIGHT
-        + active_previews
-            .first()
-            .map_or(0, |preview| preview.len() as u16 + 1))
-    .min(area.height.saturating_sub(3));
+    let selected_preview_height = selected_active
+        .and_then(|index| active_previews.get(index))
+        .map_or(0, |preview| preview.len() as u16 + 1);
+    let active_minimum_height =
+        (SESSION_TABLE_CHROME_HEIGHT + selected_preview_height).min(area.height.saturating_sub(3));
     let archived_height = (archived.len() as u16 + SESSION_TABLE_CHROME_HEIGHT)
         .max(3)
         .min(area.height.saturating_sub(active_minimum_height).max(3));
@@ -2315,6 +2336,20 @@ fn active_message_preview(detail: Option<&SessionDetail>, width: usize) -> Vec<L
             render_agent_message_preview(&single_line, width, ACTIVE_MESSAGE_LINES)
         })
         .unwrap_or_default()
+}
+
+fn active_transcript_tail(
+    detail: Option<&mut SessionDetail>,
+    width: u16,
+    maximum_lines: usize,
+) -> Vec<Line<'static>> {
+    let Some(detail) = detail else {
+        return Vec::new();
+    };
+    match detail.transcript.as_mut() {
+        Some(transcript) => transcript.rich_tail(width, maximum_lines),
+        None => active_message_preview(Some(detail), usize::from(width)),
+    }
 }
 
 fn active_session_row(
@@ -3009,6 +3044,7 @@ mod tests {
         CONFIG_VERSION, ContainerTemplate, HarnessProfile, ProjectBundle, ProjectRepository,
     };
     use crate::hel_state::{CheckpointMetadata, STATE_VERSION};
+    use crate::hel_worker::WorkerSnapshot;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -3154,11 +3190,27 @@ mod tests {
                     "type": "session_update",
                     "update": {
                         "sessionUpdate": kind,
-                        "content": { "text": text }
+                        "content": { "type": "text", "text": text }
                     }
                 }),
             },
         }
+    }
+
+    fn apply_transcript(dashboard: &mut DashboardState, events: &[SequencedEvent]) {
+        let snapshot: WorkerSnapshot = serde_json::from_value(serde_json::json!({
+            "session_id": "session-1",
+            "phase": "running",
+            "latest_seq": events.last().map_or(0, |event| event.seq),
+            "last_checkpoint_seq": null,
+            "active_prompt": null,
+            "config": {},
+            "handled_requests": {}
+        }))
+        .unwrap();
+        let chat = crate::hel_chat::ChatState::new(&snapshot, events);
+        dashboard.apply_worker_events("session-1", events, 100);
+        dashboard.apply_transcript("session-1", chat.transcript_snapshot());
     }
 
     #[test]
@@ -4089,6 +4141,105 @@ mod tests {
         assert!(rendered.contains("ACP pretty name"));
         assert!(!rendered.contains("native-1"));
         assert!(!rendered.contains("Raise the dead"));
+    }
+
+    #[test]
+    fn highlighted_active_session_renders_rich_transcript_tail_and_collapses_on_blur() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        let events = vec![
+            SequencedEvent {
+                seq: 1,
+                request_id: None,
+                event: WorkerEvent::PromptAccepted {
+                    request_id: "request-1".into(),
+                    text: "inspect the dashboard".into(),
+                    attachments: Vec::new(),
+                },
+            },
+            adapter_text_event(2, "agent_message_chunk", "**Rendered answer**"),
+            SequencedEvent {
+                seq: 3,
+                request_id: None,
+                event: WorkerEvent::Adapter {
+                    kind: "session_update".into(),
+                    payload: serde_json::json!({
+                        "type": "session_update",
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": "tool-1",
+                            "title": "Run dashboard tests",
+                            "kind": "execute",
+                            "status": "completed",
+                            "content": [],
+                            "locations": []
+                        }
+                    }),
+                },
+            },
+        ];
+        apply_transcript(&mut dashboard, &events);
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw selected dashboard");
+        let selected = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(selected.contains("❯ You"));
+        assert!(selected.contains("inspect the dashboard"));
+        assert!(selected.contains("● Agent"));
+        assert!(selected.contains("Rendered answer"));
+        assert!(selected.contains("✓ Tool · done"));
+        assert!(selected.contains("Run dashboard tests"));
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw blurred dashboard");
+        let blurred = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(blurred.contains("Rendered answer"));
+        assert!(!blurred.contains("❯ You"));
+        assert!(!blurred.contains("Run dashboard tests"));
+    }
+
+    #[test]
+    fn selected_transcript_tail_adapts_to_a_constrained_terminal() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        let events = (1..=20)
+            .map(|seq| adapter_text_event(seq, "agent_message_chunk", &format!("line {seq}\n")))
+            .collect::<Vec<_>>();
+        apply_transcript(&mut dashboard, &events);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw constrained dashboard");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Active"));
+        assert!(rendered.contains("Archived"));
+        assert!(rendered.contains("Profile Quotas"));
     }
 
     #[test]

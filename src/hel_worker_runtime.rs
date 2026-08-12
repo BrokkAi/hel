@@ -7,6 +7,49 @@ use serde::{Deserialize, Serialize};
 
 use crate::hel_config::HarnessKind;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerOwnership {
+    pub version: u32,
+    pub session_id: String,
+    pub profile_id: String,
+    pub bundle_id: String,
+    pub target_template_id: String,
+}
+
+impl WorkerOwnership {
+    pub const VERSION: u32 = 1;
+
+    pub fn write(&self, path: &Path) -> Result<()> {
+        let body = serde_json::to_vec(self)?;
+        crate::hel_config::atomic_write(path, &body)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpSupervisorSpec {
+    pub command: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub environment: std::collections::BTreeMap<String, String>,
+    pub cwd: PathBuf,
+}
+
+impl AcpSupervisorSpec {
+    pub fn read(path: &Path) -> Result<Self> {
+        let body = std::fs::read(path)
+            .with_context(|| format!("read ACP supervisor spec {}", path.display()))?;
+        serde_json::from_slice(&body)
+            .with_context(|| format!("parse ACP supervisor spec {}", path.display()))
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
+        let body = serde_json::to_vec_pretty(self)?;
+        crate::hel_config::atomic_write(path, &body)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerLaunchConfig {
     pub session_id: String,
@@ -63,17 +106,30 @@ mod unix {
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::mpsc;
 
-    use super::WorkerLaunchConfig;
+    use super::{AcpSupervisorSpec, WorkerLaunchConfig};
     use crate::hel_acp::{self, CommandRequest, LaunchSpec, RuntimeEvent};
     use crate::hel_worker::{
         DurableWorker, ErrorCode, PROTOCOL_VERSION, ProtocolError, RequestEnvelope, ResponseBody,
         ResponseEnvelope, ResponsePayload, WorkerRequest,
     };
+    use crate::hel_worker_protocol::DecodedRequest;
+
+    struct SocketGuard(PathBuf);
+
+    impl Drop for SocketGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     pub async fn run_daemon(root: PathBuf, mut config: WorkerLaunchConfig) -> Result<()> {
         super::resolve_relative_harness_home(&mut config, &std::env::current_dir()?);
         std::fs::create_dir_all(&root)
             .with_context(|| format!("create worker root {}", root.display()))?;
+        // Validate and recover durable state before publishing a socket. A
+        // failed startup must never leave a fresh endpoint that looks live.
+        let durable_worker =
+            DurableWorker::open(&root, &config.session_id, env!("CARGO_PKG_VERSION"))?;
         let socket = root.join("control.sock");
         if socket.exists() {
             match UnixStream::connect(&socket).await {
@@ -84,28 +140,42 @@ mod unix {
         }
         let listener = UnixListener::bind(&socket)
             .with_context(|| format!("bind worker socket {}", socket.display()))?;
+        let _socket_guard = SocketGuard(socket.clone());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         }
 
-        let durable_worker =
-            DurableWorker::open(&root, &config.session_id, env!("CARGO_PKG_VERSION"))?;
         let resume_session = select_resume_session(&config, &durable_worker);
         let worker = Arc::new(Mutex::new(durable_worker));
         let (acp_commands_tx, acp_commands_rx) = mpsc::channel(32);
         let (acp_events_tx, mut acp_events_rx) = mpsc::unbounded_channel();
-        let acp_spec = LaunchSpec {
+        let supervisor_path = root.join("acp-supervisor.json");
+        AcpSupervisorSpec {
             command: config.bridge_command,
             args: config.bridge_args,
             environment: config.environment,
+            cwd: config.cwd.clone(),
+        }
+        .write(&supervisor_path)?;
+        let acp_spec = LaunchSpec {
+            command: std::env::current_exe().context("locate Hel worker executable")?,
+            args: vec![
+                "worker".into(),
+                "acp-supervisor".into(),
+                "--spec".into(),
+                supervisor_path.to_string_lossy().into_owned(),
+            ],
+            environment: Default::default(),
             cwd: config.cwd,
             additional_directories: config.additional_directories,
             resume_session,
             harness: config.harness,
         };
         let mut acp_task = tokio::spawn(hel_acp::run(acp_spec, acp_commands_rx, acp_events_tx));
+
+        dispatch_pending(&worker, &acp_commands_tx).await?;
 
         let event_worker = worker.clone();
         let mut event_task = tokio::spawn(async move {
@@ -125,8 +195,12 @@ mod unix {
                     worker.record_adapter_event(runtime_event_kind(&event), value)?;
                 }
                 match event {
-                    RuntimeEvent::PromptFinished { .. } => {
+                    RuntimeEvent::PromptFinished { request_id, .. } => {
                         worker.record_turn_completed()?;
+                        worker.complete_dispatch(&request_id)?;
+                    }
+                    RuntimeEvent::ConfigApplied { request_id, .. } => {
+                        worker.complete_dispatch(&request_id)?;
                     }
                     RuntimeEvent::Stopped
                         if worker.snapshot().phase == crate::hel_worker::WorkerPhase::Closing =>
@@ -161,7 +235,6 @@ mod unix {
                 }
             }
         }
-        let _ = std::fs::remove_file(socket);
         Ok(())
     }
 
@@ -192,33 +265,59 @@ mod unix {
             if line.len() > crate::hel_worker::MAX_FRAME_BYTES {
                 bail!("worker request frame is too large");
             }
-            let envelope: RequestEnvelope =
-                serde_json::from_str(&line).context("decode worker request")?;
+            let envelope = match crate::hel_worker_protocol::decode_request(line.as_bytes())? {
+                DecodedRequest::Known(envelope) => envelope,
+                DecodedRequest::Unknown {
+                    request_id,
+                    protocol_version,
+                    method,
+                } => {
+                    let response = crate::hel_worker::unsupported_method_response(
+                        request_id,
+                        protocol_version,
+                        method,
+                    );
+                    write_response(&mut writer, &response).await?;
+                    continue;
+                }
+                DecodedRequest::Invalid {
+                    request_id,
+                    protocol_version,
+                    message,
+                } => {
+                    let response = crate::hel_worker::invalid_request_response(
+                        request_id,
+                        protocol_version,
+                        message,
+                    );
+                    write_response(&mut writer, &response).await?;
+                    continue;
+                }
+            };
             let request = envelope.request.clone();
             if let WorkerRequest::Compact { text } = request {
                 let response = compact_response(envelope, text, &commands).await;
-                let mut encoded = serde_json::to_vec(&response)?;
-                encoded.push(b'\n');
-                writer.write_all(&encoded).await?;
-                writer.flush().await?;
+                write_response(&mut writer, &response).await?;
                 continue;
             }
             let response = worker
                 .lock()
                 .expect("worker state lock poisoned")
                 .handle(envelope);
-            let accepted = accepted(&response);
-            let mut encoded = serde_json::to_vec(&response)?;
-            encoded.push(b'\n');
-            writer.write_all(&encoded).await?;
-            writer.flush().await?;
-            if accepted && let Some(command) = acp_command(request) {
-                commands
-                    .send(command)
-                    .await
-                    .context("ACP runtime stopped")?;
-            }
+            dispatch_pending(&worker, &commands).await?;
+            write_response(&mut writer, &response).await?;
         }
+        Ok(())
+    }
+
+    async fn write_response(
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        response: &ResponseEnvelope,
+    ) -> Result<()> {
+        let mut encoded = serde_json::to_vec(response)?;
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await?;
+        writer.flush().await?;
         Ok(())
     }
 
@@ -236,6 +335,7 @@ mod unix {
                         envelope.protocol_version, PROTOCOL_VERSION
                     ),
                     retryable: false,
+                    detail: None,
                 },
             }
         } else if text.trim().is_empty() {
@@ -244,6 +344,7 @@ mod unix {
                     code: ErrorCode::InvalidRequest,
                     message: "compaction prompt is empty".into(),
                     retryable: false,
+                    detail: None,
                 },
             }
         } else {
@@ -278,30 +379,42 @@ mod unix {
                 code: ErrorCode::Internal,
                 message: message.into(),
                 retryable: false,
+                detail: None,
             },
         }
     }
 
-    fn accepted(response: &ResponseEnvelope) -> bool {
-        matches!(
-            response.body,
-            ResponseBody::Ok {
-                payload: ResponsePayload::Accepted { .. }
+    async fn dispatch_pending(
+        worker: &Arc<Mutex<DurableWorker>>,
+        commands: &mpsc::Sender<CommandRequest>,
+    ) -> Result<()> {
+        let pending = worker
+            .lock()
+            .expect("worker state lock poisoned")
+            .claim_pending_dispatches()?;
+        for (request_id, request) in pending {
+            if let Some(command) = acp_command(request_id, request) {
+                commands
+                    .send(command)
+                    .await
+                    .context("ACP runtime stopped")?;
             }
-        )
+        }
+        Ok(())
     }
 
-    fn acp_command(request: WorkerRequest) -> Option<CommandRequest> {
+    fn acp_command(request_id: String, request: WorkerRequest) -> Option<CommandRequest> {
         match request {
-            WorkerRequest::Prompt { text, .. } => Some(CommandRequest::Prompt(text)),
+            WorkerRequest::Prompt { text, .. } => Some(CommandRequest::Prompt { request_id, text }),
             WorkerRequest::SetConfig { key, value } => {
                 value.as_str().map(|value| CommandRequest::SetConfig {
+                    request_id,
                     key,
                     value: value.to_owned(),
                 })
             }
-            WorkerRequest::Cancel => Some(CommandRequest::Cancel),
-            WorkerRequest::Close => Some(CommandRequest::Close),
+            WorkerRequest::Cancel => Some(CommandRequest::Cancel { request_id }),
+            WorkerRequest::Close => Some(CommandRequest::Close { request_id }),
             _ => None,
         }
     }
@@ -378,6 +491,66 @@ mod unix {
             }
         }
     }
+
+    /// Own the ACP bridge's process group.  The daemon communicates only with
+    /// this supervisor; if the daemon is killed, stdin reaches EOF and the
+    /// complete bridge process tree is terminated and reaped.
+    pub async fn run_acp_supervisor(spec: AcpSupervisorSpec) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut command = tokio::process::Command::new(&spec.command);
+        command
+            .args(&spec.args)
+            .envs(&spec.environment)
+            .current_dir(&spec.cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit());
+        command.process_group(0);
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("launch supervised ACP bridge {}", spec.command.display()))?;
+        let pid = child
+            .id()
+            .context("supervised ACP bridge has no process ID")? as i32;
+        let mut child_stdin = child.stdin.take().context("ACP bridge stdin unavailable")?;
+        let mut child_stdout = child
+            .stdout
+            .take()
+            .context("ACP bridge stdout unavailable")?;
+        let mut parent_stdin = tokio::io::stdin();
+        let mut parent_stdout = tokio::io::stdout();
+
+        {
+            let input = tokio::io::copy(&mut parent_stdin, &mut child_stdin);
+            let output = tokio::io::copy(&mut child_stdout, &mut parent_stdout);
+            tokio::pin!(input, output);
+            tokio::select! {
+                result = &mut input => { result.context("forward ACP supervisor input")?; }
+                result = &mut output => { result.context("forward ACP supervisor output")?; }
+            }
+        }
+        let _ = child_stdin.shutdown().await;
+        terminate_process_group(pid, libc::SIGTERM);
+        match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
+            Ok(status) => {
+                let _ = status.context("wait for supervised ACP bridge")?;
+            }
+            Err(_) => {
+                terminate_process_group(pid, libc::SIGKILL);
+                child.wait().await.context("reap supervised ACP bridge")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn terminate_process_group(pid: i32, signal: i32) {
+        // SAFETY: a negative, validated child PID targets only the process
+        // group created for this supervisor's child.
+        unsafe {
+            libc::kill(-pid, signal);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -393,7 +566,7 @@ fn resolve_relative_harness_home(config: &mut WorkerLaunchConfig, base: &Path) {
 }
 
 #[cfg(unix)]
-pub use unix::{proxy, run_daemon};
+pub use unix::{proxy, run_acp_supervisor, run_daemon};
 
 #[cfg(not(unix))]
 pub async fn run_daemon(
@@ -406,6 +579,11 @@ pub async fn run_daemon(
 #[cfg(not(unix))]
 pub async fn proxy(_root: std::path::PathBuf) -> anyhow::Result<()> {
     anyhow::bail!("target workers require Unix")
+}
+
+#[cfg(not(unix))]
+pub async fn run_acp_supervisor(_spec: AcpSupervisorSpec) -> anyhow::Result<()> {
+    anyhow::bail!("ACP supervision requires Unix")
 }
 
 #[cfg(all(test, unix))]
