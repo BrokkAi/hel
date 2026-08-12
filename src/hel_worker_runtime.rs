@@ -44,6 +44,7 @@ impl AcpSupervisorSpec {
             .with_context(|| format!("parse ACP supervisor spec {}", path.display()))
     }
 
+    #[cfg(unix)]
     fn write(&self, path: &Path) -> Result<()> {
         let body = serde_json::to_vec_pretty(self)?;
         crate::hel_config::atomic_write(path, &body)
