@@ -248,6 +248,7 @@ enum WorkerPollPayload {
     Events {
         events: Vec<SequencedEvent>,
         phase: WorkerPhase,
+        transcript: hel::hel_chat::TranscriptSnapshot,
     },
     /// The worker failed several consecutive polls; the session needs
     /// attention and a diagnosis.
@@ -1130,11 +1131,16 @@ async fn poll_dashboard_workers(
                     .expect("a successfully synced worker remains cached");
                 worker.chat.apply_events(&events);
                 let phase = worker.chat.phase();
+                let transcript = worker.chat.transcript_snapshot();
                 if !events.is_empty()
                     && updates
                         .send(WorkerPollUpdate {
                             session_id: target.session_id.clone(),
-                            payload: WorkerPollPayload::Events { events, phase },
+                            payload: WorkerPollPayload::Events {
+                                events,
+                                phase,
+                                transcript,
+                            },
                         })
                         .await
                         .is_err()
@@ -1166,6 +1172,7 @@ async fn poll_dashboard_workers(
                         let chat =
                             hel::hel_chat::ChatState::new(&bootstrap.snapshot, &bootstrap.events);
                         let phase = chat.phase();
+                        let transcript = chat.transcript_snapshot();
                         clients.insert(
                             target.session_id.clone(),
                             WarmWorker {
@@ -1177,7 +1184,11 @@ async fn poll_dashboard_workers(
                         if updates
                             .send(WorkerPollUpdate {
                                 session_id: target.session_id.clone(),
-                                payload: WorkerPollPayload::Events { events, phase },
+                                payload: WorkerPollPayload::Events {
+                                    events,
+                                    phase,
+                                    transcript,
+                                },
                             })
                             .await
                             .is_err()
@@ -1239,7 +1250,11 @@ fn apply_worker_poll_update(
 ) -> Result<bool> {
     let mut latest_message_updated = false;
     match update.payload {
-        WorkerPollPayload::Events { events, phase } => {
+        WorkerPollPayload::Events {
+            events,
+            phase,
+            transcript,
+        } => {
             if let Some(title) = harness_session_title(&events)
                 && let Some(session) = controller.state.sessions.get_mut(&update.session_id)
                 && session.acp_session_title.as_deref() != Some(&title)
@@ -1254,6 +1269,7 @@ fn apply_worker_poll_update(
                 phase,
                 current_epoch_seconds(),
             );
+            dashboard.apply_transcript(&update.session_id, transcript);
         }
         WorkerPollPayload::Unreachable { detail } => {
             let diagnosis = controller.diagnose_worker(&update.session_id);
@@ -1802,6 +1818,10 @@ async fn run_dashboard() -> Result<()> {
                         },
                         worker,
                     )) => {
+                        if let Some(worker) = worker.as_ref() {
+                            dashboard
+                                .apply_transcript(&session_id, worker.chat.transcript_snapshot());
+                        }
                         worker_commands_tx
                             .send(WorkerPollCommand::Checkin {
                                 session_id: session_id.clone(),
