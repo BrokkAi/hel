@@ -2102,6 +2102,15 @@ fn resource_summary(usage: &SessionResourceUsage) -> String {
     resources.join(" · ")
 }
 
+fn checkpoint_archive_size(session: &SessionRecord) -> String {
+    session
+        .checkpoint
+        .as_ref()
+        .and_then(|checkpoint| std::fs::metadata(&checkpoint.archive_path).ok())
+        .map(|metadata| format_resource_bytes(metadata.len()))
+        .unwrap_or_else(|| "—".into())
+}
+
 fn format_resource_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -2170,7 +2179,7 @@ fn archived_session_row(
         profile,
         target,
         checkpoint,
-        String::new(),
+        checkpoint_archive_size(session),
         session_name,
     ])
 }
@@ -3749,6 +3758,19 @@ mod tests {
         assert!(rendered.contains("26-08-09 01:00"));
         assert!(!rendered.contains("2026-08-09T01:00:00Z"));
         assert!(!rendered.contains("idle"));
+    }
+
+    #[test]
+    fn archived_resources_show_the_checkpoint_archive_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("session.hel.zip");
+        std::fs::write(&archive, vec![0_u8; 1_536]).unwrap();
+        let mut session = archived_session();
+        session.checkpoint.as_mut().unwrap().archive_path = archive;
+
+        assert_eq!(checkpoint_archive_size(&session), "1.5K");
+        session.checkpoint.as_mut().unwrap().archive_path = directory.path().join("missing.zip");
+        assert_eq!(checkpoint_archive_size(&session), "—");
     }
 
     #[test]
