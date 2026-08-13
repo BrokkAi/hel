@@ -78,6 +78,7 @@ pub struct RecoveryScan {
 pub struct CheckpointArtifact {
     pub metadata: CheckpointMetadata,
     pub native_session_id: String,
+    pub full_history_fallbacks: Vec<String>,
 }
 
 pub struct SessionLaunchOptions {
@@ -450,14 +451,16 @@ impl Controller {
                             "-C",
                             &directory.to_string_lossy(),
                             "rev-parse",
-                            "--is-inside-work-tree",
+                            "--verify",
+                            "HEAD",
                         ],
                     )
                     .purpose("verify local bare Git project"),
                 )?;
                 ensure!(
-                    output.status == 0 && String::from_utf8_lossy(&output.stdout).trim() == "true",
-                    "project directory is not a Git worktree: {}",
+                    output.status == 0
+                        && !String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+                    "project directory has no valid Git HEAD: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
                 );
                 Ok(())
@@ -1274,7 +1277,7 @@ impl Controller {
             .targets
             .get(target_id)
             .with_context(|| format!("unknown target template {target_id:?}"))?;
-        if previous.project_directory.is_some() {
+        if let Some(project_directory) = &previous.project_directory {
             let previous_template = self
                 .config
                 .targets
@@ -1286,6 +1289,8 @@ impl Controller {
             {
                 bail!("raw project sessions must resume on the same bare target kind");
             }
+            self.validate_project_directory(target_id, project_directory, &ProcessExecutor)
+                .context("raw project is unavailable for resume")?;
         }
         let resource_allocation =
             resource_allocation.or_else(|| previous.resource_allocation.clone());
@@ -1607,7 +1612,8 @@ impl Controller {
                         id: "project".into(),
                         relative_destination: PathBuf::from(destination),
                         base_commit: "HEAD".into(),
-                        full_history: true,
+                        full_history: false,
+                        capture_contents: false,
                         origin_override: None,
                     }],
                 )
@@ -1636,7 +1642,8 @@ impl Controller {
                                 .map(|git_ref| format!("origin/{git_ref}"))
                                 .unwrap_or_else(|| "origin/HEAD".into())
                         },
-                        full_history: repository.is_local(),
+                        full_history: false,
+                        capture_contents: true,
                         origin_override: repository
                             .is_local()
                             .then(|| format!("hel-local:{}", repository.id)),
@@ -1701,6 +1708,13 @@ impl Controller {
                 target_checkpoint.event_sequence
             );
         }
+        if !target_checkpoint.full_history_fallbacks.is_empty() {
+            tracing::warn!(
+                session_id,
+                repositories = %target_checkpoint.full_history_fallbacks.join(", "),
+                "checkpoint used full Git history because no common base was available"
+            );
+        }
 
         let destination = sessions_dir().join(format!(
             "{session_id}-{}.hel.zip",
@@ -1727,6 +1741,7 @@ impl Controller {
         Ok(CheckpointArtifact {
             metadata,
             native_session_id,
+            full_history_fallbacks: target_checkpoint.full_history_fallbacks,
         })
     }
 
@@ -4388,10 +4403,7 @@ mod tests {
         assert_eq!(commands[0].program, "git");
         assert_eq!(commands[0].args[0], "-C");
         assert_eq!(commands[0].args[1], project.path().to_string_lossy());
-        assert_eq!(
-            commands[0].args[2..],
-            ["rev-parse", "--is-inside-work-tree"]
-        );
+        assert_eq!(commands[0].args[2..], ["rev-parse", "--verify", "HEAD"]);
     }
 
     #[test]

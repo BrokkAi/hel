@@ -1606,7 +1606,7 @@ pub fn ssh_directory_exists(
     }
 }
 
-/// Verify that a bare-SSH project path exists and belongs to a Git repository.
+/// Verify that a bare-SSH project path exists and has a committed Git HEAD.
 pub fn validate_bare_project_directory(
     ssh: &SshTarget,
     path: &Path,
@@ -1626,7 +1626,8 @@ pub fn validate_bare_project_directory(
             "-C".into(),
             path.to_string_lossy().into_owned(),
             "rev-parse".into(),
-            "--git-dir".into(),
+            "--verify".into(),
+            "HEAD".into(),
         ],
         "validate bare SSH Git project",
     ))?;
@@ -1635,12 +1636,12 @@ pub fn validate_bare_project_directory(
         let detail = detail.trim();
         if detail.is_empty() {
             bail!(
-                "remote project directory {} is not a Git repository",
+                "remote project directory {} has no valid Git HEAD",
                 path.display()
             );
         }
         bail!(
-            "remote project directory {} is not a Git repository: {detail}",
+            "remote project directory {} has no valid Git HEAD: {detail}",
             path.display()
         );
     }
@@ -2358,7 +2359,7 @@ mod tests {
                 .args
                 .last()
                 .unwrap()
-                .contains("'git' '-C' '/srv/project' 'rev-parse' '--git-dir'")
+                .contains("'git' '-C' '/srv/project' 'rev-parse' '--verify' 'HEAD'")
         );
         assert!(seen[0].args.contains(&"ConnectTimeout=3".to_owned()));
 
@@ -2381,7 +2382,7 @@ mod tests {
         };
         let error =
             validate_bare_project_directory(&ssh(), Path::new("/srv/plain"), &not_git).unwrap_err();
-        assert!(error.to_string().contains("is not a Git repository"));
+        assert!(error.to_string().contains("has no valid Git HEAD"));
         assert_eq!(not_git.seen.borrow().len(), 2);
     }
 
