@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event,
+    Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -3179,12 +3179,26 @@ fn quick_config_id(value: &str) -> String {
 
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    keyboard_enhancement: bool,
 }
 
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("enable terminal raw mode")?;
         let mut stdout = io::stdout();
+        // Legacy terminal input encodes Ctrl+I as the same byte as Tab. Ask
+        // capable terminals to report them distinctly so both bindings work.
+        let keyboard_enhancement = matches!(
+            crossterm::terminal::supports_keyboard_enhancement(),
+            Ok(true)
+        );
+        if keyboard_enhancement {
+            execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )
+            .context("enable unambiguous terminal key reporting")?;
+        }
         execute!(
             stdout,
             EnterAlternateScreen,
@@ -3193,11 +3207,17 @@ impl TerminalGuard {
         )
         .context("enter alternate screen and enable terminal input modes")?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            keyboard_enhancement,
+        })
     }
 
     fn suspend(&mut self) -> Result<()> {
-        disable_raw_mode().context("disable terminal raw mode for setup")?;
+        if self.keyboard_enhancement {
+            execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags)
+                .context("restore terminal key reporting for setup")?;
+        }
         execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
@@ -3205,6 +3225,7 @@ impl TerminalGuard {
             LeaveAlternateScreen
         )
         .context("disable terminal input modes and leave alternate screen for setup")?;
+        disable_raw_mode().context("disable terminal raw mode for setup")?;
         self.terminal
             .show_cursor()
             .context("show cursor for setup")?;
@@ -3213,6 +3234,13 @@ impl TerminalGuard {
 
     fn resume(&mut self) -> Result<()> {
         enable_raw_mode().context("re-enable terminal raw mode after setup")?;
+        if self.keyboard_enhancement {
+            execute!(
+                self.terminal.backend_mut(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )
+            .context("re-enable unambiguous terminal key reporting after setup")?;
+        }
         execute!(
             self.terminal.backend_mut(),
             EnterAlternateScreen,
@@ -3229,13 +3257,16 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
+        if self.keyboard_enhancement {
+            let _ = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
+        let _ = disable_raw_mode();
         let _ = self.terminal.show_cursor();
     }
 }
