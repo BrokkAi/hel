@@ -2757,7 +2757,7 @@ async fn close_session_with_redraw(
 fn close_progress_notice(session_id: &str, elapsed: Duration, frame: usize) -> String {
     const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
     format!(
-        "{} Saving recovery copy for {}… {}s",
+        "{} Saving checkpoint for {}… {}s",
         SPINNER[frame % SPINNER.len()],
         short_id(session_id),
         elapsed.as_secs()
@@ -3488,7 +3488,7 @@ mod tests {
     fn close_progress_notice_animates_and_reports_elapsed_time() {
         assert_eq!(
             close_progress_notice("0123456789", Duration::from_secs(7), 1),
-            "/ Saving recovery copy for 01234567… 7s"
+            "/ Saving checkpoint for 01234567… 7s"
         );
     }
 
