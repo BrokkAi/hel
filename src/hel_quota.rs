@@ -28,6 +28,8 @@ pub struct QuotaWindow {
     pub used: Option<i64>,
     pub limit: Option<i64>,
     pub resets: Option<String>,
+    #[serde(default)]
+    pub resets_at_epoch_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,15 +47,14 @@ impl ProfileQuota {
         if let Some(error) = &self.error {
             return format!("unavailable: {error}");
         }
-        let hide_short_windows = self.harness == HarnessKind::Claude
-            && self.windows.iter().any(|window| {
-                window.label.eq_ignore_ascii_case("week") && window.remaining_percent == Some(0)
-            });
         let mut seen_resets = BTreeSet::new();
         let mut parts = self
             .windows
             .iter()
-            .filter(|window| !hide_short_windows || window.label.eq_ignore_ascii_case("week"))
+            .filter(|window| {
+                !is_short_quota_window(&window.label)
+                    || projects_exhaustion_before_reset(window, self.refreshed_at_epoch_seconds)
+            })
             .map(|window| {
                 let usage = match (window.remaining_percent, window.used, window.limit) {
                     (Some(remaining), _, _) => format!("{remaining}% left"),
@@ -79,6 +80,37 @@ impl ProfileQuota {
             parts.join(" · ")
         }
     }
+}
+
+fn is_short_quota_window(label: &str) -> bool {
+    matches!(
+        label.to_ascii_lowercase().as_str(),
+        "5h" | "5-hour" | "5 hour"
+    )
+}
+
+fn projects_exhaustion_before_reset(window: &QuotaWindow, now: u64) -> bool {
+    const FIVE_HOURS_SECONDS: i64 = 5 * 60 * 60;
+    let Some(reset) = window.resets_at_epoch_seconds else {
+        return false;
+    };
+    let Ok(now) = i64::try_from(now) else {
+        return false;
+    };
+    let remaining_time = reset - now;
+    let elapsed = FIVE_HOURS_SECONDS - remaining_time;
+    if remaining_time <= 0 || elapsed <= 0 || elapsed >= FIVE_HOURS_SECONDS {
+        return false;
+    }
+    if let (Some(used), Some(limit)) = (window.used, window.limit)
+        && limit > 0
+    {
+        return i128::from(used.clamp(0, limit)) * i128::from(FIVE_HOURS_SECONDS)
+            > i128::from(limit) * i128::from(elapsed);
+    }
+    window
+        .remaining_percent
+        .is_some_and(|remaining| i64::from(100 - remaining) * FIVE_HOURS_SECONDS > 100 * elapsed)
 }
 
 #[derive(Default)]
@@ -164,6 +196,7 @@ async fn refresh_profile(
                             resets: window
                                 .resets_at
                                 .and_then(crate::usage_format::format_reset_local_seconds),
+                            resets_at_epoch_seconds: window.resets_at,
                         })
                         .collect(),
                     extra: None,
@@ -193,6 +226,10 @@ async fn refresh_profile(
                         .reset_context
                         .as_deref()
                         .and_then(crate::usage_format::normalize_reset_text),
+                    resets_at_epoch_seconds: window
+                        .reset_context
+                        .as_deref()
+                        .and_then(crate::usage_format::normalize_reset_epoch_seconds),
                 })
                 .collect(),
                 extra: None,
@@ -541,22 +578,37 @@ fn parse_kimi_window(value: &Value, fallback: &str) -> Option<QuotaWindow> {
     if used.is_none() && limit.is_none() {
         return None;
     }
-    let label = value
+    let provider_label = value
         .get("name")
         .or_else(|| value.get("title"))
         .and_then(Value::as_str)
-        .unwrap_or(fallback)
-        .to_string();
-    let resets = ["resetAt", "reset_at", "resetTime", "reset_time"]
+        .unwrap_or(fallback);
+    let label = if provider_label.to_ascii_lowercase().contains("week") {
+        "week".to_string()
+    } else if provider_label.to_ascii_lowercase().contains("5h") || fallback.starts_with("Limit #")
+    {
+        "5H".to_string()
+    } else {
+        provider_label.to_string()
+    };
+    let reset_value = ["resetAt", "reset_at", "resetTime", "reset_time"]
         .iter()
-        .find_map(|key| value.get(*key))
-        .and_then(normalize_kimi_reset);
+        .find_map(|key| value.get(*key));
+    let resets = reset_value.and_then(normalize_kimi_reset);
+    let resets_at_epoch_seconds = reset_value.and_then(kimi_reset_epoch_seconds);
+    let remaining_percent = match (used, limit) {
+        (Some(used), Some(limit)) if limit > 0 => {
+            Some((100 - used.clamp(0, limit) * 100 / limit) as u8)
+        }
+        _ => None,
+    };
     Some(QuotaWindow {
         label,
-        remaining_percent: None,
+        remaining_percent,
         used,
         limit,
         resets,
+        resets_at_epoch_seconds,
     })
 }
 
@@ -574,6 +626,23 @@ fn normalize_kimi_reset(value: &Value) -> Option<String> {
             value
                 .as_str()
                 .and_then(crate::usage_format::normalize_reset_text)
+        })
+}
+
+fn kimi_reset_epoch_seconds(value: &Value) -> Option<i64> {
+    value
+        .as_f64()
+        .map(|epoch| {
+            if epoch.abs() >= 1_000_000_000_000.0 {
+                (epoch / 1000.0).trunc() as i64
+            } else {
+                epoch.trunc() as i64
+            }
+        })
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(crate::usage_format::normalize_reset_epoch_seconds)
         })
 }
 
@@ -598,6 +667,10 @@ mod tests {
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].used, Some(40));
         assert_eq!(windows[1].used, Some(10));
+        assert_eq!(windows[0].label, "week");
+        assert_eq!(windows[0].remaining_percent, Some(96));
+        assert_eq!(windows[1].label, "5H");
+        assert_eq!(windows[1].remaining_percent, Some(90));
         assert_eq!(extra.as_deref(), Some("booster 42 remaining"));
     }
 
@@ -608,16 +681,17 @@ mod tests {
             harness: HarnessKind::Codex,
             windows: vec![QuotaWindow {
                 label: "5H".into(),
-                remaining_percent: Some(80),
+                remaining_percent: Some(70),
                 used: None,
                 limit: None,
                 resets: Some("10:00 Jun 17".into()),
+                resets_at_epoch_seconds: Some(14_400),
             }],
             extra: None,
             error: None,
             refreshed_at_epoch_seconds: 0,
         };
-        assert!(report.compact().contains("80% left"));
+        assert!(report.compact().contains("70% left"));
         assert!(report.compact().contains("resets 10:00 Jun 17"));
     }
 
@@ -629,10 +703,11 @@ mod tests {
             windows: vec![
                 QuotaWindow {
                     label: "5H".into(),
-                    remaining_percent: Some(80),
+                    remaining_percent: Some(70),
                     used: None,
                     limit: None,
                     resets: Some("10:00 Jun 17".into()),
+                    resets_at_epoch_seconds: Some(14_400),
                 },
                 QuotaWindow {
                     label: "week".into(),
@@ -640,6 +715,7 @@ mod tests {
                     used: None,
                     limit: None,
                     resets: Some("10:00 Jun 17".into()),
+                    resets_at_epoch_seconds: Some(14_400),
                 },
             ],
             extra: None,
@@ -648,7 +724,7 @@ mod tests {
         };
         assert_eq!(
             report.compact(),
-            "5H 80% left, resets 10:00 Jun 17 · week 55% left"
+            "5H 70% left, resets 10:00 Jun 17 · week 55% left"
         );
     }
 
@@ -664,6 +740,7 @@ mod tests {
                     used: None,
                     limit: None,
                     resets: None,
+                    resets_at_epoch_seconds: None,
                 },
                 QuotaWindow {
                     label: "week".into(),
@@ -671,6 +748,7 @@ mod tests {
                     used: None,
                     limit: None,
                     resets: Some("03:59 Aug 14".into()),
+                    resets_at_epoch_seconds: None,
                 },
             ],
             extra: None,
@@ -679,6 +757,56 @@ mod tests {
         };
 
         assert_eq!(report.compact(), "week 0% left, resets 03:59 Aug 14");
+    }
+
+    #[test]
+    fn kimi_uses_percent_left_and_hides_a_short_window_on_sustainable_pace() {
+        let report = ProfileQuota {
+            profile_id: "kimi".into(),
+            harness: HarnessKind::Kimi,
+            windows: vec![
+                QuotaWindow {
+                    label: "week".into(),
+                    remaining_percent: Some(94),
+                    used: Some(6),
+                    limit: Some(100),
+                    resets: Some("12:22 Aug 18".into()),
+                    resets_at_epoch_seconds: Some(604_800),
+                },
+                QuotaWindow {
+                    label: "5H".into(),
+                    remaining_percent: Some(97),
+                    used: Some(3),
+                    limit: Some(100),
+                    resets: Some("10:22 Aug 13".into()),
+                    resets_at_epoch_seconds: Some(18_000),
+                },
+            ],
+            extra: None,
+            error: None,
+            refreshed_at_epoch_seconds: 3_600,
+        };
+
+        assert_eq!(report.compact(), "week 94% left, resets 12:22 Aug 18");
+    }
+
+    #[test]
+    fn short_window_is_shown_only_when_burn_rate_projects_early_exhaustion() {
+        let window = QuotaWindow {
+            label: "5H".into(),
+            remaining_percent: Some(70),
+            used: None,
+            limit: None,
+            resets: Some("later".into()),
+            resets_at_epoch_seconds: Some(14_400),
+        };
+        assert!(projects_exhaustion_before_reset(&window, 0));
+
+        let sustainable = QuotaWindow {
+            remaining_percent: Some(80),
+            ..window
+        };
+        assert!(!projects_exhaustion_before_reset(&sustainable, 0));
     }
 
     #[derive(Clone, Default)]

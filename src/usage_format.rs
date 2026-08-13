@@ -26,21 +26,31 @@ pub(crate) fn format_reset_local_seconds(epoch: i64) -> Option<String> {
 /// used by the dashboard. A time-only value is the next occurrence of that
 /// wall-clock time; Claude Code uses this shape for its five-hour window.
 pub(crate) fn normalize_reset_text(value: &str) -> Option<String> {
-    normalize_reset_text_at(value, Local::now().fixed_offset())
+    normalize_reset_at(value, Local::now().fixed_offset()).map(format_reset_label)
 }
 
-fn normalize_reset_text_at(value: &str, now: DateTime<FixedOffset>) -> Option<String> {
+pub(crate) fn normalize_reset_epoch_seconds(value: &str) -> Option<i64> {
+    normalize_reset_at(value, Local::now().fixed_offset()).map(|reset| reset.timestamp())
+}
+
+fn normalize_reset_at(value: &str, now: DateTime<FixedOffset>) -> Option<DateTime<FixedOffset>> {
     let value = value.trim();
     if value.is_empty() {
         return None;
     }
     if let Ok(epoch) = value.parse::<f64>() {
-        return format_reset_local(epoch);
+        let seconds = if epoch.abs() >= 1_000_000_000_000.0 {
+            (epoch / 1000.0).trunc() as i64
+        } else {
+            epoch.trunc() as i64
+        };
+        return Local
+            .timestamp_opt(seconds, 0)
+            .single()
+            .map(|reset| reset.fixed_offset());
     }
     if let Ok(timestamp) = DateTime::parse_from_rfc3339(value) {
-        return Some(format_reset_label(
-            timestamp.with_timezone(&Local).fixed_offset(),
-        ));
+        return Some(timestamp.with_timezone(&Local).fixed_offset());
     }
 
     let value = value
@@ -91,8 +101,7 @@ fn normalize_reset_text_at(value: &str, now: DateTime<FixedOffset>) -> Option<St
         return now
             .timezone()
             .from_local_datetime(&date.and_time(time))
-            .single()
-            .map(format_reset_label);
+            .single();
     }
 
     let time = parse_time(value)?;
@@ -108,7 +117,7 @@ fn normalize_reset_text_at(value: &str, now: DateTime<FixedOffset>) -> Option<St
             .from_local_datetime(&date.and_time(time))
             .single()?;
     }
-    Some(format_reset_label(reset))
+    Some(reset)
 }
 
 /// Render a session's current-turn clock, leaving idle sessions blank.
@@ -167,11 +176,15 @@ mod tests {
             .single()
             .expect("now");
         assert_eq!(
-            normalize_reset_text_at("3:30 PM (America/Chicago)", now).as_deref(),
+            normalize_reset_at("3:30 PM (America/Chicago)", now)
+                .map(format_reset_label)
+                .as_deref(),
             Some("15:30 Aug 10")
         );
         assert_eq!(
-            normalize_reset_text_at("at 1pm (America/Chicago)", now).as_deref(),
+            normalize_reset_at("at 1pm (America/Chicago)", now)
+                .map(format_reset_label)
+                .as_deref(),
             Some("13:00 Aug 11")
         );
     }
@@ -184,7 +197,9 @@ mod tests {
             .single()
             .expect("now");
         assert_eq!(
-            normalize_reset_text_at("Aug 14, 4am (America/Chicago)", now).as_deref(),
+            normalize_reset_at("Aug 14, 4am (America/Chicago)", now)
+                .map(format_reset_label)
+                .as_deref(),
             Some("04:00 Aug 14")
         );
     }
