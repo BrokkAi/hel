@@ -4323,7 +4323,7 @@ fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         ],
     )
     .header(
-        Row::new(["Host / fleet", "Targets", "Capacity in Use"])
+        Row::new(["Host / fleet", "Targets", "In Use"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .row_highlight_style(if focused {
@@ -4337,7 +4337,7 @@ fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         Block::default()
             .borders(Borders::ALL)
             .border_type(focus_border(focused))
-            .title(" Capacity in Use "),
+            .title(" Capacity "),
     );
     let mut state = TableState::default().with_selected(
         (!dashboard.capacity_details.is_empty()).then_some(dashboard.capacity_index),
@@ -7120,7 +7120,7 @@ mod tests {
             })
             .find(|line| line.contains("Host / fleet") && line.contains("Targets"))
             .expect("capacity header");
-        assert!(header.contains("Capacity in Use"));
+        assert!(header.contains("In Use"));
     }
 
     #[test]
@@ -8283,7 +8283,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("╔ Capacity in Use"));
+        assert!(rendered.contains("╔ Capacity"));
+        assert!(!rendered.contains("╔ Capacity in Use"));
 
         dashboard.handle_key(key(KeyCode::Tab));
         terminal
