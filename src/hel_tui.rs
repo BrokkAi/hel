@@ -532,6 +532,7 @@ pub struct DashboardState {
     quota_index: usize,
     focus: Focus,
     pane_areas: Option<[Rect; DASHBOARD_PANE_COUNT]>,
+    import_sessions_area: Option<Rect>,
     mode: Mode,
     notice: Option<String>,
 }
@@ -550,6 +551,7 @@ impl DashboardState {
             quota_index: 0,
             focus: Focus::Active,
             pane_areas: None,
+            import_sessions_area: None,
             mode: Mode::Dashboard,
             notice: None,
         };
@@ -816,7 +818,7 @@ impl DashboardState {
             profile_index: 0,
             session_index: 0,
             filter: String::new(),
-            focus: ImportFocus::Filter,
+            focus: ImportFocus::Profiles,
             opened_at: Instant::now(),
         });
     }
@@ -1027,6 +1029,23 @@ impl DashboardState {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if let Mode::Import(dialog) = &mut self.mode {
+            let Some(area) = self.import_sessions_area else {
+                return;
+            };
+            if !rect_contains(area, mouse.column, mouse.row) {
+                return;
+            }
+            let delta = match mouse.kind {
+                MouseEventKind::ScrollUp => -MOUSE_SCROLL_ROWS,
+                MouseEventKind::ScrollDown => MOUSE_SCROLL_ROWS,
+                _ => return,
+            };
+            let len = dialog.filtered_sessions().len();
+            dialog.focus = ImportFocus::Sessions;
+            dialog.session_index = offset_index(dialog.session_index, len, delta);
+            return;
+        }
         if !matches!(self.mode, Mode::Dashboard) {
             return;
         }
@@ -1161,8 +1180,8 @@ impl DashboardState {
                 dialog.focus = cycle_control(
                     dialog.focus,
                     &[
-                        ImportFocus::Filter,
                         ImportFocus::Profiles,
+                        ImportFocus::Filter,
                         ImportFocus::Sessions,
                         ImportFocus::Cancel,
                         ImportFocus::Import,
@@ -1176,8 +1195,8 @@ impl DashboardState {
                 dialog.focus = cycle_control(
                     dialog.focus,
                     &[
-                        ImportFocus::Filter,
                         ImportFocus::Profiles,
+                        ImportFocus::Filter,
                         ImportFocus::Sessions,
                         ImportFocus::Cancel,
                         ImportFocus::Import,
@@ -1211,8 +1230,11 @@ impl DashboardState {
                         dialog.session_index = 0;
                     }
                     ImportFocus::Sessions => {
-                        let len = dialog.filtered_sessions().len();
-                        move_index(&mut dialog.session_index, len, -1);
+                        if dialog.session_index == 0 {
+                            dialog.focus = ImportFocus::Filter;
+                        } else {
+                            dialog.session_index -= 1;
+                        }
                     }
                     ImportFocus::Filter | ImportFocus::Cancel | ImportFocus::Import => {}
                 }
@@ -1221,6 +1243,9 @@ impl DashboardState {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 match dialog.focus {
+                    ImportFocus::Filter => {
+                        dialog.focus = ImportFocus::Sessions;
+                    }
                     ImportFocus::Profiles => {
                         move_index(&mut dialog.profile_index, dialog.profiles.len(), 1);
                         dialog.session_index = 0;
@@ -1229,7 +1254,7 @@ impl DashboardState {
                         let len = dialog.filtered_sessions().len();
                         move_index(&mut dialog.session_index, len, 1);
                     }
-                    ImportFocus::Filter | ImportFocus::Cancel | ImportFocus::Import => {}
+                    ImportFocus::Cancel | ImportFocus::Import => {}
                 }
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None
@@ -3345,6 +3370,8 @@ impl ResumeWizard {
 pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     dashboard.pane_areas = None;
     let area = frame.area();
+    dashboard.import_sessions_area =
+        matches!(dashboard.mode, Mode::Import(_)).then(|| import_sessions_pane(area));
 
     if !dashboard.config_is_empty() {
         render_adaptive_dashboard(frame, area, area, dashboard);
@@ -3884,6 +3911,14 @@ fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
             }),
         session_rows[1],
         &mut session_state,
+    );
+    let visible_sessions = usize::from(session_rows[1].height) / 2;
+    render_session_scrollbar(
+        frame,
+        panes[1],
+        filtered_sessions.len(),
+        session_state.offset(),
+        visible_sessions.max(1),
     );
 
     let unavailable_reason = dialog
@@ -5464,6 +5499,35 @@ fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
         ])
         .split(vertical[1]);
     horizontal[1]
+}
+
+fn import_sessions_pane(area: Rect) -> Rect {
+    let popup = centered_rect(82, 22, area);
+    let inner = popup.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .split(inner);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .split(rows[0])[1]
+}
+
+fn offset_index(index: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if delta.is_negative() {
+        index.saturating_sub(delta.unsigned_abs())
+    } else {
+        index
+            .saturating_add(delta as usize)
+            .min(len.saturating_sub(1))
+    }
 }
 
 fn move_index(index: &mut usize, len: usize, delta: isize) {
@@ -7477,7 +7541,6 @@ mod tests {
         dashboard.show_import_dialog(1, profiles.clone());
         dashboard.apply_import_profiles(1, profiles);
 
-        dashboard.handle_key(key(KeyCode::Left));
         dashboard.handle_key(key(KeyCode::Down));
         dashboard.handle_key(key(KeyCode::Right));
         dashboard.handle_key(key(KeyCode::Enter));
@@ -7496,7 +7559,7 @@ mod tests {
     }
 
     #[test]
-    fn import_dialog_starts_in_filter_and_matches_only_project_directories() {
+    fn import_dialog_focuses_profiles_then_filters_each_selected_profile() {
         let mut dashboard = dashboard_with_session(archived_session());
         let session = |id: &str, title: &str, project_directory: &str| ImportSessionOption {
             native_session_id: id.into(),
@@ -7533,12 +7596,14 @@ mod tests {
         let Mode::Import(dialog) = &dashboard.mode else {
             panic!("expected import dialog");
         };
-        assert_eq!(dialog.focus, ImportFocus::Filter);
+        assert_eq!(dialog.focus, ImportFocus::Profiles);
 
+        dashboard.handle_key(key(KeyCode::Tab));
         dashboard.handle_paste("hEl\n");
         let Mode::Import(dialog) = &dashboard.mode else {
             panic!("expected import dialog");
         };
+        assert_eq!(dialog.focus, ImportFocus::Filter);
         assert_eq!(dialog.filter, "hEl");
         assert_eq!(
             dialog
@@ -7549,12 +7614,24 @@ mod tests {
             vec!["codex-match"]
         );
 
+        dashboard.handle_key(key(KeyCode::Down));
+        let Mode::Import(dialog) = &dashboard.mode else {
+            panic!("expected import dialog");
+        };
+        assert_eq!(dialog.focus, ImportFocus::Sessions);
+        dashboard.handle_key(key(KeyCode::Up));
+        let Mode::Import(dialog) = &dashboard.mode else {
+            panic!("expected import dialog");
+        };
+        assert_eq!(dialog.focus, ImportFocus::Filter);
+
         dashboard.handle_key(key(KeyCode::Left));
         dashboard.handle_key(key(KeyCode::Down));
         dashboard.handle_key(key(KeyCode::Right));
         let Mode::Import(dialog) = &dashboard.mode else {
             panic!("expected import dialog");
         };
+        assert_eq!(dialog.focus, ImportFocus::Filter);
         assert_eq!(dialog.filter, "hEl");
         assert_eq!(
             dialog.filtered_sessions()[0].native_session_id,
@@ -7639,6 +7716,7 @@ mod tests {
         dashboard.apply_import_profiles(1, initial);
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Down));
+        dashboard.handle_key(key(KeyCode::Down));
 
         dashboard.apply_import_profile(
             1,
@@ -7722,8 +7800,8 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
 
         for (expected_focus, expected_cursors) in [
-            (ImportFocus::Filter, 0),
             (ImportFocus::Profiles, 1),
+            (ImportFocus::Filter, 0),
             (ImportFocus::Sessions, 1),
             (ImportFocus::Cancel, 0),
             (ImportFocus::Import, 0),
@@ -7747,6 +7825,59 @@ mod tests {
             );
             dashboard.handle_key(key(KeyCode::Tab));
         }
+    }
+
+    #[test]
+    fn import_session_list_renders_a_scrollbar_and_accepts_mouse_wheel() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        let sessions = (0..20)
+            .map(|index| ImportSessionOption {
+                native_session_id: format!("native-session-{index}"),
+                title: format!("Native session {index}"),
+                project_directory: "/home/user/Projects/hel".into(),
+                details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
+                unavailable_reason: None,
+            })
+            .collect();
+        dashboard.show_import_dialog(
+            1,
+            vec![ImportProfileOption {
+                profile_id: "codex-1".into(),
+                harness_kind: HarnessKind::Codex,
+                sessions,
+                scan_progress: Some((20, 20)),
+                error: None,
+            }],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw import dialog");
+        let symbols = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>();
+        assert!(symbols.contains(&"▲"));
+        assert!(symbols.contains(&"▼"));
+
+        let sessions_area = dashboard
+            .import_sessions_area
+            .expect("import session pane hitbox");
+        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, sessions_area));
+        let Mode::Import(dialog) = &dashboard.mode else {
+            panic!("expected import dialog");
+        };
+        assert_eq!(dialog.focus, ImportFocus::Sessions);
+        assert_eq!(dialog.session_index, MOUSE_SCROLL_ROWS as usize);
+
+        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, sessions_area));
+        let Mode::Import(dialog) = &dashboard.mode else {
+            panic!("expected import dialog");
+        };
+        assert_eq!(dialog.session_index, 0);
     }
 
     #[test]
