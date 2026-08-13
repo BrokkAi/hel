@@ -72,7 +72,7 @@ it drops into the same plain-stdio setup dialog as `hel setup`. The dialog finds
 local Codex, Claude Code, and Kimi Code homes, reports whether their credentials
 appear present, detects the current GitHub origin, recommends a usable local
 container runtime, writes the configuration after confirmation, and smoke-tests
-the selected image. `q` or Back detaches; it does not stop the target-side
+the selected image. `Ctrl+Q` or Esc detaches; it does not stop the target-side
 worker. `hel server` explicitly starts the authenticated phone controller. It
 binds only to loopback unless direct TLS is configured:
 
@@ -265,7 +265,7 @@ Checkpoint archives are versioned ZIPs containing a manifest, a canonical
 event stream, allowlisted native harness artifacts, and Git state for every
 repository (committed bundle, staged and unstaged patches, and untracked
 files). Every payload is SHA-256 verified after the archive is atomically
-installed. Normal Archive refuses teardown if that verification fails; explicit
+installed. Normal Pause refuses teardown if that verification fails; explicit
 force-destroy is the data-loss escape hatch.
 
 Hel is licensed under `GPL-3.0-only`.

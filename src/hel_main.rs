@@ -1685,7 +1685,7 @@ async fn run_dashboard() -> Result<()> {
                 controller.reload()?;
                 dashboard.set_config(controller.config.clone());
                 dashboard.set_state(controller.state.clone());
-                dashboard.set_notice("Setup complete. Press n to start your first session.");
+                dashboard.set_notice("Setup complete. Press Ctrl+N to start your first session.");
             }
             SetupOutcome::Cancelled => return Ok(()),
         }
@@ -1713,6 +1713,7 @@ async fn run_dashboard() -> Result<()> {
         tokio::sync::mpsc::channel::<DashboardImportUpdate>(8);
     let mut pending_import = None;
     let mut import_discovery_id = 0_u64;
+    let mut quit_detached = false;
     let mut next_import_task_id = 0_u64;
     let mut active_import: Option<ActiveDashboardImport> = None;
     let termination = hel::termination::Coordinator::install().token();
@@ -1871,7 +1872,10 @@ async fn run_dashboard() -> Result<()> {
         };
         match action {
             DashboardAction::None => {}
-            DashboardAction::QuitDetach => break,
+            DashboardAction::QuitDetach => {
+                quit_detached = true;
+                break;
+            }
             DashboardAction::OpenConfig => {
                 terminal.suspend()?;
                 let setup_result = run_setup_dialog(&config_path());
@@ -1891,8 +1895,9 @@ async fn run_dashboard() -> Result<()> {
                             &worker_targets_tx,
                             &resource_targets_tx,
                         );
-                        dashboard
-                            .set_notice("Setup complete. Press n to start your first session.");
+                        dashboard.set_notice(
+                            "Setup complete. Press Ctrl+N to start your first session.",
+                        );
                     }
                     SetupOutcome::Cancelled => dashboard.set_notice("Setup cancelled."),
                 }
@@ -2281,7 +2286,7 @@ async fn run_dashboard() -> Result<()> {
             DashboardAction::Checkpoint { session_id } => {
                 match controller.checkpoint_session(&session_id).await {
                     Ok(checkpoint) => dashboard.set_notice(format!(
-                        "Archived {} at event {}",
+                        "Checkpointed {} at event {}",
                         short_id(&session_id),
                         checkpoint.event_sequence
                     )),
@@ -2304,7 +2309,7 @@ async fn run_dashboard() -> Result<()> {
                 .await?;
                 controller = returned_controller;
                 match result {
-                    Ok(()) => dashboard.set_notice(format!("Archived {}", short_id(&session_id))),
+                    Ok(()) => dashboard.set_notice(format!("Paused {}", short_id(&session_id))),
                     Err(error) => {
                         dashboard.show_close_failure(session_id.clone(), format!("{error:#}"))
                     }
@@ -2374,7 +2379,7 @@ async fn run_dashboard() -> Result<()> {
             DashboardAction::DeleteArchived { session_id } => {
                 match delete_archived_session(&mut controller, &session_id) {
                     Ok(()) => dashboard.set_notice(format!(
-                        "Permanently deleted archived session {}",
+                        "Permanently deleted paused session {}",
                         short_id(&session_id)
                     )),
                     Err(error) => dashboard.set_notice(format!("Delete failed: {error:#}")),
@@ -2387,6 +2392,12 @@ async fn run_dashboard() -> Result<()> {
                 );
             }
         }
+    }
+    drop(terminal);
+    if quit_detached {
+        println!(
+            "Active sessions will continue working; Hel will reattach to them on your next invocation."
+        );
     }
     Ok(())
 }
@@ -2413,7 +2424,7 @@ fn delete_archived_session(controller: &mut Controller, session_id: &str) -> Res
             .state
             .sessions
             .insert(session.id.clone(), session);
-        return Err(error).context("save state after deleting archived session");
+        return Err(error).context("save state after deleting paused session");
     }
     Ok(())
 }

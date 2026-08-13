@@ -898,13 +898,16 @@ impl DashboardState {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return DashboardAction::None;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if !matches!(self.mode, Mode::Dashboard)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c')
+        {
             return DashboardAction::QuitDetach;
         }
 
         self.notice = None;
         match self.mode.clone() {
-            Mode::Dashboard => self.handle_dashboard_key(key.code),
+            Mode::Dashboard => self.handle_dashboard_key(key),
             Mode::New(wizard) => self.handle_new_key(key.code, wizard),
             Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
             Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
@@ -952,53 +955,58 @@ impl DashboardState {
         }
     }
 
-    fn handle_dashboard_key(&mut self, code: KeyCode) -> DashboardAction {
-        match code {
-            KeyCode::Char('q') | KeyCode::Esc => DashboardAction::QuitDetach,
-            KeyCode::Tab => {
+    fn handle_dashboard_key(&mut self, key: KeyEvent) -> DashboardAction {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match (key.code, control) {
+            (KeyCode::Char('q') | KeyCode::Char('c'), true) | (KeyCode::Esc, _) => {
+                DashboardAction::QuitDetach
+            }
+            (KeyCode::Tab, _) => {
                 self.cycle_focus(false);
                 DashboardAction::None
             }
-            KeyCode::BackTab => {
+            (KeyCode::BackTab, _) => {
                 self.cycle_focus(true);
                 DashboardAction::None
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            (KeyCode::Up | KeyCode::Char('k'), false) => {
                 self.move_selection(-1);
                 DashboardAction::None
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            (KeyCode::Down | KeyCode::Char('j'), false) => {
                 self.move_selection(1);
                 DashboardAction::None
             }
-            KeyCode::Home => {
+            (KeyCode::Home, _) => {
                 self.set_selection(0);
                 DashboardAction::None
             }
-            KeyCode::End => {
+            (KeyCode::End, _) => {
                 let len = self.focus_len();
                 self.set_selection(len.saturating_sub(1));
                 DashboardAction::None
             }
-            KeyCode::Char('n') => self.begin_new(),
-            KeyCode::Char('i') => DashboardAction::OpenImport,
-            KeyCode::Char('r') => {
+            (KeyCode::Char('n'), true) => self.begin_new(),
+            (KeyCode::Char('i'), true) => DashboardAction::OpenImport,
+            (KeyCode::Char('r'), true) => {
                 if self.focus == Focus::Quotas {
                     DashboardAction::RefreshQuotas
-                } else {
+                } else if matches!(self.focus, Focus::Active | Focus::Archived) {
                     self.begin_rename();
+                    DashboardAction::None
+                } else {
                     DashboardAction::None
                 }
             }
-            KeyCode::Char('u') => DashboardAction::RefreshQuotas,
-            KeyCode::Char('e') if self.config_is_empty() => DashboardAction::OpenConfig,
-            KeyCode::Char('p') if self.focus == Focus::Active => self
+            (KeyCode::Char('u'), true) => DashboardAction::RefreshQuotas,
+            (KeyCode::Char('e'), true) if self.config_is_empty() => DashboardAction::OpenConfig,
+            (KeyCode::Char('k'), true) if self.focus == Focus::Active => self
                 .selected_session()
                 .map(|session| DashboardAction::Checkpoint {
                     session_id: session.id.clone(),
                 })
                 .unwrap_or(DashboardAction::None),
-            KeyCode::Char('a') if self.focus == Focus::Active => {
+            (KeyCode::Char('p'), true) if self.focus == Focus::Active => {
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(Confirmation::Close {
                         session_id: session.id.clone(),
@@ -1006,7 +1014,7 @@ impl DashboardState {
                 }
                 DashboardAction::None
             }
-            KeyCode::Char('x') if self.focus == Focus::Archived => {
+            (KeyCode::Char('d'), true) if self.focus == Focus::Archived => {
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(Confirmation::DeleteArchived {
                         session_id: session.id.clone(),
@@ -1014,7 +1022,7 @@ impl DashboardState {
                 }
                 DashboardAction::None
             }
-            KeyCode::Enter | KeyCode::Char('o') => self.open_or_resume(),
+            (KeyCode::Enter, _) | (KeyCode::Char('o'), true) => self.open_or_resume(),
             _ => DashboardAction::None,
         }
     }
@@ -3561,7 +3569,7 @@ fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) 
             )),
             Line::raw(""),
             Line::raw(format!("Setup can create {missing} from this machine.")),
-            Line::raw("Press e to run setup, or edit Hel's TOML configuration by hand."),
+            Line::raw("Press Ctrl+E to run setup, or edit Hel's TOML configuration by hand."),
         ])
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
@@ -3677,7 +3685,7 @@ fn render_sessions(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(focus_border(archived_focused))
-                .title(" Archived "),
+                .title(" Paused "),
         );
     let mut archived_state = TableState::default().with_selected(
         Some(dashboard.session_index.saturating_sub(active.len()))
@@ -4145,13 +4153,15 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
 fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     let actions = match dashboard.focus {
         Focus::Active => {
-            "n new · i import · r rename · p checkpoint · a archive · u quota · Tab pane · q detach"
+            "Ctrl for: [N]ew · [I]mport · [R]ename · Chec[K]point · [P]ause · [U]pdate quotas · [Q]uit · Tab pane"
         }
         Focus::Archived => {
-            "n new · i import · r rename · x delete permanently · u quota · Tab pane · q detach"
+            "Ctrl for: [N]ew · [I]mport · [R]ename · [D]elete permanently · [U]pdate quotas · [Q]uit · Tab pane"
         }
-        Focus::Capacity => "n new · i import · u quota · Tab pane · q detach",
-        Focus::Quotas => "n new · i import · r refresh · u quota · Tab pane · q detach",
+        Focus::Capacity => "Ctrl for: [N]ew · [I]mport · [U]pdate quotas · [Q]uit · Tab pane",
+        Focus::Quotas => {
+            "Ctrl for: [N]ew · [I]mport · [R]efresh · [U]pdate quotas · [Q]uit · Tab pane"
+        }
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -4800,16 +4810,16 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             (" Local repository has uncommitted changes ", lines)
         }
         Confirmation::Close { session_id } => (
-            " Archive session? ",
+            " Pause session? ",
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
                 Line::raw("Hel will verify the checkpoint before destroying the target."),
-                Line::raw("Press y/Enter to archive, or n/Esc to cancel."),
+                Line::raw("Press y/Enter to pause, or n/Esc to cancel."),
             ],
         ),
         Confirmation::DeleteArchived { session_id } => (
-            " Permanently delete archived session? ",
+            " Permanently delete paused session? ",
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
@@ -4818,16 +4828,16 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             ],
         ),
         Confirmation::CloseFailed { session_id, error } => (
-            " Archive could not complete ",
+            " Pause could not complete ",
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
                 Line::styled(
-                    format!("Archive failed: {error}"),
+                    format!("Pause failed: {error}"),
                     Style::default().fg(Color::Yellow),
                 ),
                 Line::raw(""),
-                Line::raw("r retry archive · f force destroy · Esc cancel"),
+                Line::raw("r retry pause · f force destroy · Esc cancel"),
             ],
         ),
         Confirmation::ForceDestroy { session_id, typed } => (
@@ -5080,6 +5090,10 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl_key(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
     }
 
     fn mouse_in(kind: MouseEventKind, area: Rect) -> MouseEvent {
@@ -5367,8 +5381,45 @@ mod tests {
 
         assert_eq!(buffer[(buffer.area.x, buffer.area.y)].symbol(), " ");
         assert!(!line(buffer.area.y).contains(" HEL "));
-        assert!(line(buffer.area.bottom() - 2).contains("n new"));
+        assert!(line(buffer.area.bottom() - 2).contains("Ctrl for: [N]ew"));
         assert!(line(buffer.area.bottom() - 1).contains("Transient dashboard message"));
+    }
+
+    #[test]
+    fn dashboard_actions_require_control_while_navigation_does_not() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('n'))),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('q'))),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('k')),
+            DashboardAction::Checkpoint {
+                session_id: "session-1".into()
+            }
+        );
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('u')),
+            DashboardAction::RefreshQuotas
+        );
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('q')),
+            DashboardAction::QuitDetach
+        );
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Tab)),
+            DashboardAction::None
+        );
+        assert_eq!(dashboard.focus, Focus::Archived);
     }
 
     fn test_capacity_target() -> DeploymentCapacityTarget {
@@ -5668,10 +5719,7 @@ mod tests {
     #[test]
     fn new_session_wizard_returns_all_three_choices() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('n'))),
-            DashboardAction::None
-        );
+        assert_eq!(dashboard.handle_key(ctrl_key('n')), DashboardAction::None);
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Down)),
             DashboardAction::None
@@ -5707,7 +5755,7 @@ mod tests {
     #[test]
     fn new_session_wizard_renders_and_focuses_explicit_navigation_buttons() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        dashboard.handle_key(key(KeyCode::Char('n')));
+        dashboard.handle_key(ctrl_key('n'));
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
@@ -5753,7 +5801,7 @@ mod tests {
             DashboardState::new(config.clone(), HelState::default(), BTreeMap::new());
 
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('n'))),
+            dashboard.handle_key(ctrl_key('n')),
             DashboardAction::ResolveAwsResourceOptions {
                 target_template_ids: vec!["aws-a".into(), "aws-b".into()],
             }
@@ -5791,7 +5839,7 @@ mod tests {
         let mut config = config();
         config.bundles.clear();
         let mut dashboard = DashboardState::new(config, HelState::default(), BTreeMap::new());
-        dashboard.handle_key(key(KeyCode::Char('n')));
+        dashboard.handle_key(ctrl_key('n'));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         for character in "example/new-repo".chars() {
@@ -5830,7 +5878,7 @@ mod tests {
         );
 
         let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
-        dashboard.handle_key(key(KeyCode::Char('n')));
+        dashboard.handle_key(ctrl_key('n'));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
@@ -5871,7 +5919,7 @@ mod tests {
         };
         let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
 
-        dashboard.handle_key(key(KeyCode::Char('n')));
+        dashboard.handle_key(ctrl_key('n'));
         let Mode::New(wizard) = &dashboard.mode else {
             panic!("expected new-session wizard");
         };
@@ -5892,7 +5940,7 @@ mod tests {
     #[test]
     fn new_session_mount_wizard_adds_mount_and_preserves_typed_source() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        dashboard.handle_key(key(KeyCode::Char('n')));
+        dashboard.handle_key(ctrl_key('n'));
         dashboard.handle_key(key(KeyCode::Down));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
@@ -5949,7 +5997,7 @@ mod tests {
     #[test]
     fn directory_completion_is_bounded_and_keyboard_selectable() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        dashboard.handle_key(key(KeyCode::Char('n')));
+        dashboard.handle_key(ctrl_key('n'));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
@@ -5992,7 +6040,7 @@ mod tests {
     #[test]
     fn failed_source_validation_does_not_add_new_or_resume_mounts() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        dashboard.handle_key(key(KeyCode::Char('n')));
+        dashboard.handle_key(ctrl_key('n'));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
@@ -6215,7 +6263,7 @@ mod tests {
     #[test]
     fn rename_uses_acp_title_as_the_initial_value() {
         let mut dashboard = dashboard_with_session(archived_session());
-        dashboard.handle_key(key(KeyCode::Char('r')));
+        dashboard.handle_key(ctrl_key('r'));
         for character in " v2".chars() {
             dashboard.handle_key(key(KeyCode::Char(character)));
         }
@@ -6470,7 +6518,7 @@ mod tests {
     fn import_dialog_selects_a_session_from_the_chosen_profile() {
         let mut dashboard = dashboard_with_session(archived_session());
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('i'))),
+            dashboard.handle_key(ctrl_key('i')),
             DashboardAction::OpenImport
         );
         let profiles = vec![
@@ -6999,7 +7047,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Active"));
-        assert!(rendered.contains("Archived"));
+        assert!(rendered.contains("Paused"));
         assert!(rendered.contains("Profile Quotas"));
     }
 
@@ -7336,7 +7384,7 @@ mod tests {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
-        dashboard.handle_key(key(KeyCode::Char('a')));
+        dashboard.handle_key(ctrl_key('p'));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Char('y'))),
             DashboardAction::Close {
@@ -7379,18 +7427,13 @@ mod tests {
     fn archived_pane_replaces_checkpoint_and_archive_with_permanent_delete() {
         let mut dashboard = dashboard_with_session(archived_session());
         assert_eq!(dashboard.focus, Focus::Archived);
+        assert_eq!(dashboard.handle_key(ctrl_key('k')), DashboardAction::None);
+        assert_eq!(dashboard.handle_key(ctrl_key('p')), DashboardAction::None);
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('p'))),
+            dashboard.handle_key(key(KeyCode::Char('d'))),
             DashboardAction::None
         );
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('a'))),
-            DashboardAction::None
-        );
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('x'))),
-            DashboardAction::None
-        );
+        assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::DeleteArchived {
@@ -7410,9 +7453,9 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("x delete permanently"));
-        assert!(!rendered.contains("p checkpoint"));
-        assert!(!rendered.contains("a archive"));
+        assert!(rendered.contains("[D]elete permanently"));
+        assert!(!rendered.contains("Chec[K]point"));
+        assert!(!rendered.contains("[P]ause"));
     }
 
     #[test]
@@ -7431,7 +7474,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("╔ Archived"));
+        assert!(rendered.contains("╔ Paused"));
         assert!(rendered.contains("┌ Active"));
         assert!(!rendered.contains("[focused]"));
 
@@ -7549,7 +7592,7 @@ mod tests {
         assert!(rendered.contains("Welcome to Hel."));
         assert!(rendered.contains("Hel needs a little fuel."));
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('e'))),
+            dashboard.handle_key(ctrl_key('e')),
             DashboardAction::OpenConfig
         );
     }
