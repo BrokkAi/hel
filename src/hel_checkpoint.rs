@@ -102,7 +102,13 @@ pub struct CheckpointRestoreSpec {
     pub workspace_root: PathBuf,
     pub worker_root: PathBuf,
     pub harness_home: PathBuf,
+    #[serde(default = "default_true")]
+    pub restore_repositories: bool,
     pub restore_native: bool,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,7 +142,9 @@ pub fn restore_from_spec_file(path: &Path) -> Result<()> {
 pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunner) -> Result<()> {
     ensure!(spec.workspace_root.is_dir(), "restore workspace is missing");
     let archive = read_archive_verified(&spec.archive_path)?;
-    restore_repositories_from_archive(&archive, &spec.workspace_root, git)?;
+    if spec.restore_repositories {
+        restore_repositories_from_archive(&archive, &spec.workspace_root, git)?;
+    }
 
     fs::create_dir_all(&spec.worker_root)?;
     crate::hel_worker::clear_native_session_identity(&spec.worker_root)?;
@@ -913,6 +921,10 @@ pub fn export_command(
         spec_path.into(),
     ];
     let command = match locator {
+        TargetLocator::LocalBare { .. } => {
+            let mut args = args;
+            CommandSpec::new(args.remove(0), args)
+        }
         TargetLocator::LocalPodman { container_id } => container_exec("podman", container_id, args),
         TargetLocator::AppleContainer { container_id } => {
             container_exec("container", container_id, args)
@@ -949,6 +961,10 @@ pub fn restore_command(
         spec_path.into(),
     ];
     let command = match locator {
+        TargetLocator::LocalBare { .. } => {
+            let mut args = args;
+            CommandSpec::new(args.remove(0), args)
+        }
         TargetLocator::LocalPodman { container_id } => container_exec("podman", container_id, args),
         TargetLocator::AppleContainer { container_id } => {
             container_exec("container", container_id, args)
@@ -1068,6 +1084,10 @@ pub fn transfer_plan(
     worker_root(locator, session_id)?;
     let local = local_temporary.to_string_lossy().into_owned();
     let mut commands = match locator {
+        TargetLocator::LocalBare { .. } => vec![
+            CommandSpec::new("cp", [remote_archive, local.as_str()])
+                .purpose("copy local bare checkpoint"),
+        ],
         TargetLocator::LocalPodman { container_id } => vec![
             CommandSpec::new(
                 "podman",
@@ -1119,6 +1139,10 @@ fn cleanup_plan(locator: &TargetLocator, session_id: &str, remote: &str) -> Resu
     validate_remote_path(remote)?;
     worker_root(locator, session_id)?;
     let commands = match locator {
+        TargetLocator::LocalBare { .. } => vec![
+            CommandSpec::new("rm", ["-f", "--", remote])
+                .purpose("remove local bare checkpoint staging"),
+        ],
         TargetLocator::LocalPodman { container_id } => vec![container_exec(
             "podman",
             container_id,
@@ -1341,6 +1365,9 @@ mod tests {
     fn locators() -> Vec<TargetLocator> {
         let name = crate::hel_targets::resource_name(SESSION).unwrap();
         vec![
+            TargetLocator::LocalBare {
+                worker_root: format!("/var/lib/hel/workers/{SESSION}"),
+            },
             TargetLocator::LocalPodman {
                 container_id: name.clone(),
             },
@@ -1380,26 +1407,27 @@ mod tests {
                 .unwrap()
             })
             .collect::<Vec<_>>();
-        assert_eq!(plans[0].commands[0].program, "podman");
-        assert_eq!(plans[1].commands[0].program, "container");
-        assert_eq!(plans[2].commands[0].program, "scp");
+        assert_eq!(plans[0].commands[0].program, "cp");
+        assert_eq!(plans[1].commands[0].program, "podman");
+        assert_eq!(plans[2].commands[0].program, "container");
         assert_eq!(plans[3].commands[0].program, "scp");
-        assert_eq!(plans[4].commands.len(), 3);
+        assert_eq!(plans[4].commands[0].program, "scp");
+        assert_eq!(plans[5].commands.len(), 3);
         assert!(
-            plans[4].commands[1]
+            plans[5].commands[1]
                 .args
                 .last()
                 .unwrap()
                 .contains("'podman' 'cp'")
         );
         assert!(
-            !plans[4]
+            !plans[5]
                 .commands
                 .iter()
                 .flat_map(|command| &command.args)
                 .any(|arg| arg == "--remote")
         );
-        assert!(plans[2].commands[0].args.contains(&"-P".into()));
+        assert!(plans[3].commands[0].args.contains(&"-P".into()));
     }
 
     #[test]

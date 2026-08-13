@@ -731,6 +731,7 @@ const fn session_state_name(state: SessionState) -> &'static str {
 
 const fn target_kind_name(target: &TargetTemplate) -> &'static str {
     match target {
+        TargetTemplate::LocalBare => "local-bare",
         TargetTemplate::LocalPodman { .. } => "local-podman",
         TargetTemplate::AppleContainer { .. } => "apple-container",
         TargetTemplate::AwsEc2 { .. } => "aws-ec2",

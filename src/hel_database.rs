@@ -16,7 +16,7 @@ use crate::hel_state::{
 };
 use crate::hel_targets::AdditionalMount;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryScope {
@@ -89,14 +89,16 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              ) STRICT;
              CREATE TABLE session_targets (
                  session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
-                 kind TEXT NOT NULL CHECK(kind IN ('local-podman','apple-container','aws-ec2','ssh-bare','ssh-podman')),
+                 kind TEXT NOT NULL CHECK(kind IN ('local-bare','local-podman','apple-container','aws-ec2','ssh-bare','ssh-podman')),
                  host TEXT,
                  resource_id TEXT,
                  address TEXT,
                  workspace BLOB,
                  worker_id TEXT,
                  CHECK(
-                     (kind IN ('local-podman','apple-container') AND resource_id IS NOT NULL
+                     (kind = 'local-bare' AND workspace IS NOT NULL
+                      AND host IS NULL AND resource_id IS NULL AND address IS NULL AND worker_id IS NULL)
+                  OR (kind IN ('local-podman','apple-container') AND resource_id IS NOT NULL
                       AND host IS NULL AND address IS NULL AND workspace IS NULL AND worker_id IS NULL)
                   OR (kind = 'aws-ec2' AND resource_id IS NOT NULL
                       AND host IS NULL AND workspace IS NULL AND worker_id IS NULL)
@@ -175,6 +177,40 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              INSERT INTO schema_migrations(version, applied_at)
                  VALUES (4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
              PRAGMA user_version = 4;
+             COMMIT;",
+        )?;
+    }
+    if version < 5 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE session_targets RENAME TO session_targets_v4;
+             CREATE TABLE session_targets (
+                 session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+                 kind TEXT NOT NULL CHECK(kind IN ('local-bare','local-podman','apple-container','aws-ec2','ssh-bare','ssh-podman')),
+                 host TEXT,
+                 resource_id TEXT,
+                 address TEXT,
+                 workspace BLOB,
+                 worker_id TEXT,
+                 CHECK(
+                     (kind = 'local-bare' AND workspace IS NOT NULL
+                      AND host IS NULL AND resource_id IS NULL AND address IS NULL AND worker_id IS NULL)
+                  OR (kind IN ('local-podman','apple-container') AND resource_id IS NOT NULL
+                      AND host IS NULL AND address IS NULL AND workspace IS NULL AND worker_id IS NULL)
+                  OR (kind = 'aws-ec2' AND resource_id IS NOT NULL
+                      AND host IS NULL AND workspace IS NULL AND worker_id IS NULL)
+                  OR (kind = 'ssh-bare' AND host IS NOT NULL AND workspace IS NOT NULL
+                      AND resource_id IS NULL AND address IS NULL)
+                  OR (kind = 'ssh-podman' AND host IS NOT NULL AND resource_id IS NOT NULL
+                      AND address IS NULL AND workspace IS NULL AND worker_id IS NULL)
+                 )
+             ) STRICT;
+             INSERT INTO session_targets
+                 SELECT * FROM session_targets_v4;
+             DROP TABLE session_targets_v4;
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 5;
              COMMIT;",
         )?;
     }
@@ -427,6 +463,14 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
 
 fn insert_target(tx: &Transaction<'_>, session_id: &str, target: &TargetLocator) -> Result<()> {
     let (kind, host, resource, address, workspace, worker_id) = match target {
+        TargetLocator::LocalBare { worker_root } => (
+            "local-bare",
+            None,
+            None,
+            None,
+            Some(path_to_blob(worker_root)),
+            None,
+        ),
         TargetLocator::LocalPodman { container_id } => (
             "local-podman",
             None,
@@ -497,6 +541,9 @@ fn load_targets(connection: &Connection, state: &mut HelState) -> Result<()> {
         let workspace = row.get_ref(5)?.blob_or_null()?.map(blob_to_path);
         let worker_id: Option<String> = row.get(6)?;
         let target = match kind.as_str() {
+            "local-bare" => TargetLocator::LocalBare {
+                worker_root: workspace.unwrap(),
+            },
             "local-podman" => TargetLocator::LocalPodman {
                 container_id: resource.unwrap(),
             },
@@ -864,6 +911,10 @@ mod tests {
         let mut state = HelState::default();
         let mut record = session("session-1", "project-1");
         record.project_directory = Some(PathBuf::from("/srv/project-1"));
+        record.resource_allocation = None;
+        record.target = Some(TargetLocator::LocalBare {
+            worker_root: PathBuf::from("/var/lib/hel/workers/session-1"),
+        });
         state.sessions.insert(record.id.clone(), record);
         state.mount_history.insert(
             "local".into(),
@@ -881,6 +932,62 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn version_four_database_migrates_existing_targets_and_accepts_local_bare() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE schema_migrations (
+                     version INTEGER PRIMARY KEY CHECK(version > 0),
+                     applied_at TEXT NOT NULL
+                 ) STRICT;
+                 CREATE TABLE sessions (session_id TEXT PRIMARY KEY) STRICT;
+                 CREATE TABLE session_targets (
+                     session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+                     kind TEXT NOT NULL CHECK(kind IN ('local-podman','apple-container','aws-ec2','ssh-bare','ssh-podman')),
+                     host TEXT,
+                     resource_id TEXT,
+                     address TEXT,
+                     workspace BLOB,
+                     worker_id TEXT
+                 ) STRICT;
+                 INSERT INTO schema_migrations(version, applied_at) VALUES (1, 'now'), (2, 'now'), (3, 'now'), (4, 'now');
+                 INSERT INTO sessions VALUES ('old-session');
+                 INSERT INTO session_targets(session_id, kind, resource_id)
+                     VALUES ('old-session', 'local-podman', 'container-1');
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let connection = open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT resource_id FROM session_targets WHERE session_id = 'old-session'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "container-1"
+        );
+        connection
+            .execute("INSERT INTO sessions VALUES ('local-session')", [])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_targets(session_id, kind, workspace)
+                 VALUES ('local-session', 'local-bare', ?1)",
+                [path_to_blob(Path::new(
+                    "/var/lib/hel/workers/local-session",
+                ))],
+            )
+            .unwrap();
     }
 
     #[test]

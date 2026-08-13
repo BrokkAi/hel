@@ -1387,7 +1387,7 @@ impl DashboardState {
                 WizardStep::Review => {
                     if matches!(
                         self.config.targets[&nth_key(&self.config.targets, wizard.target)],
-                        TargetTemplate::SshBare { .. }
+                        TargetTemplate::LocalBare | TargetTemplate::SshBare { .. }
                     ) {
                         WizardStep::ProjectDirectory
                     } else {
@@ -1549,12 +1549,14 @@ impl DashboardState {
                     self.mode = Mode::New(wizard);
                     return DashboardAction::None;
                 }
-                wizard.step = if matches!(target, TargetTemplate::SshBare { .. }) {
+                wizard.step = if is_bare_project_target(target) {
                     wizard.mounts = MountWizard::new(Vec::new());
-                    let TargetTemplate::SshBare { ssh, .. } = target else {
-                        unreachable!()
+                    let history_host = match target {
+                        TargetTemplate::LocalBare => "local",
+                        TargetTemplate::SshBare { ssh, .. } => &ssh.host,
+                        _ => unreachable!(),
                     };
-                    wizard.project_history = self.state.project_directories(&ssh.host).to_vec();
+                    wizard.project_history = self.state.project_directories(history_host).to_vec();
                     wizard.project_history_index = 0;
                     if wizard.project_directory.is_empty()
                         && let Some(directory) = wizard.project_history.first()
@@ -1624,7 +1626,7 @@ impl DashboardState {
                 ReviewFocus::Back => {
                     let target =
                         &self.config.targets[&nth_key(&self.config.targets, wizard.target)];
-                    wizard.step = if matches!(target, TargetTemplate::SshBare { .. }) {
+                    wizard.step = if is_bare_project_target(target) {
                         WizardStep::ProjectDirectory
                     } else {
                         WizardStep::Bundle
@@ -1849,10 +1851,7 @@ impl DashboardState {
 
     fn create_session_action(&mut self, wizard: &NewWizard) -> DashboardAction {
         let target_template_id = nth_key(&self.config.targets, wizard.target);
-        let raw_project = matches!(
-            self.config.targets[&target_template_id],
-            TargetTemplate::SshBare { .. }
-        );
+        let raw_project = is_bare_project_target(&self.config.targets[&target_template_id]);
         let action = DashboardAction::CreateSession {
             profile_id: nth_key(&self.config.profiles, wizard.profile),
             bundle_id: if raw_project {
@@ -1981,6 +1980,10 @@ impl DashboardState {
         let target = &self.config.targets[&target_id];
         *sizing_error = None;
         match target {
+            TargetTemplate::LocalBare => {
+                *allocation = None;
+                DashboardAction::None
+            }
             TargetTemplate::LocalPodman { .. }
             | TargetTemplate::AppleContainer { .. }
             | TargetTemplate::SshPodman { .. } => {
@@ -2878,7 +2881,12 @@ impl DashboardState {
                 .map(ProfileQuota::compact)
                 .unwrap_or_else(|| "refreshing".to_string())
         };
-        format!("{id}  {}  ·  {quota}", harness_label(harness))
+        let danger = if harness == HarnessKind::Kimi {
+            "  ⚠ DANGER: auto mode allows commands without approval"
+        } else {
+            ""
+        };
+        format!("{id}  {}  ·  {quota}{danger}", harness_label(harness))
     }
 
     fn config_is_empty(&self) -> bool {
@@ -4492,10 +4500,7 @@ fn render_new_wizard(
 ) {
     if wizard.step == WizardStep::Review {
         let target_id = nth_key(&dashboard.config.targets, wizard.target);
-        let raw_project = matches!(
-            dashboard.config.targets[&target_id],
-            TargetTemplate::SshBare { .. }
-        );
+        let raw_project = is_bare_project_target(&dashboard.config.targets[&target_id]);
         let bundle_id = (!raw_project)
             .then(|| nth_bundle_key(&dashboard.config, &dashboard.state, wizard.bundle));
         render_review_wizard(
@@ -4520,8 +4525,17 @@ fn render_new_wizard(
         return;
     }
     if wizard.step == WizardStep::ProjectDirectory {
+        let target_id = nth_key(&dashboard.config.targets, wizard.target);
+        let local = matches!(
+            dashboard.config.targets[&target_id],
+            TargetTemplate::LocalBare
+        );
         let mut lines = vec![
-            Line::raw("Absolute project directory on the remote machine:"),
+            Line::raw(if local {
+                "Absolute project directory on this machine:"
+            } else {
+                "Absolute project directory on the remote machine:"
+            }),
             Line::raw(""),
             Line::styled(
                 format!("> {}▏", wizard.project_directory),
@@ -4569,11 +4583,11 @@ fn render_new_wizard(
         let popup = centered_rect(76, (lines.len() as u16 + 2).clamp(9, 16), area);
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" New session · 3/4 remote project "),
-            ),
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(if local {
+                " New session · 3/4 local project "
+            } else {
+                " New session · 3/4 remote project "
+            })),
             popup,
         );
         return;
@@ -4732,6 +4746,18 @@ fn render_review_wizard(
             resource_allocation_label(allocation, None)
         )),
     ];
+    if matches!(target, TargetTemplate::LocalBare)
+        && dashboard
+            .config
+            .profiles
+            .get(profile_id)
+            .is_some_and(|profile| profile.kind == HarnessKind::Kimi)
+    {
+        lines.push(Line::styled(
+            "⚠ DANGER: Kimi auto mode on raw localhost can modify this machine without approval.",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
     if can_attach {
         lines.push(Line::raw(""));
         lines.push(Line::raw(format!(
@@ -4822,7 +4848,9 @@ fn render_mount_wizard(
         TargetTemplate::AwsEc2 { .. } => {
             "EC2 directories stream as tar.gz through one SSH connection into the destination."
         }
-        TargetTemplate::SshBare { .. } => unreachable!("bare SSH does not attach resources"),
+        TargetTemplate::LocalBare | TargetTemplate::SshBare { .. } => {
+            unreachable!("bare targets do not attach resources")
+        }
     };
     let source_marker = if mounts.focus == MountFocus::Source {
         "› "
@@ -5333,12 +5361,20 @@ fn harness_label(kind: HarnessKind) -> &'static str {
 
 fn target_label(target: &TargetTemplate) -> &'static str {
     match target {
+        TargetTemplate::LocalBare => "raw localhost",
         TargetTemplate::LocalPodman { .. } => "local Podman",
         TargetTemplate::AppleContainer { .. } => "Apple container",
         TargetTemplate::AwsEc2 { .. } => "AWS EC2",
         TargetTemplate::SshBare { .. } => "named SSH machine",
         TargetTemplate::SshPodman { .. } => "Podman over SSH",
     }
+}
+
+fn is_bare_project_target(target: &TargetTemplate) -> bool {
+    matches!(
+        target,
+        TargetTemplate::LocalBare | TargetTemplate::SshBare { .. }
+    )
 }
 
 fn resource_allocation_label(
@@ -5367,6 +5403,7 @@ fn resource_allocation_label(
 
 fn mount_history_host(target: &TargetTemplate) -> Option<&str> {
     match target {
+        TargetTemplate::LocalBare => None,
         TargetTemplate::LocalPodman { .. }
         | TargetTemplate::AppleContainer { .. }
         | TargetTemplate::AwsEc2 { .. } => Some("local"),
@@ -6345,6 +6382,66 @@ mod tests {
                 bundle_id: raw_project_context_id("/srv/project"),
                 project_directory: Some("/srv/project".into()),
                 target_template_id: "machine".into(),
+                additional_mounts: Vec::new(),
+                allow_dirty_local: false,
+                resource_allocation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn raw_localhost_uses_local_project_history_and_warns_for_kimi() {
+        let mut config = config();
+        config.profiles = BTreeMap::from([(
+            "kimi".into(),
+            HarnessProfile {
+                context_window_bytes: None,
+                kind: HarnessKind::Kimi,
+                home: PathBuf::from("/profiles/kimi"),
+                executable: None,
+                environment: BTreeMap::new(),
+            },
+        )]);
+        config.targets = BTreeMap::from([("raw-localhost".into(), TargetTemplate::LocalBare)]);
+        let mut state = HelState::default();
+        state.remember_project_directory("local", std::path::Path::new("/home/me/project"));
+        let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
+
+        dashboard.handle_key(ctrl_key('n'));
+        let mut terminal = Terminal::new(TestBackend::new(140, 28)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("DANGER"));
+
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected local project directory step")
+        };
+        assert_eq!(wizard.project_directory, "/home/me/project");
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ValidateProjectDirectory {
+                target_template_id: "raw-localhost".into(),
+                directory: "/home/me/project".into(),
+            }
+        );
+        dashboard.apply_project_directory_validation("/home/me/project", Ok(()));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::CreateSession {
+                profile_id: "kimi".into(),
+                bundle_id: raw_project_context_id("/home/me/project"),
+                project_directory: Some("/home/me/project".into()),
+                target_template_id: "raw-localhost".into(),
                 additional_mounts: Vec::new(),
                 allow_dirty_local: false,
                 resource_allocation: None,

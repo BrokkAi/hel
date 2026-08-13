@@ -379,8 +379,8 @@ impl Controller {
             TargetTemplate::SshPodman { ssh, .. } => {
                 hel_targets::ssh_directory_completions(&backend_ssh(ssh), prefix, executor)
             }
-            TargetTemplate::SshBare { .. } => {
-                bail!("resource path completion is unsupported for bare SSH targets")
+            TargetTemplate::LocalBare | TargetTemplate::SshBare { .. } => {
+                bail!("resource path completion is unsupported for bare targets")
             }
         }
     }
@@ -413,8 +413,8 @@ impl Controller {
             TargetTemplate::SshPodman { ssh, .. } => {
                 hel_targets::ssh_directory_exists(&backend_ssh(ssh), source, executor)?
             }
-            TargetTemplate::SshBare { .. } => {
-                bail!("resource attachments are unsupported for bare SSH targets")
+            TargetTemplate::LocalBare | TargetTemplate::SshBare { .. } => {
+                bail!("resource attachments are unsupported for bare targets")
             }
         };
         ensure!(
@@ -425,7 +425,7 @@ impl Controller {
         Ok(())
     }
 
-    /// Verify a bare-SSH project before leaving the project-directory dialog.
+    /// Verify a bare project before leaving the project-directory dialog.
     pub fn validate_project_directory(
         &self,
         target_id: &str,
@@ -437,10 +437,36 @@ impl Controller {
             .targets
             .get(target_id)
             .with_context(|| format!("unknown target template {target_id:?}"))?;
-        let TargetTemplate::SshBare { ssh, .. } = target else {
-            bail!("project directory validation requires a bare SSH target");
-        };
-        hel_targets::validate_bare_project_directory(&backend_ssh(ssh), directory, executor)
+        match target {
+            TargetTemplate::LocalBare => {
+                ensure!(
+                    directory.is_dir(),
+                    "project directory does not exist or is not a directory"
+                );
+                let output = executor.execute(
+                    &CommandSpec::new(
+                        "git",
+                        [
+                            "-C",
+                            &directory.to_string_lossy(),
+                            "rev-parse",
+                            "--is-inside-work-tree",
+                        ],
+                    )
+                    .purpose("verify local bare Git project"),
+                )?;
+                ensure!(
+                    output.status == 0 && String::from_utf8_lossy(&output.stdout).trim() == "true",
+                    "project directory is not a Git worktree: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                Ok(())
+            }
+            TargetTemplate::SshBare { ssh, .. } => {
+                hel_targets::validate_bare_project_directory(&backend_ssh(ssh), directory, executor)
+            }
+            _ => bail!("project directory validation requires a bare target"),
+        }
     }
 
     pub fn register_session(
@@ -518,10 +544,8 @@ impl Controller {
             .targets
             .get(target_id)
             .with_context(|| format!("unknown target template {target_id:?}"))?;
-        if project_directory.is_some() != matches!(template, TargetTemplate::SshBare { .. }) {
-            bail!(
-                "raw project directories require a bare SSH target, and bare SSH targets require one"
-            );
+        if project_directory.is_some() != is_bare_project_target(template) {
+            bail!("raw project directories require a bare target, and bare targets require one");
         }
         if let Some(path) = &project_directory
             && (!path.is_absolute()
@@ -529,7 +553,7 @@ impl Controller {
                     .components()
                     .any(|part| part == std::path::Component::ParentDir))
         {
-            bail!("bare SSH project directory must be an absolute safe path");
+            bail!("bare project directory must be an absolute safe path");
         }
         let bundle = project_directory
             .is_none()
@@ -756,10 +780,16 @@ impl Controller {
         if result.is_ok()
             && let Some(session) = self.state.sessions.get(session_id)
             && let Some(directory) = session.project_directory.clone()
-            && let Some(TargetTemplate::SshBare { ssh, .. }) =
-                self.config.targets.get(&session.target_template_id)
+            && let Some(template) = self.config.targets.get(&session.target_template_id)
         {
-            self.state.remember_project_directory(&ssh.host, &directory);
+            let host = match template {
+                TargetTemplate::LocalBare => Some("local"),
+                TargetTemplate::SshBare { ssh, .. } => Some(ssh.host.as_str()),
+                _ => None,
+            };
+            if let Some(host) = host {
+                self.state.remember_project_directory(host, &directory);
+            }
         }
         self.state.save()?;
         result
@@ -842,17 +872,7 @@ impl Controller {
             .context("session target is missing")?;
         let backend = backend_locator(locator, session, &self.config)?;
         let worker_root = hel_targets::worker_root(&backend, session_id)?;
-        let target_profile_home = match backend {
-            hel_targets::TargetLocator::LocalPodman { .. }
-            | hel_targets::TargetLocator::AppleContainer { .. }
-            | hel_targets::TargetLocator::SshPodman { .. } => {
-                format!("/var/lib/hel/profiles/{session_id}")
-            }
-            hel_targets::TargetLocator::AwsEc2 { .. }
-            | hel_targets::TargetLocator::SshBare { .. } => {
-                format!(".local/share/hel/profiles/{session_id}")
-            }
-        };
+        let target_profile_home = target_profile_home(&backend, session_id, profile);
         let workspace = if let Some(project_directory) = &session.project_directory {
             (project_directory.to_string_lossy().into_owned(), Vec::new())
         } else {
@@ -887,6 +907,7 @@ impl Controller {
             additional_directories,
             native_session_id: session.native_session_id.clone(),
             recover_native_session,
+            force_unrestricted_mode: force_unrestricted_mode(&backend),
         };
 
         let staging = tempfile::tempdir().context("create worker staging directory")?;
@@ -902,7 +923,9 @@ impl Controller {
         }
         .write(&ownership_path)?;
         let profile_stage = staging.path().join("profile");
-        stage_profile(profile, &profile_stage)?;
+        if !matches!(backend, hel_targets::TargetLocator::LocalBare { .. }) {
+            stage_profile(profile, &profile_stage)?;
+        }
         let worker_binary = worker_binary_for(&backend, executor)?;
 
         install_worker_files(
@@ -963,6 +986,7 @@ impl Controller {
             | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_owned(),
             hel_targets::TargetLocator::AwsEc2 { workspace, .. }
             | hel_targets::TargetLocator::SshBare { workspace, .. } => workspace.clone(),
+            hel_targets::TargetLocator::LocalBare { worker_root } => worker_root.clone(),
         };
         let mut missing = Vec::new();
         for &(repository, source) in &local {
@@ -1109,7 +1133,9 @@ impl Controller {
         let mut targets = Vec::new();
         for (target_id, template) in &self.config.targets {
             match template {
-                TargetTemplate::LocalPodman { .. } | TargetTemplate::AppleContainer { .. } => {
+                TargetTemplate::LocalBare
+                | TargetTemplate::LocalPodman { .. }
+                | TargetTemplate::AppleContainer { .. } => {
                     local_ids.push(target_id.clone());
                 }
                 TargetTemplate::SshBare { ssh, .. } | TargetTemplate::SshPodman { ssh, .. } => {
@@ -1241,16 +1267,25 @@ impl Controller {
             .config
             .profiles
             .get(profile_id)
-            .with_context(|| format!("unknown profile {profile_id:?}"))?;
+            .with_context(|| format!("unknown profile {profile_id:?}"))?
+            .clone();
         let target_template = self
             .config
             .targets
             .get(target_id)
             .with_context(|| format!("unknown target template {target_id:?}"))?;
-        if previous.project_directory.is_some()
-            && !matches!(target_template, TargetTemplate::SshBare { .. })
-        {
-            bail!("sessions using a raw project directory must resume on a bare SSH target");
+        if previous.project_directory.is_some() {
+            let previous_template = self
+                .config
+                .targets
+                .get(&previous.target_template_id)
+                .context("previous bare target template is missing")?;
+            if !is_bare_project_target(target_template)
+                || matches!(previous_template, TargetTemplate::LocalBare)
+                    != matches!(target_template, TargetTemplate::LocalBare)
+            {
+                bail!("raw project sessions must resume on the same bare target kind");
+            }
         }
         let resource_allocation =
             resource_allocation.or_else(|| previous.resource_allocation.clone());
@@ -1301,11 +1336,11 @@ impl Controller {
                 .await?;
             let (backend, worker_root) =
                 self.prepare_worker_files(session_id, &ProcessExecutor, same_harness)?;
-            let harness_home = target_profile_home(&backend, session_id);
+            let harness_home = target_profile_home(&backend, session_id, &profile);
             let workspace_root = if let Some(project_directory) = &previous.project_directory {
                 project_directory
                     .parent()
-                    .context("bare SSH project directory has no parent")?
+                    .context("bare project directory has no parent")?
                     .to_string_lossy()
                     .into_owned()
             } else {
@@ -1315,6 +1350,7 @@ impl Controller {
                     | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_string(),
                     hel_targets::TargetLocator::AwsEc2 { workspace, .. }
                     | hel_targets::TargetLocator::SshBare { workspace, .. } => workspace.clone(),
+                    hel_targets::TargetLocator::LocalBare { worker_root } => worker_root.clone(),
                 }
             };
             let target_path = |path: &str| match &backend {
@@ -1330,6 +1366,7 @@ impl Controller {
                 workspace_root: target_path(&workspace_root),
                 worker_root: target_path(&worker_root),
                 harness_home: target_path(&harness_home),
+                restore_repositories: previous.project_directory.is_none(),
                 restore_native: same_harness,
             };
             let staging = tempfile::tempdir().context("create restore staging")?;
@@ -1528,6 +1565,11 @@ impl Controller {
             .as_ref()
             .context("session has no live target")?;
         let backend = backend_locator(locator, &session, &self.config)?;
+        let profile = self
+            .config
+            .profiles
+            .get(&session.last_profile)
+            .context("session profile is missing")?;
         let bundle = session
             .project_directory
             .is_none()
@@ -1549,15 +1591,15 @@ impl Controller {
         client.detach().await?;
 
         let worker_root = hel_targets::worker_root(&backend, session_id)?;
-        let harness_home = target_profile_home(&backend, session_id);
+        let harness_home = target_profile_home(&backend, session_id, profile);
         let (workspace_root, primary_repository, repositories) =
             if let Some(project_directory) = &session.project_directory {
                 let parent = project_directory
                     .parent()
-                    .context("bare SSH project directory has no parent")?;
+                    .context("bare project directory has no parent")?;
                 let destination = project_directory
                     .file_name()
-                    .context("bare SSH project directory cannot be the filesystem root")?;
+                    .context("bare project directory cannot be the filesystem root")?;
                 (
                     parent.to_string_lossy().into_owned(),
                     "project".to_owned(),
@@ -1577,6 +1619,7 @@ impl Controller {
                     | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_string(),
                     hel_targets::TargetLocator::AwsEc2 { workspace, .. }
                     | hel_targets::TargetLocator::SshBare { workspace, .. } => workspace.clone(),
+                    hel_targets::TargetLocator::LocalBare { worker_root } => worker_root.clone(),
                 };
                 let repositories = bundle
                     .repositories
@@ -2144,6 +2187,7 @@ fn target_architecture(
     executor: &impl CommandExecutor,
 ) -> Result<&'static str> {
     let command = match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("uname", ["-m"]),
         hel_targets::TargetLocator::LocalPodman { container_id } => {
             CommandSpec::new("podman", ["exec", container_id, "uname", "-m"])
         }
@@ -2214,6 +2258,7 @@ fn validate_worker_sha256(expected_sha256: &str) -> Result<()> {
 
 fn target_kind(locator: &hel_targets::TargetLocator) -> &'static str {
     match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => "local-bare",
         hel_targets::TargetLocator::LocalPodman { .. } => "local-podman",
         hel_targets::TargetLocator::AppleContainer { .. } => "apple-container",
         hel_targets::TargetLocator::AwsEc2 { .. } => "aws-ec2",
@@ -2222,8 +2267,13 @@ fn target_kind(locator: &hel_targets::TargetLocator) -> &'static str {
     }
 }
 
-fn target_profile_home(locator: &hel_targets::TargetLocator, session_id: &str) -> String {
+fn target_profile_home(
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+    profile: &crate::hel_config::HarnessProfile,
+) -> String {
     match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => profile.home.to_string_lossy().into_owned(),
         hel_targets::TargetLocator::LocalPodman { .. }
         | hel_targets::TargetLocator::AppleContainer { .. }
         | hel_targets::TargetLocator::SshPodman { .. } => {
@@ -2243,6 +2293,11 @@ fn upload_checkpoint_spec(
     remote: &str,
 ) -> Result<()> {
     match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => {
+            std::fs::copy(local, remote)
+                .with_context(|| format!("copy checkpoint specification to {remote}"))?;
+            Ok(())
+        }
         hel_targets::TargetLocator::LocalPodman { container_id } => execute_checked(
             executor,
             CommandSpec::new(
@@ -2254,7 +2309,8 @@ fn upload_checkpoint_spec(
                 ],
             )
             .purpose("upload checkpoint specification"),
-        ),
+        )
+        .map(|_| ()),
         hel_targets::TargetLocator::AppleContainer { container_id } => execute_checked(
             executor,
             CommandSpec::new(
@@ -2266,12 +2322,14 @@ fn upload_checkpoint_spec(
                 ],
             )
             .purpose("upload checkpoint specification"),
-        ),
+        )
+        .map(|_| ()),
         hel_targets::TargetLocator::AwsEc2 { ssh, .. }
         | hel_targets::TargetLocator::SshBare { ssh, .. } => execute_checked(
             executor,
             scp_command_spec(ssh, local, remote, false).purpose("upload checkpoint specification"),
-        ),
+        )
+        .map(|_| ()),
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
             let staging = format!(".local/share/hel/uploads/{session_id}-checkpoint.json");
             execute_checked(
@@ -2301,7 +2359,8 @@ fn upload_checkpoint_spec(
                 executor,
                 ssh_command_spec(ssh, ["rm", "-f", "--", &staging])
                     .purpose("remove remote checkpoint staging"),
-            )
+            )?;
+            Ok(())
         }
     }?;
     Ok(())
@@ -2337,6 +2396,9 @@ fn scan_target_workers(
     executor: &impl CommandExecutor,
 ) -> Result<Vec<RecoveryCandidate>> {
     let mut candidates = match template {
+        // Local bare sessions persist their locator in the controller database.
+        // Do not infer an adoptable project from Hel's transient worker directory.
+        TargetTemplate::LocalBare => Vec::new(),
         TargetTemplate::LocalPodman { .. } => scan_container_engine(
             target_id,
             template,
@@ -2677,6 +2739,11 @@ fn recovery_backend_locator(
     session_id: &str,
 ) -> Result<hel_targets::TargetLocator> {
     Ok(match (template, locator) {
+        (TargetTemplate::LocalBare, TargetLocator::LocalBare { worker_root }) => {
+            hel_targets::TargetLocator::LocalBare {
+                worker_root: worker_root.to_string_lossy().into_owned(),
+            }
+        }
         (TargetTemplate::LocalPodman { .. }, TargetLocator::LocalPodman { container_id }) => {
             hel_targets::TargetLocator::LocalPodman {
                 container_id: container_id.clone(),
@@ -2734,6 +2801,7 @@ fn backend_target(
     allocation: Option<&SessionResourceAllocation>,
 ) -> Result<hel_targets::TargetTemplate> {
     Ok(match template {
+        TargetTemplate::LocalBare => hel_targets::TargetTemplate::LocalBare,
         TargetTemplate::LocalPodman { container } => {
             hel_targets::TargetTemplate::LocalPodman(backend_container(container, allocation))
         }
@@ -2786,7 +2854,7 @@ fn mount_history_host(template: &TargetTemplate) -> Option<String> {
         | TargetTemplate::AppleContainer { .. }
         | TargetTemplate::AwsEc2 { .. } => Some("local".into()),
         TargetTemplate::SshPodman { ssh, .. } => Some(ssh.host.clone()),
-        TargetTemplate::SshBare { .. } => None,
+        TargetTemplate::LocalBare | TargetTemplate::SshBare { .. } => None,
     }
 }
 
@@ -2831,11 +2899,18 @@ fn validate_resource_allocation(
             Some(SessionResourceAllocation::Container { .. }),
         )
         | (TargetTemplate::AwsEc2 { .. }, Some(SessionResourceAllocation::AwsEc2 { .. })) => Ok(()),
-        (TargetTemplate::SshBare { .. }, Some(_)) => {
-            bail!("bare SSH targets have fixed host resources")
+        (TargetTemplate::LocalBare | TargetTemplate::SshBare { .. }, Some(_)) => {
+            bail!("bare targets have fixed host resources")
         }
         _ => bail!("resource allocation does not match the selected target kind"),
     }
+}
+
+fn is_bare_project_target(template: &TargetTemplate) -> bool {
+    matches!(
+        template,
+        TargetTemplate::LocalBare | TargetTemplate::SshBare { .. }
+    )
 }
 
 fn backend_ssh(ssh: &SshConnection) -> SshTarget {
@@ -2956,7 +3031,9 @@ fn cleanup_failed_provision(
             .purpose("terminate EC2 instance after failed provisioning")
         }
         // SSH machines are persistent; nothing was created that must die.
-        TargetTemplate::SshBare { .. } | TargetTemplate::SshPodman { .. } => return None,
+        TargetTemplate::LocalBare
+        | TargetTemplate::SshBare { .. }
+        | TargetTemplate::SshPodman { .. } => return None,
     };
     let purpose = command.purpose.clone();
     match executor.execute(&command) {
@@ -2981,6 +3058,9 @@ fn locator_after_provision(
 ) -> Result<TargetLocator> {
     let generated = hel_targets::resource_name(session_id)?;
     Ok(match canonical {
+        TargetTemplate::LocalBare => TargetLocator::LocalBare {
+            worker_root: data_dir().join("workers").join(session_id),
+        },
         TargetTemplate::LocalPodman { .. } => TargetLocator::LocalPodman {
             container_id: generated,
         },
@@ -3101,6 +3181,14 @@ fn backend_locator(
         .get(&session.target_template_id)
         .context("session target template is missing")?;
     Ok(match locator {
+        TargetLocator::LocalBare { worker_root } => {
+            let TargetTemplate::LocalBare = template else {
+                bail!("session locator/template mismatch")
+            };
+            hel_targets::TargetLocator::LocalBare {
+                worker_root: worker_root.to_string_lossy().into_owned(),
+            }
+        }
         TargetLocator::LocalPodman { container_id } => hel_targets::TargetLocator::LocalPodman {
             container_id: container_id.clone(),
         },
@@ -3424,15 +3512,26 @@ fn install_inherited_git_settings(
     locator: &hel_targets::TargetLocator,
     session_id: &str,
 ) -> Result<()> {
-    let settings = if matches!(locator, hel_targets::TargetLocator::SshBare { .. }) {
-        BTreeMap::new()
-    } else {
+    let settings = if inherits_controller_git_settings(locator) {
         controller_git_settings()?
+    } else {
+        BTreeMap::new()
     };
     for command in inherited_git_setting_commands(locator, session_id, settings)? {
         execute_checked(executor, command)?;
     }
     Ok(())
+}
+
+fn inherits_controller_git_settings(locator: &hel_targets::TargetLocator) -> bool {
+    !matches!(
+        locator,
+        hel_targets::TargetLocator::LocalBare { .. } | hel_targets::TargetLocator::SshBare { .. }
+    )
+}
+
+fn force_unrestricted_mode(locator: &hel_targets::TargetLocator) -> bool {
+    !matches!(locator, hel_targets::TargetLocator::LocalBare { .. })
 }
 
 fn inherited_git_setting_commands(
@@ -3508,6 +3607,9 @@ fn workspace_paths(
     session_id: &str,
 ) -> Result<(String, Vec<String>)> {
     let root = match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => {
+            bail!("local bare projects use their selected directory")
+        }
         hel_targets::TargetLocator::LocalPodman { .. }
         | hel_targets::TargetLocator::AppleContainer { .. }
         | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_string(),
@@ -3680,6 +3782,40 @@ fn install_worker_files(
     profile_stage: &Path,
 ) -> Result<()> {
     match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => {
+            for command in [
+                CommandSpec::new("mkdir", ["-p", worker_root])
+                    .purpose("create local bare worker directory"),
+                CommandSpec::new(
+                    "cp",
+                    [
+                        worker_binary.to_string_lossy().into_owned(),
+                        format!("{worker_root}/hel"),
+                    ],
+                )
+                .purpose("install local Hel worker"),
+                CommandSpec::new(
+                    "cp",
+                    [
+                        launch_config.to_string_lossy().into_owned(),
+                        format!("{worker_root}/launch.json"),
+                    ],
+                )
+                .purpose("install local worker launch configuration"),
+                CommandSpec::new(
+                    "cp",
+                    [
+                        ownership.to_string_lossy().into_owned(),
+                        format!("{worker_root}/ownership.json"),
+                    ],
+                )
+                .purpose("install local worker ownership marker"),
+                CommandSpec::new("chmod", ["700", &format!("{worker_root}/hel")])
+                    .purpose("make local Hel worker executable"),
+            ] {
+                execute_checked(executor, command)?;
+            }
+        }
         hel_targets::TargetLocator::LocalPodman { container_id }
         | hel_targets::TargetLocator::AppleContainer { container_id } => {
             let engine = if matches!(locator, hel_targets::TargetLocator::LocalPodman { .. }) {
@@ -3957,6 +4093,9 @@ fn start_worker(
         hel_targets::join_remote_command(&[format!("{worker_root}/worker.log")]),
     );
     let command = match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => {
+            CommandSpec::new("sh", ["-c", &detached_script])
+        }
         hel_targets::TargetLocator::LocalPodman { container_id } => CommandSpec::new(
             "podman",
             ["exec", "--detach", container_id, "sh", "-c", &exec_script],
@@ -4023,6 +4162,9 @@ fn worker_probe_diagnosis(
 ) -> anyhow::Error {
     let binary = format!("{worker_root}/hel");
     let command = match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => {
+            CommandSpec::new(binary.clone(), ["--version"])
+        }
         hel_targets::TargetLocator::LocalPodman { container_id } => {
             CommandSpec::new("podman", ["exec", container_id, &binary, "--version"])
         }
@@ -4070,6 +4212,7 @@ fn worker_last_words(
         root = worker_root
     );
     let command = match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("sh", ["-c", &script]),
         hel_targets::TargetLocator::LocalPodman { container_id } => {
             CommandSpec::new("podman", ["exec", container_id, "sh", "-c", &script])
         }
@@ -4206,6 +4349,49 @@ mod tests {
                     .contains("does not exist or is not a directory")
             );
         }
+    }
+
+    #[test]
+    fn local_bare_project_validation_runs_git_in_the_selected_directory() {
+        struct GitExecutor {
+            commands: RefCell<Vec<CommandSpec>>,
+        }
+        impl CommandExecutor for GitExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.commands.borrow_mut().push(command.clone());
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: b"true\n".to_vec(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let project = tempfile::tempdir().unwrap();
+        let mut config = HelConfig::default();
+        config
+            .targets
+            .insert("raw-localhost".into(), TargetTemplate::LocalBare);
+        let controller = Controller {
+            config,
+            state: HelState::default(),
+        };
+        let executor = GitExecutor {
+            commands: RefCell::new(Vec::new()),
+        };
+
+        controller
+            .validate_project_directory("raw-localhost", project.path(), &executor)
+            .unwrap();
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].program, "git");
+        assert_eq!(commands[0].args[0], "-C");
+        assert_eq!(commands[0].args[1], project.path().to_string_lossy());
+        assert_eq!(
+            commands[0].args[2..],
+            ["rev-parse", "--is-inside-work-tree"]
+        );
     }
 
     #[test]
@@ -4658,7 +4844,7 @@ mod tests {
     }
 
     #[test]
-    fn inherited_git_settings_target_every_ephemeral_worker_but_ssh_bare() {
+    fn inherited_git_settings_target_only_isolated_workers() {
         let ssh = SshTarget {
             destination: "worker@example.test".into(),
             ssh_args: vec!["-p".into(), "2222".into()],
@@ -4683,9 +4869,10 @@ mod tests {
                 container_id: "abcdef012347".into(),
             },
         ];
-        for locator in ephemeral {
+        for locator in &ephemeral {
+            assert!(inherits_controller_git_settings(locator));
             let commands = inherited_git_setting_commands(
-                &locator,
+                locator,
                 "018f9dd2-a3b4-7c8d-9000-123456789abc",
                 BTreeMap::from([("user.name".into(), "- Agent O'Brien 日本語".into())]),
             )
@@ -4709,6 +4896,13 @@ mod tests {
             ssh,
             workspace: "/srv/hel/018f9dd2-a3b4-7c8d-9000-123456789abc".into(),
         };
+        let local = hel_targets::TargetLocator::LocalBare {
+            worker_root: "/var/lib/hel/workers/018f9dd2-a3b4-7c8d-9000-123456789abc".into(),
+        };
+        assert!(!inherits_controller_git_settings(&persistent));
+        assert!(!inherits_controller_git_settings(&local));
+        assert!(!force_unrestricted_mode(&local));
+        assert!(force_unrestricted_mode(&ephemeral[0]));
         assert!(
             inherited_git_setting_commands(
                 &persistent,

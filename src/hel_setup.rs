@@ -271,6 +271,14 @@ pub fn build_config(
     runtime: RuntimeKind,
     image: &str,
 ) -> HelConfig {
+    build_config_with_runtime(homes, repository, Some((runtime, image)))
+}
+
+fn build_config_with_runtime(
+    homes: &[DiscoveredHome],
+    repository: Option<&GithubRepository>,
+    runtime: Option<(RuntimeKind, &str)>,
+) -> HelConfig {
     let mut config = HelConfig::default();
     for home in homes {
         let base_id = match home.kind {
@@ -308,21 +316,27 @@ pub fn build_config(
         );
     }
 
-    let container = ContainerTemplate {
-        image: image.trim().to_owned(),
-        platform: None,
-        cpus: None,
-        memory: None,
-        environment: BTreeMap::new(),
-    };
-    let (target_id, target) = match runtime {
-        RuntimeKind::Podman => ("podman", TargetTemplate::LocalPodman { container }),
-        RuntimeKind::AppleContainer => (
-            "apple-container",
-            TargetTemplate::AppleContainer { container },
-        ),
-    };
-    config.targets.insert(target_id.to_owned(), target);
+    #[cfg(unix)]
+    config
+        .targets
+        .insert("raw-localhost".to_owned(), TargetTemplate::LocalBare);
+    if let Some((runtime, image)) = runtime {
+        let container = ContainerTemplate {
+            image: image.trim().to_owned(),
+            platform: None,
+            cpus: None,
+            memory: None,
+            environment: BTreeMap::new(),
+        };
+        let (target_id, target) = match runtime {
+            RuntimeKind::Podman => ("podman", TargetTemplate::LocalPodman { container }),
+            RuntimeKind::AppleContainer => (
+                "apple-container",
+                TargetTemplate::AppleContainer { container },
+            ),
+        };
+        config.targets.insert(target_id.to_owned(), target);
+    }
     config
 }
 
@@ -367,36 +381,42 @@ pub fn run_setup_dialog_with(
     write_repository(output, discovery.repository.as_ref())?;
     write_runtimes(output, &discovery.runtimes)?;
 
-    let Some(recommended) = recommended_runtime(&discovery.runtimes) else {
-        let failures = discovery
-            .runtimes
-            .iter()
-            .map(|runtime| format!("{}: {}", runtime.kind.label(), runtime.detail))
-            .collect::<Vec<_>>()
-            .join("\n");
-        bail!("no usable local container runtime found:\n{failures}");
-    };
-    let runtime = select_runtime(input, output, &discovery.runtimes, recommended)?;
-    let image = prompt(
-        input,
-        output,
-        &format!("Container image [{DEFAULT_IMAGE}]: "),
-    )?;
-    let image = if image.is_empty() {
-        DEFAULT_IMAGE.to_owned()
+    let runtime = if let Some(recommended) = recommended_runtime(&discovery.runtimes) {
+        let runtime = select_runtime(input, output, &discovery.runtimes, recommended)?;
+        let image = prompt(
+            input,
+            output,
+            &format!("Container image [{DEFAULT_IMAGE}]: "),
+        )?;
+        let image = if image.is_empty() {
+            DEFAULT_IMAGE.to_owned()
+        } else {
+            image
+        };
+        Some((runtime, image))
     } else {
-        image
+        writeln!(
+            output,
+            "No usable container runtime found; raw localhost will still be configured."
+        )?;
+        None
     };
-    let config = build_config(
+    let config = build_config_with_runtime(
         &discovery.homes,
         discovery.repository.as_ref(),
-        runtime,
-        &image,
+        runtime
+            .as_ref()
+            .map(|(runtime, image)| (*runtime, image.as_str())),
     );
     config.validate()?;
 
     writeln!(output)?;
-    write_summary(output, config_path, &config, runtime)?;
+    write_summary(
+        output,
+        config_path,
+        &config,
+        runtime.as_ref().map(|(kind, _)| *kind),
+    )?;
     let confirmation = prompt(input, output, "Write this configuration? [y/N]: ")?;
     if !matches!(confirmation.to_ascii_lowercase().as_str(), "y" | "yes") {
         writeln!(output, "Setup cancelled.")?;
@@ -405,8 +425,10 @@ pub fn run_setup_dialog_with(
 
     writeln!(output, "Writing {}...", config_path.display())?;
     config.save_to(config_path)?;
-    let smoke_target = smoke_target(runtime, &image);
-    run_smoke_test(output, &smoke_target, executor)?;
+    if let Some((runtime, image)) = runtime {
+        let smoke_target = smoke_target(runtime, &image);
+        run_smoke_test(output, &smoke_target, executor)?;
+    }
     writeln!(
         output,
         "Advanced users can edit TOML for extra profiles, virtual monorepos, SSH, and AWS."
@@ -431,9 +453,14 @@ fn write_discovered_homes(output: &mut impl Write, homes: &[DiscoveredHome]) -> 
         };
         writeln!(
             output,
-            "  {}: {} ({authentication})",
+            "  {}: {} ({authentication}){}",
             harness_label(home.kind),
-            home.path.display()
+            home.path.display(),
+            if home.kind == HarnessKind::Kimi {
+                " — DANGER: auto mode permits commands without approval on raw localhost"
+            } else {
+                ""
+            }
         )?;
     }
     Ok(())
@@ -526,21 +553,27 @@ fn write_summary(
     output: &mut impl Write,
     config_path: &Path,
     config: &HelConfig,
-    runtime: RuntimeKind,
+    runtime: Option<RuntimeKind>,
 ) -> Result<()> {
     writeln!(output, "Hel will write {} with:", config_path.display())?;
     writeln!(output, "  {} profile(s)", config.profiles.len())?;
     writeln!(output, "  {} bundle(s)", config.bundles.len())?;
-    let target = config
-        .targets
-        .get(runtime.id())
-        .expect("selected target exists");
-    let image = match target {
-        TargetTemplate::LocalPodman { container }
-        | TargetTemplate::AppleContainer { container } => &container.image,
-        _ => unreachable!("setup only creates local container targets"),
-    };
-    writeln!(output, "  {} target using {image}", runtime.label())?;
+    writeln!(
+        output,
+        "  raw localhost target using configured harness homes directly"
+    )?;
+    if let Some(runtime) = runtime {
+        let target = config
+            .targets
+            .get(runtime.id())
+            .expect("selected target exists");
+        let image = match target {
+            TargetTemplate::LocalPodman { container }
+            | TargetTemplate::AppleContainer { container } => &container.image,
+            _ => unreachable!("setup runtime target is a local container"),
+        };
+        writeln!(output, "  {} target using {image}", runtime.label())?;
+    }
     if config_path.exists() {
         writeln!(output, "  This replaces the existing configuration file.")?;
     }
@@ -732,6 +765,10 @@ mod tests {
             config.targets["podman"],
             TargetTemplate::LocalPodman { .. }
         ));
+        assert!(matches!(
+            config.targets["raw-localhost"],
+            TargetTemplate::LocalBare
+        ));
     }
 
     #[test]
@@ -835,5 +872,42 @@ mod tests {
                 .unwrap()
                 .ends_with("Press n to start your first session.\n")
         );
+    }
+
+    #[test]
+    fn dialog_configures_raw_localhost_without_a_container_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let discovery = SetupDiscovery {
+            homes: vec![DiscoveredHome {
+                kind: HarnessKind::Kimi,
+                path: PathBuf::from("/profiles/kimi"),
+                authenticated: true,
+            }],
+            repository: None,
+            runtimes: vec![RuntimeProbe {
+                kind: RuntimeKind::Podman,
+                usable: false,
+                detail: "not installed".into(),
+            }],
+        };
+        let executor = FakeExecutor::succeeds();
+        let mut input = b"y\n".as_slice();
+        let mut output = Vec::new();
+
+        assert_eq!(
+            run_setup_dialog_with(&mut input, &mut output, &config_path, &discovery, &executor)
+                .unwrap(),
+            SetupOutcome::Written
+        );
+        let config = HelConfig::load_from(&config_path).unwrap();
+        assert!(matches!(
+            config.targets["raw-localhost"],
+            TargetTemplate::LocalBare
+        ));
+        assert!(executor.commands.borrow().is_empty());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("DANGER"));
+        assert!(output.contains("raw localhost will still be configured"));
     }
 }

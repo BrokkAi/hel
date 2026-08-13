@@ -297,6 +297,7 @@ fn default_named_machine_prefix() -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum TargetTemplate {
+    LocalBare,
     LocalPodman {
         #[serde(flatten)]
         container: ContainerTemplate,
@@ -338,6 +339,7 @@ impl TargetTemplate {
     fn validate(&self, id: &str) -> Result<()> {
         validate_id("target template", id)?;
         match self {
+            Self::LocalBare => Ok(()),
             Self::LocalPodman { container } | Self::AppleContainer { container } => {
                 container.validate(id)
             }

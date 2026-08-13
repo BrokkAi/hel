@@ -36,6 +36,7 @@ pub struct LaunchSpec {
     pub additional_directories: Vec<PathBuf>,
     pub resume_session: Option<String>,
     pub harness: HarnessKind,
+    pub force_unrestricted_mode: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +95,8 @@ pub enum RuntimeEvent {
     SessionStarted {
         native_session_id: String,
         resumed: bool,
-        unrestricted_mode: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unrestricted_mode: Option<String>,
     },
     SessionConfigured {
         config_options: Vec<SessionConfigOption>,
@@ -231,6 +233,7 @@ where
 {
     let notification_events = events.clone();
     let permission_events = events.clone();
+    let auto_approve_permissions = spec.force_unrestricted_mode;
     let scratch_outputs = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
     let notification_scratch_outputs = scratch_outputs.clone();
     Client
@@ -260,6 +263,11 @@ where
         )
         .on_receive_request(
             async move |request: RequestPermissionRequest, responder, _cx| {
+                if !auto_approve_permissions {
+                    return responder.respond(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Cancelled,
+                    ));
+                }
                 let selected = request
                     .options
                     .iter()
@@ -380,20 +388,24 @@ async fn drive_connection(
             )
         };
 
-    let desired_mode = spec.harness.unrestricted_mode();
-    enforce_unrestricted_mode(
-        &connection,
-        &session_id,
-        desired_mode,
-        config_options.as_deref().unwrap_or_default(),
-        modes.as_ref(),
-    )
-    .await?;
+    let desired_mode = spec
+        .force_unrestricted_mode
+        .then(|| spec.harness.unrestricted_mode());
+    if let Some(desired_mode) = desired_mode {
+        enforce_unrestricted_mode(
+            &connection,
+            &session_id,
+            desired_mode,
+            config_options.as_deref().unwrap_or_default(),
+            modes.as_ref(),
+        )
+        .await?;
+    }
     let mut config_options = config_options.unwrap_or_default();
     let _ = events.send(RuntimeEvent::SessionStarted {
         native_session_id: session_id.to_string(),
         resumed,
-        unrestricted_mode: desired_mode.to_string(),
+        unrestricted_mode: desired_mode.map(str::to_owned),
     });
     let _ = events.send(RuntimeEvent::SessionConfigured {
         config_options: config_options.clone(),
@@ -579,14 +591,16 @@ async fn compact_in_scratch_session(
         .await
         .context("create scratch ACP session")?;
     let session_id = created.session_id;
-    enforce_unrestricted_mode(
-        connection,
-        &session_id,
-        spec.harness.unrestricted_mode(),
-        created.config_options.as_deref().unwrap_or_default(),
-        created.modes.as_ref(),
-    )
-    .await?;
+    if spec.force_unrestricted_mode {
+        enforce_unrestricted_mode(
+            connection,
+            &session_id,
+            spec.harness.unrestricted_mode(),
+            created.config_options.as_deref().unwrap_or_default(),
+            created.modes.as_ref(),
+        )
+        .await?;
+    }
     configure_production_compactor(
         connection,
         &session_id,
@@ -840,6 +854,7 @@ mod tests {
             additional_directories: Vec::new(),
             resume_session: None,
             harness: HarnessKind::Kimi,
+            force_unrestricted_mode: true,
         };
 
         let error = tokio::time::timeout(

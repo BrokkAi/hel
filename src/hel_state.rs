@@ -44,6 +44,9 @@ impl SessionState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum TargetLocator {
+    LocalBare {
+        worker_root: PathBuf,
+    },
     LocalPodman {
         container_id: String,
     },
@@ -102,6 +105,18 @@ impl SessionResourceAllocation {
 impl TargetLocator {
     fn validate(&self, session_id: &str) -> Result<()> {
         match self {
+            Self::LocalBare { worker_root } => {
+                if !worker_root.is_absolute()
+                    || worker_root
+                        .components()
+                        .any(|part| part == Component::ParentDir)
+                    || !worker_root.ends_with(session_id)
+                {
+                    bail!(
+                        "local bare worker root must be an absolute safe path ending in the session id"
+                    );
+                }
+            }
             Self::LocalPodman { container_id }
             | Self::AppleContainer { container_id }
             | Self::SshPodman { container_id, .. }
@@ -175,7 +190,7 @@ pub struct SessionRecord {
     pub harness_kind: HarnessKind,
     pub last_profile: String,
     pub bundle_id: String,
-    /// Existing project directory used directly by a bare SSH target.
+    /// Existing project directory used directly by a local or SSH bare target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_directory: Option<PathBuf>,
     pub target_template_id: String,
