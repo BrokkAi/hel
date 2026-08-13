@@ -1710,6 +1710,15 @@ impl DashboardState {
         let Some(session) = self.selected_session() else {
             return DashboardAction::None;
         };
+        if session.state == SessionState::Error {
+            self.notice = Some(
+                session
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "Session failed without a recorded error.".into()),
+            );
+            return DashboardAction::None;
+        }
         if session.state.is_active() {
             DashboardAction::Open {
                 session_id: session.id.clone(),
@@ -4741,6 +4750,23 @@ mod tests {
             DashboardAction::Open {
                 session_id: "session-1".into()
             }
+        );
+    }
+
+    #[test]
+    fn opening_a_failed_session_preserves_the_actionable_error() {
+        let mut session = archived_session();
+        session.state = SessionState::Error;
+        session.last_error = Some("resume failed: worker upload source was replaced".into());
+        let mut dashboard = dashboard_with_session(session);
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.notice.as_deref(),
+            Some("resume failed: worker upload source was replaced")
         );
     }
 

@@ -1535,7 +1535,6 @@ fn packaged_worker_binary_path(directory: &Path, triple: &str) -> PathBuf {
 /// container or making a network request.
 pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAvailability> {
     let triple = format!("{arch}-unknown-linux-musl");
-    let current = std::env::current_exe().context("resolve Hel controller binary")?;
     if let Some(path) = std::env::var_os("HEL_WORKER_BINARY").map(PathBuf::from) {
         if !path.is_file() {
             bail!("HEL_WORKER_BINARY is not a file: {}", path.display());
@@ -1545,6 +1544,7 @@ pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAva
             source: "HEL_WORKER_BINARY".into(),
         });
     }
+    let current = std::env::current_exe().context("resolve Hel controller binary")?;
     let mut candidates = Vec::new();
     if let Some(directory) = std::env::var_os("HEL_WORKER_DIR").map(PathBuf::from) {
         candidates.push((
@@ -1582,7 +1582,7 @@ pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAva
             || (arch == "aarch64" && cfg!(target_arch = "aarch64")))
     {
         return Ok(WorkerBinaryAvailability::Local {
-            path: current,
+            path: stable_running_executable(&current)?,
             source: "native Linux Hel binary".into(),
         });
     }
@@ -1599,6 +1599,56 @@ pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAva
     bail!(
         "no Linux worker for {triple}; install hel-worker-{triple} beside Hel, set HEL_WORKER_DIR/HEL_WORKER_BINARY, or configure HEL_WORKER_URL and HEL_WORKER_SHA256"
     )
+}
+
+fn stable_running_executable(current: &Path) -> Result<PathBuf> {
+    if current.is_file() {
+        return Ok(current.to_path_buf());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let proc_exe = PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+        let directory = data_dir().join("workers").join("running");
+        let cached = directory.join(format!("hel-{}", std::process::id()));
+        materialize_running_executable(current, &proc_exe, &cached)
+    }
+    #[cfg(not(target_os = "linux"))]
+    bail!(
+        "resolved Hel controller executable is no longer readable: {}",
+        current.display()
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn materialize_running_executable(
+    current: &Path,
+    proc_exe: &Path,
+    cached: &Path,
+) -> Result<PathBuf> {
+    if !proc_exe.is_file() {
+        bail!(
+            "resolved Hel controller executable is no longer readable: {}",
+            current.display()
+        );
+    }
+    let parent = cached
+        .parent()
+        .context("worker executable cache has no parent")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create worker executable cache {}", parent.display()))?;
+    std::fs::copy(proc_exe, cached).with_context(|| {
+        format!(
+            "copy running Hel executable from {} after {} was replaced",
+            proc_exe.display(),
+            current.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(cached, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(cached.to_path_buf())
 }
 
 fn worker_binary_for(
@@ -3607,6 +3657,28 @@ mod tests {
         assert_eq!(
             packaged_worker_binary_path(directory, "aarch64-unknown-linux-musl"),
             directory.join("hel-worker-aarch64-unknown-linux-musl")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replaced_running_executable_is_materialized_for_worker_upload() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let replaced = directory.path().join("hel (deleted)");
+        let proc_exe = directory.path().join("proc-exe");
+        let cached = directory.path().join("workers/running/hel-1");
+        std::fs::write(&proc_exe, b"running executable").unwrap();
+
+        assert_eq!(
+            materialize_running_executable(&replaced, &proc_exe, &cached).unwrap(),
+            cached
+        );
+        assert_eq!(std::fs::read(&cached).unwrap(), b"running executable");
+        assert_eq!(
+            std::fs::metadata(&cached).unwrap().permissions().mode() & 0o777,
+            0o700
         );
     }
 
