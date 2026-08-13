@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::hel_chat::{TranscriptSnapshot, render_agent_message_preview};
 use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
-use crate::hel_quota::ProfileQuota;
+use crate::hel_quota::{ProfileQuota, QuotaWindow};
 use crate::hel_state::{HelState, SessionRecord, SessionResourceAllocation, SessionState};
 use crate::hel_targets::{
     AdditionalMount, DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage,
@@ -578,6 +578,12 @@ impl DashboardState {
         observed_at_epoch_seconds: u64,
     ) -> bool {
         let mut updated_latest_message = false;
+        let message_is_visible = matches!(self.mode, Mode::Dashboard)
+            && self.focus == Focus::Active
+            && partition_sessions(self.state.sessions.values(), &self.session_details)
+                .0
+                .get(self.session_index)
+                .is_some_and(|session| session.id == session_id);
         let viewed_through = self
             .state
             .sessions
@@ -608,7 +614,10 @@ impl DashboardState {
                             let message_id = adapter_message_id(payload);
                             let continues_message = detail.agent_text_stream_open
                                 && detail.last_agent_message_id == message_id;
-                            if !continues_message && event.seq > viewed_through {
+                            if !continues_message
+                                && event.seq > viewed_through
+                                && !message_is_visible
+                            {
                                 detail.unread_agent_message_sequences.push(event.seq);
                             }
                             if continues_message {
@@ -4019,9 +4028,11 @@ fn focus_border(focused: bool) -> BorderType {
     }
 }
 
-fn session_column_constraints() -> [Constraint; 5] {
+fn session_column_constraints() -> [Constraint; 6] {
     [
         Constraint::Length(10),
+        // Leave a little air before the profile column.
+        Constraint::Length(11),
         Constraint::Length(14),
         Constraint::Length(18),
         Constraint::Length(17),
@@ -4040,6 +4051,7 @@ fn archived_session_column_constraints() -> [Constraint; 4] {
 
 fn session_header() -> Row<'static> {
     Row::new([
+        "Unread",
         "Turn clock",
         "Profile",
         "Target",
@@ -4156,17 +4168,17 @@ fn session_name(session: &SessionRecord) -> &str {
     session.display_title()
 }
 
-fn session_name_line(session_name: String, unread_count: usize) -> Line<'static> {
-    let mut spans = vec![Span::raw(session_name)];
+fn unread_line(unread_count: usize) -> Line<'static> {
     if unread_count > 0 {
-        spans.push(Span::styled(
-            format!("  {unread_count} unread"),
+        Line::from(Span::styled(
+            format!("{unread_count} unread"),
             Style::default()
                 .fg(Color::Blue)
                 .add_modifier(Modifier::BOLD),
-        ));
+        ))
+    } else {
+        Line::default()
     }
-    Line::from(spans)
 }
 
 fn active_message_preview(detail: Option<&SessionDetail>, width: usize) -> Vec<Line<'static>> {
@@ -4205,13 +4217,15 @@ fn active_session_row(
         session_values(session, detail, now_epoch_seconds, config);
     let unread_count = detail.map_or(0, |detail| detail.unread_agent_message_sequences.len());
     Row::new([
+        Cell::from(unread_line(unread_count)),
         Cell::from(clock),
         Cell::from(profile),
         Cell::from(target),
         Cell::from(resources),
-        Cell::from(session_name_line(
-            recovery_warning_name(session, session_name, now_epoch_seconds),
-            unread_count,
+        Cell::from(recovery_warning_name(
+            session,
+            session_name,
+            now_epoch_seconds,
         )),
     ])
     .height(height)
@@ -4338,24 +4352,111 @@ fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
     );
 }
 
+fn quota_remaining_percent(window: &QuotaWindow) -> Option<u8> {
+    window
+        .remaining_percent
+        .map(|value| value.min(100))
+        .or_else(|| {
+            let (Some(used), Some(limit)) = (window.used, window.limit) else {
+                return None;
+            };
+            if limit <= 0 {
+                return None;
+            }
+            let remaining = i128::from(limit.saturating_sub(used).clamp(0, limit));
+            Some((remaining * 100 / i128::from(limit)) as u8)
+        })
+}
+
+fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
+    const CELLS: usize = 10;
+    const EIGHTHS_PER_CELL: usize = 8;
+    let Some(remaining) = window.and_then(quota_remaining_percent) else {
+        return Line::default();
+    };
+    let eighths = (usize::from(remaining) * CELLS * EIGHTHS_PER_CELL + 50) / 100;
+    let full_cells = eighths / EIGHTHS_PER_CELL;
+    let partial_eighths = eighths % EIGHTHS_PER_CELL;
+    let partial = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"][partial_eighths];
+    let empty_cells = CELLS
+        .saturating_sub(full_cells)
+        .saturating_sub(usize::from(partial_eighths > 0));
+    let color = match remaining {
+        0..=20 => Color::Red,
+        21..=50 => Color::Yellow,
+        _ => Color::Green,
+    };
+    let bar_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    Line::from(vec![
+        Span::styled("█".repeat(full_cells), bar_style),
+        Span::styled(partial.to_string(), bar_style),
+        Span::styled(
+            "░".repeat(empty_cells),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!(" {remaining:>3}%"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn quota_reset_summary(quota: &ProfileQuota) -> String {
+    let weekly = quota
+        .weekly_window()
+        .and_then(|window| window.resets.as_deref());
+    let five_hour = quota
+        .five_hour_projects_exhaustion()
+        .then(|| quota.five_hour_window())
+        .flatten()
+        .and_then(|window| window.resets.as_deref());
+    let mut summary = match (weekly, five_hour) {
+        (Some(weekly), Some(five_hour)) => format!("{weekly} / {five_hour}"),
+        (Some(weekly), None) => weekly.to_string(),
+        (None, Some(five_hour)) => five_hour.to_string(),
+        (None, None) => String::new(),
+    };
+    if let Some(extra) = quota.extra.as_deref() {
+        if !summary.is_empty() {
+            summary.push_str(" · ");
+        }
+        summary.push_str(extra);
+    }
+    summary
+}
+
 fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let rows = dashboard.config.profiles.iter().map(|(id, profile)| {
-        let usage = if dashboard.quota_refreshing.contains(id) {
-            "refreshing".into()
+        let (weekly, five_hour, resets) = if dashboard.quota_refreshing.contains(id) {
+            (Line::raw("refreshing…"), Line::default(), String::new())
         } else {
             match dashboard.quotas.get(id) {
-                Some(quota) => quota.compact(),
-                None => "refreshing".into(),
+                Some(quota) if quota.error.is_none() => (
+                    quota_bar(quota.weekly_window()),
+                    quota_bar(quota.five_hour_window()),
+                    quota_reset_summary(quota),
+                ),
+                Some(quota) => (
+                    Line::raw(format!(
+                        "unavailable: {}",
+                        quota.error.as_deref().unwrap_or("unknown error")
+                    )),
+                    Line::default(),
+                    String::new(),
+                ),
+                None => (Line::raw("refreshing…"), Line::default(), String::new()),
             }
         };
         Row::new([
             Cell::from(id.clone()),
             Cell::from(harness_label(profile.kind)),
-            Cell::from(usage),
+            Cell::from(weekly),
+            Cell::from(five_hour),
+            Cell::from(resets),
         ])
     });
     let refresh_status = if !dashboard.quota_refreshing.is_empty() {
@@ -4386,12 +4487,14 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         rows,
         [
             Constraint::Percentage(14),
-            Constraint::Percentage(12),
-            Constraint::Percentage(74),
+            Constraint::Percentage(10),
+            Constraint::Percentage(22),
+            Constraint::Percentage(22),
+            Constraint::Percentage(32),
         ],
     )
     .header(
-        Row::new(["Profile", "Harness", "Quota / reset / error"])
+        Row::new(["Profile", "Harness", "Weekly", "5H", "Resets"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .row_highlight_style(if quotas_focused {
@@ -6038,6 +6141,7 @@ mod tests {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
+        dashboard.focus = Focus::Quotas;
         dashboard.apply_worker_events(
             "session-1",
             &[
@@ -6051,10 +6155,10 @@ mod tests {
 
         let detail = dashboard.session_details.get("session-1").unwrap();
         assert_eq!(detail.unread_agent_message_sequences, [1, 4]);
-        let badge = session_name_line("session".into(), 2);
-        assert_eq!(badge.spans[1].content.as_ref(), "  2 unread");
+        let badge = unread_line(2);
+        assert_eq!(badge.spans[0].content.as_ref(), "2 unread");
         assert_eq!(
-            badge.spans[1].style,
+            badge.spans[0].style,
             Style::default()
                 .fg(Color::Blue)
                 .add_modifier(Modifier::BOLD)
@@ -6084,6 +6188,84 @@ mod tests {
                 .unread_agent_message_sequences
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn expanded_active_session_treats_incoming_messages_as_already_read() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+
+        dashboard.apply_worker_events(
+            "session-1",
+            &[adapter_text_event(
+                1,
+                "agent_message_chunk",
+                "visible response",
+            )],
+            100,
+        );
+
+        assert!(
+            dashboard.session_details["session-1"]
+                .unread_agent_message_sequences
+                .is_empty()
+        );
+
+        dashboard.focus = Focus::Quotas;
+        dashboard.apply_worker_events(
+            "session-1",
+            &[
+                adapter_text_event(2, "agent_thought_chunk", "new turn"),
+                adapter_text_event(3, "agent_message_chunk", "hidden response"),
+            ],
+            101,
+        );
+        assert_eq!(
+            dashboard.session_details["session-1"].unread_agent_message_sequences,
+            [3]
+        );
+    }
+
+    #[test]
+    fn active_status_row_leads_with_unread_and_separates_clock_from_profile() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.focus = Focus::Quotas;
+        dashboard.apply_worker_events(
+            "session-1",
+            &[adapter_text_event(
+                1,
+                "agent_message_chunk",
+                "hidden response",
+            )],
+            100,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(140, 28)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let lines = (terminal.backend().buffer().area.y..terminal.backend().buffer().area.bottom())
+            .map(|y| {
+                (terminal.backend().buffer().area.x..terminal.backend().buffer().area.right())
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let header = lines
+            .iter()
+            .find(|line| line.contains("Turn clock") && line.contains("Profile"))
+            .expect("active table header");
+        let clock_end = header.find("Turn clock").unwrap() + "Turn clock".len();
+        let profile_start = header.find("Profile").unwrap();
+        assert!(profile_start.saturating_sub(clock_end) >= 2);
+
+        let status = lines
+            .iter()
+            .find(|line| line.contains("1 unread") && line.contains("codex-1"))
+            .expect("active status row");
+        assert!(status.find("1 unread") < status.find("codex-1"));
     }
 
     #[test]
@@ -8233,5 +8415,114 @@ mod tests {
         assert!(!rendered.contains("Refreshed"));
         assert!(!rendered.contains("Access"));
         assert!(!rendered.contains("agent-full-access"));
+    }
+
+    #[test]
+    fn quota_bars_show_fractional_remaining_capacity_and_blank_missing_windows() {
+        let window = QuotaWindow {
+            label: "Week".into(),
+            remaining_percent: Some(73),
+            used: None,
+            limit: None,
+            resets: None,
+            resets_at_epoch_seconds: None,
+        };
+
+        let bar = quota_bar(Some(&window));
+        assert_eq!(
+            bar.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "███████▎░░  73%"
+        );
+        assert_eq!(bar.spans[0].style.fg, Some(Color::Green));
+        assert_eq!(bar.spans[2].style.fg, Some(Color::DarkGray));
+        assert!(quota_bar(None).spans.is_empty());
+    }
+
+    #[test]
+    fn quota_resets_add_five_hour_only_when_projected_to_exhaust() {
+        let mut quota = ProfileQuota {
+            profile_id: "codex-1".into(),
+            harness: HarnessKind::Codex,
+            windows: vec![
+                QuotaWindow {
+                    label: "Week".into(),
+                    remaining_percent: Some(73),
+                    used: None,
+                    limit: None,
+                    resets: Some("09:00 Aug 20".into()),
+                    resets_at_epoch_seconds: Some(604_800),
+                },
+                QuotaWindow {
+                    label: "5H".into(),
+                    remaining_percent: Some(80),
+                    used: None,
+                    limit: None,
+                    resets: Some("14:00 Aug 13".into()),
+                    resets_at_epoch_seconds: Some(14_400),
+                },
+            ],
+            extra: None,
+            error: None,
+            refreshed_at_epoch_seconds: 0,
+        };
+
+        assert_eq!(quota_reset_summary(&quota), "09:00 Aug 20");
+        quota.windows[1].remaining_percent = Some(70);
+        assert_eq!(quota_reset_summary(&quota), "09:00 Aug 20 / 14:00 Aug 13");
+    }
+
+    #[test]
+    fn quota_render_uses_weekly_five_hour_and_reset_columns() {
+        let quota = ProfileQuota {
+            profile_id: "codex-1".into(),
+            harness: HarnessKind::Codex,
+            windows: vec![
+                QuotaWindow {
+                    label: "Week".into(),
+                    remaining_percent: Some(73),
+                    used: None,
+                    limit: None,
+                    resets: Some("09:00 Aug 20".into()),
+                    resets_at_epoch_seconds: Some(604_800),
+                },
+                QuotaWindow {
+                    label: "5H".into(),
+                    remaining_percent: Some(70),
+                    used: None,
+                    limit: None,
+                    resets: Some("14:00 Aug 13".into()),
+                    resets_at_epoch_seconds: Some(14_400),
+                },
+            ],
+            extra: None,
+            error: None,
+            refreshed_at_epoch_seconds: 0,
+        };
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState::default(),
+            BTreeMap::from([("codex-1".into(), quota)]),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(140, 28)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Weekly"));
+        assert!(rendered.contains("5H"));
+        assert!(rendered.contains("Resets"));
+        assert!(rendered.contains("73%"));
+        assert!(rendered.contains("70%"));
+        assert!(rendered.contains("09:00 Aug 20 / 14:00 Aug 13"));
     }
 }

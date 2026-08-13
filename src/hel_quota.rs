@@ -43,6 +43,24 @@ pub struct ProfileQuota {
 }
 
 impl ProfileQuota {
+    pub(crate) fn weekly_window(&self) -> Option<&QuotaWindow> {
+        self.windows
+            .iter()
+            .find(|window| is_weekly_quota_window(&window.label))
+    }
+
+    pub(crate) fn five_hour_window(&self) -> Option<&QuotaWindow> {
+        self.windows
+            .iter()
+            .find(|window| is_short_quota_window(&window.label))
+    }
+
+    pub(crate) fn five_hour_projects_exhaustion(&self) -> bool {
+        self.five_hour_window().is_some_and(|window| {
+            projects_exhaustion_before_reset(window, self.refreshed_at_epoch_seconds)
+        })
+    }
+
     pub fn compact(&self) -> String {
         if let Some(error) = &self.error {
             return format!("unavailable: {error}");
@@ -80,6 +98,13 @@ impl ProfileQuota {
             parts.join(" · ")
         }
     }
+}
+
+fn is_weekly_quota_window(label: &str) -> bool {
+    matches!(
+        label.to_ascii_lowercase().as_str(),
+        "week" | "weekly" | "7d"
+    )
 }
 
 fn is_short_quota_window(label: &str) -> bool {
