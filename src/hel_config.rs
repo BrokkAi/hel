@@ -54,13 +54,6 @@ pub struct HarnessProfile {
     pub executable: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
-    /// Model override applied to the per-session copy of the harness config.
-    /// The controller-side home is never modified.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Reasoning-effort override (Codex `model_reasoning_effort`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
     /// Conservative byte budget for cross-harness transcript compaction.
     /// Bytes avoid pretending Hel has an accurate tokenizer for every model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,22 +86,6 @@ impl HarnessProfile {
                 "profile {id:?} must use `home`, not override {} in `environment`",
                 self.kind.home_env()
             );
-        }
-        if self.reasoning_effort.is_some() && self.kind != HarnessKind::Codex {
-            bail!("profile {id:?}: `reasoning_effort` is only supported for codex profiles");
-        }
-        if self.model.is_some() && self.kind == HarnessKind::Kimi {
-            bail!("profile {id:?}: `model` override is not supported for kimi profiles");
-        }
-        if let Some(model) = &self.model
-            && model.trim().is_empty()
-        {
-            bail!("profile {id:?} has an empty `model` override");
-        }
-        if let Some(effort) = &self.reasoning_effort
-            && effort.trim().is_empty()
-        {
-            bail!("profile {id:?} has an empty `reasoning_effort` override");
         }
         if self
             .context_window_bytes
@@ -478,6 +455,7 @@ impl HelConfig {
         if contents.trim().is_empty() {
             return Ok(Self::default());
         }
+        reject_removed_profile_overrides(&contents)?;
         let config: Self = toml::from_str(&contents)
             .with_context(|| format!("parse Hel config {}", path.display()))?;
         config.validate()?;
@@ -493,6 +471,26 @@ impl HelConfig {
         let body = toml::to_string_pretty(self).context("serialize Hel config")?;
         atomic_write(path, body.as_bytes())
     }
+}
+
+fn reject_removed_profile_overrides(contents: &str) -> Result<()> {
+    let value: toml::Value = contents.parse().context("parse Hel config TOML")?;
+    let Some(profiles) = value.get("profiles").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    for (id, profile) in profiles {
+        let Some(profile) = profile.as_table() else {
+            continue;
+        };
+        for key in ["model", "reasoning_effort"] {
+            if profile.contains_key(key) {
+                bail!(
+                    "profile {id:?}: `{key}` is no longer supported; configure it in the harness home or change it per session with `/config`"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn config_dir() -> PathBuf {
@@ -629,8 +627,6 @@ mod tests {
             profiles: BTreeMap::from([(
                 "codex-1".into(),
                 HarnessProfile {
-                    model: None,
-                    reasoning_effort: None,
                     context_window_bytes: None,
                     kind: HarnessKind::Codex,
                     home: PathBuf::from("/home/test/.codex-one"),
@@ -805,6 +801,20 @@ mod tests {
         let path = directory.path().join("config.toml");
         fs::write(&path, "\n\t").unwrap();
         assert_eq!(HelConfig::load_from(&path).unwrap(), HelConfig::default());
+    }
+
+    #[test]
+    fn removed_profile_overrides_have_an_actionable_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "version = 1\n[profiles.codex]\nkind = \"codex\"\nhome = \"/tmp/codex\"\nmodel = \"gpt-old\"\n",
+        )
+        .unwrap();
+        let error = HelConfig::load_from(&path).unwrap_err().to_string();
+        assert!(error.contains("`model` is no longer supported"));
+        assert!(error.contains("/config"));
     }
 
     #[test]

@@ -830,8 +830,6 @@ mod tests {
             profiles: BTreeMap::from([(
                 "codex-1".into(),
                 HarnessProfile {
-                    model: None,
-                    reasoning_effort: None,
                     context_window_bytes: None,
                     kind: HarnessKind::Codex,
                     home: "/highly/secret/codex".into(),
@@ -1026,8 +1024,6 @@ mod tests {
         config.profiles.insert(
             "claude-1".into(),
             HarnessProfile {
-                model: None,
-                reasoning_effort: None,
                 context_window_bytes: None,
                 kind: HarnessKind::Claude,
                 home: "/secret/claude".into(),

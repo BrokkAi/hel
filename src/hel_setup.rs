@@ -286,8 +286,6 @@ pub fn build_config(
                 home: home.path.clone(),
                 executable: None,
                 environment: BTreeMap::new(),
-                model: None,
-                reasoning_effort: None,
                 context_window_bytes: None,
             },
         );
