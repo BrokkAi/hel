@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const READY_MARKER: &[u8] = b"Welcome to Hel.";
+const READY_MARKER: &[u8] = b"Active";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 struct ReapChild(Option<Child>);

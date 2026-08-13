@@ -503,6 +503,7 @@ pub struct DashboardState {
     pane_areas: Option<[Rect; DASHBOARD_PANE_COUNT]>,
     mode: Mode,
     notice: Option<String>,
+    greeting: String,
 }
 
 impl DashboardState {
@@ -521,9 +522,14 @@ impl DashboardState {
             pane_areas: None,
             mode: Mode::Dashboard,
             notice: None,
+            greeting: "Welcome to Hel".into(),
         };
         dashboard.clamp_selections();
         dashboard
+    }
+
+    pub fn set_greeting(&mut self, greeting: String) {
+        self.greeting = greeting;
     }
 
     pub fn set_config(&mut self, config: HelConfig) {
@@ -3300,7 +3306,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
             Constraint::Length(2),
         ])
         .split(area);
-    render_dashboard_title(frame, layout[0]);
+    render_dashboard_title(frame, layout[0], &dashboard.greeting);
 
     render_onboarding(frame, layout[1], dashboard);
     render_capacity(frame, layout[2], dashboard);
@@ -3321,10 +3327,10 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     }
 }
 
-fn render_dashboard_title(frame: &mut Frame, area: Rect) {
+fn render_dashboard_title(frame: &mut Frame, area: Rect, greeting: &str) {
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "Welcome to Hel.",
+            greeting,
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -3467,7 +3473,7 @@ fn render_adaptive_dashboard(
             Constraint::Length(2),
         ])
         .split(inner);
-    render_dashboard_title(frame, fixed[0]);
+    render_dashboard_title(frame, fixed[0], &dashboard.greeting);
     let panes = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
@@ -5806,7 +5812,7 @@ mod tests {
         };
 
         assert_eq!(buffer[(buffer.area.x, buffer.area.y)].symbol(), " ");
-        assert!(line(buffer.area.y).contains("Welcome to Hel."));
+        assert!(line(buffer.area.y).contains("Welcome to Hel"));
         assert!(!line(buffer.area.y).contains("ACP sessions"));
         assert!(line(buffer.area.y + 1).contains("Active"));
         let accelerator = if cfg!(target_os = "macos") {
@@ -8273,12 +8279,33 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Welcome to Hel."));
+        assert!(rendered.contains("Welcome to Hel"));
         assert!(rendered.contains("Hel needs a little fuel."));
         assert_eq!(
             dashboard.handle_key(ctrl_key('e')),
             DashboardAction::OpenConfig
         );
+    }
+
+    #[test]
+    fn startup_greeting_does_not_change_with_dashboard_updates() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.set_greeting("A fixed greeting".into());
+        dashboard.set_state(HelState::default());
+        dashboard.set_quotas(BTreeMap::new());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("A fixed greeting"));
     }
 
     #[test]

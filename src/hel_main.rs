@@ -18,6 +18,7 @@ use crossterm::terminal::{
 };
 use hel::hel_config::{HelConfig, ProjectBundle, ProjectRepository, config_path, sessions_dir};
 use hel::hel_controller::{Controller, SessionLaunchOptions};
+use hel::hel_greeting::{GreetingFacts, RepositoryGreetingFacts};
 use hel::hel_import::{
     BundleResolution, ClaudeImportRequest, ClaudeSessionSelection, CodexImportRequest,
     CodexSessionSelection, ImportArchiveProgress, ImportControl, KimiImportRequest,
@@ -32,7 +33,9 @@ use hel::hel_import::{
 use hel::hel_quota::{ProfileQuota, QuotaManager, QuotaRefreshRequest};
 use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapshot};
 use hel::hel_setup::{SetupOutcome, github_repository_from_origin, run_setup_dialog};
-use hel::hel_state::{HelState, SessionResourceAllocation, SessionState, harness_session_title};
+use hel::hel_state::{
+    HelState, SessionResourceAllocation, SessionState, TargetLocator, harness_session_title,
+};
 use hel::hel_targets::{
     CommandOutput, CommandSpec, DeploymentCapacityKind, DeploymentCapacityTarget,
     DeploymentCapacityUsage, ProcessExecutor, SessionResourceProbe, SessionResourceUsage,
@@ -1763,19 +1766,111 @@ struct ActiveDashboardImport {
     cancelled: Arc<AtomicBool>,
 }
 
+fn startup_greeting(controller: &Controller) -> String {
+    let active = controller
+        .state
+        .sessions
+        .values()
+        .filter(|session| session.state.is_active())
+        .collect::<Vec<_>>();
+    let raw_localhost_active = active
+        .iter()
+        .any(|session| matches!(session.target, Some(TargetLocator::LocalBare { .. })));
+    let container_active = active.iter().any(|session| {
+        matches!(
+            session.target,
+            Some(
+                TargetLocator::LocalPodman { .. }
+                    | TargetLocator::AppleContainer { .. }
+                    | TargetLocator::SshPodman { .. }
+            )
+        )
+    });
+    let remote_active = active.iter().any(|session| {
+        matches!(
+            session.target,
+            Some(
+                TargetLocator::AwsEc2 { .. }
+                    | TargetLocator::SshBare { .. }
+                    | TargetLocator::SshPodman { .. }
+            )
+        )
+    });
+    let facts = GreetingFacts {
+        first_name: git_output(&["config", "--get", "user.name"])
+            .and_then(|name| name.split_whitespace().next().map(str::to_owned)),
+        returning: !controller.state.sessions.is_empty(),
+        profile_count: controller.config.profiles.len(),
+        active_sessions: active.len(),
+        paused_sessions: controller
+            .state
+            .sessions
+            .values()
+            .filter(|session| session.state == SessionState::Archived)
+            .count(),
+        raw_localhost_active,
+        container_active,
+        remote_active,
+        repository: repository_greeting_facts(),
+        ..GreetingFacts::default()
+    };
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    hel::hel_greeting::select(&facts, seed)
+}
+
+fn repository_greeting_facts() -> Option<RepositoryGreetingFacts> {
+    git_output(&["rev-parse", "--is-inside-work-tree"]).filter(|answer| answer == "true")?;
+    let status = git_output(&["status", "--porcelain=v1"])?;
+    let conflicted = git_output(&["diff", "--name-only", "--diff-filter=U"])
+        .is_some_and(|paths| !paths.is_empty());
+    let (ahead, behind) =
+        git_output(&["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
+            .and_then(|counts| {
+                let mut counts = counts.split_whitespace();
+                Some((
+                    counts.next()?.parse::<u64>().ok()?,
+                    counts.next()?.parse::<u64>().ok()?,
+                ))
+            })
+            .unwrap_or_default();
+    Some(RepositoryGreetingFacts {
+        clean: status.is_empty(),
+        dirty: !status.is_empty(),
+        ahead: ahead > 0 && behind == 0,
+        behind: behind > 0 && ahead == 0,
+        diverged_or_conflicted: conflicted || (ahead > 0 && behind > 0),
+    })
+}
+
+fn git_output(arguments: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(arguments)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
 async fn run_dashboard() -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        println!("Welcome to Hel.");
+        println!("Welcome to Hel");
         println!("Run `hel doctor` for non-interactive validation.");
         return Ok(());
     }
 
     let mut controller = Controller::load()?;
+    let greeting = startup_greeting(&controller);
     let mut dashboard = DashboardState::new(
         controller.config.clone(),
         controller.state.clone(),
         std::collections::BTreeMap::new(),
     );
+    dashboard.set_greeting(greeting);
     let mut terminal = TerminalGuard::enter()?;
     if configuration_needs_setup(&controller.config) {
         terminal.suspend()?;
