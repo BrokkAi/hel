@@ -2106,8 +2106,10 @@ async fn run_dashboard() -> Result<()> {
                             }
                         };
                         controller = updated_controller;
+                        dashboard.set_state(controller.state.clone());
                         match provision_result {
                             Ok(()) => {
+                                dashboard.select_active_session(&session_id);
                                 dashboard.set_notice(format!(
                                     "Target ready for {}; connecting worker",
                                     short_id(&session_id)
@@ -2122,7 +2124,6 @@ async fn run_dashboard() -> Result<()> {
                                 dashboard.set_notice(format!("Provisioning failed: {error:#}"))
                             }
                         }
-                        dashboard.set_state(controller.state.clone());
                         refresh_dashboard_poll_targets(
                             &controller,
                             &worker_targets_tx,

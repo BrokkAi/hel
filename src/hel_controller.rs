@@ -603,40 +603,41 @@ impl Controller {
         if session.state != SessionState::Provisioning {
             bail!("session {session_id} is not provisioning");
         }
-        let template = self
-            .config
-            .targets
-            .get(&session.target_template_id)
-            .context("target template disappeared during provisioning")?;
-        if matches!(template, TargetTemplate::AwsEc2 { .. }) {
-            for resource in &session.additional_mounts {
-                ensure!(
-                    resource.source.is_dir(),
-                    "attached resource source is not a directory: {}",
-                    resource.source.display()
-                );
+        // Once registration succeeds, every subsequent failure must remove the
+        // provisional record. Keep planning, preflight, creation, and locator
+        // discovery in one result so no early `?` can strand a session.
+        let result = (|| {
+            let template = self
+                .config
+                .targets
+                .get(&session.target_template_id)
+                .context("target template disappeared during provisioning")?;
+            if matches!(template, TargetTemplate::AwsEc2 { .. }) {
+                for resource in &session.additional_mounts {
+                    ensure!(
+                        resource.source.is_dir(),
+                        "attached resource source is not a directory: {}",
+                        resource.source.display()
+                    );
+                }
             }
-        }
-        let bundle = self
-            .config
-            .bundles
-            .get(&session.bundle_id)
-            .context("project bundle disappeared during provisioning")?;
-        let target = backend_target(template, session.resource_allocation.as_ref())?;
-        let bundle = backend_bundle(bundle)?;
-        let runtime_mounts = if matches!(target, hel_targets::TargetTemplate::AwsEc2(_)) {
-            &[][..]
-        } else {
-            session.additional_mounts.as_slice()
-        };
-        let provision = hel_targets::provision_plan(&target, session_id, &bundle, runtime_mounts)?;
+            let bundle = self
+                .config
+                .bundles
+                .get(&session.bundle_id)
+                .context("project bundle disappeared during provisioning")?;
+            let target = backend_target(template, session.resource_allocation.as_ref())?;
+            let bundle = backend_bundle(bundle)?;
+            let runtime_mounts = if matches!(target, hel_targets::TargetTemplate::AwsEc2(_)) {
+                &[][..]
+            } else {
+                session.additional_mounts.as_slice()
+            };
+            let provision =
+                hel_targets::provision_plan(&target, session_id, &bundle, runtime_mounts)?;
 
-        let result =
-            preflight_target(template, executor).and_then(|()| provision.execute(executor));
-        // Everything after resource creation must funnel through the error
-        // branch below: an early `?` here once left records stuck in
-        // Provisioning with a live, untracked cloud resource.
-        let result = result.and_then(|outputs| {
+            let outputs =
+                preflight_target(template, executor).and_then(|()| provision.execute(executor))?;
             locator_after_provision(
                 template,
                 &target,
@@ -651,28 +652,10 @@ impl Controller {
                     None => error,
                 }
             })
-        });
-        match result {
-            Ok(locator) => {
-                let record = self.state.sessions.get_mut(session_id).unwrap();
-                record.target = Some(locator);
-                // Provisioning has completed, but Running is reserved for a
-                // successful worker handshake.
-                record.state = SessionState::Disconnected;
-                record.updated_at = now();
-                record.last_error = None;
-                self.state.save()?;
-                Ok(())
-            }
-            Err(error) => {
-                let record = self.state.sessions.get_mut(session_id).unwrap();
-                record.state = SessionState::Error;
-                record.updated_at = now();
-                record.last_error = Some(format!("{error:#}"));
-                self.state.save()?;
-                Err(error)
-            }
-        }
+        })();
+        let result = apply_new_session_provisioning_result(&mut self.state, session_id, result);
+        self.state.save()?;
+        result
     }
 
     pub fn mark_worker_connected(
@@ -1568,6 +1551,29 @@ impl Controller {
         record.target = None;
         record.updated_at = now();
         self.state.save()
+    }
+}
+
+fn apply_new_session_provisioning_result(
+    state: &mut HelState,
+    session_id: &str,
+    result: Result<TargetLocator>,
+) -> Result<()> {
+    match result {
+        Ok(locator) => {
+            let record = state.sessions.get_mut(session_id).unwrap();
+            record.target = Some(locator);
+            // Provisioning has completed, but Running is reserved for a
+            // successful worker handshake.
+            record.state = SessionState::Disconnected;
+            record.updated_at = now();
+            record.last_error = None;
+            Ok(())
+        }
+        Err(error) => {
+            state.sessions.remove(session_id);
+            Err(error)
+        }
     }
 }
 
@@ -3950,6 +3956,42 @@ mod tests {
             std::fs::metadata(&cached).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn failed_new_session_provisioning_discards_provisional_record() {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let record = SessionRecord {
+            id: session_id.into(),
+            title: "new session".into(),
+            harness_kind: crate::hel_config::HarnessKind::Codex,
+            last_profile: "codex".into(),
+            bundle_id: "project".into(),
+            target_template_id: "podman".into(),
+            resource_allocation: None,
+            additional_mounts: Vec::new(),
+            state: SessionState::Provisioning,
+            target: None,
+            native_session_id: None,
+            acp_session_title: None,
+            session_title_override: None,
+            created_at: "2026-08-12T00:00:00Z".into(),
+            updated_at: "2026-08-12T00:00:00Z".into(),
+            last_viewed_event_sequence: 0,
+            last_error: None,
+            checkpoint: None,
+        };
+        let mut state = HelState::default();
+        state.sessions.insert(session_id.into(), record);
+
+        let result = apply_new_session_provisioning_result(
+            &mut state,
+            session_id,
+            Err(anyhow::anyhow!("container creation failed")),
+        );
+
+        assert!(result.is_err());
+        assert!(!state.sessions.contains_key(session_id));
     }
 
     #[test]

@@ -5665,10 +5665,10 @@ mod tests {
     }
 
     #[test]
-    fn restored_session_can_be_focused_by_identity() {
-        let mut restored = archived_session();
-        restored.id = "restored".into();
-        restored.state = SessionState::Running;
+    fn newly_ready_session_can_be_selected_after_state_refresh() {
+        let mut new_session = archived_session();
+        new_session.id = "new-session".into();
+        new_session.state = SessionState::Running;
         let mut other = archived_session();
         other.id = "other".into();
         other.state = SessionState::Running;
@@ -5676,20 +5676,22 @@ mod tests {
             config(),
             HelState {
                 version: STATE_VERSION,
-                sessions: BTreeMap::from([
-                    (restored.id.clone(), restored),
-                    (other.id.clone(), other),
-                ]),
+                sessions: BTreeMap::from([(other.id.clone(), other)]),
                 mount_history: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
         dashboard.focus = Focus::Archived;
 
-        dashboard.select_active_session("restored");
+        let mut refreshed = dashboard.state.clone();
+        refreshed
+            .sessions
+            .insert(new_session.id.clone(), new_session);
+        dashboard.set_state(refreshed);
+        dashboard.select_active_session("new-session");
 
         assert_eq!(dashboard.focus, Focus::Active);
-        assert_eq!(dashboard.selected_session().unwrap().id, "restored");
+        assert_eq!(dashboard.selected_session().unwrap().id, "new-session");
     }
 
     #[test]
