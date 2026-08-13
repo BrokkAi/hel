@@ -2950,6 +2950,77 @@ mod tests {
     }
 
     #[test]
+    fn advertised_plan_and_goal_commands_are_forwarded_unchanged() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.apply_session_update(
+            1,
+            &serde_json::json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {"name": "plan", "description": "toggle plan mode"},
+                    {"name": "goal", "description": "set a persistent goal", "input": {"hint": "objective"}}
+                ]
+            }),
+        );
+        assert!(
+            chat.command_choices
+                .iter()
+                .any(|command| command.name == "plan")
+        );
+        assert!(
+            chat.command_choices
+                .iter()
+                .any(|command| command.name == "goal")
+        );
+
+        chat.input = "/plan".into();
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::Prompt("/plan".into())
+        );
+
+        chat.input = "/goal ship the release".into();
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::Prompt("/goal ship the release".into())
+        );
+    }
+
+    #[test]
+    fn command_updates_replace_stale_adapter_capabilities() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        for available_commands in [
+            serde_json::json!([
+                {"name": "plan", "description": "toggle plan mode"},
+                {"name": "goal", "description": "set a persistent goal"}
+            ]),
+            serde_json::json!([
+                {"name": "plan", "description": "toggle plan mode"}
+            ]),
+        ] {
+            chat.apply_session_update(
+                1,
+                &serde_json::json!({
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": available_commands
+                }),
+            );
+        }
+
+        assert!(
+            chat.command_choices
+                .iter()
+                .any(|command| command.name == "plan")
+        );
+        assert!(
+            !chat
+                .command_choices
+                .iter()
+                .any(|command| command.name == "goal")
+        );
+    }
+
+    #[test]
     fn config_value_autocomplete_uses_advertised_acp_choices() {
         use agent_client_protocol::schema::v1::{
             SessionConfigSelectOption, SessionConfigSelectOptions,

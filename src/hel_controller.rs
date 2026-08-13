@@ -2973,7 +2973,7 @@ fn bridge_launch(
             "sh".into(),
             vec![
                 "-lc".into(),
-                format!("if command -v claude-agent-acp >/dev/null 2>&1; then exec claude-agent-acp; fi; {}; exec npx -y @agentclientprotocol/claude-agent-acp@0.63.0", ensure_node_script()),
+                format!("if command -v claude-agent-acp >/dev/null 2>&1; then exec claude-agent-acp; fi; {}; exec npx -y @agentclientprotocol/claude-agent-acp@0.66.0", ensure_node_script()),
             ],
         ),
         crate::hel_config::HarnessKind::Kimi => (
@@ -3608,6 +3608,15 @@ mod tests {
             packaged_worker_binary_path(directory, "aarch64-unknown-linux-musl"),
             directory.join("hel-worker-aarch64-unknown-linux-musl")
         );
+    }
+
+    #[test]
+    fn default_bridges_pin_command_capable_adapter_versions() {
+        let (_, codex_arguments) = bridge_launch(crate::hel_config::HarnessKind::Codex, None);
+        assert!(codex_arguments[1].contains("@agentclientprotocol/codex-acp@1.1.14"));
+
+        let (_, claude_arguments) = bridge_launch(crate::hel_config::HarnessKind::Claude, None);
+        assert!(claude_arguments[1].contains("@agentclientprotocol/claude-agent-acp@0.66.0"));
     }
 
     #[test]

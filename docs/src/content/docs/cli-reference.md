@@ -55,11 +55,17 @@ control](/remote/) for behavioral boundaries.
 | `/memory` | List stored memories and the use/generate toggles |
 | `/memory add [--global] <text>` | Save a memory for this project (or globally) |
 | `/compact` | Compact the primary agent's session where supported |
+| `/plan` | Toggle the selected agent's native planning mode where advertised |
+| `/goal OBJECTIVE` | Start the selected agent's native persistent-goal workflow where advertised |
 | `/subagents` | Open the session-wide actor roster and its retained transcripts |
 | `/ragnarok TASK` | Summon the model-vs-model arena for one implementation task |
 
-The interactive autocomplete is the source of truth for commands in the
-installed version.
+Agent commands are capability-driven. Codex advertises `/plan` and `/goal`,
+Claude advertises both with a compatible recent adapter, and Kimi Code
+advertises `/plan` but not `/goal` in compatible releases. Older or custom
+adapter executables may expose fewer commands. The interactive autocomplete is
+the source of truth for the active session; Hel does not emulate a missing
+command or expose the adapters' general permission modes.
 
 ## Keyboard basics
 
