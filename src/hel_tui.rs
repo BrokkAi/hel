@@ -134,6 +134,7 @@ enum WizardStep {
     Profile,
     Bundle,
     Target,
+    Review,
     Mounts,
     NewBundle,
 }
@@ -154,6 +155,7 @@ struct NewWizard {
     bundle: usize,
     target: usize,
     mounts: MountWizard,
+    review_focus: ReviewFocus,
     new_bundle_source: String,
     resource_allocation: Option<SessionResourceAllocation>,
     aws_options: BTreeMap<String, Vec<SessionResourceAllocation>>,
@@ -164,6 +166,14 @@ struct NewWizard {
 enum MountFocus {
     Source,
     Destination,
+    Cancel,
+    Back,
+    Add,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewFocus {
+    Attachments,
     Cancel,
     Back,
     Add,
@@ -179,6 +189,10 @@ struct MountWizard {
     history: Vec<std::path::PathBuf>,
     history_index: usize,
     completion_cache: BTreeMap<String, Vec<String>>,
+    completion_candidates: Vec<String>,
+    completion_index: usize,
+    error: Option<String>,
+    editing_mount: Option<usize>,
 }
 
 impl MountWizard {
@@ -191,6 +205,10 @@ impl MountWizard {
             history,
             history_index: 0,
             completion_cache: BTreeMap::new(),
+            completion_candidates: Vec::new(),
+            completion_index: 0,
+            error: None,
+            editing_mount: None,
         }
     }
 
@@ -201,13 +219,20 @@ impl MountWizard {
     }
 
     fn add_validated_mount(&mut self) {
-        self.mounts.push(AdditionalMount {
+        let mount = AdditionalMount {
             source: self.source.clone().into(),
             destination: self.destination.clone().into(),
-        });
+        };
+        if let Some(index) = self.editing_mount.take() {
+            self.mounts[index] = mount;
+        } else {
+            self.mounts.push(mount);
+        }
         self.source.clear();
         self.destination.clear();
         self.focus = MountFocus::Source;
+        self.completion_candidates.clear();
+        self.error = None;
     }
 }
 
@@ -219,6 +244,7 @@ struct ResumeWizard {
     profile: usize,
     target: usize,
     mounts: MountWizard,
+    review_focus: ReviewFocus,
     resource_allocation: Option<SessionResourceAllocation>,
     aws_options: BTreeMap<String, Vec<SessionResourceAllocation>>,
     sizing_error: Option<String>,
@@ -319,6 +345,90 @@ fn cycle_wizard_focus(current: WizardFocus, has_back: bool, reverse: bool) -> Wi
             reverse,
         )
     }
+}
+
+fn review_focus_order(can_attach: bool, has_attachments: bool) -> Vec<ReviewFocus> {
+    let mut order = Vec::new();
+    if has_attachments {
+        order.push(ReviewFocus::Attachments);
+    }
+    order.extend([ReviewFocus::Cancel, ReviewFocus::Back]);
+    if can_attach {
+        order.push(ReviewFocus::Add);
+    }
+    order.push(ReviewFocus::Submit);
+    order
+}
+
+fn remove_selected_mount(mounts: &mut MountWizard) {
+    if mounts.mounts.is_empty() {
+        return;
+    }
+    mounts.mounts.remove(mounts.history_index);
+    mounts.history_index = mounts
+        .history_index
+        .min(mounts.mounts.len().saturating_sub(1));
+}
+
+fn prepare_mount_editor(step: &mut WizardStep, mounts: &mut MountWizard) {
+    mounts.source.clear();
+    mounts.destination.clear();
+    mounts.focus = MountFocus::Source;
+    mounts.error = None;
+    mounts.editing_mount = None;
+    mounts.completion_candidates.clear();
+    *step = WizardStep::Mounts;
+}
+
+fn prepare_selected_mount_editor(step: &mut WizardStep, mounts: &mut MountWizard) {
+    if mounts.mounts.is_empty() {
+        return;
+    }
+    let index = mounts.history_index;
+    let mount = &mounts.mounts[index];
+    mounts.source = mount.source.to_string_lossy().into_owned();
+    mounts.destination = mount.destination.to_string_lossy().into_owned();
+    mounts.focus = MountFocus::Source;
+    mounts.error = None;
+    mounts.editing_mount = Some(index);
+    mounts.completion_candidates.clear();
+    *step = WizardStep::Mounts;
+}
+
+fn begin_mount_editor(wizard: &mut NewWizard) {
+    prepare_mount_editor(&mut wizard.step, &mut wizard.mounts);
+}
+
+fn edit_selected_mount(wizard: &mut NewWizard) {
+    prepare_selected_mount_editor(&mut wizard.step, &mut wizard.mounts);
+}
+
+fn begin_resume_mount_editor(wizard: &mut ResumeWizard) {
+    prepare_mount_editor(&mut wizard.step, &mut wizard.mounts);
+}
+
+fn edit_selected_resume_mount(wizard: &mut ResumeWizard) {
+    prepare_selected_mount_editor(&mut wizard.step, &mut wizard.mounts);
+}
+
+fn validate_mount_entry(mounts: &MountWizard) -> Option<String> {
+    let mount = AdditionalMount {
+        source: mounts.source.clone().into(),
+        destination: mounts.destination.clone().into(),
+    };
+    if let Err(error) = crate::hel_targets::validate_additional_mounts(std::slice::from_ref(&mount))
+    {
+        return Some(error.to_string());
+    }
+    let duplicate = mounts.mounts.iter().enumerate().any(|(index, existing)| {
+        Some(index) != mounts.editing_mount && existing.destination == mount.destination
+    });
+    duplicate.then(|| {
+        format!(
+            "{} is already an attached directory destination.",
+            mount.destination.display()
+        )
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1096,6 +1206,9 @@ impl DashboardState {
         if wizard.step == WizardStep::Mounts {
             return self.handle_mount_key(code, wizard);
         }
+        if wizard.step == WizardStep::Review {
+            return self.handle_new_review_key(code, wizard);
+        }
         let has_back = wizard.step != WizardStep::Profile;
         if matches!(code, KeyCode::Tab | KeyCode::BackTab) {
             wizard.focus = cycle_wizard_focus(wizard.focus, has_back, code == KeyCode::BackTab);
@@ -1110,6 +1223,7 @@ impl DashboardState {
             wizard.step = match wizard.step {
                 WizardStep::Bundle => WizardStep::Profile,
                 WizardStep::Target => WizardStep::Bundle,
+                WizardStep::Review => WizardStep::Target,
                 WizardStep::NewBundle => WizardStep::Bundle,
                 WizardStep::Profile => WizardStep::Profile,
                 WizardStep::Mounts => unreachable!("mount input is handled above"),
@@ -1155,7 +1269,11 @@ impl DashboardState {
             && wizard.focus == WizardFocus::Content
             && matches!(
                 code,
-                KeyCode::Char('+') | KeyCode::Char('-') | KeyCode::Char('r')
+                KeyCode::Char('+')
+                    | KeyCode::Char('-')
+                    | KeyCode::Char('r')
+                    | KeyCode::Char('c')
+                    | KeyCode::Char('m')
             )
         {
             self.adjust_new_resources(&mut wizard, code);
@@ -1166,6 +1284,7 @@ impl DashboardState {
             WizardStep::Profile => self.config.profiles.len(),
             WizardStep::Bundle => self.config.bundles.len() + 1,
             WizardStep::Target => self.config.targets.len(),
+            WizardStep::Review => unreachable!("review input is handled above"),
             WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
             WizardStep::NewBundle => unreachable!("bundle input is handled above"),
         };
@@ -1200,6 +1319,7 @@ impl DashboardState {
                 }
                 WizardStep::Bundle => WizardStep::Profile,
                 WizardStep::Target => WizardStep::Bundle,
+                WizardStep::Review => WizardStep::Target,
                 WizardStep::Mounts => {
                     unreachable!("mount input is handled before picker navigation")
                 }
@@ -1255,29 +1375,88 @@ impl DashboardState {
                     self.mode = Mode::New(wizard);
                     return DashboardAction::None;
                 }
-                if let Some(host) = mount_history_host(target) {
-                    wizard.step = WizardStep::Mounts;
-                    wizard.mounts = MountWizard::new(
-                        self.state
-                            .mount_history
-                            .get(host)
-                            .cloned()
-                            .unwrap_or_default(),
-                    );
-                    self.mode = Mode::New(wizard);
-                    DashboardAction::None
-                } else {
-                    self.create_session_action(&wizard)
-                }
+                wizard.step = WizardStep::Review;
+                wizard.review_focus = ReviewFocus::Submit;
+                wizard.mounts = MountWizard::new(
+                    mount_history_host(target)
+                        .and_then(|host| self.state.mount_history.get(host))
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+                self.mode = Mode::New(wizard);
+                DashboardAction::None
             }
+            WizardStep::Review => unreachable!("review input is handled before picker navigation"),
             WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
             WizardStep::NewBundle => unreachable!("bundle input is handled above"),
         }
     }
 
+    fn handle_new_review_key(&mut self, code: KeyCode, mut wizard: NewWizard) -> DashboardAction {
+        let can_attach =
+            mount_history_host(&self.config.targets[&nth_key(&self.config.targets, wizard.target)])
+                .is_some();
+        let order = review_focus_order(can_attach, !wizard.mounts.mounts.is_empty());
+        match code {
+            KeyCode::Tab | KeyCode::BackTab => {
+                wizard.review_focus =
+                    cycle_control(wizard.review_focus, &order, code == KeyCode::BackTab);
+            }
+            KeyCode::Up if wizard.review_focus == ReviewFocus::Attachments => {
+                move_index(
+                    &mut wizard.mounts.history_index,
+                    wizard.mounts.mounts.len(),
+                    -1,
+                );
+            }
+            KeyCode::Down if wizard.review_focus == ReviewFocus::Attachments => {
+                move_index(
+                    &mut wizard.mounts.history_index,
+                    wizard.mounts.mounts.len(),
+                    1,
+                );
+            }
+            KeyCode::Delete if wizard.review_focus == ReviewFocus::Attachments => {
+                remove_selected_mount(&mut wizard.mounts);
+                wizard.review_focus = if wizard.mounts.mounts.is_empty() {
+                    ReviewFocus::Submit
+                } else {
+                    ReviewFocus::Attachments
+                };
+            }
+            KeyCode::Enter => match wizard.review_focus {
+                ReviewFocus::Attachments => edit_selected_mount(&mut wizard),
+                ReviewFocus::Cancel => {
+                    self.cancel_modal();
+                    return DashboardAction::None;
+                }
+                ReviewFocus::Back => {
+                    wizard.step = WizardStep::Target;
+                    wizard.focus = WizardFocus::Content;
+                }
+                ReviewFocus::Add if can_attach => begin_mount_editor(&mut wizard),
+                ReviewFocus::Add => {}
+                ReviewFocus::Submit => return self.create_session_action(&wizard),
+            },
+            KeyCode::Esc => {
+                self.cancel_modal();
+                return DashboardAction::None;
+            }
+            _ => {}
+        }
+        self.mode = Mode::New(wizard);
+        DashboardAction::None
+    }
+
     fn handle_mount_key(&mut self, code: KeyCode, mut wizard: NewWizard) -> DashboardAction {
         let target_template_id = nth_key(&self.config.targets, wizard.target);
         match code {
+            KeyCode::Tab
+                if wizard.mounts.focus == MountFocus::Source
+                    && !wizard.mounts.source.is_empty() =>
+            {
+                self.complete_new_mount_source(wizard, target_template_id)
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 wizard.mounts.focus = cycle_control(
                     wizard.mounts.focus,
@@ -1287,37 +1466,38 @@ impl DashboardState {
                         MountFocus::Cancel,
                         MountFocus::Back,
                         MountFocus::Add,
-                        MountFocus::Submit,
                     ],
                     code == KeyCode::BackTab,
                 );
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
             }
-            KeyCode::Delete if wizard.mounts.focus == MountFocus::Source => {
-                wizard.mounts.mounts.pop();
+            KeyCode::F(2) if wizard.mounts.focus == MountFocus::Source => {
+                self.complete_new_mount_source(wizard, target_template_id)
+            }
+            KeyCode::Up
+                if wizard.mounts.focus == MountFocus::Source
+                    && !wizard.mounts.completion_candidates.is_empty() =>
+            {
+                move_index(
+                    &mut wizard.mounts.completion_index,
+                    wizard.mounts.completion_candidates.len(),
+                    -1,
+                );
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
             }
-            KeyCode::F(2) if wizard.mounts.focus == MountFocus::Source => {
-                let prefix = wizard.mounts.source.clone();
-                if prefix.is_empty() {
-                    self.mode = Mode::New(wizard);
-                    return DashboardAction::None;
-                }
-                if let Some(candidates) = wizard.mounts.completion_cache.get(&prefix) {
-                    if let Some(completed) = path_completion(&prefix, candidates) {
-                        wizard.mounts.source = completed;
-                    }
-                    self.mode = Mode::New(wizard);
-                    DashboardAction::None
-                } else {
-                    self.mode = Mode::New(wizard);
-                    DashboardAction::CompleteMountSource {
-                        target_template_id,
-                        prefix,
-                    }
-                }
+            KeyCode::Down
+                if wizard.mounts.focus == MountFocus::Source
+                    && !wizard.mounts.completion_candidates.is_empty() =>
+            {
+                move_index(
+                    &mut wizard.mounts.completion_index,
+                    wizard.mounts.completion_candidates.len(),
+                    1,
+                );
+                self.mode = Mode::New(wizard);
+                DashboardAction::None
             }
             KeyCode::Up
                 if wizard.mounts.focus == MountFocus::Source
@@ -1355,94 +1535,69 @@ impl DashboardState {
                 match wizard.mounts.focus {
                     MountFocus::Source => {
                         wizard.mounts.source.pop();
+                        wizard.mounts.completion_candidates.clear();
                     }
                     MountFocus::Destination => {
                         wizard.mounts.destination.pop();
                     }
-                    MountFocus::Cancel
-                    | MountFocus::Back
-                    | MountFocus::Add
-                    | MountFocus::Submit => {}
+                    MountFocus::Cancel | MountFocus::Back | MountFocus::Add => {}
                 }
+                wizard.mounts.error = None;
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
             }
             KeyCode::Enter => match wizard.mounts.focus {
+                MountFocus::Source if !wizard.mounts.completion_candidates.is_empty() => {
+                    wizard.mounts.source =
+                        wizard.mounts.completion_candidates[wizard.mounts.completion_index].clone();
+                    wizard.mounts.completion_candidates.clear();
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
                 MountFocus::Source if wizard.mounts.source.is_empty() => {
-                    self.notice = Some("Type a resource source, or Tab to Create.".into());
+                    wizard.mounts.error =
+                        Some("Choose or type a directory on the controller.".into());
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
                 MountFocus::Source => {
-                    wizard.mounts.destination = default_resource_destination(
-                        &self.config.targets[&target_template_id],
-                        std::path::Path::new(&wizard.mounts.source),
-                        &wizard.mounts.mounts,
-                    )
-                    .to_string_lossy()
-                    .into_owned();
+                    if wizard.mounts.destination.is_empty() {
+                        wizard.mounts.destination = default_resource_destination(
+                            &self.config.targets[&target_template_id],
+                            std::path::Path::new(&wizard.mounts.source),
+                            &wizard.mounts.mounts,
+                        )
+                        .to_string_lossy()
+                        .into_owned();
+                    }
                     wizard.mounts.focus = MountFocus::Destination;
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
-                MountFocus::Destination => {
-                    wizard.mounts.focus = MountFocus::Add;
-                    self.mode = Mode::New(wizard);
-                    DashboardAction::None
+                MountFocus::Destination | MountFocus::Add => {
+                    self.validate_new_mount(wizard, target_template_id)
                 }
                 MountFocus::Cancel => {
                     self.cancel_modal();
                     DashboardAction::None
                 }
                 MountFocus::Back => {
-                    wizard.step = WizardStep::Target;
-                    wizard.focus = WizardFocus::Content;
+                    wizard.step = WizardStep::Review;
+                    wizard.review_focus = ReviewFocus::Add;
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
-                MountFocus::Add => {
-                    let mount = AdditionalMount {
-                        source: wizard.mounts.source.clone().into(),
-                        destination: wizard.mounts.destination.clone().into(),
-                    };
-                    if let Err(error) =
-                        crate::hel_targets::validate_additional_mounts(std::slice::from_ref(&mount))
-                    {
-                        self.notice = Some(format!("Invalid mount: {error}"));
-                        self.mode = Mode::New(wizard);
-                        return DashboardAction::None;
-                    }
-                    if wizard
-                        .mounts
-                        .mounts
-                        .iter()
-                        .any(|existing| existing.destination == mount.destination)
-                    {
-                        self.notice = Some(format!(
-                            "{} is already a mount destination.",
-                            mount.destination.display()
-                        ));
-                        self.mode = Mode::New(wizard);
-                        return DashboardAction::None;
-                    }
-                    let source = wizard.mounts.source.clone();
-                    self.mode = Mode::New(wizard);
-                    DashboardAction::ValidateMountSource {
-                        target_template_id,
-                        source,
-                    }
-                }
-                MountFocus::Submit => self.create_session_action(&wizard),
             },
             KeyCode::Char(character) => {
                 match wizard.mounts.focus {
-                    MountFocus::Source => wizard.mounts.source.push(character),
+                    MountFocus::Source => {
+                        wizard.mounts.source.push(character);
+                        wizard.mounts.completion_candidates.clear();
+                    }
                     MountFocus::Destination => wizard.mounts.destination.push(character),
-                    MountFocus::Cancel
-                    | MountFocus::Back
-                    | MountFocus::Add
-                    | MountFocus::Submit => {}
+                    MountFocus::Cancel | MountFocus::Back | MountFocus::Add => {}
                 }
+                wizard.mounts.error = None;
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
             }
@@ -1450,6 +1605,48 @@ impl DashboardState {
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
             }
+        }
+    }
+
+    fn complete_new_mount_source(
+        &mut self,
+        mut wizard: NewWizard,
+        target_template_id: String,
+    ) -> DashboardAction {
+        let prefix = wizard.mounts.source.clone();
+        if prefix.is_empty() {
+            self.mode = Mode::New(wizard);
+            return DashboardAction::None;
+        }
+        if let Some(candidates) = wizard.mounts.completion_cache.get(&prefix).cloned() {
+            apply_mount_completions(&mut wizard.mounts, &prefix, candidates);
+            self.mode = Mode::New(wizard);
+            DashboardAction::None
+        } else {
+            self.mode = Mode::New(wizard);
+            DashboardAction::CompleteMountSource {
+                target_template_id,
+                prefix,
+            }
+        }
+    }
+
+    fn validate_new_mount(
+        &mut self,
+        mut wizard: NewWizard,
+        target_template_id: String,
+    ) -> DashboardAction {
+        if let Some(error) = validate_mount_entry(&wizard.mounts) {
+            wizard.mounts.error = Some(error);
+            wizard.mounts.focus = MountFocus::Source;
+            self.mode = Mode::New(wizard);
+            return DashboardAction::None;
+        }
+        let source = wizard.mounts.source.clone();
+        self.mode = Mode::New(wizard);
+        DashboardAction::ValidateMountSource {
+            target_template_id,
+            source,
         }
     }
 
@@ -1660,22 +1857,40 @@ impl DashboardState {
     }
 
     pub fn apply_mount_source_validation(&mut self, source: &str, result: Result<(), String>) {
-        let mounts = match &mut self.mode {
+        match &mut self.mode {
             Mode::New(wizard)
                 if wizard.step == WizardStep::Mounts && wizard.mounts.source == source =>
             {
-                &mut wizard.mounts
+                match result {
+                    Ok(()) => {
+                        wizard.mounts.add_validated_mount();
+                        wizard.mounts.history_index = wizard.mounts.mounts.len().saturating_sub(1);
+                        wizard.review_focus = ReviewFocus::Attachments;
+                        wizard.step = WizardStep::Review;
+                    }
+                    Err(error) => {
+                        wizard.mounts.error = Some(error);
+                        wizard.mounts.focus = MountFocus::Source;
+                    }
+                }
             }
             Mode::Resume(wizard)
                 if wizard.step == WizardStep::Mounts && wizard.mounts.source == source =>
             {
-                &mut wizard.mounts
+                match result {
+                    Ok(()) => {
+                        wizard.mounts.add_validated_mount();
+                        wizard.mounts.history_index = wizard.mounts.mounts.len().saturating_sub(1);
+                        wizard.review_focus = ReviewFocus::Attachments;
+                        wizard.step = WizardStep::Review;
+                    }
+                    Err(error) => {
+                        wizard.mounts.error = Some(error);
+                        wizard.mounts.focus = MountFocus::Source;
+                    }
+                }
             }
-            _ => return,
-        };
-        match result {
-            Ok(()) => mounts.add_validated_mount(),
-            Err(error) => self.notice = Some(format!("Cannot add resource: {error}")),
+            _ => {}
         }
     }
 
@@ -1686,6 +1901,9 @@ impl DashboardState {
         }
         if wizard.step == WizardStep::Mounts {
             return self.handle_resume_mount_key(code, wizard);
+        }
+        if wizard.step == WizardStep::Review {
+            return self.handle_resume_review_key(code, wizard);
         }
         let has_back = wizard.step != WizardStep::Profile;
         if matches!(code, KeyCode::Tab | KeyCode::BackTab) {
@@ -1701,6 +1919,7 @@ impl DashboardState {
             wizard.step = match wizard.step {
                 WizardStep::Target => WizardStep::Profile,
                 WizardStep::Profile => WizardStep::Profile,
+                WizardStep::Review => WizardStep::Target,
                 WizardStep::Bundle | WizardStep::NewBundle | WizardStep::Mounts => {
                     unreachable!("invalid resume wizard step")
                 }
@@ -1714,7 +1933,11 @@ impl DashboardState {
             && wizard.focus == WizardFocus::Content
             && matches!(
                 code,
-                KeyCode::Char('+') | KeyCode::Char('-') | KeyCode::Char('r')
+                KeyCode::Char('+')
+                    | KeyCode::Char('-')
+                    | KeyCode::Char('r')
+                    | KeyCode::Char('c')
+                    | KeyCode::Char('m')
             )
         {
             self.adjust_resume_resources(&mut wizard, code);
@@ -1724,6 +1947,7 @@ impl DashboardState {
         let len = match wizard.step {
             WizardStep::Profile => profiles.len(),
             WizardStep::Target => self.config.targets.len(),
+            WizardStep::Review => unreachable!("review input is handled above"),
             WizardStep::Bundle => unreachable!("resume does not select a bundle"),
             WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
             WizardStep::NewBundle => unreachable!("resume does not create bundles"),
@@ -1756,6 +1980,10 @@ impl DashboardState {
                 WizardStep::Profile => self.cancel_modal(),
                 WizardStep::Target => {
                     wizard.step = WizardStep::Profile;
+                    self.mode = Mode::Resume(wizard);
+                }
+                WizardStep::Review => {
+                    wizard.step = WizardStep::Target;
                     self.mode = Mode::Resume(wizard);
                 }
                 WizardStep::Bundle => unreachable!("resume does not select a bundle"),
@@ -1796,29 +2024,84 @@ impl DashboardState {
                     self.mode = Mode::Resume(wizard);
                     return DashboardAction::None;
                 }
-                if let Some(host) = mount_history_host(&self.config.targets[&target_id]) {
-                    wizard.step = WizardStep::Mounts;
-                    wizard.mounts.history = self
-                        .state
-                        .mount_history
-                        .get(host)
-                        .cloned()
-                        .unwrap_or_default();
-                    wizard.mounts.history_index = 0;
-                    self.mode = Mode::Resume(wizard);
-                    DashboardAction::None
-                } else {
-                    let profile_id = profiles
-                        .get(wizard.profile)
-                        .map(|(id, _)| (*id).clone())
-                        .expect("resume wizard is only opened with a compatible profile");
-                    self.resume_session_action(wizard, profile_id)
-                }
+                wizard.mounts.history = mount_history_host(&self.config.targets[&target_id])
+                    .and_then(|host| self.state.mount_history.get(host))
+                    .cloned()
+                    .unwrap_or_default();
+                wizard.mounts.history_index = 0;
+                wizard.step = WizardStep::Review;
+                wizard.review_focus = ReviewFocus::Submit;
+                self.mode = Mode::Resume(wizard);
+                DashboardAction::None
             }
             WizardStep::Bundle => unreachable!("resume does not select a bundle"),
+            WizardStep::Review => unreachable!("review input is handled before picker navigation"),
             WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
             WizardStep::NewBundle => unreachable!("resume does not create bundles"),
         }
+    }
+
+    fn handle_resume_review_key(
+        &mut self,
+        code: KeyCode,
+        mut wizard: ResumeWizard,
+    ) -> DashboardAction {
+        let can_attach =
+            mount_history_host(&self.config.targets[&nth_key(&self.config.targets, wizard.target)])
+                .is_some();
+        let order = review_focus_order(can_attach, !wizard.mounts.mounts.is_empty());
+        match code {
+            KeyCode::Tab | KeyCode::BackTab => {
+                wizard.review_focus =
+                    cycle_control(wizard.review_focus, &order, code == KeyCode::BackTab);
+            }
+            KeyCode::Up if wizard.review_focus == ReviewFocus::Attachments => move_index(
+                &mut wizard.mounts.history_index,
+                wizard.mounts.mounts.len(),
+                -1,
+            ),
+            KeyCode::Down if wizard.review_focus == ReviewFocus::Attachments => move_index(
+                &mut wizard.mounts.history_index,
+                wizard.mounts.mounts.len(),
+                1,
+            ),
+            KeyCode::Delete if wizard.review_focus == ReviewFocus::Attachments => {
+                remove_selected_mount(&mut wizard.mounts);
+                wizard.review_focus = if wizard.mounts.mounts.is_empty() {
+                    ReviewFocus::Submit
+                } else {
+                    ReviewFocus::Attachments
+                };
+            }
+            KeyCode::Enter => match wizard.review_focus {
+                ReviewFocus::Attachments => edit_selected_resume_mount(&mut wizard),
+                ReviewFocus::Cancel => {
+                    self.cancel_modal();
+                    return DashboardAction::None;
+                }
+                ReviewFocus::Back => {
+                    wizard.step = WizardStep::Target;
+                    wizard.focus = WizardFocus::Content;
+                }
+                ReviewFocus::Add if can_attach => begin_resume_mount_editor(&mut wizard),
+                ReviewFocus::Add => {}
+                ReviewFocus::Submit => {
+                    let profile_id = self
+                        .compatible_profiles(&wizard.session_id)
+                        .get(wizard.profile)
+                        .map(|(id, _)| (*id).clone())
+                        .expect("resume wizard is only opened with a compatible profile");
+                    return self.resume_session_action(wizard, profile_id);
+                }
+            },
+            KeyCode::Esc => {
+                self.cancel_modal();
+                return DashboardAction::None;
+            }
+            _ => {}
+        }
+        self.mode = Mode::Resume(wizard);
+        DashboardAction::None
     }
 
     fn handle_resume_mount_key(
@@ -1828,6 +2111,12 @@ impl DashboardState {
     ) -> DashboardAction {
         let target_template_id = nth_key(&self.config.targets, wizard.target);
         match code {
+            KeyCode::Tab
+                if wizard.mounts.focus == MountFocus::Source
+                    && !wizard.mounts.source.is_empty() =>
+            {
+                self.complete_resume_mount_source(wizard, target_template_id)
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 wizard.mounts.focus = cycle_control(
                     wizard.mounts.focus,
@@ -1837,37 +2126,38 @@ impl DashboardState {
                         MountFocus::Cancel,
                         MountFocus::Back,
                         MountFocus::Add,
-                        MountFocus::Submit,
                     ],
                     code == KeyCode::BackTab,
                 );
                 self.mode = Mode::Resume(wizard);
                 DashboardAction::None
             }
-            KeyCode::Delete if wizard.mounts.focus == MountFocus::Source => {
-                wizard.mounts.mounts.pop();
+            KeyCode::F(2) if wizard.mounts.focus == MountFocus::Source => {
+                self.complete_resume_mount_source(wizard, target_template_id)
+            }
+            KeyCode::Up
+                if wizard.mounts.focus == MountFocus::Source
+                    && !wizard.mounts.completion_candidates.is_empty() =>
+            {
+                move_index(
+                    &mut wizard.mounts.completion_index,
+                    wizard.mounts.completion_candidates.len(),
+                    -1,
+                );
                 self.mode = Mode::Resume(wizard);
                 DashboardAction::None
             }
-            KeyCode::F(2) if wizard.mounts.focus == MountFocus::Source => {
-                let prefix = wizard.mounts.source.clone();
-                if prefix.is_empty() {
-                    self.mode = Mode::Resume(wizard);
-                    return DashboardAction::None;
-                }
-                if let Some(candidates) = wizard.mounts.completion_cache.get(&prefix) {
-                    if let Some(completed) = path_completion(&prefix, candidates) {
-                        wizard.mounts.source = completed;
-                    }
-                    self.mode = Mode::Resume(wizard);
-                    DashboardAction::None
-                } else {
-                    self.mode = Mode::Resume(wizard);
-                    DashboardAction::CompleteMountSource {
-                        target_template_id,
-                        prefix,
-                    }
-                }
+            KeyCode::Down
+                if wizard.mounts.focus == MountFocus::Source
+                    && !wizard.mounts.completion_candidates.is_empty() =>
+            {
+                move_index(
+                    &mut wizard.mounts.completion_index,
+                    wizard.mounts.completion_candidates.len(),
+                    1,
+                );
+                self.mode = Mode::Resume(wizard);
+                DashboardAction::None
             }
             KeyCode::Up
                 if wizard.mounts.focus == MountFocus::Source
@@ -1905,101 +2195,69 @@ impl DashboardState {
                 match wizard.mounts.focus {
                     MountFocus::Source => {
                         wizard.mounts.source.pop();
+                        wizard.mounts.completion_candidates.clear();
                     }
                     MountFocus::Destination => {
                         wizard.mounts.destination.pop();
                     }
-                    MountFocus::Cancel
-                    | MountFocus::Back
-                    | MountFocus::Add
-                    | MountFocus::Submit => {}
+                    MountFocus::Cancel | MountFocus::Back | MountFocus::Add => {}
                 }
+                wizard.mounts.error = None;
                 self.mode = Mode::Resume(wizard);
                 DashboardAction::None
             }
             KeyCode::Enter => match wizard.mounts.focus {
+                MountFocus::Source if !wizard.mounts.completion_candidates.is_empty() => {
+                    wizard.mounts.source =
+                        wizard.mounts.completion_candidates[wizard.mounts.completion_index].clone();
+                    wizard.mounts.completion_candidates.clear();
+                    self.mode = Mode::Resume(wizard);
+                    DashboardAction::None
+                }
                 MountFocus::Source if wizard.mounts.source.is_empty() => {
-                    self.notice = Some("Type a resource source, or Tab to Resume.".into());
+                    wizard.mounts.error =
+                        Some("Choose or type a directory on the controller.".into());
                     self.mode = Mode::Resume(wizard);
                     DashboardAction::None
                 }
                 MountFocus::Source => {
-                    wizard.mounts.destination = default_resource_destination(
-                        &self.config.targets[&target_template_id],
-                        std::path::Path::new(&wizard.mounts.source),
-                        &wizard.mounts.mounts,
-                    )
-                    .to_string_lossy()
-                    .into_owned();
+                    if wizard.mounts.destination.is_empty() {
+                        wizard.mounts.destination = default_resource_destination(
+                            &self.config.targets[&target_template_id],
+                            std::path::Path::new(&wizard.mounts.source),
+                            &wizard.mounts.mounts,
+                        )
+                        .to_string_lossy()
+                        .into_owned();
+                    }
                     wizard.mounts.focus = MountFocus::Destination;
                     self.mode = Mode::Resume(wizard);
                     DashboardAction::None
                 }
-                MountFocus::Destination => {
-                    wizard.mounts.focus = MountFocus::Add;
-                    self.mode = Mode::Resume(wizard);
-                    DashboardAction::None
+                MountFocus::Destination | MountFocus::Add => {
+                    self.validate_resume_mount(wizard, target_template_id)
                 }
                 MountFocus::Cancel => {
                     self.cancel_modal();
                     DashboardAction::None
                 }
                 MountFocus::Back => {
-                    wizard.step = WizardStep::Target;
-                    wizard.focus = WizardFocus::Content;
+                    wizard.step = WizardStep::Review;
+                    wizard.review_focus = ReviewFocus::Add;
                     self.mode = Mode::Resume(wizard);
                     DashboardAction::None
-                }
-                MountFocus::Add => {
-                    let mount = AdditionalMount {
-                        source: wizard.mounts.source.clone().into(),
-                        destination: wizard.mounts.destination.clone().into(),
-                    };
-                    if let Err(error) =
-                        crate::hel_targets::validate_additional_mounts(std::slice::from_ref(&mount))
-                    {
-                        self.notice = Some(format!("Invalid resource: {error}"));
-                        self.mode = Mode::Resume(wizard);
-                        return DashboardAction::None;
-                    }
-                    if wizard
-                        .mounts
-                        .mounts
-                        .iter()
-                        .any(|existing| existing.destination == mount.destination)
-                    {
-                        self.notice = Some(format!(
-                            "{} is already a resource destination.",
-                            mount.destination.display()
-                        ));
-                        self.mode = Mode::Resume(wizard);
-                        return DashboardAction::None;
-                    }
-                    let source = wizard.mounts.source.clone();
-                    self.mode = Mode::Resume(wizard);
-                    DashboardAction::ValidateMountSource {
-                        target_template_id,
-                        source,
-                    }
-                }
-                MountFocus::Submit => {
-                    let profile_id = self
-                        .compatible_profiles(&wizard.session_id)
-                        .get(wizard.profile)
-                        .map(|(id, _)| (*id).clone())
-                        .expect("resume wizard is only opened with a compatible profile");
-                    self.resume_session_action(wizard, profile_id)
                 }
             },
             KeyCode::Char(character) => {
                 match wizard.mounts.focus {
-                    MountFocus::Source => wizard.mounts.source.push(character),
+                    MountFocus::Source => {
+                        wizard.mounts.source.push(character);
+                        wizard.mounts.completion_candidates.clear();
+                    }
                     MountFocus::Destination => wizard.mounts.destination.push(character),
-                    MountFocus::Cancel
-                    | MountFocus::Back
-                    | MountFocus::Add
-                    | MountFocus::Submit => {}
+                    MountFocus::Cancel | MountFocus::Back | MountFocus::Add => {}
                 }
+                wizard.mounts.error = None;
                 self.mode = Mode::Resume(wizard);
                 DashboardAction::None
             }
@@ -2007,6 +2265,48 @@ impl DashboardState {
                 self.mode = Mode::Resume(wizard);
                 DashboardAction::None
             }
+        }
+    }
+
+    fn complete_resume_mount_source(
+        &mut self,
+        mut wizard: ResumeWizard,
+        target_template_id: String,
+    ) -> DashboardAction {
+        let prefix = wizard.mounts.source.clone();
+        if prefix.is_empty() {
+            self.mode = Mode::Resume(wizard);
+            return DashboardAction::None;
+        }
+        if let Some(candidates) = wizard.mounts.completion_cache.get(&prefix).cloned() {
+            apply_mount_completions(&mut wizard.mounts, &prefix, candidates);
+            self.mode = Mode::Resume(wizard);
+            DashboardAction::None
+        } else {
+            self.mode = Mode::Resume(wizard);
+            DashboardAction::CompleteMountSource {
+                target_template_id,
+                prefix,
+            }
+        }
+    }
+
+    fn validate_resume_mount(
+        &mut self,
+        mut wizard: ResumeWizard,
+        target_template_id: String,
+    ) -> DashboardAction {
+        if let Some(error) = validate_mount_entry(&wizard.mounts) {
+            wizard.mounts.error = Some(error);
+            wizard.mounts.focus = MountFocus::Source;
+            self.mode = Mode::Resume(wizard);
+            return DashboardAction::None;
+        }
+        let source = wizard.mounts.source.clone();
+        self.mode = Mode::Resume(wizard);
+        DashboardAction::ValidateMountSource {
+            target_template_id,
+            source,
         }
     }
 
@@ -2138,13 +2438,38 @@ impl DashboardState {
             self.notice = Some("Configure at least one profile and target first.".into());
             return DashboardAction::None;
         }
+        let recent = most_recent_configured_session(&self.config, &self.state);
+        let profile = recent
+            .and_then(|session| {
+                self.config
+                    .profiles
+                    .keys()
+                    .position(|id| id == &session.last_profile)
+            })
+            .unwrap_or(0);
+        let bundle = recent
+            .and_then(|session| {
+                bundle_ids_by_recent_creation(&self.config, &self.state)
+                    .iter()
+                    .position(|id| *id == session.bundle_id)
+            })
+            .unwrap_or(0);
+        let target = recent
+            .and_then(|session| {
+                self.config
+                    .targets
+                    .keys()
+                    .position(|id| id == &session.target_template_id)
+            })
+            .unwrap_or(0);
         self.mode = Mode::New(NewWizard {
             step: WizardStep::Profile,
             focus: WizardFocus::Content,
-            profile: 0,
-            bundle: 0,
-            target: 0,
+            profile,
+            bundle,
+            target,
             mounts: MountWizard::new(Vec::new()),
+            review_focus: ReviewFocus::Submit,
             new_bundle_source: String::new(),
             resource_allocation: None,
             aws_options: BTreeMap::new(),
@@ -2187,6 +2512,7 @@ impl DashboardState {
             profile,
             target,
             mounts: MountWizard::with_mounts(Vec::new(), session.additional_mounts.clone()),
+            review_focus: ReviewFocus::Submit,
             resource_allocation: None,
             aws_options: BTreeMap::new(),
             sizing_error: None,
@@ -2494,6 +2820,13 @@ fn allocation_cpus(allocation: &SessionResourceAllocation) -> u64 {
     }
 }
 
+fn allocation_memory(allocation: &SessionResourceAllocation) -> u64 {
+    match allocation {
+        SessionResourceAllocation::Container { memory_bytes, .. }
+        | SessionResourceAllocation::AwsEc2 { memory_bytes, .. } => *memory_bytes,
+    }
+}
+
 fn adjust_resources(
     allocation: &mut Option<SessionResourceAllocation>,
     aws_options: Option<&Vec<SessionResourceAllocation>>,
@@ -2516,6 +2849,18 @@ fn adjust_resources(
                         memory_bytes.saturating_mul(2).min(max_memory.max(1)),
                     )
                 }
+                KeyCode::Char('c') => {
+                    let Some((max_cpus, _)) = limits else {
+                        return;
+                    };
+                    (cpus.saturating_mul(2).min(max_cpus.max(1)), memory_bytes)
+                }
+                KeyCode::Char('m') => {
+                    let Some((_, max_memory)) = limits else {
+                        return;
+                    };
+                    (cpus, memory_bytes.saturating_mul(2).min(max_memory.max(1)))
+                }
                 KeyCode::Char('-') if cpus > 1 => (cpus / 2, (memory_bytes / 2).max(1)),
                 _ => return,
             };
@@ -2524,20 +2869,28 @@ fn adjust_resources(
                 memory_bytes: next.1,
             });
         }
-        SessionResourceAllocation::AwsEc2 { vcpus, .. } => {
+        SessionResourceAllocation::AwsEc2 {
+            vcpus,
+            memory_bytes,
+            ..
+        } => {
             let Some(options) = aws_options else {
                 return;
             };
             let desired = match code {
-                KeyCode::Char('+') => vcpus.saturating_mul(2),
-                KeyCode::Char('-') if vcpus > 1 => vcpus / 2,
-                KeyCode::Char('r') => BASELINE_CPUS,
+                KeyCode::Char('+') => (Some(vcpus.saturating_mul(2)), None),
+                KeyCode::Char('-') if vcpus > 1 => (Some(vcpus / 2), None),
+                KeyCode::Char('r') => (Some(BASELINE_CPUS), None),
+                KeyCode::Char('c') => (Some(vcpus.saturating_mul(2)), Some(memory_bytes)),
+                KeyCode::Char('m') => (Some(vcpus), Some(memory_bytes.saturating_mul(2))),
                 _ => return,
             };
-            if let Some(next) = options
-                .iter()
-                .find(|option| allocation_cpus(option) == desired)
-            {
+            if let Some(next) = options.iter().find(|option| {
+                desired.0.is_none_or(|cpus| allocation_cpus(option) == cpus)
+                    && desired
+                        .1
+                        .is_none_or(|memory| allocation_memory(option) == memory)
+            }) {
                 *allocation = Some(next.clone());
             }
         }
@@ -2617,6 +2970,7 @@ impl NewWizard {
             WizardStep::Profile => &mut self.profile,
             WizardStep::Bundle => &mut self.bundle,
             WizardStep::Target => &mut self.target,
+            WizardStep::Review => unreachable!("review input has no picker index"),
             WizardStep::Mounts => unreachable!("mount input has no picker index"),
             WizardStep::NewBundle => unreachable!("bundle input has no picker index"),
         }
@@ -2628,6 +2982,7 @@ impl ResumeWizard {
         match self.step {
             WizardStep::Profile => &mut self.profile,
             WizardStep::Target => &mut self.target,
+            WizardStep::Review => unreachable!("review input has no picker index"),
             WizardStep::Bundle => unreachable!("resume does not select a bundle"),
             WizardStep::Mounts => unreachable!("resume does not select mounts"),
             WizardStep::NewBundle => unreachable!("resume does not create bundles"),
@@ -3850,6 +4205,24 @@ fn render_new_wizard(
     dashboard: &DashboardState,
     wizard: &NewWizard,
 ) {
+    if wizard.step == WizardStep::Review {
+        render_review_wizard(
+            frame,
+            area,
+            dashboard,
+            ReviewWizardView {
+                profile_id: &nth_key(&dashboard.config.profiles, wizard.profile),
+                bundle_id: &nth_bundle_key(&dashboard.config, &dashboard.state, wizard.bundle),
+                target_id: &nth_key(&dashboard.config.targets, wizard.target),
+                allocation: wizard.resource_allocation.as_ref(),
+                mounts: &wizard.mounts,
+                focus: wizard.review_focus,
+                title: " New session · 4/4 review ",
+                submit_label: "Create",
+            },
+        );
+        return;
+    }
     if wizard.step == WizardStep::Mounts {
         render_mount_wizard(
             frame,
@@ -3857,8 +4230,7 @@ fn render_new_wizard(
             dashboard,
             wizard.target,
             &wizard.mounts,
-            " New session · 4/4 attached resources ",
-            "Create",
+            " Add attached directory ",
         );
         return;
     }
@@ -3902,7 +4274,7 @@ fn render_new_wizard(
     }
     let (title, choices, selected) = match wizard.step {
         WizardStep::Profile => (
-            " New session · 1/3 profile ",
+            " New session · 1/4 profile ",
             dashboard
                 .config
                 .profiles
@@ -3912,7 +4284,7 @@ fn render_new_wizard(
             wizard.profile,
         ),
         WizardStep::Bundle => (
-            " New session · 2/3 project bundle ",
+            " New session · 2/4 project bundle ",
             bundle_ids_by_recent_creation(&dashboard.config, &dashboard.state)
                 .into_iter()
                 .map(|id| {
@@ -3924,7 +4296,7 @@ fn render_new_wizard(
             wizard.bundle,
         ),
         WizardStep::Target => (
-            " New session · 3/3 target ",
+            " New session · 3/4 target ",
             dashboard
                 .config
                 .targets
@@ -3943,11 +4315,12 @@ fn render_new_wizard(
                 .collect(),
             wizard.target,
         ),
+        WizardStep::Review => unreachable!("review was rendered above"),
         WizardStep::Mounts => unreachable!("mount input was rendered above"),
         WizardStep::NewBundle => unreachable!("bundle input was rendered above"),
     };
     let help = if wizard.step == WizardStep::Target {
-        "+ double · - halve · r reset 8 CPU / 32 GiB"
+        "+ both · c CPU · m memory · - halve · r reset"
     } else {
         "↑/↓ select · Tab moves focus · Enter activates"
     };
@@ -3965,6 +4338,101 @@ fn render_new_wizard(
     );
 }
 
+struct ReviewWizardView<'a> {
+    profile_id: &'a str,
+    bundle_id: &'a str,
+    target_id: &'a str,
+    allocation: Option<&'a SessionResourceAllocation>,
+    mounts: &'a MountWizard,
+    focus: ReviewFocus,
+    title: &'a str,
+    submit_label: &'a str,
+}
+
+fn render_review_wizard(
+    frame: &mut Frame,
+    area: Rect,
+    dashboard: &DashboardState,
+    view: ReviewWizardView<'_>,
+) {
+    let ReviewWizardView {
+        profile_id,
+        bundle_id,
+        target_id,
+        allocation,
+        mounts,
+        focus,
+        title,
+        submit_label,
+    } = view;
+    let target = &dashboard.config.targets[target_id];
+    let mut lines = vec![
+        Line::raw(format!("Profile: {profile_id}")),
+        Line::raw(format!("Project: {bundle_id}")),
+        Line::raw(format!("Target: {target_id} ({})", target_label(target))),
+        Line::raw(format!(
+            "Compute:{}",
+            resource_allocation_label(allocation, None)
+        )),
+        Line::raw(""),
+        Line::raw(format!("Attached directories: {}", mounts.mounts.len())),
+    ];
+    if mounts.mounts.is_empty() {
+        lines.push(Line::styled(
+            "  None (optional)",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        lines.extend(
+            mounts
+                .mounts
+                .iter()
+                .enumerate()
+                .take(6)
+                .map(|(index, mount)| {
+                    let selected =
+                        focus == ReviewFocus::Attachments && index == mounts.history_index;
+                    Line::styled(
+                        format!(
+                            "{}{} → {}",
+                            if selected { "› " } else { "  " },
+                            mount.source.display(),
+                            mount.destination.display()
+                        ),
+                        if selected {
+                            Style::default().bg(Color::DarkGray).fg(Color::White)
+                        } else {
+                            Style::default()
+                        },
+                    )
+                }),
+        );
+    }
+    let can_attach = mount_history_host(target).is_some();
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Tab moves focus · Enter edits selected directory · Del removes it",
+        Style::default().fg(Color::DarkGray),
+    ));
+    let mut buttons = vec![
+        ("Cancel", focus == ReviewFocus::Cancel),
+        ("Back", focus == ReviewFocus::Back),
+    ];
+    if can_attach {
+        buttons.push(("Add directory…", focus == ReviewFocus::Add));
+    }
+    buttons.push((submit_label, focus == ReviewFocus::Submit));
+    lines.push(action_buttons(&buttons));
+    let popup = centered_rect(84, (lines.len() as u16 + 2).clamp(13, 24), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
 fn render_mount_wizard(
     frame: &mut Frame,
     area: Rect,
@@ -3972,7 +4440,6 @@ fn render_mount_wizard(
     target_index: usize,
     mounts: &MountWizard,
     title: &str,
-    submit_label: &str,
 ) {
     let target_id = nth_key(&dashboard.config.targets, target_index);
     let target = dashboard
@@ -3988,7 +4455,7 @@ fn render_mount_wizard(
             "Podman uses :O copy-on-write overlays; container writes never change the source."
         }
         TargetTemplate::AwsEc2 { .. } => {
-            "EC2 resources stream as tar.gz through one SSH connection into the destination."
+            "EC2 directories stream as tar.gz through one SSH connection into the destination."
         }
         TargetTemplate::SshBare { .. } => unreachable!("bare SSH does not attach resources"),
     };
@@ -4038,7 +4505,7 @@ fn render_mount_wizard(
     ];
     if !mounts.mounts.is_empty() {
         lines.push(Line::raw(""));
-        lines.push(Line::raw("Attached resources:"));
+        lines.push(Line::raw("Already attached:"));
         lines.extend(mounts.mounts.iter().map(|mount| {
             Line::raw(format!(
                 "  {} → {}",
@@ -4047,7 +4514,8 @@ fn render_mount_wizard(
             ))
         }));
     }
-    if mounts.focus == MountFocus::Source && !mounts.history.is_empty() {
+    if mounts.focus == MountFocus::Source && mounts.source.is_empty() && !mounts.history.is_empty()
+    {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             "Recent sources (↑/↓ when Source is empty):",
@@ -4069,24 +4537,40 @@ fn render_mount_wizard(
                 }),
         );
     }
-    if let Some(candidates) = mounts.completion_cache.get(&mounts.source) {
+    if !mounts.completion_candidates.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            format!("F2 matches: {}", candidates.join("  ")),
+            "Matches (↑/↓ select · Enter choose):",
             Style::default().fg(Color::DarkGray),
         ));
+        lines.extend(mounts.completion_candidates.iter().take(5).enumerate().map(
+            |(index, candidate)| {
+                Line::raw(format!(
+                    "{}{}",
+                    if index == mounts.completion_index {
+                        "› "
+                    } else {
+                        "  "
+                    },
+                    candidate
+                ))
+            },
+        ));
+    }
+    if let Some(error) = &mounts.error {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(error, Style::default().fg(Color::Red)));
     }
     lines.extend([
         Line::raw(""),
         Line::styled(
-            "Tab moves focus · Enter activates · F2 completes source · Del removes last",
+            "Tab completes source · Shift-Tab moves focus · Enter continues/adds",
             Style::default().fg(Color::DarkGray),
         ),
         action_buttons(&[
             ("Cancel", mounts.focus == MountFocus::Cancel),
             ("Back", mounts.focus == MountFocus::Back),
-            ("Add resource", mounts.focus == MountFocus::Add),
-            (submit_label, mounts.focus == MountFocus::Submit),
+            ("Add directory", mounts.focus == MountFocus::Add),
         ]),
     ]);
     let popup = centered_rect(84, (lines.len() as u16 + 2).clamp(12, 24), area);
@@ -4105,6 +4589,35 @@ fn render_resume_wizard(
     dashboard: &DashboardState,
     wizard: &ResumeWizard,
 ) {
+    if wizard.step == WizardStep::Review {
+        let profile_id = dashboard
+            .compatible_profiles(&wizard.session_id)
+            .get(wizard.profile)
+            .map(|(id, _)| id.as_str())
+            .unwrap_or("unknown");
+        let bundle_id = dashboard
+            .state
+            .sessions
+            .get(&wizard.session_id)
+            .map(|session| session.bundle_id.as_str())
+            .unwrap_or("unknown");
+        render_review_wizard(
+            frame,
+            area,
+            dashboard,
+            ReviewWizardView {
+                profile_id,
+                bundle_id,
+                target_id: &nth_key(&dashboard.config.targets, wizard.target),
+                allocation: wizard.resource_allocation.as_ref(),
+                mounts: &wizard.mounts,
+                focus: wizard.review_focus,
+                title: " Resume · 3/3 review ",
+                submit_label: "Resume",
+            },
+        );
+        return;
+    }
     if wizard.step == WizardStep::Mounts {
         render_mount_wizard(
             frame,
@@ -4112,8 +4625,7 @@ fn render_resume_wizard(
             dashboard,
             wizard.target,
             &wizard.mounts,
-            " Resume · 3/3 attached resources ",
-            "Resume",
+            " Add attached directory ",
         );
         return;
     }
@@ -4161,9 +4673,10 @@ fn render_resume_wizard(
                 })
                 .collect(),
             wizard.target,
-            &["+ double · - halve · r reset 8 CPU / 32 GiB"][..],
+            &["+ both · c CPU · m memory · - halve · r reset"][..],
         ),
         WizardStep::Bundle => unreachable!("resume does not select a bundle"),
+        WizardStep::Review => unreachable!("review was rendered above"),
         WizardStep::Mounts => unreachable!("mount input was rendered above"),
         WizardStep::NewBundle => unreachable!("resume does not create bundles"),
     };
@@ -4383,6 +4896,25 @@ fn nth_bundle_key(config: &HelConfig, state: &HelState, index: usize) -> String 
         .to_string()
 }
 
+fn most_recent_configured_session<'a>(
+    config: &HelConfig,
+    state: &'a HelState,
+) -> Option<&'a SessionRecord> {
+    state
+        .sessions
+        .values()
+        .filter(|session| {
+            config.profiles.contains_key(&session.last_profile)
+                && config.bundles.contains_key(&session.bundle_id)
+                && config.targets.contains_key(&session.target_template_id)
+        })
+        .max_by_key(|session| {
+            chrono::DateTime::parse_from_rfc3339(&session.created_at)
+                .ok()
+                .map(|timestamp| timestamp.timestamp_millis())
+        })
+}
+
 fn bundle_ids_by_recent_creation<'a>(config: &'a HelConfig, state: &HelState) -> Vec<&'a str> {
     let mut latest_created_at = BTreeMap::<&str, i64>::new();
     for session in state.sessions.values() {
@@ -4508,6 +5040,12 @@ fn apply_mount_completions(wizard: &mut MountWizard, prefix: &str, candidates: V
         .insert(prefix.to_owned(), candidates.clone());
     if let Some(completed) = path_completion(prefix, &candidates) {
         wizard.source = completed;
+    }
+    if candidates.len() > 1 {
+        wizard.completion_candidates = candidates.into_iter().take(5).collect();
+        wizard.completion_index = 0;
+    } else {
+        wizard.completion_candidates.clear();
     }
 }
 
@@ -5152,15 +5690,6 @@ mod tests {
         );
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::None
-        );
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Right)),
-            DashboardAction::None
-        );
-        dashboard.handle_key(key(KeyCode::BackTab));
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::CreateSession {
                 profile_id: "codex-1".into(),
                 bundle_id: "hel".into(),
@@ -5305,11 +5834,10 @@ mod tests {
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
-        dashboard.handle_key(key(KeyCode::BackTab));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::CreateSession {
-                profile_id: "claude-1".into(),
+                profile_id: "codex-1".into(),
                 bundle_id: "zebra-recent".into(),
                 target_template_id: "podman".into(),
                 additional_mounts: vec![],
@@ -5323,12 +5851,53 @@ mod tests {
     }
 
     #[test]
+    fn new_session_defaults_to_the_most_recent_configured_choices() {
+        let mut config = config();
+        config
+            .bundles
+            .insert("recent-project".into(), config.bundles["hel"].clone());
+        config
+            .targets
+            .insert("recent-target".into(), config.targets["podman"].clone());
+        let mut recent = archived_session();
+        recent.last_profile = "codex-1".into();
+        recent.bundle_id = "recent-project".into();
+        recent.target_template_id = "recent-target".into();
+        recent.created_at = "2026-08-12T12:00:00Z".into();
+        let state = HelState {
+            version: STATE_VERSION,
+            sessions: BTreeMap::from([(recent.id.clone(), recent)]),
+            mount_history: BTreeMap::new(),
+        };
+        let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
+
+        dashboard.handle_key(key(KeyCode::Char('n')));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new-session wizard");
+        };
+        assert_eq!(
+            nth_key(&dashboard.config.profiles, wizard.profile),
+            "codex-1"
+        );
+        assert_eq!(
+            nth_bundle_key(&dashboard.config, &dashboard.state, wizard.bundle),
+            "recent-project"
+        );
+        assert_eq!(
+            nth_key(&dashboard.config.targets, wizard.target),
+            "recent-target"
+        );
+    }
+
+    #[test]
     fn new_session_mount_wizard_adds_mount_and_preserves_typed_source() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
         dashboard.handle_key(key(KeyCode::Char('n')));
         dashboard.handle_key(key(KeyCode::Down));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::BackTab));
         dashboard.handle_key(key(KeyCode::Enter));
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
         terminal
@@ -5342,13 +5911,11 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Source: ▏"));
-        assert!(rendered.contains("Add resource"));
-        assert!(rendered.contains("Create"));
+        assert!(rendered.contains("Add directory"));
         for character in "/opt/cache".chars() {
             dashboard.handle_key(key(KeyCode::Char(character)));
         }
         dashboard.apply_mount_source_completions("/opt/ca", vec!["/opt/cache/".into()]);
-        dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
@@ -5380,16 +5947,60 @@ mod tests {
     }
 
     #[test]
+    fn directory_completion_is_bounded_and_keyboard_selectable() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.handle_key(key(KeyCode::Char('n')));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::BackTab));
+        dashboard.handle_key(key(KeyCode::Enter));
+        for character in "/opt/".chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+        let candidates = (0..12)
+            .map(|index| format!("/opt/directory-{index}/"))
+            .collect::<Vec<_>>();
+        dashboard.apply_mount_source_completions("/opt/", candidates);
+
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected directory editor");
+        };
+        assert_eq!(wizard.mounts.completion_candidates.len(), 5);
+        dashboard.handle_key(key(KeyCode::Down));
+        dashboard.handle_key(key(KeyCode::Enter));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected directory editor");
+        };
+        assert_eq!(wizard.mounts.source, "/opt/directory-1/");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw bounded directory editor");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Add directory"));
+        assert!(rendered.contains("Cancel"));
+    }
+
+    #[test]
     fn failed_source_validation_does_not_add_new_or_resume_mounts() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
         dashboard.handle_key(key(KeyCode::Char('n')));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::BackTab));
+        dashboard.handle_key(key(KeyCode::Enter));
         for character in "/missing".chars() {
             dashboard.handle_key(key(KeyCode::Char(character)));
         }
-        dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             dashboard.handle_key(key(KeyCode::Enter)),
@@ -5404,20 +6015,21 @@ mod tests {
         };
         assert!(wizard.mounts.mounts.is_empty());
         assert_eq!(wizard.mounts.source, "/missing");
-        assert_eq!(wizard.mounts.focus, MountFocus::Add);
+        assert_eq!(wizard.mounts.focus, MountFocus::Source);
         assert_eq!(
-            dashboard.notice.as_deref(),
-            Some("Cannot add resource: source path /missing does not exist or is not a directory")
+            wizard.mounts.error.as_deref(),
+            Some("source path /missing does not exist or is not a directory")
         );
 
         let mut dashboard = dashboard_with_session(archived_session());
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::BackTab));
+        dashboard.handle_key(key(KeyCode::Enter));
         for character in "/missing".chars() {
             dashboard.handle_key(key(KeyCode::Char(character)));
         }
-        dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             dashboard.handle_key(key(KeyCode::Enter)),
@@ -5432,7 +6044,7 @@ mod tests {
         };
         assert!(wizard.mounts.mounts.is_empty());
         assert_eq!(wizard.mounts.source, "/missing");
-        assert_eq!(wizard.mounts.focus, MountFocus::Add);
+        assert_eq!(wizard.mounts.focus, MountFocus::Source);
     }
 
     #[test]
@@ -5443,11 +6055,6 @@ mod tests {
         dashboard.handle_key(key(KeyCode::Up));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Right)),
-            DashboardAction::None
-        );
-        dashboard.handle_key(key(KeyCode::BackTab));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::ResumeSession {
@@ -5495,10 +6102,11 @@ mod tests {
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::BackTab));
+        dashboard.handle_key(key(KeyCode::Enter));
         for character in "/opt/cache".chars() {
             dashboard.handle_key(key(KeyCode::Char(character)));
         }
-        dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
@@ -5539,12 +6147,50 @@ mod tests {
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Tab));
         dashboard.handle_key(key(KeyCode::Delete));
 
         let Mode::Resume(wizard) = &dashboard.mode else {
             panic!("expected resume resource dialog");
         };
         assert!(wizard.mounts.mounts.is_empty());
+    }
+
+    #[test]
+    fn resume_review_edits_an_existing_attached_directory_in_place() {
+        let mut session = archived_session();
+        session.additional_mounts = vec![AdditionalMount {
+            source: "/opt/cache".into(),
+            destination: "/mnt/cache".into(),
+        }];
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Tab));
+        dashboard.handle_key(key(KeyCode::Enter));
+
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected attached-directory editor");
+        };
+        assert_eq!(wizard.mounts.source, "/opt/cache");
+        assert_eq!(wizard.mounts.destination, "/mnt/cache");
+        assert_eq!(wizard.mounts.editing_mount, Some(0));
+
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ValidateMountSource {
+                target_template_id: "podman".into(),
+                source: "/opt/cache".into(),
+            }
+        );
+        dashboard.apply_mount_source_validation("/opt/cache", Ok(()));
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume review");
+        };
+        assert_eq!(wizard.step, WizardStep::Review);
+        assert_eq!(wizard.mounts.mounts.len(), 1);
     }
 
     #[test]
@@ -6647,6 +7293,23 @@ mod tests {
             Some(SessionResourceAllocation::Container {
                 cpus: 8,
                 memory_bytes: 32 * gib,
+            })
+        );
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('c'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 16,
+                memory_bytes: 32 * gib,
+            })
+        );
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('m'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 16,
+                memory_bytes: 64 * gib,
             })
         );
     }

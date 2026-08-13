@@ -238,14 +238,17 @@ bundles and explicit Git refs remain TOML-first.
 
 New and resumed sessions expose resource sizing in the target picker. The
 baseline is 8 CPUs and 32 GiB; `+` doubles, `-` halves the current allocation,
-and `r` returns to the baseline. Container targets cap each dimension
+`c` doubles only CPU, `m` doubles only memory, and `r` returns to the baseline.
+For EC2, the independent controls select a discovered instance type only when
+the other dimension remains unchanged. Container targets cap each dimension
 independently at the host's total logical cores and physical RAM. Current load
 is intentionally not subtracted, so overcommit remains available. Container
 sizing uses runtime flags with the same image. EC2 sizing discovers the launch
 template's instance family and passes an instance-type override while retaining
 the same launch template and AMI.
 
-New and resumed sessions can also attach resource directories. Container
+New and resumed sessions end with a review screen where attached directories
+can optionally be added, edited, or removed before launch. Container
 targets expose them with the runtime's isolated mount mode. EC2 targets stream
 each directory as tar.gz through one SSH process directly into the installed
 Hel worker, without writing a controller or target archive. Symbolic links are
