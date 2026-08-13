@@ -73,6 +73,14 @@ enum Command {
     Import(ImportArgs),
     /// Find, adopt, or explicitly destroy managed workers missing from state.
     Recover(RecoverArgs),
+    /// Create a verified recovery copy for an active session.
+    Checkpoint(CheckpointArgs),
+}
+
+#[derive(Debug, Args)]
+struct CheckpointArgs {
+    #[arg(long)]
+    session: String,
 }
 
 #[derive(Debug, Args)]
@@ -470,6 +478,15 @@ async fn main() -> Result<()> {
         Some(Command::Setup(args)) => setup(args),
         Some(Command::Import(args)) => import(args),
         Some(Command::Recover(args)) => recover(args).await,
+        Some(Command::Checkpoint(args)) => {
+            let mut controller = Controller::load()?;
+            let checkpoint = controller.checkpoint_session(&args.session).await?;
+            println!(
+                "saved recovery copy for {} at event {}",
+                args.session, checkpoint.event_sequence
+            );
+            Ok(())
+        }
     }
 }
 
@@ -786,6 +803,11 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     let (snapshot_tx, snapshot_rx) =
         tokio::sync::watch::channel(viewer_snapshot(&controller, &quotas, revision));
     let (action_tx, mut action_rx) = tokio::sync::mpsc::channel(32);
+    let (worker_targets_tx, mut worker_updates_rx, _worker_commands_tx) =
+        spawn_dashboard_worker_poller();
+    worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+    let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn();
+    let recovery_observer = recovery.observer();
     let termination = hel::termination::Coordinator::install().token();
     let mut options = ServerOptions::new(bind, snapshot_rx, action_tx)?;
     options.shutdown = termination.clone();
@@ -803,12 +825,47 @@ async fn run_server(args: ServerArgs) -> Result<()> {
 
     let serve = hel::hel_server::run_server(options);
     let control = async {
+        let mut recovery_tick = tokio::time::interval(Duration::from_millis(250));
         loop {
             tokio::select! {
                 _ = termination.cancelled() => break,
+                update = worker_updates_rx.recv() => {
+                    let Some(update) = update else { break };
+                    if let WorkerPollPayload::Events { events, phase, .. } = update.payload
+                        && let Some(session) = controller.state.sessions.get(&update.session_id).cloned()
+                    {
+                        recovery_observer
+                            .observe(hel::hel_recovery::RecoveryObservation {
+                                session,
+                                config: controller.config.clone(),
+                                events,
+                                phase,
+                            })
+                            .await;
+                    }
+                }
+                _ = recovery_tick.tick() => {
+                    let mut changed = false;
+                    while let Some(result) = recovery.try_result() {
+                        changed |= merge_recovery_result(&mut controller, result);
+                    }
+                    if changed {
+                        revision += 1;
+                        let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, revision));
+                    }
+                }
                 action = action_rx.recv() => {
                     let Some(action) = action else { break };
+                    if let ControllerAction::Prompt { session_id, .. }
+                        | ControllerAction::Close { session_id } = &action
+                    {
+                        recovery_observer.wait_idle(session_id).await;
+                        while let Some(result) = recovery.try_result() {
+                            merge_recovery_result(&mut controller, result);
+                        }
+                    }
                     apply_phone_action(&mut controller, action).await;
+                    worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
                     revision += 1;
                     let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, revision));
                 }
@@ -837,9 +894,6 @@ async fn apply_phone_action(controller: &mut Controller, action: ControllerActio
         },
         ControllerAction::Prompt { session_id, text } => {
             worker_prompt(controller, &session_id, text).await
-        }
-        ControllerAction::Checkpoint { session_id } => {
-            controller.checkpoint_session(&session_id).await.map(|_| ())
         }
         ControllerAction::Close { session_id } => controller.close_session(&session_id).await,
         ControllerAction::Resume {
@@ -1619,6 +1673,53 @@ fn apply_worker_poll_update(
     Ok(latest_message_updated)
 }
 
+fn apply_recovery_result(
+    controller: &mut Controller,
+    dashboard: &mut DashboardState,
+    result: hel::hel_recovery::RecoveryResult,
+) {
+    let session_id = result.session_id.clone();
+    let failure = result.outcome.as_ref().err().cloned();
+    if merge_recovery_result(controller, result) {
+        dashboard.set_state(controller.state.clone());
+        if let Some(detail) = failure {
+            dashboard.set_notice(format!(
+                "Recovery copy for {} failed: {detail}",
+                short_id(&session_id)
+            ));
+        }
+    }
+}
+
+fn merge_recovery_result(
+    controller: &mut Controller,
+    result: hel::hel_recovery::RecoveryResult,
+) -> bool {
+    let Some(session) = controller.state.sessions.get_mut(&result.session_id) else {
+        return false;
+    };
+    if session.target.as_ref() != Some(&result.expected_target) || !session.state.is_active() {
+        return false;
+    }
+    match result.outcome {
+        Ok(artifact) => {
+            session.native_session_id = Some(artifact.native_session_id);
+            session.checkpoint = Some(artifact.metadata.clone());
+            session.last_checkpoint_error = None;
+            if let Some(previous) = result
+                .previous_checkpoint
+                .filter(|previous| previous.archive_path != artifact.metadata.archive_path)
+                && let Err(error) = std::fs::remove_file(&previous.archive_path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %previous.archive_path.display(), "could not remove superseded recovery copy: {error}");
+            }
+        }
+        Err(detail) => session.last_checkpoint_error = Some(detail),
+    }
+    true
+}
+
 #[derive(Clone)]
 struct PendingDashboardImport {
     profile_id: String,
@@ -1694,6 +1795,8 @@ async fn run_dashboard() -> Result<()> {
     request_dashboard_quota_refresh(&controller, &mut dashboard, &quota_profiles_tx);
     let (worker_targets_tx, mut worker_updates_rx, worker_commands_tx) =
         spawn_dashboard_worker_poller();
+    let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn();
+    let recovery_observer = recovery.observer();
     let (resource_targets_tx, resource_triggers_tx, mut resource_updates_rx) =
         spawn_dashboard_resource_poller();
     let (capacity_targets_tx, mut capacity_updates_rx) = spawn_dashboard_capacity_poller();
@@ -1732,6 +1835,18 @@ async fn run_dashboard() -> Result<()> {
         }
         while let Ok(update) = worker_updates_rx.try_recv() {
             let session_id = update.session_id.clone();
+            if let WorkerPollPayload::Events { events, phase, .. } = &update.payload
+                && let Some(session) = controller.state.sessions.get(&session_id).cloned()
+            {
+                recovery_observer
+                    .observe(hel::hel_recovery::RecoveryObservation {
+                        session,
+                        config: controller.config.clone(),
+                        events: events.clone(),
+                        phase: *phase,
+                    })
+                    .await;
+            }
             match apply_worker_poll_update(&mut controller, &mut dashboard, update) {
                 Ok(true) => {
                     let _ = resource_triggers_tx.try_send(session_id);
@@ -1741,6 +1856,9 @@ async fn run_dashboard() -> Result<()> {
                     dashboard.set_notice(format!("Could not save harness title: {error:#}"));
                 }
             }
+        }
+        while let Some(result) = recovery.try_result() {
+            apply_recovery_result(&mut controller, &mut dashboard, result);
         }
         while let Ok(update) = resource_updates_rx.try_recv() {
             dashboard.apply_resource_usage(&update.session_id, update.usage);
@@ -2141,13 +2259,18 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
             DashboardAction::Open { session_id } => {
-                let bundle_id = controller
+                let session = controller
                     .state
                     .sessions
                     .get(&session_id)
                     .with_context(|| format!("unknown session {session_id}"))?
-                    .bundle_id
                     .clone();
+                let bundle_id = session.bundle_id.clone();
+                let recovery_context = hel::hel_recovery::RecoveryContext {
+                    observer: recovery_observer.clone(),
+                    session,
+                    config: controller.config.clone(),
+                };
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 worker_commands_tx
                     .send(WorkerPollCommand::Checkout {
@@ -2165,6 +2288,7 @@ async fn run_dashboard() -> Result<()> {
                             worker.client,
                             Some(worker.chat),
                             &bundle_id,
+                            Some(recovery_context.clone()),
                         )
                         .await
                         .map(|(exit, client, chat)| (exit, Some(WarmWorker { spec, client, chat })))
@@ -2178,6 +2302,7 @@ async fn run_dashboard() -> Result<()> {
                                 client,
                                 None,
                                 &bundle_id,
+                                Some(recovery_context),
                             )
                             .await?;
                             Ok((exit, Some(WarmWorker { spec, client, chat })))
@@ -2203,6 +2328,9 @@ async fn run_dashboard() -> Result<()> {
                             })
                             .await
                             .context("dashboard worker poller stopped")?;
+                        while let Some(result) = recovery.try_result() {
+                            apply_recovery_result(&mut controller, &mut dashboard, result);
+                        }
                         let read_result = controller
                             .mark_session_viewed_through(&session_id, last_seen_event_sequence);
                         dashboard.set_state(controller.state.clone());
@@ -2283,23 +2411,11 @@ async fn run_dashboard() -> Result<()> {
                     &resource_targets_tx,
                 );
             }
-            DashboardAction::Checkpoint { session_id } => {
-                match controller.checkpoint_session(&session_id).await {
-                    Ok(checkpoint) => dashboard.set_notice(format!(
-                        "Checkpointed {} at event {}",
-                        short_id(&session_id),
-                        checkpoint.event_sequence
-                    )),
-                    Err(error) => dashboard.set_notice(format!("Checkpoint failed: {error:#}")),
-                }
-                dashboard.set_state(controller.state.clone());
-                refresh_dashboard_poll_targets(
-                    &controller,
-                    &worker_targets_tx,
-                    &resource_targets_tx,
-                );
-            }
             DashboardAction::Close { session_id } => {
+                recovery_observer.wait_idle(&session_id).await;
+                while let Some(result) = recovery.try_result() {
+                    apply_recovery_result(&mut controller, &mut dashboard, result);
+                }
                 let (returned_controller, result) = close_session_with_redraw(
                     controller,
                     &session_id,
@@ -2417,7 +2533,7 @@ fn delete_archived_session(controller: &mut Controller, session_id: &str) -> Res
             .sessions
             .insert(session.id.clone(), session);
         return Err(error)
-            .with_context(|| format!("delete checkpoint archive {}", archive_path.display()));
+            .with_context(|| format!("delete recovery archive {}", archive_path.display()));
     }
     if let Err(error) = controller.state.save() {
         controller
@@ -2473,7 +2589,7 @@ async fn close_session_with_redraw(
 fn close_progress_notice(session_id: &str, elapsed: Duration, frame: usize) -> String {
     const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
     format!(
-        "{} Checkpointing {}… {}s",
+        "{} Saving recovery copy for {}… {}s",
         SPINNER[frame % SPINNER.len()],
         short_id(session_id),
         elapsed.as_secs()
@@ -3166,7 +3282,7 @@ mod tests {
     fn close_progress_notice_animates_and_reports_elapsed_time() {
         assert_eq!(
             close_progress_notice("0123456789", Duration::from_secs(7), 1),
-            "/ Checkpointing 01234567… 7s"
+            "/ Saving recovery copy for 01234567… 7s"
         );
     }
 

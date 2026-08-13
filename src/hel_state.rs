@@ -196,6 +196,8 @@ pub struct SessionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<CheckpointMetadata>,
 }
 
@@ -499,6 +501,7 @@ mod tests {
             updated_at: "2026-08-09T12:01:00Z".into(),
             last_viewed_event_sequence: 0,
             last_error: None,
+            last_checkpoint_error: None,
             checkpoint: Some(CheckpointMetadata {
                 archive_path: PathBuf::from("sessions/0123456789abcdef.hel.zip"),
                 sha256: "a".repeat(64),

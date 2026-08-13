@@ -2203,6 +2203,7 @@ fn import_claude_session_inner(
             updated_at: timestamp,
             last_viewed_event_sequence: 0,
             last_error: None,
+            last_checkpoint_error: None,
             checkpoint: Some(checkpoint),
         },
     );
@@ -2437,6 +2438,7 @@ fn import_native_session(
             updated_at: timestamp,
             last_viewed_event_sequence: 0,
             last_error: None,
+            last_checkpoint_error: None,
             checkpoint: Some(checkpoint),
         },
     );

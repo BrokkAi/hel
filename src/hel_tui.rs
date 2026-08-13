@@ -73,9 +73,6 @@ pub enum DashboardAction {
     CreateBundle {
         source: String,
     },
-    Checkpoint {
-        session_id: String,
-    },
     Close {
         session_id: String,
     },
@@ -1000,12 +997,6 @@ impl DashboardState {
             }
             (KeyCode::Char('u'), true) => DashboardAction::RefreshQuotas,
             (KeyCode::Char('e'), true) if self.config_is_empty() => DashboardAction::OpenConfig,
-            (KeyCode::Char('k'), true) if self.focus == Focus::Active => self
-                .selected_session()
-                .map(|session| DashboardAction::Checkpoint {
-                    session_id: session.id.clone(),
-                })
-                .unwrap_or(DashboardAction::None),
             (KeyCode::Char('p'), true) if self.focus == Focus::Active => {
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(Confirmation::Close {
@@ -2495,7 +2486,7 @@ impl DashboardState {
             return DashboardAction::None;
         }
         if session.checkpoint.is_none() {
-            self.notice = Some("This session has no verified checkpoint to resume.".into());
+            self.notice = Some("This session has no verified recovery copy to resume.".into());
             return DashboardAction::None;
         }
         if self.compatible_profiles(&session.id).is_empty() || self.config.targets.is_empty() {
@@ -3739,12 +3730,11 @@ fn focus_border(focused: bool) -> BorderType {
     }
 }
 
-fn session_column_constraints() -> [Constraint; 6] {
+fn session_column_constraints() -> [Constraint; 5] {
     [
         Constraint::Length(10),
         Constraint::Length(14),
         Constraint::Length(18),
-        Constraint::Length(14),
         Constraint::Length(17),
         Constraint::Min(18),
     ]
@@ -3764,7 +3754,6 @@ fn session_header() -> Row<'static> {
         "Turn clock",
         "Profile",
         "Target",
-        "Checkpoint",
         "Resources",
         "Session name",
     ])
@@ -3772,7 +3761,7 @@ fn session_header() -> Row<'static> {
 }
 
 fn archived_session_header() -> Row<'static> {
-    Row::new(["Profile", "Checkpoint", "Resources", "Session name"])
+    Row::new(["Profile", "Archived", "Archive", "Session name"])
         .style(Style::default().add_modifier(Modifier::BOLD))
 }
 
@@ -3781,18 +3770,7 @@ fn session_values(
     detail: Option<&SessionDetail>,
     now_epoch_seconds: u64,
     config: &HelConfig,
-) -> (String, String, String, String, String, String) {
-    let checkpoint = session
-        .checkpoint
-        .as_ref()
-        .map(|checkpoint| {
-            if session.state.is_active() {
-                checkpoint_age(now_epoch_seconds, &checkpoint.created_at)
-            } else {
-                checkpoint_time_display(&checkpoint.created_at)
-            }
-        })
-        .unwrap_or_else(|| "never".into());
+) -> (String, String, String, String, String) {
     let clock = if session.state == SessionState::Provisioning {
         let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
         format!("Launch {}s", now_epoch_seconds.saturating_sub(started_at))
@@ -3806,7 +3784,6 @@ fn session_values(
         clock,
         session.last_profile.clone(),
         session_target(config, session),
-        checkpoint,
         detail
             .and_then(|detail| detail.resource_usage.as_ref())
             .map(resource_summary)
@@ -3935,16 +3912,18 @@ fn active_session_row(
     height: u16,
     top_margin: u16,
 ) -> Row<'static> {
-    let (clock, profile, target, checkpoint, resources, session_name) =
+    let (clock, profile, target, resources, session_name) =
         session_values(session, detail, now_epoch_seconds, config);
     let unread_count = detail.map_or(0, |detail| detail.unread_agent_message_sequences.len());
     Row::new([
         Cell::from(clock),
         Cell::from(profile),
         Cell::from(target),
-        Cell::from(checkpoint),
         Cell::from(resources),
-        Cell::from(session_name_line(session_name, unread_count)),
+        Cell::from(session_name_line(
+            recovery_warning_name(session, session_name, now_epoch_seconds),
+            unread_count,
+        )),
     ])
     .height(height)
     .top_margin(top_margin)
@@ -3978,6 +3957,19 @@ fn checkpoint_age(now_epoch_seconds: u64, checkpointed_at: &str) -> String {
         format!("{}h", age / 3_600)
     } else {
         format!("{}d", age / 86_400)
+    }
+}
+
+fn recovery_warning_name(session: &SessionRecord, name: String, now_epoch_seconds: u64) -> String {
+    if session.last_checkpoint_error.is_none() {
+        return name;
+    }
+    match &session.checkpoint {
+        Some(checkpoint) => format!(
+            "{name}  ⚠ Recovery copy {} old",
+            checkpoint_age(now_epoch_seconds, &checkpoint.created_at)
+        ),
+        None => format!("{name}  ⚠ Recovery unavailable"),
     }
 }
 
@@ -4153,7 +4145,7 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
 fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     let actions = match dashboard.focus {
         Focus::Active => {
-            "Ctrl for: [N]ew · [I]mport · [R]ename · Chec[K]point · [P]ause · [U]pdate quotas · [Q]uit · Tab pane"
+            "Ctrl for: [N]ew · [I]mport · [R]ename · [P]ause · [U]pdate quotas · [Q]uit · Tab pane"
         }
         Focus::Archived => {
             "Ctrl for: [N]ew · [I]mport · [R]ename · [D]elete permanently · [U]pdate quotas · [Q]uit · Tab pane"
@@ -4814,7 +4806,7 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
-                Line::raw("Hel will verify the checkpoint before destroying the target."),
+                Line::raw("Hel will verify a recovery copy before destroying the target."),
                 Line::raw("Press y/Enter to pause, or n/Esc to cancel."),
             ],
         ),
@@ -4823,7 +4815,7 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
-                Line::raw("Hel will permanently delete the checkpoint archive and session record."),
+                Line::raw("Hel will permanently delete the recovery archive and session record."),
                 Line::raw("Press y/Enter to delete, or n/Esc to cancel."),
             ],
         ),
@@ -5193,6 +5185,7 @@ mod tests {
             updated_at: "2026-08-09T01:00:00Z".into(),
             last_viewed_event_sequence: 0,
             last_error: None,
+            last_checkpoint_error: None,
             checkpoint: Some(CheckpointMetadata {
                 archive_path: PathBuf::from("sessions/session-1.hel.zip"),
                 sha256: "a".repeat(64),
@@ -5400,12 +5393,7 @@ mod tests {
             dashboard.handle_key(key(KeyCode::Char('q'))),
             DashboardAction::None
         );
-        assert_eq!(
-            dashboard.handle_key(ctrl_key('k')),
-            DashboardAction::Checkpoint {
-                session_id: "session-1".into()
-            }
-        );
+        assert_eq!(dashboard.handle_key(ctrl_key('k')), DashboardAction::None);
         assert_eq!(
             dashboard.handle_key(ctrl_key('u')),
             DashboardAction::RefreshQuotas
@@ -6942,7 +6930,7 @@ mod tests {
         assert!(rendered.contains("Turn clock"));
         assert!(rendered.contains("Profile"));
         assert!(rendered.contains("Target"));
-        assert!(rendered.contains("Checkpoint"));
+        assert!(!rendered.contains("Checkpoint"));
         assert!(rendered.contains("Resources"));
         assert!(rendered.contains("C 37% · M 50%"));
         assert!(!rendered.contains("S 4.0K · D 8.0K"));
@@ -7207,6 +7195,23 @@ mod tests {
     }
 
     #[test]
+    fn recovery_state_is_hidden_until_a_failure_needs_attention() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        assert_eq!(
+            recovery_warning_name(&session, "Build Hel".into(), 0),
+            "Build Hel"
+        );
+
+        session.last_checkpoint_error = Some("copy failed".into());
+        session.checkpoint = None;
+        assert_eq!(
+            recovery_warning_name(&session, "Build Hel".into(), 0),
+            "Build Hel  ⚠ Recovery unavailable"
+        );
+    }
+
+    #[test]
     fn active_idle_clock_is_blank() {
         let mut session = archived_session();
         session.state = SessionState::Running;
@@ -7215,7 +7220,7 @@ mod tests {
             ..SessionDetail::default()
         };
 
-        let (clock, _, _, _, _, _) = session_values(&session, Some(&detail), 1_480, &config());
+        let (clock, _, _, _, _) = session_values(&session, Some(&detail), 1_480, &config());
         assert_eq!(clock, "");
     }
 
@@ -7282,7 +7287,7 @@ mod tests {
         session.state = SessionState::Provisioning;
         session.updated_at = "1970-01-01T00:16:40Z".into();
 
-        let (clock, _, _, _, _, _) = session_values(&session, None, 1_012, &config());
+        let (clock, _, _, _, _) = session_values(&session, None, 1_012, &config());
         assert_eq!(clock, "Launch 12s");
     }
 

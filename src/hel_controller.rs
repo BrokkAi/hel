@@ -74,6 +74,12 @@ pub struct RecoveryScan {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CheckpointArtifact {
+    pub metadata: CheckpointMetadata,
+    pub native_session_id: String,
+}
+
 pub struct SessionLaunchOptions {
     pub additional_mounts: Vec<AdditionalMount>,
     pub allow_dirty_local: bool,
@@ -301,6 +307,7 @@ impl Controller {
             updated_at: now,
             last_viewed_event_sequence: 0,
             last_error: None,
+            last_checkpoint_error: None,
             checkpoint: None,
         };
         let backend = backend_locator(record.target.as_ref().unwrap(), &record, &self.config)?;
@@ -530,6 +537,7 @@ impl Controller {
             updated_at: now,
             last_viewed_event_sequence: 0,
             last_error: None,
+            last_checkpoint_error: None,
             checkpoint: None,
         };
         self.state.sessions.insert(id.clone(), record);
@@ -1323,16 +1331,43 @@ impl Controller {
     /// target remains live. A failed export or transfer leaves the previous
     /// archive and target untouched.
     pub async fn checkpoint_session(&mut self, session_id: &str) -> Result<CheckpointMetadata> {
+        let previous = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?
+            .clone();
+        let record = self.state.sessions.get_mut(session_id).unwrap();
+        record.state = SessionState::Checkpointing;
+        record.updated_at = now();
+        record.last_checkpoint_error = None;
+        self.state.save()?;
+
         match self
             .checkpoint_session_with(session_id, &ProcessExecutor)
             .await
         {
-            Ok(checkpoint) => Ok(checkpoint),
+            Ok(artifact) => {
+                let record = self.state.sessions.get_mut(session_id).unwrap();
+                record.state = SessionState::Running;
+                record.native_session_id = Some(artifact.native_session_id);
+                record.checkpoint = Some(artifact.metadata.clone());
+                record.updated_at = now();
+                record.last_error = None;
+                record.last_checkpoint_error = None;
+                self.state.save()?;
+                prune_replaced_checkpoint(previous.checkpoint.as_ref(), &artifact.metadata);
+                Ok(artifact.metadata)
+            }
             Err(error) => {
                 if let Some(record) = self.state.sessions.get_mut(session_id) {
-                    record.state = SessionState::Error;
+                    record.state = if previous.state == SessionState::Checkpointing {
+                        SessionState::Running
+                    } else {
+                        previous.state
+                    };
                     record.updated_at = now();
-                    record.last_error = Some(format!("checkpoint failed: {error:#}"));
+                    record.last_checkpoint_error = Some(format!("{error:#}"));
                     self.state.save()?;
                 }
                 Err(error)
@@ -1340,11 +1375,18 @@ impl Controller {
         }
     }
 
+    /// Create and verify a recovery archive without mutating controller state.
+    /// The caller is responsible for installing the returned metadata.
+    pub async fn create_recovery_checkpoint(&self, session_id: &str) -> Result<CheckpointArtifact> {
+        self.checkpoint_session_with(session_id, &ProcessExecutor)
+            .await
+    }
+
     async fn checkpoint_session_with(
-        &mut self,
+        &self,
         session_id: &str,
         executor: &(impl CommandExecutor + Sync),
-    ) -> Result<CheckpointMetadata> {
+    ) -> Result<CheckpointArtifact> {
         let session = self
             .state
             .sessions
@@ -1361,12 +1403,6 @@ impl Controller {
             .bundles
             .get(&session.bundle_id)
             .context("session bundle is missing")?;
-        let record = self.state.sessions.get_mut(session_id).unwrap();
-        record.state = SessionState::Checkpointing;
-        record.updated_at = now();
-        record.last_error = None;
-        self.state.save()?;
-
         let reconnect = hel_targets::reconnect_plan(&backend, session_id)?
             .commands
             .into_iter()
@@ -1465,7 +1501,10 @@ impl Controller {
             );
         }
 
-        let destination = sessions_dir().join(format!("{session_id}.hel.zip"));
+        let destination = sessions_dir().join(format!(
+            "{session_id}-{}.hel.zip",
+            target_checkpoint.event_sequence
+        ));
         let transfer = CheckpointTransfer {
             locator: &backend,
             session_id,
@@ -1478,20 +1517,16 @@ impl Controller {
             bail!("target and controller checkpoint checksums differ");
         }
         transfer.cleanup_plan(&verified)?.execute(executor)?;
-        let checkpoint = CheckpointMetadata {
+        let metadata = CheckpointMetadata {
             archive_path: verified.archive_path().to_path_buf(),
             sha256: verified.sha256().to_string(),
             created_at: checkpointed_at,
             event_sequence: verified.event_sequence(),
         };
-        let record = self.state.sessions.get_mut(session_id).unwrap();
-        record.state = SessionState::Running;
-        record.native_session_id = Some(native_session_id);
-        record.checkpoint = Some(checkpoint.clone());
-        record.updated_at = now();
-        record.last_error = None;
-        self.state.save()?;
-        Ok(checkpoint)
+        Ok(CheckpointArtifact {
+            metadata,
+            native_session_id,
+        })
     }
 
     /// Checkpoint, ask the harness to close, and only then tear down the exact
@@ -3877,6 +3912,20 @@ fn now() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+fn prune_replaced_checkpoint(previous: Option<&CheckpointMetadata>, current: &CheckpointMetadata) {
+    let Some(previous) = previous.filter(|old| old.archive_path != current.archive_path) else {
+        return;
+    };
+    if let Err(error) = std::fs::remove_file(&previous.archive_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %previous.archive_path.display(),
+            "could not remove superseded recovery copy: {error}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -3980,6 +4029,7 @@ mod tests {
             updated_at: "2026-08-12T00:00:00Z".into(),
             last_viewed_event_sequence: 0,
             last_error: None,
+            last_checkpoint_error: None,
             checkpoint: None,
         };
         let mut state = HelState::default();
@@ -4015,6 +4065,7 @@ mod tests {
             updated_at: "2026-08-12T00:00:00Z".into(),
             last_viewed_event_sequence: 0,
             last_error: None,
+            last_checkpoint_error: None,
             checkpoint: None,
         };
         let partial_target = TargetLocator::LocalPodman {
@@ -4110,6 +4161,7 @@ mod tests {
             updated_at: "2026-08-12T00:00:00Z".into(),
             last_viewed_event_sequence: 0,
             last_error: None,
+            last_checkpoint_error: None,
             checkpoint: None,
         };
         let state = HelState {
