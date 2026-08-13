@@ -880,13 +880,14 @@ pub fn collect_git_snapshot(
     repository: &Path,
     spec: &GitCollectionSpec,
 ) -> Result<RepositorySnapshot> {
-    collect_git_snapshot_with_progress(runner, repository, spec, &|_| Ok(()))
+    collect_git_snapshot_with_progress(runner, repository, spec, true, &|_| Ok(()))
 }
 
 pub fn collect_git_snapshot_with_progress(
     runner: &dyn GitCommandRunner,
     repository: &Path,
     spec: &GitCollectionSpec,
+    include_untracked: bool,
     progress: &(dyn Fn(GitSnapshotProgress) -> Result<()> + Sync),
 ) -> Result<RepositorySnapshot> {
     validate_component(&spec.id, "repository id")?;
@@ -975,6 +976,9 @@ pub fn collect_git_snapshot_with_progress(
                     )
                 },
                 || {
+                    if !include_untracked {
+                        return Ok(Vec::new());
+                    }
                     let untracked = git_bytes(
                         runner,
                         repository,
@@ -1739,6 +1743,37 @@ mod tests {
             .collect();
         assert_eq!(paths, vec![PathBuf::from("note.txt")]);
         assert_eq!(runner.commands().len(), 8);
+    }
+
+    #[test]
+    fn git_collection_can_omit_untracked_files_without_losing_tracked_changes() {
+        let repository = tempfile::tempdir().unwrap();
+        fs::write(repository.path().join("note.txt"), b"untracked").unwrap();
+        let runner = CollectionGit::new(0, false);
+        let snapshot = collect_git_snapshot_with_progress(
+            &runner,
+            repository.path(),
+            &GitCollectionSpec {
+                id: "repo".into(),
+                relative_destination: PathBuf::from("repo"),
+                base_commit: "a".repeat(40),
+                full_history: false,
+                origin_override: None,
+            },
+            false,
+            &|_| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.staged_patch, b"staged");
+        assert_eq!(snapshot.unstaged_patch, b"unstaged");
+        assert!(snapshot.untracked_tar.is_empty());
+        assert!(runner.commands().iter().all(|command| {
+            command
+                .arguments
+                .first()
+                .is_none_or(|argument| argument != "ls-files")
+        }));
     }
 
     #[test]

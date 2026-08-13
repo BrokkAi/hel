@@ -105,6 +105,7 @@ pub enum DashboardAction {
     CancelImport,
     ConfirmImportBundle {
         accepted: bool,
+        include_untracked: bool,
     },
     OpenConfig,
     QuitDetach,
@@ -319,6 +320,8 @@ struct ImportProgress {
 struct ImportBundleConfirmation {
     dirty_git_roots: Vec<String>,
     omitted_non_git_dirs: Vec<String>,
+    has_untracked_files: bool,
+    ignore_untracked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -915,10 +918,13 @@ impl DashboardState {
         &mut self,
         dirty_git_roots: Vec<String>,
         omitted_non_git_dirs: Vec<String>,
+        has_untracked_files: bool,
     ) {
         self.mode = Mode::ConfirmImportBundle(ImportBundleConfirmation {
             dirty_git_roots,
             omitted_non_git_dirs,
+            has_untracked_files,
+            ignore_untracked: has_untracked_files,
         });
     }
 
@@ -966,14 +972,24 @@ impl DashboardState {
                 KeyCode::Esc => DashboardAction::CancelImport,
                 _ => DashboardAction::None,
             },
-            Mode::ConfirmImportBundle(_) => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
-                    DashboardAction::ConfirmImportBundle { accepted: true }
+            Mode::ConfirmImportBundle(mut confirmation) => match key.code {
+                KeyCode::Char(' ') if confirmation.has_untracked_files => {
+                    confirmation.ignore_untracked = !confirmation.ignore_untracked;
+                    self.mode = Mode::ConfirmImportBundle(confirmation);
+                    DashboardAction::None
                 }
-                KeyCode::Char('n') | KeyCode::Esc => {
-                    DashboardAction::ConfirmImportBundle { accepted: false }
+                KeyCode::Char('y') | KeyCode::Enter => DashboardAction::ConfirmImportBundle {
+                    accepted: true,
+                    include_untracked: !confirmation.ignore_untracked,
+                },
+                KeyCode::Char('n') | KeyCode::Esc => DashboardAction::ConfirmImportBundle {
+                    accepted: false,
+                    include_untracked: false,
+                },
+                _ => {
+                    self.mode = Mode::ConfirmImportBundle(confirmation);
+                    DashboardAction::None
                 }
-                _ => DashboardAction::None,
             },
             Mode::Confirm(confirmation) => self.handle_confirmation_key(key.code, confirmation),
         }
@@ -3726,14 +3742,16 @@ fn render_import_bundle_confirmation(
     area: Rect,
     confirmation: &ImportBundleConfirmation,
 ) {
-    let height =
-        (confirmation.dirty_git_roots.len() + confirmation.omitted_non_git_dirs.len() + 10) as u16;
+    let height = (confirmation.dirty_git_roots.len()
+        + confirmation.omitted_non_git_dirs.len()
+        + usize::from(confirmation.has_untracked_files)
+        + 11) as u16;
     let popup = centered_rect(76, height.clamp(12, 24), area);
     frame.render_widget(Clear, popup);
     let mut lines = Vec::new();
     if !confirmation.dirty_git_roots.is_empty() {
         lines.push(Line::raw(
-            "These Git roots are dirty; Hel will archive their complete current state:",
+            "These Git roots have local changes; Hel will archive tracked changes:",
         ));
         lines.extend(
             confirmation
@@ -3741,6 +3759,20 @@ fn render_import_bundle_confirmation(
                 .iter()
                 .map(|root| Line::styled(root.clone(), Style::default().fg(Color::Yellow))),
         );
+        if confirmation.has_untracked_files {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                format!(
+                    "{} Ignore untracked files",
+                    if confirmation.ignore_untracked {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    }
+                ),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
     }
     if !confirmation.omitted_non_git_dirs.is_empty() {
         if !lines.is_empty() {
@@ -3757,7 +3789,7 @@ fn render_import_bundle_confirmation(
     }
     lines.extend([
         Line::raw(""),
-        Line::raw("Press y/Enter to continue, or n/Esc to cancel."),
+        Line::raw("Space toggles checkbox · y/Enter continues · n/Esc cancels."),
     ]);
     frame.render_widget(
         Paragraph::new(lines)
@@ -7692,6 +7724,52 @@ mod tests {
         assert!(rendered.contains("unavailable"));
         assert!(rendered.contains("Cannot import: Legacy Codex history"));
         assert!(rendered.contains("codex migrate-rollouts --apply"));
+    }
+
+    #[test]
+    fn import_safety_defaults_to_ignoring_untracked_files_and_can_include_them() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.show_import_bundle_confirmation(
+            vec!["/work/repo — 1 tracked change · 222561 untracked paths".into()],
+            Vec::new(),
+            true,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw safety warning");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("[x] Ignore untracked files"));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ConfirmImportBundle {
+                accepted: true,
+                include_untracked: false,
+            }
+        );
+
+        dashboard.show_import_bundle_confirmation(
+            vec!["/work/repo — 222561 untracked paths".into()],
+            Vec::new(),
+            true,
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char(' '))),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ConfirmImportBundle {
+                accepted: true,
+                include_untracked: true,
+            }
+        );
     }
 
     #[test]

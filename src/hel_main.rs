@@ -1727,9 +1727,16 @@ struct PendingDashboardImport {
     display_title: String,
 }
 
+#[derive(Clone, Copy)]
+struct DashboardImportSafety {
+    accepted: bool,
+    include_untracked: bool,
+}
+
 struct ImportBundlePrompt {
     dirty_git_roots: Vec<String>,
     omitted_non_git_dirs: Vec<String>,
+    has_untracked_files: bool,
 }
 
 struct DashboardImportSuccess {
@@ -1910,6 +1917,7 @@ async fn run_dashboard() -> Result<()> {
                             dashboard.show_import_bundle_confirmation(
                                 prompt.dirty_git_roots,
                                 prompt.omitted_non_git_dirs,
+                                prompt.has_untracked_files,
                             );
                         }
                         Ok(DashboardImportTaskResult::Imported(mut imported)) => {
@@ -2072,7 +2080,10 @@ async fn run_dashboard() -> Result<()> {
                 spawn_dashboard_import(
                     &controller,
                     pending,
-                    false,
+                    DashboardImportSafety {
+                        accepted: false,
+                        include_untracked: true,
+                    },
                     next_import_task_id,
                     cancelled,
                     import_task_tx.clone(),
@@ -2086,7 +2097,10 @@ async fn run_dashboard() -> Result<()> {
                         .set_notice("Import cancellation requested; no Hel state will be changed.");
                 }
             }
-            DashboardAction::ConfirmImportBundle { accepted } => {
+            DashboardAction::ConfirmImportBundle {
+                accepted,
+                include_untracked,
+            } => {
                 let Some(pending) = pending_import.take() else {
                     dashboard.finish_import();
                     dashboard.set_notice("Import confirmation expired.");
@@ -2103,7 +2117,10 @@ async fn run_dashboard() -> Result<()> {
                     spawn_dashboard_import(
                         &controller,
                         pending,
-                        true,
+                        DashboardImportSafety {
+                            accepted: true,
+                            include_untracked,
+                        },
                         next_import_task_id,
                         cancelled,
                         import_task_tx.clone(),
@@ -2796,7 +2813,7 @@ fn display_home_relative(path: &std::path::Path) -> String {
 fn spawn_dashboard_import(
     controller: &Controller,
     pending: PendingDashboardImport,
-    safety_accepted: bool,
+    safety: DashboardImportSafety,
     task_id: u64,
     cancelled: Arc<AtomicBool>,
     updates: tokio::sync::mpsc::Sender<DashboardImportUpdate>,
@@ -2842,7 +2859,7 @@ fn spawn_dashboard_import(
             &pending.profile_id,
             &pending.native_session_id,
             &pending.display_title,
-            safety_accepted,
+            safety,
             &cancelled,
             report,
         );
@@ -2937,6 +2954,7 @@ fn resolve_background_import_bundle(
                     .into_iter()
                     .map(|path| path.display().to_string())
                     .collect(),
+                has_untracked_files: issues.has_untracked_files,
             },
         ));
     }
@@ -2948,7 +2966,7 @@ fn import_session_from_profile(
     profile_id: &str,
     native_session_id: &str,
     display_title: &str,
-    safety_accepted: bool,
+    safety: DashboardImportSafety,
     cancelled: &AtomicBool,
     report: impl Fn(usize, Option<usize>, &str, bool) + Sync,
 ) -> Result<DashboardImportTaskResult> {
@@ -2971,7 +2989,7 @@ fn import_session_from_profile(
                 &mut controller.config,
                 &transcript,
                 &profile.home,
-                safety_accepted,
+                safety.accepted,
             )? {
                 BackgroundBundleResolution::Ready(bundle_id) => bundle_id,
                 BackgroundBundleResolution::NeedsConfirmation(prompt) => {
@@ -2982,6 +3000,7 @@ fn import_session_from_profile(
             let control = ImportControl {
                 cancelled,
                 progress: &archive_progress,
+                include_untracked: safety.include_untracked,
             };
             let imported = import_codex_session_with_control(
                 &controller.config,
@@ -3017,7 +3036,7 @@ fn import_session_from_profile(
                 &mut controller.config,
                 &transcript,
                 &profile.home,
-                safety_accepted,
+                safety.accepted,
             )? {
                 BackgroundBundleResolution::Ready(bundle_id) => bundle_id,
                 BackgroundBundleResolution::NeedsConfirmation(prompt) => {
@@ -3028,6 +3047,7 @@ fn import_session_from_profile(
             let control = ImportControl {
                 cancelled,
                 progress: &archive_progress,
+                include_untracked: safety.include_untracked,
             };
             let imported = import_claude_session_with_control(
                 &controller.config,
@@ -3063,7 +3083,7 @@ fn import_session_from_profile(
                 &mut controller.config,
                 &transcript,
                 &profile.home,
-                safety_accepted,
+                safety.accepted,
             )? {
                 BackgroundBundleResolution::Ready(bundle_id) => bundle_id,
                 BackgroundBundleResolution::NeedsConfirmation(prompt) => {
@@ -3074,6 +3094,7 @@ fn import_session_from_profile(
             let control = ImportControl {
                 cancelled,
                 progress: &archive_progress,
+                include_untracked: safety.include_untracked,
             };
             let imported = import_kimi_session_with_control(
                 &controller.config,
