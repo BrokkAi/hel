@@ -758,6 +758,43 @@ pub fn provision_plan(
     })
 }
 
+/// Prepare Hel-owned runtime storage while using an existing bare-SSH project
+/// directory in place. The project directory is verified but never created or
+/// removed by Hel.
+pub fn provision_bare_project_plan(
+    template: &TargetTemplate,
+    session_id: &str,
+    project_directory: &str,
+) -> Result<CommandPlan> {
+    let TargetTemplate::SshBare { ssh, .. } = template else {
+        bail!("raw project directories require a bare SSH target");
+    };
+    validate_ssh(ssh)?;
+    let project = std::path::Path::new(project_directory);
+    if !project.is_absolute()
+        || project
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        bail!("bare SSH project directory must be an absolute safe path");
+    }
+    let workspace = workspace_for(template, session_id)?;
+    Ok(CommandPlan {
+        description: format!("provision Hel session {session_id}"),
+        commands: vec![
+            ssh_command(ssh, ["test", "-d", project_directory])
+                .purpose("verify bare SSH project directory"),
+            ssh_command(
+                ssh,
+                ["git", "-C", project_directory, "rev-parse", "--git-dir"],
+            )
+            .purpose("verify bare SSH Git project"),
+            ssh_command(ssh, ["mkdir", "-p", &workspace])
+                .purpose("create SSH session runtime workspace"),
+        ],
+    })
+}
+
 /// Create the short-lived local container used to verify a setup target.
 ///
 /// This deliberately shares the same argv construction as session targets so
@@ -2281,6 +2318,36 @@ mod tests {
         assert_eq!(
             command.args.last().unwrap(),
             "'git' 'clone' '--' 'repo'\\''; touch /tmp/pwned; echo '\\'''"
+        );
+    }
+
+    #[test]
+    fn bare_project_plan_uses_existing_directory_without_owning_it() {
+        let template = TargetTemplate::SshBare {
+            ssh: ssh(),
+            workspace_prefix: ".local/share/hel/workspaces".into(),
+        };
+        let provision = provision_bare_project_plan(&template, SESSION, "/srv/project").unwrap();
+        let commands = provision
+            .commands
+            .iter()
+            .map(|command| command.args.last().unwrap().as_str())
+            .collect::<Vec<_>>();
+        assert!(commands[0].contains("'test' '-d' '/srv/project'"));
+        assert!(commands[1].contains("'git' '-C' '/srv/project'"));
+        assert!(commands.iter().all(|command| !command.contains("'rm'")));
+
+        let locator = TargetLocator::SshBare {
+            ssh: ssh(),
+            workspace: format!(".local/share/hel/workspaces/{SESSION}"),
+        };
+        let close = close_plan(&locator, SESSION).unwrap();
+        assert!(
+            !close.commands[0]
+                .args
+                .last()
+                .unwrap()
+                .contains("/srv/project")
         );
     }
 

@@ -875,6 +875,7 @@ mod tests {
                     harness_kind: HarnessKind::Codex,
                     last_profile: "codex-1".into(),
                     bundle_id: "hel".into(),
+                    project_directory: None,
                     target_template_id: "podman".into(),
                     resource_allocation: None,
                     additional_mounts: vec![],

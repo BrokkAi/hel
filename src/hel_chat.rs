@@ -242,6 +242,12 @@ pub struct TranscriptSnapshot {
 }
 
 impl TranscriptSnapshot {
+    pub(crate) fn has_assistant_messages(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty())
+    }
+
     pub(crate) fn rich_tail(&mut self, width: u16, maximum_lines: usize) -> Vec<Line<'static>> {
         let lines = transcript_entry_lines(
             &self.entries,

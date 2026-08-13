@@ -16,7 +16,7 @@ use crate::hel_state::{
 };
 use crate::hel_targets::AdditionalMount;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryScope {
@@ -168,6 +168,16 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 4 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE sessions ADD COLUMN project_directory BLOB;
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 4;
+             COMMIT;",
+        )?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -194,7 +204,7 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
                 s.target_template_id, s.state, s.native_session_id, s.acp_session_title,
                 s.session_title_override, c.created_at, s.updated_at,
                 s.last_viewed_event_sequence, s.last_error, s.resource_allocation,
-                s.last_checkpoint_error
+                s.last_checkpoint_error, s.project_directory
          FROM sessions s JOIN session_contexts c USING(session_id)
          ORDER BY s.session_id",
     )?;
@@ -205,6 +215,7 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
             harness_kind: parse_harness(&row.get::<_, String>(2)?),
             last_profile: row.get(3)?,
             bundle_id: row.get(4)?,
+            project_directory: row.get_ref(16)?.blob_or_null()?.map(blob_to_path),
             target_template_id: row.get(5)?,
             resource_allocation: row
                 .get::<_, Option<String>>(14)?
@@ -356,8 +367,8 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
              session_id, title, harness_kind, last_profile, target_template_id, state,
              native_session_id, acp_session_title, session_title_override, updated_at,
              last_viewed_event_sequence, last_error, resource_allocation,
-             last_checkpoint_error
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+             last_checkpoint_error, project_directory
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
         params![
             session.id,
             session.title,
@@ -377,6 +388,10 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
                 .map(serde_json::to_string)
                 .transpose()?,
             session.last_checkpoint_error,
+            session
+                .project_directory
+                .as_ref()
+                .map(|path| path_to_blob(path)),
         ],
     )?;
     if let Some(target) = &session.target {
@@ -811,6 +826,7 @@ mod tests {
             harness_kind: HarnessKind::Codex,
             last_profile: "codex".into(),
             bundle_id: bundle.into(),
+            project_directory: None,
             target_template_id: "local".into(),
             resource_allocation: Some(SessionResourceAllocation::Container {
                 cpus: 8,
@@ -846,7 +862,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("hel.sqlite3");
         let mut state = HelState::default();
-        let record = session("session-1", "project-1");
+        let mut record = session("session-1", "project-1");
+        record.project_directory = Some(PathBuf::from("/srv/project-1"));
         state.sessions.insert(record.id.clone(), record);
         state.mount_history.insert(
             "local".into(),

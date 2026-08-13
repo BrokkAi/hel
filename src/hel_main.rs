@@ -2145,12 +2145,13 @@ async fn run_dashboard() -> Result<()> {
             DashboardAction::CreateSession {
                 profile_id,
                 bundle_id,
+                project_directory,
                 target_template_id,
                 additional_mounts,
                 allow_dirty_local,
                 resource_allocation,
             } => {
-                if !allow_dirty_local {
+                if !allow_dirty_local && project_directory.is_none() {
                     let dirty = controller
                         .config
                         .bundles
@@ -2169,6 +2170,7 @@ async fn run_dashboard() -> Result<()> {
                                 DashboardAction::CreateSession {
                                     profile_id,
                                     bundle_id,
+                                    project_directory,
                                     target_template_id,
                                     additional_mounts,
                                     allow_dirty_local: false,
@@ -2187,7 +2189,13 @@ async fn run_dashboard() -> Result<()> {
                         _ => {}
                     }
                 }
-                let title = format!("{bundle_id} via {profile_id}");
+                let title = format!(
+                    "{} via {profile_id}",
+                    project_directory
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| bundle_id.clone())
+                );
                 match controller.register_session_with_resources(
                     &profile_id,
                     &bundle_id,
@@ -2197,6 +2205,7 @@ async fn run_dashboard() -> Result<()> {
                         additional_mounts,
                         allow_dirty_local,
                         resource_allocation,
+                        project_directory,
                     },
                 ) {
                     Ok(session_id) => {
@@ -2484,6 +2493,24 @@ async fn run_dashboard() -> Result<()> {
                         short_id(&session_id)
                     )),
                     Err(error) => dashboard.set_notice(format!("Destroy failed: {error:#}")),
+                }
+                dashboard.set_state(controller.state.clone());
+                refresh_dashboard_poll_targets(
+                    &controller,
+                    &worker_targets_tx,
+                    &resource_targets_tx,
+                );
+            }
+            DashboardAction::DeleteActive { session_id } => {
+                let result = controller
+                    .force_destroy(&session_id, &ProcessExecutor)
+                    .and_then(|()| delete_archived_session(&mut controller, &session_id));
+                match result {
+                    Ok(()) => dashboard.set_notice(format!(
+                        "Deleted active session {} without checkpointing",
+                        short_id(&session_id)
+                    )),
+                    Err(error) => dashboard.set_notice(format!("Delete failed: {error:#}")),
                 }
                 dashboard.set_state(controller.state.clone());
                 refresh_dashboard_poll_targets(

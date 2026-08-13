@@ -84,6 +84,7 @@ pub struct SessionLaunchOptions {
     pub additional_mounts: Vec<AdditionalMount>,
     pub allow_dirty_local: bool,
     pub resource_allocation: Option<SessionResourceAllocation>,
+    pub project_directory: Option<PathBuf>,
 }
 
 impl Controller {
@@ -295,6 +296,7 @@ impl Controller {
             harness_kind: profile.kind,
             last_profile: profile_id,
             bundle_id,
+            project_directory: None,
             target_template_id: target_id.to_owned(),
             resource_allocation: None,
             additional_mounts: Vec::new(),
@@ -469,6 +471,7 @@ impl Controller {
                 additional_mounts,
                 allow_dirty_local,
                 resource_allocation: None,
+                project_directory: None,
             },
         )
     }
@@ -485,18 +488,42 @@ impl Controller {
             additional_mounts,
             allow_dirty_local,
             resource_allocation,
+            project_directory,
         } = options;
         let profile = self
             .config
             .profiles
             .get(profile_id)
             .with_context(|| format!("unknown profile {profile_id:?}"))?;
-        let bundle = self
+        let template = self
             .config
-            .bundles
-            .get(bundle_id)
-            .with_context(|| format!("unknown bundle {bundle_id:?}"))?;
-        let dirty = dirty_local_repositories(bundle)?;
+            .targets
+            .get(target_id)
+            .with_context(|| format!("unknown target template {target_id:?}"))?;
+        if project_directory.is_some() != matches!(template, TargetTemplate::SshBare { .. }) {
+            bail!(
+                "raw project directories require a bare SSH target, and bare SSH targets require one"
+            );
+        }
+        if let Some(path) = &project_directory
+            && (!path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir))
+        {
+            bail!("bare SSH project directory must be an absolute safe path");
+        }
+        let bundle = project_directory
+            .is_none()
+            .then(|| self.config.bundles.get(bundle_id))
+            .flatten();
+        if project_directory.is_none() && bundle.is_none() {
+            bail!("unknown bundle {bundle_id:?}");
+        }
+        let dirty = bundle
+            .map(dirty_local_repositories)
+            .transpose()?
+            .unwrap_or_default();
         if !allow_dirty_local && !dirty.is_empty() {
             let repositories = dirty
                 .iter()
@@ -507,11 +534,6 @@ impl Controller {
                 "local repositories have uncommitted changes: {repositories}; explicit confirmation is required"
             );
         }
-        let template = self
-            .config
-            .targets
-            .get(target_id)
-            .with_context(|| format!("unknown target template {target_id:?}"))?;
         validate_resource_allocation(template, resource_allocation.as_ref())?;
         if !additional_mounts.is_empty() && mount_history_host(template).is_none() {
             bail!("attached resources are unsupported for this target");
@@ -525,6 +547,7 @@ impl Controller {
             harness_kind: profile.kind,
             last_profile: profile_id.to_string(),
             bundle_id: bundle_id.to_string(),
+            project_directory,
             target_template_id: target_id.to_string(),
             resource_allocation,
             additional_mounts: additional_mounts.clone(),
@@ -629,20 +652,35 @@ impl Controller {
                     );
                 }
             }
-            let bundle = self
-                .config
-                .bundles
-                .get(&session.bundle_id)
-                .context("project bundle disappeared during provisioning")?;
             let target = backend_target(template, session.resource_allocation.as_ref())?;
-            let bundle = backend_bundle(bundle)?;
             let runtime_mounts = if matches!(target, hel_targets::TargetTemplate::AwsEc2(_)) {
                 &[][..]
             } else {
                 session.additional_mounts.as_slice()
             };
-            let provision =
-                hel_targets::provision_plan(&target, session_id, &bundle, runtime_mounts)?;
+            let bundle = session
+                .project_directory
+                .is_none()
+                .then(|| self.config.bundles.get(&session.bundle_id))
+                .flatten()
+                .map(backend_bundle)
+                .transpose()?;
+            let provision = if let Some(project_directory) = &session.project_directory {
+                hel_targets::provision_bare_project_plan(
+                    &target,
+                    session_id,
+                    &project_directory.to_string_lossy(),
+                )?
+            } else {
+                hel_targets::provision_plan(
+                    &target,
+                    session_id,
+                    bundle
+                        .as_ref()
+                        .context("project bundle disappeared during provisioning")?,
+                    runtime_mounts,
+                )?
+            };
 
             let outputs =
                 preflight_target(template, executor).and_then(|()| provision.execute(executor))?;
@@ -652,7 +690,7 @@ impl Controller {
                 session_id,
                 outputs.first(),
                 executor,
-                &bundle,
+                bundle.as_ref(),
             )
             .map_err(|error| {
                 match cleanup_failed_provision(template, session_id, outputs.first(), executor) {
@@ -726,11 +764,11 @@ impl Controller {
             .profiles
             .get(&session.last_profile)
             .context("session profile is missing")?;
-        let bundle = self
-            .config
-            .bundles
-            .get(&session.bundle_id)
-            .context("session bundle is missing")?;
+        let bundle = session
+            .project_directory
+            .is_none()
+            .then(|| self.config.bundles.get(&session.bundle_id))
+            .flatten();
         let locator = session
             .target
             .as_ref()
@@ -748,7 +786,15 @@ impl Controller {
                 format!(".local/share/hel/profiles/{session_id}")
             }
         };
-        let workspace = workspace_paths(&backend, bundle, session_id)?;
+        let workspace = if let Some(project_directory) = &session.project_directory {
+            (project_directory.to_string_lossy().into_owned(), Vec::new())
+        } else {
+            workspace_paths(
+                &backend,
+                bundle.context("session bundle is missing")?,
+                session_id,
+            )?
+        };
         let mut additional_directories = workspace
             .1
             .into_iter()
@@ -819,6 +865,9 @@ impl Controller {
             .sessions
             .get(session_id)
             .with_context(|| format!("unknown session {session_id}"))?;
+        if session.project_directory.is_some() {
+            return Ok(());
+        }
         let bundle = self
             .config
             .bundles
@@ -1131,6 +1180,11 @@ impl Controller {
             .targets
             .get(target_id)
             .with_context(|| format!("unknown target template {target_id:?}"))?;
+        if previous.project_directory.is_some()
+            && !matches!(target_template, TargetTemplate::SshBare { .. })
+        {
+            bail!("sessions using a raw project directory must resume on a bare SSH target");
+        }
         let resource_allocation =
             resource_allocation.or_else(|| previous.resource_allocation.clone());
         let additional_mounts =
@@ -1181,16 +1235,25 @@ impl Controller {
             let (backend, worker_root) =
                 self.prepare_worker_files(session_id, &ProcessExecutor, same_harness)?;
             let harness_home = target_profile_home(&backend, session_id);
-            let workspace_root = match &backend {
-                hel_targets::TargetLocator::LocalPodman { .. }
-                | hel_targets::TargetLocator::AppleContainer { .. }
-                | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_string(),
-                hel_targets::TargetLocator::AwsEc2 { workspace, .. }
-                | hel_targets::TargetLocator::SshBare { workspace, .. } => workspace.clone(),
+            let workspace_root = if let Some(project_directory) = &previous.project_directory {
+                project_directory
+                    .parent()
+                    .context("bare SSH project directory has no parent")?
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                match &backend {
+                    hel_targets::TargetLocator::LocalPodman { .. }
+                    | hel_targets::TargetLocator::AppleContainer { .. }
+                    | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_string(),
+                    hel_targets::TargetLocator::AwsEc2 { workspace, .. }
+                    | hel_targets::TargetLocator::SshBare { workspace, .. } => workspace.clone(),
+                }
             };
             let target_path = |path: &str| match &backend {
                 hel_targets::TargetLocator::AwsEc2 { .. }
-                | hel_targets::TargetLocator::SshBare { .. } => PathBuf::from(format!("~/{path}")),
+                | hel_targets::TargetLocator::SshBare { .. }
+                    if !path.starts_with('/') => PathBuf::from(format!("~/{path}")),
                 _ => PathBuf::from(path),
             };
             let remote_archive = format!("{worker_root}/restore.hel.zip");
@@ -1398,11 +1461,11 @@ impl Controller {
             .as_ref()
             .context("session has no live target")?;
         let backend = backend_locator(locator, &session, &self.config)?;
-        let bundle = self
-            .config
-            .bundles
-            .get(&session.bundle_id)
-            .context("session bundle is missing")?;
+        let bundle = session
+            .project_directory
+            .is_none()
+            .then(|| self.config.bundles.get(&session.bundle_id))
+            .flatten();
         let reconnect = hel_targets::reconnect_plan(&backend, session_id)?
             .commands
             .into_iter()
@@ -1420,16 +1483,64 @@ impl Controller {
 
         let worker_root = hel_targets::worker_root(&backend, session_id)?;
         let harness_home = target_profile_home(&backend, session_id);
-        let workspace_root = match &backend {
-            hel_targets::TargetLocator::LocalPodman { .. }
-            | hel_targets::TargetLocator::AppleContainer { .. }
-            | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_string(),
-            hel_targets::TargetLocator::AwsEc2 { workspace, .. }
-            | hel_targets::TargetLocator::SshBare { workspace, .. } => workspace.clone(),
-        };
+        let (workspace_root, primary_repository, repositories) =
+            if let Some(project_directory) = &session.project_directory {
+                let parent = project_directory
+                    .parent()
+                    .context("bare SSH project directory has no parent")?;
+                let destination = project_directory
+                    .file_name()
+                    .context("bare SSH project directory cannot be the filesystem root")?;
+                (
+                    parent.to_string_lossy().into_owned(),
+                    "project".to_owned(),
+                    vec![CheckpointRepositorySpec {
+                        id: "project".into(),
+                        relative_destination: PathBuf::from(destination),
+                        base_commit: "HEAD".into(),
+                        full_history: true,
+                        origin_override: None,
+                    }],
+                )
+            } else {
+                let bundle = bundle.context("session bundle is missing")?;
+                let workspace_root = match &backend {
+                    hel_targets::TargetLocator::LocalPodman { .. }
+                    | hel_targets::TargetLocator::AppleContainer { .. }
+                    | hel_targets::TargetLocator::SshPodman { .. } => "/workspace".to_string(),
+                    hel_targets::TargetLocator::AwsEc2 { workspace, .. }
+                    | hel_targets::TargetLocator::SshBare { workspace, .. } => workspace.clone(),
+                };
+                let repositories = bundle
+                    .repositories
+                    .iter()
+                    .map(|repository| CheckpointRepositorySpec {
+                        id: repository.id.clone(),
+                        relative_destination: repository.destination.clone(),
+                        base_commit: if repository.is_local() {
+                            "refs/hel/base".into()
+                        } else {
+                            repository
+                                .git_ref
+                                .as_deref()
+                                .map(|git_ref| format!("origin/{git_ref}"))
+                                .unwrap_or_else(|| "origin/HEAD".into())
+                        },
+                        full_history: repository.is_local(),
+                        origin_override: repository
+                            .is_local()
+                            .then(|| format!("hel-local:{}", repository.id)),
+                    })
+                    .collect();
+                (workspace_root, bundle.primary_repo.clone(), repositories)
+            };
         let target_path = |path: &str| match &backend {
             hel_targets::TargetLocator::AwsEc2 { .. }
-            | hel_targets::TargetLocator::SshBare { .. } => PathBuf::from(format!("~/{path}")),
+            | hel_targets::TargetLocator::SshBare { .. }
+                if !path.starts_with('/') =>
+            {
+                PathBuf::from(format!("~/{path}"))
+            }
             _ => PathBuf::from(path),
         };
         let remote_spec = format!("{worker_root}/checkpoint-spec.json");
@@ -1455,32 +1566,12 @@ impl Controller {
             },
             bundle: BundleManifest {
                 id: session.bundle_id.clone(),
-                primary_repository: bundle.primary_repo.clone(),
+                primary_repository,
             },
             worker_root: target_path(&worker_root),
             harness_home: target_path(&harness_home),
             workspace_root: target_path(&workspace_root),
-            repositories: bundle
-                .repositories
-                .iter()
-                .map(|repository| CheckpointRepositorySpec {
-                    id: repository.id.clone(),
-                    relative_destination: repository.destination.clone(),
-                    base_commit: if repository.is_local() {
-                        "refs/hel/base".into()
-                    } else {
-                        repository
-                            .git_ref
-                            .as_deref()
-                            .map(|git_ref| format!("origin/{git_ref}"))
-                            .unwrap_or_else(|| "origin/HEAD".into())
-                    },
-                    full_history: repository.is_local(),
-                    origin_override: repository
-                        .is_local()
-                        .then(|| format!("hel-local:{}", repository.id)),
-                })
-                .collect(),
+            repositories,
             event_sequence: expected_sequence,
             output_path: target_path(&remote_archive),
         };
@@ -2721,7 +2812,7 @@ fn locator_after_provision(
     session_id: &str,
     first_output: Option<&CommandOutput>,
     executor: &impl CommandExecutor,
-    bundle: &ProjectBundleSpec,
+    bundle: Option<&ProjectBundleSpec>,
 ) -> Result<TargetLocator> {
     let generated = hel_targets::resource_name(session_id)?;
     Ok(match canonical {
@@ -2821,8 +2912,12 @@ fn locator_after_provision(
                 ssh,
                 workspace: format!(".local/share/hel/workspaces/{session_id}"),
             };
-            hel_targets::provision_on_locator_plan(&backend_locator, session_id, bundle)?
-                .execute(executor)?;
+            hel_targets::provision_on_locator_plan(
+                &backend_locator,
+                session_id,
+                bundle.context("AWS provisioning requires a project bundle")?,
+            )?
+            .execute(executor)?;
             TargetLocator::AwsEc2 {
                 instance_id,
                 address: Some(address),
@@ -4017,6 +4112,7 @@ mod tests {
             harness_kind: crate::hel_config::HarnessKind::Codex,
             last_profile: "codex".into(),
             bundle_id: "project".into(),
+            project_directory: None,
             target_template_id: "podman".into(),
             resource_allocation: None,
             additional_mounts: Vec::new(),
@@ -4053,6 +4149,7 @@ mod tests {
             harness_kind: crate::hel_config::HarnessKind::Codex,
             last_profile: "codex-old".into(),
             bundle_id: "project".into(),
+            project_directory: None,
             target_template_id: "podman-old".into(),
             resource_allocation: None,
             additional_mounts: Vec::new(),
@@ -4146,6 +4243,7 @@ mod tests {
             harness_kind: crate::hel_config::HarnessKind::Codex,
             last_profile: "codex".into(),
             bundle_id: "project".into(),
+            project_directory: None,
             target_template_id: "aws".into(),
             resource_allocation: None,
             additional_mounts: vec![AdditionalMount {
