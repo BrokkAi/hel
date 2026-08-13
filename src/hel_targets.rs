@@ -771,24 +771,20 @@ pub fn provision_bare_project_plan(
     };
     validate_ssh(ssh)?;
     let project = std::path::Path::new(project_directory);
-    if !project.is_absolute()
-        || project
-            .components()
-            .any(|part| part == std::path::Component::ParentDir)
-    {
-        bail!("bare SSH project directory must be an absolute safe path");
-    }
+    validate_bare_project_path(project)?;
     let workspace = workspace_for(template, session_id)?;
     Ok(CommandPlan {
         description: format!("provision Hel session {session_id}"),
         commands: vec![
-            ssh_command(ssh, ["test", "-d", project_directory])
-                .purpose("verify bare SSH project directory"),
+            ssh_command(ssh, ["test", "-d", project_directory]).purpose(format!(
+                "verify bare SSH project directory {}",
+                project.display()
+            )),
             ssh_command(
                 ssh,
                 ["git", "-C", project_directory, "rev-parse", "--git-dir"],
             )
-            .purpose("verify bare SSH Git project"),
+            .purpose(format!("verify bare SSH Git project {}", project.display())),
             ssh_command(ssh, ["mkdir", "-p", &workspace])
                 .purpose("create SSH session runtime workspace"),
         ],
@@ -1575,6 +1571,83 @@ pub fn ssh_directory_exists(
     path: &Path,
     executor: &impl CommandExecutor,
 ) -> Result<bool> {
+    let command = ssh_validation_command(
+        ssh,
+        vec![
+            "test".into(),
+            "-d".into(),
+            path.to_string_lossy().into_owned(),
+        ],
+        "validate remote directory",
+    );
+    let output = executor.execute(&command)?;
+    match output.status {
+        0 => Ok(true),
+        1 => Ok(false),
+        status => bail!(
+            "remote directory check failed with status {status}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+/// Verify that a bare-SSH project path exists and belongs to a Git repository.
+pub fn validate_bare_project_directory(
+    ssh: &SshTarget,
+    path: &Path,
+    executor: &impl CommandExecutor,
+) -> Result<()> {
+    validate_bare_project_path(path)?;
+    if !ssh_directory_exists(ssh, path, executor)? {
+        bail!(
+            "remote project directory {} does not exist or is not a directory",
+            path.display()
+        );
+    }
+    let output = executor.execute(&ssh_validation_command(
+        ssh,
+        vec![
+            "git".into(),
+            "-C".into(),
+            path.to_string_lossy().into_owned(),
+            "rev-parse".into(),
+            "--git-dir".into(),
+        ],
+        "validate bare SSH Git project",
+    ))?;
+    if output.status != 0 {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+        if detail.is_empty() {
+            bail!(
+                "remote project directory {} is not a Git repository",
+                path.display()
+            );
+        }
+        bail!(
+            "remote project directory {} is not a Git repository: {detail}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_bare_project_path(path: &Path) -> Result<()> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        bail!("bare SSH project directory must be an absolute safe path");
+    }
+    Ok(())
+}
+
+fn ssh_validation_command(
+    ssh: &SshTarget,
+    remote_args: Vec<String>,
+    purpose: &'static str,
+) -> CommandSpec {
     let mut args = ssh.ssh_args.clone();
     args.extend([
         "-o".into(),
@@ -1586,22 +1659,9 @@ pub fn ssh_directory_exists(
         "-o".into(),
         "ServerAliveCountMax=1".into(),
         ssh.destination.clone(),
-        join_remote_command(&[
-            "test".into(),
-            "-d".into(),
-            path.to_string_lossy().into_owned(),
-        ]),
+        join_remote_command(&remote_args),
     ]);
-    let output = executor
-        .execute(&CommandSpec::new("ssh", args).purpose("validate remote mount directory"))?;
-    match output.status {
-        0 => Ok(true),
-        1 => Ok(false),
-        status => bail!(
-            "remote directory check failed with status {status}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-    }
+    CommandSpec::new("ssh", args).purpose(purpose)
 }
 
 fn posix_quote(value: &str) -> String {
@@ -2249,6 +2309,54 @@ mod tests {
             fail_at: Some(0),
         };
         assert!(!ssh_directory_exists(&ssh(), Path::new("/missing"), &missing).unwrap());
+    }
+
+    #[test]
+    fn bare_project_validation_checks_directory_and_git_repository() {
+        let valid = FakeExecutor {
+            seen: RefCell::new(vec![]),
+            fail_at: None,
+        };
+        validate_bare_project_directory(&ssh(), Path::new("/srv/project"), &valid).unwrap();
+        let seen = valid.seen.borrow();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen[0]
+                .args
+                .last()
+                .unwrap()
+                .contains("'test' '-d' '/srv/project'")
+        );
+        assert!(
+            seen[1]
+                .args
+                .last()
+                .unwrap()
+                .contains("'git' '-C' '/srv/project' 'rev-parse' '--git-dir'")
+        );
+        assert!(seen[0].args.contains(&"ConnectTimeout=3".to_owned()));
+
+        let missing = FakeExecutor {
+            seen: RefCell::new(vec![]),
+            fail_at: Some(0),
+        };
+        let error =
+            validate_bare_project_directory(&ssh(), Path::new("/missing"), &missing).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not exist or is not a directory")
+        );
+        assert_eq!(missing.seen.borrow().len(), 1);
+
+        let not_git = FakeExecutor {
+            seen: RefCell::new(vec![]),
+            fail_at: Some(1),
+        };
+        let error =
+            validate_bare_project_directory(&ssh(), Path::new("/srv/plain"), &not_git).unwrap_err();
+        assert!(error.to_string().contains("is not a Git repository"));
+        assert_eq!(not_git.seen.borrow().len(), 2);
     }
 
     #[test]

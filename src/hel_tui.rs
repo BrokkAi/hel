@@ -62,6 +62,10 @@ pub enum DashboardAction {
         target_template_id: String,
         source: String,
     },
+    ValidateProjectDirectory {
+        target_template_id: String,
+        directory: String,
+    },
     ResumeSession {
         session_id: String,
         profile_id: String,
@@ -161,6 +165,7 @@ struct NewWizard {
     review_focus: ReviewFocus,
     new_bundle_source: String,
     project_directory: String,
+    project_directory_error: Option<String>,
     project_history: Vec<std::path::PathBuf>,
     project_history_index: usize,
     resource_allocation: Option<SessionResourceAllocation>,
@@ -948,7 +953,10 @@ impl DashboardState {
                 editor.title.extend(pasted.chars().take(remaining));
             }
             Mode::New(wizard) => match wizard.step {
-                WizardStep::ProjectDirectory => wizard.project_directory.push_str(&pasted),
+                WizardStep::ProjectDirectory => {
+                    wizard.project_directory.push_str(&pasted);
+                    wizard.project_directory_error = None;
+                }
                 WizardStep::NewBundle => wizard.new_bundle_source.push_str(&pasted),
                 WizardStep::Mounts => match wizard.mounts.focus {
                     MountFocus::Source => wizard.mounts.source.push_str(&pasted),
@@ -1292,6 +1300,7 @@ impl DashboardState {
                     wizard.project_directory = wizard.project_history[wizard.project_history_index]
                         .to_string_lossy()
                         .into_owned();
+                    wizard.project_directory_error = None;
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
@@ -1301,6 +1310,7 @@ impl DashboardState {
                     wizard.project_directory = wizard.project_history[wizard.project_history_index]
                         .to_string_lossy()
                         .into_owned();
+                    wizard.project_directory_error = None;
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
@@ -1311,30 +1321,45 @@ impl DashboardState {
                 }
                 KeyCode::Backspace => {
                     wizard.project_directory.pop();
+                    wizard.project_directory_error = None;
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
                 KeyCode::Enter if wizard.project_directory.trim().is_empty() => {
-                    self.notice = Some("Project directory cannot be empty.".into());
+                    wizard.project_directory_error =
+                        Some("Project directory cannot be empty.".into());
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
                 KeyCode::Enter => {
                     let path = std::path::Path::new(wizard.project_directory.trim());
                     if !path.is_absolute() {
-                        self.notice =
+                        wizard.project_directory_error =
                             Some("Project directory must be an absolute remote path.".into());
                         self.mode = Mode::New(wizard);
                         DashboardAction::None
-                    } else {
-                        wizard.step = WizardStep::Review;
-                        wizard.review_focus = ReviewFocus::Submit;
+                    } else if path
+                        .components()
+                        .any(|part| part == std::path::Component::ParentDir)
+                    {
+                        wizard.project_directory_error =
+                            Some("Project directory must not contain '..'.".into());
                         self.mode = Mode::New(wizard);
                         DashboardAction::None
+                    } else {
+                        let target_template_id = nth_key(&self.config.targets, wizard.target);
+                        let directory = wizard.project_directory.trim().to_owned();
+                        wizard.project_directory_error = None;
+                        self.mode = Mode::New(wizard);
+                        DashboardAction::ValidateProjectDirectory {
+                            target_template_id,
+                            directory,
+                        }
                     }
                 }
                 KeyCode::Char(character) if wizard.focus == WizardFocus::Content => {
                     wizard.project_directory.push(character);
+                    wizard.project_directory_error = None;
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
@@ -2080,6 +2105,29 @@ impl DashboardState {
         }
     }
 
+    pub fn apply_project_directory_validation(
+        &mut self,
+        directory: &str,
+        result: Result<(), String>,
+    ) {
+        let Mode::New(wizard) = &mut self.mode else {
+            return;
+        };
+        if wizard.step != WizardStep::ProjectDirectory
+            || wizard.project_directory.trim() != directory
+        {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                wizard.project_directory_error = None;
+                wizard.step = WizardStep::Review;
+                wizard.review_focus = ReviewFocus::Submit;
+            }
+            Err(error) => wizard.project_directory_error = Some(error),
+        }
+    }
+
     fn handle_resume_key(&mut self, code: KeyCode, mut wizard: ResumeWizard) -> DashboardAction {
         if code == KeyCode::Esc {
             self.cancel_modal();
@@ -2699,6 +2747,7 @@ impl DashboardState {
             review_focus: ReviewFocus::Submit,
             new_bundle_source: String::new(),
             project_directory: String::new(),
+            project_directory_error: None,
             project_history: Vec::new(),
             project_history_index: 0,
             resource_allocation: None,
@@ -4501,8 +4550,15 @@ fn render_new_wizard(
                 },
             ));
         }
+        if let Some(error) = &wizard.project_directory_error {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                format!("Error: {error}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
         lines.push(Line::styled(
-            "Enter continues · Backspace on empty goes back · Esc cancels",
+            "Enter validates · Backspace on empty goes back · Esc cancels",
             Style::default().fg(Color::Gray),
         ));
         let popup = centered_rect(76, (lines.len() as u16 + 2).clamp(9, 16), area);
@@ -6241,9 +6297,35 @@ mod tests {
         for character in "/srv/project".chars() {
             dashboard.handle_key(key(KeyCode::Char(character)));
         }
-        dashboard.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ValidateProjectDirectory {
+                target_template_id: "machine".into(),
+                directory: "/srv/project".into(),
+            }
+        );
+        dashboard.apply_project_directory_validation(
+            "/srv/project",
+            Err(
+                "remote project directory /srv/project does not exist or is not a directory".into(),
+            ),
+        );
 
         let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Error: remote project directory /srv/project does not exist"));
+
+        dashboard.apply_project_directory_validation("/srv/project", Ok(()));
+
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .unwrap();

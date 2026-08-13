@@ -425,6 +425,24 @@ impl Controller {
         Ok(())
     }
 
+    /// Verify a bare-SSH project before leaving the project-directory dialog.
+    pub fn validate_project_directory(
+        &self,
+        target_id: &str,
+        directory: &Path,
+        executor: &impl CommandExecutor,
+    ) -> Result<()> {
+        let target = self
+            .config
+            .targets
+            .get(target_id)
+            .with_context(|| format!("unknown target template {target_id:?}"))?;
+        let TargetTemplate::SshBare { ssh, .. } = target else {
+            bail!("project directory validation requires a bare SSH target");
+        };
+        hel_targets::validate_bare_project_directory(&backend_ssh(ssh), directory, executor)
+    }
+
     pub fn register_session(
         &mut self,
         profile_id: &str,

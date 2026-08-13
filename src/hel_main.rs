@@ -2146,6 +2146,19 @@ async fn run_dashboard() -> Result<()> {
                     .map_err(|error| format!("{error:#}"));
                 dashboard.apply_mount_source_validation(&source, result);
             }
+            DashboardAction::ValidateProjectDirectory {
+                target_template_id,
+                directory,
+            } => {
+                let result = controller
+                    .validate_project_directory(
+                        &target_template_id,
+                        std::path::Path::new(&directory),
+                        &ProcessExecutor,
+                    )
+                    .map_err(|error| format!("{error:#}"));
+                dashboard.apply_project_directory_validation(&directory, result);
+            }
             DashboardAction::CreateSession {
                 profile_id,
                 bundle_id,
