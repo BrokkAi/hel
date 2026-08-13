@@ -7,10 +7,12 @@ sessions. It keeps the useful ACP client and TUI shell from Mjolnir, while
 removing its review, council, delegation, and subagent business logic.
 
 The dashboard gives one view of sessions and quotas across any number of
-Codex, Claude Code, and Kimi Code profiles. A session can run in a local Podman
-container, an Apple `container`, a disposable EC2 instance, a named SSH
-machine, or Podman reached through SSH. Hel always gives the selected harness
-its unrestricted mode (`agent-full-access`, `bypassPermissions`, or `auto`).
+Codex, Claude Code, and Kimi Code profiles. A session can run directly in an
+existing local Git project, in a local Podman container, an Apple `container`,
+a disposable EC2 instance, a named SSH machine, or Podman reached through SSH.
+Isolated and remote targets run the selected harness in its unrestricted mode
+(`agent-full-access`, `bypassPermissions`, or `auto`). Raw localhost honors the
+configured harness home and approval settings instead.
 
 ## Status
 
@@ -135,6 +137,12 @@ image = "ghcr.io/your-org/agent-dev:latest"
 cpus = "8"
 memory = "32g"
 
+# Run directly in a selected existing local Git worktree. Hel uses each
+# profile's configured home in place and does not copy credentials or Git
+# configuration. Closing removes only Hel's per-session worker data.
+[targets.raw-localhost]
+kind = "local-bare"
+
 [targets.mac-container]
 kind = "apple-container"
 image = "ghcr.io/your-org/agent-dev:latest"
@@ -210,18 +218,25 @@ effective global Git configuration: `user.name`, `user.email`,
 `rerere.enabled`, `rerere.autoUpdate`, `merge.conflictStyle`, and
 `diff.algorithm`. Hel applies these settings after cloning, so they do not
 provide repository credentials, and repository-local configuration still
-wins. Named `ssh-bare` machines keep their own Git configuration. Hel does not
-copy Git aliases, credentials, URL rewrites, includes, LFS filters, signing
+wins. Raw localhost and named `ssh-bare` machines keep their own Git
+configuration. Hel does not copy Git aliases, credentials, URL rewrites, includes, LFS filters, signing
 settings, hooks, editor or pager commands, custom drivers, proxies,
 `safe.directory`, line-ending settings, or the controller's global excludes
 file.
 
-The harness homes are whitelists rather than complete dot-directory copies.
-For Claude, Hel copies `.credentials.json`, `settings.json`, `CLAUDE.md`,
+For isolated and remote targets, harness homes are whitelists rather than
+complete dot-directory copies. For Claude, Hel copies `.credentials.json`, `settings.json`, `CLAUDE.md`,
 `skills/`, and `plugins/`; it does not copy transcripts, project history, or
 caches. SSH and GPG keys, GitHub CLI and package-registry credentials, cloud
 configuration, shell dotfiles, editor configuration, and toolchain state are
 not transferred automatically.
+
+`local-bare` is intentionally different: it runs the ACP bridge in the chosen
+local Git worktree and points `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, or
+`KIMI_CODE_HOME` at the configured profile home directly. Hel does not force an
+unrestricted mode or auto-approve ACP permission requests there. Kimi's normal
+`auto` mode is its no-confirmation mode, so the dashboard displays a prominent
+warning before using Kimi on raw localhost.
 
 The dashboard's Deployment Capacity pane groups configured local and SSH
 targets by host and shows current CPU and RAM utilization. Multiple target

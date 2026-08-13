@@ -731,6 +731,7 @@ const fn session_state_name(state: SessionState) -> &'static str {
 
 const fn target_kind_name(target: &TargetTemplate) -> &'static str {
     match target {
+        TargetTemplate::LocalBare => "local-bare",
         TargetTemplate::LocalPodman { .. } => "local-podman",
         TargetTemplate::AppleContainer { .. } => "apple-container",
         TargetTemplate::AwsEc2 { .. } => "aws-ec2",
@@ -830,8 +831,6 @@ mod tests {
             profiles: BTreeMap::from([(
                 "codex-1".into(),
                 HarnessProfile {
-                    model: None,
-                    reasoning_effort: None,
                     context_window_bytes: None,
                     kind: HarnessKind::Codex,
                     home: "/highly/secret/codex".into(),
@@ -1026,8 +1025,6 @@ mod tests {
         config.profiles.insert(
             "claude-1".into(),
             HarnessProfile {
-                model: None,
-                reasoning_effort: None,
                 context_window_bytes: None,
                 kind: HarnessKind::Claude,
                 home: "/secret/claude".into(),

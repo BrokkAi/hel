@@ -535,6 +535,7 @@ pub struct AwsTemplate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TargetTemplate {
+    LocalBare,
     LocalPodman(ContainerTemplate),
     AppleContainer(ContainerTemplate),
     AwsEc2(AwsTemplate),
@@ -556,6 +557,9 @@ fn default_ssh_prefix() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TargetLocator {
+    LocalBare {
+        worker_root: String,
+    },
     LocalPodman {
         container_id: String,
     },
@@ -597,6 +601,7 @@ pub fn resource_name(session_id: &str) -> Result<String> {
 pub fn workspace_for(template: &TargetTemplate, session_id: &str) -> Result<String> {
     validate_session_id(session_id)?;
     match template {
+        TargetTemplate::LocalBare => bail!("local bare projects use their selected directory"),
         TargetTemplate::LocalPodman(_)
         | TargetTemplate::AppleContainer(_)
         | TargetTemplate::SshPodman { .. } => Ok(CONTAINER_WORKSPACE.to_owned()),
@@ -635,6 +640,9 @@ pub fn provision_plan(
     let name = resource_name(session_id)?;
     let mut commands = Vec::new();
     match template {
+        TargetTemplate::LocalBare => {
+            bail!("local bare projects must use the existing-project provisioning path")
+        }
         TargetTemplate::LocalPodman(container) => {
             validate_container_template(container)?;
             commands.push(container_run(
@@ -758,7 +766,7 @@ pub fn provision_plan(
     })
 }
 
-/// Build the no-op infrastructure plan for an existing bare-SSH project.
+/// Build the no-op infrastructure plan for an existing bare project.
 /// The wizard validates the project for early feedback; worker/ACP startup is
 /// authoritative if it changes before launch. Worker state is installed later
 /// under the dedicated worker and profile roots, not under a cloned workspace.
@@ -767,13 +775,16 @@ pub fn provision_bare_project_plan(
     session_id: &str,
     project_directory: &str,
 ) -> Result<CommandPlan> {
-    let TargetTemplate::SshBare { ssh, .. } = template else {
-        bail!("raw project directories require a bare SSH target");
-    };
-    validate_ssh(ssh)?;
     let project = std::path::Path::new(project_directory);
     validate_bare_project_path(project)?;
-    workspace_for(template, session_id)?;
+    match template {
+        TargetTemplate::LocalBare => {}
+        TargetTemplate::SshBare { ssh, .. } => {
+            validate_ssh(ssh)?;
+            workspace_for(template, session_id)?;
+        }
+        _ => bail!("raw project directories require a bare target"),
+    }
     Ok(CommandPlan {
         description: format!("provision Hel session {session_id}"),
         commands: Vec::new(),
@@ -861,6 +872,9 @@ pub fn reconnect_plan(locator: &TargetLocator, session_id: &str) -> Result<Comma
     let root = worker_root(locator, session_id)?;
     let binary = format!("{root}/hel");
     let command = match locator {
+        TargetLocator::LocalBare { .. } => {
+            CommandSpec::new(binary, ["worker", "proxy", "--root", root.as_str()])
+        }
         TargetLocator::LocalPodman { container_id } => container_exec(
             "podman",
             container_id,
@@ -927,6 +941,11 @@ pub fn command_on_locator(
         bail!("target command must not be empty");
     }
     let command = match locator {
+        TargetLocator::LocalBare { .. } => {
+            let mut args = args.into_iter();
+            let program = args.next().expect("checked non-empty target command");
+            CommandSpec::new(program, args)
+        }
         TargetLocator::LocalPodman { container_id } => container_exec("podman", container_id, args),
         TargetLocator::AppleContainer { container_id } => {
             container_exec("container", container_id, args)
@@ -1088,7 +1107,9 @@ pub fn resource_probe(locator: &TargetLocator, session_id: &str) -> Result<Sessi
             .purpose("sample Apple container resources"),
             None,
         ),
-        TargetLocator::SshBare { .. } => bail!("resource sampling is unsupported for this target"),
+        TargetLocator::LocalBare { .. } | TargetLocator::SshBare { .. } => {
+            bail!("resource sampling is unsupported for this target")
+        }
     };
     Ok(SessionResourceProbe { memory, disk })
 }
@@ -1237,6 +1258,7 @@ fn parse_cgroup_counter(value: &str) -> Result<Option<u64>> {
 pub fn worker_root(locator: &TargetLocator, session_id: &str) -> Result<String> {
     verify_locator(locator, session_id)?;
     Ok(match locator {
+        TargetLocator::LocalBare { worker_root } => worker_root.clone(),
         TargetLocator::LocalPodman { .. }
         | TargetLocator::AppleContainer { .. }
         | TargetLocator::SshPodman { .. } => format!("/var/lib/hel/workers/{session_id}"),
@@ -1251,6 +1273,10 @@ pub fn close_plan(locator: &TargetLocator, session_id: &str) -> Result<CommandPl
     let session_worker_root = worker_root(locator, session_id)?;
     let session_profile_home = format!(".local/share/hel/profiles/{session_id}");
     let command = match locator {
+        TargetLocator::LocalBare { .. } => {
+            CommandSpec::new("rm", ["-rf", "--", session_worker_root.as_str()])
+                .purpose("remove exact local Hel worker state")
+        }
         TargetLocator::LocalPodman { container_id } => {
             CommandSpec::new("podman", ["rm", "--force", container_id])
                 .purpose("remove local Podman session container")
@@ -1627,7 +1653,7 @@ fn validate_bare_project_path(path: &Path) -> Result<()> {
             .components()
             .any(|part| part == std::path::Component::ParentDir)
     {
-        bail!("bare SSH project directory must be an absolute safe path");
+        bail!("bare project directory must be an absolute safe path");
     }
     Ok(())
 }
@@ -1660,6 +1686,17 @@ fn posix_quote(value: &str) -> String {
 fn verify_locator(locator: &TargetLocator, session_id: &str) -> Result<()> {
     let expected_name = resource_name(session_id)?;
     match locator {
+        TargetLocator::LocalBare { worker_root } => {
+            let path = Path::new(worker_root);
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir)
+                || !path.ends_with(session_id)
+            {
+                bail!("refusing cleanup: invalid local bare worker root");
+            }
+        }
         TargetLocator::LocalPodman { container_id }
         | TargetLocator::AppleContainer { container_id }
         | TargetLocator::SshPodman { container_id, .. } => {
@@ -2420,6 +2457,11 @@ mod tests {
 
     #[test]
     fn bare_project_plan_leaves_project_validation_to_dialog_and_launch() {
+        let local =
+            provision_bare_project_plan(&TargetTemplate::LocalBare, SESSION, "/home/me/project")
+                .unwrap();
+        assert!(local.commands.is_empty());
+
         let template = TargetTemplate::SshBare {
             ssh: ssh(),
             workspace_prefix: ".local/share/hel/workspaces".into(),
@@ -2444,6 +2486,24 @@ mod tests {
                 .unwrap()
                 .contains("/srv/project")
         );
+    }
+
+    #[test]
+    fn local_bare_worker_commands_are_direct_and_cleanup_is_exact() {
+        let worker_root = format!("/var/lib/hel/workers/{SESSION}");
+        let locator = TargetLocator::LocalBare {
+            worker_root: worker_root.clone(),
+        };
+
+        let reconnect = reconnect_plan(&locator, SESSION).unwrap();
+        assert_eq!(reconnect.commands[0].program, format!("{worker_root}/hel"));
+        assert_eq!(
+            reconnect.commands[0].args,
+            ["worker", "proxy", "--root", worker_root.as_str()]
+        );
+        let close = close_plan(&locator, SESSION).unwrap();
+        assert_eq!(close.commands[0].program, "rm");
+        assert_eq!(close.commands[0].args, ["-rf", "--", worker_root.as_str()]);
     }
 
     #[test]

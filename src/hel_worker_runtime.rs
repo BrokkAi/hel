@@ -69,9 +69,17 @@ pub struct WorkerLaunchConfig {
     /// disables this because restored history belongs to the source harness.
     #[serde(default = "default_recover_native_session")]
     pub recover_native_session: bool,
+    /// Isolated and remote targets deliberately run without harness approval
+    /// prompts. Raw localhost instead honors the user's harness configuration.
+    #[serde(default = "default_force_unrestricted_mode")]
+    pub force_unrestricted_mode: bool,
 }
 
 const fn default_recover_native_session() -> bool {
+    true
+}
+
+const fn default_force_unrestricted_mode() -> bool {
     true
 }
 
@@ -222,6 +230,7 @@ mod unix {
             additional_directories: config.additional_directories,
             resume_session,
             harness: config.harness,
+            force_unrestricted_mode: config.force_unrestricted_mode,
         };
         let mut acp_task = tokio::spawn(hel_acp::run(acp_spec, acp_commands_rx, acp_events_tx));
 
@@ -799,6 +808,7 @@ mod tests {
             additional_directories: Vec::new(),
             native_session_id: None,
             recover_native_session: true,
+            force_unrestricted_mode: true,
         }
     }
 
