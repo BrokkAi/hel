@@ -318,6 +318,21 @@ impl HelState {
         sources.truncate(20);
     }
 
+    pub fn project_directories(&self, host: &str) -> &[PathBuf] {
+        self.mount_history
+            .get(&project_history_key(host))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub fn remember_project_directory(&mut self, host: &str, directory: &Path) {
+        let key = project_history_key(host);
+        let directories = self.mount_history.entry(key).or_default();
+        directories.retain(|existing| existing != directory);
+        directories.insert(0, directory.to_path_buf());
+        directories.truncate(20);
+    }
+
     pub fn remove_archived_session(&mut self, session_id: &str) -> Result<SessionRecord> {
         let session = self
             .sessions
@@ -407,6 +422,10 @@ impl HelState {
         let body = serde_json::to_vec_pretty(self).context("serialize Hel state")?;
         atomic_write(path, &body)
     }
+}
+
+fn project_history_key(host: &str) -> String {
+    format!("project:{host}")
 }
 
 pub fn state_path() -> PathBuf {
@@ -623,6 +642,24 @@ mod tests {
         assert_eq!(
             state.mount_history["builder.example.test"],
             vec![PathBuf::from("/srv/first"), PathBuf::from("/srv/second")]
+        );
+    }
+
+    #[test]
+    fn project_directory_history_is_recent_and_isolated_per_remote_host() {
+        let mut state = HelState::default();
+        state.remember_project_directory("builder-a", Path::new("/srv/one"));
+        state.remember_project_directory("builder-a", Path::new("/srv/two"));
+        state.remember_project_directory("builder-a", Path::new("/srv/one"));
+        state.remember_project_directory("builder-b", Path::new("/work/other"));
+
+        assert_eq!(
+            state.project_directories("builder-a"),
+            [PathBuf::from("/srv/one"), PathBuf::from("/srv/two")]
+        );
+        assert_eq!(
+            state.project_directories("builder-b"),
+            [PathBuf::from("/work/other")]
         );
     }
 

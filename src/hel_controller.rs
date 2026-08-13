@@ -700,6 +700,14 @@ impl Controller {
             })
         })();
         let result = apply_new_session_provisioning_result(&mut self.state, session_id, result);
+        if result.is_ok()
+            && let Some(session) = self.state.sessions.get(session_id)
+            && let Some(directory) = session.project_directory.clone()
+            && let Some(TargetTemplate::SshBare { ssh, .. }) =
+                self.config.targets.get(&session.target_template_id)
+        {
+            self.state.remember_project_directory(&ssh.host, &directory);
+        }
         self.state.save()?;
         result
     }

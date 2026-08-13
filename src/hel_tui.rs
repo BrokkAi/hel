@@ -161,6 +161,8 @@ struct NewWizard {
     review_focus: ReviewFocus,
     new_bundle_source: String,
     project_directory: String,
+    project_history: Vec<std::path::PathBuf>,
+    project_history_index: usize,
     resource_allocation: Option<SessionResourceAllocation>,
     aws_options: BTreeMap<String, Vec<SessionResourceAllocation>>,
     sizing_error: Option<String>,
@@ -897,8 +899,15 @@ impl DashboardState {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return DashboardAction::None;
         }
+        if is_paste_shortcut(key) {
+            match crate::hel_clipboard::read_text() {
+                Ok(text) => self.handle_paste(&text),
+                Err(error) => self.notice = Some(format!("Paste failed: {error:#}")),
+            }
+            return DashboardAction::None;
+        }
         if !matches!(self.mode, Mode::Dashboard)
-            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && dashboard_accelerator(key.modifiers)
             && key.code == KeyCode::Char('c')
         {
             return DashboardAction::QuitDetach;
@@ -925,6 +934,48 @@ impl DashboardState {
                 _ => DashboardAction::None,
             },
             Mode::Confirm(confirmation) => self.handle_confirmation_key(key.code, confirmation),
+        }
+    }
+
+    pub fn handle_paste(&mut self, pasted: &str) {
+        let pasted = single_line_paste(pasted);
+        if pasted.is_empty() {
+            return;
+        }
+        match &mut self.mode {
+            Mode::Rename(editor) => {
+                let remaining = 64_usize.saturating_sub(editor.title.chars().count());
+                editor.title.extend(pasted.chars().take(remaining));
+            }
+            Mode::New(wizard) => match wizard.step {
+                WizardStep::ProjectDirectory => wizard.project_directory.push_str(&pasted),
+                WizardStep::NewBundle => wizard.new_bundle_source.push_str(&pasted),
+                WizardStep::Mounts => match wizard.mounts.focus {
+                    MountFocus::Source => wizard.mounts.source.push_str(&pasted),
+                    MountFocus::Destination => wizard.mounts.destination.push_str(&pasted),
+                    _ => {}
+                },
+                _ => {}
+            },
+            Mode::Resume(wizard) if wizard.step == WizardStep::Mounts => {
+                match wizard.mounts.focus {
+                    MountFocus::Source => wizard.mounts.source.push_str(&pasted),
+                    MountFocus::Destination => wizard.mounts.destination.push_str(&pasted),
+                    _ => {}
+                }
+            }
+            Mode::Confirm(Confirmation::ForceDestroy { typed, .. })
+            | Mode::Confirm(Confirmation::DeleteActive { typed, .. }) => {
+                let remaining = FORCE_CONFIRMATION.len().saturating_sub(typed.len());
+                typed.extend(
+                    pasted
+                        .chars()
+                        .filter(char::is_ascii_alphabetic)
+                        .take(remaining)
+                        .map(|character| character.to_ascii_uppercase()),
+                );
+            }
+            _ => {}
         }
     }
 
@@ -955,8 +1006,8 @@ impl DashboardState {
     }
 
     fn handle_dashboard_key(&mut self, key: KeyEvent) -> DashboardAction {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        match (key.code, control) {
+        let command = dashboard_accelerator(key.modifiers);
+        match (key.code, command) {
             (KeyCode::Char('q') | KeyCode::Char('c'), true) | (KeyCode::Esc, _) => {
                 DashboardAction::QuitDetach
             }
@@ -1233,6 +1284,26 @@ impl DashboardState {
         }
         if wizard.step == WizardStep::ProjectDirectory {
             return match code {
+                KeyCode::Up if !wizard.project_history.is_empty() => {
+                    wizard.project_history_index = wizard
+                        .project_history_index
+                        .checked_sub(1)
+                        .unwrap_or(wizard.project_history.len() - 1);
+                    wizard.project_directory = wizard.project_history[wizard.project_history_index]
+                        .to_string_lossy()
+                        .into_owned();
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
+                KeyCode::Down if !wizard.project_history.is_empty() => {
+                    wizard.project_history_index =
+                        (wizard.project_history_index + 1) % wizard.project_history.len();
+                    wizard.project_directory = wizard.project_history[wizard.project_history_index]
+                        .to_string_lossy()
+                        .into_owned();
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
                 KeyCode::Backspace if wizard.project_directory.is_empty() => {
                     wizard.step = WizardStep::Target;
                     self.mode = Mode::New(wizard);
@@ -1455,6 +1526,16 @@ impl DashboardState {
                 }
                 wizard.step = if matches!(target, TargetTemplate::SshBare { .. }) {
                     wizard.mounts = MountWizard::new(Vec::new());
+                    let TargetTemplate::SshBare { ssh, .. } = target else {
+                        unreachable!()
+                    };
+                    wizard.project_history = self.state.project_directories(&ssh.host).to_vec();
+                    wizard.project_history_index = 0;
+                    if wizard.project_directory.is_empty()
+                        && let Some(directory) = wizard.project_history.first()
+                    {
+                        wizard.project_directory = directory.to_string_lossy().into_owned();
+                    }
                     WizardStep::ProjectDirectory
                 } else {
                     wizard.mounts = MountWizard::new(
@@ -2618,6 +2699,8 @@ impl DashboardState {
             review_focus: ReviewFocus::Submit,
             new_bundle_source: String::new(),
             project_directory: String::new(),
+            project_history: Vec::new(),
+            project_history_index: 0,
             resource_allocation: None,
             aws_options: BTreeMap::new(),
             sizing_error: None,
@@ -4283,21 +4366,27 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
+    let accelerator = if cfg!(target_os = "macos") {
+        "Cmd"
+    } else {
+        "Ctrl"
+    };
     let actions = match dashboard.focus {
         Focus::Active => {
-            "Ctrl for: [N]ew · [I]mport · [R]ename · [P]ause · [D]elete · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · [I]mport · [R]ename · [P]ause · [D]elete · [U]pdate quotas · [Q]uit · Tab pane"
         }
         Focus::Archived => {
-            "Ctrl for: [N]ew · [I]mport · [R]ename · [D]elete permanently · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · [I]mport · [R]ename · [D]elete permanently · [U]pdate quotas · [Q]uit · Tab pane"
         }
-        Focus::Capacity => "Ctrl for: [N]ew · [I]mport · [U]pdate quotas · [Q]uit · Tab pane",
-        Focus::Quotas => {
-            "Ctrl for: [N]ew · [I]mport · [R]efresh · [U]pdate quotas · [Q]uit · Tab pane"
-        }
+        Focus::Capacity => "[N]ew · [I]mport · [U]pdate quotas · [Q]uit · Tab pane",
+        Focus::Quotas => "[N]ew · [I]mport · [R]efresh · [U]pdate quotas · [Q]uit · Tab pane",
     };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::styled(actions, Style::default().fg(Color::DarkGray)),
+            Line::styled(
+                format!("{accelerator} for: {actions}"),
+                Style::default().fg(Color::DarkGray),
+            ),
             Line::styled(
                 dashboard.notice.as_deref().unwrap_or_default(),
                 Style::default().fg(Color::Yellow),
@@ -4377,22 +4466,49 @@ fn render_new_wizard(
         return;
     }
     if wizard.step == WizardStep::ProjectDirectory {
-        let popup = centered_rect(76, 9, area);
+        let mut lines = vec![
+            Line::raw("Absolute project directory on the remote machine:"),
+            Line::raw(""),
+            Line::styled(
+                format!("> {}▏", wizard.project_directory),
+                Style::default().bg(Color::DarkGray).fg(Color::White),
+            ),
+        ];
+        if !wizard.project_history.is_empty() {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "Recent on this host (↑/↓ selects):",
+                Style::default().fg(Color::Gray),
+            ));
+            lines.extend(wizard.project_history.iter().take(5).enumerate().map(
+                |(index, directory)| {
+                    Line::styled(
+                        format!(
+                            "{} {}",
+                            if index == wizard.project_history_index {
+                                "›"
+                            } else {
+                                " "
+                            },
+                            directory.display()
+                        ),
+                        if index == wizard.project_history_index {
+                            Style::default().fg(Color::White)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    )
+                },
+            ));
+        }
+        lines.push(Line::styled(
+            "Enter continues · Backspace on empty goes back · Esc cancels",
+            Style::default().fg(Color::Gray),
+        ));
+        let popup = centered_rect(76, (lines.len() as u16 + 2).clamp(9, 16), area);
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::raw("Absolute project directory on the remote machine:"),
-                Line::raw(""),
-                Line::styled(
-                    format!("> {}▏", wizard.project_directory),
-                    Style::default().bg(Color::DarkGray).fg(Color::White),
-                ),
-                Line::styled(
-                    "Enter continues · Backspace on empty goes back · Esc cancels",
-                    Style::default().fg(Color::Gray),
-                ),
-            ])
-            .block(
+            Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" New session · 3/4 remote project "),
@@ -5207,6 +5323,27 @@ fn raw_project_context_id(project_directory: &str) -> String {
     format!("remote-project-{suffix}")
 }
 
+fn is_paste_shortcut(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('v')
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+}
+
+#[cfg(target_os = "macos")]
+fn dashboard_accelerator(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::SUPER)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn dashboard_accelerator(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn single_line_paste(pasted: &str) -> String {
+    pasted.trim_matches(['\r', '\n']).replace(['\r', '\n'], " ")
+}
+
 fn default_resource_destination(
     target: &TargetTemplate,
     source: &std::path::Path,
@@ -5292,7 +5429,14 @@ mod tests {
     }
 
     fn ctrl_key(character: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
+        KeyEvent::new(
+            KeyCode::Char(character),
+            if cfg!(target_os = "macos") {
+                KeyModifiers::SUPER
+            } else {
+                KeyModifiers::CONTROL
+            },
+        )
     }
 
     fn mouse_in(kind: MouseEventKind, area: Rect) -> MouseEvent {
@@ -5582,7 +5726,12 @@ mod tests {
 
         assert_eq!(buffer[(buffer.area.x, buffer.area.y)].symbol(), " ");
         assert!(!line(buffer.area.y).contains(" HEL "));
-        assert!(line(buffer.area.bottom() - 2).contains("Ctrl for: [N]ew"));
+        let accelerator = if cfg!(target_os = "macos") {
+            "Cmd"
+        } else {
+            "Ctrl"
+        };
+        assert!(line(buffer.area.bottom() - 2).contains(&format!("{accelerator} for: [N]ew")));
         assert!(line(buffer.area.bottom() - 1).contains("Transient dashboard message"));
     }
 
@@ -6066,11 +6215,29 @@ mod tests {
                 workspace_prefix: ".local/share/hel/workspaces".into(),
             },
         )]);
-        let mut dashboard = DashboardState::new(config, HelState::default(), BTreeMap::new());
+        let mut state = HelState::default();
+        state
+            .remember_project_directory("builder.example.com", std::path::Path::new("/srv/recent"));
+        state.remember_project_directory("builder.example.com", std::path::Path::new("/srv/older"));
+        let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
 
         dashboard.handle_key(ctrl_key('n'));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new-session wizard")
+        };
+        assert_eq!(wizard.project_directory, "/srv/older");
+        dashboard.handle_key(key(KeyCode::Down));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new-session wizard")
+        };
+        assert_eq!(wizard.project_directory, "/srv/recent");
+        while let Mode::New(wizard) = &dashboard.mode
+            && !wizard.project_directory.is_empty()
+        {
+            dashboard.handle_key(key(KeyCode::Backspace));
+        }
         for character in "/srv/project".chars() {
             dashboard.handle_key(key(KeyCode::Char(character)));
         }
@@ -6102,6 +6269,25 @@ mod tests {
                 resource_allocation: None,
             }
         );
+    }
+
+    #[test]
+    fn bracketed_paste_populates_dashboard_text_editors() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+
+        dashboard.handle_key(ctrl_key('r'));
+        let Mode::Rename(editor) = &mut dashboard.mode else {
+            panic!("expected rename editor")
+        };
+        editor.title.clear();
+        dashboard.handle_paste("pasted title\n");
+
+        let Mode::Rename(editor) = &dashboard.mode else {
+            panic!("expected rename editor")
+        };
+        assert_eq!(editor.title, "pasted title");
     }
 
     #[test]

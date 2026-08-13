@@ -435,6 +435,11 @@ impl ChatState {
         if pasted.is_empty() {
             return;
         }
+        if let Some(search) = self.history_search.as_mut() {
+            search.query.push_str(&pasted.replace(['\r', '\n'], " "));
+            self.refresh_history_search();
+            return;
+        }
         self.input.insert_str(self.input_cursor, &pasted);
         self.input_cursor += pasted.len();
         self.history_index = None;
@@ -1051,6 +1056,20 @@ impl ChatState {
         }
         let (code, modifiers) = normalize_key(key.code, key.modifiers);
 
+        if code == KeyCode::Char('v')
+            && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        {
+            match crate::hel_clipboard::read_text() {
+                Ok(text) => self.handle_paste(&text),
+                Err(error) => self.set_notice(format!("Paste failed: {error:#}")),
+            }
+            return ChatAction::None;
+        }
+
+        if modifiers.contains(KeyModifiers::ALT) && code == KeyCode::Char('v') {
+            return ChatAction::ToggleVoice;
+        }
+
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('g') {
             return ChatAction::Back;
         }
@@ -1136,7 +1155,6 @@ impl ChatState {
                     );
                     return ChatAction::None;
                 }
-                KeyCode::Char('v') => return ChatAction::ToggleVoice,
                 KeyCode::Char('a') => self.move_to_line_start(true),
                 KeyCode::Char('e') => self.move_to_line_end(true),
                 KeyCode::Char('b') => self.move_input_cursor(-1),
@@ -1906,7 +1924,7 @@ pub async fn run_chat(
                             voice_cancel = Some(cancel_tx);
                             voice_prefix.clone_from(&chat.input);
                             chat.voice_active = true;
-                            chat.set_notice("Listening… press Ctrl-V again to stop");
+                            chat.set_notice("Listening… press Alt-V again to stop");
                             spawn_dictation(voice_updates_tx.clone(), cancel_rx);
                             None
                         }
@@ -2039,7 +2057,7 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
         );
     }
     let default_footer = if chat.voice_active {
-        "Listening… Ctrl-V stop · Ctrl-G dashboard"
+        "Listening… Alt-V stop · Ctrl-G dashboard"
     } else {
         "Enter send/queue · Shift-Enter newline · Ctrl-R history · Ctrl-T transcript · Esc cancel · Ctrl-G dashboard"
     };
@@ -2776,9 +2794,9 @@ mod tests {
     }
 
     #[test]
-    fn control_v_toggles_voice_without_editing_prompt() {
+    fn alt_v_toggles_voice_without_editing_prompt() {
         let mut chat = ChatState::new(&snapshot(), &[]);
-        let action = chat.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        let action = chat.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
         assert_eq!(action, ChatAction::ToggleVoice);
         assert!(chat.input.is_empty());
     }

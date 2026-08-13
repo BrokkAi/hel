@@ -27,6 +27,7 @@ path = "src/hel_main.rs"
 [dependencies]
 agent-client-protocol = { version = "1", features = ["unstable_session_fork", "unstable_end_turn_token_usage", "unstable_elicitation", "unstable_auth_methods"] }
 anyhow = "1"
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 axum = "0.8"
 # Use the ring provider already pulled by reqwest instead of aws-lc-rs, which
 # needs a C toolchain and complicates cross-compilation.

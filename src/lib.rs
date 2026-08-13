@@ -10,6 +10,7 @@ pub mod hel_acp;
 pub mod hel_archive;
 pub mod hel_chat;
 pub mod hel_checkpoint;
+pub mod hel_clipboard;
 pub mod hel_compaction;
 pub mod hel_config;
 pub mod hel_controller;

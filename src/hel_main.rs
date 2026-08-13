@@ -1982,6 +1982,10 @@ async fn run_dashboard() -> Result<()> {
         }
         let action = match event::read()? {
             Event::Key(key) => dashboard.handle_key(key),
+            Event::Paste(pasted) => {
+                dashboard.handle_paste(&pasted);
+                DashboardAction::None
+            }
             Event::Mouse(mouse) => {
                 dashboard.handle_mouse(mouse);
                 DashboardAction::None
