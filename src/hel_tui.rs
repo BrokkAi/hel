@@ -3891,11 +3891,9 @@ fn render_sessions(
     let active_focused = dashboard.focus == Focus::Active;
     let active_table = Table::new(active_rows, session_column_constraints())
         .header(session_header())
-        .row_highlight_style(if active_focused {
-            Style::default().bg(Color::DarkGray).fg(Color::White)
-        } else {
-            Style::default()
-        })
+        // Active rows reserve multiple lines for the conversation preview.
+        // Selection styling is applied to the one-line session summary below.
+        .row_highlight_style(Style::default())
         .highlight_symbol(if active_focused { "› " } else { "  " })
         .highlight_spacing(HighlightSpacing::Always)
         .block(
@@ -3919,11 +3917,18 @@ fn render_sessions(
         }
         visible_sessions += 1;
         let selected = dashboard.focus == Focus::Active && index == dashboard.session_index;
-        let style = if selected {
-            Style::default().bg(Color::DarkGray)
-        } else {
-            Style::default()
-        };
+        let info_y = detail_y.saturating_sub(1);
+        if selected && info_y < active_area.bottom().saturating_sub(1) {
+            frame.buffer_mut().set_style(
+                Rect::new(
+                    active_area.x.saturating_add(1),
+                    info_y,
+                    active_area.width.saturating_sub(2),
+                    1,
+                ),
+                Style::default().bg(Color::DarkGray).fg(Color::White),
+            );
+        }
         let preview_height = active_area
             .bottom()
             .saturating_sub(1)
@@ -3931,7 +3936,7 @@ fn render_sessions(
             .min(preview.len() as u16);
         if preview_height > 0 {
             frame.render_widget(
-                Paragraph::new(preview.clone()).style(style),
+                Paragraph::new(preview.clone()),
                 Rect::new(active_area.x + 3, detail_y, preview_width, preview_height),
             );
         }
@@ -7555,6 +7560,26 @@ mod tests {
         assert!(selected.contains("Rendered answer"));
         assert!(selected.contains("✓ Tool · done"));
         assert!(selected.contains("Run dashboard tests"));
+        let buffer = terminal.backend().buffer();
+        let row_text = |y| {
+            (buffer.area.x..buffer.area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let info_y = (buffer.area.y..buffer.area.bottom())
+            .find(|y| row_text(*y).contains("ACP pretty name"))
+            .expect("session info row");
+        let conversation_y = (buffer.area.y..buffer.area.bottom())
+            .find(|y| row_text(*y).contains("Rendered answer"))
+            .expect("conversation row");
+        assert!(
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .all(|x| buffer[(x, info_y)].bg == Color::DarkGray)
+        );
+        assert!(
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .all(|x| buffer[(x, conversation_y)].bg != Color::DarkGray)
+        );
 
         dashboard.handle_key(key(KeyCode::Tab));
         terminal
