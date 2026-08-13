@@ -40,6 +40,7 @@ const MOUSE_SCROLL_ROWS: usize = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatExit {
     Detached { last_seen_event_sequence: u64 },
+    QuitDetached { last_seen_event_sequence: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +51,7 @@ pub enum ChatAction {
     Cancel,
     ToggleVoice,
     Back,
+    QuitDetach,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +295,8 @@ pub struct ChatState {
     command_choices: Vec<CommandChoice>,
     model_values: Vec<ConfigValueChoice>,
     effort_values: Vec<ConfigValueChoice>,
+    current_model: Option<String>,
+    current_effort: Option<String>,
     autocomplete: Option<Autocomplete>,
     scroll_top: usize,
     follow_bottom: bool,
@@ -326,6 +330,16 @@ impl ChatState {
             command_choices: builtin_command_choices(),
             model_values: Vec::new(),
             effort_values: Vec::new(),
+            current_model: snapshot
+                .config
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            current_effort: snapshot
+                .config
+                .get("effort")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             autocomplete: None,
             scroll_top: 0,
             follow_bottom: true,
@@ -887,6 +901,8 @@ impl ChatState {
     }
 
     fn set_config_options(&mut self, options: &[SessionConfigOption]) {
+        self.current_model = config_current_value(options, "model");
+        self.current_effort = config_current_value(options, "effort");
         self.model_values = config_values(options, "model");
         self.effort_values = config_values(options, "effort");
         self.update_autocomplete();
@@ -1076,6 +1092,9 @@ impl ChatState {
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('g') {
             return ChatAction::Back;
         }
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('q') {
+            return ChatAction::QuitDetach;
+        }
 
         if self.history_search.is_some() {
             if modifiers.contains(KeyModifiers::ALT) && code == KeyCode::Char('r') {
@@ -1173,7 +1192,9 @@ impl ChatState {
                 KeyCode::Char('y') => self.yank(),
                 KeyCode::Char('j') | KeyCode::Char('m') => self.insert_character('\n'),
                 KeyCode::Char('p') => {
-                    if self.input.is_empty() || self.history_index.is_some() {
+                    if self.input.is_empty() && !self.queued_prompts.is_empty() {
+                        self.edit_latest_queued_prompt();
+                    } else if self.input.is_empty() || self.history_index.is_some() {
                         self.move_history(-1);
                     } else {
                         self.move_vertical(-1);
@@ -1262,7 +1283,9 @@ impl ChatState {
                 ChatAction::None
             }
             KeyCode::Up => {
-                if self.input.is_empty() || self.history_index.is_some() {
+                if self.input.is_empty() && !self.queued_prompts.is_empty() {
+                    self.edit_latest_queued_prompt();
+                } else if self.input.is_empty() || self.history_index.is_some() {
                     self.move_history(-1);
                 } else {
                     self.move_vertical(-1);
@@ -1635,8 +1658,11 @@ fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> {
     Some((command, args))
 }
 
-fn config_values(options: &[SessionConfigOption], key: &str) -> Vec<ConfigValueChoice> {
-    let option = match key {
+fn find_config_option<'a>(
+    options: &'a [SessionConfigOption],
+    key: &str,
+) -> Option<&'a SessionConfigOption> {
+    match key {
         "model" => options
             .iter()
             .find(|option| option.id.to_string() == "model")
@@ -1661,7 +1687,19 @@ fn config_values(options: &[SessionConfigOption], key: &str) -> Vec<ConfigValueC
                 })
             }),
         _ => None,
+    }
+}
+
+fn config_current_value(options: &[SessionConfigOption], key: &str) -> Option<String> {
+    let option = find_config_option(options, key)?;
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return None;
     };
+    Some(select.current_value.to_string())
+}
+
+fn config_values(options: &[SessionConfigOption], key: &str) -> Vec<ConfigValueChoice> {
+    let option = find_config_option(options, key);
     let Some(option) = option else {
         return Vec::new();
     };
@@ -1789,8 +1827,8 @@ fn tool_location_details(locations: &[ToolCallLocation]) -> Vec<String> {
         .collect()
 }
 
-/// Run chat until the user presses Escape. This detaches the proxy and leaves
-/// the target worker alive.
+/// Run chat until the user returns to the dashboard or quits Hel. Either exit
+/// detaches the proxy and leaves the target worker alive.
 pub async fn run_chat(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut client: WorkerClient,
@@ -1932,19 +1970,22 @@ pub async fn run_chat(
                             None
                         }
                     }
-                    ChatAction::Back => {
+                    action @ (ChatAction::Back | ChatAction::QuitDetach) => {
                         if let Some(cancel) = voice_cancel.take() {
                             let _ = cancel.send(());
                         }
                         let last_seen_event_sequence = chat.latest_seq();
                         chat.reset_interaction();
-                        return Ok((
+                        let exit = if action == ChatAction::QuitDetach {
+                            ChatExit::QuitDetached {
+                                last_seen_event_sequence,
+                            }
+                        } else {
                             ChatExit::Detached {
                                 last_seen_event_sequence,
-                            },
-                            client,
-                            chat,
-                        ));
+                            }
+                        };
+                        return Ok((exit, client, chat));
                     }
                 };
                 if let Some(error) = result {
@@ -1966,13 +2007,7 @@ pub async fn run_chat(
 }
 
 pub fn render(frame: &mut Frame, chat: &mut ChatState) {
-    let area = frame.area();
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" HEL / {} ", short_id(&chat.session_id)))
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
+    let inner = frame.area();
     let visible_queued = chat.queued_prompts.len().min(3) as u16;
     let prompt_width = usize::from(inner.width.saturating_sub(2)).max(1);
     let input_rows = input_visual_rows(&chat.input, prompt_width) as u16;
@@ -1992,20 +2027,7 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
         .split(inner);
     render_transcript(frame, chunks[0], chat);
     let queued = chat.queued_prompts.len();
-    let prompt_title = if chat.recovery_busy {
-        format!(" Saving recovery copy… · {queued} queued ")
-    } else {
-        match (chat.phase, queued) {
-            (WorkerPhase::Idle, 0) => " Prompt ".to_owned(),
-            (WorkerPhase::Idle, queued) => format!(" Prompt · {queued} queued "),
-            (WorkerPhase::Running, 0) => " Running · Esc cancels ".to_owned(),
-            (WorkerPhase::Running, queued) => {
-                format!(" Running · {queued} queued · Esc cancels ")
-            }
-            (WorkerPhase::Closing, _) => " Closing ".to_owned(),
-            (WorkerPhase::Closed, _) => " Closed ".to_owned(),
-        }
-    };
+    let prompt_title = prompt_title(chat, queued);
     let prompt_block = Block::default().borders(Borders::ALL).title(prompt_title);
     let prompt_inner = prompt_block.inner(chunks[1]);
     let mut prompt_lines = chat
@@ -2061,6 +2083,8 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
     }
     let default_footer = if chat.voice_active {
         "Listening… Alt-V stop · Ctrl-G dashboard"
+    } else if !chat.queued_prompts.is_empty() {
+        "Up/Ctrl-P edit last queued · Enter send/queue · Shift-Enter newline · Ctrl-R history · Esc cancel · Ctrl-G dashboard"
     } else {
         "Enter send/queue · Shift-Enter newline · Ctrl-R history · Ctrl-T transcript · Esc cancel · Ctrl-G dashboard"
     };
@@ -2084,6 +2108,35 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
         ));
     }
     render_autocomplete(frame, chunks[1], chat);
+}
+
+fn prompt_title(chat: &ChatState, queued: usize) -> String {
+    let mut parts = [
+        chat.current_model.as_deref(),
+        chat.current_effort.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    if chat.recovery_busy {
+        parts.push("Saving recovery copy…".into());
+        parts.push(format!("{queued} queued"));
+    } else {
+        match chat.phase {
+            WorkerPhase::Idle => parts.push("Prompt".into()),
+            WorkerPhase::Running => parts.push("Running".into()),
+            WorkerPhase::Closing => parts.push("Closing".into()),
+            WorkerPhase::Closed => parts.push("Closed".into()),
+        }
+        if queued > 0 {
+            parts.push(format!("{queued} queued"));
+        }
+        if chat.phase == WorkerPhase::Running {
+            parts.push("Esc cancels".into());
+        }
+    }
+    format!(" {} ", parts.join(" · "))
 }
 
 fn set_input_cursor(
@@ -2114,26 +2167,134 @@ fn input_visual_rows(input: &str, width: usize) -> usize {
 
 fn input_cursor_visual_position(input: &str, cursor: usize, width: usize) -> (usize, usize) {
     let width = width.max(1);
-    let mut row = 0;
-    let mut column = 0;
-    for grapheme in input[..cursor].graphemes(true) {
-        if grapheme == "\n" {
-            row += 1;
-            column = 0;
+    let cursor = cursor.min(input.len());
+    let mut line_offset = 0;
+    let mut row_offset = 0;
+
+    for line in input.split('\n') {
+        let line_end = line_offset + line.len();
+        let wrapped = wrap_input_line(line, line_offset, width);
+        if cursor <= line_end {
+            let mut previous = (0, row_offset);
+            for (wrapped_row, graphemes) in wrapped.iter().enumerate() {
+                let row = row_offset + wrapped_row;
+                let mut column = 0;
+                for grapheme in graphemes {
+                    let start = (column, row);
+                    if cursor <= grapheme.start {
+                        return start;
+                    }
+                    column += grapheme.width;
+                    let end = if column >= width {
+                        (0, row + 1)
+                    } else {
+                        (column, row)
+                    };
+                    if cursor <= grapheme.end {
+                        return end;
+                    }
+                    previous = end;
+                }
+            }
+            return previous;
+        }
+        row_offset += wrapped.len();
+        line_offset = line_end + 1;
+    }
+
+    (0, row_offset)
+}
+
+#[derive(Clone, Copy)]
+struct InputGrapheme {
+    start: usize,
+    end: usize,
+    width: usize,
+    whitespace: bool,
+}
+
+/// Mirror ratatui's `WordWrapper` layout so the terminal cursor follows the
+/// word-wrapped `Paragraph`, including whitespace discarded at wrap points.
+fn wrap_input_line(line: &str, offset: usize, width: usize) -> Vec<Vec<InputGrapheme>> {
+    let mut wrapped = Vec::new();
+    let mut pending_line = Vec::new();
+    let mut pending_word = Vec::new();
+    let mut pending_whitespace = VecDeque::<InputGrapheme>::new();
+    let mut line_width = 0;
+    let mut word_width = 0;
+    let mut whitespace_width = 0;
+    let mut previous_was_non_whitespace = false;
+
+    for (start, symbol) in line.grapheme_indices(true) {
+        let symbol_width = display_width(symbol);
+        if symbol_width > width {
             continue;
         }
-        let grapheme_width = display_width(grapheme).max(1);
-        if column + grapheme_width > width {
-            row += 1;
-            column = 0;
+        let whitespace = symbol == "\u{200b}"
+            || (symbol.chars().all(char::is_whitespace) && symbol != "\u{00a0}");
+        let grapheme = InputGrapheme {
+            start: offset + start,
+            end: offset + start + symbol.len(),
+            width: symbol_width,
+            whitespace,
+        };
+        let word_found = previous_was_non_whitespace && whitespace;
+        let untrimmed_overflow =
+            pending_line.is_empty() && word_width + whitespace_width + symbol_width > width;
+
+        if word_found || untrimmed_overflow {
+            pending_line.extend(pending_whitespace.drain(..));
+            line_width += whitespace_width;
+            pending_line.append(&mut pending_word);
+            line_width += word_width;
+            whitespace_width = 0;
+            word_width = 0;
         }
-        column += grapheme_width;
-        if column >= width {
-            row += 1;
-            column = 0;
+
+        let line_full = line_width >= width;
+        let pending_word_overflow =
+            symbol_width > 0 && line_width + whitespace_width + word_width >= width;
+        if line_full || pending_word_overflow {
+            let mut remaining_width = width.saturating_sub(line_width);
+            wrapped.push(std::mem::take(&mut pending_line));
+            line_width = 0;
+
+            while let Some(pending) = pending_whitespace.front() {
+                if pending.width > remaining_width {
+                    break;
+                }
+                whitespace_width -= pending.width;
+                remaining_width -= pending.width;
+                pending_whitespace.pop_front();
+            }
+            if whitespace && pending_whitespace.is_empty() {
+                previous_was_non_whitespace = false;
+                continue;
+            }
         }
+
+        if grapheme.whitespace {
+            whitespace_width += grapheme.width;
+            pending_whitespace.push_back(grapheme);
+        } else {
+            word_width += grapheme.width;
+            pending_word.push(grapheme);
+        }
+        previous_was_non_whitespace = !whitespace;
     }
-    (column, row)
+
+    if pending_line.is_empty() && pending_word.is_empty() && !pending_whitespace.is_empty() {
+        wrapped.push(Vec::new());
+    }
+    pending_line.extend(pending_whitespace);
+    pending_line.append(&mut pending_word);
+    if !pending_line.is_empty() {
+        wrapped.push(pending_line);
+    }
+    if wrapped.is_empty() {
+        wrapped.push(Vec::new());
+    }
+    wrapped
 }
 
 fn history_scope_name(scope: HistoryScope) -> &'static str {
@@ -2690,14 +2851,11 @@ fn line_is_empty(line: &Line<'_>) -> bool {
     line.spans.iter().all(|span| span.content.trim().is_empty())
 }
 
-fn short_id(id: &str) -> &str {
-    id.get(..8).unwrap_or(id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hel_worker::{ActivePrompt, WorkerSnapshot};
+    use ratatui::backend::TestBackend;
 
     fn snapshot() -> WorkerSnapshot {
         serde_json::from_value(serde_json::json!({
@@ -2802,6 +2960,13 @@ mod tests {
         let mut chat = ChatState::new(&snapshot(), &[]);
         let control_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         assert_eq!(chat.handle_key(control_g), ChatAction::Back);
+    }
+
+    #[test]
+    fn control_q_quits_from_conversation() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+
+        assert_eq!(chat.handle_key(ctrl('q')), ChatAction::QuitDetach);
     }
 
     #[test]
@@ -2915,6 +3080,33 @@ mod tests {
     }
 
     #[test]
+    fn up_and_control_p_peel_queued_prompts_back_into_the_editor() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        for text in ["first", "second", "third"] {
+            chat.queued_prompts
+                .push_back(QueuedPrompt { text: text.into() });
+        }
+
+        chat.handle_key(key(KeyCode::Up));
+        assert_eq!(chat.input, "third");
+        assert_eq!(chat.queued_prompts.len(), 2);
+
+        chat.clear_input();
+        chat.handle_key(ctrl('p'));
+        assert_eq!(chat.input, "second");
+        assert_eq!(chat.queued_prompts.len(), 1);
+
+        chat.clear_input();
+        chat.handle_key(key(KeyCode::Up));
+        assert_eq!(chat.input, "first");
+        assert!(chat.queued_prompts.is_empty());
+
+        chat.clear_input();
+        chat.handle_key(key(KeyCode::Up));
+        assert!(chat.input.is_empty());
+    }
+
+    #[test]
     fn model_and_effort_slash_commands_change_live_session_config() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.input = "/model gpt-5.6-luna".into();
@@ -2934,6 +3126,89 @@ mod tests {
                 value: "xhigh".into(),
             }
         );
+    }
+
+    #[test]
+    fn composer_title_shows_live_model_and_effort_without_outer_session_frame() {
+        use agent_client_protocol::schema::v1::{
+            SessionConfigSelectOption, SessionConfigSelectOptions,
+        };
+
+        let options = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "gpt-5.6-sol",
+                SessionConfigSelectOptions::Ungrouped(vec![SessionConfigSelectOption::new(
+                    "gpt-5.6-sol",
+                    "Sol",
+                )]),
+            )
+            .category(SessionConfigOptionCategory::Model),
+            SessionConfigOption::select(
+                "effort",
+                "Effort",
+                "high",
+                SessionConfigSelectOptions::Ungrouped(vec![SessionConfigSelectOption::new(
+                    "high", "High",
+                )]),
+            )
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+        ];
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.phase = WorkerPhase::Running;
+        chat.set_config_options(&options);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut chat))
+            .expect("draw chat");
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("gpt-5.6-sol · high · Running · Esc cancels"));
+        assert!(!rendered.contains("HEL /"));
+        assert_ne!(buffer[(buffer.area.x, buffer.area.y)].symbol(), "┌");
+    }
+
+    #[test]
+    fn composer_cursor_follows_a_word_moved_to_the_next_visual_row() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("abcdefgh ijkl".into());
+        let mut terminal = Terminal::new(TestBackend::new(14, 12)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut chat))
+            .expect("draw chat");
+        let (word_end_x, word_row) = {
+            let buffer = terminal.backend().buffer();
+            let word_row = (buffer.area.y..buffer.area.bottom())
+                .find(|&y| {
+                    (buffer.area.x..buffer.area.right())
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains("ijkl")
+                })
+                .expect("wrapped word");
+            let word_start_x = (buffer.area.x..buffer.area.right())
+                .find(|&x| buffer[(x, word_row)].symbol() == "i")
+                .expect("wrapped word start");
+            (word_start_x + 4, word_row)
+        };
+
+        terminal
+            .backend_mut()
+            .assert_cursor_position((word_end_x, word_row));
+        assert_eq!(
+            input_cursor_visual_position(&chat.input, chat.input.len(), 12),
+            (4, 1)
+        );
+        assert_eq!(input_cursor_visual_position(&chat.input, 9, 12), (0, 1));
+        assert_eq!(input_cursor_visual_position(&chat.input, 10, 12), (1, 1));
     }
 
     #[test]

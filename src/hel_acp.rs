@@ -201,6 +201,7 @@ pub async fn run(
 }
 
 const ACP_STDERR_TAIL_BYTES: usize = 16 * 1024;
+const UNEXPECTED_PERMISSION_REQUEST_WARNING: &str = "The agent made a permission request, which means its permission policy is misconfigured. Hel is designed to run in either auto-review or YOLO mode.";
 
 async fn read_stderr_tail(mut stderr: tokio::process::ChildStderr) -> String {
     let mut tail = Vec::new();
@@ -263,6 +264,9 @@ where
         )
         .on_receive_request(
             async move |request: RequestPermissionRequest, responder, _cx| {
+                let _ = permission_events.send(RuntimeEvent::Warning {
+                    message: UNEXPECTED_PERMISSION_REQUEST_WARNING.to_owned(),
+                });
                 if !auto_approve_permissions {
                     return responder.respond(RequestPermissionResponse::new(
                         RequestPermissionOutcome::Cancelled,
@@ -836,6 +840,13 @@ mod tests {
                 .to_string(),
             "reasoning_effort"
         );
+    }
+
+    #[test]
+    fn permission_request_warning_explains_required_permission_modes() {
+        assert!(UNEXPECTED_PERMISSION_REQUEST_WARNING.contains("misconfigured"));
+        assert!(UNEXPECTED_PERMISSION_REQUEST_WARNING.contains("auto-review"));
+        assert!(UNEXPECTED_PERMISSION_REQUEST_WARNING.contains("YOLO"));
     }
 
     #[cfg(unix)]

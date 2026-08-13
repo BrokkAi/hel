@@ -152,10 +152,12 @@ pub struct SessionEditTargets {
 pub struct ImportSafetyIssues {
     pub dirty_git_roots: Vec<(PathBuf, String)>,
     pub omitted_non_git_dirs: Vec<PathBuf>,
+    pub has_untracked_files: bool,
 }
 
 pub fn import_safety_issues(targets: &SessionEditTargets) -> Result<ImportSafetyIssues> {
     let mut dirty_git_roots = Vec::new();
+    let mut has_untracked_files = false;
     for root in &targets.git_roots {
         let output = Command::new("git")
             .args(["status", "--porcelain=v1", "--untracked-files=normal"])
@@ -167,20 +169,38 @@ pub fn import_safety_issues(targets: &SessionEditTargets) -> Result<ImportSafety
             "could not inspect Git status in {}",
             root.display()
         );
-        let lines = String::from_utf8_lossy(&output.stdout).lines().count();
-        if lines > 0 {
-            dirty_git_roots.push((
-                root.clone(),
-                format!(
-                    "{lines} changed or untracked path{}",
-                    if lines == 1 { "" } else { "s" }
-                ),
-            ));
+        let (tracked, untracked) = String::from_utf8_lossy(&output.stdout).lines().fold(
+            (0_usize, 0_usize),
+            |(tracked, untracked), line| {
+                if line.starts_with("??") {
+                    (tracked, untracked + 1)
+                } else {
+                    (tracked + 1, untracked)
+                }
+            },
+        );
+        has_untracked_files |= untracked > 0;
+        if tracked + untracked > 0 {
+            let mut parts = Vec::new();
+            if tracked > 0 {
+                parts.push(format!(
+                    "{tracked} tracked change{}",
+                    if tracked == 1 { "" } else { "s" }
+                ));
+            }
+            if untracked > 0 {
+                parts.push(format!(
+                    "{untracked} untracked path{}",
+                    if untracked == 1 { "" } else { "s" }
+                ));
+            }
+            dirty_git_roots.push((root.clone(), parts.join(" · ")));
         }
     }
     Ok(ImportSafetyIssues {
         dirty_git_roots,
         omitted_non_git_dirs: targets.non_git_dirs.clone(),
+        has_untracked_files,
     })
 }
 
@@ -216,6 +236,7 @@ pub enum ImportArchiveProgress {
 pub struct ImportControl<'a> {
     pub cancelled: &'a AtomicBool,
     pub progress: &'a (dyn Fn(ImportArchiveProgress) + Sync),
+    pub include_untracked: bool,
 }
 
 impl ImportControl<'_> {
@@ -462,8 +483,7 @@ fn codex_indexed_sessions(home: &Path) -> Result<Option<Vec<LocatedCodexSession>
            AND source IN ('cli', 'vscode') \
            AND preview <> '' \
            AND rollout_path IS NOT NULL \
-         ORDER BY updated_at DESC, id DESC \
-         LIMIT 25"
+         ORDER BY updated_at DESC, id DESC"
     );
     let Ok(mut statement) = connection.prepare(&query) else {
         return Ok(None);
@@ -2543,6 +2563,7 @@ fn collect_local_repositories(
                         .is_local()
                         .then(|| format!("hel-local:{}", repository.id)),
                 },
+                control.is_none_or(|control| control.include_untracked),
                 &|progress| {
                     let Some(control) = control else {
                         return Ok(());
@@ -2956,6 +2977,7 @@ mod tests {
         let app = directory.path().join("app");
         initialize_repository(&app, "app");
         fs::write(app.join("README.md"), "dirty").unwrap();
+        fs::write(app.join("untracked.txt"), "new").unwrap();
         let omitted = directory.path().join("notes");
         let issues = import_safety_issues(&SessionEditTargets {
             git_roots: vec![app.clone()],
@@ -2965,6 +2987,11 @@ mod tests {
 
         assert_eq!(issues.dirty_git_roots.len(), 1);
         assert_eq!(issues.dirty_git_roots[0].0, app);
+        assert_eq!(
+            issues.dirty_git_roots[0].1,
+            "1 tracked change · 1 untracked path"
+        );
+        assert!(issues.has_untracked_files);
         assert_eq!(issues.omitted_non_git_dirs, [omitted]);
     }
 
@@ -3304,7 +3331,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_listing_uses_native_index_order_limit_and_persisted_threads() {
+    fn codex_listing_uses_native_index_order_and_includes_all_persisted_threads() {
         let directory = tempfile::tempdir().unwrap();
         let sessions = directory.path().join("sessions");
         fs::create_dir_all(&sessions).unwrap();
@@ -3358,11 +3385,11 @@ mod tests {
         drop(connection);
 
         let listed = list_codex_sessions(directory.path()).unwrap();
-        assert_eq!(listed.len(), 25);
+        assert_eq!(listed.len(), 30);
         assert_eq!(listed[0].title, "Explicit newest title");
         assert_eq!(listed[0].history_mode, CodexHistoryMode::Paginated);
         assert!(listed[0].modified_at > listed[1].modified_at);
-        assert_eq!(listed[24].title, "Generated 5");
+        assert_eq!(listed[29].title, "Generated 0");
         assert!(listed.iter().all(|session| session.title != "Ephemeral"));
     }
 

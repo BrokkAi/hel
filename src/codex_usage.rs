@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+// A cold Codex app-server start can be slow on busy machines. The client is
+// reused after initialization, so this primarily bounds the initial probe.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
