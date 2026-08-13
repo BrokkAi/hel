@@ -83,6 +83,10 @@ hel server
 hel server --bind 0.0.0.0:3765 --tls-cert ./hel.crt --tls-key ./hel.key
 ```
 
+The dashboard lists newest-added sessions first. Press `s` to switch between
+that order and most-recent activity; the current order is shown in the footer.
+Returning to the dashboard with `Ctrl+G` preserves the current message draft.
+
 ## Configuration
 
 Hel reads `~/.config/hel/config.toml` on Linux (the platform-equivalent config

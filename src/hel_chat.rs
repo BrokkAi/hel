@@ -409,8 +409,6 @@ impl ChatState {
     }
 
     fn reset_interaction(&mut self) {
-        self.input.clear();
-        self.input_cursor = 0;
         self.prompt_history.clear();
         self.history_index = None;
         self.history_draft.clear();
@@ -2946,7 +2944,8 @@ mod tests {
 
         assert_eq!(chat.entries.len(), 1);
         assert!(chat.render_cache.entries[0].is_some());
-        assert!(chat.input.is_empty());
+        assert_eq!(chat.input, "draft");
+        assert_eq!(chat.input_cursor, "draft".len());
         assert!(chat.prompt_history.is_empty());
         assert!(chat.queued_prompts.is_empty());
         assert_eq!(chat.scroll_top, 0);
