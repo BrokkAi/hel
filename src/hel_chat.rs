@@ -423,6 +423,18 @@ impl ChatState {
         self.update_autocomplete();
     }
 
+    fn handle_paste(&mut self, pasted: &str) {
+        let pasted = sanitize_terminal_text(pasted);
+        if pasted.is_empty() {
+            return;
+        }
+        self.input.insert_str(self.input_cursor, &pasted);
+        self.input_cursor += pasted.len();
+        self.history_index = None;
+        self.preferred_column = None;
+        self.update_autocomplete();
+    }
+
     fn backspace(&mut self) {
         if self.input_cursor == 0 {
             return;
@@ -1828,6 +1840,10 @@ pub async fn run_chat(
         while pending {
             let action = match event::read()? {
                 Event::Key(key) => Some(chat.handle_key(key)),
+                Event::Paste(pasted) => {
+                    chat.handle_paste(&pasted);
+                    None
+                }
                 Event::Mouse(mouse) => {
                     chat.handle_mouse(mouse);
                     None
@@ -2810,6 +2826,26 @@ mod tests {
         assert_eq!(chat.queued_prompts.len(), 1);
         assert_eq!(chat.queued_prompts[0].text, "x");
         assert!(chat.entries.is_empty());
+    }
+
+    #[test]
+    fn multiline_paste_is_one_draft_and_one_queued_prompt() {
+        let mut running = snapshot();
+        running.phase = WorkerPhase::Running;
+        running.active_prompt = Some(ActivePrompt {
+            request_id: "p".into(),
+            text: "busy".into(),
+            attachments: vec![],
+        });
+        let mut chat = ChatState::new(&running, &[]);
+
+        chat.handle_paste("first\r\nsecond\rthird");
+
+        assert_eq!(chat.input, "first\nsecond\nthird");
+        assert!(chat.queued_prompts.is_empty());
+        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
+        assert_eq!(chat.queued_prompts.len(), 1);
+        assert_eq!(chat.queued_prompts[0].text, "first\nsecond\nthird");
     }
 
     #[test]

@@ -32,7 +32,7 @@ const BASELINE_MEMORY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const ACTIVE_MESSAGE_LINES: usize = 4;
 const SELECTED_TRANSCRIPT_LINES: usize = 10;
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
-const DASHBOARD_FIXED_HEIGHT: u16 = 7;
+const DASHBOARD_FIXED_HEIGHT: u16 = 5;
 const DASHBOARD_PANE_COUNT: usize = 4;
 const MOUSE_SCROLL_ROWS: isize = 3;
 const IMPORT_STALL_WARNING_AFTER: Duration = Duration::from_secs(10);
@@ -64,7 +64,7 @@ pub enum DashboardAction {
         resource_allocation: Option<SessionResourceAllocation>,
     },
     ResolveAwsResourceOptions {
-        target_template_id: String,
+        target_template_ids: Vec<String>,
     },
     CreateBundle {
         source: String,
@@ -406,6 +406,14 @@ impl DashboardState {
                 .retain(|seq| *seq > viewed_through);
         }
         self.clamp_selections();
+    }
+
+    pub fn select_active_session(&mut self, session_id: &str) {
+        let (active, _) = partition_sessions(self.state.sessions.values(), &self.session_details);
+        if let Some(index) = active.iter().position(|session| session.id == session_id) {
+            self.focus = Focus::Active;
+            self.session_index = index;
+        }
     }
 
     pub fn set_quotas(&mut self, quotas: BTreeMap<String, ProfileQuota>) {
@@ -831,10 +839,7 @@ impl DashboardState {
                 self.set_selection(len.saturating_sub(1));
                 DashboardAction::None
             }
-            KeyCode::Char('n') => {
-                self.begin_new();
-                DashboardAction::None
-            }
+            KeyCode::Char('n') => self.begin_new(),
             KeyCode::Char('i') => DashboardAction::OpenImport,
             KeyCode::Char('r') => {
                 if self.focus == Focus::Quotas {
@@ -1457,6 +1462,10 @@ impl DashboardState {
         match self.mode.clone() {
             Mode::New(mut wizard) => {
                 if nth_key(&self.config.targets, wizard.target) != target_id {
+                    if let Ok(options) = result {
+                        wizard.aws_options.insert(target_id.to_string(), options);
+                        self.mode = Mode::New(wizard);
+                    }
                     return;
                 }
                 apply_aws_options(
@@ -1471,6 +1480,10 @@ impl DashboardState {
             }
             Mode::Resume(mut wizard) => {
                 if nth_key(&self.config.targets, wizard.target) != target_id {
+                    if let Ok(options) = result {
+                        wizard.aws_options.insert(target_id.to_string(), options);
+                        self.mode = Mode::Resume(wizard);
+                    }
                     return;
                 }
                 let previous = self
@@ -1552,7 +1565,7 @@ impl DashboardState {
                 } else {
                     *allocation = None;
                     DashboardAction::ResolveAwsResourceOptions {
-                        target_template_id: target_id,
+                        target_template_ids: vec![target_id],
                     }
                 }
             }
@@ -2069,10 +2082,10 @@ impl DashboardState {
         }
     }
 
-    fn begin_new(&mut self) {
+    fn begin_new(&mut self) -> DashboardAction {
         if self.config.profiles.is_empty() || self.config.targets.is_empty() {
             self.notice = Some("Configure at least one profile and target first.".into());
-            return;
+            return DashboardAction::None;
         }
         self.mode = Mode::New(NewWizard {
             step: WizardStep::Profile,
@@ -2086,23 +2099,24 @@ impl DashboardState {
             aws_options: BTreeMap::new(),
             sizing_error: None,
         });
+        self.resolve_all_aws_resource_options_action()
     }
 
-    fn begin_resume(&mut self) {
+    fn begin_resume(&mut self) -> DashboardAction {
         let Some(session) = self.selected_session() else {
-            return;
+            return DashboardAction::None;
         };
         if session.state.is_active() && session.state != SessionState::Error {
             self.notice = Some("This session is active; press Enter to open it.".into());
-            return;
+            return DashboardAction::None;
         }
         if session.checkpoint.is_none() {
             self.notice = Some("This session has no verified checkpoint to resume.".into());
-            return;
+            return DashboardAction::None;
         }
         if self.compatible_profiles(&session.id).is_empty() || self.config.targets.is_empty() {
             self.notice = Some("Resume needs a profile and a target template.".into());
-            return;
+            return DashboardAction::None;
         }
         let profile = self
             .compatible_profiles(&session.id)
@@ -2120,6 +2134,25 @@ impl DashboardState {
             aws_options: BTreeMap::new(),
             sizing_error: None,
         });
+        self.resolve_all_aws_resource_options_action()
+    }
+
+    fn resolve_all_aws_resource_options_action(&self) -> DashboardAction {
+        let target_template_ids = self
+            .config
+            .targets
+            .iter()
+            .filter_map(|(id, target)| {
+                matches!(target, TargetTemplate::AwsEc2 { .. }).then_some(id.clone())
+            })
+            .collect::<Vec<_>>();
+        if target_template_ids.is_empty() {
+            DashboardAction::None
+        } else {
+            DashboardAction::ResolveAwsResourceOptions {
+                target_template_ids,
+            }
+        }
     }
 
     fn open_or_resume(&mut self) -> DashboardAction {
@@ -2128,7 +2161,7 @@ impl DashboardState {
         };
         if session.state == SessionState::Error {
             if session.checkpoint.is_some() {
-                self.begin_resume();
+                return self.begin_resume();
             } else {
                 self.notice = Some(
                     session
@@ -2144,8 +2177,7 @@ impl DashboardState {
                 session_id: session.id.clone(),
             }
         } else {
-            self.begin_resume();
-            DashboardAction::None
+            self.begin_resume()
         }
     }
 
@@ -2540,15 +2572,9 @@ impl ResumeWizard {
 
 pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     let area = frame.area();
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(" HEL ")
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
 
     if !dashboard.config_is_empty() {
-        render_adaptive_dashboard(frame, area, inner, dashboard);
+        render_adaptive_dashboard(frame, area, area, dashboard);
         return;
     }
 
@@ -2561,7 +2587,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
             Constraint::Length(8),
             Constraint::Length(2),
         ])
-        .split(inner);
+        .split(area);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -3212,10 +3238,10 @@ fn render_sessions(
 
     let archived_rows = archived
         .iter()
-        .map(|session| archived_session_row(session, now_epoch_seconds, &dashboard.config));
+        .map(|session| archived_session_row(session, &dashboard.config));
     let archived_focused = dashboard.focus == Focus::Archived;
-    let archived_table = Table::new(archived_rows, session_column_constraints())
-        .header(session_header())
+    let archived_table = Table::new(archived_rows, archived_session_column_constraints())
+        .header(archived_session_header())
         .row_highlight_style(if archived_focused {
             Style::default().bg(Color::DarkGray).fg(Color::White)
         } else {
@@ -3284,7 +3310,17 @@ fn session_column_constraints() -> [Constraint; 6] {
         Constraint::Length(14),
         Constraint::Length(18),
         Constraint::Length(14),
-        Constraint::Length(34),
+        Constraint::Length(17),
+        Constraint::Min(18),
+    ]
+}
+
+fn archived_session_column_constraints() -> [Constraint; 5] {
+    [
+        Constraint::Length(14),
+        Constraint::Length(18),
+        Constraint::Length(14),
+        Constraint::Length(17),
         Constraint::Min(18),
     ]
 }
@@ -3292,6 +3328,17 @@ fn session_column_constraints() -> [Constraint; 6] {
 fn session_header() -> Row<'static> {
     Row::new([
         "Turn clock",
+        "Profile",
+        "Target",
+        "Checkpoint",
+        "Resources",
+        "Session name",
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD))
+}
+
+fn archived_session_header() -> Row<'static> {
+    Row::new([
         "Profile",
         "Target",
         "Checkpoint",
@@ -3475,20 +3522,18 @@ fn active_session_row(
     .top_margin(top_margin)
 }
 
-fn archived_session_row(
-    session: &SessionRecord,
-    now_epoch_seconds: u64,
-    config: &HelConfig,
-) -> Row<'static> {
-    let (_clock, profile, target, checkpoint, _resources, session_name) =
-        session_values(session, None, now_epoch_seconds, config);
+fn archived_session_row(session: &SessionRecord, config: &HelConfig) -> Row<'static> {
+    let checkpoint = session
+        .checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint_time_display(&checkpoint.created_at))
+        .unwrap_or_else(|| "never".into());
     Row::new([
-        String::new(),
-        profile,
-        target,
+        session.last_profile.clone(),
+        session_target(config, session),
         checkpoint,
         checkpoint_archive_size(session),
-        session_name,
+        session_name(session).to_string(),
     ])
 }
 
@@ -3682,13 +3727,16 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
         Focus::Capacity => "n new · i import · u quota · Tab pane · q detach",
         Focus::Quotas => "n new · i import · r refresh · u quota · Tab pane · q detach",
     };
-    let text = dashboard.notice.as_deref().unwrap_or(actions);
-    let style = if dashboard.notice.is_some() {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    frame.render_widget(Paragraph::new(text).style(style), area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(actions, Style::default().fg(Color::DarkGray)),
+            Line::styled(
+                dashboard.notice.as_deref().unwrap_or_default(),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        area,
+    );
 }
 
 fn action_buttons(buttons: &[(&str, bool)]) -> Line<'static> {
@@ -4000,7 +4048,7 @@ fn render_resume_wizard(
     }
     let (title, choices, selected, help) = match wizard.step {
         WizardStep::Profile => (
-            " Resume · 1/2 profile (cross-harness supported) ",
+            " Resume · 1/3 profile (cross-harness supported) ",
             dashboard
                 .compatible_profiles(&wizard.session_id)
                 .into_iter()
@@ -4024,7 +4072,7 @@ fn render_resume_wizard(
             ][..],
         ),
         WizardStep::Target => (
-            " Resume · 2/2 new target ",
+            " Resume · 2/3 new target ",
             dashboard
                 .config
                 .targets
@@ -4566,7 +4614,7 @@ mod tests {
         assert_eq!(
             allocation,
             PaneAllocation::Fits(PaneHeights {
-                active: 15,
+                active: 17,
                 archived: 5,
                 capacity: 5,
                 quotas: 5,
@@ -4592,7 +4640,7 @@ mod tests {
             (
                 Focus::Active,
                 PaneHeights {
-                    active: 20,
+                    active: 22,
                     archived: 5,
                     capacity: 5,
                     quotas: 5,
@@ -4601,7 +4649,7 @@ mod tests {
             (
                 Focus::Archived,
                 PaneHeights {
-                    active: 15,
+                    active: 17,
                     archived: 10,
                     capacity: 5,
                     quotas: 5,
@@ -4610,7 +4658,7 @@ mod tests {
             (
                 Focus::Capacity,
                 PaneHeights {
-                    active: 15,
+                    active: 17,
                     archived: 5,
                     capacity: 10,
                     quotas: 5,
@@ -4619,7 +4667,7 @@ mod tests {
             (
                 Focus::Quotas,
                 PaneHeights {
-                    active: 15,
+                    active: 17,
                     archived: 5,
                     capacity: 5,
                     quotas: 10,
@@ -4649,13 +4697,13 @@ mod tests {
             quotas: 5,
         };
         assert_eq!(
-            allocate_pane_heights(26, heights, heights, Focus::Active),
+            allocate_pane_heights(24, heights, heights, Focus::Active),
             PaneAllocation::TooSmall {
-                required_frame_height: 27,
+                required_frame_height: 25,
             }
         );
         assert!(matches!(
-            allocate_pane_heights(27, heights, heights, Focus::Active),
+            allocate_pane_heights(25, heights, heights, Focus::Active),
             PaneAllocation::Fits(_)
         ));
     }
@@ -4663,7 +4711,7 @@ mod tests {
     #[test]
     fn dashboard_replaces_too_short_layout_with_required_height() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 18)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw short dashboard");
@@ -4675,9 +4723,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Terminal too small"));
-        assert!(rendered.contains("at least 21 rows (currently 20)"));
+        assert!(rendered.contains("at least 19 rows (currently 18)"));
 
-        let mut terminal = Terminal::new(TestBackend::new(120, 21)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 19)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw exact minimum dashboard");
@@ -4691,6 +4739,27 @@ mod tests {
         assert!(!rendered.contains("Terminal too small"));
         assert!(rendered.contains("Active"));
         assert!(rendered.contains("Profile Quotas"));
+    }
+
+    #[test]
+    fn dashboard_uses_separate_hotkey_and_notice_rows_without_an_outer_border() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.set_notice("Transient dashboard message");
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let buffer = terminal.backend().buffer();
+        let line = |y| {
+            (buffer.area.x..buffer.area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        assert_eq!(buffer[(buffer.area.x, buffer.area.y)].symbol(), " ");
+        assert!(!line(buffer.area.y).contains(" HEL "));
+        assert!(line(buffer.area.bottom() - 2).contains("n new"));
+        assert!(line(buffer.area.bottom() - 1).contains("Transient dashboard message"));
     }
 
     fn test_capacity_target() -> DeploymentCapacityTarget {
@@ -5066,6 +5135,58 @@ mod tests {
     }
 
     #[test]
+    fn opening_session_wizards_prefetches_all_aws_sizes() {
+        let aws_target = || TargetTemplate::AwsEc2 {
+            aws_profile: None,
+            region: "us-east-1".into(),
+            launch_template: "hel".into(),
+            launch_template_version: None,
+            ssh_user: "ubuntu".into(),
+            address_source: crate::hel_config::AwsAddressSource::PublicIp,
+            identity_file: None,
+            ssh_args: Vec::new(),
+        };
+        let mut config = config();
+        config.targets.insert("aws-a".into(), aws_target());
+        config.targets.insert("aws-b".into(), aws_target());
+        let mut dashboard =
+            DashboardState::new(config.clone(), HelState::default(), BTreeMap::new());
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('n'))),
+            DashboardAction::ResolveAwsResourceOptions {
+                target_template_ids: vec!["aws-a".into(), "aws-b".into()],
+            }
+        );
+        let aws_b_options = vec![SessionResourceAllocation::AwsEc2 {
+            instance_type: "m7i.2xlarge".into(),
+            vcpus: 8,
+            memory_bytes: 32 * 1024 * 1024 * 1024,
+        }];
+        dashboard.apply_aws_resource_options("aws-b", Ok(aws_b_options.clone()));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new-session wizard");
+        };
+        assert_eq!(wizard.aws_options["aws-b"], aws_b_options);
+
+        let mut dashboard = DashboardState::new(
+            config,
+            HelState {
+                version: STATE_VERSION,
+                sessions: BTreeMap::from([("session-1".into(), archived_session())]),
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ResolveAwsResourceOptions {
+                target_template_ids: vec!["aws-a".into(), "aws-b".into()],
+            }
+        );
+    }
+
+    #[test]
     fn new_session_can_request_a_repository_when_no_bundle_exists() {
         let mut config = config();
         config.bundles.clear();
@@ -5437,6 +5558,34 @@ mod tests {
         dashboard.handle_mouse(mouse(MouseEventKind::ScrollDown));
         assert_eq!(dashboard.quota_index, 2);
         assert_eq!(dashboard.session_index, 0);
+    }
+
+    #[test]
+    fn restored_session_can_be_focused_by_identity() {
+        let mut restored = archived_session();
+        restored.id = "restored".into();
+        restored.state = SessionState::Running;
+        let mut other = archived_session();
+        other.id = "other".into();
+        other.state = SessionState::Running;
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions: BTreeMap::from([
+                    (restored.id.clone(), restored),
+                    (other.id.clone(), other),
+                ]),
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        dashboard.focus = Focus::Archived;
+
+        dashboard.select_active_session("restored");
+
+        assert_eq!(dashboard.focus, Focus::Active);
+        assert_eq!(dashboard.selected_session().unwrap().id, "restored");
     }
 
     #[test]
@@ -5834,7 +5983,34 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("(lossy: text-only transcript)"));
+        assert!(rendered.contains("Resume · 1/3"));
         assert!(rendered.contains("Lossy: text only; tool calls + reasoning dropped."));
+
+        dashboard.handle_key(key(KeyCode::Enter));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw resume target step");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Resume · 2/3"));
+
+        dashboard.handle_key(key(KeyCode::Enter));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw resume resource step");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Resume · 3/3"));
     }
 
     #[test]
@@ -5911,7 +6087,8 @@ mod tests {
         assert!(rendered.contains("Target"));
         assert!(rendered.contains("Checkpoint"));
         assert!(rendered.contains("Resources"));
-        assert!(rendered.contains("C 37% · M 50% · S 4.0K · D 8.0K"));
+        assert!(rendered.contains("C 37% · M 50%"));
+        assert!(!rendered.contains("S 4.0K · D 8.0K"));
         assert!(rendered.contains("Session name"));
         assert!(rendered.contains("ACP pretty name"));
         assert!(!rendered.contains("native-1"));
@@ -6068,7 +6245,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_sessions_leave_the_turn_clock_cell_blank() {
+    fn archived_sessions_omit_the_turn_clock_column() {
         let mut dashboard = dashboard_with_session(archived_session());
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -6083,7 +6260,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.contains("Turn clock"));
+        assert_eq!(rendered.matches("Turn clock").count(), 1);
         assert!(rendered.contains("26-08-09 01:00"));
         assert!(!rendered.contains("2026-08-09T01:00:00Z"));
         assert!(!rendered.contains("idle"));
@@ -6413,7 +6590,7 @@ mod tests {
     }
 
     #[test]
-    fn only_focused_pane_draws_caret_without_shifting_session_columns() {
+    fn only_focused_pane_draws_caret_without_shifting_table_columns() {
         let mut active = archived_session();
         active.id = "session-0".into();
         active.state = SessionState::Running;
@@ -6433,6 +6610,7 @@ mod tests {
         dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut initial_name_columns = None;
 
         for expected_focus in [
             Focus::Active,
@@ -6468,7 +6646,12 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(name_columns.len(), 2);
-            assert_eq!(name_columns[0], name_columns[1]);
+            if let Some(initial_name_columns) = &initial_name_columns {
+                assert_eq!(&name_columns, initial_name_columns);
+            } else {
+                assert_ne!(name_columns[0], name_columns[1]);
+                initial_name_columns = Some(name_columns);
+            }
 
             dashboard.handle_key(key(KeyCode::Tab));
         }

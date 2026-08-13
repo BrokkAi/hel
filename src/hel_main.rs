@@ -8,7 +8,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -29,7 +32,7 @@ use hel::hel_import::{
 use hel::hel_quota::{ProfileQuota, QuotaManager, QuotaRefreshRequest};
 use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapshot};
 use hel::hel_setup::{SetupOutcome, github_repository_from_origin, run_setup_dialog};
-use hel::hel_state::{HelState, SessionState, harness_session_title};
+use hel::hel_state::{HelState, SessionResourceAllocation, SessionState, harness_session_title};
 use hel::hel_targets::{
     CommandOutput, CommandSpec, DeploymentCapacityKind, DeploymentCapacityTarget,
     DeploymentCapacityUsage, ProcessExecutor, SessionResourceProbe, SessionResourceUsage,
@@ -1036,6 +1039,26 @@ fn refresh_dashboard_poll_targets(
     resource_targets_tx.send_replace(dashboard_resource_targets(controller));
 }
 
+fn spawn_aws_resource_options_resolution(
+    config: HelConfig,
+    target_id: String,
+    updates: tokio::sync::mpsc::UnboundedSender<(
+        String,
+        std::result::Result<Vec<SessionResourceAllocation>, String>,
+    )>,
+) {
+    let _task = tokio::task::spawn_blocking(move || {
+        let controller = Controller {
+            config,
+            state: HelState::default(),
+        };
+        let result = controller
+            .resolve_aws_resource_options(&target_id, &ProcessExecutor)
+            .map_err(|error| format!("{error:#}"));
+        let _ = updates.send((target_id, result));
+    });
+}
+
 fn spawn_dashboard_resource_poller() -> (
     tokio::sync::watch::Sender<Vec<ResourcePollTarget>>,
     tokio::sync::mpsc::Sender<String>,
@@ -1674,6 +1697,12 @@ async fn run_dashboard() -> Result<()> {
     let (resource_targets_tx, resource_triggers_tx, mut resource_updates_rx) =
         spawn_dashboard_resource_poller();
     let (capacity_targets_tx, mut capacity_updates_rx) = spawn_dashboard_capacity_poller();
+    let (aws_resource_options_tx, mut aws_resource_options_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(
+            String,
+            std::result::Result<Vec<SessionResourceAllocation>, String>,
+        )>();
+    let mut resolving_aws_resource_options = std::collections::BTreeSet::new();
     refresh_dashboard_poll_targets(&controller, &worker_targets_tx, &resource_targets_tx);
     let capacity_targets = controller.deployment_capacity_targets();
     capacity_targets_tx.send_replace(capacity_targets.clone());
@@ -1721,6 +1750,10 @@ async fn run_dashboard() -> Result<()> {
                 update.result,
                 update.sampled_at_epoch_seconds,
             );
+        }
+        while let Ok((target_id, result)) = aws_resource_options_rx.try_recv() {
+            resolving_aws_resource_options.remove(&target_id);
+            dashboard.apply_aws_resource_options(&target_id, result);
         }
         while let Ok((discovery_id, profile)) = import_updates_rx.try_recv() {
             dashboard.apply_import_profile(discovery_id, profile);
@@ -2190,7 +2223,7 @@ async fn run_dashboard() -> Result<()> {
                 terminal
                     .terminal
                     .draw(|frame| render(frame, &mut dashboard))?;
-                match controller
+                let resumed_chat = match controller
                     .resume_session_with_options(
                         &session_id,
                         &profile_id,
@@ -2200,7 +2233,7 @@ async fn run_dashboard() -> Result<()> {
                     )
                     .await
                 {
-                    Ok(()) => {
+                    Ok(bootstrap) => {
                         dashboard.set_notice(format!(
                             "Resumed {} with {profile_id} on {target_template_id}",
                             short_id(&session_id)
@@ -2210,10 +2243,21 @@ async fn run_dashboard() -> Result<()> {
                             &mut dashboard,
                             &quota_profiles_tx,
                         );
+                        Some(hel::hel_chat::ChatState::new(
+                            &bootstrap.snapshot,
+                            &bootstrap.events,
+                        ))
                     }
-                    Err(error) => dashboard.set_notice(format!("Resume failed: {error:#}")),
-                }
+                    Err(error) => {
+                        dashboard.set_notice(format!("Resume failed: {error:#}"));
+                        None
+                    }
+                };
                 dashboard.set_state(controller.state.clone());
+                if let Some(chat) = resumed_chat {
+                    dashboard.apply_transcript(&session_id, chat.transcript_snapshot());
+                    dashboard.select_active_session(&session_id);
+                }
                 refresh_dashboard_poll_targets(
                     &controller,
                     &worker_targets_tx,
@@ -2258,11 +2302,18 @@ async fn run_dashboard() -> Result<()> {
                     &resource_targets_tx,
                 );
             }
-            DashboardAction::ResolveAwsResourceOptions { target_template_id } => {
-                let result = controller
-                    .resolve_aws_resource_options(&target_template_id, &ProcessExecutor)
-                    .map_err(|error| format!("{error:#}"));
-                dashboard.apply_aws_resource_options(&target_template_id, result);
+            DashboardAction::ResolveAwsResourceOptions {
+                target_template_ids,
+            } => {
+                for target_template_id in target_template_ids {
+                    if resolving_aws_resource_options.insert(target_template_id.clone()) {
+                        spawn_aws_resource_options_resolution(
+                            controller.config.clone(),
+                            target_template_id,
+                            aws_resource_options_tx.clone(),
+                        );
+                    }
+                }
             }
             DashboardAction::CreateBundle { source } => {
                 match create_quick_bundle(&mut controller.config, &source) {
@@ -2270,13 +2321,20 @@ async fn run_dashboard() -> Result<()> {
                         controller.config.save()?;
                         let followup =
                             dashboard.apply_created_bundle(controller.config.clone(), &bundle_id);
-                        if let DashboardAction::ResolveAwsResourceOptions { target_template_id } =
-                            followup
+                        if let DashboardAction::ResolveAwsResourceOptions {
+                            target_template_ids,
+                        } = followup
                         {
-                            let result = controller
-                                .resolve_aws_resource_options(&target_template_id, &ProcessExecutor)
-                                .map_err(|error| format!("{error:#}"));
-                            dashboard.apply_aws_resource_options(&target_template_id, result);
+                            for target_template_id in target_template_ids {
+                                if resolving_aws_resource_options.insert(target_template_id.clone())
+                                {
+                                    spawn_aws_resource_options_resolution(
+                                        controller.config.clone(),
+                                        target_template_id,
+                                        aws_resource_options_tx.clone(),
+                                    );
+                                }
+                            }
                         }
                     }
                     Err(error) => {
@@ -2936,8 +2994,13 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("enable terminal raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-            .context("enter alternate screen and enable mouse capture")?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )
+        .context("enter alternate screen and enable terminal input modes")?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal })
     }
@@ -2946,10 +3009,11 @@ impl TerminalGuard {
         disable_raw_mode().context("disable terminal raw mode for setup")?;
         execute!(
             self.terminal.backend_mut(),
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         )
-        .context("disable mouse capture and leave alternate screen for setup")?;
+        .context("disable terminal input modes and leave alternate screen for setup")?;
         self.terminal
             .show_cursor()
             .context("show cursor for setup")?;
@@ -2961,9 +3025,10 @@ impl TerminalGuard {
         execute!(
             self.terminal.backend_mut(),
             EnterAlternateScreen,
-            EnableMouseCapture
+            EnableMouseCapture,
+            EnableBracketedPaste
         )
-        .context("re-enter alternate screen and enable mouse capture after setup")?;
+        .context("re-enter alternate screen and enable terminal input modes after setup")?;
         self.terminal
             .clear()
             .context("clear dashboard after setup")?;
@@ -2976,6 +3041,7 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
