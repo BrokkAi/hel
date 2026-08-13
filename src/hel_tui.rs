@@ -6160,6 +6160,7 @@ mod tests {
     fn adapter_text_event(seq: u64, kind: &str, text: &str) -> SequencedEvent {
         SequencedEvent {
             seq,
+            recorded_at_ms: None,
             request_id: None,
             event: WorkerEvent::Adapter {
                 kind: "session_update".into(),
@@ -6333,6 +6334,7 @@ mod tests {
             "session-b",
             &[SequencedEvent {
                 seq: 2,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
@@ -6489,6 +6491,7 @@ mod tests {
         let mut dashboard = dashboard_with_session(session);
         let unrelated = SequencedEvent {
             seq: 2,
+            recorded_at_ms: None,
             request_id: None,
             event: WorkerEvent::Adapter {
                 kind: "usage_update".into(),
@@ -8181,6 +8184,7 @@ mod tests {
         let events = vec![
             SequencedEvent {
                 seq: 1,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::PromptAccepted {
                     request_id: "request-1".into(),
@@ -8191,6 +8195,7 @@ mod tests {
             adapter_text_event(2, "agent_message_chunk", "**Rendered answer**"),
             SequencedEvent {
                 seq: 3,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
@@ -8524,6 +8529,7 @@ mod tests {
         let mut dashboard = dashboard_with_session(archived_session());
         let prompt = SequencedEvent {
             seq: 1,
+            recorded_at_ms: None,
             request_id: None,
             event: WorkerEvent::PromptAccepted {
                 request_id: "request-1".into(),

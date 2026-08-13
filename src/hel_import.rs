@@ -1811,6 +1811,7 @@ fn finish_imported_turn(events: &mut Vec<SequencedEvent>) {
 fn push_event(events: &mut Vec<SequencedEvent>, event: WorkerEvent) {
     events.push(SequencedEvent {
         seq: events.len() as u64 + 1,
+        recorded_at_ms: None,
         request_id: None,
         event,
     });

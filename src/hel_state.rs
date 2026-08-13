@@ -697,6 +697,7 @@ mod tests {
         let events = vec![
             SequencedEvent {
                 seq: 1,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
@@ -711,6 +712,7 @@ mod tests {
             },
             SequencedEvent {
                 seq: 2,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
@@ -738,6 +740,7 @@ mod tests {
         let events = vec![
             SequencedEvent {
                 seq: 1,
+                recorded_at_ms: None,
                 request_id: Some("prompt-1".into()),
                 event: WorkerEvent::PromptAccepted {
                     request_id: "prompt-1".into(),
@@ -747,6 +750,7 @@ mod tests {
             },
             SequencedEvent {
                 seq: 2,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
@@ -771,6 +775,7 @@ mod tests {
     fn first_prompt_is_not_used_as_an_acp_session_title() {
         let events = vec![SequencedEvent {
             seq: 1,
+            recorded_at_ms: None,
             request_id: Some("prompt-1".into()),
             event: WorkerEvent::PromptAccepted {
                 request_id: "prompt-1".into(),
@@ -786,6 +791,7 @@ mod tests {
     fn harness_titles_are_normalized_to_one_complete_line() {
         let events = vec![SequencedEvent {
             seq: 1,
+            recorded_at_ms: None,
             request_id: None,
             event: WorkerEvent::Adapter {
                 kind: "session_update".into(),

@@ -303,6 +303,10 @@ impl WorkerSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequencedEvent {
     pub seq: u64,
+    /// UTC receive/accept time recorded by the durable worker. Legacy and
+    /// imported event streams may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at_ms: Option<i64>,
     /// Present for controller mutations. Persisting the id beside the event
     /// closes the crash window between appending the event and snapshotting
     /// the idempotency result.
@@ -770,6 +774,7 @@ impl DurableWorker {
             .ok_or_else(|| anyhow!("event sequence exhausted"))?;
         let event = SequencedEvent {
             seq,
+            recorded_at_ms: Some(chrono::Utc::now().timestamp_millis()),
             request_id: request_id.map(str::to_owned),
             event,
         };
@@ -1235,6 +1240,7 @@ mod tests {
         let events: Vec<SequencedEvent> = (1..=3)
             .map(|seq| SequencedEvent {
                 seq,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::PromptAccepted {
                     request_id: format!("r{seq}"),
@@ -1312,6 +1318,7 @@ mod tests {
         };
         let event = SequencedEvent {
             seq: 1,
+            recorded_at_ms: None,
             request_id: Some("prompt-1".into()),
             event: WorkerEvent::PromptAccepted {
                 request_id: "prompt-1".into(),
@@ -1378,6 +1385,26 @@ mod tests {
             )]
         );
         assert!(worker.claim_pending_dispatches().unwrap().is_empty());
+    }
+
+    #[test]
+    fn durable_events_record_worker_wall_clock_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let before = chrono::Utc::now().timestamp_millis();
+        let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        accepted(&worker.handle(request(
+            "prompt-time",
+            WorkerRequest::Prompt {
+                text: "when".into(),
+                attachments: Vec::new(),
+            },
+        )));
+        let after = chrono::Utc::now().timestamp_millis();
+
+        let recorded = worker.events_after(0).unwrap()[0]
+            .recorded_at_ms
+            .expect("new event timestamp");
+        assert!((before..=after).contains(&recorded));
     }
 
     #[test]

@@ -130,6 +130,7 @@ pub struct ChatEntry {
     pub seq: u64,
     pub role: ChatRole,
     pub text: String,
+    recorded_at_ms: Option<i64>,
     revision: u64,
     message_id: Option<String>,
     tool_call_id: Option<String>,
@@ -146,6 +147,7 @@ impl ChatEntry {
             seq,
             role,
             text: sanitize_terminal_text(&text.into()),
+            recorded_at_ms: None,
             revision: 0,
             message_id: None,
             tool_call_id: None,
@@ -167,6 +169,7 @@ impl ChatEntry {
             seq,
             role: ChatRole::Tool,
             text: sanitize_terminal_text(&title.into()),
+            recorded_at_ms: None,
             revision: 0,
             message_id: None,
             tool_call_id,
@@ -183,6 +186,7 @@ impl ChatEntry {
             seq,
             role: ChatRole::Plan,
             text: String::new(),
+            recorded_at_ms: None,
             revision: 0,
             message_id: None,
             tool_call_id: None,
@@ -197,6 +201,11 @@ impl ChatEntry {
     fn touch(&mut self, seq: u64) {
         self.seq = seq;
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn with_recorded_at(mut self, recorded_at_ms: Option<i64>) -> Self {
+        self.recorded_at_ms = recorded_at_ms;
+        self
     }
 }
 
@@ -1367,8 +1376,10 @@ impl ChatState {
         match &event.event {
             WorkerEvent::PromptAccepted { text, .. } => {
                 self.phase = WorkerPhase::Running;
-                self.entries
-                    .push(ChatEntry::plain(event.seq, ChatRole::User, text));
+                self.entries.push(
+                    ChatEntry::plain(event.seq, ChatRole::User, text)
+                        .with_recorded_at(event.recorded_at_ms),
+                );
             }
             WorkerEvent::TurnCompleted => {
                 self.phase = WorkerPhase::Idle;
@@ -1382,17 +1393,26 @@ impl ChatState {
             WorkerEvent::Closing => self.phase = WorkerPhase::Closing,
             WorkerEvent::Closed => self.phase = WorkerPhase::Closed,
             WorkerEvent::Checkpointed { .. } => {}
-            WorkerEvent::Adapter { payload, .. } => self.apply_adapter(event.seq, payload),
+            WorkerEvent::Adapter { payload, .. } => {
+                self.apply_adapter(event.seq, event.recorded_at_ms, payload)
+            }
             WorkerEvent::ConfigChanged { .. } => {}
         }
     }
 
-    fn apply_adapter(&mut self, seq: u64, payload: &serde_json::Value) {
+    fn apply_adapter(
+        &mut self,
+        seq: u64,
+        recorded_at_ms: Option<i64>,
+        payload: &serde_json::Value,
+    ) {
         let Ok(runtime) = serde_json::from_value::<RuntimeEvent>(payload.clone()) else {
             return;
         };
         match runtime {
-            RuntimeEvent::SessionUpdate { update } => self.apply_session_update(seq, &update),
+            RuntimeEvent::SessionUpdate { update } => {
+                self.apply_session_update_at(seq, recorded_at_ms, &update)
+            }
             RuntimeEvent::Warning { message } => self.entries.push(ChatEntry::plain(
                 seq,
                 ChatRole::System,
@@ -1422,7 +1442,17 @@ impl ChatState {
     /// Project one typed ACP update into stable transcript items. The runtime
     /// keeps JSON at the persistence boundary so old event logs remain wire
     /// compatible; rendering never guesses at arbitrary JSON shapes.
+    #[cfg(test)]
     fn apply_session_update(&mut self, seq: u64, update: &serde_json::Value) {
+        self.apply_session_update_at(seq, None, update);
+    }
+
+    fn apply_session_update_at(
+        &mut self,
+        seq: u64,
+        recorded_at_ms: Option<i64>,
+        update: &serde_json::Value,
+    ) {
         let parsed = match serde_json::from_value::<SessionUpdate>(update.clone()) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -1434,13 +1464,13 @@ impl ChatState {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 let message_id = chunk.message_id.map(|id| id.to_string());
                 if let Some(text) = content_block_text(&chunk.content) {
-                    self.push_streamed(seq, ChatRole::Agent, message_id, &text);
+                    self.push_streamed(seq, recorded_at_ms, ChatRole::Agent, message_id, &text);
                 }
             }
             SessionUpdate::AgentThoughtChunk(chunk) => {
                 let message_id = chunk.message_id.map(|id| id.to_string());
                 if let Some(text) = content_block_text(&chunk.content) {
-                    self.push_streamed(seq, ChatRole::Thought, message_id, &text);
+                    self.push_streamed(seq, recorded_at_ms, ChatRole::Thought, message_id, &text);
                 }
             }
             // PromptAccepted is the canonical local user-message event. ACP
@@ -1519,7 +1549,14 @@ impl ChatState {
         }
     }
 
-    fn push_streamed(&mut self, seq: u64, role: ChatRole, message_id: Option<String>, text: &str) {
+    fn push_streamed(
+        &mut self,
+        seq: u64,
+        recorded_at_ms: Option<i64>,
+        role: ChatRole,
+        message_id: Option<String>,
+        text: &str,
+    ) {
         let text = sanitize_terminal_text(text);
         if let Some(last) = self.entries.last_mut()
             && last.role == role
@@ -1541,7 +1578,7 @@ impl ChatState {
             }
             return;
         }
-        let mut entry = ChatEntry::plain(seq, role, text);
+        let mut entry = ChatEntry::plain(seq, role, text).with_recorded_at(recorded_at_ms);
         entry.message_id = message_id;
         self.entries.push(entry);
     }
@@ -2671,15 +2708,19 @@ fn render_transcript_entry(
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let visual = entry_visual(entry);
+    let label = match entry.role {
+        ChatRole::User | ChatRole::Agent => format_event_time(entry.recorded_at_ms).map_or_else(
+            || visual.label.clone(),
+            |time| format!("{} · {time}", visual.label),
+        ),
+        _ => visual.label.clone(),
+    };
     let header = Line::from(vec![
         Span::styled(
             format!("{} ", visual.glyph),
             visual.header_style.add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            visual.label.clone(),
-            visual.header_style.add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(label, visual.header_style.add_modifier(Modifier::BOLD)),
     ]);
     out.extend(wrap_styled_line(header, width, ROLE_GUTTER_WIDTH));
 
@@ -2692,6 +2733,14 @@ fn render_transcript_entry(
     }
     out.push(Line::from(""));
     out
+}
+
+fn format_event_time(recorded_at_ms: Option<i64>) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(recorded_at_ms?).map(|time| {
+        time.with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string()
+    })
 }
 
 fn entry_logical_lines(
@@ -3040,6 +3089,7 @@ mod tests {
         });
         chat.apply_event(&SequencedEvent {
             seq: 1,
+            recorded_at_ms: None,
             request_id: Some("cancel".into()),
             event: WorkerEvent::Cancelled,
         });
@@ -3047,6 +3097,7 @@ mod tests {
 
         chat.apply_event(&SequencedEvent {
             seq: 2,
+            recorded_at_ms: None,
             request_id: None,
             event: WorkerEvent::TurnCompleted,
         });
@@ -3460,6 +3511,7 @@ mod tests {
         let events = vec![
             SequencedEvent {
                 seq: 1,
+                recorded_at_ms: None,
                 request_id: Some("p".into()),
                 event: WorkerEvent::PromptAccepted {
                     request_id: "p".into(),
@@ -3469,6 +3521,7 @@ mod tests {
             },
             SequencedEvent {
                 seq: 2,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
@@ -3482,6 +3535,57 @@ mod tests {
         assert_eq!(chat.entries.len(), 2);
         assert_eq!(chat.entries[0].role, ChatRole::User);
         assert_eq!(chat.entries[1].text, "done");
+    }
+
+    #[test]
+    fn user_and_agent_headers_show_first_event_time_as_local_hours_and_minutes() {
+        let expected = format_event_time(Some(0)).unwrap();
+        let runtime = |text| RuntimeEvent::SessionUpdate {
+            update: serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "message-1",
+                "content": {"type": "text", "text": text}
+            }),
+        };
+        let events = vec![
+            SequencedEvent {
+                seq: 1,
+                recorded_at_ms: Some(0),
+                request_id: Some("p".into()),
+                event: WorkerEvent::PromptAccepted {
+                    request_id: "p".into(),
+                    text: "work".into(),
+                    attachments: vec![],
+                },
+            },
+            SequencedEvent {
+                seq: 2,
+                recorded_at_ms: Some(0),
+                request_id: None,
+                event: WorkerEvent::Adapter {
+                    kind: "session_update".into(),
+                    payload: serde_json::to_value(runtime("do")).unwrap(),
+                },
+            },
+            SequencedEvent {
+                seq: 3,
+                recorded_at_ms: Some(60_000),
+                request_id: None,
+                event: WorkerEvent::Adapter {
+                    kind: "session_update".into(),
+                    payload: serde_json::to_value(runtime("ne")).unwrap(),
+                },
+            },
+        ];
+        let mut initial = snapshot();
+        initial.latest_seq = 3;
+        let mut chat = ChatState::new(&initial, &events);
+        let lines = transcript_text(&mut chat, 80);
+
+        assert!(lines.contains(&format!("❯ You · {expected}")));
+        assert!(lines.contains(&format!("● Agent · {expected}")));
+        assert_eq!(chat.entries[1].text, "done");
+        assert_eq!(chat.entries[1].recorded_at_ms, Some(0));
     }
 
     #[test]

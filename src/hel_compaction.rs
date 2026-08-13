@@ -550,6 +550,7 @@ mod tests {
                 &mut output,
                 SequencedEvent {
                     seq,
+                    recorded_at_ms: None,
                     request_id: None,
                     event: WorkerEvent::PromptAccepted {
                         request_id: format!("r{seq}"),
@@ -563,6 +564,7 @@ mod tests {
                 &mut output,
                 SequencedEvent {
                     seq,
+                    recorded_at_ms: None,
                     request_id: None,
                     event: WorkerEvent::Adapter {
                         kind: "session_update".into(),
@@ -661,6 +663,7 @@ mod tests {
             &mut input,
             SequencedEvent {
                 seq: 3,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
@@ -685,6 +688,7 @@ mod tests {
             &mut input,
             SequencedEvent {
                 seq: 1,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
@@ -713,6 +717,7 @@ mod tests {
             &mut input,
             SequencedEvent {
                 seq: 3,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::PromptAccepted {
                     request_id: "handoff".into(),
@@ -729,6 +734,7 @@ mod tests {
             &mut input,
             SequencedEvent {
                 seq: 4,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
