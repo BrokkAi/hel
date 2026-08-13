@@ -64,7 +64,7 @@ pub enum DashboardAction {
         resource_allocation: Option<SessionResourceAllocation>,
     },
     ResolveAwsResourceOptions {
-        target_template_id: String,
+        target_template_ids: Vec<String>,
     },
     CreateBundle {
         source: String,
@@ -356,6 +356,14 @@ impl DashboardState {
                 .retain(|seq| *seq > viewed_through);
         }
         self.clamp_selections();
+    }
+
+    pub fn select_active_session(&mut self, session_id: &str) {
+        let (active, _) = partition_sessions(self.state.sessions.values(), &self.session_details);
+        if let Some(index) = active.iter().position(|session| session.id == session_id) {
+            self.focus = Focus::Active;
+            self.session_index = index;
+        }
     }
 
     pub fn set_quotas(&mut self, quotas: BTreeMap<String, ProfileQuota>) {
@@ -781,10 +789,7 @@ impl DashboardState {
                 self.set_selection(len.saturating_sub(1));
                 DashboardAction::None
             }
-            KeyCode::Char('n') => {
-                self.begin_new();
-                DashboardAction::None
-            }
+            KeyCode::Char('n') => self.begin_new(),
             KeyCode::Char('i') => DashboardAction::OpenImport,
             KeyCode::Char('r') => {
                 if self.focus == Focus::Quotas {
@@ -1306,6 +1311,10 @@ impl DashboardState {
         match self.mode.clone() {
             Mode::New(mut wizard) => {
                 if nth_key(&self.config.targets, wizard.target) != target_id {
+                    if let Ok(options) = result {
+                        wizard.aws_options.insert(target_id.to_string(), options);
+                        self.mode = Mode::New(wizard);
+                    }
                     return;
                 }
                 apply_aws_options(
@@ -1320,6 +1329,10 @@ impl DashboardState {
             }
             Mode::Resume(mut wizard) => {
                 if nth_key(&self.config.targets, wizard.target) != target_id {
+                    if let Ok(options) = result {
+                        wizard.aws_options.insert(target_id.to_string(), options);
+                        self.mode = Mode::Resume(wizard);
+                    }
                     return;
                 }
                 let previous = self
@@ -1401,7 +1414,7 @@ impl DashboardState {
                 } else {
                     *allocation = None;
                     DashboardAction::ResolveAwsResourceOptions {
-                        target_template_id: target_id,
+                        target_template_ids: vec![target_id],
                     }
                 }
             }
@@ -1855,10 +1868,10 @@ impl DashboardState {
         }
     }
 
-    fn begin_new(&mut self) {
+    fn begin_new(&mut self) -> DashboardAction {
         if self.config.profiles.is_empty() || self.config.targets.is_empty() {
             self.notice = Some("Configure at least one profile and target first.".into());
-            return;
+            return DashboardAction::None;
         }
         self.mode = Mode::New(NewWizard {
             step: WizardStep::Profile,
@@ -1871,23 +1884,24 @@ impl DashboardState {
             aws_options: BTreeMap::new(),
             sizing_error: None,
         });
+        self.resolve_all_aws_resource_options_action()
     }
 
-    fn begin_resume(&mut self) {
+    fn begin_resume(&mut self) -> DashboardAction {
         let Some(session) = self.selected_session() else {
-            return;
+            return DashboardAction::None;
         };
         if session.state.is_active() && session.state != SessionState::Error {
             self.notice = Some("This session is active; press Enter to open it.".into());
-            return;
+            return DashboardAction::None;
         }
         if session.checkpoint.is_none() {
             self.notice = Some("This session has no verified checkpoint to resume.".into());
-            return;
+            return DashboardAction::None;
         }
         if self.compatible_profiles(&session.id).is_empty() || self.config.targets.is_empty() {
             self.notice = Some("Resume needs a profile and a target template.".into());
-            return;
+            return DashboardAction::None;
         }
         let profile = self
             .compatible_profiles(&session.id)
@@ -1904,6 +1918,25 @@ impl DashboardState {
             aws_options: BTreeMap::new(),
             sizing_error: None,
         });
+        self.resolve_all_aws_resource_options_action()
+    }
+
+    fn resolve_all_aws_resource_options_action(&self) -> DashboardAction {
+        let target_template_ids = self
+            .config
+            .targets
+            .iter()
+            .filter_map(|(id, target)| {
+                matches!(target, TargetTemplate::AwsEc2 { .. }).then_some(id.clone())
+            })
+            .collect::<Vec<_>>();
+        if target_template_ids.is_empty() {
+            DashboardAction::None
+        } else {
+            DashboardAction::ResolveAwsResourceOptions {
+                target_template_ids,
+            }
+        }
     }
 
     fn open_or_resume(&mut self) -> DashboardAction {
@@ -1912,7 +1945,7 @@ impl DashboardState {
         };
         if session.state == SessionState::Error {
             if session.checkpoint.is_some() {
-                self.begin_resume();
+                return self.begin_resume();
             } else {
                 self.notice = Some(
                     session
@@ -1928,8 +1961,7 @@ impl DashboardState {
                 session_id: session.id.clone(),
             }
         } else {
-            self.begin_resume();
-            DashboardAction::None
+            self.begin_resume()
         }
     }
 
@@ -3718,7 +3750,7 @@ fn render_resume_wizard(
     }
     let (title, choices, selected, help) = match wizard.step {
         WizardStep::Profile => (
-            " Resume · 1/2 profile (cross-harness supported) ",
+            " Resume · 1/3 profile (cross-harness supported) ",
             dashboard
                 .compatible_profiles(&wizard.session_id)
                 .into_iter()
@@ -3742,7 +3774,7 @@ fn render_resume_wizard(
             ][..],
         ),
         WizardStep::Target => (
-            " Resume · 2/2 new target ",
+            " Resume · 2/3 new target ",
             dashboard
                 .config
                 .targets
@@ -4719,6 +4751,58 @@ mod tests {
     }
 
     #[test]
+    fn opening_session_wizards_prefetches_all_aws_sizes() {
+        let aws_target = || TargetTemplate::AwsEc2 {
+            aws_profile: None,
+            region: "us-east-1".into(),
+            launch_template: "hel".into(),
+            launch_template_version: None,
+            ssh_user: "ubuntu".into(),
+            address_source: crate::hel_config::AwsAddressSource::PublicIp,
+            identity_file: None,
+            ssh_args: Vec::new(),
+        };
+        let mut config = config();
+        config.targets.insert("aws-a".into(), aws_target());
+        config.targets.insert("aws-b".into(), aws_target());
+        let mut dashboard =
+            DashboardState::new(config.clone(), HelState::default(), BTreeMap::new());
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('n'))),
+            DashboardAction::ResolveAwsResourceOptions {
+                target_template_ids: vec!["aws-a".into(), "aws-b".into()],
+            }
+        );
+        let aws_b_options = vec![SessionResourceAllocation::AwsEc2 {
+            instance_type: "m7i.2xlarge".into(),
+            vcpus: 8,
+            memory_bytes: 32 * 1024 * 1024 * 1024,
+        }];
+        dashboard.apply_aws_resource_options("aws-b", Ok(aws_b_options.clone()));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new-session wizard");
+        };
+        assert_eq!(wizard.aws_options["aws-b"], aws_b_options);
+
+        let mut dashboard = DashboardState::new(
+            config,
+            HelState {
+                version: STATE_VERSION,
+                sessions: BTreeMap::from([("session-1".into(), archived_session())]),
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ResolveAwsResourceOptions {
+                target_template_ids: vec!["aws-a".into(), "aws-b".into()],
+            }
+        );
+    }
+
+    #[test]
     fn new_session_can_request_a_repository_when_no_bundle_exists() {
         let mut config = config();
         config.bundles.clear();
@@ -5066,6 +5150,34 @@ mod tests {
         dashboard.handle_mouse(mouse(MouseEventKind::ScrollDown));
         assert_eq!(dashboard.quota_index, 2);
         assert_eq!(dashboard.session_index, 0);
+    }
+
+    #[test]
+    fn restored_session_can_be_focused_by_identity() {
+        let mut restored = archived_session();
+        restored.id = "restored".into();
+        restored.state = SessionState::Running;
+        let mut other = archived_session();
+        other.id = "other".into();
+        other.state = SessionState::Running;
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions: BTreeMap::from([
+                    (restored.id.clone(), restored),
+                    (other.id.clone(), other),
+                ]),
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        dashboard.focus = Focus::Archived;
+
+        dashboard.select_active_session("restored");
+
+        assert_eq!(dashboard.focus, Focus::Active);
+        assert_eq!(dashboard.selected_session().unwrap().id, "restored");
     }
 
     #[test]
@@ -5454,7 +5566,34 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("(lossy: text-only transcript)"));
+        assert!(rendered.contains("Resume · 1/3"));
         assert!(rendered.contains("Lossy: text only; tool calls + reasoning dropped."));
+
+        dashboard.handle_key(key(KeyCode::Enter));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw resume target step");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Resume · 2/3"));
+
+        dashboard.handle_key(key(KeyCode::Enter));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw resume resource step");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Resume · 3/3"));
     }
 
     #[test]

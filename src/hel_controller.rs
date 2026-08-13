@@ -35,7 +35,7 @@ use crate::hel_worker::{
     PROTOCOL_VERSION, RequestEnvelope, ResponseBody, ResponsePayload, VersionRange, WorkerEvent,
     WorkerRequest,
 };
-use crate::hel_worker_client::WorkerClient;
+use crate::hel_worker_client::{WorkerBootstrap, WorkerClient};
 use crate::hel_worker_runtime::{WorkerLaunchConfig, WorkerOwnership};
 
 const INHERITED_GIT_SETTINGS: &[&str] = &[
@@ -1061,6 +1061,7 @@ impl Controller {
             resource_allocation,
         )
         .await
+        .map(|_| ())
     }
 
     pub async fn resume_session_with_options(
@@ -1070,7 +1071,7 @@ impl Controller {
         target_id: &str,
         additional_mounts: Option<Vec<AdditionalMount>>,
         resource_allocation: Option<SessionResourceAllocation>,
-    ) -> Result<()> {
+    ) -> Result<WorkerBootstrap> {
         let previous = self
             .state
             .sessions
@@ -1246,12 +1247,13 @@ impl Controller {
                     .await?;
             }
             self.mark_worker_connected(session_id, Some(native_session_id))?;
+            let bootstrap = client.bootstrap().await?;
             client.detach().await?;
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, anyhow::Error>(bootstrap)
         }
         .await;
         match result {
-            Ok(()) => Ok(()),
+            Ok(bootstrap) => Ok(bootstrap),
             Err(error) => {
                 Err(self.rollback_failed_resume(session_id, &previous, error, &ProcessExecutor)?)
             }
