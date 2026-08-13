@@ -144,18 +144,42 @@ pub async fn run(
         .context("ACP bridge stdout unavailable")?;
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
 
-    let result = drive(transport, spec, requests, events.clone()).await;
+    let (result, child_reaped) = {
+        let drive = drive(transport, spec, requests, events.clone());
+        tokio::pin!(drive);
+        tokio::select! {
+            biased;
+            result = &mut drive => (result, false),
+            waited = child.wait() => {
+                let result = match waited {
+                    Ok(status) => Err(anyhow!(
+                        "ACP bridge exited before the protocol runtime completed with {status}; \
+                         bridge stdout must contain only JSON-RPC frames and login-shell startup must be silent"
+                    )),
+                    Err(error) => Err(error).context("wait for ACP bridge"),
+                };
+                (result, true)
+            }
+        }
+    };
     // Dropping the transport closes the supervisor's stdin. Give it time to
     // terminate and reap the complete bridge process group before killing the
     // supervisor itself as a last resort.
-    match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
-        Ok(waited) => {
-            let _ = waited;
+    if !child_reaped {
+        match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
+            Ok(waited) => {
+                let _ = waited;
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
         }
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
+    }
+    if let Err(error) = &result {
+        let _ = events.send(RuntimeEvent::Warning {
+            message: format!("ACP runtime failed: {error:#}"),
+        });
     }
     let _ = events.send(RuntimeEvent::Stopped);
     result
@@ -237,7 +261,12 @@ where
                 })
         })
         .await
-        .map_err(|error| anyhow!("ACP connection failed: {error}"))
+        .map_err(|error| {
+            anyhow!(
+                "ACP protocol failed: {error}; bridge stdout must contain only JSON-RPC frames \
+                 and login-shell startup must be silent"
+            )
+        })
 }
 
 async fn drive_connection(
@@ -757,6 +786,49 @@ mod tests {
                 .id
                 .to_string(),
             "reasoning_effort"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bridge_exit_during_initialize_returns_an_actionable_error() {
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let spec = LaunchSpec {
+            command: "sh".into(),
+            args: vec!["-c".into(), "exit 17".into()],
+            environment: BTreeMap::new(),
+            cwd: std::env::current_dir().unwrap(),
+            additional_directories: Vec::new(),
+            resume_session: None,
+            harness: HarnessKind::Kimi,
+        };
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run(spec, request_rx, event_tx),
+        )
+        .await
+        .expect("an exited bridge must not leave ACP initialization hanging")
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("bridge stdout must contain only JSON-RPC frames"),
+            "unexpected error: {error:#}"
+        );
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::Warning { message } if
+            message.contains("ACP runtime failed")))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::Stopped))
         );
     }
 }

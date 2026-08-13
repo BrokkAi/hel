@@ -252,15 +252,15 @@ mod unix {
                 }
                 result = &mut event_task => {
                     result.context("worker event task stopped")??;
-                    break;
+                    return acp_task.await.context("ACP runtime task stopped")?;
                 }
                 result = &mut acp_task => {
-                    result.context("ACP runtime task stopped")??;
-                    break;
+                    let acp_result = result.context("ACP runtime task stopped");
+                    event_task.await.context("worker event task stopped")??;
+                    return acp_result?;
                 }
             }
         }
-        Ok(())
     }
 
     pub(super) async fn run_event_coordinator(
@@ -694,20 +694,29 @@ mod unix {
         let mut parent_stdin = tokio::io::stdin();
         let mut parent_stdout = tokio::io::stdout();
 
-        {
+        let child_output_ended = {
             let input = tokio::io::copy(&mut parent_stdin, &mut child_stdin);
             let output = tokio::io::copy(&mut child_stdout, &mut parent_stdout);
             tokio::pin!(input, output);
             tokio::select! {
-                result = &mut input => { result.context("forward ACP supervisor input")?; }
-                result = &mut output => { result.context("forward ACP supervisor output")?; }
+                result = &mut input => {
+                    result.context("forward ACP supervisor input")?;
+                    false
+                }
+                result = &mut output => {
+                    result.context("forward ACP supervisor output")?;
+                    true
+                }
             }
-        }
+        };
         let _ = child_stdin.shutdown().await;
         terminate_process_group(pid, libc::SIGTERM);
         match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
             Ok(status) => {
-                let _ = status.context("wait for supervised ACP bridge")?;
+                let status = status.context("wait for supervised ACP bridge")?;
+                if child_output_ended && !status.success() {
+                    bail!("supervised ACP bridge exited with {status}");
+                }
             }
             Err(_) => {
                 terminate_process_group(pid, libc::SIGKILL);
