@@ -133,7 +133,9 @@ pub async fn run(
         .current_dir(&spec.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // The worker daemon redirects its own stderr to worker.log. Preserve
+        // bridge stderr there so startup failures retain their actual cause.
+        .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("launch ACP bridge {}", spec.command.display()))?;

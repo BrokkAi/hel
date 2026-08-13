@@ -598,14 +598,42 @@ impl Controller {
         {
             Ok(native_session_id) => self.mark_worker_connected(session_id, native_session_id),
             Err(error) => {
-                let record = self.state.sessions.get_mut(session_id).unwrap();
-                record.state = SessionState::Error;
-                record.updated_at = now();
-                record.last_error = Some(format!("worker bootstrap failed: {error:#}"));
-                self.state.save()?;
-                Err(error)
+                Err(self.rollback_failed_new_session(session_id, error, &ProcessExecutor)?)
             }
         }
+    }
+
+    fn rollback_failed_new_session(
+        &mut self,
+        session_id: &str,
+        error: anyhow::Error,
+        executor: &impl CommandExecutor,
+    ) -> Result<anyhow::Error> {
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?
+            .clone();
+        let cleanup = match session.target.as_ref() {
+            Some(locator) => (|| -> Result<()> {
+                let backend = backend_locator(locator, &session, &self.config)?;
+                hel_targets::close_plan(&backend, session_id)?
+                    .execute(executor)
+                    .map(|_| ())
+            })(),
+            None => Ok(()),
+        };
+        let failure = apply_failed_new_session_rollback(
+            &mut self.state,
+            session_id,
+            &format!("{error:#}"),
+            cleanup
+                .err()
+                .map(|cleanup_error| format!("{cleanup_error:#}")),
+        );
+        self.state.save()?;
+        Ok(failure)
     }
 
     pub fn rename_session(&mut self, session_id: &str, title: &str) -> Result<String> {
@@ -1726,6 +1754,32 @@ fn apply_new_session_provisioning_result(
         Err(error) => {
             state.sessions.remove(session_id);
             Err(error)
+        }
+    }
+}
+
+fn apply_failed_new_session_rollback(
+    state: &mut HelState,
+    session_id: &str,
+    original_error: &str,
+    cleanup_error: Option<String>,
+) -> anyhow::Error {
+    match cleanup_error {
+        None => {
+            state.sessions.remove(session_id);
+            anyhow::anyhow!(
+                "{original_error}; partial target removed and provisional session discarded"
+            )
+        }
+        Some(cleanup_error) => {
+            let failure = format!(
+                "{original_error}; cleanup of the failed session target failed: {cleanup_error}"
+            );
+            let record = state.sessions.get_mut(session_id).unwrap();
+            record.state = SessionState::Error;
+            record.updated_at = now();
+            record.last_error = Some(format!("worker bootstrap failed: {failure}"));
+            anyhow::anyhow!(failure)
         }
     }
 }
@@ -3458,6 +3512,7 @@ fn stage_profile(profile: &crate::hel_config::HarnessProfile, destination: &Path
         crate::hel_config::HarnessKind::Kimi => &[
             "credentials",
             "config.toml",
+            "device_id",
             "AGENTS.md",
             "SYSTEM.md",
             "mcp.json",
@@ -3575,6 +3630,7 @@ fn copy_profile_entry(source: &Path, destination: &Path) -> Result<()> {
             let entry = entry?;
             copy_profile_entry(&entry.path(), &destination.join(entry.file_name()))?;
         }
+        std::fs::set_permissions(destination, metadata.permissions())?;
     }
     Ok(())
 }
@@ -3659,6 +3715,18 @@ fn install_worker_files(
                     ],
                 )
                 .purpose("make Hel worker executable"),
+                CommandSpec::new(
+                    engine,
+                    [
+                        "exec".into(),
+                        container_id.clone(),
+                        "chmod".into(),
+                        "-R".into(),
+                        "go-rwx".into(),
+                        profile_home.into(),
+                    ],
+                )
+                .purpose("restrict harness profile permissions"),
             ] {
                 execute_checked(executor, command)?;
             }
@@ -3741,6 +3809,15 @@ fn install_worker_files(
                     "700".into(),
                     format!("{worker_root}/hel"),
                 ],
+                vec![
+                    "podman".into(),
+                    "exec".into(),
+                    container_id.clone(),
+                    "chmod".into(),
+                    "-R".into(),
+                    "go-rwx".into(),
+                    profile_home.into(),
+                ],
                 vec!["rm".into(), "-rf".into(), "--".into(), upload.clone()],
             ];
             for args in remote {
@@ -3803,6 +3880,11 @@ fn install_worker_over_ssh(
         executor,
         ssh_command_spec(ssh, ["chmod", "700", &format!("{worker_root}/hel")])
             .purpose("make SSH worker executable"),
+    )?;
+    execute_checked(
+        executor,
+        ssh_command_spec(ssh, ["chmod", "-R", "go-rwx", profile_home])
+            .purpose("restrict SSH harness profile permissions"),
     )?;
     Ok(())
 }
@@ -4168,6 +4250,63 @@ mod tests {
     }
 
     #[test]
+    fn failed_new_worker_start_discards_session_only_after_target_cleanup() {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let mut session = SessionRecord {
+            id: session_id.into(),
+            title: "new session".into(),
+            harness_kind: crate::hel_config::HarnessKind::Kimi,
+            last_profile: "kimi".into(),
+            bundle_id: "raw-project".into(),
+            project_directory: Some("/srv/project".into()),
+            target_template_id: "remote".into(),
+            resource_allocation: None,
+            additional_mounts: Vec::new(),
+            state: SessionState::Disconnected,
+            target: Some(TargetLocator::SshBare {
+                host: "builder".into(),
+                workspace: format!(".local/share/hel/workspaces/{session_id}").into(),
+                worker_id: None,
+            }),
+            native_session_id: None,
+            acp_session_title: None,
+            session_title_override: None,
+            created_at: "2026-08-12T00:00:00Z".into(),
+            updated_at: "2026-08-12T00:00:00Z".into(),
+            last_viewed_event_sequence: 0,
+            last_error: None,
+            last_checkpoint_error: None,
+            checkpoint: None,
+        };
+        let mut cleaned = HelState::default();
+        cleaned.sessions.insert(session_id.into(), session.clone());
+
+        let failure =
+            apply_failed_new_session_rollback(&mut cleaned, session_id, "ACP startup failed", None);
+
+        assert!(!cleaned.sessions.contains_key(session_id));
+        assert!(
+            failure
+                .to_string()
+                .contains("provisional session discarded")
+        );
+
+        session.state = SessionState::Disconnected;
+        let mut cleanup_failed = HelState::default();
+        cleanup_failed.sessions.insert(session_id.into(), session);
+        let failure = apply_failed_new_session_rollback(
+            &mut cleanup_failed,
+            session_id,
+            "ACP startup failed",
+            Some("ssh unavailable".into()),
+        );
+        let retained = cleanup_failed.sessions.get(session_id).unwrap();
+        assert_eq!(retained.state, SessionState::Error);
+        assert!(retained.target.is_some());
+        assert!(failure.to_string().contains("cleanup"));
+    }
+
+    #[test]
     fn failed_resume_rolls_back_only_after_target_cleanup() {
         let previous = SessionRecord {
             id: "0123456789abcdef0123456789abcdef".into(),
@@ -4347,6 +4486,37 @@ mod tests {
         assert_eq!(arguments[0], "-lc");
         assert!(arguments[1].contains("install.sh | bash &&"));
         assert!(arguments[1].contains("$HOME/.kimi-code/bin/kimi"));
+    }
+
+    #[test]
+    fn stage_kimi_profile_preserves_device_identity() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "default_model = \"k3\"\n").unwrap();
+        std::fs::write(home.path().join("device_id"), "stable-device-id").unwrap();
+        std::fs::create_dir(home.path().join("credentials")).unwrap();
+        std::fs::write(
+            home.path().join("credentials/kimi-code.json"),
+            "{\"access_token\":\"secret\"}",
+        )
+        .unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let profile = crate::hel_config::HarnessProfile {
+            kind: crate::hel_config::HarnessKind::Kimi,
+            home: home.path().to_path_buf(),
+            executable: None,
+            environment: BTreeMap::new(),
+            model: None,
+            reasoning_effort: None,
+            context_window_bytes: None,
+        };
+
+        stage_profile(&profile, staged.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(staged.path().join("device_id")).unwrap(),
+            "stable-device-id"
+        );
+        assert!(staged.path().join("credentials/kimi-code.json").is_file());
     }
 
     #[test]
