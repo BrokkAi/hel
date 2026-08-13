@@ -170,7 +170,9 @@ mod unix {
     }
 
     pub async fn run_daemon(root: PathBuf, mut config: WorkerLaunchConfig) -> Result<()> {
-        super::resolve_relative_harness_home(&mut config, &std::env::current_dir()?);
+        let startup_directory = std::env::current_dir()?;
+        let root = super::resolve_relative_worker_root(root, &startup_directory);
+        super::resolve_relative_harness_home(&mut config, &startup_directory);
         std::fs::create_dir_all(&root)
             .with_context(|| format!("create worker root {}", root.display()))?;
         // Validate and recover durable state before publishing a socket. A
@@ -748,6 +750,15 @@ fn resolve_relative_harness_home(config: &mut WorkerLaunchConfig, base: &Path) {
 }
 
 #[cfg(unix)]
+fn resolve_relative_worker_root(root: PathBuf, base: &Path) -> PathBuf {
+    if root.is_relative() {
+        base.join(root)
+    } else {
+        root
+    }
+}
+
+#[cfg(unix)]
 pub use unix::{proxy, run_acp_supervisor, run_daemon};
 
 #[cfg(not(unix))]
@@ -886,6 +897,28 @@ mod tests {
         assert_eq!(
             config.environment["CODEX_HOME"],
             "/home/ubuntu/.local/share/hel/profiles/session"
+        );
+    }
+
+    #[test]
+    fn relative_worker_root_is_resolved_before_bridge_changes_directory() {
+        assert_eq!(
+            resolve_relative_worker_root(
+                ".local/share/hel/workers/session".into(),
+                Path::new("/home/ubuntu"),
+            ),
+            Path::new("/home/ubuntu/.local/share/hel/workers/session")
+        );
+    }
+
+    #[test]
+    fn absolute_worker_root_is_preserved() {
+        assert_eq!(
+            resolve_relative_worker_root(
+                "/var/lib/hel/workers/session".into(),
+                Path::new("/home/ubuntu"),
+            ),
+            Path::new("/var/lib/hel/workers/session")
         );
     }
 

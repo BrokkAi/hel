@@ -20,6 +20,7 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -133,9 +134,7 @@ pub async fn run(
         .current_dir(&spec.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        // The worker daemon redirects its own stderr to worker.log. Preserve
-        // bridge stderr there so startup failures retain their actual cause.
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("launch ACP bridge {}", spec.command.display()))?;
@@ -144,9 +143,14 @@ pub async fn run(
         .stdout
         .take()
         .context("ACP bridge stdout unavailable")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("ACP bridge stderr unavailable")?;
+    let stderr_task = tokio::spawn(read_stderr_tail(stderr));
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
 
-    let (result, child_reaped) = {
+    let (mut result, child_reaped) = {
         let drive = drive(transport, spec, requests, events.clone());
         tokio::pin!(drive);
         tokio::select! {
@@ -178,6 +182,13 @@ pub async fn run(
             }
         }
     }
+    let stderr_tail = stderr_task
+        .await
+        .unwrap_or_else(|error| format!("failed to collect ACP bridge stderr: {error}"));
+    if !stderr_tail.trim().is_empty() {
+        result =
+            result.map_err(|error| error.context(format!("ACP bridge stderr:\n{stderr_tail}")));
+    }
     if let Err(error) = &result {
         let _ = events.send(RuntimeEvent::Warning {
             message: format!("ACP runtime failed: {error:#}"),
@@ -185,6 +196,28 @@ pub async fn run(
     }
     let _ = events.send(RuntimeEvent::Stopped);
     result
+}
+
+const ACP_STDERR_TAIL_BYTES: usize = 16 * 1024;
+
+async fn read_stderr_tail(mut stderr: tokio::process::ChildStderr) -> String {
+    let mut tail = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match stderr.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                tail.extend_from_slice(&buffer[..read]);
+                if tail.len() > ACP_STDERR_TAIL_BYTES {
+                    tail.drain(..tail.len() - ACP_STDERR_TAIL_BYTES);
+                }
+            }
+            Err(error) => {
+                return format!("failed to read ACP bridge stderr: {error}");
+            }
+        }
+    }
+    String::from_utf8_lossy(&tail).trim().to_owned()
 }
 
 async fn drive<T>(
@@ -798,7 +831,10 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let spec = LaunchSpec {
             command: "sh".into(),
-            args: vec!["-c".into(), "exit 17".into()],
+            args: vec![
+                "-c".into(),
+                "echo 'specific supervisor failure' >&2; exit 17".into(),
+            ],
             environment: BTreeMap::new(),
             cwd: std::env::current_dir().unwrap(),
             additional_directories: Vec::new(),
@@ -813,12 +849,12 @@ mod tests {
         .await
         .expect("an exited bridge must not leave ACP initialization hanging")
         .unwrap_err();
+        let complete_error = format!("{error:#}");
         assert!(
-            error
-                .to_string()
-                .contains("bridge stdout must contain only JSON-RPC frames"),
+            complete_error.contains("bridge stdout must contain only JSON-RPC frames"),
             "unexpected error: {error:#}"
         );
+        assert!(complete_error.contains("specific supervisor failure"));
 
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(

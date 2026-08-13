@@ -18,8 +18,8 @@ use crate::hel_checkpoint::{
     RepositoryRestoreSpec, export_command, restore_command,
 };
 use crate::hel_config::{
-    AwsAddressSource, HelConfig, ProjectBundle, SshConnection, TargetTemplate, data_dir,
-    sessions_dir,
+    AwsAddressSource, HelConfig, ProjectBundle, SshConnection, TargetTemplate, atomic_write,
+    data_dir, sessions_dir,
 };
 use crate::hel_git_proxy::{GitBrokerSpec, broker_is_alive};
 use crate::hel_local_git::{canonical_repository, dirty_local_repositories};
@@ -624,10 +624,17 @@ impl Controller {
             })(),
             None => Ok(()),
         };
+        let original = format!("{error:#}");
+        let original = match persist_launch_failure(session_id, &original) {
+            Ok(path) => format!("{original}; full diagnostic saved to {}", path.display()),
+            Err(save_error) => {
+                format!("{original}; saving the local diagnostic failed: {save_error:#}")
+            }
+        };
         let failure = apply_failed_new_session_rollback(
             &mut self.state,
             session_id,
-            &format!("{error:#}"),
+            &original,
             cleanup
                 .err()
                 .map(|cleanup_error| format!("{cleanup_error:#}")),
@@ -1733,6 +1740,78 @@ impl Controller {
         record.updated_at = now();
         self.state.save()
     }
+}
+
+const MAX_LAUNCH_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+const RETAINED_LAUNCH_DIAGNOSTICS: usize = 20;
+
+fn persist_launch_failure(session_id: &str, detail: &str) -> Result<PathBuf> {
+    persist_launch_failure_to(&data_dir().join("diagnostics"), session_id, detail)
+}
+
+fn persist_launch_failure_to(directory: &Path, session_id: &str, detail: &str) -> Result<PathBuf> {
+    crate::hel_config::validate_id("session", session_id)?;
+    std::fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "create launch diagnostics directory {}",
+            directory.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let path = directory.join(format!("{session_id}-launch-error.txt"));
+    let detail = bounded_launch_diagnostic(detail);
+    let body = format!(
+        "Hel session launch failure\nsession: {session_id}\nat: {}\n\n{detail}\n",
+        now()
+    );
+    atomic_write(&path, body.as_bytes())?;
+    prune_launch_diagnostics(directory)?;
+    Ok(path)
+}
+
+fn bounded_launch_diagnostic(detail: &str) -> String {
+    if detail.len() <= MAX_LAUNCH_DIAGNOSTIC_BYTES {
+        return detail.to_owned();
+    }
+    let mut head_end = MAX_LAUNCH_DIAGNOSTIC_BYTES / 4;
+    while !detail.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let tail_bytes = MAX_LAUNCH_DIAGNOSTIC_BYTES - head_end;
+    let mut tail_start = detail.len() - tail_bytes;
+    while !detail.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n\n[... launch diagnostic truncated ...]\n\n{}",
+        &detail[..head_end],
+        &detail[tail_start..]
+    )
+}
+
+fn prune_launch_diagnostics(directory: &Path) -> Result<()> {
+    let mut diagnostics = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with("-launch-error.txt"))
+        {
+            continue;
+        }
+        diagnostics.push((entry.metadata()?.modified()?, entry.path()));
+    }
+    diagnostics.sort_by(|left, right| right.0.cmp(&left.0));
+    for (_, path) in diagnostics.into_iter().skip(RETAINED_LAUNCH_DIAGNOSTICS) {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("prune old launch diagnostic {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn apply_new_session_provisioning_result(
@@ -4304,6 +4383,35 @@ mod tests {
         assert_eq!(retained.state, SessionState::Error);
         assert!(retained.target.is_some());
         assert!(failure.to_string().contains("cleanup"));
+    }
+
+    #[test]
+    fn launch_failure_is_persisted_separately_from_session_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let detail = format!(
+            "specific startup cause\n{}\nstderr tail survives",
+            "x".repeat(MAX_LAUNCH_DIAGNOSTIC_BYTES)
+        );
+
+        let path = persist_launch_failure_to(directory.path(), session_id, &detail).unwrap();
+        let saved = std::fs::read_to_string(path).unwrap();
+
+        assert!(saved.contains("specific startup cause"));
+        assert!(saved.contains("launch diagnostic truncated"));
+        assert!(saved.contains("stderr tail survives"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(directory.path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
     }
 
     #[test]
