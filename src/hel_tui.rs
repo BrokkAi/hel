@@ -363,6 +363,7 @@ pub struct DashboardState {
     capacity_index: usize,
     quota_index: usize,
     focus: Focus,
+    pane_areas: Option<[Rect; DASHBOARD_PANE_COUNT]>,
     mode: Mode,
     notice: Option<String>,
 }
@@ -380,6 +381,7 @@ impl DashboardState {
             capacity_index: 0,
             quota_index: 0,
             focus: Focus::Active,
+            pane_areas: None,
             mode: Mode::Dashboard,
             notice: None,
         };
@@ -804,9 +806,24 @@ impl DashboardState {
         if !matches!(self.mode, Mode::Dashboard) {
             return;
         }
+        let hovered = self.pane_areas.and_then(|areas| {
+            areas
+                .into_iter()
+                .position(|area| rect_contains(area, mouse.column, mouse.row))
+                .map(|index| match index {
+                    0 => Focus::Active,
+                    1 => Focus::Archived,
+                    2 => Focus::Capacity,
+                    3 => Focus::Quotas,
+                    _ => unreachable!("dashboard has exactly four panes"),
+                })
+        });
+        let Some(hovered) = hovered else {
+            return;
+        };
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_selection(-MOUSE_SCROLL_ROWS),
-            MouseEventKind::ScrollDown => self.scroll_selection(MOUSE_SCROLL_ROWS),
+            MouseEventKind::ScrollUp => self.scroll_selection_for(hovered, -MOUSE_SCROLL_ROWS),
+            MouseEventKind::ScrollDown => self.scroll_selection_for(hovered, MOUSE_SCROLL_ROWS),
             _ => {}
         }
     }
@@ -2228,9 +2245,13 @@ impl DashboardState {
     }
 
     fn focus_len(&self) -> usize {
+        self.focus_len_for(self.focus)
+    }
+
+    fn focus_len_for(&self, focus: Focus) -> usize {
         let (active, archived) =
             partition_sessions(self.state.sessions.values(), &self.session_details);
-        match self.focus {
+        match focus {
             Focus::Active => active.len(),
             Focus::Archived => archived.len(),
             Focus::Capacity => self.capacity_details.len(),
@@ -2239,10 +2260,14 @@ impl DashboardState {
     }
 
     fn set_selection(&mut self, index: usize) {
+        self.set_selection_for(self.focus, index);
+    }
+
+    fn set_selection_for(&mut self, focus: Focus, index: usize) {
         let active_len = partition_sessions(self.state.sessions.values(), &self.session_details)
             .0
             .len();
-        match self.focus {
+        match focus {
             Focus::Active => self.session_index = index,
             Focus::Archived => self.session_index = active_len + index,
             Focus::Capacity => self.capacity_index = index,
@@ -2268,16 +2293,16 @@ impl DashboardState {
         }
     }
 
-    fn scroll_selection(&mut self, delta: isize) {
-        let len = self.focus_len();
+    fn scroll_selection_for(&mut self, focus: Focus, delta: isize) {
+        let len = self.focus_len_for(focus);
         if len == 0 {
-            self.set_selection(0);
+            self.set_selection_for(focus, 0);
             return;
         }
         let active_len = partition_sessions(self.state.sessions.values(), &self.session_details)
             .0
             .len();
-        let current = match self.focus {
+        let current = match focus {
             Focus::Active => self.session_index,
             Focus::Archived => self.session_index.saturating_sub(active_len),
             Focus::Capacity => self.capacity_index,
@@ -2290,7 +2315,7 @@ impl DashboardState {
                 .saturating_add(delta as usize)
                 .min(len.saturating_sub(1))
         };
-        self.set_selection(next);
+        self.set_selection_for(focus, next);
     }
 
     fn cycle_focus(&mut self, reverse: bool) {
@@ -2571,6 +2596,7 @@ impl ResumeWizard {
 }
 
 pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
+    dashboard.pane_areas = None;
     let area = frame.area();
 
     if !dashboard.config_is_empty() {
@@ -2777,6 +2803,7 @@ fn render_adaptive_dashboard(
                 .collect::<Vec<_>>(),
         )
         .split(fixed[1]);
+    dashboard.pane_areas = Some([panes[0], panes[1], panes[2], panes[3]]);
     let selected_lines = usize::from(
         panes[0]
             .height
@@ -2805,6 +2832,10 @@ fn render_adaptive_dashboard(
 
 fn plain_table_height(rows: usize) -> u16 {
     SESSION_TABLE_CHROME_HEIGHT.saturating_add(rows.min(u16::MAX as usize) as u16)
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
 }
 
 fn focused_or_minimized_table_height(focused: bool, rows: usize) -> u16 {
@@ -3280,6 +3311,9 @@ fn render_session_scrollbar(
     position: usize,
     viewport_content_length: usize,
 ) {
+    if content_length <= viewport_content_length {
+        return;
+    }
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .thumb_style(Style::default().fg(Color::Gray))
         .track_style(Style::default().fg(Color::DarkGray));
@@ -3714,6 +3748,13 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
     let mut state = TableState::default()
         .with_selected((!dashboard.config.profiles.is_empty()).then_some(dashboard.quota_index));
     frame.render_stateful_widget(table, area, &mut state);
+    render_session_scrollbar(
+        frame,
+        area,
+        dashboard.config.profiles.len(),
+        state.offset(),
+        usize::from(area.height.saturating_sub(SESSION_TABLE_CHROME_HEIGHT)),
+    );
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
@@ -4473,11 +4514,11 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn mouse(kind: MouseEventKind) -> MouseEvent {
+    fn mouse_in(kind: MouseEventKind, area: Rect) -> MouseEvent {
         MouseEvent {
             kind,
-            column: 0,
-            row: 0,
+            column: area.x.saturating_add(1),
+            row: area.y.saturating_add(1),
             modifiers: KeyModifiers::NONE,
         }
     }
@@ -5530,7 +5571,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_wheel_scrolls_the_focused_dashboard_pane() {
+    fn mouse_wheel_scrolls_the_hovered_pane_without_changing_focus() {
         let sessions = (0..5)
             .map(|index| {
                 let mut session = archived_session();
@@ -5548,16 +5589,22 @@ mod tests {
             },
             BTreeMap::new(),
         );
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw pane hitboxes");
+        let pane_areas = dashboard.pane_areas.expect("dashboard pane hitboxes");
 
-        dashboard.handle_mouse(mouse(MouseEventKind::ScrollDown));
+        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane_areas[0]));
         assert_eq!(dashboard.session_index, 3);
-        dashboard.handle_mouse(mouse(MouseEventKind::ScrollUp));
+        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, pane_areas[0]));
         assert_eq!(dashboard.session_index, 0);
 
-        dashboard.focus = Focus::Quotas;
-        dashboard.handle_mouse(mouse(MouseEventKind::ScrollDown));
+        assert_eq!(dashboard.focus, Focus::Active);
+        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane_areas[3]));
         assert_eq!(dashboard.quota_index, 2);
         assert_eq!(dashboard.session_index, 0);
+        assert_eq!(dashboard.focus, Focus::Active);
     }
 
     #[test]
@@ -6242,6 +6289,53 @@ mod tests {
         let down = symbols.iter().filter(|symbol| **symbol == "▼").count();
         assert!(up >= 1, "expected an upper arrow, rendered {up}");
         assert!(down >= 1, "expected a lower arrow, rendered {down}");
+    }
+
+    #[test]
+    fn fully_visible_tables_do_not_show_scrollbars() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw fully visible tables");
+        let symbols = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>();
+
+        assert!(!symbols.iter().any(|symbol| matches!(*symbol, "▲" | "▼")));
+    }
+
+    #[test]
+    fn overflowing_quota_pane_uses_the_shared_scrollbar() {
+        let mut config = config();
+        let profile = config.profiles["codex-1"].clone();
+        for index in 0..20 {
+            config
+                .profiles
+                .insert(format!("profile-{index:02}"), profile.clone());
+        }
+        let mut dashboard = DashboardState::new(config, HelState::default(), BTreeMap::new());
+        dashboard.focus = Focus::Quotas;
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw overflowing quotas");
+        let symbols = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>();
+
+        assert!(symbols.contains(&"▲"));
+        assert!(symbols.contains(&"▼"));
     }
 
     #[test]
