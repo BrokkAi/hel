@@ -1532,6 +1532,41 @@ pub fn ssh_directory_completions(
     Ok(matches)
 }
 
+/// Check whether a directory exists on the configured SSH host.
+pub fn ssh_directory_exists(
+    ssh: &SshTarget,
+    path: &Path,
+    executor: &impl CommandExecutor,
+) -> Result<bool> {
+    let mut args = ssh.ssh_args.clone();
+    args.extend([
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=3".into(),
+        "-o".into(),
+        "ServerAliveInterval=2".into(),
+        "-o".into(),
+        "ServerAliveCountMax=1".into(),
+        ssh.destination.clone(),
+        join_remote_command(&[
+            "test".into(),
+            "-d".into(),
+            path.to_string_lossy().into_owned(),
+        ]),
+    ]);
+    let output = executor
+        .execute(&CommandSpec::new("ssh", args).purpose("validate remote mount directory"))?;
+    match output.status {
+        0 => Ok(true),
+        1 => Ok(false),
+        status => bail!(
+            "remote directory check failed with status {status}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
 fn posix_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -2157,6 +2192,26 @@ mod tests {
             path_completion("/srv/da", &["/srv/data/".into()]),
             Some("/srv/data/".into())
         );
+    }
+
+    #[test]
+    fn ssh_directory_check_quotes_the_source_and_distinguishes_missing() {
+        let exists = FakeExecutor {
+            seen: RefCell::new(vec![]),
+            fail_at: None,
+        };
+        assert!(ssh_directory_exists(&ssh(), Path::new("/srv/user's data"), &exists).unwrap());
+        let command = &exists.seen.borrow()[0];
+        assert_eq!(command.program, "ssh");
+        let remote_command = command.args.last().unwrap();
+        assert!(remote_command.starts_with("'test' '-d' "));
+        assert!(remote_command.contains("'/srv/user'\\''s data'"));
+
+        let missing = FakeExecutor {
+            seen: RefCell::new(vec![]),
+            fail_at: Some(0),
+        };
+        assert!(!ssh_directory_exists(&ssh(), Path::new("/missing"), &missing).unwrap());
     }
 
     #[test]

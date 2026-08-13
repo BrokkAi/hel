@@ -56,6 +56,10 @@ pub enum DashboardAction {
         target_template_id: String,
         prefix: String,
     },
+    ValidateMountSource {
+        target_template_id: String,
+        source: String,
+    },
     ResumeSession {
         session_id: String,
         profile_id: String,
@@ -194,6 +198,16 @@ impl MountWizard {
         let mut wizard = Self::new(history);
         wizard.mounts = mounts;
         wizard
+    }
+
+    fn add_validated_mount(&mut self) {
+        self.mounts.push(AdditionalMount {
+            source: self.source.clone().into(),
+            destination: self.destination.clone().into(),
+        });
+        self.source.clear();
+        self.destination.clear();
+        self.focus = MountFocus::Source;
     }
 }
 
@@ -1411,12 +1425,12 @@ impl DashboardState {
                         self.mode = Mode::New(wizard);
                         return DashboardAction::None;
                     }
-                    wizard.mounts.mounts.push(mount);
-                    wizard.mounts.source.clear();
-                    wizard.mounts.destination.clear();
-                    wizard.mounts.focus = MountFocus::Source;
+                    let source = wizard.mounts.source.clone();
                     self.mode = Mode::New(wizard);
-                    DashboardAction::None
+                    DashboardAction::ValidateMountSource {
+                        target_template_id,
+                        source,
+                    }
                 }
                 MountFocus::Submit => self.create_session_action(&wizard),
             },
@@ -1642,6 +1656,26 @@ impl DashboardState {
                 self.mode = Mode::Resume(wizard);
             }
             _ => {}
+        }
+    }
+
+    pub fn apply_mount_source_validation(&mut self, source: &str, result: Result<(), String>) {
+        let mounts = match &mut self.mode {
+            Mode::New(wizard)
+                if wizard.step == WizardStep::Mounts && wizard.mounts.source == source =>
+            {
+                &mut wizard.mounts
+            }
+            Mode::Resume(wizard)
+                if wizard.step == WizardStep::Mounts && wizard.mounts.source == source =>
+            {
+                &mut wizard.mounts
+            }
+            _ => return,
+        };
+        match result {
+            Ok(()) => mounts.add_validated_mount(),
+            Err(error) => self.notice = Some(format!("Cannot add resource: {error}")),
         }
     }
 
@@ -1941,12 +1975,12 @@ impl DashboardState {
                         self.mode = Mode::Resume(wizard);
                         return DashboardAction::None;
                     }
-                    wizard.mounts.mounts.push(mount);
-                    wizard.mounts.source.clear();
-                    wizard.mounts.destination.clear();
-                    wizard.mounts.focus = MountFocus::Source;
+                    let source = wizard.mounts.source.clone();
                     self.mode = Mode::Resume(wizard);
-                    DashboardAction::None
+                    DashboardAction::ValidateMountSource {
+                        target_template_id,
+                        source,
+                    }
                 }
                 MountFocus::Submit => {
                     let profile_id = self
@@ -2140,12 +2174,18 @@ impl DashboardState {
             .iter()
             .position(|(profile_id, _)| profile_id.as_str() == session.last_profile)
             .unwrap_or(0);
+        let target = self
+            .config
+            .targets
+            .keys()
+            .position(|target_id| target_id == &session.target_template_id)
+            .unwrap_or(0);
         self.mode = Mode::Resume(ResumeWizard {
             session_id: session.id.clone(),
             step: WizardStep::Profile,
             focus: WizardFocus::Content,
             profile,
-            target: 0,
+            target,
             mounts: MountWizard::with_mounts(Vec::new(), session.additional_mounts.clone()),
             resource_allocation: None,
             aws_options: BTreeMap::new(),
@@ -3267,9 +3307,7 @@ fn render_sessions(
         visible_sessions,
     );
 
-    let archived_rows = archived
-        .iter()
-        .map(|session| archived_session_row(session, &dashboard.config));
+    let archived_rows = archived.iter().map(|session| archived_session_row(session));
     let archived_focused = dashboard.focus == Focus::Archived;
     let archived_table = Table::new(archived_rows, archived_session_column_constraints())
         .header(archived_session_header())
@@ -3349,10 +3387,9 @@ fn session_column_constraints() -> [Constraint; 6] {
     ]
 }
 
-fn archived_session_column_constraints() -> [Constraint; 5] {
+fn archived_session_column_constraints() -> [Constraint; 4] {
     [
         Constraint::Length(14),
-        Constraint::Length(18),
         Constraint::Length(14),
         Constraint::Length(17),
         Constraint::Min(18),
@@ -3372,14 +3409,8 @@ fn session_header() -> Row<'static> {
 }
 
 fn archived_session_header() -> Row<'static> {
-    Row::new([
-        "Profile",
-        "Target",
-        "Checkpoint",
-        "Resources",
-        "Session name",
-    ])
-    .style(Style::default().add_modifier(Modifier::BOLD))
+    Row::new(["Profile", "Checkpoint", "Resources", "Session name"])
+        .style(Style::default().add_modifier(Modifier::BOLD))
 }
 
 fn session_values(
@@ -3556,7 +3587,7 @@ fn active_session_row(
     .top_margin(top_margin)
 }
 
-fn archived_session_row(session: &SessionRecord, config: &HelConfig) -> Row<'static> {
+fn archived_session_row(session: &SessionRecord) -> Row<'static> {
     let checkpoint = session
         .checkpoint
         .as_ref()
@@ -3564,7 +3595,6 @@ fn archived_session_row(session: &SessionRecord, config: &HelConfig) -> Row<'sta
         .unwrap_or_else(|| "never".into());
     Row::new([
         session.last_profile.clone(),
-        session_target(config, session),
         checkpoint,
         checkpoint_archive_size(session),
         session_name(session).to_string(),
@@ -5320,7 +5350,14 @@ mod tests {
         dashboard.apply_mount_source_completions("/opt/ca", vec!["/opt/cache/".into()]);
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
-        dashboard.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ValidateMountSource {
+                target_template_id: "podman".into(),
+                source: "/opt/cache".into(),
+            }
+        );
+        dashboard.apply_mount_source_validation("/opt/cache", Ok(()));
         dashboard.handle_key(key(KeyCode::BackTab));
 
         assert_eq!(
@@ -5340,6 +5377,62 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn failed_source_validation_does_not_add_new_or_resume_mounts() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.handle_key(key(KeyCode::Char('n')));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        for character in "/missing".chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ValidateMountSource { .. }
+        ));
+        dashboard.apply_mount_source_validation(
+            "/missing",
+            Err("source path /missing does not exist or is not a directory".into()),
+        );
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new-session resource dialog");
+        };
+        assert!(wizard.mounts.mounts.is_empty());
+        assert_eq!(wizard.mounts.source, "/missing");
+        assert_eq!(wizard.mounts.focus, MountFocus::Add);
+        assert_eq!(
+            dashboard.notice.as_deref(),
+            Some("Cannot add resource: source path /missing does not exist or is not a directory")
+        );
+
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        for character in "/missing".chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ValidateMountSource { .. }
+        ));
+        dashboard.apply_mount_source_validation(
+            "/missing",
+            Err("source path /missing does not exist or is not a directory".into()),
+        );
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume resource dialog");
+        };
+        assert!(wizard.mounts.mounts.is_empty());
+        assert_eq!(wizard.mounts.source, "/missing");
+        assert_eq!(wizard.mounts.focus, MountFocus::Add);
     }
 
     #[test]
@@ -5383,6 +5476,20 @@ mod tests {
     }
 
     #[test]
+    fn resume_defaults_to_the_previously_used_target() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        let target = dashboard.config.targets["podman"].clone();
+        dashboard.config.targets.insert("alternate".into(), target);
+
+        dashboard.handle_key(key(KeyCode::Enter));
+
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume wizard");
+        };
+        assert_eq!(nth_key(&dashboard.config.targets, wizard.target), "podman");
+    }
+
+    #[test]
     fn resume_dialog_attaches_an_additional_resource() {
         let mut dashboard = dashboard_with_session(archived_session());
         dashboard.handle_key(key(KeyCode::Enter));
@@ -5393,7 +5500,14 @@ mod tests {
         }
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
-        dashboard.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ValidateMountSource {
+                target_template_id: "podman".into(),
+                source: "/opt/cache".into(),
+            }
+        );
+        dashboard.apply_mount_source_validation("/opt/cache", Ok(()));
         dashboard.handle_key(key(KeyCode::BackTab));
 
         assert_eq!(
@@ -5608,10 +5722,10 @@ mod tests {
     }
 
     #[test]
-    fn restored_session_can_be_focused_by_identity() {
-        let mut restored = archived_session();
-        restored.id = "restored".into();
-        restored.state = SessionState::Running;
+    fn newly_ready_session_can_be_selected_after_state_refresh() {
+        let mut new_session = archived_session();
+        new_session.id = "new-session".into();
+        new_session.state = SessionState::Running;
         let mut other = archived_session();
         other.id = "other".into();
         other.state = SessionState::Running;
@@ -5619,20 +5733,22 @@ mod tests {
             config(),
             HelState {
                 version: STATE_VERSION,
-                sessions: BTreeMap::from([
-                    (restored.id.clone(), restored),
-                    (other.id.clone(), other),
-                ]),
+                sessions: BTreeMap::from([(other.id.clone(), other)]),
                 mount_history: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
         dashboard.focus = Focus::Archived;
 
-        dashboard.select_active_session("restored");
+        let mut refreshed = dashboard.state.clone();
+        refreshed
+            .sessions
+            .insert(new_session.id.clone(), new_session);
+        dashboard.set_state(refreshed);
+        dashboard.select_active_session("new-session");
 
         assert_eq!(dashboard.focus, Focus::Active);
-        assert_eq!(dashboard.selected_session().unwrap().id, "restored");
+        assert_eq!(dashboard.selected_session().unwrap().id, "new-session");
     }
 
     #[test]
@@ -6339,7 +6455,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_sessions_omit_the_turn_clock_column() {
+    fn archived_sessions_omit_turn_clock_and_target_columns() {
         let mut dashboard = dashboard_with_session(archived_session());
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -6355,6 +6471,7 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(rendered.matches("Turn clock").count(), 1);
+        assert!(!rendered.contains("podman: hel"));
         assert!(rendered.contains("26-08-09 01:00"));
         assert!(!rendered.contains("2026-08-09T01:00:00Z"));
         assert!(!rendered.contains("idle"));

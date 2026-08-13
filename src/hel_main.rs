@@ -2006,6 +2006,19 @@ async fn run_dashboard() -> Result<()> {
                 Ok(candidates) => dashboard.apply_mount_source_completions(&prefix, candidates),
                 Err(error) => dashboard.set_notice(format!("Path completion failed: {error:#}")),
             },
+            DashboardAction::ValidateMountSource {
+                target_template_id,
+                source,
+            } => {
+                let result = controller
+                    .validate_mount_source(
+                        &target_template_id,
+                        std::path::Path::new(&source),
+                        &ProcessExecutor,
+                    )
+                    .map_err(|error| format!("{error:#}"));
+                dashboard.apply_mount_source_validation(&source, result);
+            }
             DashboardAction::CreateSession {
                 profile_id,
                 bundle_id,
@@ -2093,8 +2106,10 @@ async fn run_dashboard() -> Result<()> {
                             }
                         };
                         controller = updated_controller;
+                        dashboard.set_state(controller.state.clone());
                         match provision_result {
                             Ok(()) => {
+                                dashboard.select_active_session(&session_id);
                                 dashboard.set_notice(format!(
                                     "Target ready for {}; connecting worker",
                                     short_id(&session_id)
@@ -2109,7 +2124,6 @@ async fn run_dashboard() -> Result<()> {
                                 dashboard.set_notice(format!("Provisioning failed: {error:#}"))
                             }
                         }
-                        dashboard.set_state(controller.state.clone());
                         refresh_dashboard_poll_targets(
                             &controller,
                             &worker_targets_tx,
