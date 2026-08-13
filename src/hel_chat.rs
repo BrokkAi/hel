@@ -2609,13 +2609,7 @@ fn render_agent_message_lines(
     )
     .into_iter()
     .flat_map(|logical| wrap_styled_line(logical.line, content_width, logical.continuation_indent))
-    .map(|line| {
-        if line_is_empty(&line) {
-            Line::from("")
-        } else {
-            with_role_gutter(line, agent_style)
-        }
-    })
+    .map(|line| with_role_gutter(line, agent_style))
     .collect()
 }
 
@@ -2693,11 +2687,7 @@ fn render_transcript_entry(
     let logical_lines = entry_logical_lines(entry, mode, &visual, content_width);
     for logical in logical_lines {
         for row in wrap_styled_line(logical.line, content_width, logical.continuation_indent) {
-            if line_is_empty(&row) {
-                out.push(Line::from(""));
-            } else {
-                out.push(with_role_gutter(row, visual.rail_style));
-            }
+            out.push(with_role_gutter(row, visual.rail_style));
         }
     }
     out.push(Line::from(""));
@@ -2848,7 +2838,9 @@ fn with_role_gutter(line: Line<'static>, style: Style) -> Line<'static> {
 }
 
 fn line_is_empty(line: &Line<'_>) -> bool {
-    line.spans.iter().all(|span| span.content.trim().is_empty())
+    line.spans
+        .iter()
+        .all(|span| span.content.trim().is_empty() || span.content.as_ref() == ROLE_GUTTER)
 }
 
 #[cfg(test)]
@@ -3676,6 +3668,31 @@ mod tests {
     }
 
     #[test]
+    fn blank_rows_inside_messages_keep_the_role_gutter() {
+        for (role, color) in [
+            (ChatRole::User, Color::Cyan),
+            (ChatRole::Agent, Color::Green),
+        ] {
+            let entry = ChatEntry::plain(1, role, "1. first\n\n2. second");
+            let lines = render_transcript_entry(&entry, 80, TranscriptRenderMode::Rich);
+            let blank = lines
+                .iter()
+                .find(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                        == ROLE_GUTTER
+                })
+                .expect("blank row with role gutter");
+
+            assert_eq!(blank.spans[0].style.fg, Some(color));
+            assert!(lines.last().is_some_and(line_is_empty));
+            assert!(lines.last().is_some_and(|line| line.spans.is_empty()));
+        }
+    }
+
+    #[test]
     fn transcript_snapshot_tail_matches_rich_conversation_rows() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.entries
@@ -3685,10 +3702,11 @@ mod tests {
             ChatRole::Agent,
             "**Done.**\n\n- shared renderer\n- live tail",
         ));
-        let expected = transcript_text(&mut chat, 32)
+        let expected = transcript_lines(&mut chat, 32)
             .into_iter()
-            .filter(|line| !line.trim().is_empty())
+            .filter(|line| !line_is_empty(line))
             .collect::<Vec<_>>();
+        let expected = line_text(expected);
         let expected = expected[expected.len().saturating_sub(6)..].to_vec();
 
         let mut snapshot = chat.transcript_snapshot();
