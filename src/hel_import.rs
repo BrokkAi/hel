@@ -2191,6 +2191,7 @@ fn import_claude_session_inner(
             harness_kind: HarnessKind::Claude,
             last_profile: profile_id,
             bundle_id: bundle_id.to_owned(),
+            project_directory: None,
             target_template_id: target_id,
             resource_allocation: None,
             additional_mounts: Vec::new(),
@@ -2203,6 +2204,7 @@ fn import_claude_session_inner(
             updated_at: timestamp,
             last_viewed_event_sequence: 0,
             last_error: None,
+            last_checkpoint_error: None,
             checkpoint: Some(checkpoint),
         },
     );
@@ -2425,6 +2427,7 @@ fn import_native_session(
             harness_kind: harness,
             last_profile: profile_id,
             bundle_id: bundle_id.to_owned(),
+            project_directory: None,
             target_template_id: target_id,
             resource_allocation: None,
             additional_mounts: Vec::new(),
@@ -2437,6 +2440,7 @@ fn import_native_session(
             updated_at: timestamp,
             last_viewed_event_sequence: 0,
             last_error: None,
+            last_checkpoint_error: None,
             checkpoint: Some(checkpoint),
         },
     );

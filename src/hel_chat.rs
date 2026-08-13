@@ -27,6 +27,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::hel_acp::RuntimeEvent;
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
+use crate::hel_recovery::RecoveryContext;
 use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot};
 use crate::hel_worker_client::WorkerClient;
 use rendering::{
@@ -47,7 +48,6 @@ pub enum ChatAction {
     Prompt(String),
     SetConfig { key: String, value: String },
     Cancel,
-    Checkpoint(Option<String>),
     ToggleVoice,
     Back,
 }
@@ -56,7 +56,6 @@ pub enum ChatAction {
 enum LocalCommand {
     Help,
     Detach,
-    Checkpoint,
     Model,
     Effort,
 }
@@ -243,6 +242,12 @@ pub struct TranscriptSnapshot {
 }
 
 impl TranscriptSnapshot {
+    pub(crate) fn has_assistant_messages(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty())
+    }
+
     pub(crate) fn rich_tail(&mut self, width: u16, maximum_lines: usize) -> Vec<Line<'static>> {
         let lines = transcript_entry_lines(
             &self.entries,
@@ -280,6 +285,7 @@ pub struct ChatState {
     preferred_column: Option<usize>,
     history_search: Option<HistorySearch>,
     queued_prompts: VecDeque<QueuedPrompt>,
+    recovery_busy: bool,
     agent_commands: Vec<AvailableCommand>,
     command_choices: Vec<CommandChoice>,
     model_values: Vec<ConfigValueChoice>,
@@ -312,6 +318,7 @@ impl ChatState {
             preferred_column: None,
             history_search: None,
             queued_prompts: VecDeque::new(),
+            recovery_busy: false,
             agent_commands: Vec::new(),
             command_choices: builtin_command_choices(),
             model_values: Vec::new(),
@@ -938,6 +945,16 @@ impl ChatState {
         self.set_notice("Editing the most recently queued prompt");
     }
 
+    fn queue_prompt(&mut self, text: String) {
+        self.queued_prompts
+            .push_back(QueuedPrompt { text: text.clone() });
+        self.set_notice(format!(
+            "Queued {}: {}",
+            self.queued_prompts.len(),
+            queued_prompt_preview(&text)
+        ));
+    }
+
     fn show_help(&mut self) {
         let commands = self
             .command_choices
@@ -982,10 +999,6 @@ impl ChatState {
                 LocalCommand::Detach => {
                     self.clear_input();
                     ChatAction::Back
-                }
-                LocalCommand::Checkpoint => {
-                    self.clear_input();
-                    ChatAction::Checkpoint((!args.is_empty()).then(|| args.to_owned()))
                 }
                 LocalCommand::Model | LocalCommand::Effort => {
                     let key = if command == LocalCommand::Model {
@@ -1324,14 +1337,7 @@ impl ChatState {
             }
             WorkerEvent::Closing => self.phase = WorkerPhase::Closing,
             WorkerEvent::Closed => self.phase = WorkerPhase::Closed,
-            WorkerEvent::Checkpointed { reason, .. } => self.entries.push(ChatEntry::plain(
-                event.seq,
-                ChatRole::System,
-                reason.as_deref().map_or_else(
-                    || "checkpoint created".into(),
-                    |reason| format!("checkpoint: {reason}"),
-                ),
-            )),
+            WorkerEvent::Checkpointed { .. } => {}
             WorkerEvent::Adapter { payload, .. } => self.apply_adapter(event.seq, payload),
             WorkerEvent::ConfigChanged { .. } => {}
         }
@@ -1576,11 +1582,6 @@ fn builtin_command_choices() -> Vec<CommandChoice> {
             "return to the dashboard without stopping the worker",
             None,
         ),
-        (
-            "checkpoint",
-            "checkpoint the current session",
-            Some("reason"),
-        ),
         ("model", "change the active model while idle", Some("value")),
         (
             "effort",
@@ -1606,7 +1607,6 @@ fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> {
     let command = match name {
         "help" => LocalCommand::Help,
         "detach" => LocalCommand::Detach,
-        "checkpoint" => LocalCommand::Checkpoint,
         "model" => LocalCommand::Model,
         "effort" => LocalCommand::Effort,
         _ => return None,
@@ -1775,20 +1775,37 @@ pub async fn run_chat(
     mut client: WorkerClient,
     chat: Option<ChatState>,
     bundle_id: &str,
+    recovery: Option<RecoveryContext>,
 ) -> Result<(ChatExit, WorkerClient, ChatState)> {
-    let mut chat = match chat {
-        Some(chat) => chat,
+    let (mut chat, bootstrap_events) = match chat {
+        Some(chat) => (chat, Vec::new()),
         None => {
             let bootstrap = client.bootstrap().await?;
-            ChatState::new(&bootstrap.snapshot, &bootstrap.events)
+            let events = bootstrap.events.clone();
+            (
+                ChatState::new(&bootstrap.snapshot, &bootstrap.events),
+                events,
+            )
         }
     };
     chat.set_history_context(bundle_id);
+    if let Some(detail) = recovery
+        .as_ref()
+        .and_then(|recovery| recovery.session.last_checkpoint_error.as_deref())
+    {
+        chat.set_notice(format!("Recovery copy failed: {detail}"));
+    }
+    if !bootstrap_events.is_empty()
+        && let Some(recovery) = &recovery
+    {
+        recovery.observe(&bootstrap_events, chat.phase()).await;
+    }
     let (voice_updates_tx, mut voice_updates_rx) =
         tokio::sync::mpsc::unbounded_channel::<VoiceUpdate>();
     let mut voice_cancel: Option<std::sync::mpsc::Sender<()>> = None;
     let mut voice_prefix = String::new();
     loop {
+        chat.recovery_busy = recovery.as_ref().is_some_and(RecoveryContext::is_busy);
         while let Ok(update) = voice_updates_rx.try_recv() {
             match update {
                 VoiceUpdate::Partial(text) => {
@@ -1811,6 +1828,7 @@ pub async fn run_chat(
             }
         }
         if chat.phase == WorkerPhase::Idle
+            && !chat.recovery_busy
             && let Some(queued) = chat.queued_prompts.pop_front()
         {
             match client.prompt(queued.text.clone(), Vec::new()).await {
@@ -1853,6 +1871,10 @@ pub async fn run_chat(
             if let Some(action) = action {
                 let result = match action {
                     ChatAction::None => None,
+                    ChatAction::Prompt(text) if chat.recovery_busy => {
+                        chat.queue_prompt(text);
+                        None
+                    }
                     ChatAction::Prompt(text) => match client.prompt(text.clone(), Vec::new()).await
                     {
                         Ok(sequence) => {
@@ -1869,12 +1891,6 @@ pub async fn run_chat(
                         client.set_config(key, value).await.err()
                     }
                     ChatAction::Cancel => client.cancel().await.err(),
-                    ChatAction::Checkpoint(reason) => client
-                        .checkpoint(Some(
-                            reason.unwrap_or_else(|| "manual chat checkpoint".into()),
-                        ))
-                        .await
-                        .err(),
                     ChatAction::ToggleVoice => {
                         if let Some(cancel) = voice_cancel.as_ref() {
                             let _ = cancel.send(());
@@ -1919,6 +1935,9 @@ pub async fn run_chat(
         match client.sync().await {
             Ok(events) => {
                 chat.apply_events(&events);
+                if let Some(recovery) = &recovery {
+                    recovery.observe(&events, chat.phase()).await;
+                }
             }
             Err(error) => chat.set_notice(format!("connection lost: {error:#}")),
         }
@@ -1952,15 +1971,19 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
         .split(inner);
     render_transcript(frame, chunks[0], chat);
     let queued = chat.queued_prompts.len();
-    let prompt_title = match (chat.phase, queued) {
-        (WorkerPhase::Idle, 0) => " Prompt ".to_owned(),
-        (WorkerPhase::Idle, queued) => format!(" Prompt · {queued} queued "),
-        (WorkerPhase::Running, 0) => " Running · Esc cancels ".to_owned(),
-        (WorkerPhase::Running, queued) => {
-            format!(" Running · {queued} queued · Esc cancels ")
+    let prompt_title = if chat.recovery_busy {
+        format!(" Saving recovery copy… · {queued} queued ")
+    } else {
+        match (chat.phase, queued) {
+            (WorkerPhase::Idle, 0) => " Prompt ".to_owned(),
+            (WorkerPhase::Idle, queued) => format!(" Prompt · {queued} queued "),
+            (WorkerPhase::Running, 0) => " Running · Esc cancels ".to_owned(),
+            (WorkerPhase::Running, queued) => {
+                format!(" Running · {queued} queued · Esc cancels ")
+            }
+            (WorkerPhase::Closing, _) => " Closing ".to_owned(),
+            (WorkerPhase::Closed, _) => " Closed ".to_owned(),
         }
-        (WorkerPhase::Closing, _) => " Closing ".to_owned(),
-        (WorkerPhase::Closed, _) => " Closed ".to_owned(),
     };
     let prompt_block = Block::default().borders(Borders::ALL).title(prompt_title);
     let prompt_inner = prompt_block.inner(chunks[1]);
@@ -2946,10 +2969,7 @@ mod tests {
 
     #[test]
     fn local_command_parser_requires_an_exact_command_boundary() {
-        assert_eq!(
-            parse_local_command("/checkpoint before refactor"),
-            Some((LocalCommand::Checkpoint, "before refactor"))
-        );
+        assert_eq!(parse_local_command("/checkpoint before refactor"), None);
         assert_eq!(parse_local_command("/checkpointing"), None);
         assert_eq!(parse_local_command("explain /checkpoint"), None);
     }

@@ -16,7 +16,7 @@ use crate::hel_state::{
 };
 use crate::hel_targets::AdditionalMount;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryScope {
@@ -158,6 +158,26 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 3 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE sessions ADD COLUMN last_checkpoint_error TEXT;
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 3;
+             COMMIT;",
+        )?;
+    }
+    if version < 4 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE sessions ADD COLUMN project_directory BLOB;
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 4;
+             COMMIT;",
+        )?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -183,7 +203,8 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
         "SELECT s.session_id, s.title, s.harness_kind, s.last_profile, c.bundle_id,
                 s.target_template_id, s.state, s.native_session_id, s.acp_session_title,
                 s.session_title_override, c.created_at, s.updated_at,
-                s.last_viewed_event_sequence, s.last_error, s.resource_allocation
+                s.last_viewed_event_sequence, s.last_error, s.resource_allocation,
+                s.last_checkpoint_error, s.project_directory
          FROM sessions s JOIN session_contexts c USING(session_id)
          ORDER BY s.session_id",
     )?;
@@ -194,6 +215,7 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
             harness_kind: parse_harness(&row.get::<_, String>(2)?),
             last_profile: row.get(3)?,
             bundle_id: row.get(4)?,
+            project_directory: row.get_ref(16)?.blob_or_null()?.map(blob_to_path),
             target_template_id: row.get(5)?,
             resource_allocation: row
                 .get::<_, Option<String>>(14)?
@@ -216,6 +238,7 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
             updated_at: row.get(11)?,
             last_viewed_event_sequence: row.get::<_, u64>(12)?,
             last_error: row.get(13)?,
+            last_checkpoint_error: row.get(15)?,
             checkpoint: None,
         })
     })?;
@@ -244,6 +267,55 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
 
 pub fn save_state(state: &HelState) -> Result<()> {
     save_state_to(&database_path(), state)
+}
+
+pub fn record_recovery_success(
+    session_id: &str,
+    native_session_id: &str,
+    checkpoint: &CheckpointMetadata,
+) -> Result<()> {
+    let mut connection = open(&database_path())?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        "UPDATE sessions
+         SET native_session_id = ?2, last_checkpoint_error = NULL
+         WHERE session_id = ?1",
+        params![session_id, native_session_id],
+    )?;
+    if changed != 1 {
+        bail!("unknown session {session_id}");
+    }
+    tx.execute(
+        "INSERT INTO session_checkpoints(
+             session_id, archive_path, sha256, created_at, event_sequence
+         ) VALUES (?1,?2,?3,?4,?5)
+         ON CONFLICT(session_id) DO UPDATE SET
+             archive_path = excluded.archive_path,
+             sha256 = excluded.sha256,
+             created_at = excluded.created_at,
+             event_sequence = excluded.event_sequence",
+        params![
+            session_id,
+            path_to_blob(&checkpoint.archive_path),
+            checkpoint.sha256,
+            checkpoint.created_at,
+            checkpoint.event_sequence,
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn record_recovery_failure(session_id: &str, detail: &str) -> Result<()> {
+    let connection = open(&database_path())?;
+    let changed = connection.execute(
+        "UPDATE sessions SET last_checkpoint_error = ?2 WHERE session_id = ?1",
+        params![session_id, detail],
+    )?;
+    if changed != 1 {
+        bail!("unknown session {session_id}");
+    }
+    Ok(())
 }
 
 pub fn save_state_to(path: &Path, state: &HelState) -> Result<()> {
@@ -294,8 +366,9 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
         "INSERT INTO sessions(
              session_id, title, harness_kind, last_profile, target_template_id, state,
              native_session_id, acp_session_title, session_title_override, updated_at,
-             last_viewed_event_sequence, last_error, resource_allocation
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             last_viewed_event_sequence, last_error, resource_allocation,
+             last_checkpoint_error, project_directory
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
         params![
             session.id,
             session.title,
@@ -314,6 +387,11 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?,
+            session.last_checkpoint_error,
+            session
+                .project_directory
+                .as_ref()
+                .map(|path| path_to_blob(path)),
         ],
     )?;
     if let Some(target) = &session.target {
@@ -748,6 +826,7 @@ mod tests {
             harness_kind: HarnessKind::Codex,
             last_profile: "codex".into(),
             bundle_id: bundle.into(),
+            project_directory: None,
             target_template_id: "local".into(),
             resource_allocation: Some(SessionResourceAllocation::Container {
                 cpus: 8,
@@ -768,6 +847,7 @@ mod tests {
             updated_at: "2026-08-12T01:00:00Z".into(),
             last_viewed_event_sequence: 7,
             last_error: None,
+            last_checkpoint_error: Some("temporary recovery failure".into()),
             checkpoint: Some(CheckpointMetadata {
                 archive_path: PathBuf::from("sessions/test.hel.zip"),
                 sha256: "a".repeat(64),
@@ -782,7 +862,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("hel.sqlite3");
         let mut state = HelState::default();
-        let record = session("session-1", "project-1");
+        let mut record = session("session-1", "project-1");
+        record.project_directory = Some(PathBuf::from("/srv/project-1"));
         state.sessions.insert(record.id.clone(), record);
         state.mount_history.insert(
             "local".into(),

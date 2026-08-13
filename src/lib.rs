@@ -19,6 +19,7 @@ pub mod hel_git_proxy;
 pub mod hel_import;
 pub mod hel_local_git;
 pub mod hel_quota;
+pub mod hel_recovery;
 pub mod hel_resources;
 pub mod hel_server;
 pub mod hel_setup;

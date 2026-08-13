@@ -175,6 +175,9 @@ pub struct SessionRecord {
     pub harness_kind: HarnessKind,
     pub last_profile: String,
     pub bundle_id: String,
+    /// Existing project directory used directly by a bare SSH target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_directory: Option<PathBuf>,
     pub target_template_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_allocation: Option<SessionResourceAllocation>,
@@ -195,6 +198,8 @@ pub struct SessionRecord {
     pub last_viewed_event_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<CheckpointMetadata>,
 }
@@ -218,6 +223,14 @@ impl SessionRecord {
         }
         validate_id("profile", &self.last_profile)?;
         validate_id("bundle", &self.bundle_id)?;
+        if let Some(project_directory) = &self.project_directory
+            && (!project_directory.is_absolute()
+                || project_directory
+                    .components()
+                    .any(|part| part == Component::ParentDir))
+        {
+            bail!("session {:?} has an unsafe project directory", self.id);
+        }
         validate_id("target template", &self.target_template_id)?;
         if let Some(allocation) = &self.resource_allocation {
             allocation.validate()?;
@@ -345,7 +358,9 @@ impl HelState {
                     profile.kind
                 );
             }
-            if !config.bundles.contains_key(&session.bundle_id) {
+            if session.project_directory.is_none()
+                && !config.bundles.contains_key(&session.bundle_id)
+            {
                 bail!(
                     "active session {:?} references missing bundle {:?}",
                     session.id,
@@ -482,6 +497,7 @@ mod tests {
             harness_kind: HarnessKind::Codex,
             last_profile: "codex-1".into(),
             bundle_id: "hel".into(),
+            project_directory: None,
             target_template_id: "podman".into(),
             resource_allocation: None,
             additional_mounts: vec![AdditionalMount {
@@ -499,6 +515,7 @@ mod tests {
             updated_at: "2026-08-09T12:01:00Z".into(),
             last_viewed_event_sequence: 0,
             last_error: None,
+            last_checkpoint_error: None,
             checkpoint: Some(CheckpointMetadata {
                 archive_path: PathBuf::from("sessions/0123456789abcdef.hel.zip"),
                 sha256: "a".repeat(64),

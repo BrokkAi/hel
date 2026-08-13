@@ -15,6 +15,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState,
     Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
+use sha2::{Digest, Sha256};
 
 use crate::hel_chat::{TranscriptSnapshot, render_agent_message_preview};
 use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
@@ -47,6 +48,7 @@ pub enum DashboardAction {
     CreateSession {
         profile_id: String,
         bundle_id: String,
+        project_directory: Option<std::path::PathBuf>,
         target_template_id: String,
         additional_mounts: Vec<AdditionalMount>,
         allow_dirty_local: bool,
@@ -73,13 +75,13 @@ pub enum DashboardAction {
     CreateBundle {
         source: String,
     },
-    Checkpoint {
-        session_id: String,
-    },
     Close {
         session_id: String,
     },
     ForceDestroy {
+        session_id: String,
+    },
+    DeleteActive {
         session_id: String,
     },
     DeleteArchived {
@@ -132,8 +134,9 @@ enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WizardStep {
     Profile,
-    Bundle,
     Target,
+    Bundle,
+    ProjectDirectory,
     Review,
     Mounts,
     NewBundle,
@@ -157,6 +160,7 @@ struct NewWizard {
     mounts: MountWizard,
     review_focus: ReviewFocus,
     new_bundle_source: String,
+    project_directory: String,
     resource_allocation: Option<SessionResourceAllocation>,
     aws_options: BTreeMap<String, Vec<SessionResourceAllocation>>,
     sizing_error: Option<String>,
@@ -270,6 +274,10 @@ enum Confirmation {
         error: String,
     },
     ForceDestroy {
+        session_id: String,
+        typed: String,
+    },
+    DeleteActive {
         session_id: String,
         typed: String,
     },
@@ -991,12 +999,6 @@ impl DashboardState {
             }
             (KeyCode::Char('u'), true) => DashboardAction::RefreshQuotas,
             (KeyCode::Char('e'), true) if self.config_is_empty() => DashboardAction::OpenConfig,
-            (KeyCode::Char('k'), true) if self.focus == Focus::Active => self
-                .selected_session()
-                .map(|session| DashboardAction::Checkpoint {
-                    session_id: session.id.clone(),
-                })
-                .unwrap_or(DashboardAction::None),
             (KeyCode::Char('p'), true) if self.focus == Focus::Active => {
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(Confirmation::Close {
@@ -1005,10 +1007,31 @@ impl DashboardState {
                 }
                 DashboardAction::None
             }
-            (KeyCode::Char('d'), true) if self.focus == Focus::Archived => {
+            (KeyCode::Char('d'), true) | (KeyCode::Delete, _) if self.focus == Focus::Archived => {
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(Confirmation::DeleteArchived {
                         session_id: session.id.clone(),
+                    });
+                }
+                DashboardAction::None
+            }
+            (KeyCode::Char('d'), true) | (KeyCode::Delete, _) if self.focus == Focus::Active => {
+                if let Some(session) = self.selected_session() {
+                    let session_id = session.id.clone();
+                    let has_assistant_messages =
+                        self.session_details.get(&session_id).is_some_and(|detail| {
+                            detail.last_agent_message.is_some()
+                                || detail
+                                    .transcript
+                                    .as_ref()
+                                    .is_some_and(TranscriptSnapshot::has_assistant_messages)
+                        });
+                    if !has_assistant_messages {
+                        return DashboardAction::DeleteActive { session_id };
+                    }
+                    self.mode = Mode::Confirm(Confirmation::DeleteActive {
+                        session_id,
+                        typed: String::new(),
                     });
                 }
                 DashboardAction::None
@@ -1208,6 +1231,48 @@ impl DashboardState {
         if wizard.step == WizardStep::Review {
             return self.handle_new_review_key(code, wizard);
         }
+        if wizard.step == WizardStep::ProjectDirectory {
+            return match code {
+                KeyCode::Backspace if wizard.project_directory.is_empty() => {
+                    wizard.step = WizardStep::Target;
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
+                KeyCode::Backspace => {
+                    wizard.project_directory.pop();
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
+                KeyCode::Enter if wizard.project_directory.trim().is_empty() => {
+                    self.notice = Some("Project directory cannot be empty.".into());
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
+                KeyCode::Enter => {
+                    let path = std::path::Path::new(wizard.project_directory.trim());
+                    if !path.is_absolute() {
+                        self.notice =
+                            Some("Project directory must be an absolute remote path.".into());
+                        self.mode = Mode::New(wizard);
+                        DashboardAction::None
+                    } else {
+                        wizard.step = WizardStep::Review;
+                        wizard.review_focus = ReviewFocus::Submit;
+                        self.mode = Mode::New(wizard);
+                        DashboardAction::None
+                    }
+                }
+                KeyCode::Char(character) if wizard.focus == WizardFocus::Content => {
+                    wizard.project_directory.push(character);
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
+                _ => {
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
+            };
+        }
         let has_back = wizard.step != WizardStep::Profile;
         if matches!(code, KeyCode::Tab | KeyCode::BackTab) {
             wizard.focus = cycle_wizard_focus(wizard.focus, has_back, code == KeyCode::BackTab);
@@ -1220,9 +1285,19 @@ impl DashboardState {
         }
         if code == KeyCode::Enter && wizard.focus == WizardFocus::Back {
             wizard.step = match wizard.step {
-                WizardStep::Bundle => WizardStep::Profile,
-                WizardStep::Target => WizardStep::Bundle,
-                WizardStep::Review => WizardStep::Target,
+                WizardStep::Target => WizardStep::Profile,
+                WizardStep::Bundle => WizardStep::Target,
+                WizardStep::ProjectDirectory => WizardStep::Target,
+                WizardStep::Review => {
+                    if matches!(
+                        self.config.targets[&nth_key(&self.config.targets, wizard.target)],
+                        TargetTemplate::SshBare { .. }
+                    ) {
+                        WizardStep::ProjectDirectory
+                    } else {
+                        WizardStep::Bundle
+                    }
+                }
                 WizardStep::NewBundle => WizardStep::Bundle,
                 WizardStep::Profile => WizardStep::Profile,
                 WizardStep::Mounts => unreachable!("mount input is handled above"),
@@ -1283,6 +1358,9 @@ impl DashboardState {
             WizardStep::Profile => self.config.profiles.len(),
             WizardStep::Bundle => self.config.bundles.len() + 1,
             WizardStep::Target => self.config.targets.len(),
+            WizardStep::ProjectDirectory => {
+                unreachable!("project directory input is handled above")
+            }
             WizardStep::Review => unreachable!("review input is handled above"),
             WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
             WizardStep::NewBundle => unreachable!("bundle input is handled above"),
@@ -1316,8 +1394,9 @@ impl DashboardState {
                     self.cancel_modal();
                     return DashboardAction::None;
                 }
-                WizardStep::Bundle => WizardStep::Profile,
-                WizardStep::Target => WizardStep::Bundle,
+                WizardStep::Target => WizardStep::Profile,
+                WizardStep::Bundle => WizardStep::Target,
+                WizardStep::ProjectDirectory => WizardStep::Target,
                 WizardStep::Review => WizardStep::Target,
                 WizardStep::Mounts => {
                     unreachable!("mount input is handled before picker navigation")
@@ -1336,10 +1415,11 @@ impl DashboardState {
 
         match wizard.step {
             WizardStep::Profile => {
-                wizard.step = WizardStep::Bundle;
+                wizard.step = WizardStep::Target;
                 wizard.focus = WizardFocus::Content;
+                let action = self.prepare_new_target(&mut wizard);
                 self.mode = Mode::New(wizard);
-                DashboardAction::None
+                action
             }
             WizardStep::Bundle => {
                 if wizard.bundle == self.config.bundles.len() {
@@ -1349,11 +1429,10 @@ impl DashboardState {
                     self.mode = Mode::New(wizard);
                     return DashboardAction::None;
                 }
-                wizard.step = WizardStep::Target;
-                wizard.focus = WizardFocus::Content;
-                let action = self.prepare_new_target(&mut wizard);
+                wizard.step = WizardStep::Review;
+                wizard.review_focus = ReviewFocus::Submit;
                 self.mode = Mode::New(wizard);
-                action
+                DashboardAction::None
             }
             WizardStep::Target => {
                 let target_template_id = nth_key(&self.config.targets, wizard.target);
@@ -1374,20 +1453,27 @@ impl DashboardState {
                     self.mode = Mode::New(wizard);
                     return DashboardAction::None;
                 }
-                wizard.step = WizardStep::Review;
-                wizard.review_focus = ReviewFocus::Submit;
-                wizard.mounts = MountWizard::new(
-                    mount_history_host(target)
-                        .and_then(|host| self.state.mount_history.get(host))
-                        .cloned()
-                        .unwrap_or_default(),
-                );
+                wizard.step = if matches!(target, TargetTemplate::SshBare { .. }) {
+                    wizard.mounts = MountWizard::new(Vec::new());
+                    WizardStep::ProjectDirectory
+                } else {
+                    wizard.mounts = MountWizard::new(
+                        mount_history_host(target)
+                            .and_then(|host| self.state.mount_history.get(host))
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
+                    WizardStep::Bundle
+                };
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
             }
             WizardStep::Review => unreachable!("review input is handled before picker navigation"),
             WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
             WizardStep::NewBundle => unreachable!("bundle input is handled above"),
+            WizardStep::ProjectDirectory => {
+                unreachable!("project directory input is handled above")
+            }
         }
     }
 
@@ -1430,7 +1516,13 @@ impl DashboardState {
                     return DashboardAction::None;
                 }
                 ReviewFocus::Back => {
-                    wizard.step = WizardStep::Target;
+                    let target =
+                        &self.config.targets[&nth_key(&self.config.targets, wizard.target)];
+                    wizard.step = if matches!(target, TargetTemplate::SshBare { .. }) {
+                        WizardStep::ProjectDirectory
+                    } else {
+                        WizardStep::Bundle
+                    };
                     wizard.focus = WizardFocus::Content;
                 }
                 ReviewFocus::Add if can_attach => begin_mount_editor(&mut wizard),
@@ -1650,11 +1742,26 @@ impl DashboardState {
     }
 
     fn create_session_action(&mut self, wizard: &NewWizard) -> DashboardAction {
+        let target_template_id = nth_key(&self.config.targets, wizard.target);
+        let raw_project = matches!(
+            self.config.targets[&target_template_id],
+            TargetTemplate::SshBare { .. }
+        );
         let action = DashboardAction::CreateSession {
             profile_id: nth_key(&self.config.profiles, wizard.profile),
-            bundle_id: nth_bundle_key(&self.config, &self.state, wizard.bundle),
-            target_template_id: nth_key(&self.config.targets, wizard.target),
-            additional_mounts: wizard.mounts.mounts.clone(),
+            bundle_id: if raw_project {
+                raw_project_context_id(&wizard.project_directory)
+            } else {
+                nth_bundle_key(&self.config, &self.state, wizard.bundle)
+            },
+            project_directory: raw_project
+                .then(|| std::path::PathBuf::from(wizard.project_directory.trim())),
+            target_template_id,
+            additional_mounts: if raw_project {
+                Vec::new()
+            } else {
+                wizard.mounts.mounts.clone()
+            },
             allow_dirty_local: false,
             resource_allocation: wizard.resource_allocation.clone(),
         };
@@ -1675,10 +1782,9 @@ impl DashboardState {
             return DashboardAction::None;
         };
         wizard.bundle = index;
-        wizard.step = WizardStep::Target;
-        let action = self.prepare_new_target(&mut wizard);
+        wizard.step = WizardStep::Review;
         self.mode = Mode::New(wizard);
-        action
+        DashboardAction::None
     }
 
     pub fn apply_aws_resource_options(
@@ -1922,6 +2028,9 @@ impl DashboardState {
                 WizardStep::Bundle | WizardStep::NewBundle | WizardStep::Mounts => {
                     unreachable!("invalid resume wizard step")
                 }
+                WizardStep::ProjectDirectory => {
+                    unreachable!("resume does not select a project directory")
+                }
             };
             wizard.focus = WizardFocus::Content;
             self.mode = Mode::Resume(wizard);
@@ -1950,6 +2059,9 @@ impl DashboardState {
             WizardStep::Bundle => unreachable!("resume does not select a bundle"),
             WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
             WizardStep::NewBundle => unreachable!("resume does not create bundles"),
+            WizardStep::ProjectDirectory => {
+                unreachable!("resume does not select a project directory")
+            }
         };
         if wizard.focus == WizardFocus::Content && matches!(code, KeyCode::Up | KeyCode::Char('k'))
         {
@@ -1990,6 +2102,9 @@ impl DashboardState {
                     unreachable!("mount input is handled before picker navigation")
                 }
                 WizardStep::NewBundle => unreachable!("resume does not create bundles"),
+                WizardStep::ProjectDirectory => {
+                    unreachable!("resume does not select a project directory")
+                }
             }
             return DashboardAction::None;
         }
@@ -2037,6 +2152,9 @@ impl DashboardState {
             WizardStep::Review => unreachable!("review input is handled before picker navigation"),
             WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
             WizardStep::NewBundle => unreachable!("resume does not create bundles"),
+            WizardStep::ProjectDirectory => {
+                unreachable!("resume does not select a project directory")
+            }
         }
     }
 
@@ -2429,6 +2547,35 @@ impl DashboardState {
                     DashboardAction::None
                 }
             },
+            Confirmation::DeleteActive {
+                session_id,
+                mut typed,
+            } => match code {
+                KeyCode::Esc => {
+                    self.cancel_modal();
+                    DashboardAction::None
+                }
+                KeyCode::Backspace => {
+                    typed.pop();
+                    self.mode = Mode::Confirm(Confirmation::DeleteActive { session_id, typed });
+                    DashboardAction::None
+                }
+                KeyCode::Char(c) => {
+                    if typed.len() < FORCE_CONFIRMATION.len() {
+                        typed.push(c.to_ascii_uppercase());
+                    }
+                    self.mode = Mode::Confirm(Confirmation::DeleteActive { session_id, typed });
+                    DashboardAction::None
+                }
+                KeyCode::Enter if typed == FORCE_CONFIRMATION => {
+                    self.cancel_modal();
+                    DashboardAction::DeleteActive { session_id }
+                }
+                _ => {
+                    self.mode = Mode::Confirm(Confirmation::DeleteActive { session_id, typed });
+                    DashboardAction::None
+                }
+            },
         }
     }
 
@@ -2470,6 +2617,7 @@ impl DashboardState {
             mounts: MountWizard::new(Vec::new()),
             review_focus: ReviewFocus::Submit,
             new_bundle_source: String::new(),
+            project_directory: String::new(),
             resource_allocation: None,
             aws_options: BTreeMap::new(),
             sizing_error: None,
@@ -2486,7 +2634,7 @@ impl DashboardState {
             return DashboardAction::None;
         }
         if session.checkpoint.is_none() {
-            self.notice = Some("This session has no verified checkpoint to resume.".into());
+            self.notice = Some("This session has no verified recovery copy to resume.".into());
             return DashboardAction::None;
         }
         if self.compatible_profiles(&session.id).is_empty() || self.config.targets.is_empty() {
@@ -2969,6 +3117,7 @@ impl NewWizard {
             WizardStep::Profile => &mut self.profile,
             WizardStep::Bundle => &mut self.bundle,
             WizardStep::Target => &mut self.target,
+            WizardStep::ProjectDirectory => unreachable!("project directory has no picker index"),
             WizardStep::Review => unreachable!("review input has no picker index"),
             WizardStep::Mounts => unreachable!("mount input has no picker index"),
             WizardStep::NewBundle => unreachable!("bundle input has no picker index"),
@@ -2985,6 +3134,9 @@ impl ResumeWizard {
             WizardStep::Bundle => unreachable!("resume does not select a bundle"),
             WizardStep::Mounts => unreachable!("resume does not select mounts"),
             WizardStep::NewBundle => unreachable!("resume does not create bundles"),
+            WizardStep::ProjectDirectory => {
+                unreachable!("resume does not select a project directory")
+            }
         }
     }
 }
@@ -3730,12 +3882,11 @@ fn focus_border(focused: bool) -> BorderType {
     }
 }
 
-fn session_column_constraints() -> [Constraint; 6] {
+fn session_column_constraints() -> [Constraint; 5] {
     [
         Constraint::Length(10),
         Constraint::Length(14),
         Constraint::Length(18),
-        Constraint::Length(14),
         Constraint::Length(17),
         Constraint::Min(18),
     ]
@@ -3755,7 +3906,6 @@ fn session_header() -> Row<'static> {
         "Turn clock",
         "Profile",
         "Target",
-        "Checkpoint",
         "Resources",
         "Session name",
     ])
@@ -3763,7 +3913,7 @@ fn session_header() -> Row<'static> {
 }
 
 fn archived_session_header() -> Row<'static> {
-    Row::new(["Profile", "Checkpoint", "Resources", "Session name"])
+    Row::new(["Profile", "Archived", "Archive", "Session name"])
         .style(Style::default().add_modifier(Modifier::BOLD))
 }
 
@@ -3772,18 +3922,7 @@ fn session_values(
     detail: Option<&SessionDetail>,
     now_epoch_seconds: u64,
     config: &HelConfig,
-) -> (String, String, String, String, String, String) {
-    let checkpoint = session
-        .checkpoint
-        .as_ref()
-        .map(|checkpoint| {
-            if session.state.is_active() {
-                checkpoint_age(now_epoch_seconds, &checkpoint.created_at)
-            } else {
-                checkpoint_time_display(&checkpoint.created_at)
-            }
-        })
-        .unwrap_or_else(|| "never".into());
+) -> (String, String, String, String, String) {
     let clock = if session.state == SessionState::Provisioning {
         let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
         format!("Launch {}s", now_epoch_seconds.saturating_sub(started_at))
@@ -3797,7 +3936,6 @@ fn session_values(
         clock,
         session.last_profile.clone(),
         session_target(config, session),
-        checkpoint,
         detail
             .and_then(|detail| detail.resource_usage.as_ref())
             .map(resource_summary)
@@ -3926,16 +4064,18 @@ fn active_session_row(
     height: u16,
     top_margin: u16,
 ) -> Row<'static> {
-    let (clock, profile, target, checkpoint, resources, session_name) =
+    let (clock, profile, target, resources, session_name) =
         session_values(session, detail, now_epoch_seconds, config);
     let unread_count = detail.map_or(0, |detail| detail.unread_agent_message_sequences.len());
     Row::new([
         Cell::from(clock),
         Cell::from(profile),
         Cell::from(target),
-        Cell::from(checkpoint),
         Cell::from(resources),
-        Cell::from(session_name_line(session_name, unread_count)),
+        Cell::from(session_name_line(
+            recovery_warning_name(session, session_name, now_epoch_seconds),
+            unread_count,
+        )),
     ])
     .height(height)
     .top_margin(top_margin)
@@ -3969,6 +4109,19 @@ fn checkpoint_age(now_epoch_seconds: u64, checkpointed_at: &str) -> String {
         format!("{}h", age / 3_600)
     } else {
         format!("{}d", age / 86_400)
+    }
+}
+
+fn recovery_warning_name(session: &SessionRecord, name: String, now_epoch_seconds: u64) -> String {
+    if session.last_checkpoint_error.is_none() {
+        return name;
+    }
+    match &session.checkpoint {
+        Some(checkpoint) => format!(
+            "{name}  ⚠ Recovery copy {} old",
+            checkpoint_age(now_epoch_seconds, &checkpoint.created_at)
+        ),
+        None => format!("{name}  ⚠ Recovery unavailable"),
     }
 }
 
@@ -4132,7 +4285,7 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
 fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     let actions = match dashboard.focus {
         Focus::Active => {
-            "Ctrl for: [N]ew · [I]mport · [R]ename · Chec[K]point · [P]ause · [U]pdate quotas · [Q]uit · Tab pane"
+            "Ctrl for: [N]ew · [I]mport · [R]ename · [P]ause · [D]elete · [U]pdate quotas · [Q]uit · Tab pane"
         }
         Focus::Archived => {
             "Ctrl for: [N]ew · [I]mport · [R]ename · [D]elete permanently · [U]pdate quotas · [Q]uit · Tab pane"
@@ -4195,20 +4348,56 @@ fn render_new_wizard(
     wizard: &NewWizard,
 ) {
     if wizard.step == WizardStep::Review {
+        let target_id = nth_key(&dashboard.config.targets, wizard.target);
+        let raw_project = matches!(
+            dashboard.config.targets[&target_id],
+            TargetTemplate::SshBare { .. }
+        );
+        let bundle_id = (!raw_project)
+            .then(|| nth_bundle_key(&dashboard.config, &dashboard.state, wizard.bundle));
         render_review_wizard(
             frame,
             area,
             dashboard,
             ReviewWizardView {
                 profile_id: &nth_key(&dashboard.config.profiles, wizard.profile),
-                bundle_id: &nth_bundle_key(&dashboard.config, &dashboard.state, wizard.bundle),
-                target_id: &nth_key(&dashboard.config.targets, wizard.target),
+                bundle_id: if raw_project {
+                    wizard.project_directory.trim()
+                } else {
+                    bundle_id.as_deref().expect("bundle selected")
+                },
+                target_id: &target_id,
                 allocation: wizard.resource_allocation.as_ref(),
                 mounts: &wizard.mounts,
                 focus: wizard.review_focus,
                 title: " New session · 4/4 review ",
                 submit_label: "Create",
             },
+        );
+        return;
+    }
+    if wizard.step == WizardStep::ProjectDirectory {
+        let popup = centered_rect(76, 9, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::raw("Absolute project directory on the remote machine:"),
+                Line::raw(""),
+                Line::styled(
+                    format!("> {}▏", wizard.project_directory),
+                    Style::default().bg(Color::DarkGray).fg(Color::White),
+                ),
+                Line::styled(
+                    "Enter continues · Backspace on empty goes back · Esc cancels",
+                    Style::default().fg(Color::Gray),
+                ),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" New session · 3/4 remote project "),
+            ),
+            popup,
         );
         return;
     }
@@ -4273,7 +4462,7 @@ fn render_new_wizard(
             wizard.profile,
         ),
         WizardStep::Bundle => (
-            " New session · 2/4 project bundle ",
+            " New session · 3/4 project bundle ",
             bundle_ids_by_recent_creation(&dashboard.config, &dashboard.state)
                 .into_iter()
                 .map(|id| {
@@ -4285,7 +4474,7 @@ fn render_new_wizard(
             wizard.bundle,
         ),
         WizardStep::Target => (
-            " New session · 3/4 target ",
+            " New session · 2/4 target ",
             dashboard
                 .config
                 .targets
@@ -4307,6 +4496,7 @@ fn render_new_wizard(
         WizardStep::Review => unreachable!("review was rendered above"),
         WizardStep::Mounts => unreachable!("mount input was rendered above"),
         WizardStep::NewBundle => unreachable!("bundle input was rendered above"),
+        WizardStep::ProjectDirectory => unreachable!("project directory input was rendered above"),
     };
     let help = if wizard.step == WizardStep::Target {
         "+ both · c CPU · m memory · - halve · r reset"
@@ -4355,6 +4545,7 @@ fn render_review_wizard(
         submit_label,
     } = view;
     let target = &dashboard.config.targets[target_id];
+    let can_attach = mount_history_host(target).is_some();
     let mut lines = vec![
         Line::raw(format!("Profile: {profile_id}")),
         Line::raw(format!("Project: {bundle_id}")),
@@ -4363,15 +4554,20 @@ fn render_review_wizard(
             "Compute:{}",
             resource_allocation_label(allocation, None)
         )),
-        Line::raw(""),
-        Line::raw(format!("Attached directories: {}", mounts.mounts.len())),
     ];
-    if mounts.mounts.is_empty() {
+    if can_attach {
+        lines.push(Line::raw(""));
+        lines.push(Line::raw(format!(
+            "Attached directories: {}",
+            mounts.mounts.len()
+        )));
+    }
+    if can_attach && mounts.mounts.is_empty() {
         lines.push(Line::styled(
             "  None (optional)",
             Style::default().fg(Color::DarkGray),
         ));
-    } else {
+    } else if can_attach {
         lines.extend(
             mounts
                 .mounts
@@ -4397,10 +4593,13 @@ fn render_review_wizard(
                 }),
         );
     }
-    let can_attach = mount_history_host(target).is_some();
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "Tab moves focus · Enter edits selected directory · Del removes it",
+        if can_attach {
+            "Tab moves focus · Enter edits selected directory · Del removes it"
+        } else {
+            "Tab moves focus · Enter activates"
+        },
         Style::default().fg(Color::DarkGray),
     ));
     let mut buttons = vec![
@@ -4668,6 +4867,7 @@ fn render_resume_wizard(
         WizardStep::Review => unreachable!("review was rendered above"),
         WizardStep::Mounts => unreachable!("mount input was rendered above"),
         WizardStep::NewBundle => unreachable!("resume does not create bundles"),
+        WizardStep::ProjectDirectory => unreachable!("resume does not select a project directory"),
     };
     render_picker(
         frame,
@@ -4767,6 +4967,7 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             Confirmation::CloseFailed { .. } => 12,
             Confirmation::Close { .. }
             | Confirmation::ForceDestroy { .. }
+            | Confirmation::DeleteActive { .. }
             | Confirmation::DeleteArchived { .. } => 9,
         },
         area,
@@ -4793,7 +4994,7 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
-                Line::raw("Hel will verify the checkpoint before destroying the target."),
+                Line::raw("Hel will verify a recovery copy before destroying the target."),
                 Line::raw("Press y/Enter to pause, or n/Esc to cancel."),
             ],
         ),
@@ -4802,7 +5003,7 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
-                Line::raw("Hel will permanently delete the checkpoint archive and session record."),
+                Line::raw("Hel will permanently delete the recovery archive and session record."),
                 Line::raw("Press y/Enter to delete, or n/Esc to cancel."),
             ],
         ),
@@ -4821,6 +5022,15 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
         ),
         Confirmation::ForceDestroy { session_id, typed } => (
             " FORCE DESTROY · DATA MAY BE LOST ",
+            vec![
+                Line::raw(format!("Session: {session_id}")),
+                Line::raw(""),
+                Line::raw(format!("Type {FORCE_CONFIRMATION}, then press Enter:")),
+                Line::styled(typed.clone(), Style::default().fg(Color::Red)),
+            ],
+        ),
+        Confirmation::DeleteActive { session_id, typed } => (
+            " DELETE ACTIVE SESSION · NO CHECKPOINT ",
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
@@ -4988,6 +5198,15 @@ fn mount_history_host(target: &TargetTemplate) -> Option<&str> {
     }
 }
 
+fn raw_project_context_id(project_directory: &str) -> String {
+    let digest = Sha256::digest(project_directory.trim().as_bytes());
+    let suffix = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("remote-project-{suffix}")
+}
+
 fn default_resource_destination(
     target: &TargetTemplate,
     source: &std::path::Path,
@@ -5063,6 +5282,7 @@ mod tests {
     use super::*;
     use crate::hel_config::{
         CONFIG_VERSION, ContainerTemplate, HarnessProfile, ProjectBundle, ProjectRepository,
+        SshConnection,
     };
     use crate::hel_state::{CheckpointMetadata, STATE_VERSION};
     use crate::hel_worker::WorkerSnapshot;
@@ -5160,6 +5380,7 @@ mod tests {
             harness_kind: HarnessKind::Codex,
             last_profile: "codex-1".into(),
             bundle_id: "hel".into(),
+            project_directory: None,
             target_template_id: "podman".into(),
             resource_allocation: None,
             additional_mounts: vec![],
@@ -5172,6 +5393,7 @@ mod tests {
             updated_at: "2026-08-09T01:00:00Z".into(),
             last_viewed_event_sequence: 0,
             last_error: None,
+            last_checkpoint_error: None,
             checkpoint: Some(CheckpointMetadata {
                 archive_path: PathBuf::from("sessions/session-1.hel.zip"),
                 sha256: "a".repeat(64),
@@ -5379,12 +5601,7 @@ mod tests {
             dashboard.handle_key(key(KeyCode::Char('q'))),
             DashboardAction::None
         );
-        assert_eq!(
-            dashboard.handle_key(ctrl_key('k')),
-            DashboardAction::Checkpoint {
-                session_id: "session-1".into()
-            }
-        );
+        assert_eq!(dashboard.handle_key(ctrl_key('k')), DashboardAction::None);
         assert_eq!(
             dashboard.handle_key(ctrl_key('u')),
             DashboardAction::RefreshQuotas
@@ -5720,6 +5937,7 @@ mod tests {
             DashboardAction::CreateSession {
                 profile_id: "codex-1".into(),
                 bundle_id: "hel".into(),
+                project_directory: None,
                 target_template_id: "podman".into(),
                 additional_mounts: vec![],
                 allow_dirty_local: false,
@@ -5821,6 +6039,7 @@ mod tests {
         dashboard.handle_key(ctrl_key('n'));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
         for character in "example/new-repo".chars() {
             dashboard.handle_key(key(KeyCode::Char(character)));
         }
@@ -5830,6 +6049,85 @@ mod tests {
                 source: "example/new-repo".into(),
             }
         );
+    }
+
+    #[test]
+    fn bare_ssh_new_session_selects_target_then_raw_project_without_attachments() {
+        let mut config = config();
+        config.targets = BTreeMap::from([(
+            "machine".into(),
+            TargetTemplate::SshBare {
+                ssh: SshConnection {
+                    host: "builder.example.com".into(),
+                    user: None,
+                    identity_file: None,
+                    extra_args: Vec::new(),
+                },
+                workspace_prefix: ".local/share/hel/workspaces".into(),
+            },
+        )]);
+        let mut dashboard = DashboardState::new(config, HelState::default(), BTreeMap::new());
+
+        dashboard.handle_key(ctrl_key('n'));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        for character in "/srv/project".chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+        dashboard.handle_key(key(KeyCode::Enter));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Project: /srv/project"));
+        assert!(!rendered.contains("Attached directories"));
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::CreateSession {
+                profile_id: "claude-1".into(),
+                bundle_id: raw_project_context_id("/srv/project"),
+                project_directory: Some("/srv/project".into()),
+                target_template_id: "machine".into(),
+                additional_mounts: Vec::new(),
+                allow_dirty_local: false,
+                resource_allocation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn delete_active_is_immediate_without_assistant_messages_and_guarded_after_one() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        session.checkpoint = None;
+        let mut dashboard = dashboard_with_session(session);
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Delete)),
+            DashboardAction::DeleteActive {
+                session_id: "session-1".into()
+            }
+        );
+
+        dashboard.apply_worker_events(
+            "session-1",
+            &[adapter_text_event(1, "agent_message_chunk", "hello")],
+            1,
+        );
+        assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
+        assert!(matches!(
+            dashboard.mode,
+            Mode::Confirm(Confirmation::DeleteActive { .. })
+        ));
     }
 
     #[test]
@@ -5866,6 +6164,7 @@ mod tests {
             DashboardAction::CreateSession {
                 profile_id: "codex-1".into(),
                 bundle_id: "zebra-recent".into(),
+                project_directory: None,
                 target_template_id: "podman".into(),
                 additional_mounts: vec![],
                 allow_dirty_local: false,
@@ -5959,6 +6258,7 @@ mod tests {
             DashboardAction::CreateSession {
                 profile_id: "codex-1".into(),
                 bundle_id: "hel".into(),
+                project_directory: None,
                 target_template_id: "podman".into(),
                 additional_mounts: vec![AdditionalMount {
                     source: "/opt/cache".into(),
@@ -6922,7 +7222,7 @@ mod tests {
         assert!(rendered.contains("Turn clock"));
         assert!(rendered.contains("Profile"));
         assert!(rendered.contains("Target"));
-        assert!(rendered.contains("Checkpoint"));
+        assert!(!rendered.contains("Checkpoint"));
         assert!(rendered.contains("Resources"));
         assert!(rendered.contains("C 37% · M 50%"));
         assert!(!rendered.contains("S 4.0K · D 8.0K"));
@@ -7187,6 +7487,23 @@ mod tests {
     }
 
     #[test]
+    fn recovery_state_is_hidden_until_a_failure_needs_attention() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        assert_eq!(
+            recovery_warning_name(&session, "Build Hel".into(), 0),
+            "Build Hel"
+        );
+
+        session.last_checkpoint_error = Some("copy failed".into());
+        session.checkpoint = None;
+        assert_eq!(
+            recovery_warning_name(&session, "Build Hel".into(), 0),
+            "Build Hel  ⚠ Recovery unavailable"
+        );
+    }
+
+    #[test]
     fn active_idle_clock_is_blank() {
         let mut session = archived_session();
         session.state = SessionState::Running;
@@ -7195,7 +7512,7 @@ mod tests {
             ..SessionDetail::default()
         };
 
-        let (clock, _, _, _, _, _) = session_values(&session, Some(&detail), 1_480, &config());
+        let (clock, _, _, _, _) = session_values(&session, Some(&detail), 1_480, &config());
         assert_eq!(clock, "");
     }
 
@@ -7217,6 +7534,18 @@ mod tests {
         assert_eq!(
             dashboard.session_details["session-1"].current_turn_started_at,
             None
+        );
+    }
+
+    #[test]
+    fn checked_in_running_worker_starts_clock_without_unseen_events() {
+        let mut dashboard = dashboard_with_session(archived_session());
+
+        dashboard.apply_worker_update("session-1", &[], WorkerPhase::Running, 1_000);
+
+        assert_eq!(
+            dashboard.session_details["session-1"].current_turn_started_at,
+            Some(1_000)
         );
     }
 
@@ -7262,7 +7591,7 @@ mod tests {
         session.state = SessionState::Provisioning;
         session.updated_at = "1970-01-01T00:16:40Z".into();
 
-        let (clock, _, _, _, _, _) = session_values(&session, None, 1_012, &config());
+        let (clock, _, _, _, _) = session_values(&session, None, 1_012, &config());
         assert_eq!(clock, "Launch 12s");
     }
 

@@ -173,9 +173,9 @@ template.
 
 Repository values accept `owner/repo`, an HTTPS URL, or an SSH GitHub URL.
 Each target starts from a full clone. Container and EC2 resources are unnamed
-templates: closing a session first writes and verifies a `.hel.zip` checkpoint,
+templates: closing a session first writes and verifies a `.hel.zip` recovery copy,
 then deletes that exact resource. Named SSH machines persist, but Hel removes
-the exact per-session workspace after the same verified checkpoint.
+the exact per-session workspace after the same verified recovery copy.
 
 A repository configured with `local` is bootstrapped from the controller
 checkout, including its full commit history, index, worktree changes, and
@@ -259,9 +259,16 @@ inside a GitHub checkout, one-repository bundle. Advanced configurations remain
 TOML-first: edit `config.toml` directly to add profiles, multi-repository virtual
 monorepos, SSH targets, or AWS targets.
 
-## Session archives
+## Session recovery and archives
 
-Checkpoint archives are versioned ZIPs containing a manifest, a canonical
+After a completed turn, Hel automatically saves a recovery copy when the worker
+is idle, the previous copy is at least ten minutes old, and the turn is not
+already covered. Reconnect replay is evaluated by the same policy; there is no
+separate startup checkpoint. Healthy recovery state stays out of the UI, while
+failures leave the session usable and surface a warning. Operators can force a
+copy with `hel checkpoint --session <id>`.
+
+Recovery archives are versioned ZIPs containing a manifest, a canonical
 event stream, allowlisted native harness artifacts, and Git state for every
 repository (committed bundle, staged and unstaged patches, and untracked
 files). Every payload is SHA-256 verified after the archive is atomically
