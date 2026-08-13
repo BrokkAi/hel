@@ -130,6 +130,10 @@ destination = "private-local"
 [targets.podman]
 kind = "local-podman"
 image = "ghcr.io/your-org/agent-dev:latest"
+# Optional template defaults used by non-interactive callers. The dashboard's
+# target step can override these for one launch without changing the image.
+cpus = "8"
+memory = "32g"
 
 [targets.mac-container]
 kind = "apple-container"
@@ -228,10 +232,23 @@ cores, RAM, and workspace-filesystem capacity of currently allocated
 instances, or `on demand` when none are running. Capacity refreshes every 30
 seconds; a failed refresh leaves the previous sample visible as stale.
 
+The new-session bundle picker can save a reusable one-repository bundle from an
+existing local Git checkout or a GitHub `owner/repository`/URL. Multi-repository
+bundles and explicit Git refs remain TOML-first.
+
+New and resumed sessions expose resource sizing in the target picker. The
+baseline is 8 CPUs and 32 GiB; `+` doubles, `-` halves the current allocation,
+and `r` returns to the baseline. Container targets cap each dimension
+independently at the host's total logical cores and physical RAM. Current load
+is intentionally not subtracted, so overcommit remains available. Container
+sizing uses runtime flags with the same image. EC2 sizing discovers the launch
+template's instance family and passes an instance-type override while retaining
+the same launch template and AMI.
+
 The first-run dialog intentionally creates one local target and, when started
 inside a GitHub checkout, one-repository bundle. Advanced configurations remain
-TOML-first: edit `config.toml` directly to add profiles, virtual monorepos, SSH
-targets, or AWS targets.
+TOML-first: edit `config.toml` directly to add profiles, multi-repository virtual
+monorepos, SSH targets, or AWS targets.
 
 ## Session archives
 

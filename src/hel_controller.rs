@@ -24,8 +24,8 @@ use crate::hel_config::{
 use crate::hel_git_proxy::{GitBrokerSpec, broker_is_alive};
 use crate::hel_local_git::{canonical_repository, dirty_local_repositories};
 use crate::hel_state::{
-    CheckpointMetadata, HelState, SessionRecord, SessionState, TargetLocator, new_session_id,
-    normalize_session_title,
+    CheckpointMetadata, HelState, SessionRecord, SessionResourceAllocation, SessionState,
+    TargetLocator, new_session_id, normalize_session_title,
 };
 use crate::hel_targets::{
     self, AdditionalMount, AwsTemplate, CommandExecutor, CommandOutput, CommandSpec,
@@ -74,7 +74,127 @@ pub struct RecoveryScan {
     pub warnings: Vec<String>,
 }
 
+pub struct SessionLaunchOptions {
+    pub additional_mounts: Vec<AdditionalMount>,
+    pub allow_dirty_local: bool,
+    pub resource_allocation: Option<SessionResourceAllocation>,
+}
+
 impl Controller {
+    pub fn resolve_aws_resource_options(
+        &self,
+        target_id: &str,
+        executor: &impl CommandExecutor,
+    ) -> Result<Vec<SessionResourceAllocation>> {
+        let TargetTemplate::AwsEc2 {
+            aws_profile,
+            region,
+            launch_template,
+            launch_template_version,
+            ..
+        } = self
+            .config
+            .targets
+            .get(target_id)
+            .with_context(|| format!("unknown target template {target_id:?}"))?
+        else {
+            bail!("target {target_id:?} is not an AWS EC2 target");
+        };
+        let profile = aws_profile.as_deref().unwrap_or("default");
+        let launch_key = if launch_template.starts_with("lt-") {
+            "--launch-template-id"
+        } else {
+            "--launch-template-name"
+        };
+        let version = launch_template_version.as_deref().unwrap_or("$Default");
+        let describe_template = CommandSpec::new(
+            "aws",
+            [
+                "--profile",
+                profile,
+                "--region",
+                region,
+                "ec2",
+                "describe-launch-template-versions",
+                launch_key,
+                launch_template,
+                "--versions",
+                version,
+                "--output",
+                "json",
+            ],
+        )
+        .purpose("resolve EC2 launch template instance family");
+        let output = executor.execute(&describe_template)?;
+        if output.status != 0 {
+            bail!(
+                "{} failed with status {}: {}",
+                describe_template.purpose,
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let response: serde_json::Value =
+            serde_json::from_slice(&output.stdout).context("parse EC2 launch template response")?;
+        let instance_type = response
+            .pointer("/LaunchTemplateVersions/0/LaunchTemplateData/InstanceType")
+            .and_then(serde_json::Value::as_str)
+            .context("launch template does not specify a concrete instance type")?;
+        let family = instance_type
+            .rsplit_once('.')
+            .map(|(family, _)| family)
+            .context("launch template instance type has no size suffix")?;
+        let filter = format!("Name=instance-type,Values={family}.*");
+        let describe_types = CommandSpec::new(
+            "aws",
+            [
+                "--profile",
+                profile,
+                "--region",
+                region,
+                "ec2",
+                "describe-instance-types",
+                "--filters",
+                &filter,
+                "--output",
+                "json",
+            ],
+        )
+        .purpose("discover EC2 instance sizes");
+        let output = executor.execute(&describe_types)?;
+        if output.status != 0 {
+            bail!(
+                "{} failed with status {}: {}",
+                describe_types.purpose,
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let response: serde_json::Value =
+            serde_json::from_slice(&output.stdout).context("parse EC2 instance type response")?;
+        let mut options = response
+            .get("InstanceTypes")
+            .and_then(serde_json::Value::as_array)
+            .context("EC2 instance type response omitted InstanceTypes")?
+            .iter()
+            .filter_map(|entry| {
+                Some(SessionResourceAllocation::AwsEc2 {
+                    instance_type: entry.get("InstanceType")?.as_str()?.to_owned(),
+                    vcpus: entry.pointer("/VCpuInfo/DefaultVCpus")?.as_u64()?,
+                    memory_bytes: entry
+                        .pointer("/MemoryInfo/SizeInMiB")?
+                        .as_u64()?
+                        .checked_mul(1024 * 1024)?,
+                })
+            })
+            .collect::<Vec<_>>();
+        options.sort_by_key(allocation_vcpus);
+        if !options.iter().any(|option| allocation_vcpus(option) == 8) {
+            bail!("EC2 family {family:?} has no exact 8-vCPU baseline size");
+        }
+        Ok(options)
+    }
+
     pub fn load() -> Result<Self> {
         let config = HelConfig::load()?;
         let state = HelState::load()?;
@@ -170,6 +290,7 @@ impl Controller {
             last_profile: profile_id,
             bundle_id,
             target_template_id: target_id.to_owned(),
+            resource_allocation: None,
             additional_mounts: Vec::new(),
             state: SessionState::Disconnected,
             target: Some(candidate.locator),
@@ -290,6 +411,32 @@ impl Controller {
         additional_mounts: Vec<AdditionalMount>,
         allow_dirty_local: bool,
     ) -> Result<String> {
+        self.register_session_with_resources(
+            profile_id,
+            bundle_id,
+            target_id,
+            title,
+            SessionLaunchOptions {
+                additional_mounts,
+                allow_dirty_local,
+                resource_allocation: None,
+            },
+        )
+    }
+
+    pub fn register_session_with_resources(
+        &mut self,
+        profile_id: &str,
+        bundle_id: &str,
+        target_id: &str,
+        title: impl Into<String>,
+        options: SessionLaunchOptions,
+    ) -> Result<String> {
+        let SessionLaunchOptions {
+            additional_mounts,
+            allow_dirty_local,
+            resource_allocation,
+        } = options;
         let profile = self
             .config
             .profiles
@@ -316,6 +463,7 @@ impl Controller {
             .targets
             .get(target_id)
             .with_context(|| format!("unknown target template {target_id:?}"))?;
+        validate_resource_allocation(template, resource_allocation.as_ref())?;
         if !additional_mounts.is_empty() && mount_history_host(template).is_none() {
             bail!("additional mounts require a container-backed target");
         }
@@ -329,6 +477,7 @@ impl Controller {
             last_profile: profile_id.to_string(),
             bundle_id: bundle_id.to_string(),
             target_template_id: target_id.to_string(),
+            resource_allocation,
             additional_mounts: additional_mounts.clone(),
             state: SessionState::Provisioning,
             target: None,
@@ -422,7 +571,7 @@ impl Controller {
             .bundles
             .get(&session.bundle_id)
             .context("project bundle disappeared during provisioning")?;
-        let target = backend_target(template)?;
+        let target = backend_target(template, session.resource_allocation.as_ref())?;
         let bundle = backend_bundle(bundle)?;
         let provision =
             hel_targets::provision_plan(&target, session_id, &bundle, &session.additional_mounts)?;
@@ -866,6 +1015,17 @@ impl Controller {
         profile_id: &str,
         target_id: &str,
     ) -> Result<()> {
+        self.resume_session_with_resources(session_id, profile_id, target_id, None)
+            .await
+    }
+
+    pub async fn resume_session_with_resources(
+        &mut self,
+        session_id: &str,
+        profile_id: &str,
+        target_id: &str,
+        resource_allocation: Option<SessionResourceAllocation>,
+    ) -> Result<()> {
         let previous = self
             .state
             .sessions
@@ -894,6 +1054,9 @@ impl Controller {
             .targets
             .get(target_id)
             .with_context(|| format!("unknown target template {target_id:?}"))?;
+        let resource_allocation =
+            resource_allocation.or_else(|| previous.resource_allocation.clone());
+        validate_resource_allocation(target_template, resource_allocation.as_ref())?;
         if !previous.additional_mounts.is_empty() && mount_history_host(target_template).is_none() {
             bail!("resuming a session with additional mounts requires a container-backed target");
         }
@@ -909,6 +1072,7 @@ impl Controller {
         record.harness_kind = profile.kind;
         record.last_profile = profile_id.to_string();
         record.target_template_id = target_id.to_string();
+        record.resource_allocation = resource_allocation;
         record.target = None;
         record.native_session_id =
             same_harness.then(|| archive.manifest.session.native_session_id.clone());
@@ -1259,6 +1423,13 @@ impl Controller {
         record.target = None;
         record.updated_at = now();
         self.state.save()
+    }
+}
+
+fn allocation_vcpus(allocation: &SessionResourceAllocation) -> u64 {
+    match allocation {
+        SessionResourceAllocation::Container { cpus, .. } => *cpus,
+        SessionResourceAllocation::AwsEc2 { vcpus, .. } => *vcpus,
     }
 }
 
@@ -1742,7 +1913,7 @@ fn scan_target_workers(
                     let path = std::str::from_utf8(line).ok()?.trim();
                     let session_id = Path::new(path).parent()?.file_name()?.to_str()?;
                     hel_targets::resource_name(session_id).ok()?;
-                    let backend = backend_target(template).ok()?;
+                    let backend = backend_target(template, None).ok()?;
                     let workspace = hel_targets::workspace_for(&backend, session_id).ok()?;
                     Some(RecoveryCandidate {
                         session_id: session_id.to_owned(),
@@ -2035,13 +2206,16 @@ fn recovery_backend_locator(
     })
 }
 
-fn backend_target(template: &TargetTemplate) -> Result<hel_targets::TargetTemplate> {
+fn backend_target(
+    template: &TargetTemplate,
+    allocation: Option<&SessionResourceAllocation>,
+) -> Result<hel_targets::TargetTemplate> {
     Ok(match template {
         TargetTemplate::LocalPodman { container } => {
-            hel_targets::TargetTemplate::LocalPodman(backend_container(container))
+            hel_targets::TargetTemplate::LocalPodman(backend_container(container, allocation))
         }
         TargetTemplate::AppleContainer { container } => {
-            hel_targets::TargetTemplate::AppleContainer(backend_container(container))
+            hel_targets::TargetTemplate::AppleContainer(backend_container(container, allocation))
         }
         TargetTemplate::AwsEc2 {
             aws_profile,
@@ -2057,6 +2231,12 @@ fn backend_target(template: &TargetTemplate) -> Result<hel_targets::TargetTempla
             region: region.clone(),
             launch_template: launch_template.clone(),
             launch_template_version: launch_template_version.clone(),
+            instance_type: match allocation {
+                Some(SessionResourceAllocation::AwsEc2 { instance_type, .. }) => {
+                    Some(instance_type.clone())
+                }
+                _ => None,
+            },
             // The address is filled after describe-instances.
             ssh: SshTarget {
                 destination: format!("{ssh_user}@pending.invalid"),
@@ -2072,7 +2252,7 @@ fn backend_target(template: &TargetTemplate) -> Result<hel_targets::TargetTempla
         },
         TargetTemplate::SshPodman { ssh, container } => hel_targets::TargetTemplate::SshPodman {
             ssh: backend_ssh(ssh),
-            container: backend_container(container),
+            container: backend_container(container, allocation),
         },
     })
 }
@@ -2087,16 +2267,24 @@ fn mount_history_host(template: &TargetTemplate) -> Option<String> {
     }
 }
 
-fn backend_container(container: &crate::hel_config::ContainerTemplate) -> ContainerTemplate {
+fn backend_container(
+    container: &crate::hel_config::ContainerTemplate,
+    allocation: Option<&SessionResourceAllocation>,
+) -> ContainerTemplate {
     let mut extra_run_args = Vec::new();
     if let Some(platform) = &container.platform {
         extra_run_args.push(format!("--platform={platform}"));
     }
-    if let Some(cpus) = &container.cpus {
+    if let Some(SessionResourceAllocation::Container { cpus, memory_bytes }) = allocation {
         extra_run_args.push(format!("--cpus={cpus}"));
-    }
-    if let Some(memory) = &container.memory {
-        extra_run_args.push(format!("--memory={memory}"));
+        extra_run_args.push(format!("--memory={memory_bytes}"));
+    } else {
+        if let Some(cpus) = &container.cpus {
+            extra_run_args.push(format!("--cpus={cpus}"));
+        }
+        if let Some(memory) = &container.memory {
+            extra_run_args.push(format!("--memory={memory}"));
+        }
     }
     for (key, value) in &container.environment {
         extra_run_args.extend(["--env".to_string(), format!("{key}={value}")]);
@@ -2104,6 +2292,26 @@ fn backend_container(container: &crate::hel_config::ContainerTemplate) -> Contai
     ContainerTemplate {
         image: container.image.clone(),
         extra_run_args,
+    }
+}
+
+fn validate_resource_allocation(
+    template: &TargetTemplate,
+    allocation: Option<&SessionResourceAllocation>,
+) -> Result<()> {
+    match (template, allocation) {
+        (_, None)
+        | (
+            TargetTemplate::LocalPodman { .. }
+            | TargetTemplate::AppleContainer { .. }
+            | TargetTemplate::SshPodman { .. },
+            Some(SessionResourceAllocation::Container { .. }),
+        )
+        | (TargetTemplate::AwsEc2 { .. }, Some(SessionResourceAllocation::AwsEc2 { .. })) => Ok(()),
+        (TargetTemplate::SshBare { .. }, Some(_)) => {
+            bail!("bare SSH targets have fixed host resources")
+        }
+        _ => bail!("resource allocation does not match the selected target kind"),
     }
 }
 
@@ -3633,12 +3841,56 @@ mod tests {
             },
         };
         let hel_targets::TargetTemplate::LocalPodman(container) =
-            backend_target(&template).unwrap()
+            backend_target(&template, None).unwrap()
         else {
             unreachable!()
         };
         assert!(container.extra_run_args.contains(&"--cpus=4".into()));
         assert!(container.extra_run_args.contains(&"A=b c".into()));
+    }
+
+    #[test]
+    fn aws_resource_options_follow_the_launch_template_family() {
+        let mut config = HelConfig::default();
+        config.targets.insert(
+            "aws".into(),
+            TargetTemplate::AwsEc2 {
+                aws_profile: None,
+                region: "us-east-1".into(),
+                launch_template: "hel-runson".into(),
+                launch_template_version: None,
+                ssh_user: "ubuntu".into(),
+                address_source: AwsAddressSource::PublicIp,
+                identity_file: None,
+                ssh_args: Vec::new(),
+            },
+        );
+        let executor = PreflightExecutor {
+            outputs: RefCell::new(vec![
+                CommandOutput {
+                    status: 0,
+                    stdout: br#"{"LaunchTemplateVersions":[{"LaunchTemplateData":{"InstanceType":"m8i-flex.large"}}]}"#.to_vec(),
+                    stderr: Vec::new(),
+                },
+                CommandOutput {
+                    status: 0,
+                    stdout: br#"{"InstanceTypes":[{"InstanceType":"m8i-flex.4xlarge","VCpuInfo":{"DefaultVCpus":16},"MemoryInfo":{"SizeInMiB":65536}},{"InstanceType":"m8i-flex.2xlarge","VCpuInfo":{"DefaultVCpus":8},"MemoryInfo":{"SizeInMiB":32768}}]}"#.to_vec(),
+                    stderr: Vec::new(),
+                },
+            ]),
+        };
+        let controller = Controller {
+            config,
+            state: HelState::default(),
+        };
+
+        let options = controller
+            .resolve_aws_resource_options("aws", &executor)
+            .unwrap();
+        assert_eq!(
+            options.iter().map(allocation_vcpus).collect::<Vec<_>>(),
+            [8, 16]
+        );
     }
 
     #[test]
