@@ -2327,6 +2327,12 @@ async fn run_dashboard() -> Result<()> {
                         worker,
                     )) => {
                         if let Some(worker) = worker.as_ref() {
+                            dashboard.apply_worker_update(
+                                &session_id,
+                                &[],
+                                worker.chat.phase(),
+                                current_epoch_seconds(),
+                            );
                             dashboard
                                 .apply_transcript(&session_id, worker.chat.transcript_snapshot());
                         }

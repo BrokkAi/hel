@@ -7538,6 +7538,18 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_running_worker_starts_clock_without_unseen_events() {
+        let mut dashboard = dashboard_with_session(archived_session());
+
+        dashboard.apply_worker_update("session-1", &[], WorkerPhase::Running, 1_000);
+
+        assert_eq!(
+            dashboard.session_details["session-1"].current_turn_started_at,
+            Some(1_000)
+        );
+    }
+
+    #[test]
     fn active_message_preview_uses_only_the_wrapped_lines_it_needs() {
         let short = SessionDetail {
             last_agent_message: Some("one line".into()),
