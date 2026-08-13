@@ -758,9 +758,10 @@ pub fn provision_plan(
     })
 }
 
-/// Prepare Hel-owned runtime storage while using an existing bare-SSH project
-/// directory in place. The project directory is verified but never created or
-/// removed by Hel.
+/// Build the no-op infrastructure plan for an existing bare-SSH project.
+/// The wizard validates the project for early feedback; worker/ACP startup is
+/// authoritative if it changes before launch. Worker state is installed later
+/// under the dedicated worker and profile roots, not under a cloned workspace.
 pub fn provision_bare_project_plan(
     template: &TargetTemplate,
     session_id: &str,
@@ -772,22 +773,10 @@ pub fn provision_bare_project_plan(
     validate_ssh(ssh)?;
     let project = std::path::Path::new(project_directory);
     validate_bare_project_path(project)?;
-    let workspace = workspace_for(template, session_id)?;
+    workspace_for(template, session_id)?;
     Ok(CommandPlan {
         description: format!("provision Hel session {session_id}"),
-        commands: vec![
-            ssh_command(ssh, ["test", "-d", project_directory]).purpose(format!(
-                "verify bare SSH project directory {}",
-                project.display()
-            )),
-            ssh_command(
-                ssh,
-                ["git", "-C", project_directory, "rev-parse", "--git-dir"],
-            )
-            .purpose(format!("verify bare SSH Git project {}", project.display())),
-            ssh_command(ssh, ["mkdir", "-p", &workspace])
-                .purpose("create SSH session runtime workspace"),
-        ],
+        commands: Vec::new(),
     })
 }
 
@@ -2430,7 +2419,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_project_plan_uses_existing_directory_without_owning_it() {
+    fn bare_project_plan_leaves_project_validation_to_dialog_and_launch() {
         let template = TargetTemplate::SshBare {
             ssh: ssh(),
             workspace_prefix: ".local/share/hel/workspaces".into(),
@@ -2441,9 +2430,7 @@ mod tests {
             .iter()
             .map(|command| command.args.last().unwrap().as_str())
             .collect::<Vec<_>>();
-        assert!(commands[0].contains("'test' '-d' '/srv/project'"));
-        assert!(commands[1].contains("'git' '-C' '/srv/project'"));
-        assert!(commands.iter().all(|command| !command.contains("'rm'")));
+        assert!(commands.is_empty());
 
         let locator = TargetLocator::SshBare {
             ssh: ssh(),

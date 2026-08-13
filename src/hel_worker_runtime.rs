@@ -813,6 +813,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_project_directory_fails_actual_acp_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("worker");
+        let mut config = launch_config("profile");
+        config.session_id = "018f9dd2-a3b4-7c8d-9000-123456789abc".into();
+        config.cwd = temp.path().join("removed-project");
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            unix::run_daemon(root.clone(), config),
+        )
+        .await
+        .expect("worker startup should not hang")
+        .unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(error.contains("launch ACP bridge"), "{error}");
+        assert!(!root.join("control.sock").exists());
+    }
+
+    #[tokio::test]
     async fn checkpoint_waits_for_the_observed_tool_cohort_to_finish() {
         let temp = tempfile::tempdir().unwrap();
         let worker = Arc::new(Mutex::new(

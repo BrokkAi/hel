@@ -761,9 +761,15 @@ impl Controller {
         install_attached_resources(&self.state, session_id, &backend, &worker_root, executor)?;
         self.connect_local_repositories(session_id, &backend, &worker_root, executor)?;
         start_worker(executor, &backend, &worker_root)?;
-        match handshake_worker(&hel_targets::reconnect_plan(&backend, session_id)?.commands[0])
-            .await
-        {
+        let reconnect = &hel_targets::reconnect_plan(&backend, session_id)?.commands[0];
+        let readiness = async {
+            handshake_worker(reconnect).await?;
+            let mut client = WorkerClient::connect(reconnect, session_id).await?;
+            let (native_session_id, _) = wait_for_session_started(&mut client, 0).await?;
+            Ok(Some(native_session_id))
+        }
+        .await;
+        match readiness {
             Ok(native_session_id) => Ok(native_session_id),
             Err(error) => Err(worker_probe_diagnosis(
                 executor,
