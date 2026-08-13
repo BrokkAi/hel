@@ -45,7 +45,7 @@ impl ClaudeUsageReport {
             parts.push(window.compact_label("5H"));
         }
         if let Some(window) = &self.week {
-            parts.push(window.compact_label("week"));
+            parts.push(window.compact_label("Week"));
         }
 
         if parts.is_empty() {
@@ -561,7 +561,7 @@ mod tests {
         );
         assert_eq!(
             report.compact_label(),
-            "Claude usage: 5H 88% left · resets at 4:30pm · week 63% left · resets Monday"
+            "Claude usage: 5H 88% left · resets at 4:30pm · Week 63% left · resets Monday"
         );
     }
 
@@ -612,7 +612,7 @@ mod tests {
         assert_eq!(report.week.as_ref().unwrap().remaining_percent, 73);
         assert_eq!(
             report.compact_label(),
-            "Claude usage: 5H 98% left · resets Jul 1, 12:40pm (Europe/Paris) · week 73% left · resets Jul 2, 1am (Europe/Paris)"
+            "Claude usage: 5H 98% left · resets Jul 1, 12:40pm (Europe/Paris) · Week 73% left · resets Jul 2, 1am (Europe/Paris)"
         );
     }
 

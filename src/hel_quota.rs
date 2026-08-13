@@ -213,7 +213,7 @@ async fn refresh_profile(
                 harness,
                 windows: [
                     report.five_hour.map(|window| ("5H", window)),
-                    report.week.map(|window| ("week", window)),
+                    report.week.map(|window| ("Week", window)),
                 ]
                 .into_iter()
                 .flatten()
@@ -584,7 +584,7 @@ fn parse_kimi_window(value: &Value, fallback: &str) -> Option<QuotaWindow> {
         .and_then(Value::as_str)
         .unwrap_or(fallback);
     let label = if provider_label.to_ascii_lowercase().contains("week") {
-        "week".to_string()
+        "Week".to_string()
     } else if provider_label.to_ascii_lowercase().contains("5h") || fallback.starts_with("Limit #")
     {
         "5H".to_string()
@@ -667,7 +667,7 @@ mod tests {
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].used, Some(40));
         assert_eq!(windows[1].used, Some(10));
-        assert_eq!(windows[0].label, "week");
+        assert_eq!(windows[0].label, "Week");
         assert_eq!(windows[0].remaining_percent, Some(96));
         assert_eq!(windows[1].label, "5H");
         assert_eq!(windows[1].remaining_percent, Some(90));
@@ -710,7 +710,7 @@ mod tests {
                     resets_at_epoch_seconds: Some(14_400),
                 },
                 QuotaWindow {
-                    label: "week".into(),
+                    label: "Week".into(),
                     remaining_percent: Some(55),
                     used: None,
                     limit: None,
@@ -724,7 +724,7 @@ mod tests {
         };
         assert_eq!(
             report.compact(),
-            "5H 70% left, resets 10:00 Jun 17 · week 55% left"
+            "5H 70% left, resets 10:00 Jun 17 · Week 55% left"
         );
     }
 
@@ -743,7 +743,7 @@ mod tests {
                     resets_at_epoch_seconds: None,
                 },
                 QuotaWindow {
-                    label: "week".into(),
+                    label: "Week".into(),
                     remaining_percent: Some(0),
                     used: None,
                     limit: None,
@@ -756,7 +756,7 @@ mod tests {
             refreshed_at_epoch_seconds: 0,
         };
 
-        assert_eq!(report.compact(), "week 0% left, resets 03:59 Aug 14");
+        assert_eq!(report.compact(), "Week 0% left, resets 03:59 Aug 14");
     }
 
     #[test]
@@ -766,7 +766,7 @@ mod tests {
             harness: HarnessKind::Kimi,
             windows: vec![
                 QuotaWindow {
-                    label: "week".into(),
+                    label: "Week".into(),
                     remaining_percent: Some(94),
                     used: Some(6),
                     limit: Some(100),
@@ -787,7 +787,7 @@ mod tests {
             refreshed_at_epoch_seconds: 3_600,
         };
 
-        assert_eq!(report.compact(), "week 94% left, resets 12:22 Aug 18");
+        assert_eq!(report.compact(), "Week 94% left, resets 12:22 Aug 18");
     }
 
     #[test]

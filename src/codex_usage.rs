@@ -399,7 +399,7 @@ fn parse_window(value: &Value) -> Option<CodexUsageWindow> {
 fn window_label(minutes: Option<i64>) -> String {
     match minutes {
         Some(300) => "5H".to_string(),
-        Some(10_080) => "week".to_string(),
+        Some(10_080) => "Week".to_string(),
         Some(value) if value > 0 && value < 60 => format!("{value}m"),
         Some(value) if value > 0 && value % 1_440 == 0 => format!("{}d", value / 1_440),
         Some(value) if value > 0 && value % 60 == 0 => format!("{}H", value / 60),
@@ -456,7 +456,7 @@ mod tests {
         assert_eq!(report.primary.as_ref().unwrap().remaining_percent, 75);
         assert_eq!(report.primary.as_ref().unwrap().label, "5H");
         assert_eq!(report.secondary.as_ref().unwrap().remaining_percent, 82);
-        assert_eq!(report.secondary.as_ref().unwrap().label, "week");
+        assert_eq!(report.secondary.as_ref().unwrap().label, "Week");
     }
 
     #[test]
