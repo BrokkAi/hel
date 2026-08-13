@@ -210,7 +210,9 @@ impl WorkerClient {
     }
 
     pub async fn checkpoint(&mut self, reason: Option<String>) -> Result<u64> {
-        self.accepted(WorkerRequest::Checkpoint { reason }).await
+        self.require_protocol("tool-quiescent checkpointing", 2)?;
+        self.accepted(WorkerRequest::CheckpointWhenQuiescent { reason })
+            .await
     }
 
     pub async fn close(&mut self) -> Result<u64> {

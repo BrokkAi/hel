@@ -99,13 +99,15 @@ impl WorkerLaunchConfig {
 
 #[cfg(unix)]
 mod unix {
+    use std::collections::{BTreeSet, VecDeque};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
+    use agent_client_protocol::schema::v1::{SessionUpdate, ToolCallStatus};
     use anyhow::{Context, Result, bail};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
 
     use super::{AcpSupervisorSpec, WorkerLaunchConfig};
     use crate::hel_acp::{self, CommandRequest, LaunchSpec, RuntimeEvent};
@@ -116,6 +118,50 @@ mod unix {
     use crate::hel_worker_protocol::DecodedRequest;
 
     struct SocketGuard(PathBuf);
+
+    pub(super) struct CheckpointBarrier {
+        pub(super) envelope: RequestEnvelope,
+        pub(super) response: oneshot::Sender<ResponseEnvelope>,
+    }
+
+    #[derive(Default)]
+    struct ToolActivity {
+        open: BTreeSet<String>,
+    }
+
+    impl ToolActivity {
+        fn observe(&mut self, event: &RuntimeEvent) {
+            let RuntimeEvent::SessionUpdate { update } = event else {
+                return;
+            };
+            let Ok(update) = serde_json::from_value::<SessionUpdate>(update.clone()) else {
+                return;
+            };
+            match update {
+                SessionUpdate::ToolCall(call) => {
+                    self.set_status(call.tool_call_id.to_string(), call.status);
+                }
+                SessionUpdate::ToolCallUpdate(update) => {
+                    if let Some(status) = update.fields.status {
+                        self.set_status(update.tool_call_id.to_string(), status);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn set_status(&mut self, id: String, status: ToolCallStatus) {
+            if matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
+                self.open.remove(&id);
+            } else {
+                self.open.insert(id);
+            }
+        }
+
+        fn is_quiescent(&self) -> bool {
+            self.open.is_empty()
+        }
+    }
 
     impl Drop for SocketGuard {
         fn drop(&mut self) {
@@ -151,7 +197,8 @@ mod unix {
         let resume_session = select_resume_session(&config, &durable_worker);
         let worker = Arc::new(Mutex::new(durable_worker));
         let (acp_commands_tx, acp_commands_rx) = mpsc::channel(32);
-        let (acp_events_tx, mut acp_events_rx) = mpsc::unbounded_channel();
+        let (acp_events_tx, acp_events_rx) = mpsc::unbounded_channel();
+        let (checkpoint_tx, checkpoint_rx) = mpsc::unbounded_channel();
         let supervisor_path = root.join("acp-supervisor.json");
         AcpSupervisorSpec {
             command: config.bridge_command,
@@ -179,40 +226,11 @@ mod unix {
         dispatch_pending(&worker, &acp_commands_tx).await?;
 
         let event_worker = worker.clone();
-        let mut event_task = tokio::spawn(async move {
-            while let Some(event) = acp_events_rx.recv().await {
-                let value = serde_json::to_value(&event)?;
-                let mut worker = event_worker.lock().expect("worker state lock poisoned");
-                if let RuntimeEvent::SessionStarted {
-                    native_session_id, ..
-                } = &event
-                {
-                    worker.record_native_session_started(
-                        runtime_event_kind(&event),
-                        value,
-                        native_session_id,
-                    )?;
-                } else {
-                    worker.record_adapter_event(runtime_event_kind(&event), value)?;
-                }
-                match event {
-                    RuntimeEvent::PromptFinished { request_id, .. } => {
-                        worker.record_turn_completed()?;
-                        worker.complete_dispatch(&request_id)?;
-                    }
-                    RuntimeEvent::ConfigApplied { request_id, .. } => {
-                        worker.complete_dispatch(&request_id)?;
-                    }
-                    RuntimeEvent::Stopped
-                        if worker.snapshot().phase == crate::hel_worker::WorkerPhase::Closing =>
-                    {
-                        worker.record_closed()?;
-                    }
-                    _ => {}
-                }
-            }
-            Ok::<_, anyhow::Error>(())
-        });
+        let mut event_task = tokio::spawn(run_event_coordinator(
+            event_worker,
+            acp_events_rx,
+            checkpoint_rx,
+        ));
 
         loop {
             tokio::select! {
@@ -220,8 +238,14 @@ mod unix {
                     let (stream, _) = accepted.context("accept worker proxy")?;
                     let client_worker = worker.clone();
                     let client_commands = acp_commands_tx.clone();
+                    let client_checkpoints = checkpoint_tx.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = serve_client(stream, client_worker, client_commands).await {
+                        if let Err(error) = serve_client(
+                            stream,
+                            client_worker,
+                            client_commands,
+                            client_checkpoints,
+                        ).await {
                             tracing::warn!(%error, "worker proxy client disconnected");
                         }
                     });
@@ -235,6 +259,99 @@ mod unix {
                     break;
                 }
             }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn run_event_coordinator(
+        worker: Arc<Mutex<DurableWorker>>,
+        mut events: mpsc::UnboundedReceiver<RuntimeEvent>,
+        mut checkpoints: mpsc::UnboundedReceiver<CheckpointBarrier>,
+    ) -> Result<()> {
+        const DRAIN_BATCH: usize = 256;
+
+        let mut activity = ToolActivity::default();
+        let mut pending = VecDeque::new();
+        let mut checkpoints_open = true;
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    let Some(event) = event else { return Ok(()) };
+                    record_runtime_event(&worker, &mut activity, &event)?;
+                }
+                checkpoint = checkpoints.recv(), if checkpoints_open => {
+                    match checkpoint {
+                        Some(checkpoint) => pending.push_back(checkpoint),
+                        None => checkpoints_open = false,
+                    }
+                }
+            }
+
+            let mut drained = 0;
+            loop {
+                match events.try_recv() {
+                    Ok(event) => {
+                        record_runtime_event(&worker, &mut activity, &event)?;
+                        drained += 1;
+                        if drained == DRAIN_BATCH {
+                            drained = 0;
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
+                }
+            }
+
+            if activity.is_quiescent() {
+                while let Some(checkpoint) = pending.pop_front() {
+                    if checkpoint.response.is_closed() {
+                        continue;
+                    }
+                    let response = worker
+                        .lock()
+                        .expect("worker state lock poisoned")
+                        .handle(checkpoint.envelope);
+                    let _ = checkpoint.response.send(response);
+                }
+            }
+        }
+    }
+
+    fn record_runtime_event(
+        worker: &Arc<Mutex<DurableWorker>>,
+        activity: &mut ToolActivity,
+        event: &RuntimeEvent,
+    ) -> Result<()> {
+        activity.observe(event);
+        let value = serde_json::to_value(event)?;
+        let mut worker = worker.lock().expect("worker state lock poisoned");
+        if let RuntimeEvent::SessionStarted {
+            native_session_id, ..
+        } = event
+        {
+            worker.record_native_session_started(
+                runtime_event_kind(event),
+                value,
+                native_session_id,
+            )?;
+        } else {
+            worker.record_adapter_event(runtime_event_kind(event), value)?;
+        }
+        match event {
+            RuntimeEvent::PromptFinished { request_id, .. } => {
+                worker.record_turn_completed()?;
+                worker.complete_dispatch(request_id)?;
+            }
+            RuntimeEvent::ConfigApplied { request_id, .. } => {
+                worker.complete_dispatch(request_id)?;
+            }
+            RuntimeEvent::Stopped
+                if worker.snapshot().phase == crate::hel_worker::WorkerPhase::Closing =>
+            {
+                worker.record_closed()?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -259,6 +376,7 @@ mod unix {
         stream: UnixStream,
         worker: Arc<Mutex<DurableWorker>>,
         commands: mpsc::Sender<CommandRequest>,
+        checkpoints: mpsc::UnboundedSender<CheckpointBarrier>,
     ) -> Result<()> {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
@@ -301,6 +419,37 @@ mod unix {
                 write_response(&mut writer, &response).await?;
                 continue;
             }
+            if matches!(
+                request,
+                WorkerRequest::Checkpoint { .. } | WorkerRequest::CheckpointWhenQuiescent { .. }
+            ) {
+                let request_id = envelope.request_id.clone();
+                let protocol_version = envelope.protocol_version;
+                let (response_tx, response_rx) = oneshot::channel();
+                let response = if checkpoints
+                    .send(CheckpointBarrier {
+                        envelope,
+                        response: response_tx,
+                    })
+                    .is_ok()
+                {
+                    response_rx.await.unwrap_or_else(|_| {
+                        runtime_request_error(
+                            request_id,
+                            protocol_version,
+                            "worker event coordinator stopped",
+                        )
+                    })
+                } else {
+                    runtime_request_error(
+                        request_id,
+                        protocol_version,
+                        "worker event coordinator stopped",
+                    )
+                };
+                write_response(&mut writer, &response).await?;
+                continue;
+            }
             let response = worker
                 .lock()
                 .expect("worker state lock poisoned")
@@ -309,6 +458,25 @@ mod unix {
             write_response(&mut writer, &response).await?;
         }
         Ok(())
+    }
+
+    fn runtime_request_error(
+        request_id: String,
+        protocol_version: u32,
+        message: &str,
+    ) -> ResponseEnvelope {
+        ResponseEnvelope {
+            request_id,
+            protocol_version,
+            body: ResponseBody::Error {
+                error: ProtocolError {
+                    code: ErrorCode::Internal,
+                    message: message.into(),
+                    retryable: true,
+                    detail: None,
+                },
+            },
+        }
     }
 
     async fn write_response(
@@ -327,13 +495,17 @@ mod unix {
         text: String,
         commands: &mpsc::Sender<CommandRequest>,
     ) -> ResponseEnvelope {
-        let body = if envelope.protocol_version != PROTOCOL_VERSION {
+        let body = if !(crate::hel_worker::MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION)
+            .contains(&envelope.protocol_version)
+        {
             ResponseBody::Error {
                 error: ProtocolError {
                     code: ErrorCode::IncompatibleProtocol,
                     message: format!(
-                        "request uses protocol {}, worker requires {}",
-                        envelope.protocol_version, PROTOCOL_VERSION
+                        "request uses protocol {}, worker supports {}-{}",
+                        envelope.protocol_version,
+                        crate::hel_worker::MIN_PROTOCOL_VERSION,
+                        PROTOCOL_VERSION
                     ),
                     retryable: false,
                     detail: None,
@@ -369,7 +541,7 @@ mod unix {
         };
         ResponseEnvelope {
             request_id: envelope.request_id,
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: envelope.protocol_version,
             body,
         }
     }
@@ -591,6 +763,10 @@ pub async fn run_acp_supervisor(_spec: AcpSupervisorSpec) -> anyhow::Result<()> 
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use crate::hel_acp;
+    use tokio::sync::{mpsc, oneshot};
 
     fn launch_config(profile_home: &str) -> WorkerLaunchConfig {
         WorkerLaunchConfig {
@@ -604,6 +780,92 @@ mod tests {
             native_session_id: None,
             recover_native_session: true,
         }
+    }
+
+    fn tool_event(id: &str, status: &str) -> hel_acp::RuntimeEvent {
+        hel_acp::RuntimeEvent::SessionUpdate {
+            update: serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": id,
+                "title": id,
+                "status": status,
+            }),
+        }
+    }
+
+    fn tool_update(id: &str, status: &str) -> hel_acp::RuntimeEvent {
+        hel_acp::RuntimeEvent::SessionUpdate {
+            update: serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": id,
+                "status": status,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_waits_for_the_observed_tool_cohort_to_finish() {
+        let temp = tempfile::tempdir().unwrap();
+        let worker = Arc::new(Mutex::new(
+            crate::hel_worker::DurableWorker::open(
+                temp.path(),
+                "018f9dd2-a3b4-7c8d-9000-123456789abc",
+                "1.0.0",
+            )
+            .unwrap(),
+        ));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (checkpoint_tx, checkpoint_rx) = mpsc::unbounded_channel();
+        let coordinator = tokio::spawn(unix::run_event_coordinator(
+            worker.clone(),
+            event_rx,
+            checkpoint_rx,
+        ));
+
+        event_tx.send(tool_event("one", "in_progress")).unwrap();
+        event_tx.send(tool_event("two", "pending")).unwrap();
+        let (response_tx, mut response_rx) = oneshot::channel();
+        checkpoint_tx
+            .send(unix::CheckpointBarrier {
+                envelope: crate::hel_worker::RequestEnvelope {
+                    request_id: "checkpoint-request".into(),
+                    protocol_version: crate::hel_worker::PROTOCOL_VERSION,
+                    request: crate::hel_worker::WorkerRequest::CheckpointWhenQuiescent {
+                        reason: Some("test".into()),
+                    },
+                },
+                response: response_tx,
+            })
+            .unwrap();
+
+        event_tx.send(tool_update("one", "completed")).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut response_rx)
+                .await
+                .is_err(),
+            "one remaining tool call must keep the checkpoint parked"
+        );
+
+        event_tx.send(tool_update("two", "failed")).unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), response_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::hel_worker::ResponseBody::Ok {
+            payload: crate::hel_worker::ResponsePayload::Accepted { seq },
+        } = &response.body
+        else {
+            panic!("checkpoint was not accepted: {response:?}");
+        };
+        assert_eq!(*seq, 5);
+        assert_eq!(
+            worker.lock().unwrap().snapshot().last_checkpoint_seq,
+            Some(5)
+        );
+
+        drop(event_tx);
+        drop(checkpoint_tx);
+        coordinator.await.unwrap().unwrap();
     }
 
     #[test]

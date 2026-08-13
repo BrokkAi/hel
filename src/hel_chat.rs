@@ -1324,7 +1324,7 @@ impl ChatState {
             }
             WorkerEvent::Closing => self.phase = WorkerPhase::Closing,
             WorkerEvent::Closed => self.phase = WorkerPhase::Closed,
-            WorkerEvent::Checkpointed { reason } => self.entries.push(ChatEntry::plain(
+            WorkerEvent::Checkpointed { reason, .. } => self.entries.push(ChatEntry::plain(
                 event.seq,
                 ChatRole::System,
                 reason.as_deref().map_or_else(

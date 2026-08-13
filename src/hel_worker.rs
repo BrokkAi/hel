@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Serialized bytes of events allowed in one replay response, well under
@@ -102,6 +102,9 @@ pub enum WorkerRequest {
     Checkpoint {
         reason: Option<String>,
     },
+    CheckpointWhenQuiescent {
+        reason: Option<String>,
+    },
     Close,
 }
 
@@ -117,7 +120,15 @@ impl WorkerRequest {
             Self::Cancel => "cancel",
             Self::SetConfig { .. } => "set_config",
             Self::Checkpoint { .. } => "checkpoint",
+            Self::CheckpointWhenQuiescent { .. } => "checkpoint_when_quiescent",
             Self::Close => "close",
+        }
+    }
+
+    const fn minimum_protocol(&self) -> u32 {
+        match self {
+            Self::CheckpointWhenQuiescent { .. } => 2,
+            _ => 1,
         }
     }
 
@@ -129,6 +140,7 @@ impl WorkerRequest {
                 | Self::Cancel
                 | Self::SetConfig { .. }
                 | Self::Checkpoint { .. }
+                | Self::CheckpointWhenQuiescent { .. }
                 | Self::Close
         )
     }
@@ -322,6 +334,8 @@ pub enum WorkerEvent {
     },
     Checkpointed {
         reason: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        quiescent: bool,
     },
     Closing,
     Closed,
@@ -329,6 +343,10 @@ pub enum WorkerEvent {
         kind: String,
         payload: Value,
     },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub struct DurableWorker {
@@ -527,7 +545,7 @@ impl DurableWorker {
             ResponseBody::Ok {
                 payload: ResponsePayload::Hello { negotiated, .. },
             } => *negotiated,
-            _ => PROTOCOL_VERSION,
+            _ => envelope.protocol_version,
         };
         ResponseEnvelope {
             request_id,
@@ -563,12 +581,23 @@ impl DurableWorker {
                 },
             });
         }
-        if envelope.protocol_version != PROTOCOL_VERSION {
+        if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&envelope.protocol_version) {
             return Ok(error(
                 ErrorCode::IncompatibleProtocol,
                 format!(
-                    "request uses protocol {}, worker requires {}",
-                    envelope.protocol_version, PROTOCOL_VERSION
+                    "request uses protocol {}, worker supports {}-{}",
+                    envelope.protocol_version, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION
+                ),
+                false,
+            ));
+        }
+        let minimum = envelope.request.minimum_protocol();
+        if envelope.protocol_version < minimum {
+            return Ok(error(
+                ErrorCode::IncompatibleProtocol,
+                format!(
+                    "{} requires worker protocol {minimum}",
+                    envelope.request.method_name()
                 ),
                 false,
             ));
@@ -680,6 +709,20 @@ impl DurableWorker {
                     Some(&envelope.request_id),
                     WorkerEvent::Checkpointed {
                         reason: reason.clone(),
+                        quiescent: false,
+                    },
+                )?;
+                ResponsePayload::Accepted { seq }
+            }
+            WorkerRequest::CheckpointWhenQuiescent { reason } => {
+                if self.snapshot.phase == WorkerPhase::Closed {
+                    return Ok(error(ErrorCode::InvalidState, "worker is closed", false));
+                }
+                let seq = self.append_event(
+                    Some(&envelope.request_id),
+                    WorkerEvent::Checkpointed {
+                        reason: reason.clone(),
+                        quiescent: true,
                     },
                 )?;
                 ResponsePayload::Accepted { seq }
@@ -952,9 +995,17 @@ fn apply_event(snapshot: &mut WorkerSnapshot, event: &SequencedEvent) -> Result<
                 key: key.clone(),
                 value: value.clone(),
             },
-            WorkerEvent::Checkpointed { reason } => WorkerRequest::Checkpoint {
-                reason: reason.clone(),
-            },
+            WorkerEvent::Checkpointed { reason, quiescent } => {
+                if *quiescent {
+                    WorkerRequest::CheckpointWhenQuiescent {
+                        reason: reason.clone(),
+                    }
+                } else {
+                    WorkerRequest::Checkpoint {
+                        reason: reason.clone(),
+                    }
+                }
+            }
             WorkerEvent::Closing => WorkerRequest::Close,
             WorkerEvent::TurnCompleted | WorkerEvent::Closed | WorkerEvent::Adapter { .. } => {
                 bail!("non-controller event carries a request ID")
@@ -1240,16 +1291,17 @@ mod tests {
 
     #[test]
     fn current_v1_wire_shapes_match_frozen_fixtures() {
-        let hello = request(
-            "hello-1",
-            WorkerRequest::Hello {
+        let hello = RequestEnvelope {
+            request_id: "hello-1".into(),
+            protocol_version: 1,
+            request: WorkerRequest::Hello {
                 client_version: "1.2.3".into(),
-                supported: VersionRange::CURRENT,
+                supported: VersionRange { min: 1, max: 1 },
             },
-        );
+        };
         let response = ResponseEnvelope {
             request_id: "hello-1".into(),
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: 1,
             body: ResponseBody::Ok {
                 payload: ResponsePayload::Hello {
                     negotiated: 1,
@@ -1372,6 +1424,35 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn protocol_v1_rejects_quiescent_checkpoint_without_rejecting_legacy_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let quiescent = worker.handle(RequestEnvelope {
+            request_id: "checkpoint-v2".into(),
+            protocol_version: 1,
+            request: WorkerRequest::CheckpointWhenQuiescent { reason: None },
+        });
+        assert!(matches!(
+            quiescent.body,
+            ResponseBody::Error {
+                error: ProtocolError {
+                    code: ErrorCode::IncompatibleProtocol,
+                    retryable: false,
+                    ..
+                }
+            }
+        ));
+
+        let legacy = worker.handle(RequestEnvelope {
+            request_id: "checkpoint-v1".into(),
+            protocol_version: 1,
+            request: WorkerRequest::Checkpoint { reason: None },
+        });
+        assert_eq!(legacy.protocol_version, 1);
+        assert_eq!(accepted(&legacy), 1);
     }
 
     #[test]

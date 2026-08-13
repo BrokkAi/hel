@@ -10,7 +10,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -52,6 +52,8 @@ pub struct CheckpointExportSpec {
     pub harness_home: PathBuf,
     pub workspace_root: PathBuf,
     pub repositories: Vec<CheckpointRepositorySpec>,
+    /// Inclusive canonical event frontier established by the live worker.
+    pub event_sequence: u64,
     pub output_path: PathBuf,
 }
 
@@ -460,7 +462,8 @@ pub fn export_checkpoint_with_git(
     resolved.output_path = resolve_target_path(&resolved.output_path)?;
     let spec = &resolved;
     validate_export_spec(spec)?;
-    let (canonical_events, event_sequence) = collect_canonical_events(&spec.worker_root)?;
+    let canonical_events = collect_canonical_events(&spec.worker_root, spec.event_sequence)?;
+    let event_sequence = spec.event_sequence;
     // A session that never accepted a prompt legitimately has no native
     // harness artifacts yet; requiring them would make an unused session
     // impossible to close cleanly.
@@ -558,11 +561,25 @@ fn events_contain_prompt(canonical_events: &[u8]) -> bool {
     })
 }
 
-fn collect_canonical_events(worker_root: &Path) -> Result<(Vec<u8>, u64)> {
+fn collect_canonical_events(worker_root: &Path, through_sequence: u64) -> Result<Vec<u8>> {
     let path = worker_root.join("events.jsonl");
     let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    let sequence = verify_canonical_payload(&bytes)?;
-    Ok((bytes, sequence))
+    let mut expected = 1_u64;
+    let mut end = 0;
+    for frame in bytes.split_inclusive(|byte| *byte == b'\n') {
+        ensure!(frame.ends_with(b"\n"), "incomplete canonical event frame");
+        let event: SequencedEvent = serde_json::from_slice(&frame[..frame.len() - 1])?;
+        ensure!(event.seq == expected, "canonical event sequence gap");
+        end += frame.len();
+        if event.seq == through_sequence {
+            return Ok(bytes[..end].to_vec());
+        }
+        expected += 1;
+    }
+    bail!(
+        "canonical event frontier {through_sequence} is unavailable; event log ended at {}",
+        expected.saturating_sub(1)
+    )
 }
 
 pub fn collect_native_artifacts(
@@ -1723,6 +1740,7 @@ mod tests {
                     full_history: false,
                     origin_override: None,
                 }],
+                event_sequence: 1,
                 output_path: output.clone(),
             },
             output,
@@ -1774,6 +1792,21 @@ mod tests {
             read_archive_verified(&destination).unwrap().archive_sha256,
             gate.sha256()
         );
+    }
+
+    #[test]
+    fn canonical_checkpoint_payload_stops_at_the_latched_frontier() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        let mut worker = DurableWorker::open(&spec.worker_root, SESSION, "0.1.0").unwrap();
+        worker
+            .record_adapter_event("later", serde_json::json!({"text": "excluded"}))
+            .unwrap();
+
+        let payload = collect_canonical_events(&spec.worker_root, spec.event_sequence).unwrap();
+
+        assert_eq!(verify_canonical_payload(&payload).unwrap(), 1);
+        assert!(!String::from_utf8(payload).unwrap().contains("excluded"));
     }
 
     #[test]

@@ -1445,6 +1445,7 @@ impl Controller {
                         .then(|| format!("hel-local:{}", repository.id)),
                 })
                 .collect(),
+            event_sequence: expected_sequence,
             output_path: target_path(&remote_archive),
         };
         let staging = tempfile::tempdir().context("create checkpoint staging")?;
@@ -1457,9 +1458,9 @@ impl Controller {
         )?;
         let target_checkpoint: crate::hel_checkpoint::TargetCheckpoint =
             serde_json::from_slice(&exported.stdout).context("decode target checkpoint result")?;
-        if target_checkpoint.event_sequence < expected_sequence {
+        if target_checkpoint.event_sequence != expected_sequence {
             bail!(
-                "target checkpoint omitted the checkpoint event {expected_sequence}; ended at {}",
+                "target checkpoint event frontier changed: expected {expected_sequence}, found {}",
                 target_checkpoint.event_sequence
             );
         }
