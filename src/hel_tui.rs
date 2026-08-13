@@ -467,9 +467,7 @@ struct SessionDetail {
 struct CapacityDetail {
     target: DeploymentCapacityTarget,
     usage: Option<DeploymentCapacityUsage>,
-    sampled_at_epoch_seconds: Option<u64>,
     on_demand: bool,
-    failed: bool,
 }
 
 /// Stateful, renderable projection of controller configuration and state.
@@ -664,9 +662,7 @@ impl DashboardState {
                     CapacityDetail {
                         target: target.clone(),
                         usage: None,
-                        sampled_at_epoch_seconds: None,
                         on_demand: false,
-                        failed: false,
                     },
                     |mut detail| {
                         detail.target = target;
@@ -685,19 +681,14 @@ impl DashboardState {
         &mut self,
         target_id: &str,
         result: std::result::Result<Option<DeploymentCapacityUsage>, String>,
-        sampled_at_epoch_seconds: u64,
+        _sampled_at_epoch_seconds: u64,
     ) {
         let Some(detail) = self.capacity_details.get_mut(target_id) else {
             return;
         };
-        match result {
-            Ok(usage) => {
-                detail.on_demand = usage.is_none();
-                detail.usage = usage;
-                detail.sampled_at_epoch_seconds = Some(sampled_at_epoch_seconds);
-                detail.failed = false;
-            }
-            Err(_) => detail.failed = true,
+        if let Ok(usage) = result {
+            detail.on_demand = usage.is_none();
+            detail.usage = usage;
         }
         let affected_targets = detail.target.target_ids.clone();
         let limits = detail
@@ -3980,10 +3971,6 @@ fn checkpoint_time_display(checkpointed_at: &str) -> String {
 }
 
 fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
     let rows = dashboard.capacity_details.values().map(|detail| {
         let capacity = match (&detail.target.kind, &detail.usage) {
             (DeploymentCapacityKind::Host, Some(usage)) => {
@@ -4008,31 +3995,23 @@ fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
             (DeploymentCapacityKind::AwsFleet, None) if detail.on_demand => "on demand".into(),
             _ => "unavailable".into(),
         };
-        let status = match (detail.failed, detail.sampled_at_epoch_seconds) {
-            (true, Some(sampled)) => format!("stale {}", refresh_age(now, sampled)),
-            (true, None) => "unavailable".into(),
-            (false, Some(sampled)) => refresh_age(now, sampled),
-            (false, None) => "sampling…".into(),
-        };
         Row::new([
             detail.target.host.clone(),
             detail.target.target_ids.join(", "),
             capacity,
-            status,
         ])
     });
     let focused = dashboard.focus == Focus::Capacity;
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(18),
-            Constraint::Percentage(30),
+            Constraint::Percentage(22),
             Constraint::Percentage(36),
-            Constraint::Percentage(16),
+            Constraint::Percentage(42),
         ],
     )
     .header(
-        Row::new(["Host / fleet", "Targets", "Capacity", "Sample"])
+        Row::new(["Host / fleet", "Targets", "Capacity"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .row_highlight_style(if focused {
@@ -4046,7 +4025,7 @@ fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         Block::default()
             .borders(Borders::ALL)
             .border_type(focus_border(focused))
-            .title(" Deployment Capacity "),
+            .title(" Capacity in Use "),
     );
     let mut state = TableState::default().with_selected(
         (!dashboard.capacity_details.is_empty()).then_some(dashboard.capacity_index),
@@ -6330,7 +6309,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_pane_renders_grouped_host_load_and_keeps_stale_sample() {
+    fn capacity_pane_renders_grouped_host_load_without_sample_clock() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
         let mut target = test_capacity_target();
         target.target_ids = vec!["podman".into(), "mac-container".into()];
@@ -6363,7 +6342,8 @@ mod tests {
 
         assert!(rendered.contains("podman, mac-container"));
         assert!(rendered.contains("37% CPU · 75% RAM"));
-        assert!(rendered.contains("stale"));
+        assert!(!rendered.contains("Sample"));
+        assert!(!rendered.contains("stale"));
     }
 
     #[test]
@@ -7494,7 +7474,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("╔ Deployment Capacity"));
+        assert!(rendered.contains("╔ Capacity in Use"));
 
         dashboard.handle_key(key(KeyCode::Tab));
         terminal
