@@ -5,7 +5,9 @@ use std::io::{Read, Write};
 use std::path::{Component, Path};
 
 use anyhow::{Context, Result, ensure};
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use flate2::read::GzDecoder;
+#[cfg(unix)]
+use flate2::{Compression, write::GzEncoder};
 
 const MAX_ENTRIES: usize = 1_000_000;
 const MAX_EXPANDED_BYTES: u64 = 50 * 1024 * 1024 * 1024;
@@ -45,6 +47,7 @@ pub fn stream_resource(
     anyhow::bail!("streaming attached resources requires a Unix controller")
 }
 
+#[cfg(unix)]
 fn write_resource_stream(source: &Path, output: impl Write) -> Result<()> {
     let encoder = GzEncoder::new(output, Compression::fast());
     let mut archive = tar::Builder::new(encoder);
@@ -55,6 +58,7 @@ fn write_resource_stream(source: &Path, output: impl Write) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn append_directory<W: Write>(
     archive: &mut tar::Builder<W>,
     root: &Path,
@@ -114,6 +118,7 @@ fn ensure_entry_limit(entries: &usize) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn safe_relative_path<'a>(root: &Path, path: &'a Path) -> Result<&'a Path> {
     let relative = path.strip_prefix(root)?;
     ensure!(
@@ -236,6 +241,7 @@ fn ensure_safe_parent(root: &Path, parent: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn resource_directory_round_trips_through_one_stream() {
         let source = tempfile::tempdir().unwrap();
