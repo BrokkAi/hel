@@ -308,6 +308,8 @@ enum WorkerPollPayload {
         events: Vec<SequencedEvent>,
         phase: WorkerPhase,
         transcript: hel::hel_chat::TranscriptSnapshot,
+        /// These events predate the connection established by this poll.
+        received_while_detached: bool,
     },
     /// The worker failed several consecutive polls; the session needs
     /// attention and a diagnosis.
@@ -1505,6 +1507,7 @@ async fn poll_dashboard_workers(
                                 events,
                                 phase,
                                 transcript,
+                                received_while_detached: false,
                             },
                         })
                         .await
@@ -1563,6 +1566,7 @@ async fn poll_dashboard_workers(
                                     events,
                                     phase,
                                     transcript,
+                                    received_while_detached: true,
                                 },
                             })
                             .await
@@ -1643,6 +1647,7 @@ fn apply_worker_poll_update(
             events,
             phase,
             transcript,
+            received_while_detached,
         } => {
             if let Some(title) = harness_session_title(&events)
                 && let Some(session) = controller.state.sessions.get_mut(&update.session_id)
@@ -1657,6 +1662,7 @@ fn apply_worker_poll_update(
                 &events,
                 phase,
                 current_epoch_seconds(),
+                received_while_detached,
             );
             dashboard.apply_transcript(&update.session_id, transcript);
         }
@@ -2464,6 +2470,7 @@ async fn run_dashboard() -> Result<()> {
                                 &[],
                                 worker.chat.phase(),
                                 current_epoch_seconds(),
+                                false,
                             );
                             dashboard
                                 .apply_transcript(&session_id, worker.chat.transcript_snapshot());

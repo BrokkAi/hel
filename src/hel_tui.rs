@@ -618,14 +618,9 @@ impl DashboardState {
         session_id: &str,
         events: &[SequencedEvent],
         observed_at_epoch_seconds: u64,
+        received_while_detached: bool,
     ) -> bool {
         let mut updated_latest_message = false;
-        let message_is_visible = matches!(self.mode, Mode::Dashboard)
-            && self.focus == Focus::Active
-            && partition_sessions(self.state.sessions.values(), &self.session_details)
-                .0
-                .get(self.session_index)
-                .is_some_and(|session| session.id == session_id);
         let viewed_through = self
             .state
             .sessions
@@ -658,7 +653,7 @@ impl DashboardState {
                                 && detail.last_agent_message_id == message_id;
                             if !continues_message
                                 && event.seq > viewed_through
-                                && !message_is_visible
+                                && received_while_detached
                             {
                                 detail.unread_agent_message_sequences.push(event.seq);
                             }
@@ -698,8 +693,14 @@ impl DashboardState {
         events: &[SequencedEvent],
         phase: WorkerPhase,
         observed_at_epoch_seconds: u64,
+        received_while_detached: bool,
     ) -> bool {
-        let updated = self.apply_worker_events(session_id, events, observed_at_epoch_seconds);
+        let updated = self.apply_worker_events(
+            session_id,
+            events,
+            observed_at_epoch_seconds,
+            received_while_detached,
+        );
         let detail = self
             .session_details
             .entry(session_id.to_string())
@@ -6187,7 +6188,7 @@ mod tests {
         }))
         .unwrap();
         let chat = crate::hel_chat::ChatState::new(&snapshot, events);
-        dashboard.apply_worker_events("session-1", events, 100);
+        dashboard.apply_worker_events("session-1", events, 100, false);
         dashboard.apply_transcript("session-1", chat.transcript_snapshot());
     }
 
@@ -6300,6 +6301,7 @@ mod tests {
             "session-b",
             &[adapter_text_event(1, "agent_message_chunk", "second")],
             100,
+            false,
         );
         assert_eq!(
             ordered_ids(&dashboard),
@@ -6314,6 +6316,7 @@ mod tests {
                 "later thought",
             )],
             200,
+            false,
         );
         assert_eq!(
             ordered_ids(&dashboard),
@@ -6324,6 +6327,7 @@ mod tests {
             "session-a",
             &[adapter_text_event(1, "agent_message_chunk", "newest")],
             300,
+            false,
         );
         assert_eq!(
             ordered_ids(&dashboard),
@@ -6345,6 +6349,7 @@ mod tests {
                 },
             }],
             400,
+            false,
         );
         assert_eq!(
             ordered_ids(&dashboard),
@@ -6353,7 +6358,7 @@ mod tests {
     }
 
     #[test]
-    fn unread_badge_counts_messages_not_chunks_and_clears_through_viewed_sequence() {
+    fn messages_recovered_after_attach_are_unread_by_message_not_chunk() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
@@ -6367,6 +6372,7 @@ mod tests {
                 adapter_text_event(4, "agent_message_chunk", "second message"),
             ],
             100,
+            true,
         );
 
         let detail = dashboard.session_details.get("session-1").unwrap();
@@ -6407,7 +6413,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_active_session_treats_incoming_messages_as_already_read() {
+    fn messages_received_while_attached_are_read_regardless_of_dashboard_focus() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
@@ -6420,6 +6426,7 @@ mod tests {
                 "visible response",
             )],
             100,
+            false,
         );
 
         assert!(
@@ -6436,10 +6443,12 @@ mod tests {
                 adapter_text_event(3, "agent_message_chunk", "hidden response"),
             ],
             101,
+            false,
         );
-        assert_eq!(
-            dashboard.session_details["session-1"].unread_agent_message_sequences,
-            [3]
+        assert!(
+            dashboard.session_details["session-1"]
+                .unread_agent_message_sequences
+                .is_empty()
         );
     }
 
@@ -6457,6 +6466,7 @@ mod tests {
                 "hidden response",
             )],
             100,
+            true,
         );
         let mut terminal = Terminal::new(TestBackend::new(140, 28)).expect("terminal");
         terminal
@@ -6511,6 +6521,7 @@ mod tests {
                 adapter_text_event(4, "agent_message_chunk", "3 directly."),
             ],
             100,
+            false,
         );
 
         assert_eq!(
@@ -6854,6 +6865,7 @@ mod tests {
             "session-1",
             &[adapter_text_event(1, "agent_message_chunk", "hello")],
             1,
+            false,
         );
         assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
         assert!(matches!(
@@ -8104,6 +8116,7 @@ mod tests {
             "session-1",
             &[adapter_text_event(1, "agent_message_chunk", "updated")],
             100,
+            false,
         ));
         assert!(!dashboard.apply_worker_events(
             "session-1",
@@ -8113,6 +8126,7 @@ mod tests {
                 "not a message"
             )],
             101,
+            false,
         ));
     }
 
@@ -8140,6 +8154,7 @@ mod tests {
                 adapter_text_event(3, "agent_thought_chunk", "later thought"),
             ],
             100,
+            false,
         );
         assert_eq!(
             dashboard.session_details["session-1"]
@@ -8326,6 +8341,7 @@ mod tests {
                     "one\ntwo\nthree\nfour",
                 )],
                 100,
+                false,
             );
         }
         let backend = TestBackend::new(120, 36);
@@ -8538,7 +8554,7 @@ mod tests {
             },
         };
 
-        dashboard.apply_worker_update("session-1", &[prompt], WorkerPhase::Idle, 1_000);
+        dashboard.apply_worker_update("session-1", &[prompt], WorkerPhase::Idle, 1_000, false);
 
         assert_eq!(
             dashboard.session_details["session-1"].current_turn_started_at,
@@ -8550,7 +8566,7 @@ mod tests {
     fn checked_in_running_worker_starts_clock_without_unseen_events() {
         let mut dashboard = dashboard_with_session(archived_session());
 
-        dashboard.apply_worker_update("session-1", &[], WorkerPhase::Running, 1_000);
+        dashboard.apply_worker_update("session-1", &[], WorkerPhase::Running, 1_000, false);
 
         assert_eq!(
             dashboard.session_details["session-1"].current_turn_started_at,
