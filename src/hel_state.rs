@@ -470,35 +470,8 @@ pub fn harness_session_title(events: &[SequencedEvent]) -> Option<String> {
 }
 
 pub(crate) fn normalize_session_title(title: &str) -> Option<String> {
-    const MAX_TITLE_CHARS: usize = 64;
-
-    let words = title.split_whitespace().collect::<Vec<_>>();
-    if words.is_empty() {
-        return None;
-    }
-    let normalized = words.join(" ");
-    if normalized.chars().count() <= MAX_TITLE_CHARS {
-        return Some(normalized);
-    }
-
-    let mut truncated = String::new();
-    for word in words {
-        let separator = (!truncated.is_empty()).then_some(' ');
-        let candidate_len =
-            truncated.chars().count() + usize::from(separator.is_some()) + word.chars().count() + 1;
-        if candidate_len > MAX_TITLE_CHARS {
-            break;
-        }
-        if let Some(separator) = separator {
-            truncated.push(separator);
-        }
-        truncated.push_str(word);
-    }
-    if truncated.is_empty() {
-        truncated = normalized.chars().take(MAX_TITLE_CHARS - 1).collect();
-    }
-    truncated.push('…');
-    Some(truncated)
+    let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 #[cfg(test)]
@@ -746,9 +719,9 @@ mod tests {
     }
 
     #[test]
-    fn extension_session_title_is_cleaned_and_truncated() {
+    fn extension_session_title_is_cleaned_without_losing_available_text() {
         let first_prompt = format!("{}overflow", "word ".repeat(20));
-        let expected = format!("{}word…", "word ".repeat(11));
+        let expected = first_prompt.trim().to_string();
         let events = vec![
             SequencedEvent {
                 seq: 1,
@@ -797,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn harness_titles_are_single_line_and_truncated_at_word_boundaries() {
+    fn harness_titles_are_normalized_to_one_complete_line() {
         let events = vec![SequencedEvent {
             seq: 1,
             request_id: None,
@@ -815,7 +788,9 @@ mod tests {
 
         assert_eq!(
             harness_session_title(&events).as_deref(),
-            Some("first second third fourth fifth sixth seventh eighth ninth…")
+            Some(
+                "first second third fourth fifth sixth seventh eighth ninth tenth eleventh twelfth thirteenth"
+            )
         );
     }
 

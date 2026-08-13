@@ -4043,8 +4043,8 @@ fn session_column_constraints() -> [Constraint; 6] {
 fn archived_session_column_constraints() -> [Constraint; 4] {
     [
         Constraint::Length(14),
-        Constraint::Length(14),
-        Constraint::Length(17),
+        Constraint::Length(15),
+        Constraint::Length(7),
         Constraint::Min(18),
     ]
 }
@@ -7934,6 +7934,48 @@ mod tests {
         assert!(rendered.contains("26-08-09 01:00"));
         assert!(!rendered.contains("2026-08-09T01:00:00Z"));
         assert!(!rendered.contains("idle"));
+    }
+
+    #[test]
+    fn archived_columns_leave_all_remaining_width_for_the_complete_session_name() {
+        let long_name =
+            "A session name that is deliberately longer than sixty-four characters but still fits";
+        let mut session = archived_session();
+        session.acp_session_title = Some(long_name.into());
+        let mut dashboard = dashboard_with_session(session);
+        let mut terminal = Terminal::new(TestBackend::new(160, 36)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let buffer = terminal.backend().buffer();
+        let lines = (buffer.area.y..buffer.area.bottom())
+            .map(|y| {
+                (buffer.area.x..buffer.area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let header = lines
+            .iter()
+            .find(|line| {
+                line.contains("Profile")
+                    && line.contains("Archived")
+                    && line.contains("Session name")
+            })
+            .expect("archived header");
+        let profile = header.find("Profile").unwrap();
+        let archived = header.find("Archived").unwrap();
+        let archive = header[archived + "Archived".len()..]
+            .find("Archive")
+            .map(|offset| offset + archived + "Archived".len())
+            .unwrap();
+        let session_name = header.find("Session name").unwrap();
+
+        assert_eq!(archived - profile, 15);
+        assert_eq!(archive - archived, 16);
+        assert_eq!(session_name - archive, 8);
+        assert!(lines.iter().any(|line| line.contains(long_name)));
     }
 
     #[test]

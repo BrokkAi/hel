@@ -2370,10 +2370,9 @@ async fn run_dashboard() -> Result<()> {
                             .mark_session_viewed_through(&session_id, last_seen_event_sequence);
                         dashboard.set_state(controller.state.clone());
                         match read_result {
-                            Ok(()) => dashboard
-                                .set_notice(format!("Detached from {}", short_id(&session_id))),
+                            Ok(()) => dashboard.clear_notice(),
                             Err(error) => dashboard.set_notice(format!(
-                                "Detached from {}; could not save read status: {error:#}",
+                                "Could not save read status for {}: {error:#}",
                                 short_id(&session_id)
                             )),
                         }
