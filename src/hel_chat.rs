@@ -290,6 +290,8 @@ pub struct ChatState {
     command_choices: Vec<CommandChoice>,
     model_values: Vec<ConfigValueChoice>,
     effort_values: Vec<ConfigValueChoice>,
+    current_model: Option<String>,
+    current_effort: Option<String>,
     autocomplete: Option<Autocomplete>,
     scroll_top: usize,
     follow_bottom: bool,
@@ -323,6 +325,16 @@ impl ChatState {
             command_choices: builtin_command_choices(),
             model_values: Vec::new(),
             effort_values: Vec::new(),
+            current_model: snapshot
+                .config
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            current_effort: snapshot
+                .config
+                .get("effort")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             autocomplete: None,
             scroll_top: 0,
             follow_bottom: true,
@@ -884,6 +896,8 @@ impl ChatState {
     }
 
     fn set_config_options(&mut self, options: &[SessionConfigOption]) {
+        self.current_model = config_current_value(options, "model");
+        self.current_effort = config_current_value(options, "effort");
         self.model_values = config_values(options, "model");
         self.effort_values = config_values(options, "effort");
         self.update_autocomplete();
@@ -1170,7 +1184,9 @@ impl ChatState {
                 KeyCode::Char('y') => self.yank(),
                 KeyCode::Char('j') | KeyCode::Char('m') => self.insert_character('\n'),
                 KeyCode::Char('p') => {
-                    if self.input.is_empty() || self.history_index.is_some() {
+                    if self.input.is_empty() && !self.queued_prompts.is_empty() {
+                        self.edit_latest_queued_prompt();
+                    } else if self.input.is_empty() || self.history_index.is_some() {
                         self.move_history(-1);
                     } else {
                         self.move_vertical(-1);
@@ -1259,7 +1275,9 @@ impl ChatState {
                 ChatAction::None
             }
             KeyCode::Up => {
-                if self.input.is_empty() || self.history_index.is_some() {
+                if self.input.is_empty() && !self.queued_prompts.is_empty() {
+                    self.edit_latest_queued_prompt();
+                } else if self.input.is_empty() || self.history_index.is_some() {
                     self.move_history(-1);
                 } else {
                     self.move_vertical(-1);
@@ -1632,8 +1650,11 @@ fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> {
     Some((command, args))
 }
 
-fn config_values(options: &[SessionConfigOption], key: &str) -> Vec<ConfigValueChoice> {
-    let option = match key {
+fn find_config_option<'a>(
+    options: &'a [SessionConfigOption],
+    key: &str,
+) -> Option<&'a SessionConfigOption> {
+    match key {
         "model" => options
             .iter()
             .find(|option| option.id.to_string() == "model")
@@ -1658,7 +1679,19 @@ fn config_values(options: &[SessionConfigOption], key: &str) -> Vec<ConfigValueC
                 })
             }),
         _ => None,
+    }
+}
+
+fn config_current_value(options: &[SessionConfigOption], key: &str) -> Option<String> {
+    let option = find_config_option(options, key)?;
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return None;
     };
+    Some(select.current_value.to_string())
+}
+
+fn config_values(options: &[SessionConfigOption], key: &str) -> Vec<ConfigValueChoice> {
+    let option = find_config_option(options, key);
     let Some(option) = option else {
         return Vec::new();
     };
@@ -1963,13 +1996,7 @@ pub async fn run_chat(
 }
 
 pub fn render(frame: &mut Frame, chat: &mut ChatState) {
-    let area = frame.area();
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" HEL / {} ", short_id(&chat.session_id)))
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
+    let inner = frame.area();
     let visible_queued = chat.queued_prompts.len().min(3) as u16;
     let prompt_width = usize::from(inner.width.saturating_sub(2)).max(1);
     let input_rows = input_visual_rows(&chat.input, prompt_width) as u16;
@@ -1989,20 +2016,7 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
         .split(inner);
     render_transcript(frame, chunks[0], chat);
     let queued = chat.queued_prompts.len();
-    let prompt_title = if chat.recovery_busy {
-        format!(" Saving recovery copy… · {queued} queued ")
-    } else {
-        match (chat.phase, queued) {
-            (WorkerPhase::Idle, 0) => " Prompt ".to_owned(),
-            (WorkerPhase::Idle, queued) => format!(" Prompt · {queued} queued "),
-            (WorkerPhase::Running, 0) => " Running · Esc cancels ".to_owned(),
-            (WorkerPhase::Running, queued) => {
-                format!(" Running · {queued} queued · Esc cancels ")
-            }
-            (WorkerPhase::Closing, _) => " Closing ".to_owned(),
-            (WorkerPhase::Closed, _) => " Closed ".to_owned(),
-        }
-    };
+    let prompt_title = prompt_title(chat, queued);
     let prompt_block = Block::default().borders(Borders::ALL).title(prompt_title);
     let prompt_inner = prompt_block.inner(chunks[1]);
     let mut prompt_lines = chat
@@ -2058,6 +2072,8 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
     }
     let default_footer = if chat.voice_active {
         "Listening… Alt-V stop · Ctrl-G dashboard"
+    } else if !chat.queued_prompts.is_empty() {
+        "Up/Ctrl-P edit last queued · Enter send/queue · Shift-Enter newline · Ctrl-R history · Esc cancel · Ctrl-G dashboard"
     } else {
         "Enter send/queue · Shift-Enter newline · Ctrl-R history · Ctrl-T transcript · Esc cancel · Ctrl-G dashboard"
     };
@@ -2081,6 +2097,35 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
         ));
     }
     render_autocomplete(frame, chunks[1], chat);
+}
+
+fn prompt_title(chat: &ChatState, queued: usize) -> String {
+    let mut parts = [
+        chat.current_model.as_deref(),
+        chat.current_effort.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    if chat.recovery_busy {
+        parts.push("Saving recovery copy…".into());
+        parts.push(format!("{queued} queued"));
+    } else {
+        match chat.phase {
+            WorkerPhase::Idle => parts.push("Prompt".into()),
+            WorkerPhase::Running => parts.push("Running".into()),
+            WorkerPhase::Closing => parts.push("Closing".into()),
+            WorkerPhase::Closed => parts.push("Closed".into()),
+        }
+        if queued > 0 {
+            parts.push(format!("{queued} queued"));
+        }
+        if chat.phase == WorkerPhase::Running {
+            parts.push("Esc cancels".into());
+        }
+    }
+    format!(" {} ", parts.join(" · "))
 }
 
 fn set_input_cursor(
@@ -2697,14 +2742,11 @@ fn line_is_empty(line: &Line<'_>) -> bool {
     line.spans.iter().all(|span| span.content.trim().is_empty())
 }
 
-fn short_id(id: &str) -> &str {
-    id.get(..8).unwrap_or(id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hel_worker::{ActivePrompt, WorkerSnapshot};
+    use ratatui::backend::TestBackend;
 
     fn snapshot() -> WorkerSnapshot {
         serde_json::from_value(serde_json::json!({
@@ -2955,6 +2997,33 @@ mod tests {
     }
 
     #[test]
+    fn up_and_control_p_peel_queued_prompts_back_into_the_editor() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        for text in ["first", "second", "third"] {
+            chat.queued_prompts
+                .push_back(QueuedPrompt { text: text.into() });
+        }
+
+        chat.handle_key(key(KeyCode::Up));
+        assert_eq!(chat.input, "third");
+        assert_eq!(chat.queued_prompts.len(), 2);
+
+        chat.clear_input();
+        chat.handle_key(ctrl('p'));
+        assert_eq!(chat.input, "second");
+        assert_eq!(chat.queued_prompts.len(), 1);
+
+        chat.clear_input();
+        chat.handle_key(key(KeyCode::Up));
+        assert_eq!(chat.input, "first");
+        assert!(chat.queued_prompts.is_empty());
+
+        chat.clear_input();
+        chat.handle_key(key(KeyCode::Up));
+        assert!(chat.input.is_empty());
+    }
+
+    #[test]
     fn model_and_effort_slash_commands_change_live_session_config() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.input = "/model gpt-5.6-luna".into();
@@ -2974,6 +3043,53 @@ mod tests {
                 value: "xhigh".into(),
             }
         );
+    }
+
+    #[test]
+    fn composer_title_shows_live_model_and_effort_without_outer_session_frame() {
+        use agent_client_protocol::schema::v1::{
+            SessionConfigSelectOption, SessionConfigSelectOptions,
+        };
+
+        let options = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "gpt-5.6-sol",
+                SessionConfigSelectOptions::Ungrouped(vec![SessionConfigSelectOption::new(
+                    "gpt-5.6-sol",
+                    "Sol",
+                )]),
+            )
+            .category(SessionConfigOptionCategory::Model),
+            SessionConfigOption::select(
+                "effort",
+                "Effort",
+                "high",
+                SessionConfigSelectOptions::Ungrouped(vec![SessionConfigSelectOption::new(
+                    "high", "High",
+                )]),
+            )
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+        ];
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.phase = WorkerPhase::Running;
+        chat.set_config_options(&options);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut chat))
+            .expect("draw chat");
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("gpt-5.6-sol · high · Running · Esc cancels"));
+        assert!(!rendered.contains("HEL /"));
+        assert_ne!(buffer[(buffer.area.x, buffer.area.y)].symbol(), "┌");
     }
 
     #[test]
