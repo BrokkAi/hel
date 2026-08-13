@@ -237,11 +237,10 @@ fn ensure_safe_parent(root: &Path, parent: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn resource_directory_round_trips_through_one_stream() {
         let source = tempfile::tempdir().unwrap();
@@ -263,7 +262,6 @@ mod tests {
         assert!(destination.join("empty").is_dir());
     }
 
-    #[cfg(unix)]
     #[test]
     fn resource_streams_reject_symbolic_links() {
         use std::os::unix::fs::symlink;
