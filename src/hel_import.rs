@@ -462,8 +462,7 @@ fn codex_indexed_sessions(home: &Path) -> Result<Option<Vec<LocatedCodexSession>
            AND source IN ('cli', 'vscode') \
            AND preview <> '' \
            AND rollout_path IS NOT NULL \
-         ORDER BY updated_at DESC, id DESC \
-         LIMIT 25"
+         ORDER BY updated_at DESC, id DESC"
     );
     let Ok(mut statement) = connection.prepare(&query) else {
         return Ok(None);
@@ -3304,7 +3303,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_listing_uses_native_index_order_limit_and_persisted_threads() {
+    fn codex_listing_uses_native_index_order_and_includes_all_persisted_threads() {
         let directory = tempfile::tempdir().unwrap();
         let sessions = directory.path().join("sessions");
         fs::create_dir_all(&sessions).unwrap();
@@ -3358,11 +3357,11 @@ mod tests {
         drop(connection);
 
         let listed = list_codex_sessions(directory.path()).unwrap();
-        assert_eq!(listed.len(), 25);
+        assert_eq!(listed.len(), 30);
         assert_eq!(listed[0].title, "Explicit newest title");
         assert_eq!(listed[0].history_mode, CodexHistoryMode::Paginated);
         assert!(listed[0].modified_at > listed[1].modified_at);
-        assert_eq!(listed[24].title, "Generated 5");
+        assert_eq!(listed[29].title, "Generated 0");
         assert!(listed.iter().all(|session| session.title != "Ephemeral"));
     }
 
