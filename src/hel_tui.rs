@@ -1054,7 +1054,7 @@ impl DashboardState {
                 DashboardAction::None
             }
             (KeyCode::Char('n'), true) => self.begin_new(),
-            (KeyCode::Char('i'), true) => DashboardAction::OpenImport,
+            (KeyCode::Char('i') | KeyCode::Char('t'), true) => DashboardAction::OpenImport,
             (KeyCode::Char('r'), true) => {
                 if self.focus == Focus::Quotas {
                     DashboardAction::RefreshQuotas
@@ -4538,13 +4538,13 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     };
     let actions = match dashboard.focus {
         Focus::Active => {
-            "[N]ew · [I]mport · [R]ename · [P]ause · [D]elete · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · impor[T] · [R]ename · [P]ause · [D]elete · [U]pdate quotas · [Q]uit · Tab pane"
         }
         Focus::Archived => {
-            "[N]ew · [I]mport · [R]ename · [D]elete permanently · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · impor[T] · [R]ename · [D]elete permanently · [U]pdate quotas · [Q]uit · Tab pane"
         }
-        Focus::Capacity => "[N]ew · [I]mport · [U]pdate quotas · [Q]uit · Tab pane",
-        Focus::Quotas => "[N]ew · [I]mport · [R]efresh · [U]pdate quotas · [Q]uit · Tab pane",
+        Focus::Capacity => "[N]ew · impor[T] · [U]pdate quotas · [Q]uit · Tab pane",
+        Focus::Quotas => "[N]ew · impor[T] · [R]efresh · [U]pdate quotas · [Q]uit · Tab pane",
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -5949,6 +5949,10 @@ mod tests {
         assert_eq!(
             dashboard.handle_key(ctrl_key('u')),
             DashboardAction::RefreshQuotas
+        );
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('t')),
+            DashboardAction::OpenImport
         );
         assert_eq!(
             dashboard.handle_key(ctrl_key('q')),
