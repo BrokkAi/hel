@@ -245,6 +245,13 @@ sizing uses runtime flags with the same image. EC2 sizing discovers the launch
 template's instance family and passes an instance-type override while retaining
 the same launch template and AMI.
 
+New and resumed sessions can also attach resource directories. Container
+targets expose them with the runtime's isolated mount mode. EC2 targets create
+one deflated ZIP per directory on the controller, transfer that single archive
+over SCP, and extract it with the installed Hel worker under the selected
+destination. Symbolic links are rejected so an attachment cannot escape its
+source or destination tree.
+
 The first-run dialog intentionally creates one local target and, when started
 inside a GitHub checkout, one-repository bundle. Advanced configurations remain
 TOML-first: edit `config.toml` directly to add profiles, multi-repository virtual
@@ -256,7 +263,7 @@ Checkpoint archives are versioned ZIPs containing a manifest, a canonical
 event stream, allowlisted native harness artifacts, and Git state for every
 repository (committed bundle, staged and unstaged patches, and untracked
 files). Every payload is SHA-256 verified after the archive is atomically
-installed. Normal Close refuses teardown if that verification fails; explicit
+installed. Normal Archive refuses teardown if that verification fails; explicit
 force-destroy is the data-loss escape hatch.
 
 Hel is licensed under `GPL-3.0-only`.

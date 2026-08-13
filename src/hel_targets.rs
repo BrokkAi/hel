@@ -125,10 +125,11 @@ pub struct DeploymentCapacityUsage {
     pub disk_total_bytes: Option<u64>,
 }
 
-/// An additional host directory made available to a single container session.
+/// An additional directory made available to one session.
 ///
-/// The runtime selects the isolation mode: Podman uses a copy-on-write overlay
-/// mount while Apple Container receives a read-only bind mount.
+/// Containers use isolated mounts. Remote targets may instead receive a
+/// controller-packed snapshot at the destination while retaining this shared
+/// persisted shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdditionalMount {

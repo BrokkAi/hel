@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
@@ -364,13 +364,15 @@ impl Controller {
             .get(target_id)
             .with_context(|| format!("unknown target template {target_id:?}"))?;
         match target {
-            TargetTemplate::LocalPodman { .. } | TargetTemplate::AppleContainer { .. } => {
-                Ok(hel_targets::local_directory_completions(prefix))
-            }
+            TargetTemplate::LocalPodman { .. }
+            | TargetTemplate::AppleContainer { .. }
+            | TargetTemplate::AwsEc2 { .. } => Ok(hel_targets::local_directory_completions(prefix)),
             TargetTemplate::SshPodman { ssh, .. } => {
                 hel_targets::ssh_directory_completions(&backend_ssh(ssh), prefix, executor)
             }
-            _ => bail!("mount path completion requires a container-backed target"),
+            TargetTemplate::SshBare { .. } => {
+                bail!("resource path completion is unsupported for bare SSH targets")
+            }
         }
     }
 
@@ -465,7 +467,7 @@ impl Controller {
             .with_context(|| format!("unknown target template {target_id:?}"))?;
         validate_resource_allocation(template, resource_allocation.as_ref())?;
         if !additional_mounts.is_empty() && mount_history_host(template).is_none() {
-            bail!("additional mounts require a container-backed target");
+            bail!("attached resources are unsupported for this target");
         }
         hel_targets::validate_additional_mounts(&additional_mounts)?;
         let id = new_session_id()?;
@@ -566,6 +568,15 @@ impl Controller {
             .targets
             .get(&session.target_template_id)
             .context("target template disappeared during provisioning")?;
+        if matches!(template, TargetTemplate::AwsEc2 { .. }) {
+            for resource in &session.additional_mounts {
+                ensure!(
+                    resource.source.is_dir(),
+                    "attached resource source is not a directory: {}",
+                    resource.source.display()
+                );
+            }
+        }
         let bundle = self
             .config
             .bundles
@@ -573,8 +584,12 @@ impl Controller {
             .context("project bundle disappeared during provisioning")?;
         let target = backend_target(template, session.resource_allocation.as_ref())?;
         let bundle = backend_bundle(bundle)?;
-        let provision =
-            hel_targets::provision_plan(&target, session_id, &bundle, &session.additional_mounts)?;
+        let runtime_mounts = if matches!(target, hel_targets::TargetTemplate::AwsEc2(_)) {
+            &[][..]
+        } else {
+            session.additional_mounts.as_slice()
+        };
+        let provision = hel_targets::provision_plan(&target, session_id, &bundle, runtime_mounts)?;
 
         let result =
             preflight_target(template, executor).and_then(|()| provision.execute(executor));
@@ -648,6 +663,7 @@ impl Controller {
         executor: &impl CommandExecutor,
     ) -> Result<Option<String>> {
         let (backend, worker_root) = self.prepare_worker_files(session_id, executor, true)?;
+        install_attached_resources(&self.state, session_id, &backend, &worker_root, executor)?;
         self.connect_local_repositories(session_id, &backend, &worker_root, executor)?;
         start_worker(executor, &backend, &worker_root)?;
         match handshake_worker(&hel_targets::reconnect_plan(&backend, session_id)?.commands[0])
@@ -702,6 +718,17 @@ impl Controller {
             }
         };
         let workspace = workspace_paths(&backend, bundle, session_id)?;
+        let mut additional_directories = workspace
+            .1
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        additional_directories.extend(
+            session
+                .additional_mounts
+                .iter()
+                .map(|resource| resource.destination.clone()),
+        );
         let (bridge_command, bridge_args) =
             bridge_launch(profile.kind, profile.executable.as_deref());
         let mut environment = profile.environment.clone();
@@ -713,7 +740,7 @@ impl Controller {
             bridge_args,
             environment,
             cwd: PathBuf::from(&workspace.0),
-            additional_directories: workspace.1.into_iter().map(PathBuf::from).collect(),
+            additional_directories,
             native_session_id: session.native_session_id.clone(),
             recover_native_session,
         };
@@ -1026,6 +1053,24 @@ impl Controller {
         target_id: &str,
         resource_allocation: Option<SessionResourceAllocation>,
     ) -> Result<()> {
+        self.resume_session_with_options(
+            session_id,
+            profile_id,
+            target_id,
+            None,
+            resource_allocation,
+        )
+        .await
+    }
+
+    pub async fn resume_session_with_options(
+        &mut self,
+        session_id: &str,
+        profile_id: &str,
+        target_id: &str,
+        additional_mounts: Option<Vec<AdditionalMount>>,
+        resource_allocation: Option<SessionResourceAllocation>,
+    ) -> Result<()> {
         let previous = self
             .state
             .sessions
@@ -1056,10 +1101,15 @@ impl Controller {
             .with_context(|| format!("unknown target template {target_id:?}"))?;
         let resource_allocation =
             resource_allocation.or_else(|| previous.resource_allocation.clone());
+        let additional_mounts =
+            additional_mounts.unwrap_or_else(|| previous.additional_mounts.clone());
         validate_resource_allocation(target_template, resource_allocation.as_ref())?;
-        if !previous.additional_mounts.is_empty() && mount_history_host(target_template).is_none() {
-            bail!("resuming a session with additional mounts requires a container-backed target");
+        if !additional_mounts.is_empty() && mount_history_host(target_template).is_none() {
+            bail!("attached resources are unsupported for this target");
         }
+        hel_targets::validate_additional_mounts(&additional_mounts)?;
+        let history_host = mount_history_host(target_template);
+        let history_mounts = additional_mounts.clone();
         if previous.state == SessionState::Error
             && let Some(locator) = &previous.target
         {
@@ -1081,12 +1131,16 @@ impl Controller {
         record.last_profile = profile_id.to_string();
         record.target_template_id = target_id.to_string();
         record.resource_allocation = resource_allocation;
+        record.additional_mounts = additional_mounts;
         record.target = None;
         record.native_session_id =
             same_harness.then(|| archive.manifest.session.native_session_id.clone());
         record.state = SessionState::Provisioning;
         record.updated_at = now();
         record.last_error = None;
+        if let Some(host) = history_host {
+            self.state.remember_mount_sources(&host, &history_mounts);
+        }
         self.state.save()?;
 
         let result = async {
@@ -1136,6 +1190,13 @@ impl Controller {
             execute_checked(
                 &ProcessExecutor,
                 restore_command(&backend, session_id, &remote_spec)?,
+            )?;
+            install_attached_resources(
+                &self.state,
+                session_id,
+                &backend,
+                &worker_root,
+                &ProcessExecutor,
             )?;
             self.connect_local_repositories(
                 session_id,
@@ -2381,11 +2442,11 @@ fn backend_target(
 
 fn mount_history_host(template: &TargetTemplate) -> Option<String> {
     match template {
-        TargetTemplate::LocalPodman { .. } | TargetTemplate::AppleContainer { .. } => {
-            Some("local".into())
-        }
+        TargetTemplate::LocalPodman { .. }
+        | TargetTemplate::AppleContainer { .. }
+        | TargetTemplate::AwsEc2 { .. } => Some("local".into()),
         TargetTemplate::SshPodman { ssh, .. } => Some(ssh.host.clone()),
-        TargetTemplate::AwsEc2 { .. } | TargetTemplate::SshBare { .. } => None,
+        TargetTemplate::SshBare { .. } => None,
     }
 }
 
@@ -2468,6 +2529,62 @@ fn ssh_args_with_identity(args: &[String], identity: Option<&Path>) -> Vec<Strin
         result.push(identity.to_string_lossy().into_owned());
     }
     result
+}
+
+fn install_attached_resources(
+    state: &HelState,
+    session_id: &str,
+    backend: &hel_targets::TargetLocator,
+    worker_root: &str,
+    executor: &impl CommandExecutor,
+) -> Result<()> {
+    let hel_targets::TargetLocator::AwsEc2 { ssh, .. } = backend else {
+        return Ok(());
+    };
+    let session = state
+        .sessions
+        .get(session_id)
+        .with_context(|| format!("unknown session {session_id}"))?;
+    if session.additional_mounts.is_empty() {
+        return Ok(());
+    }
+    let staging = tempfile::tempdir().context("create attached-resource staging")?;
+    for (index, resource) in session.additional_mounts.iter().enumerate() {
+        let archive = staging.path().join(format!("resource-{index}.zip"));
+        crate::hel_resources::write_resource_archive(&resource.source, &archive)
+            .with_context(|| format!("pack attached resource {}", resource.source.display()))?;
+        let remote_archive = format!("{worker_root}/resource-{index}.zip");
+        execute_checked(
+            executor,
+            scp_command_spec(ssh, &archive, &remote_archive, false)
+                .purpose("upload attached resource archive"),
+        )?;
+        let install = hel_targets::command_on_locator(
+            backend,
+            session_id,
+            vec![
+                format!("{worker_root}/hel"),
+                "worker".into(),
+                "install-resource".into(),
+                "--archive".into(),
+                remote_archive.clone(),
+                "--destination".into(),
+                resource.destination.to_string_lossy().into_owned(),
+            ],
+            "install attached resource archive",
+        )?;
+        execute_checked(executor, install)?;
+        execute_checked(
+            executor,
+            hel_targets::command_on_locator(
+                backend,
+                session_id,
+                vec!["rm".into(), "-f".into(), remote_archive],
+                "remove attached resource archive",
+            )?,
+        )?;
+    }
+    Ok(())
 }
 
 /// Best-effort teardown of a freshly created resource whose provisioning
@@ -3808,6 +3925,97 @@ mod tests {
         assert_eq!(cleanup_failed.last_profile, "codex-new");
         assert_eq!(cleanup_failed.target, Some(partial_target));
         assert!(failure.to_string().contains("cleanup"));
+    }
+
+    #[test]
+    fn aws_resources_are_packed_then_uploaded_as_single_archives() {
+        struct RecordingExecutor {
+            commands: RefCell<Vec<CommandSpec>>,
+        }
+        impl CommandExecutor for RecordingExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.commands.borrow_mut().push(command.clone());
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("many/files")).unwrap();
+        std::fs::write(source.path().join("many/files/one"), b"one").unwrap();
+        std::fs::write(source.path().join("many/files/two"), b"two").unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let record = SessionRecord {
+            id: session_id.into(),
+            title: "AWS resources".into(),
+            harness_kind: crate::hel_config::HarnessKind::Codex,
+            last_profile: "codex".into(),
+            bundle_id: "project".into(),
+            target_template_id: "aws".into(),
+            resource_allocation: None,
+            additional_mounts: vec![AdditionalMount {
+                source: source.path().to_path_buf(),
+                destination: "/home/ubuntu/hel-resources/data".into(),
+            }],
+            state: SessionState::Disconnected,
+            target: None,
+            native_session_id: None,
+            acp_session_title: None,
+            session_title_override: None,
+            created_at: "2026-08-12T00:00:00Z".into(),
+            updated_at: "2026-08-12T00:00:00Z".into(),
+            last_viewed_event_sequence: 0,
+            last_error: None,
+            checkpoint: None,
+        };
+        let state = HelState {
+            version: crate::hel_state::STATE_VERSION,
+            sessions: BTreeMap::from([(session_id.into(), record)]),
+            mount_history: BTreeMap::new(),
+        };
+        let backend = hel_targets::TargetLocator::AwsEc2 {
+            profile: "default".into(),
+            region: "us-east-1".into(),
+            instance_id: "i-1234567890abcdef0".into(),
+            ssh: SshTarget {
+                destination: "ubuntu@example.test".into(),
+                ssh_args: Vec::new(),
+            },
+            workspace: format!(".local/share/hel/workspaces/{session_id}"),
+        };
+        let executor = RecordingExecutor {
+            commands: RefCell::new(Vec::new()),
+        };
+
+        install_attached_resources(
+            &state,
+            session_id,
+            &backend,
+            ".local/share/hel/workers/session",
+            &executor,
+        )
+        .unwrap();
+
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0].program, "scp");
+        assert!(!commands[0].args.iter().any(|argument| argument == "-r"));
+        assert!(
+            commands[0]
+                .args
+                .iter()
+                .any(|argument| argument.ends_with(".zip"))
+        );
+        assert!(
+            commands[1]
+                .args
+                .iter()
+                .any(|argument| argument.contains("install-resource"))
+        );
+        assert_eq!(commands[2].purpose, "remove attached resource archive");
     }
 
     #[test]

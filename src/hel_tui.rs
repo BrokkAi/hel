@@ -60,6 +60,7 @@ pub enum DashboardAction {
         session_id: String,
         profile_id: String,
         target_template_id: String,
+        additional_mounts: Vec<AdditionalMount>,
         resource_allocation: Option<SessionResourceAllocation>,
     },
     ResolveAwsResourceOptions {
@@ -175,6 +176,12 @@ impl MountWizard {
             completion_cache: BTreeMap::new(),
         }
     }
+
+    fn with_mounts(history: Vec<std::path::PathBuf>, mounts: Vec<AdditionalMount>) -> Self {
+        let mut wizard = Self::new(history);
+        wizard.mounts = mounts;
+        wizard
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +190,7 @@ struct ResumeWizard {
     step: WizardStep,
     profile: usize,
     target: usize,
+    mounts: MountWizard,
     resource_allocation: Option<SessionResourceAllocation>,
     aws_options: BTreeMap<String, Vec<SessionResourceAllocation>>,
     sizing_error: Option<String>,
@@ -794,7 +802,7 @@ impl DashboardState {
                     session_id: session.id.clone(),
                 })
                 .unwrap_or(DashboardAction::None),
-            KeyCode::Char('c') if self.focus == Focus::Active => {
+            KeyCode::Char('a') if self.focus == Focus::Active => {
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(Confirmation::Close {
                         session_id: session.id.clone(),
@@ -1115,6 +1123,11 @@ impl DashboardState {
     fn handle_mount_key(&mut self, code: KeyCode, mut wizard: NewWizard) -> DashboardAction {
         let target_template_id = nth_key(&self.config.targets, wizard.target);
         match code {
+            KeyCode::Delete if wizard.mounts.field == MountField::Source => {
+                wizard.mounts.mounts.pop();
+                self.mode = Mode::New(wizard);
+                DashboardAction::None
+            }
             KeyCode::Tab if wizard.mounts.field == MountField::Source => {
                 let prefix = wizard.mounts.source.clone();
                 if prefix.is_empty() {
@@ -1194,7 +1207,8 @@ impl DashboardState {
                     self.create_session_action(&wizard)
                 }
                 MountField::Source => {
-                    wizard.mounts.destination = default_mount_destination(
+                    wizard.mounts.destination = default_resource_destination(
+                        &self.config.targets[&target_template_id],
                         std::path::Path::new(&wizard.mounts.source),
                         &wizard.mounts.mounts,
                     )
@@ -1429,29 +1443,34 @@ impl DashboardState {
     /// Apply a completion response only when the source text has not changed
     /// since the request left the UI. Typed input always outranks suggestions.
     pub fn apply_mount_source_completions(&mut self, prefix: &str, candidates: Vec<String>) {
-        let Mode::New(mut wizard) = self.mode.clone() else {
-            return;
-        };
-        if wizard.step != WizardStep::Mounts
-            || wizard.mounts.field != MountField::Source
-            || wizard.mounts.source != prefix
-        {
-            return;
+        match self.mode.clone() {
+            Mode::New(mut wizard)
+                if wizard.step == WizardStep::Mounts
+                    && wizard.mounts.field == MountField::Source
+                    && wizard.mounts.source == prefix =>
+            {
+                apply_mount_completions(&mut wizard.mounts, prefix, candidates);
+                self.mode = Mode::New(wizard);
+            }
+            Mode::Resume(mut wizard)
+                if wizard.step == WizardStep::Mounts
+                    && wizard.mounts.field == MountField::Source
+                    && wizard.mounts.source == prefix =>
+            {
+                apply_mount_completions(&mut wizard.mounts, prefix, candidates);
+                self.mode = Mode::Resume(wizard);
+            }
+            _ => {}
         }
-        wizard
-            .mounts
-            .completion_cache
-            .insert(prefix.to_owned(), candidates.clone());
-        if let Some(completed) = path_completion(prefix, &candidates) {
-            wizard.mounts.source = completed;
-        }
-        self.mode = Mode::New(wizard);
     }
 
     fn handle_resume_key(&mut self, code: KeyCode, mut wizard: ResumeWizard) -> DashboardAction {
         if code == KeyCode::Esc {
             self.cancel_modal();
             return DashboardAction::None;
+        }
+        if wizard.step == WizardStep::Mounts {
+            return self.handle_resume_mount_key(code, wizard);
         }
         let profiles = self.compatible_profiles(&wizard.session_id);
         if wizard.step == WizardStep::Target
@@ -1468,7 +1487,7 @@ impl DashboardState {
             WizardStep::Profile => profiles.len(),
             WizardStep::Target => self.config.targets.len(),
             WizardStep::Bundle => unreachable!("resume does not select a bundle"),
-            WizardStep::Mounts => unreachable!("resume does not select mounts"),
+            WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
             WizardStep::NewBundle => unreachable!("resume does not create bundles"),
         };
         if matches!(code, KeyCode::Up | KeyCode::Char('k')) {
@@ -1499,7 +1518,9 @@ impl DashboardState {
                     self.mode = Mode::Resume(wizard);
                 }
                 WizardStep::Bundle => unreachable!("resume does not select a bundle"),
-                WizardStep::Mounts => unreachable!("resume does not select mounts"),
+                WizardStep::Mounts => {
+                    unreachable!("mount input is handled before picker navigation")
+                }
                 WizardStep::NewBundle => unreachable!("resume does not create bundles"),
             }
             return DashboardAction::None;
@@ -1531,22 +1552,200 @@ impl DashboardState {
                     self.mode = Mode::Resume(wizard);
                     return DashboardAction::None;
                 }
-                let action = DashboardAction::ResumeSession {
-                    session_id: wizard.session_id,
-                    profile_id: profiles
+                if let Some(host) = mount_history_host(&self.config.targets[&target_id]) {
+                    wizard.step = WizardStep::Mounts;
+                    wizard.mounts.history = self
+                        .state
+                        .mount_history
+                        .get(host)
+                        .cloned()
+                        .unwrap_or_default();
+                    wizard.mounts.history_index = 0;
+                    self.mode = Mode::Resume(wizard);
+                    DashboardAction::None
+                } else {
+                    let profile_id = profiles
                         .get(wizard.profile)
                         .map(|(id, _)| (*id).clone())
-                        .expect("resume wizard is only opened with a compatible profile"),
-                    target_template_id: target_id,
-                    resource_allocation: wizard.resource_allocation,
-                };
-                self.cancel_modal();
-                action
+                        .expect("resume wizard is only opened with a compatible profile");
+                    self.resume_session_action(wizard, profile_id)
+                }
             }
             WizardStep::Bundle => unreachable!("resume does not select a bundle"),
-            WizardStep::Mounts => unreachable!("resume does not select mounts"),
+            WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
             WizardStep::NewBundle => unreachable!("resume does not create bundles"),
         }
+    }
+
+    fn handle_resume_mount_key(
+        &mut self,
+        code: KeyCode,
+        mut wizard: ResumeWizard,
+    ) -> DashboardAction {
+        let target_template_id = nth_key(&self.config.targets, wizard.target);
+        match code {
+            KeyCode::Delete if wizard.mounts.field == MountField::Source => {
+                wizard.mounts.mounts.pop();
+                self.mode = Mode::Resume(wizard);
+                DashboardAction::None
+            }
+            KeyCode::Tab if wizard.mounts.field == MountField::Source => {
+                let prefix = wizard.mounts.source.clone();
+                if prefix.is_empty() {
+                    self.mode = Mode::Resume(wizard);
+                    return DashboardAction::None;
+                }
+                if let Some(candidates) = wizard.mounts.completion_cache.get(&prefix) {
+                    if let Some(completed) = path_completion(&prefix, candidates) {
+                        wizard.mounts.source = completed;
+                    }
+                    self.mode = Mode::Resume(wizard);
+                    DashboardAction::None
+                } else {
+                    self.mode = Mode::Resume(wizard);
+                    DashboardAction::CompleteMountSource {
+                        target_template_id,
+                        prefix,
+                    }
+                }
+            }
+            KeyCode::Up
+                if wizard.mounts.field == MountField::Source
+                    && wizard.mounts.source.is_empty()
+                    && !wizard.mounts.history.is_empty() =>
+            {
+                move_index(
+                    &mut wizard.mounts.history_index,
+                    wizard.mounts.history.len(),
+                    -1,
+                );
+                wizard.mounts.source = wizard.mounts.history[wizard.mounts.history_index]
+                    .to_string_lossy()
+                    .into_owned();
+                self.mode = Mode::Resume(wizard);
+                DashboardAction::None
+            }
+            KeyCode::Down
+                if wizard.mounts.field == MountField::Source
+                    && wizard.mounts.source.is_empty()
+                    && !wizard.mounts.history.is_empty() =>
+            {
+                move_index(
+                    &mut wizard.mounts.history_index,
+                    wizard.mounts.history.len(),
+                    1,
+                );
+                wizard.mounts.source = wizard.mounts.history[wizard.mounts.history_index]
+                    .to_string_lossy()
+                    .into_owned();
+                self.mode = Mode::Resume(wizard);
+                DashboardAction::None
+            }
+            KeyCode::Backspace => {
+                match wizard.mounts.field {
+                    MountField::Source if !wizard.mounts.source.is_empty() => {
+                        wizard.mounts.source.pop();
+                    }
+                    MountField::Source => wizard.step = WizardStep::Target,
+                    MountField::Destination if !wizard.mounts.destination.is_empty() => {
+                        wizard.mounts.destination.pop();
+                    }
+                    MountField::Destination => wizard.mounts.field = MountField::Source,
+                }
+                self.mode = Mode::Resume(wizard);
+                DashboardAction::None
+            }
+            KeyCode::Left => {
+                match wizard.mounts.field {
+                    MountField::Source => wizard.step = WizardStep::Target,
+                    MountField::Destination => wizard.mounts.field = MountField::Source,
+                }
+                self.mode = Mode::Resume(wizard);
+                DashboardAction::None
+            }
+            KeyCode::Enter | KeyCode::Right => match wizard.mounts.field {
+                MountField::Source if wizard.mounts.source.is_empty() => {
+                    let profile_id = self
+                        .compatible_profiles(&wizard.session_id)
+                        .get(wizard.profile)
+                        .map(|(id, _)| (*id).clone())
+                        .expect("resume wizard is only opened with a compatible profile");
+                    self.resume_session_action(wizard, profile_id)
+                }
+                MountField::Source => {
+                    wizard.mounts.destination = default_resource_destination(
+                        &self.config.targets[&target_template_id],
+                        std::path::Path::new(&wizard.mounts.source),
+                        &wizard.mounts.mounts,
+                    )
+                    .to_string_lossy()
+                    .into_owned();
+                    wizard.mounts.field = MountField::Destination;
+                    self.mode = Mode::Resume(wizard);
+                    DashboardAction::None
+                }
+                MountField::Destination => {
+                    let mount = AdditionalMount {
+                        source: wizard.mounts.source.clone().into(),
+                        destination: wizard.mounts.destination.clone().into(),
+                    };
+                    if let Err(error) =
+                        crate::hel_targets::validate_additional_mounts(std::slice::from_ref(&mount))
+                    {
+                        self.notice = Some(format!("Invalid resource: {error}"));
+                        self.mode = Mode::Resume(wizard);
+                        return DashboardAction::None;
+                    }
+                    if wizard
+                        .mounts
+                        .mounts
+                        .iter()
+                        .any(|existing| existing.destination == mount.destination)
+                    {
+                        self.notice = Some(format!(
+                            "{} is already a resource destination.",
+                            mount.destination.display()
+                        ));
+                        self.mode = Mode::Resume(wizard);
+                        return DashboardAction::None;
+                    }
+                    wizard.mounts.mounts.push(mount);
+                    wizard.mounts.source.clear();
+                    wizard.mounts.destination.clear();
+                    wizard.mounts.field = MountField::Source;
+                    self.mode = Mode::Resume(wizard);
+                    DashboardAction::None
+                }
+            },
+            KeyCode::Char(character) => {
+                match wizard.mounts.field {
+                    MountField::Source => wizard.mounts.source.push(character),
+                    MountField::Destination => wizard.mounts.destination.push(character),
+                }
+                self.mode = Mode::Resume(wizard);
+                DashboardAction::None
+            }
+            _ => {
+                self.mode = Mode::Resume(wizard);
+                DashboardAction::None
+            }
+        }
+    }
+
+    fn resume_session_action(
+        &mut self,
+        wizard: ResumeWizard,
+        profile_id: String,
+    ) -> DashboardAction {
+        let action = DashboardAction::ResumeSession {
+            session_id: wizard.session_id,
+            profile_id,
+            target_template_id: nth_key(&self.config.targets, wizard.target),
+            additional_mounts: wizard.mounts.mounts,
+            resource_allocation: wizard.resource_allocation,
+        };
+        self.cancel_modal();
+        action
     }
 
     fn handle_confirmation_key(
@@ -1700,6 +1899,7 @@ impl DashboardState {
             step: WizardStep::Profile,
             profile,
             target: 0,
+            mounts: MountWizard::with_mounts(Vec::new(), session.additional_mounts.clone()),
             resource_allocation: None,
             aws_options: BTreeMap::new(),
             sizing_error: None,
@@ -3253,7 +3453,7 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
 fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     let actions = match dashboard.focus {
         Focus::Active => {
-            "n new · i import · r rename · p checkpoint · c close · u quota · Tab pane · q detach"
+            "n new · i import · r rename · p checkpoint · a archive · u quota · Tab pane · q detach"
         }
         Focus::Archived => {
             "n new · i import · r rename · x delete permanently · u quota · Tab pane · q detach"
@@ -3277,7 +3477,14 @@ fn render_new_wizard(
     wizard: &NewWizard,
 ) {
     if wizard.step == WizardStep::Mounts {
-        render_mount_wizard(frame, area, dashboard, wizard);
+        render_mount_wizard(
+            frame,
+            area,
+            dashboard,
+            wizard.target,
+            &wizard.mounts,
+            " New session · 4/4 attached resources ",
+        );
         return;
     }
     if wizard.step == WizardStep::NewBundle {
@@ -3363,9 +3570,11 @@ fn render_mount_wizard(
     frame: &mut Frame,
     area: Rect,
     dashboard: &DashboardState,
-    wizard: &NewWizard,
+    target_index: usize,
+    mounts: &MountWizard,
+    title: &str,
 ) {
-    let target_id = nth_key(&dashboard.config.targets, wizard.target);
+    let target_id = nth_key(&dashboard.config.targets, target_index);
     let target = dashboard
         .config
         .targets
@@ -3378,16 +3587,17 @@ fn render_mount_wizard(
         TargetTemplate::LocalPodman { .. } | TargetTemplate::SshPodman { .. } => {
             "Podman uses :O copy-on-write overlays; container writes never change the source."
         }
-        TargetTemplate::AwsEc2 { .. } | TargetTemplate::SshBare { .. } => {
-            unreachable!("only container targets enter the mount wizard")
+        TargetTemplate::AwsEc2 { .. } => {
+            "EC2 resources are ZIP-compressed locally, uploaded once, and extracted at the destination."
         }
+        TargetTemplate::SshBare { .. } => unreachable!("bare SSH does not attach resources"),
     };
-    let source_marker = if wizard.mounts.field == MountField::Source {
+    let source_marker = if mounts.field == MountField::Source {
         "› "
     } else {
         "  "
     };
-    let destination_marker = if wizard.mounts.field == MountField::Destination {
+    let destination_marker = if mounts.field == MountField::Destination {
         "› "
     } else {
         "  "
@@ -3397,29 +3607,26 @@ fn render_mount_wizard(
         Line::styled(protection, Style::default().fg(Color::Yellow)),
         Line::raw(""),
         Line::styled(
-            format!("{source_marker}Source: {}", wizard.mounts.source),
-            if wizard.mounts.field == MountField::Source {
+            format!("{source_marker}Source: {}", mounts.source),
+            if mounts.field == MountField::Source {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
                 Style::default()
             },
         ),
         Line::styled(
-            format!(
-                "{destination_marker}Destination: {}",
-                wizard.mounts.destination
-            ),
-            if wizard.mounts.field == MountField::Destination {
+            format!("{destination_marker}Destination: {}", mounts.destination),
+            if mounts.field == MountField::Destination {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
                 Style::default()
             },
         ),
     ];
-    if !wizard.mounts.mounts.is_empty() {
+    if !mounts.mounts.is_empty() {
         lines.push(Line::raw(""));
-        lines.push(Line::raw("Additional mount points:"));
-        lines.extend(wizard.mounts.mounts.iter().map(|mount| {
+        lines.push(Line::raw("Attached resources:"));
+        lines.extend(mounts.mounts.iter().map(|mount| {
             Line::raw(format!(
                 "  {} → {}",
                 mount.source.display(),
@@ -3427,21 +3634,20 @@ fn render_mount_wizard(
             ))
         }));
     }
-    if wizard.mounts.field == MountField::Source && !wizard.mounts.history.is_empty() {
+    if mounts.field == MountField::Source && !mounts.history.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             "Recent sources (↑/↓ when Source is empty):",
             Style::default().fg(Color::DarkGray),
         ));
         lines.extend(
-            wizard
-                .mounts
+            mounts
                 .history
                 .iter()
                 .take(5)
                 .enumerate()
                 .map(|(index, source)| {
-                    let marker = if index == wizard.mounts.history_index {
+                    let marker = if index == mounts.history_index {
                         "› "
                     } else {
                         "  "
@@ -3450,7 +3656,7 @@ fn render_mount_wizard(
                 }),
         );
     }
-    if let Some(candidates) = wizard.mounts.completion_cache.get(&wizard.mounts.source) {
+    if let Some(candidates) = mounts.completion_cache.get(&mounts.source) {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             format!("Tab matches: {}", candidates.join("  ")),
@@ -3460,7 +3666,7 @@ fn render_mount_wizard(
     lines.extend([
         Line::raw(""),
         Line::styled(
-            "Enter accepts a field; empty Source continues · Tab completes · ← back · Esc cancel",
+            "Enter accepts a field; empty Source continues · Del removes last · Tab completes · ← back · Esc cancel",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -3468,11 +3674,7 @@ fn render_mount_wizard(
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" New session · 4/4 additional mount points "),
-            )
+            .block(Block::default().borders(Borders::ALL).title(title))
             .wrap(Wrap { trim: false }),
         popup,
     );
@@ -3484,6 +3686,17 @@ fn render_resume_wizard(
     dashboard: &DashboardState,
     wizard: &ResumeWizard,
 ) {
+    if wizard.step == WizardStep::Mounts {
+        render_mount_wizard(
+            frame,
+            area,
+            dashboard,
+            wizard.target,
+            &wizard.mounts,
+            " Resume · 3/3 attached resources ",
+        );
+        return;
+    }
     let (title, choices, selected, help) = match wizard.step {
         WizardStep::Profile => (
             " Resume · 1/2 profile (cross-harness supported) ",
@@ -3531,7 +3744,7 @@ fn render_resume_wizard(
             &["+ double · - halve · r reset 8 CPU / 32 GiB · Enter next · ← back · Esc cancel"][..],
         ),
         WizardStep::Bundle => unreachable!("resume does not select a bundle"),
-        WizardStep::Mounts => unreachable!("resume does not select mounts"),
+        WizardStep::Mounts => unreachable!("mount input was rendered above"),
         WizardStep::NewBundle => unreachable!("resume does not create bundles"),
     };
     render_picker(frame, area, title, choices, selected, help);
@@ -3628,12 +3841,12 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             (" Local repository has uncommitted changes ", lines)
         }
         Confirmation::Close { session_id } => (
-            " Close and archive session? ",
+            " Archive session? ",
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
                 Line::raw("Hel will verify the checkpoint before destroying the target."),
-                Line::raw("Press y/Enter to close, or n/Esc to cancel."),
+                Line::raw("Press y/Enter to archive, or n/Esc to cancel."),
             ],
         ),
         Confirmation::DeleteArchived { session_id } => (
@@ -3646,16 +3859,16 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             ],
         ),
         Confirmation::CloseFailed { session_id, error } => (
-            " Close could not complete ",
+            " Archive could not complete ",
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
                 Line::styled(
-                    format!("Close failed: {error}"),
+                    format!("Archive failed: {error}"),
                     Style::default().fg(Color::Yellow),
                 ),
                 Line::raw(""),
-                Line::raw("r retry close · f force destroy · Esc cancel"),
+                Line::raw("r retry archive · f force destroy · Esc cancel"),
             ],
         ),
         Confirmation::ForceDestroy { session_id, typed } => (
@@ -3800,9 +4013,55 @@ fn resource_allocation_label(
 
 fn mount_history_host(target: &TargetTemplate) -> Option<&str> {
     match target {
-        TargetTemplate::LocalPodman { .. } | TargetTemplate::AppleContainer { .. } => Some("local"),
+        TargetTemplate::LocalPodman { .. }
+        | TargetTemplate::AppleContainer { .. }
+        | TargetTemplate::AwsEc2 { .. } => Some("local"),
         TargetTemplate::SshPodman { ssh, .. } => Some(&ssh.host),
-        TargetTemplate::AwsEc2 { .. } | TargetTemplate::SshBare { .. } => None,
+        TargetTemplate::SshBare { .. } => None,
+    }
+}
+
+fn default_resource_destination(
+    target: &TargetTemplate,
+    source: &std::path::Path,
+    existing: &[AdditionalMount],
+) -> std::path::PathBuf {
+    let default = default_mount_destination(source, existing);
+    let TargetTemplate::AwsEc2 { ssh_user, .. } = target else {
+        return default;
+    };
+    let basename = default
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("resource"));
+    let home = if ssh_user == "root" {
+        std::path::PathBuf::from("/root")
+    } else {
+        std::path::PathBuf::from("/home").join(ssh_user)
+    };
+    let base = home.join("hel-resources").join(basename);
+    if !existing.iter().any(|resource| resource.destination == base) {
+        return base;
+    }
+    for number in 2.. {
+        let candidate = home
+            .join("hel-resources")
+            .join(format!("{}-{number}", basename.to_string_lossy()));
+        if !existing
+            .iter()
+            .any(|resource| resource.destination == candidate)
+        {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+fn apply_mount_completions(wizard: &mut MountWizard, prefix: &str, candidates: Vec<String>) {
+    wizard
+        .completion_cache
+        .insert(prefix.to_owned(), candidates.clone());
+    if let Some(completed) = path_completion(prefix, &candidates) {
+        wizard.source = completed;
     }
 }
 
@@ -4545,12 +4804,14 @@ mod tests {
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Up));
         dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::ResumeSession {
                 session_id: "session-1".into(),
                 profile_id: "claude-1".into(),
                 target_template_id: "podman".into(),
+                additional_mounts: vec![],
                 resource_allocation: Some(SessionResourceAllocation::Container {
                     cpus: BASELINE_CPUS,
                     memory_bytes: BASELINE_MEMORY_BYTES,
@@ -4569,6 +4830,74 @@ mod tests {
         };
         let profiles = dashboard.compatible_profiles(&wizard.session_id);
         assert_eq!(profiles[wizard.profile].0, "codex-1");
+    }
+
+    #[test]
+    fn resume_dialog_attaches_an_additional_resource() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        for character in "/opt/cache".chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ResumeSession {
+                session_id: "session-1".into(),
+                profile_id: "codex-1".into(),
+                target_template_id: "podman".into(),
+                additional_mounts: vec![AdditionalMount {
+                    source: "/opt/cache".into(),
+                    destination: "/mnt/cache".into(),
+                }],
+                resource_allocation: Some(SessionResourceAllocation::Container {
+                    cpus: BASELINE_CPUS,
+                    memory_bytes: BASELINE_MEMORY_BYTES,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn resume_dialog_can_remove_a_previous_resource() {
+        let mut session = archived_session();
+        session.additional_mounts = vec![AdditionalMount {
+            source: "/opt/old-cache".into(),
+            destination: "/mnt/old-cache".into(),
+        }];
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Delete));
+
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume resource dialog");
+        };
+        assert!(wizard.mounts.mounts.is_empty());
+    }
+
+    #[test]
+    fn aws_resource_destinations_default_under_the_ssh_users_home() {
+        let target = TargetTemplate::AwsEc2 {
+            aws_profile: None,
+            region: "us-east-1".into(),
+            launch_template: "hel".into(),
+            launch_template_version: None,
+            ssh_user: "ubuntu".into(),
+            address_source: crate::hel_config::AwsAddressSource::PublicIp,
+            identity_file: None,
+            ssh_args: Vec::new(),
+        };
+
+        assert_eq!(
+            default_resource_destination(&target, std::path::Path::new("/opt/cache"), &[]),
+            std::path::PathBuf::from("/home/ubuntu/hel-resources/cache")
+        );
     }
 
     #[test]
@@ -5553,11 +5882,11 @@ mod tests {
     }
 
     #[test]
-    fn failed_close_dialog_offers_retry_or_explicit_force_destroy() {
+    fn failed_archive_dialog_offers_retry_or_explicit_force_destroy() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
-        dashboard.handle_key(key(KeyCode::Char('c')));
+        dashboard.handle_key(key(KeyCode::Char('a')));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Char('y'))),
             DashboardAction::Close {
@@ -5597,7 +5926,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_pane_replaces_checkpoint_and_close_with_permanent_delete() {
+    fn archived_pane_replaces_checkpoint_and_archive_with_permanent_delete() {
         let mut dashboard = dashboard_with_session(archived_session());
         assert_eq!(dashboard.focus, Focus::Archived);
         assert_eq!(
@@ -5605,7 +5934,7 @@ mod tests {
             DashboardAction::None
         );
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('c'))),
+            dashboard.handle_key(key(KeyCode::Char('a'))),
             DashboardAction::None
         );
         assert_eq!(
@@ -5633,7 +5962,7 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("x delete permanently"));
         assert!(!rendered.contains("p checkpoint"));
-        assert!(!rendered.contains("c close"));
+        assert!(!rendered.contains("a archive"));
     }
 
     #[test]

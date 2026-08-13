@@ -376,6 +376,13 @@ enum WorkerCommand {
         #[arg(long)]
         spec: PathBuf,
     },
+    /// Install one controller-packed resource directory on a remote target.
+    InstallResource {
+        #[arg(long)]
+        archive: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+    },
     /// Bridge controller Git services to this worker over stdio.
     GitBridge {
         #[arg(long)]
@@ -447,6 +454,10 @@ async fn main() -> Result<()> {
             WorkerCommand::RestoreRepositories { spec } => {
                 hel::hel_checkpoint::restore_repositories_from_spec_file(&spec)
             }
+            WorkerCommand::InstallResource {
+                archive,
+                destination,
+            } => hel::hel_resources::install_resource_archive(&archive, &destination),
             WorkerCommand::GitBridge { root } => hel::hel_git_proxy::run_worker_bridge(&root).await,
             WorkerCommand::GitProxy {
                 root,
@@ -2171,6 +2182,7 @@ async fn run_dashboard() -> Result<()> {
                 session_id,
                 profile_id,
                 target_template_id,
+                additional_mounts,
                 resource_allocation,
             } => {
                 dashboard.set_notice(resume_progress_notice(
@@ -2182,10 +2194,11 @@ async fn run_dashboard() -> Result<()> {
                     .terminal
                     .draw(|frame| render(frame, &mut dashboard))?;
                 match controller
-                    .resume_session_with_resources(
+                    .resume_session_with_options(
                         &session_id,
                         &profile_id,
                         &target_template_id,
+                        Some(additional_mounts),
                         resource_allocation,
                     )
                     .await
@@ -2236,8 +2249,7 @@ async fn run_dashboard() -> Result<()> {
                 .await?;
                 controller = returned_controller;
                 match result {
-                    Ok(()) => dashboard
-                        .set_notice(format!("Archived and closed {}", short_id(&session_id))),
+                    Ok(()) => dashboard.set_notice(format!("Archived {}", short_id(&session_id))),
                     Err(error) => {
                         dashboard.show_close_failure(session_id.clone(), format!("{error:#}"))
                     }
