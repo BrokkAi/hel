@@ -134,9 +134,18 @@ enum WizardStep {
     NewBundle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WizardFocus {
+    Content,
+    Cancel,
+    Back,
+    Next,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NewWizard {
     step: WizardStep,
+    focus: WizardFocus,
     profile: usize,
     bundle: usize,
     target: usize,
@@ -148,16 +157,20 @@ struct NewWizard {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MountField {
+enum MountFocus {
     Source,
     Destination,
+    Cancel,
+    Back,
+    Add,
+    Submit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MountWizard {
     source: String,
     destination: String,
-    field: MountField,
+    focus: MountFocus,
     mounts: Vec<AdditionalMount>,
     history: Vec<std::path::PathBuf>,
     history_index: usize,
@@ -169,7 +182,7 @@ impl MountWizard {
         Self {
             source: String::new(),
             destination: String::new(),
-            field: MountField::Source,
+            focus: MountFocus::Source,
             mounts: Vec::new(),
             history,
             history_index: 0,
@@ -188,6 +201,7 @@ impl MountWizard {
 struct ResumeWizard {
     session_id: String,
     step: WizardStep,
+    focus: WizardFocus,
     profile: usize,
     target: usize,
     mounts: MountWizard,
@@ -252,9 +266,45 @@ struct ImportBundleConfirmation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImportPane {
+enum ImportFocus {
     Profiles,
     Sessions,
+    Cancel,
+    Import,
+}
+
+fn cycle_control<T: Copy + PartialEq>(current: T, order: &[T], reverse: bool) -> T {
+    let index = order
+        .iter()
+        .position(|candidate| *candidate == current)
+        .unwrap_or(0);
+    let next = if reverse {
+        index.checked_sub(1).unwrap_or(order.len() - 1)
+    } else {
+        (index + 1) % order.len()
+    };
+    order[next]
+}
+
+fn cycle_wizard_focus(current: WizardFocus, has_back: bool, reverse: bool) -> WizardFocus {
+    if has_back {
+        cycle_control(
+            current,
+            &[
+                WizardFocus::Content,
+                WizardFocus::Cancel,
+                WizardFocus::Back,
+                WizardFocus::Next,
+            ],
+            reverse,
+        )
+    } else {
+        cycle_control(
+            current,
+            &[WizardFocus::Content, WizardFocus::Cancel, WizardFocus::Next],
+            reverse,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,7 +313,7 @@ struct ImportDialog {
     profiles: Vec<ImportProfileOption>,
     profile_index: usize,
     session_index: usize,
-    pane: ImportPane,
+    focus: ImportFocus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,7 +635,7 @@ impl DashboardState {
             profiles,
             profile_index: 0,
             session_index: 0,
-            pane: ImportPane::Profiles,
+            focus: ImportFocus::Profiles,
         });
     }
 
@@ -829,64 +879,102 @@ impl DashboardState {
                 self.cancel_modal();
                 DashboardAction::None
             }
-            KeyCode::Left => {
-                dialog.pane = ImportPane::Profiles;
+            KeyCode::Left if dialog.focus == ImportFocus::Sessions => {
+                dialog.focus = ImportFocus::Profiles;
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None
             }
-            KeyCode::Right => {
-                dialog.pane = ImportPane::Sessions;
+            KeyCode::Right if dialog.focus == ImportFocus::Profiles => {
+                dialog.focus = ImportFocus::Sessions;
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None
             }
-            KeyCode::Tab | KeyCode::BackTab => {
-                dialog.pane = match dialog.pane {
-                    ImportPane::Profiles => ImportPane::Sessions,
-                    ImportPane::Sessions => ImportPane::Profiles,
-                };
+            KeyCode::Tab => {
+                dialog.focus = cycle_control(
+                    dialog.focus,
+                    &[
+                        ImportFocus::Profiles,
+                        ImportFocus::Sessions,
+                        ImportFocus::Cancel,
+                        ImportFocus::Import,
+                    ],
+                    false,
+                );
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::BackTab => {
+                dialog.focus = cycle_control(
+                    dialog.focus,
+                    &[
+                        ImportFocus::Profiles,
+                        ImportFocus::Sessions,
+                        ImportFocus::Cancel,
+                        ImportFocus::Import,
+                    ],
+                    true,
+                );
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                match dialog.pane {
-                    ImportPane::Profiles => {
+                match dialog.focus {
+                    ImportFocus::Profiles => {
                         move_index(&mut dialog.profile_index, dialog.profiles.len(), -1);
                         dialog.session_index = 0;
                     }
-                    ImportPane::Sessions => {
+                    ImportFocus::Sessions => {
                         let len = dialog
                             .profiles
                             .get(dialog.profile_index)
                             .map_or(0, |profile| profile.sessions.len());
                         move_index(&mut dialog.session_index, len, -1);
                     }
+                    ImportFocus::Cancel | ImportFocus::Import => {}
                 }
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                match dialog.pane {
-                    ImportPane::Profiles => {
+                match dialog.focus {
+                    ImportFocus::Profiles => {
                         move_index(&mut dialog.profile_index, dialog.profiles.len(), 1);
                         dialog.session_index = 0;
                     }
-                    ImportPane::Sessions => {
+                    ImportFocus::Sessions => {
                         let len = dialog
                             .profiles
                             .get(dialog.profile_index)
                             .map_or(0, |profile| profile.sessions.len());
                         move_index(&mut dialog.session_index, len, 1);
                     }
+                    ImportFocus::Cancel | ImportFocus::Import => {}
                 }
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None
             }
-            KeyCode::Enter if dialog.pane == ImportPane::Profiles => {
-                dialog.pane = ImportPane::Sessions;
+            KeyCode::Enter if dialog.focus == ImportFocus::Profiles => {
+                dialog.focus = ImportFocus::Sessions;
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None
             }
-            KeyCode::Enter => {
+            KeyCode::Enter if dialog.focus == ImportFocus::Sessions => {
+                let available = dialog
+                    .profiles
+                    .get(dialog.profile_index)
+                    .and_then(|profile| profile.sessions.get(dialog.session_index))
+                    .is_some_and(|session| session.unavailable_reason.is_none());
+                if available {
+                    dialog.focus = ImportFocus::Import;
+                }
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Enter if dialog.focus == ImportFocus::Cancel => {
+                self.cancel_modal();
+                DashboardAction::None
+            }
+            KeyCode::Enter if dialog.focus == ImportFocus::Import => {
                 let Some(profile) = dialog.profiles.get(dialog.profile_index) else {
                     self.mode = Mode::Import(dialog);
                     return DashboardAction::None;
@@ -972,6 +1060,28 @@ impl DashboardState {
         if wizard.step == WizardStep::Mounts {
             return self.handle_mount_key(code, wizard);
         }
+        let has_back = wizard.step != WizardStep::Profile;
+        if matches!(code, KeyCode::Tab | KeyCode::BackTab) {
+            wizard.focus = cycle_wizard_focus(wizard.focus, has_back, code == KeyCode::BackTab);
+            self.mode = Mode::New(wizard);
+            return DashboardAction::None;
+        }
+        if code == KeyCode::Enter && wizard.focus == WizardFocus::Cancel {
+            self.cancel_modal();
+            return DashboardAction::None;
+        }
+        if code == KeyCode::Enter && wizard.focus == WizardFocus::Back {
+            wizard.step = match wizard.step {
+                WizardStep::Bundle => WizardStep::Profile,
+                WizardStep::Target => WizardStep::Bundle,
+                WizardStep::NewBundle => WizardStep::Bundle,
+                WizardStep::Profile => WizardStep::Profile,
+                WizardStep::Mounts => unreachable!("mount input is handled above"),
+            };
+            wizard.focus = WizardFocus::Content;
+            self.mode = Mode::New(wizard);
+            return DashboardAction::None;
+        }
         if wizard.step == WizardStep::NewBundle {
             return match code {
                 KeyCode::Backspace if wizard.new_bundle_source.is_empty() => {
@@ -994,7 +1104,7 @@ impl DashboardState {
                     self.mode = Mode::New(wizard);
                     DashboardAction::CreateBundle { source }
                 }
-                KeyCode::Char(character) => {
+                KeyCode::Char(character) if wizard.focus == WizardFocus::Content => {
                     wizard.new_bundle_source.push(character);
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
@@ -1006,6 +1116,7 @@ impl DashboardState {
             };
         }
         if wizard.step == WizardStep::Target
+            && wizard.focus == WizardFocus::Content
             && matches!(
                 code,
                 KeyCode::Char('+') | KeyCode::Char('-') | KeyCode::Char('r')
@@ -1022,7 +1133,8 @@ impl DashboardState {
             WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
             WizardStep::NewBundle => unreachable!("bundle input is handled above"),
         };
-        if matches!(code, KeyCode::Up | KeyCode::Char('k')) {
+        if wizard.focus == WizardFocus::Content && matches!(code, KeyCode::Up | KeyCode::Char('k'))
+        {
             move_index(wizard.active_index_mut(), len, -1);
             let action = if wizard.step == WizardStep::Target {
                 self.prepare_new_target(&mut wizard)
@@ -1032,7 +1144,9 @@ impl DashboardState {
             self.mode = Mode::New(wizard);
             return action;
         }
-        if matches!(code, KeyCode::Down | KeyCode::Char('j')) {
+        if wizard.focus == WizardFocus::Content
+            && matches!(code, KeyCode::Down | KeyCode::Char('j'))
+        {
             move_index(wizard.active_index_mut(), len, 1);
             let action = if wizard.step == WizardStep::Target {
                 self.prepare_new_target(&mut wizard)
@@ -1042,7 +1156,7 @@ impl DashboardState {
             self.mode = Mode::New(wizard);
             return action;
         }
-        if matches!(code, KeyCode::Backspace | KeyCode::Left) {
+        if code == KeyCode::Backspace {
             wizard.step = match wizard.step {
                 WizardStep::Profile => {
                     self.cancel_modal();
@@ -1058,7 +1172,9 @@ impl DashboardState {
             self.mode = Mode::New(wizard);
             return DashboardAction::None;
         }
-        if !matches!(code, KeyCode::Enter | KeyCode::Right) {
+        if code != KeyCode::Enter
+            || !matches!(wizard.focus, WizardFocus::Content | WizardFocus::Next)
+        {
             self.mode = Mode::New(wizard);
             return DashboardAction::None;
         }
@@ -1066,17 +1182,20 @@ impl DashboardState {
         match wizard.step {
             WizardStep::Profile => {
                 wizard.step = WizardStep::Bundle;
+                wizard.focus = WizardFocus::Content;
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
             }
             WizardStep::Bundle => {
                 if wizard.bundle == self.config.bundles.len() {
                     wizard.step = WizardStep::NewBundle;
+                    wizard.focus = WizardFocus::Content;
                     wizard.new_bundle_source.clear();
                     self.mode = Mode::New(wizard);
                     return DashboardAction::None;
                 }
                 wizard.step = WizardStep::Target;
+                wizard.focus = WizardFocus::Content;
                 let action = self.prepare_new_target(&mut wizard);
                 self.mode = Mode::New(wizard);
                 action
@@ -1123,12 +1242,28 @@ impl DashboardState {
     fn handle_mount_key(&mut self, code: KeyCode, mut wizard: NewWizard) -> DashboardAction {
         let target_template_id = nth_key(&self.config.targets, wizard.target);
         match code {
-            KeyCode::Delete if wizard.mounts.field == MountField::Source => {
+            KeyCode::Tab | KeyCode::BackTab => {
+                wizard.mounts.focus = cycle_control(
+                    wizard.mounts.focus,
+                    &[
+                        MountFocus::Source,
+                        MountFocus::Destination,
+                        MountFocus::Cancel,
+                        MountFocus::Back,
+                        MountFocus::Add,
+                        MountFocus::Submit,
+                    ],
+                    code == KeyCode::BackTab,
+                );
+                self.mode = Mode::New(wizard);
+                DashboardAction::None
+            }
+            KeyCode::Delete if wizard.mounts.focus == MountFocus::Source => {
                 wizard.mounts.mounts.pop();
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
             }
-            KeyCode::Tab if wizard.mounts.field == MountField::Source => {
+            KeyCode::F(2) if wizard.mounts.focus == MountFocus::Source => {
                 let prefix = wizard.mounts.source.clone();
                 if prefix.is_empty() {
                     self.mode = Mode::New(wizard);
@@ -1149,7 +1284,7 @@ impl DashboardState {
                 }
             }
             KeyCode::Up
-                if wizard.mounts.field == MountField::Source
+                if wizard.mounts.focus == MountFocus::Source
                     && wizard.mounts.source.is_empty()
                     && !wizard.mounts.history.is_empty() =>
             {
@@ -1165,7 +1300,7 @@ impl DashboardState {
                 DashboardAction::None
             }
             KeyCode::Down
-                if wizard.mounts.field == MountField::Source
+                if wizard.mounts.focus == MountFocus::Source
                     && wizard.mounts.source.is_empty()
                     && !wizard.mounts.history.is_empty() =>
             {
@@ -1181,32 +1316,28 @@ impl DashboardState {
                 DashboardAction::None
             }
             KeyCode::Backspace => {
-                match wizard.mounts.field {
-                    MountField::Source if !wizard.mounts.source.is_empty() => {
+                match wizard.mounts.focus {
+                    MountFocus::Source => {
                         wizard.mounts.source.pop();
                     }
-                    MountField::Source => wizard.step = WizardStep::Target,
-                    MountField::Destination if !wizard.mounts.destination.is_empty() => {
+                    MountFocus::Destination => {
                         wizard.mounts.destination.pop();
                     }
-                    MountField::Destination => wizard.mounts.field = MountField::Source,
+                    MountFocus::Cancel
+                    | MountFocus::Back
+                    | MountFocus::Add
+                    | MountFocus::Submit => {}
                 }
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
             }
-            KeyCode::Left => {
-                match wizard.mounts.field {
-                    MountField::Source => wizard.step = WizardStep::Target,
-                    MountField::Destination => wizard.mounts.field = MountField::Source,
+            KeyCode::Enter => match wizard.mounts.focus {
+                MountFocus::Source if wizard.mounts.source.is_empty() => {
+                    self.notice = Some("Type a resource source, or Tab to Create.".into());
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
                 }
-                self.mode = Mode::New(wizard);
-                DashboardAction::None
-            }
-            KeyCode::Enter | KeyCode::Right => match wizard.mounts.field {
-                MountField::Source if wizard.mounts.source.is_empty() => {
-                    self.create_session_action(&wizard)
-                }
-                MountField::Source => {
+                MountFocus::Source => {
                     wizard.mounts.destination = default_resource_destination(
                         &self.config.targets[&target_template_id],
                         std::path::Path::new(&wizard.mounts.source),
@@ -1214,11 +1345,26 @@ impl DashboardState {
                     )
                     .to_string_lossy()
                     .into_owned();
-                    wizard.mounts.field = MountField::Destination;
+                    wizard.mounts.focus = MountFocus::Destination;
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
-                MountField::Destination => {
+                MountFocus::Destination => {
+                    wizard.mounts.focus = MountFocus::Add;
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
+                MountFocus::Cancel => {
+                    self.cancel_modal();
+                    DashboardAction::None
+                }
+                MountFocus::Back => {
+                    wizard.step = WizardStep::Target;
+                    wizard.focus = WizardFocus::Content;
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
+                MountFocus::Add => {
                     let mount = AdditionalMount {
                         source: wizard.mounts.source.clone().into(),
                         destination: wizard.mounts.destination.clone().into(),
@@ -1246,15 +1392,20 @@ impl DashboardState {
                     wizard.mounts.mounts.push(mount);
                     wizard.mounts.source.clear();
                     wizard.mounts.destination.clear();
-                    wizard.mounts.field = MountField::Source;
+                    wizard.mounts.focus = MountFocus::Source;
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
+                MountFocus::Submit => self.create_session_action(&wizard),
             },
             KeyCode::Char(character) => {
-                match wizard.mounts.field {
-                    MountField::Source => wizard.mounts.source.push(character),
-                    MountField::Destination => wizard.mounts.destination.push(character),
+                match wizard.mounts.focus {
+                    MountFocus::Source => wizard.mounts.source.push(character),
+                    MountFocus::Destination => wizard.mounts.destination.push(character),
+                    MountFocus::Cancel
+                    | MountFocus::Back
+                    | MountFocus::Add
+                    | MountFocus::Submit => {}
                 }
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
@@ -1446,7 +1597,7 @@ impl DashboardState {
         match self.mode.clone() {
             Mode::New(mut wizard)
                 if wizard.step == WizardStep::Mounts
-                    && wizard.mounts.field == MountField::Source
+                    && wizard.mounts.focus == MountFocus::Source
                     && wizard.mounts.source == prefix =>
             {
                 apply_mount_completions(&mut wizard.mounts, prefix, candidates);
@@ -1454,7 +1605,7 @@ impl DashboardState {
             }
             Mode::Resume(mut wizard)
                 if wizard.step == WizardStep::Mounts
-                    && wizard.mounts.field == MountField::Source
+                    && wizard.mounts.focus == MountFocus::Source
                     && wizard.mounts.source == prefix =>
             {
                 apply_mount_completions(&mut wizard.mounts, prefix, candidates);
@@ -1472,8 +1623,31 @@ impl DashboardState {
         if wizard.step == WizardStep::Mounts {
             return self.handle_resume_mount_key(code, wizard);
         }
+        let has_back = wizard.step != WizardStep::Profile;
+        if matches!(code, KeyCode::Tab | KeyCode::BackTab) {
+            wizard.focus = cycle_wizard_focus(wizard.focus, has_back, code == KeyCode::BackTab);
+            self.mode = Mode::Resume(wizard);
+            return DashboardAction::None;
+        }
+        if code == KeyCode::Enter && wizard.focus == WizardFocus::Cancel {
+            self.cancel_modal();
+            return DashboardAction::None;
+        }
+        if code == KeyCode::Enter && wizard.focus == WizardFocus::Back {
+            wizard.step = match wizard.step {
+                WizardStep::Target => WizardStep::Profile,
+                WizardStep::Profile => WizardStep::Profile,
+                WizardStep::Bundle | WizardStep::NewBundle | WizardStep::Mounts => {
+                    unreachable!("invalid resume wizard step")
+                }
+            };
+            wizard.focus = WizardFocus::Content;
+            self.mode = Mode::Resume(wizard);
+            return DashboardAction::None;
+        }
         let profiles = self.compatible_profiles(&wizard.session_id);
         if wizard.step == WizardStep::Target
+            && wizard.focus == WizardFocus::Content
             && matches!(
                 code,
                 KeyCode::Char('+') | KeyCode::Char('-') | KeyCode::Char('r')
@@ -1490,7 +1664,8 @@ impl DashboardState {
             WizardStep::Mounts => unreachable!("mount input is handled before picker navigation"),
             WizardStep::NewBundle => unreachable!("resume does not create bundles"),
         };
-        if matches!(code, KeyCode::Up | KeyCode::Char('k')) {
+        if wizard.focus == WizardFocus::Content && matches!(code, KeyCode::Up | KeyCode::Char('k'))
+        {
             move_index(wizard.active_index_mut(), len, -1);
             let action = if wizard.step == WizardStep::Target {
                 self.prepare_resume_target(&mut wizard)
@@ -1500,7 +1675,9 @@ impl DashboardState {
             self.mode = Mode::Resume(wizard);
             return action;
         }
-        if matches!(code, KeyCode::Down | KeyCode::Char('j')) {
+        if wizard.focus == WizardFocus::Content
+            && matches!(code, KeyCode::Down | KeyCode::Char('j'))
+        {
             move_index(wizard.active_index_mut(), len, 1);
             let action = if wizard.step == WizardStep::Target {
                 self.prepare_resume_target(&mut wizard)
@@ -1510,7 +1687,7 @@ impl DashboardState {
             self.mode = Mode::Resume(wizard);
             return action;
         }
-        if matches!(code, KeyCode::Backspace | KeyCode::Left) {
+        if code == KeyCode::Backspace {
             match wizard.step {
                 WizardStep::Profile => self.cancel_modal(),
                 WizardStep::Target => {
@@ -1525,13 +1702,16 @@ impl DashboardState {
             }
             return DashboardAction::None;
         }
-        if !matches!(code, KeyCode::Enter | KeyCode::Right) {
+        if code != KeyCode::Enter
+            || !matches!(wizard.focus, WizardFocus::Content | WizardFocus::Next)
+        {
             self.mode = Mode::Resume(wizard);
             return DashboardAction::None;
         }
         match wizard.step {
             WizardStep::Profile => {
                 wizard.step = WizardStep::Target;
+                wizard.focus = WizardFocus::Content;
                 let action = self.prepare_resume_target(&mut wizard);
                 self.mode = Mode::Resume(wizard);
                 action
@@ -1584,12 +1764,28 @@ impl DashboardState {
     ) -> DashboardAction {
         let target_template_id = nth_key(&self.config.targets, wizard.target);
         match code {
-            KeyCode::Delete if wizard.mounts.field == MountField::Source => {
+            KeyCode::Tab | KeyCode::BackTab => {
+                wizard.mounts.focus = cycle_control(
+                    wizard.mounts.focus,
+                    &[
+                        MountFocus::Source,
+                        MountFocus::Destination,
+                        MountFocus::Cancel,
+                        MountFocus::Back,
+                        MountFocus::Add,
+                        MountFocus::Submit,
+                    ],
+                    code == KeyCode::BackTab,
+                );
+                self.mode = Mode::Resume(wizard);
+                DashboardAction::None
+            }
+            KeyCode::Delete if wizard.mounts.focus == MountFocus::Source => {
                 wizard.mounts.mounts.pop();
                 self.mode = Mode::Resume(wizard);
                 DashboardAction::None
             }
-            KeyCode::Tab if wizard.mounts.field == MountField::Source => {
+            KeyCode::F(2) if wizard.mounts.focus == MountFocus::Source => {
                 let prefix = wizard.mounts.source.clone();
                 if prefix.is_empty() {
                     self.mode = Mode::Resume(wizard);
@@ -1610,7 +1806,7 @@ impl DashboardState {
                 }
             }
             KeyCode::Up
-                if wizard.mounts.field == MountField::Source
+                if wizard.mounts.focus == MountFocus::Source
                     && wizard.mounts.source.is_empty()
                     && !wizard.mounts.history.is_empty() =>
             {
@@ -1626,7 +1822,7 @@ impl DashboardState {
                 DashboardAction::None
             }
             KeyCode::Down
-                if wizard.mounts.field == MountField::Source
+                if wizard.mounts.focus == MountFocus::Source
                     && wizard.mounts.source.is_empty()
                     && !wizard.mounts.history.is_empty() =>
             {
@@ -1642,37 +1838,28 @@ impl DashboardState {
                 DashboardAction::None
             }
             KeyCode::Backspace => {
-                match wizard.mounts.field {
-                    MountField::Source if !wizard.mounts.source.is_empty() => {
+                match wizard.mounts.focus {
+                    MountFocus::Source => {
                         wizard.mounts.source.pop();
                     }
-                    MountField::Source => wizard.step = WizardStep::Target,
-                    MountField::Destination if !wizard.mounts.destination.is_empty() => {
+                    MountFocus::Destination => {
                         wizard.mounts.destination.pop();
                     }
-                    MountField::Destination => wizard.mounts.field = MountField::Source,
+                    MountFocus::Cancel
+                    | MountFocus::Back
+                    | MountFocus::Add
+                    | MountFocus::Submit => {}
                 }
                 self.mode = Mode::Resume(wizard);
                 DashboardAction::None
             }
-            KeyCode::Left => {
-                match wizard.mounts.field {
-                    MountField::Source => wizard.step = WizardStep::Target,
-                    MountField::Destination => wizard.mounts.field = MountField::Source,
+            KeyCode::Enter => match wizard.mounts.focus {
+                MountFocus::Source if wizard.mounts.source.is_empty() => {
+                    self.notice = Some("Type a resource source, or Tab to Resume.".into());
+                    self.mode = Mode::Resume(wizard);
+                    DashboardAction::None
                 }
-                self.mode = Mode::Resume(wizard);
-                DashboardAction::None
-            }
-            KeyCode::Enter | KeyCode::Right => match wizard.mounts.field {
-                MountField::Source if wizard.mounts.source.is_empty() => {
-                    let profile_id = self
-                        .compatible_profiles(&wizard.session_id)
-                        .get(wizard.profile)
-                        .map(|(id, _)| (*id).clone())
-                        .expect("resume wizard is only opened with a compatible profile");
-                    self.resume_session_action(wizard, profile_id)
-                }
-                MountField::Source => {
+                MountFocus::Source => {
                     wizard.mounts.destination = default_resource_destination(
                         &self.config.targets[&target_template_id],
                         std::path::Path::new(&wizard.mounts.source),
@@ -1680,11 +1867,26 @@ impl DashboardState {
                     )
                     .to_string_lossy()
                     .into_owned();
-                    wizard.mounts.field = MountField::Destination;
+                    wizard.mounts.focus = MountFocus::Destination;
                     self.mode = Mode::Resume(wizard);
                     DashboardAction::None
                 }
-                MountField::Destination => {
+                MountFocus::Destination => {
+                    wizard.mounts.focus = MountFocus::Add;
+                    self.mode = Mode::Resume(wizard);
+                    DashboardAction::None
+                }
+                MountFocus::Cancel => {
+                    self.cancel_modal();
+                    DashboardAction::None
+                }
+                MountFocus::Back => {
+                    wizard.step = WizardStep::Target;
+                    wizard.focus = WizardFocus::Content;
+                    self.mode = Mode::Resume(wizard);
+                    DashboardAction::None
+                }
+                MountFocus::Add => {
                     let mount = AdditionalMount {
                         source: wizard.mounts.source.clone().into(),
                         destination: wizard.mounts.destination.clone().into(),
@@ -1712,15 +1914,27 @@ impl DashboardState {
                     wizard.mounts.mounts.push(mount);
                     wizard.mounts.source.clear();
                     wizard.mounts.destination.clear();
-                    wizard.mounts.field = MountField::Source;
+                    wizard.mounts.focus = MountFocus::Source;
                     self.mode = Mode::Resume(wizard);
                     DashboardAction::None
                 }
+                MountFocus::Submit => {
+                    let profile_id = self
+                        .compatible_profiles(&wizard.session_id)
+                        .get(wizard.profile)
+                        .map(|(id, _)| (*id).clone())
+                        .expect("resume wizard is only opened with a compatible profile");
+                    self.resume_session_action(wizard, profile_id)
+                }
             },
             KeyCode::Char(character) => {
-                match wizard.mounts.field {
-                    MountField::Source => wizard.mounts.source.push(character),
-                    MountField::Destination => wizard.mounts.destination.push(character),
+                match wizard.mounts.focus {
+                    MountFocus::Source => wizard.mounts.source.push(character),
+                    MountFocus::Destination => wizard.mounts.destination.push(character),
+                    MountFocus::Cancel
+                    | MountFocus::Back
+                    | MountFocus::Add
+                    | MountFocus::Submit => {}
                 }
                 self.mode = Mode::Resume(wizard);
                 DashboardAction::None
@@ -1862,6 +2076,7 @@ impl DashboardState {
         }
         self.mode = Mode::New(NewWizard {
             step: WizardStep::Profile,
+            focus: WizardFocus::Content,
             profile: 0,
             bundle: 0,
             target: 0,
@@ -1897,6 +2112,7 @@ impl DashboardState {
         self.mode = Mode::Resume(ResumeWizard {
             session_id: session.id.clone(),
             step: WizardStep::Profile,
+            focus: WizardFocus::Content,
             profile,
             target: 0,
             mounts: MountWizard::with_mounts(Vec::new(), session.additional_mounts.clone()),
@@ -2754,7 +2970,7 @@ fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
         .collect::<Vec<_>>();
     let mut profile_state = ListState::default()
         .with_selected((!dialog.profiles.is_empty()).then_some(dialog.profile_index));
-    let profiles_focused = dialog.pane == ImportPane::Profiles;
+    let profiles_focused = dialog.focus == ImportFocus::Profiles;
     frame.render_stateful_widget(
         List::new(profile_items)
             .highlight_symbol(if profiles_focused { "› " } else { "  " })
@@ -2820,7 +3036,7 @@ fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
     let selectable_sessions = selected_profile.is_some_and(|profile| !profile.sessions.is_empty());
     let mut session_state =
         ListState::default().with_selected(selectable_sessions.then_some(dialog.session_index));
-    let sessions_focused = dialog.pane == ImportPane::Sessions;
+    let sessions_focused = dialog.focus == ImportFocus::Sessions;
     let sessions_title = selected_profile
         .and_then(|profile| profile.scan_progress)
         .map(|(scanned, total)| {
@@ -2848,10 +3064,10 @@ fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
     let unavailable_reason = selected_profile
         .and_then(|profile| profile.sessions.get(dialog.session_index))
         .and_then(|session| session.unavailable_reason.as_deref());
-    let (footer, footer_style) = unavailable_reason.map_or_else(
+    let (status, status_style) = unavailable_reason.map_or_else(
         || {
             (
-                "Tab pane · ←/→ pane · ↑/↓ select · Enter import · Esc cancel".to_owned(),
+                "Tab moves focus · ↑/↓ selects · Enter activates".to_owned(),
                 Style::default().fg(Color::Gray),
             )
         },
@@ -2863,10 +3079,15 @@ fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
         },
     );
     frame.render_widget(
-        Paragraph::new(footer)
-            .alignment(Alignment::Center)
-            .style(footer_style)
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(vec![
+            Line::styled(status, status_style),
+            action_buttons(&[
+                ("Cancel", dialog.focus == ImportFocus::Cancel),
+                ("Import", dialog.focus == ImportFocus::Import),
+            ]),
+        ])
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true }),
         rows[1],
     );
 }
@@ -3470,6 +3691,40 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     frame.render_widget(Paragraph::new(text).style(style), area);
 }
 
+fn action_buttons(buttons: &[(&str, bool)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, (label, focused)) in buttons.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = if *focused {
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        };
+        spans.push(Span::styled(format!(" {label} "), style));
+    }
+    Line::from(spans).alignment(Alignment::Center)
+}
+
+fn wizard_buttons(focus: WizardFocus, has_back: bool, next_label: &str) -> Line<'static> {
+    if has_back {
+        action_buttons(&[
+            ("Cancel", focus == WizardFocus::Cancel),
+            ("Back", focus == WizardFocus::Back),
+            (next_label, focus == WizardFocus::Next),
+        ])
+    } else {
+        action_buttons(&[
+            ("Cancel", focus == WizardFocus::Cancel),
+            (next_label, focus == WizardFocus::Next),
+        ])
+    }
+}
+
 fn render_new_wizard(
     frame: &mut Frame,
     area: Rect,
@@ -3484,24 +3739,38 @@ fn render_new_wizard(
             wizard.target,
             &wizard.mounts,
             " New session · 4/4 attached resources ",
+            "Create",
         );
         return;
     }
     if wizard.step == WizardStep::NewBundle {
-        let popup = centered_rect(76, 8, area);
+        let popup = centered_rect(76, 9, area);
         frame.render_widget(Clear, popup);
         frame.render_widget(
             Paragraph::new(vec![
                 Line::raw("Local Git path or GitHub owner/repository:"),
                 Line::raw(""),
                 Line::styled(
-                    format!("> {}", wizard.new_bundle_source),
-                    Style::default().bg(Color::DarkGray).fg(Color::White),
+                    format!(
+                        "> {}{}",
+                        wizard.new_bundle_source,
+                        if wizard.focus == WizardFocus::Content {
+                            "▏"
+                        } else {
+                            ""
+                        }
+                    ),
+                    if wizard.focus == WizardFocus::Content {
+                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                    } else {
+                        Style::default()
+                    },
                 ),
                 Line::styled(
-                    "Enter create · Backspace to return",
+                    "Tab moves focus · Enter activates · Esc cancels",
                     Style::default().fg(Color::Gray),
                 ),
+                wizard_buttons(wizard.focus, true, "Create repository"),
             ])
             .block(
                 Block::default()
@@ -3559,11 +3828,22 @@ fn render_new_wizard(
         WizardStep::NewBundle => unreachable!("bundle input was rendered above"),
     };
     let help = if wizard.step == WizardStep::Target {
-        "+ double · - halve · r reset 8 CPU / 32 GiB · Enter next · ← back · Esc cancel"
+        "+ double · - halve · r reset 8 CPU / 32 GiB"
     } else {
-        "Enter next · ← back · Esc cancel"
+        "↑/↓ select · Tab moves focus · Enter activates"
     };
-    render_picker(frame, area, title, choices, selected, &[help]);
+    render_picker(
+        frame,
+        area,
+        title,
+        choices,
+        selected,
+        &[help],
+        PickerNavigation {
+            focus: wizard.focus,
+            has_back: wizard.step != WizardStep::Profile,
+        },
+    );
 }
 
 fn render_mount_wizard(
@@ -3573,6 +3853,7 @@ fn render_mount_wizard(
     target_index: usize,
     mounts: &MountWizard,
     title: &str,
+    submit_label: &str,
 ) {
     let target_id = nth_key(&dashboard.config.targets, target_index);
     let target = dashboard
@@ -3592,31 +3873,44 @@ fn render_mount_wizard(
         }
         TargetTemplate::SshBare { .. } => unreachable!("bare SSH does not attach resources"),
     };
-    let source_marker = if mounts.field == MountField::Source {
+    let source_marker = if mounts.focus == MountFocus::Source {
         "› "
     } else {
         "  "
     };
-    let destination_marker = if mounts.field == MountField::Destination {
+    let destination_marker = if mounts.focus == MountFocus::Destination {
         "› "
     } else {
         "  "
+    };
+    let source_caret = if mounts.focus == MountFocus::Source {
+        "▏"
+    } else {
+        ""
+    };
+    let destination_caret = if mounts.focus == MountFocus::Destination {
+        "▏"
+    } else {
+        ""
     };
     let mut lines = vec![
         Line::raw(format!("Target: {target_id} ({})", target_label(target))),
         Line::styled(protection, Style::default().fg(Color::Yellow)),
         Line::raw(""),
         Line::styled(
-            format!("{source_marker}Source: {}", mounts.source),
-            if mounts.field == MountField::Source {
+            format!("{source_marker}Source: {}{source_caret}", mounts.source),
+            if mounts.focus == MountFocus::Source {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
                 Style::default()
             },
         ),
         Line::styled(
-            format!("{destination_marker}Destination: {}", mounts.destination),
-            if mounts.field == MountField::Destination {
+            format!(
+                "{destination_marker}Destination: {}{destination_caret}",
+                mounts.destination
+            ),
+            if mounts.focus == MountFocus::Destination {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
                 Style::default()
@@ -3634,7 +3928,7 @@ fn render_mount_wizard(
             ))
         }));
     }
-    if mounts.field == MountField::Source && !mounts.history.is_empty() {
+    if mounts.focus == MountFocus::Source && !mounts.history.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             "Recent sources (↑/↓ when Source is empty):",
@@ -3659,16 +3953,22 @@ fn render_mount_wizard(
     if let Some(candidates) = mounts.completion_cache.get(&mounts.source) {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            format!("Tab matches: {}", candidates.join("  ")),
+            format!("F2 matches: {}", candidates.join("  ")),
             Style::default().fg(Color::DarkGray),
         ));
     }
     lines.extend([
         Line::raw(""),
         Line::styled(
-            "Enter accepts a field; empty Source continues · Del removes last · Tab completes · ← back · Esc cancel",
+            "Tab moves focus · Enter activates · F2 completes source · Del removes last",
             Style::default().fg(Color::DarkGray),
         ),
+        action_buttons(&[
+            ("Cancel", mounts.focus == MountFocus::Cancel),
+            ("Back", mounts.focus == MountFocus::Back),
+            ("Add resource", mounts.focus == MountFocus::Add),
+            (submit_label, mounts.focus == MountFocus::Submit),
+        ]),
     ]);
     let popup = centered_rect(84, (lines.len() as u16 + 2).clamp(12, 24), area);
     frame.render_widget(Clear, popup);
@@ -3694,6 +3994,7 @@ fn render_resume_wizard(
             wizard.target,
             &wizard.mounts,
             " Resume · 3/3 attached resources ",
+            "Resume",
         );
         return;
     }
@@ -3718,7 +4019,7 @@ fn render_resume_wizard(
                 .collect(),
             wizard.profile,
             &[
-                "Enter next · ← back · Esc cancel",
+                "↑/↓ select · Tab moves focus · Enter activates",
                 "Lossy: text only; tool calls + reasoning dropped.",
             ][..],
         ),
@@ -3741,13 +4042,30 @@ fn render_resume_wizard(
                 })
                 .collect(),
             wizard.target,
-            &["+ double · - halve · r reset 8 CPU / 32 GiB · Enter next · ← back · Esc cancel"][..],
+            &["+ double · - halve · r reset 8 CPU / 32 GiB"][..],
         ),
         WizardStep::Bundle => unreachable!("resume does not select a bundle"),
         WizardStep::Mounts => unreachable!("mount input was rendered above"),
         WizardStep::NewBundle => unreachable!("resume does not create bundles"),
     };
-    render_picker(frame, area, title, choices, selected, help);
+    render_picker(
+        frame,
+        area,
+        title,
+        choices,
+        selected,
+        help,
+        PickerNavigation {
+            focus: wizard.focus,
+            has_back: wizard.step != WizardStep::Profile,
+        },
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PickerNavigation {
+    focus: WizardFocus,
+    has_back: bool,
 }
 
 fn render_picker(
@@ -3757,10 +4075,11 @@ fn render_picker(
     choices: Vec<String>,
     selected: usize,
     help: &[&str],
+    navigation: PickerNavigation,
 ) {
     let popup = centered_rect(
         68,
-        (choices.len() as u16 + help.len() as u16 + 4).clamp(8, 18),
+        (choices.len() as u16 + help.len() as u16 + 6).clamp(9, 19),
         area,
     );
     frame.render_widget(Clear, popup);
@@ -3768,8 +4087,12 @@ fn render_picker(
         .into_iter()
         .enumerate()
         .map(|(index, choice)| {
-            let marker = if index == selected { "› " } else { "  " };
-            let style = if index == selected {
+            let marker = if index == selected && navigation.focus == WizardFocus::Content {
+                "› "
+            } else {
+                "  "
+            };
+            let style = if index == selected && navigation.focus == WizardFocus::Content {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
                 Style::default()
@@ -3781,6 +4104,10 @@ fn render_picker(
             help.iter()
                 .map(|line| Line::styled(*line, Style::default().fg(Color::DarkGray))),
         )
+        .chain([
+            Line::raw(""),
+            wizard_buttons(navigation.focus, navigation.has_back, "Next"),
+        ])
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(lines)
@@ -4685,6 +5012,15 @@ mod tests {
         );
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Right)),
+            DashboardAction::None
+        );
+        dashboard.handle_key(key(KeyCode::BackTab));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::CreateSession {
                 profile_id: "codex-1".into(),
                 bundle_id: "hel".into(),
@@ -4697,6 +5033,36 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn new_session_wizard_renders_and_focuses_explicit_navigation_buttons() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.handle_key(key(KeyCode::Char('n')));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw wizard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Cancel"));
+        assert!(rendered.contains("Next"));
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new-session wizard");
+        };
+        assert_eq!(wizard.focus, WizardFocus::Cancel);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
     }
 
     #[test]
@@ -4747,6 +5113,7 @@ mod tests {
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::BackTab));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::CreateSession {
@@ -4771,12 +5138,28 @@ mod tests {
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw resource wizard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Source: ▏"));
+        assert!(rendered.contains("Add resource"));
+        assert!(rendered.contains("Create"));
         for character in "/opt/cache".chars() {
             dashboard.handle_key(key(KeyCode::Char(character)));
         }
         dashboard.apply_mount_source_completions("/opt/ca", vec!["/opt/cache/".into()]);
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::BackTab));
 
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
@@ -4805,6 +5188,11 @@ mod tests {
         dashboard.handle_key(key(KeyCode::Up));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Right)),
+            DashboardAction::None
+        );
+        dashboard.handle_key(key(KeyCode::BackTab));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::ResumeSession {
@@ -4843,6 +5231,8 @@ mod tests {
         }
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::BackTab));
 
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
@@ -5158,6 +5548,10 @@ mod tests {
         dashboard.handle_key(key(KeyCode::Right));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::ImportSession {
                 profile_id: "claude-1".into(),
                 native_session_id: "claude-session".into(),
@@ -5239,6 +5633,10 @@ mod tests {
 
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::ImportSession {
                 profile_id: "codex-1".into(),
                 native_session_id: "b".into(),
@@ -5287,7 +5685,7 @@ mod tests {
     }
 
     #[test]
-    fn import_dialog_tab_cycles_focus_and_only_active_pane_draws_cursor() {
+    fn import_dialog_tab_cycles_through_panes_and_buttons() {
         let mut dashboard = dashboard_with_session(archived_session());
         let profiles = vec![ImportProfileOption {
             profile_id: "codex-1".into(),
@@ -5305,15 +5703,16 @@ mod tests {
         dashboard.apply_import_profiles(1, profiles);
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
 
-        for expected_pane in [
-            ImportPane::Profiles,
-            ImportPane::Sessions,
-            ImportPane::Profiles,
+        for (expected_focus, expected_cursors) in [
+            (ImportFocus::Profiles, 1),
+            (ImportFocus::Sessions, 1),
+            (ImportFocus::Cancel, 0),
+            (ImportFocus::Import, 0),
         ] {
             let Mode::Import(dialog) = &dashboard.mode else {
                 panic!("expected import dialog");
             };
-            assert_eq!(dialog.pane, expected_pane);
+            assert_eq!(dialog.focus, expected_focus);
             terminal
                 .draw(|frame| render_import_dialog(frame, frame.area(), dialog))
                 .expect("draw import dialog");
@@ -5325,7 +5724,7 @@ mod tests {
                     .iter()
                     .filter(|cell| cell.symbol() == "›")
                     .count(),
-                1
+                expected_cursors
             );
             dashboard.handle_key(key(KeyCode::Tab));
         }
