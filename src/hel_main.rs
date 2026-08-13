@@ -2337,12 +2337,15 @@ async fn run_dashboard() -> Result<()> {
                     }
                 };
                 match result {
-                    Ok((
-                        hel::hel_chat::ChatExit::Detached {
-                            last_seen_event_sequence,
-                        },
-                        worker,
-                    )) => {
+                    Ok((exit, worker)) => {
+                        let (last_seen_event_sequence, quit_after_detach) = match exit {
+                            hel::hel_chat::ChatExit::Detached {
+                                last_seen_event_sequence,
+                            } => (last_seen_event_sequence, false),
+                            hel::hel_chat::ChatExit::QuitDetached {
+                                last_seen_event_sequence,
+                            } => (last_seen_event_sequence, true),
+                        };
                         if let Some(worker) = worker.as_ref() {
                             dashboard.apply_worker_update(
                                 &session_id,
@@ -2373,6 +2376,10 @@ async fn run_dashboard() -> Result<()> {
                                 "Detached from {}; could not save read status: {error:#}",
                                 short_id(&session_id)
                             )),
+                        }
+                        if quit_after_detach {
+                            quit_detached = true;
+                            break;
                         }
                     }
                     Err(error) => {

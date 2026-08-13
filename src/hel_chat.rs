@@ -40,6 +40,7 @@ const MOUSE_SCROLL_ROWS: usize = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatExit {
     Detached { last_seen_event_sequence: u64 },
+    QuitDetached { last_seen_event_sequence: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +51,7 @@ pub enum ChatAction {
     Cancel,
     ToggleVoice,
     Back,
+    QuitDetach,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1087,6 +1089,9 @@ impl ChatState {
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('g') {
             return ChatAction::Back;
         }
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('q') {
+            return ChatAction::QuitDetach;
+        }
 
         if self.history_search.is_some() {
             if modifiers.contains(KeyModifiers::ALT) && code == KeyCode::Char('r') {
@@ -1819,8 +1824,8 @@ fn tool_location_details(locations: &[ToolCallLocation]) -> Vec<String> {
         .collect()
 }
 
-/// Run chat until the user presses Escape. This detaches the proxy and leaves
-/// the target worker alive.
+/// Run chat until the user returns to the dashboard or quits Hel. Either exit
+/// detaches the proxy and leaves the target worker alive.
 pub async fn run_chat(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut client: WorkerClient,
@@ -1962,19 +1967,22 @@ pub async fn run_chat(
                             None
                         }
                     }
-                    ChatAction::Back => {
+                    action @ (ChatAction::Back | ChatAction::QuitDetach) => {
                         if let Some(cancel) = voice_cancel.take() {
                             let _ = cancel.send(());
                         }
                         let last_seen_event_sequence = chat.latest_seq();
                         chat.reset_interaction();
-                        return Ok((
+                        let exit = if action == ChatAction::QuitDetach {
+                            ChatExit::QuitDetached {
+                                last_seen_event_sequence,
+                            }
+                        } else {
                             ChatExit::Detached {
                                 last_seen_event_sequence,
-                            },
-                            client,
-                            chat,
-                        ));
+                            }
+                        };
+                        return Ok((exit, client, chat));
                     }
                 };
                 if let Some(error) = result {
@@ -2884,6 +2892,13 @@ mod tests {
         let mut chat = ChatState::new(&snapshot(), &[]);
         let control_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
         assert_eq!(chat.handle_key(control_g), ChatAction::Back);
+    }
+
+    #[test]
+    fn control_q_quits_from_conversation() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+
+        assert_eq!(chat.handle_key(ctrl('q')), ChatAction::QuitDetach);
     }
 
     #[test]
