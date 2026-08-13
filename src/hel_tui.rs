@@ -3588,7 +3588,7 @@ fn render_mount_wizard(
             "Podman uses :O copy-on-write overlays; container writes never change the source."
         }
         TargetTemplate::AwsEc2 { .. } => {
-            "EC2 resources are ZIP-compressed locally, uploaded once, and extracted at the destination."
+            "EC2 resources stream as tar.gz through one SSH connection into the destination."
         }
         TargetTemplate::SshBare { .. } => unreachable!("bare SSH does not attach resources"),
     };

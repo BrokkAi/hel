@@ -246,11 +246,10 @@ template's instance family and passes an instance-type override while retaining
 the same launch template and AMI.
 
 New and resumed sessions can also attach resource directories. Container
-targets expose them with the runtime's isolated mount mode. EC2 targets create
-one deflated ZIP per directory on the controller, transfer that single archive
-over SCP, and extract it with the installed Hel worker under the selected
-destination. Symbolic links are rejected so an attachment cannot escape its
-source or destination tree.
+targets expose them with the runtime's isolated mount mode. EC2 targets stream
+each directory as tar.gz through one SSH process directly into the installed
+Hel worker, without writing a controller or target archive. Symbolic links are
+rejected so an attachment cannot escape its source or destination tree.
 
 The first-run dialog intentionally creates one local target and, when started
 inside a GitHub checkout, one-repository bundle. Advanced configurations remain

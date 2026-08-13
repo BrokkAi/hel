@@ -376,10 +376,8 @@ enum WorkerCommand {
         #[arg(long)]
         spec: PathBuf,
     },
-    /// Install one controller-packed resource directory on a remote target.
+    /// Install one streamed resource directory on a remote target.
     InstallResource {
-        #[arg(long)]
-        archive: PathBuf,
         #[arg(long)]
         destination: PathBuf,
     },
@@ -454,10 +452,9 @@ async fn main() -> Result<()> {
             WorkerCommand::RestoreRepositories { spec } => {
                 hel::hel_checkpoint::restore_repositories_from_spec_file(&spec)
             }
-            WorkerCommand::InstallResource {
-                archive,
-                destination,
-            } => hel::hel_resources::install_resource_archive(&archive, &destination),
+            WorkerCommand::InstallResource { destination } => {
+                hel::hel_resources::install_resource_stream(std::io::stdin(), &destination)
+            }
             WorkerCommand::GitBridge { root } => hel::hel_git_proxy::run_worker_bridge(&root).await,
             WorkerCommand::GitProxy {
                 root,

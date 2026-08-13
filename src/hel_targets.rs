@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -232,6 +233,14 @@ pub fn path_completion(prefix: &str, candidates: &[String]) -> Option<String> {
 
 pub trait CommandExecutor {
     fn execute(&self, command: &CommandSpec) -> Result<CommandOutput>;
+
+    fn execute_with_stdin(
+        &self,
+        _command: &CommandSpec,
+        _input: &mut dyn Read,
+    ) -> Result<CommandOutput> {
+        bail!("this command executor does not support streamed stdin")
+    }
 }
 
 pub struct ProcessExecutor;
@@ -249,6 +258,62 @@ impl CommandExecutor for ProcessExecutor {
             status,
             stdout: output.stdout,
             stderr: output.stderr,
+        })
+    }
+
+    fn execute_with_stdin(
+        &self,
+        command: &CommandSpec,
+        input: &mut dyn Read,
+    ) -> Result<CommandOutput> {
+        let mut child = Command::new(&command.program)
+            .args(&command.args)
+            .envs(&command.env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("run {} for {}", command.program, command.purpose))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("streamed command stdin missing")?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("streamed command stdout missing")?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .context("streamed command stderr missing")?;
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::io::copy(&mut stdout, &mut bytes).map(|_| bytes)
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::io::copy(&mut stderr, &mut bytes).map(|_| bytes)
+        });
+        let copy = std::io::copy(input, &mut stdin);
+        let flush = stdin.flush();
+        drop(stdin);
+        let status = child
+            .wait()
+            .with_context(|| format!("wait for {} for {}", command.program, command.purpose))?;
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("streamed command stdout reader panicked"))??;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("streamed command stderr reader panicked"))??;
+        if status.success() {
+            copy.context("stream command input")?;
+            flush.context("flush command input")?;
+        }
+        Ok(CommandOutput {
+            status: status.code().unwrap_or(-1),
+            stdout,
+            stderr,
         })
     }
 }
@@ -1619,6 +1684,21 @@ mod tests {
     use std::cell::RefCell;
 
     const SESSION: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
+
+    #[test]
+    fn process_executor_streams_stdin_and_captures_output() {
+        let mut input = std::io::Cursor::new(b"streamed input".to_vec());
+        let output = ProcessExecutor
+            .execute_with_stdin(
+                &CommandSpec::new("sh", ["-c", "cat"]).purpose("echo streamed input"),
+                &mut input,
+            )
+            .unwrap();
+
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout, b"streamed input");
+        assert!(output.stderr.is_empty());
+    }
 
     fn bundle() -> ProjectBundleSpec {
         ProjectBundleSpec {

@@ -2538,7 +2538,7 @@ fn install_attached_resources(
     worker_root: &str,
     executor: &impl CommandExecutor,
 ) -> Result<()> {
-    let hel_targets::TargetLocator::AwsEc2 { ssh, .. } = backend else {
+    let hel_targets::TargetLocator::AwsEc2 { .. } = backend else {
         return Ok(());
     };
     let session = state
@@ -2548,17 +2548,7 @@ fn install_attached_resources(
     if session.additional_mounts.is_empty() {
         return Ok(());
     }
-    let staging = tempfile::tempdir().context("create attached-resource staging")?;
-    for (index, resource) in session.additional_mounts.iter().enumerate() {
-        let archive = staging.path().join(format!("resource-{index}.zip"));
-        crate::hel_resources::write_resource_archive(&resource.source, &archive)
-            .with_context(|| format!("pack attached resource {}", resource.source.display()))?;
-        let remote_archive = format!("{worker_root}/resource-{index}.zip");
-        execute_checked(
-            executor,
-            scp_command_spec(ssh, &archive, &remote_archive, false)
-                .purpose("upload attached resource archive"),
-        )?;
+    for resource in &session.additional_mounts {
         let install = hel_targets::command_on_locator(
             backend,
             session_id,
@@ -2566,23 +2556,15 @@ fn install_attached_resources(
                 format!("{worker_root}/hel"),
                 "worker".into(),
                 "install-resource".into(),
-                "--archive".into(),
-                remote_archive.clone(),
                 "--destination".into(),
                 resource.destination.to_string_lossy().into_owned(),
             ],
-            "install attached resource archive",
+            "stream attached resource",
         )?;
-        execute_checked(executor, install)?;
-        execute_checked(
-            executor,
-            hel_targets::command_on_locator(
-                backend,
-                session_id,
-                vec!["rm".into(), "-f".into(), remote_archive],
-                "remove attached resource archive",
-            )?,
-        )?;
+        crate::hel_resources::stream_resource(&resource.source, |stream| {
+            execute_checked_with_stdin(executor, &install, stream).map(|_| ())
+        })
+        .with_context(|| format!("stream attached resource {}", resource.source.display()))?;
     }
     Ok(())
 }
@@ -3065,6 +3047,23 @@ fn ensure_git_broker(
 
 fn execute_checked(executor: &impl CommandExecutor, command: CommandSpec) -> Result<CommandOutput> {
     let output = executor.execute(&command)?;
+    if output.status != 0 {
+        bail!(
+            "{} failed with status {}: {}",
+            command.purpose,
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(output)
+}
+
+fn execute_checked_with_stdin(
+    executor: &impl CommandExecutor,
+    command: &CommandSpec,
+    input: &mut dyn std::io::Read,
+) -> Result<CommandOutput> {
+    let output = executor.execute_with_stdin(command, input)?;
     if output.status != 0 {
         bail!(
             "{} failed with status {}: {}",
@@ -3928,13 +3927,30 @@ mod tests {
     }
 
     #[test]
-    fn aws_resources_are_packed_then_uploaded_as_single_archives() {
+    fn aws_resources_are_compressed_into_one_streamed_ssh_command() {
         struct RecordingExecutor {
             commands: RefCell<Vec<CommandSpec>>,
+            streams: RefCell<Vec<Vec<u8>>>,
         }
         impl CommandExecutor for RecordingExecutor {
             fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
                 self.commands.borrow_mut().push(command.clone());
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+
+            fn execute_with_stdin(
+                &self,
+                command: &CommandSpec,
+                input: &mut dyn std::io::Read,
+            ) -> Result<CommandOutput> {
+                self.commands.borrow_mut().push(command.clone());
+                let mut stream = Vec::new();
+                input.read_to_end(&mut stream)?;
+                self.streams.borrow_mut().push(stream);
                 Ok(CommandOutput {
                     status: 0,
                     stdout: Vec::new(),
@@ -3988,6 +4004,7 @@ mod tests {
         };
         let executor = RecordingExecutor {
             commands: RefCell::new(Vec::new()),
+            streams: RefCell::new(Vec::new()),
         };
 
         install_attached_resources(
@@ -4000,22 +4017,17 @@ mod tests {
         .unwrap();
 
         let commands = executor.commands.borrow();
-        assert_eq!(commands.len(), 3);
-        assert_eq!(commands[0].program, "scp");
-        assert!(!commands[0].args.iter().any(|argument| argument == "-r"));
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].program, "ssh");
         assert!(
             commands[0]
                 .args
                 .iter()
-                .any(|argument| argument.ends_with(".zip"))
-        );
-        assert!(
-            commands[1]
-                .args
-                .iter()
                 .any(|argument| argument.contains("install-resource"))
         );
-        assert_eq!(commands[2].purpose, "remove attached resource archive");
+        let streams = executor.streams.borrow();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(&streams[0][..2], &[0x1f, 0x8b]);
     }
 
     #[test]
