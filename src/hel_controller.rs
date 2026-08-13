@@ -1806,7 +1806,7 @@ fn prune_launch_diagnostics(directory: &Path) -> Result<()> {
         }
         diagnostics.push((entry.metadata()?.modified()?, entry.path()));
     }
-    diagnostics.sort_by(|left, right| right.0.cmp(&left.0));
+    diagnostics.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     for (_, path) in diagnostics.into_iter().skip(RETAINED_LAUNCH_DIAGNOSTICS) {
         std::fs::remove_file(&path)
             .with_context(|| format!("prune old launch diagnostic {}", path.display()))?;
