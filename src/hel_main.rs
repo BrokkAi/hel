@@ -8,7 +8,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -2991,8 +2994,13 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("enable terminal raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-            .context("enter alternate screen and enable mouse capture")?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )
+        .context("enter alternate screen and enable terminal input modes")?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal })
     }
@@ -3001,10 +3009,11 @@ impl TerminalGuard {
         disable_raw_mode().context("disable terminal raw mode for setup")?;
         execute!(
             self.terminal.backend_mut(),
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         )
-        .context("disable mouse capture and leave alternate screen for setup")?;
+        .context("disable terminal input modes and leave alternate screen for setup")?;
         self.terminal
             .show_cursor()
             .context("show cursor for setup")?;
@@ -3016,9 +3025,10 @@ impl TerminalGuard {
         execute!(
             self.terminal.backend_mut(),
             EnterAlternateScreen,
-            EnableMouseCapture
+            EnableMouseCapture,
+            EnableBracketedPaste
         )
-        .context("re-enter alternate screen and enable mouse capture after setup")?;
+        .context("re-enter alternate screen and enable terminal input modes after setup")?;
         self.terminal
             .clear()
             .context("clear dashboard after setup")?;
@@ -3031,6 +3041,7 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
