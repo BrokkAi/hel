@@ -2164,26 +2164,134 @@ fn input_visual_rows(input: &str, width: usize) -> usize {
 
 fn input_cursor_visual_position(input: &str, cursor: usize, width: usize) -> (usize, usize) {
     let width = width.max(1);
-    let mut row = 0;
-    let mut column = 0;
-    for grapheme in input[..cursor].graphemes(true) {
-        if grapheme == "\n" {
-            row += 1;
-            column = 0;
+    let cursor = cursor.min(input.len());
+    let mut line_offset = 0;
+    let mut row_offset = 0;
+
+    for line in input.split('\n') {
+        let line_end = line_offset + line.len();
+        let wrapped = wrap_input_line(line, line_offset, width);
+        if cursor <= line_end {
+            let mut previous = (0, row_offset);
+            for (wrapped_row, graphemes) in wrapped.iter().enumerate() {
+                let row = row_offset + wrapped_row;
+                let mut column = 0;
+                for grapheme in graphemes {
+                    let start = (column, row);
+                    if cursor <= grapheme.start {
+                        return start;
+                    }
+                    column += grapheme.width;
+                    let end = if column >= width {
+                        (0, row + 1)
+                    } else {
+                        (column, row)
+                    };
+                    if cursor <= grapheme.end {
+                        return end;
+                    }
+                    previous = end;
+                }
+            }
+            return previous;
+        }
+        row_offset += wrapped.len();
+        line_offset = line_end + 1;
+    }
+
+    (0, row_offset)
+}
+
+#[derive(Clone, Copy)]
+struct InputGrapheme {
+    start: usize,
+    end: usize,
+    width: usize,
+    whitespace: bool,
+}
+
+/// Mirror ratatui's `WordWrapper` layout so the terminal cursor follows the
+/// word-wrapped `Paragraph`, including whitespace discarded at wrap points.
+fn wrap_input_line(line: &str, offset: usize, width: usize) -> Vec<Vec<InputGrapheme>> {
+    let mut wrapped = Vec::new();
+    let mut pending_line = Vec::new();
+    let mut pending_word = Vec::new();
+    let mut pending_whitespace = VecDeque::<InputGrapheme>::new();
+    let mut line_width = 0;
+    let mut word_width = 0;
+    let mut whitespace_width = 0;
+    let mut previous_was_non_whitespace = false;
+
+    for (start, symbol) in line.grapheme_indices(true) {
+        let symbol_width = display_width(symbol);
+        if symbol_width > width {
             continue;
         }
-        let grapheme_width = display_width(grapheme).max(1);
-        if column + grapheme_width > width {
-            row += 1;
-            column = 0;
+        let whitespace = symbol == "\u{200b}"
+            || (symbol.chars().all(char::is_whitespace) && symbol != "\u{00a0}");
+        let grapheme = InputGrapheme {
+            start: offset + start,
+            end: offset + start + symbol.len(),
+            width: symbol_width,
+            whitespace,
+        };
+        let word_found = previous_was_non_whitespace && whitespace;
+        let untrimmed_overflow =
+            pending_line.is_empty() && word_width + whitespace_width + symbol_width > width;
+
+        if word_found || untrimmed_overflow {
+            pending_line.extend(pending_whitespace.drain(..));
+            line_width += whitespace_width;
+            pending_line.append(&mut pending_word);
+            line_width += word_width;
+            whitespace_width = 0;
+            word_width = 0;
         }
-        column += grapheme_width;
-        if column >= width {
-            row += 1;
-            column = 0;
+
+        let line_full = line_width >= width;
+        let pending_word_overflow =
+            symbol_width > 0 && line_width + whitespace_width + word_width >= width;
+        if line_full || pending_word_overflow {
+            let mut remaining_width = width.saturating_sub(line_width);
+            wrapped.push(std::mem::take(&mut pending_line));
+            line_width = 0;
+
+            while let Some(pending) = pending_whitespace.front() {
+                if pending.width > remaining_width {
+                    break;
+                }
+                whitespace_width -= pending.width;
+                remaining_width -= pending.width;
+                pending_whitespace.pop_front();
+            }
+            if whitespace && pending_whitespace.is_empty() {
+                previous_was_non_whitespace = false;
+                continue;
+            }
         }
+
+        if grapheme.whitespace {
+            whitespace_width += grapheme.width;
+            pending_whitespace.push_back(grapheme);
+        } else {
+            word_width += grapheme.width;
+            pending_word.push(grapheme);
+        }
+        previous_was_non_whitespace = !whitespace;
     }
-    (column, row)
+
+    if pending_line.is_empty() && pending_word.is_empty() && !pending_whitespace.is_empty() {
+        wrapped.push(Vec::new());
+    }
+    pending_line.extend(pending_whitespace);
+    pending_line.append(&mut pending_word);
+    if !pending_line.is_empty() {
+        wrapped.push(pending_line);
+    }
+    if wrapped.is_empty() {
+        wrapped.push(Vec::new());
+    }
+    wrapped
 }
 
 fn history_scope_name(scope: HistoryScope) -> &'static str {
@@ -3105,6 +3213,42 @@ mod tests {
         assert!(rendered.contains("gpt-5.6-sol · high · Running · Esc cancels"));
         assert!(!rendered.contains("HEL /"));
         assert_ne!(buffer[(buffer.area.x, buffer.area.y)].symbol(), "┌");
+    }
+
+    #[test]
+    fn composer_cursor_follows_a_word_moved_to_the_next_visual_row() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("abcdefgh ijkl".into());
+        let mut terminal = Terminal::new(TestBackend::new(14, 12)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut chat))
+            .expect("draw chat");
+        let (word_end_x, word_row) = {
+            let buffer = terminal.backend().buffer();
+            let word_row = (buffer.area.y..buffer.area.bottom())
+                .find(|&y| {
+                    (buffer.area.x..buffer.area.right())
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains("ijkl")
+                })
+                .expect("wrapped word");
+            let word_start_x = (buffer.area.x..buffer.area.right())
+                .find(|&x| buffer[(x, word_row)].symbol() == "i")
+                .expect("wrapped word start");
+            (word_start_x + 4, word_row)
+        };
+
+        terminal
+            .backend_mut()
+            .assert_cursor_position((word_end_x, word_row));
+        assert_eq!(
+            input_cursor_visual_position(&chat.input, chat.input.len(), 12),
+            (4, 1)
+        );
+        assert_eq!(input_cursor_visual_position(&chat.input, 9, 12), (0, 1));
+        assert_eq!(input_cursor_visual_position(&chat.input, 10, 12), (1, 1));
     }
 
     #[test]
