@@ -17,7 +17,7 @@ use ratatui::widgets::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::hel_chat::{TranscriptSnapshot, render_agent_message_preview};
+use crate::hel_chat::{TranscriptSnapshot, render_agent_message_tail};
 use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use crate::hel_quota::ProfileQuota;
 use crate::hel_state::{HelState, SessionRecord, SessionResourceAllocation, SessionState};
@@ -3563,7 +3563,7 @@ fn prepare_active_previews(
             if selected_active == Some(index) {
                 active_transcript_tail(detail, preview_width, maximum_selected_lines)
             } else {
-                active_message_preview(detail.as_deref(), usize::from(preview_width))
+                active_transcript_tail(detail, preview_width, ACTIVE_MESSAGE_LINES)
             }
         })
         .collect()
@@ -4172,13 +4172,14 @@ fn session_name_line(session_name: String, unread_count: usize) -> Line<'static>
     Line::from(spans)
 }
 
-fn active_message_preview(detail: Option<&SessionDetail>, width: usize) -> Vec<Line<'static>> {
+fn active_message_tail(
+    detail: Option<&SessionDetail>,
+    width: usize,
+    maximum_lines: usize,
+) -> Vec<Line<'static>> {
     detail
         .and_then(|detail| detail.last_agent_message.as_deref())
-        .map(|message| {
-            let single_line = message.lines().collect::<Vec<_>>().join(" ");
-            render_agent_message_preview(&single_line, width, ACTIVE_MESSAGE_LINES)
-        })
+        .map(|message| render_agent_message_tail(message, width, maximum_lines))
         .unwrap_or_default()
 }
 
@@ -4192,7 +4193,7 @@ fn active_transcript_tail(
     };
     match detail.transcript.as_mut() {
         Some(transcript) => transcript.rich_tail(width, maximum_lines),
-        None => active_message_preview(Some(detail), usize::from(width)),
+        None => active_message_tail(Some(detail), usize::from(width), maximum_lines),
     }
 }
 
@@ -7682,7 +7683,7 @@ mod tests {
             .collect::<String>();
         assert!(blurred.contains("Rendered answer"));
         assert!(!blurred.contains("❯ You"));
-        assert!(!blurred.contains("Run dashboard tests"));
+        assert!(blurred.contains("Run dashboard tests"));
     }
 
     #[test]
@@ -7931,23 +7932,35 @@ mod tests {
     }
 
     #[test]
-    fn active_message_preview_uses_only_the_wrapped_lines_it_needs() {
+    fn active_message_tail_uses_the_last_four_nonempty_lines() {
         let short = SessionDetail {
             last_agent_message: Some("one line".into()),
             ..SessionDetail::default()
         };
-        assert_eq!(active_message_preview(Some(&short), 80).len(), 1);
+        assert_eq!(
+            active_message_tail(Some(&short), 80, ACTIVE_MESSAGE_LINES).len(),
+            1
+        );
 
         let long = SessionDetail {
             last_agent_message: Some("one\ntwo\nthree\nfour\nfive".into()),
             ..SessionDetail::default()
         };
-        assert_eq!(active_message_preview(Some(&long), 80).len(), 1);
-        assert!(active_message_preview(None, 80).is_empty());
+        let lines = active_message_tail(Some(&long), 80, ACTIVE_MESSAGE_LINES)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lines, ["│ two", "│ three", "│ four", "│ five"]);
+        assert!(active_message_tail(None, 80, ACTIVE_MESSAGE_LINES).is_empty());
     }
 
     #[test]
-    fn active_message_preview_flattens_final_message_newlines_before_capping() {
+    fn active_message_tail_removes_blank_lines_before_capping() {
         let detail = SessionDetail {
             last_agent_message: Some(
                 "Fixed and pushed.\n\nDuplicate LinkedIn URLs now use last-write-wins behavior.\n\nCommit: b6cb3e8 Keep the last duplicate connection record".into(),
@@ -7955,7 +7968,7 @@ mod tests {
             ..SessionDetail::default()
         };
 
-        let rendered = active_message_preview(Some(&detail), 80)
+        let rendered = active_message_tail(Some(&detail), 80, ACTIVE_MESSAGE_LINES)
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())

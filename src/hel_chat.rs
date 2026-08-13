@@ -31,8 +31,8 @@ use crate::hel_recovery::RecoveryContext;
 use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot};
 use crate::hel_worker_client::WorkerClient;
 use rendering::{
-    LogicalLine, TranscriptRenderMode, append_omitted_character_count, display_width,
-    line_character_count, markdown_lines, raw_lines, sanitize_terminal_text, wrap_styled_line,
+    LogicalLine, TranscriptRenderMode, display_width, markdown_lines, raw_lines,
+    sanitize_terminal_text, wrap_styled_line,
 };
 
 const MOUSE_SCROLL_ROWS: usize = 3;
@@ -254,7 +254,10 @@ impl TranscriptSnapshot {
             &mut self.render_cache,
             width,
             TranscriptRenderMode::Rich,
-        );
+        )
+        .into_iter()
+        .filter(|line| !line_is_empty(line))
+        .collect::<Vec<_>>();
         let start = lines.len().saturating_sub(maximum_lines);
         lines.into_iter().skip(start).collect()
     }
@@ -2415,7 +2418,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatState) {
 const ROLE_GUTTER: &str = "│ ";
 const ROLE_GUTTER_WIDTH: usize = 2;
 
-pub(crate) fn render_agent_message_preview(
+pub(crate) fn render_agent_message_tail(
     source: &str,
     width: usize,
     maximum_lines: usize,
@@ -2423,9 +2426,21 @@ pub(crate) fn render_agent_message_preview(
     if width == 0 || maximum_lines == 0 {
         return Vec::new();
     }
-    let agent_style = Style::default().fg(Color::Green);
+    let lines = render_agent_message_lines(source, width, Style::default().fg(Color::Green))
+        .into_iter()
+        .filter(|line| !line_is_empty(line))
+        .collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(maximum_lines);
+    lines.into_iter().skip(start).collect()
+}
+
+fn render_agent_message_lines(
+    source: &str,
+    width: usize,
+    agent_style: Style,
+) -> Vec<Line<'static>> {
     let content_width = width.saturating_sub(ROLE_GUTTER_WIDTH).max(1);
-    let mut lines = markdown_lines(
+    markdown_lines(
         &sanitize_terminal_text(source),
         Style::default(),
         agent_style,
@@ -2440,29 +2455,7 @@ pub(crate) fn render_agent_message_preview(
             with_role_gutter(line, agent_style)
         }
     })
-    .collect::<Vec<_>>();
-    if lines.len() > maximum_lines {
-        let omitted_characters = lines[maximum_lines..]
-            .iter()
-            .map(|line| {
-                line_character_count(line).saturating_sub(if !line_is_empty(line) {
-                    ROLE_GUTTER_WIDTH
-                } else {
-                    0
-                })
-            })
-            .sum();
-        lines.truncate(maximum_lines);
-        if let Some(last) = lines.last_mut() {
-            *last = append_omitted_character_count(
-                std::mem::take(last),
-                width,
-                omitted_characters,
-                agent_style,
-            );
-        }
-    }
-    lines
+    .collect()
 }
 
 /// Render the complete transcript into already-wrapped visual rows. Keeping
@@ -2758,39 +2751,6 @@ mod tests {
                     .collect()
             })
             .collect()
-    }
-
-    #[test]
-    fn agent_preview_reports_omitted_character_count_after_four_rendered_rows() {
-        let lines = render_agent_message_preview(
-            "**one** two three four five six seven eight nine ten eleven twelve",
-            12,
-            4,
-        );
-        let rendered = lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(rendered.len(), 4);
-        assert!(rendered[0].starts_with(ROLE_GUTTER));
-        assert_eq!(lines[3].spans.last().unwrap().content, "[31 more]");
-        assert!(!rendered[3].contains('…'));
-        assert_eq!(
-            lines[3].spans.last().and_then(|span| span.style.fg),
-            Some(Color::Green)
-        );
-        assert!(
-            lines[0]
-                .spans
-                .iter()
-                .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
-        );
     }
 
     #[test]
@@ -3450,11 +3410,31 @@ mod tests {
             ChatRole::Agent,
             "**Done.**\n\n- shared renderer\n- live tail",
         ));
-        let expected = transcript_text(&mut chat, 32);
+        let expected = transcript_text(&mut chat, 32)
+            .into_iter()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
         let expected = expected[expected.len().saturating_sub(6)..].to_vec();
 
         let mut snapshot = chat.transcript_snapshot();
         assert_eq!(line_text(snapshot.rich_tail(32, 6)), expected);
+    }
+
+    #[test]
+    fn transcript_snapshot_tail_counts_only_nonempty_rows() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(ChatEntry::plain(
+            1,
+            ChatRole::Agent,
+            "one\n\ntwo\n\nthree\n\nfour\n\nfive",
+        ));
+
+        let mut snapshot = chat.transcript_snapshot();
+        let tail = line_text(snapshot.rich_tail(80, 4));
+
+        assert_eq!(tail.len(), 4);
+        assert!(tail.iter().all(|line| !line.trim().is_empty()));
+        assert_eq!(tail, ["│ two", "│ three", "│ four", "│ five"]);
     }
 
     #[test]
