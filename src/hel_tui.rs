@@ -4323,7 +4323,7 @@ fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
         ],
     )
     .header(
-        Row::new(["Host / fleet", "Targets", "Capacity"])
+        Row::new(["Host / fleet", "Targets", "Capacity in Use"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .row_highlight_style(if focused {
@@ -7111,6 +7111,16 @@ mod tests {
         assert!(rendered.contains("37% CPU · 75% RAM"));
         assert!(!rendered.contains("Sample"));
         assert!(!rendered.contains("stale"));
+        let buffer = terminal.backend().buffer();
+        let header = (buffer.area.y..buffer.area.bottom())
+            .map(|y| {
+                (buffer.area.x..buffer.area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("Host / fleet") && line.contains("Targets"))
+            .expect("capacity header");
+        assert!(header.contains("Capacity in Use"));
     }
 
     #[test]
