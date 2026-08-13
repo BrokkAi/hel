@@ -2157,12 +2157,18 @@ impl DashboardState {
             .iter()
             .position(|(profile_id, _)| profile_id.as_str() == session.last_profile)
             .unwrap_or(0);
+        let target = self
+            .config
+            .targets
+            .keys()
+            .position(|target_id| target_id == &session.target_template_id)
+            .unwrap_or(0);
         self.mode = Mode::Resume(ResumeWizard {
             session_id: session.id.clone(),
             step: WizardStep::Profile,
             focus: WizardFocus::Content,
             profile,
-            target: 0,
+            target,
             mounts: MountWizard::with_mounts(Vec::new(), session.additional_mounts.clone()),
             resource_allocation: None,
             aws_options: BTreeMap::new(),
@@ -3270,9 +3276,7 @@ fn render_sessions(
         visible_sessions,
     );
 
-    let archived_rows = archived
-        .iter()
-        .map(|session| archived_session_row(session, &dashboard.config));
+    let archived_rows = archived.iter().map(|session| archived_session_row(session));
     let archived_focused = dashboard.focus == Focus::Archived;
     let archived_table = Table::new(archived_rows, archived_session_column_constraints())
         .header(archived_session_header())
@@ -3349,10 +3353,9 @@ fn session_column_constraints() -> [Constraint; 6] {
     ]
 }
 
-fn archived_session_column_constraints() -> [Constraint; 5] {
+fn archived_session_column_constraints() -> [Constraint; 4] {
     [
         Constraint::Length(14),
-        Constraint::Length(18),
         Constraint::Length(14),
         Constraint::Length(17),
         Constraint::Min(18),
@@ -3372,14 +3375,8 @@ fn session_header() -> Row<'static> {
 }
 
 fn archived_session_header() -> Row<'static> {
-    Row::new([
-        "Profile",
-        "Target",
-        "Checkpoint",
-        "Resources",
-        "Session name",
-    ])
-    .style(Style::default().add_modifier(Modifier::BOLD))
+    Row::new(["Profile", "Checkpoint", "Resources", "Session name"])
+        .style(Style::default().add_modifier(Modifier::BOLD))
 }
 
 fn session_values(
@@ -3556,7 +3553,7 @@ fn active_session_row(
     .top_margin(top_margin)
 }
 
-fn archived_session_row(session: &SessionRecord, config: &HelConfig) -> Row<'static> {
+fn archived_session_row(session: &SessionRecord) -> Row<'static> {
     let checkpoint = session
         .checkpoint
         .as_ref()
@@ -3564,7 +3561,6 @@ fn archived_session_row(session: &SessionRecord, config: &HelConfig) -> Row<'sta
         .unwrap_or_else(|| "never".into());
     Row::new([
         session.last_profile.clone(),
-        session_target(config, session),
         checkpoint,
         checkpoint_archive_size(session),
         session_name(session).to_string(),
@@ -5439,6 +5435,20 @@ mod tests {
     }
 
     #[test]
+    fn resume_defaults_to_the_previously_used_target() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        let target = dashboard.config.targets["podman"].clone();
+        dashboard.config.targets.insert("alternate".into(), target);
+
+        dashboard.handle_key(key(KeyCode::Enter));
+
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume wizard");
+        };
+        assert_eq!(nth_key(&dashboard.config.targets, wizard.target), "podman");
+    }
+
+    #[test]
     fn resume_dialog_attaches_an_additional_resource() {
         let mut dashboard = dashboard_with_session(archived_session());
         dashboard.handle_key(key(KeyCode::Enter));
@@ -6351,7 +6361,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_sessions_omit_the_turn_clock_column() {
+    fn archived_sessions_omit_turn_clock_and_target_columns() {
         let mut dashboard = dashboard_with_session(archived_session());
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -6367,6 +6377,7 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(rendered.matches("Turn clock").count(), 1);
+        assert!(!rendered.contains("podman: hel"));
         assert!(rendered.contains("26-08-09 01:00"));
         assert!(!rendered.contains("2026-08-09T01:00:00Z"));
         assert!(!rendered.contains("idle"));
