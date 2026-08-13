@@ -33,7 +33,7 @@ const BASELINE_MEMORY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const ACTIVE_MESSAGE_LINES: usize = 4;
 const SELECTED_TRANSCRIPT_LINES: usize = 10;
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
-const DASHBOARD_FIXED_HEIGHT: u16 = 5;
+const DASHBOARD_FIXED_HEIGHT: u16 = 3;
 const DASHBOARD_PANE_COUNT: usize = 4;
 const MOUSE_SCROLL_ROWS: isize = 3;
 const IMPORT_STALL_WARNING_AFTER: Duration = Duration::from_secs(10);
@@ -3293,26 +3293,14 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(8),
             Constraint::Length(5),
             Constraint::Length(8),
             Constraint::Length(2),
         ])
         .split(area);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                "Welcome to Hel.",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  ACP sessions, wherever they run."),
-        ]))
-        .alignment(Alignment::Center),
-        layout[0],
-    );
+    render_dashboard_title(frame, layout[0]);
 
     render_onboarding(frame, layout[1], dashboard);
     render_capacity(frame, layout[2], dashboard);
@@ -3331,6 +3319,19 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
         Mode::Confirm(confirmation) => render_confirmation(frame, area, confirmation),
         Mode::Dashboard => {}
     }
+}
+
+fn render_dashboard_title(frame: &mut Frame, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "Welcome to Hel.",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Center),
+        area,
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3461,24 +3462,12 @@ fn render_adaptive_dashboard(
     let fixed = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(2),
         ])
         .split(inner);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                "Welcome to Hel.",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  ACP sessions, wherever they run."),
-        ]))
-        .alignment(Alignment::Center),
-        fixed[0],
-    );
+    render_dashboard_title(frame, fixed[0]);
     let panes = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
@@ -5674,7 +5663,7 @@ mod tests {
         assert_eq!(
             allocation,
             PaneAllocation::Fits(PaneHeights {
-                active: 17,
+                active: 19,
                 archived: 5,
                 capacity: 5,
                 quotas: 5,
@@ -5700,7 +5689,7 @@ mod tests {
             (
                 Focus::Active,
                 PaneHeights {
-                    active: 22,
+                    active: 24,
                     archived: 5,
                     capacity: 5,
                     quotas: 5,
@@ -5709,7 +5698,7 @@ mod tests {
             (
                 Focus::Archived,
                 PaneHeights {
-                    active: 17,
+                    active: 19,
                     archived: 10,
                     capacity: 5,
                     quotas: 5,
@@ -5718,7 +5707,7 @@ mod tests {
             (
                 Focus::Capacity,
                 PaneHeights {
-                    active: 17,
+                    active: 19,
                     archived: 5,
                     capacity: 10,
                     quotas: 5,
@@ -5727,7 +5716,7 @@ mod tests {
             (
                 Focus::Quotas,
                 PaneHeights {
-                    active: 17,
+                    active: 19,
                     archived: 5,
                     capacity: 5,
                     quotas: 10,
@@ -5757,13 +5746,13 @@ mod tests {
             quotas: 5,
         };
         assert_eq!(
-            allocate_pane_heights(24, heights, heights, Focus::Active),
+            allocate_pane_heights(22, heights, heights, Focus::Active),
             PaneAllocation::TooSmall {
-                required_frame_height: 25,
+                required_frame_height: 23,
             }
         );
         assert!(matches!(
-            allocate_pane_heights(25, heights, heights, Focus::Active),
+            allocate_pane_heights(23, heights, heights, Focus::Active),
             PaneAllocation::Fits(_)
         ));
     }
@@ -5771,7 +5760,7 @@ mod tests {
     #[test]
     fn dashboard_replaces_too_short_layout_with_required_height() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        let mut terminal = Terminal::new(TestBackend::new(120, 18)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 16)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw short dashboard");
@@ -5783,9 +5772,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Terminal too small"));
-        assert!(rendered.contains("at least 19 rows (currently 18)"));
+        assert!(rendered.contains("at least 17 rows (currently 16)"));
 
-        let mut terminal = Terminal::new(TestBackend::new(120, 19)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 17)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw exact minimum dashboard");
@@ -5817,7 +5806,9 @@ mod tests {
         };
 
         assert_eq!(buffer[(buffer.area.x, buffer.area.y)].symbol(), " ");
-        assert!(!line(buffer.area.y).contains(" HEL "));
+        assert!(line(buffer.area.y).contains("Welcome to Hel."));
+        assert!(!line(buffer.area.y).contains("ACP sessions"));
+        assert!(line(buffer.area.y + 1).contains("Active"));
         let accelerator = if cfg!(target_os = "macos") {
             "Cmd"
         } else {
