@@ -56,6 +56,10 @@ pub enum DashboardAction {
         target_template_id: String,
         prefix: String,
     },
+    ValidateMountSource {
+        target_template_id: String,
+        source: String,
+    },
     ResumeSession {
         session_id: String,
         profile_id: String,
@@ -194,6 +198,16 @@ impl MountWizard {
         let mut wizard = Self::new(history);
         wizard.mounts = mounts;
         wizard
+    }
+
+    fn add_validated_mount(&mut self) {
+        self.mounts.push(AdditionalMount {
+            source: self.source.clone().into(),
+            destination: self.destination.clone().into(),
+        });
+        self.source.clear();
+        self.destination.clear();
+        self.focus = MountFocus::Source;
     }
 }
 
@@ -1394,12 +1408,12 @@ impl DashboardState {
                         self.mode = Mode::New(wizard);
                         return DashboardAction::None;
                     }
-                    wizard.mounts.mounts.push(mount);
-                    wizard.mounts.source.clear();
-                    wizard.mounts.destination.clear();
-                    wizard.mounts.focus = MountFocus::Source;
+                    let source = wizard.mounts.source.clone();
                     self.mode = Mode::New(wizard);
-                    DashboardAction::None
+                    DashboardAction::ValidateMountSource {
+                        target_template_id,
+                        source,
+                    }
                 }
                 MountFocus::Submit => self.create_session_action(&wizard),
             },
@@ -1625,6 +1639,26 @@ impl DashboardState {
                 self.mode = Mode::Resume(wizard);
             }
             _ => {}
+        }
+    }
+
+    pub fn apply_mount_source_validation(&mut self, source: &str, result: Result<(), String>) {
+        let mounts = match &mut self.mode {
+            Mode::New(wizard)
+                if wizard.step == WizardStep::Mounts && wizard.mounts.source == source =>
+            {
+                &mut wizard.mounts
+            }
+            Mode::Resume(wizard)
+                if wizard.step == WizardStep::Mounts && wizard.mounts.source == source =>
+            {
+                &mut wizard.mounts
+            }
+            _ => return,
+        };
+        match result {
+            Ok(()) => mounts.add_validated_mount(),
+            Err(error) => self.notice = Some(format!("Cannot add resource: {error}")),
         }
     }
 
@@ -1924,12 +1958,12 @@ impl DashboardState {
                         self.mode = Mode::Resume(wizard);
                         return DashboardAction::None;
                     }
-                    wizard.mounts.mounts.push(mount);
-                    wizard.mounts.source.clear();
-                    wizard.mounts.destination.clear();
-                    wizard.mounts.focus = MountFocus::Source;
+                    let source = wizard.mounts.source.clone();
                     self.mode = Mode::Resume(wizard);
-                    DashboardAction::None
+                    DashboardAction::ValidateMountSource {
+                        target_template_id,
+                        source,
+                    }
                 }
                 MountFocus::Submit => {
                     let profile_id = self
@@ -5279,7 +5313,14 @@ mod tests {
         dashboard.apply_mount_source_completions("/opt/ca", vec!["/opt/cache/".into()]);
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
-        dashboard.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ValidateMountSource {
+                target_template_id: "podman".into(),
+                source: "/opt/cache".into(),
+            }
+        );
+        dashboard.apply_mount_source_validation("/opt/cache", Ok(()));
         dashboard.handle_key(key(KeyCode::BackTab));
 
         assert_eq!(
@@ -5299,6 +5340,62 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn failed_source_validation_does_not_add_new_or_resume_mounts() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.handle_key(key(KeyCode::Char('n')));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        for character in "/missing".chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ValidateMountSource { .. }
+        ));
+        dashboard.apply_mount_source_validation(
+            "/missing",
+            Err("source path /missing does not exist or is not a directory".into()),
+        );
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new-session resource dialog");
+        };
+        assert!(wizard.mounts.mounts.is_empty());
+        assert_eq!(wizard.mounts.source, "/missing");
+        assert_eq!(wizard.mounts.focus, MountFocus::Add);
+        assert_eq!(
+            dashboard.notice.as_deref(),
+            Some("Cannot add resource: source path /missing does not exist or is not a directory")
+        );
+
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        for character in "/missing".chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ValidateMountSource { .. }
+        ));
+        dashboard.apply_mount_source_validation(
+            "/missing",
+            Err("source path /missing does not exist or is not a directory".into()),
+        );
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume resource dialog");
+        };
+        assert!(wizard.mounts.mounts.is_empty());
+        assert_eq!(wizard.mounts.source, "/missing");
+        assert_eq!(wizard.mounts.focus, MountFocus::Add);
     }
 
     #[test]
@@ -5352,7 +5449,14 @@ mod tests {
         }
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
-        dashboard.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ValidateMountSource {
+                target_template_id: "podman".into(),
+                source: "/opt/cache".into(),
+            }
+        );
+        dashboard.apply_mount_source_validation("/opt/cache", Ok(()));
         dashboard.handle_key(key(KeyCode::BackTab));
 
         assert_eq!(

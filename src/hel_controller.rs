@@ -376,6 +376,46 @@ impl Controller {
         }
     }
 
+    /// Verify a mount source on the host where Hel will consume it.
+    pub fn validate_mount_source(
+        &self,
+        target_id: &str,
+        source: &Path,
+        executor: &impl CommandExecutor,
+    ) -> Result<()> {
+        let target = self
+            .config
+            .targets
+            .get(target_id)
+            .with_context(|| format!("unknown target template {target_id:?}"))?;
+        let exists = match target {
+            TargetTemplate::LocalPodman { .. }
+            | TargetTemplate::AppleContainer { .. }
+            | TargetTemplate::AwsEc2 { .. } => std::fs::metadata(source)
+                .map(|metadata| metadata.is_dir())
+                .or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Ok(false)
+                    } else {
+                        Err(error)
+                    }
+                })
+                .with_context(|| format!("inspect resource source {}", source.display()))?,
+            TargetTemplate::SshPodman { ssh, .. } => {
+                hel_targets::ssh_directory_exists(&backend_ssh(ssh), source, executor)?
+            }
+            TargetTemplate::SshBare { .. } => {
+                bail!("resource attachments are unsupported for bare SSH targets")
+            }
+        };
+        ensure!(
+            exists,
+            "source path {} does not exist or is not a directory",
+            source.display()
+        );
+        Ok(())
+    }
+
     pub fn register_session(
         &mut self,
         profile_id: &str,
@@ -3836,6 +3876,46 @@ mod tests {
 
     use super::*;
     use crate::hel_config::{ContainerTemplate as ConfigContainer, ProjectRepository};
+
+    #[test]
+    fn local_mount_source_must_be_an_existing_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let mut config = HelConfig::default();
+        config.targets.insert(
+            "local".into(),
+            TargetTemplate::LocalPodman {
+                container: ConfigContainer {
+                    image: "ubuntu:24.04".into(),
+                    platform: None,
+                    cpus: None,
+                    memory: None,
+                    environment: BTreeMap::new(),
+                },
+            },
+        );
+        let controller = Controller {
+            config,
+            state: HelState::default(),
+        };
+
+        assert!(
+            controller
+                .validate_mount_source("local", directory.path(), &ProcessExecutor)
+                .is_ok()
+        );
+        for invalid in [file, directory.path().join("missing")] {
+            let error = controller
+                .validate_mount_source("local", &invalid, &ProcessExecutor)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not exist or is not a directory")
+            );
+        }
+    }
 
     #[test]
     fn packaged_worker_names_match_release_archives() {

@@ -2006,6 +2006,19 @@ async fn run_dashboard() -> Result<()> {
                 Ok(candidates) => dashboard.apply_mount_source_completions(&prefix, candidates),
                 Err(error) => dashboard.set_notice(format!("Path completion failed: {error:#}")),
             },
+            DashboardAction::ValidateMountSource {
+                target_template_id,
+                source,
+            } => {
+                let result = controller
+                    .validate_mount_source(
+                        &target_template_id,
+                        std::path::Path::new(&source),
+                        &ProcessExecutor,
+                    )
+                    .map_err(|error| format!("{error:#}"));
+                dashboard.apply_mount_source_validation(&source, result);
+            }
             DashboardAction::CreateSession {
                 profile_id,
                 bundle_id,
