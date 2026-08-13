@@ -2729,16 +2729,19 @@ fn import_session_option(
     cwd: PathBuf,
     unavailable_reason: Option<String>,
 ) -> ImportSessionOption {
+    let project_directory = display_home_relative(&cwd);
+    let details = format!(
+        "{} · {} · {} · {}",
+        system_time_age(modified_at),
+        branch,
+        format_byte_size(size),
+        project_directory
+    );
     ImportSessionOption {
         native_session_id,
         title,
-        details: format!(
-            "{} · {} · {} · {}",
-            system_time_age(modified_at),
-            branch,
-            format_byte_size(size),
-            display_home_relative(&cwd),
-        ),
+        project_directory,
+        details,
         unavailable_reason,
     }
 }

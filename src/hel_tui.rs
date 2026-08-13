@@ -114,6 +114,7 @@ pub enum DashboardAction {
 pub struct ImportSessionOption {
     pub native_session_id: String,
     pub title: String,
+    pub project_directory: String,
     pub details: String,
     pub unavailable_reason: Option<String>,
 }
@@ -322,6 +323,7 @@ struct ImportBundleConfirmation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImportFocus {
+    Filter,
     Profiles,
     Sessions,
     Cancel,
@@ -452,7 +454,36 @@ struct ImportDialog {
     profiles: Vec<ImportProfileOption>,
     profile_index: usize,
     session_index: usize,
+    filter: String,
     focus: ImportFocus,
+    opened_at: Instant,
+}
+
+impl ImportDialog {
+    fn filtered_sessions(&self) -> Vec<&ImportSessionOption> {
+        let needle = self.filter.to_lowercase();
+        self.profiles
+            .get(self.profile_index)
+            .into_iter()
+            .flat_map(|profile| &profile.sessions)
+            .filter(|session| {
+                needle.is_empty() || session.project_directory.to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
+    fn selected_session(&self) -> Option<&ImportSessionOption> {
+        self.filtered_sessions().get(self.session_index).copied()
+    }
+
+    fn is_scanning(&self) -> bool {
+        self.profiles.iter().any(|profile| {
+            profile.error.is_none()
+                && profile
+                    .scan_progress
+                    .is_none_or(|(scanned, total)| scanned < total)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -784,7 +815,9 @@ impl DashboardState {
             profiles,
             profile_index: 0,
             session_index: 0,
-            focus: ImportFocus::Profiles,
+            filter: String::new(),
+            focus: ImportFocus::Filter,
+            opened_at: Instant::now(),
         });
     }
 
@@ -800,9 +833,7 @@ impl DashboardState {
             .get(dialog.profile_index)
             .map(|profile| profile.profile_id.clone());
         let selected_session = dialog
-            .profiles
-            .get(dialog.profile_index)
-            .and_then(|profile| profile.sessions.get(dialog.session_index))
+            .selected_session()
             .map(|session| session.native_session_id.clone());
         dialog.profiles = profiles;
         dialog.profile_index = selected_profile
@@ -813,11 +844,7 @@ impl DashboardState {
                     .position(|profile| profile.profile_id == selected)
             })
             .unwrap_or(0);
-        let sessions = dialog
-            .profiles
-            .get(dialog.profile_index)
-            .map(|profile| profile.sessions.as_slice())
-            .unwrap_or_default();
+        let sessions = dialog.filtered_sessions();
         dialog.session_index = selected_session
             .and_then(|selected| {
                 sessions
@@ -843,9 +870,8 @@ impl DashboardState {
         };
         let selected_native_session_id = (dialog.profile_index == profile_index)
             .then(|| {
-                dialog.profiles[profile_index]
-                    .sessions
-                    .get(dialog.session_index)
+                dialog
+                    .selected_session()
                     .map(|session| session.native_session_id.clone())
             })
             .flatten();
@@ -853,7 +879,7 @@ impl DashboardState {
         if dialog.profile_index != profile_index {
             return;
         }
-        let sessions = &dialog.profiles[profile_index].sessions;
+        let sessions = dialog.filtered_sessions();
         dialog.session_index = selected_native_session_id
             .and_then(|selected| {
                 sessions
@@ -933,7 +959,7 @@ impl DashboardState {
             Mode::New(wizard) => self.handle_new_key(key.code, wizard),
             Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
             Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
-            Mode::Import(dialog) => self.handle_import_key(key.code, dialog),
+            Mode::Import(dialog) => self.handle_import_key(key, dialog),
             Mode::Importing(_) => match key.code {
                 KeyCode::Esc => DashboardAction::CancelImport,
                 _ => DashboardAction::None,
@@ -980,6 +1006,10 @@ impl DashboardState {
                     MountFocus::Destination => wizard.mounts.destination.push_str(&pasted),
                     _ => {}
                 }
+            }
+            Mode::Import(dialog) if dialog.focus == ImportFocus::Filter => {
+                dialog.filter.push_str(&pasted);
+                dialog.session_index = 0;
             }
             Mode::Confirm(Confirmation::ForceDestroy { typed, .. })
             | Mode::Confirm(Confirmation::DeleteActive { typed, .. }) => {
@@ -1109,19 +1139,21 @@ impl DashboardState {
         }
     }
 
-    fn handle_import_key(&mut self, code: KeyCode, mut dialog: ImportDialog) -> DashboardAction {
-        match code {
+    fn handle_import_key(&mut self, key: KeyEvent, mut dialog: ImportDialog) -> DashboardAction {
+        match key.code {
             KeyCode::Esc => {
                 self.cancel_modal();
                 DashboardAction::None
             }
-            KeyCode::Left if dialog.focus == ImportFocus::Sessions => {
+            KeyCode::Left
+                if matches!(dialog.focus, ImportFocus::Filter | ImportFocus::Sessions) =>
+            {
                 dialog.focus = ImportFocus::Profiles;
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None
             }
             KeyCode::Right if dialog.focus == ImportFocus::Profiles => {
-                dialog.focus = ImportFocus::Sessions;
+                dialog.focus = ImportFocus::Filter;
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None
             }
@@ -1129,6 +1161,7 @@ impl DashboardState {
                 dialog.focus = cycle_control(
                     dialog.focus,
                     &[
+                        ImportFocus::Filter,
                         ImportFocus::Profiles,
                         ImportFocus::Sessions,
                         ImportFocus::Cancel,
@@ -1143,6 +1176,7 @@ impl DashboardState {
                 dialog.focus = cycle_control(
                     dialog.focus,
                     &[
+                        ImportFocus::Filter,
                         ImportFocus::Profiles,
                         ImportFocus::Sessions,
                         ImportFocus::Cancel,
@@ -1153,6 +1187,23 @@ impl DashboardState {
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None
             }
+            KeyCode::Backspace if dialog.focus == ImportFocus::Filter => {
+                dialog.filter.pop();
+                dialog.session_index = 0;
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Char(character)
+                if dialog.focus == ImportFocus::Filter
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                dialog.filter.push(character);
+                dialog.session_index = 0;
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 match dialog.focus {
                     ImportFocus::Profiles => {
@@ -1160,13 +1211,10 @@ impl DashboardState {
                         dialog.session_index = 0;
                     }
                     ImportFocus::Sessions => {
-                        let len = dialog
-                            .profiles
-                            .get(dialog.profile_index)
-                            .map_or(0, |profile| profile.sessions.len());
+                        let len = dialog.filtered_sessions().len();
                         move_index(&mut dialog.session_index, len, -1);
                     }
-                    ImportFocus::Cancel | ImportFocus::Import => {}
+                    ImportFocus::Filter | ImportFocus::Cancel | ImportFocus::Import => {}
                 }
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None
@@ -1178,27 +1226,27 @@ impl DashboardState {
                         dialog.session_index = 0;
                     }
                     ImportFocus::Sessions => {
-                        let len = dialog
-                            .profiles
-                            .get(dialog.profile_index)
-                            .map_or(0, |profile| profile.sessions.len());
+                        let len = dialog.filtered_sessions().len();
                         move_index(&mut dialog.session_index, len, 1);
                     }
-                    ImportFocus::Cancel | ImportFocus::Import => {}
+                    ImportFocus::Filter | ImportFocus::Cancel | ImportFocus::Import => {}
                 }
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None
             }
             KeyCode::Enter if dialog.focus == ImportFocus::Profiles => {
+                dialog.focus = ImportFocus::Filter;
+                self.mode = Mode::Import(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Enter if dialog.focus == ImportFocus::Filter => {
                 dialog.focus = ImportFocus::Sessions;
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None
             }
             KeyCode::Enter if dialog.focus == ImportFocus::Sessions => {
                 let available = dialog
-                    .profiles
-                    .get(dialog.profile_index)
-                    .and_then(|profile| profile.sessions.get(dialog.session_index))
+                    .selected_session()
                     .is_some_and(|session| session.unavailable_reason.is_none());
                 if available {
                     dialog.focus = ImportFocus::Import;
@@ -1211,11 +1259,15 @@ impl DashboardState {
                 DashboardAction::None
             }
             KeyCode::Enter if dialog.focus == ImportFocus::Import => {
-                let Some(profile) = dialog.profiles.get(dialog.profile_index) else {
+                let Some(profile_id) = dialog
+                    .profiles
+                    .get(dialog.profile_index)
+                    .map(|profile| profile.profile_id.clone())
+                else {
                     self.mode = Mode::Import(dialog);
                     return DashboardAction::None;
                 };
-                let Some(session) = profile.sessions.get(dialog.session_index) else {
+                let Some(session) = dialog.selected_session() else {
                     self.mode = Mode::Import(dialog);
                     return DashboardAction::None;
                 };
@@ -1224,7 +1276,7 @@ impl DashboardState {
                     return DashboardAction::None;
                 }
                 let action = DashboardAction::ImportSession {
-                    profile_id: profile.profile_id.clone(),
+                    profile_id,
                     native_session_id: session.native_session_id.clone(),
                     display_title: session.title.clone(),
                 };
@@ -3742,59 +3794,86 @@ fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
     );
 
     let selected_profile = dialog.profiles.get(dialog.profile_index);
-    let session_items = selected_profile
-        .map(|profile| {
-            if profile.sessions.is_empty() {
-                if let Some(error) = &profile.error {
-                    vec![ListItem::new(format!("Unavailable: {error}"))]
-                } else if profile
+    let filtered_sessions = dialog.filtered_sessions();
+    let session_items = if filtered_sessions.is_empty() {
+        selected_profile.map_or_else(Vec::new, |profile| {
+            if let Some(error) = &profile.error {
+                vec![ListItem::new(format!("Unavailable: {error}"))]
+            } else if !dialog.filter.is_empty() && !profile.sessions.is_empty() {
+                let message = if profile
                     .scan_progress
                     .is_none_or(|(scanned, total)| scanned < total)
                 {
-                    vec![ListItem::new("Scanning native sessions…")]
+                    "No matches yet · scanning…"
                 } else {
-                    vec![ListItem::new("No native sessions found")]
-                }
+                    "No matching native sessions"
+                };
+                vec![ListItem::new(message)]
+            } else if profile
+                .scan_progress
+                .is_none_or(|(scanned, total)| scanned < total)
+            {
+                vec![ListItem::new("Scanning native sessions…")]
             } else {
-                profile
-                    .sessions
-                    .iter()
-                    .map(|session| {
-                        let title_style = if session.unavailable_reason.is_some() {
-                            Style::default().fg(Color::DarkGray)
-                        } else {
-                            Style::default().add_modifier(Modifier::BOLD)
-                        };
-                        let details = if session.unavailable_reason.is_some() {
-                            format!("{} · unavailable", session.details)
-                        } else {
-                            session.details.clone()
-                        };
-                        ListItem::new(vec![
-                            Line::styled(
-                                truncate_text(
-                                    &session.title,
-                                    panes[1].width.saturating_sub(4) as usize,
-                                ),
-                                title_style,
-                            ),
-                            Line::styled(details, Style::default().fg(Color::Gray)),
-                        ])
-                    })
-                    .collect()
+                vec![ListItem::new("No native sessions found")]
             }
         })
-        .unwrap_or_default();
-    let selectable_sessions = selected_profile.is_some_and(|profile| !profile.sessions.is_empty());
+    } else {
+        filtered_sessions
+            .iter()
+            .map(|session| {
+                let title_style = if session.unavailable_reason.is_some() {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                };
+                let details = if session.unavailable_reason.is_some() {
+                    format!("{} · unavailable", session.details)
+                } else {
+                    session.details.clone()
+                };
+                ListItem::new(vec![
+                    Line::styled(
+                        truncate_text(&session.title, panes[1].width.saturating_sub(4) as usize),
+                        title_style,
+                    ),
+                    Line::styled(details, Style::default().fg(Color::Gray)),
+                ])
+            })
+            .collect()
+    };
+    let selectable_sessions = !filtered_sessions.is_empty();
     let mut session_state =
         ListState::default().with_selected(selectable_sessions.then_some(dialog.session_index));
     let sessions_focused = dialog.focus == ImportFocus::Sessions;
+    let filter_focused = dialog.focus == ImportFocus::Filter;
     let sessions_title = selected_profile
         .and_then(|profile| profile.scan_progress)
         .map(|(scanned, total)| {
             format!(" Native sessions · newest first · {scanned}/{total} sessions scanned ")
         })
         .unwrap_or_else(|| " Native sessions · newest first · scanning… ".into());
+    let sessions_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(focus_border(sessions_focused || filter_focused))
+        .title(sessions_title);
+    let sessions_inner = sessions_block.inner(panes[1]);
+    frame.render_widget(sessions_block, panes[1]);
+    let session_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(sessions_inner);
+    let filter_cursor = if filter_focused { "▏" } else { "" };
+    frame.render_widget(
+        Paragraph::new(format!("Filter: {}{filter_cursor}", dialog.filter)).style(
+            if filter_focused {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default().fg(Color::Gray)
+            },
+        ),
+        session_rows[0],
+    );
     frame.render_stateful_widget(
         List::new(session_items)
             .highlight_symbol(if sessions_focused { "› " } else { "  " })
@@ -3802,19 +3881,13 @@ fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
                 Style::default()
-            })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(focus_border(sessions_focused))
-                    .title(sessions_title),
-            ),
-        panes[1],
+            }),
+        session_rows[1],
         &mut session_state,
     );
 
-    let unavailable_reason = selected_profile
-        .and_then(|profile| profile.sessions.get(dialog.session_index))
+    let unavailable_reason = dialog
+        .selected_session()
         .and_then(|session| session.unavailable_reason.as_deref());
     let (status, status_style) = unavailable_reason.map_or_else(
         || {
@@ -3842,6 +3915,18 @@ fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
         .wrap(Wrap { trim: true }),
         rows[1],
     );
+    if dialog.is_scanning() {
+        const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+        let frame_index = (dialog.opened_at.elapsed().as_millis() / 125) as usize;
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} Parsing sessions…",
+                SPINNER[frame_index % SPINNER.len()]
+            ))
+            .style(Style::default().fg(Color::Gray)),
+            Rect::new(rows[1].x, rows[1].y + rows[1].height - 1, 22, 1),
+        );
+    }
 }
 
 fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
@@ -7368,6 +7453,7 @@ mod tests {
                 sessions: vec![ImportSessionOption {
                     native_session_id: "codex-session".into(),
                     title: "Codex title".into(),
+                    project_directory: "/home/user/Projects/hel".into(),
                     details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
                     unavailable_reason: None,
                 }],
@@ -7380,6 +7466,7 @@ mod tests {
                 sessions: vec![ImportSessionOption {
                     native_session_id: "claude-session".into(),
                     title: "Claude title".into(),
+                    project_directory: "/home/user/Projects/hel".into(),
                     details: "4m ago · master · 2.0MB · ~/Projects/hel".into(),
                     unavailable_reason: None,
                 }],
@@ -7390,8 +7477,10 @@ mod tests {
         dashboard.show_import_dialog(1, profiles.clone());
         dashboard.apply_import_profiles(1, profiles);
 
+        dashboard.handle_key(key(KeyCode::Left));
         dashboard.handle_key(key(KeyCode::Down));
         dashboard.handle_key(key(KeyCode::Right));
+        dashboard.handle_key(key(KeyCode::Enter));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::None
@@ -7407,6 +7496,83 @@ mod tests {
     }
 
     #[test]
+    fn import_dialog_starts_in_filter_and_matches_only_project_directories() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        let session = |id: &str, title: &str, project_directory: &str| ImportSessionOption {
+            native_session_id: id.into(),
+            title: title.into(),
+            project_directory: project_directory.into(),
+            details: format!("just now · master · 1.0KB · {project_directory}"),
+            unavailable_reason: None,
+        };
+        let profiles = vec![
+            ImportProfileOption {
+                profile_id: "codex-1".into(),
+                harness_kind: HarnessKind::Codex,
+                sessions: vec![
+                    session("title-only", "Hel project", "/work/other"),
+                    session("codex-match", "Matching cwd", "/work/Projects/HEL"),
+                ],
+                scan_progress: Some((2, 2)),
+                error: None,
+            },
+            ImportProfileOption {
+                profile_id: "claude-1".into(),
+                harness_kind: HarnessKind::Claude,
+                sessions: vec![session(
+                    "claude-match",
+                    "Claude matching cwd",
+                    "/Users/me/projects/hel",
+                )],
+                scan_progress: Some((1, 1)),
+                error: None,
+            },
+        ];
+        dashboard.show_import_dialog(1, profiles);
+
+        let Mode::Import(dialog) = &dashboard.mode else {
+            panic!("expected import dialog");
+        };
+        assert_eq!(dialog.focus, ImportFocus::Filter);
+
+        dashboard.handle_paste("hEl\n");
+        let Mode::Import(dialog) = &dashboard.mode else {
+            panic!("expected import dialog");
+        };
+        assert_eq!(dialog.filter, "hEl");
+        assert_eq!(
+            dialog
+                .filtered_sessions()
+                .iter()
+                .map(|session| session.native_session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["codex-match"]
+        );
+
+        dashboard.handle_key(key(KeyCode::Left));
+        dashboard.handle_key(key(KeyCode::Down));
+        dashboard.handle_key(key(KeyCode::Right));
+        let Mode::Import(dialog) = &dashboard.mode else {
+            panic!("expected import dialog");
+        };
+        assert_eq!(dialog.filter, "hEl");
+        assert_eq!(
+            dialog.filtered_sessions()[0].native_session_id,
+            "claude-match"
+        );
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ImportSession {
+                profile_id: "claude-1".into(),
+                native_session_id: "claude-match".into(),
+                display_title: "Claude matching cwd".into(),
+            }
+        );
+    }
+
+    #[test]
     fn import_dialog_explains_and_blocks_unavailable_sessions() {
         let mut dashboard = dashboard_with_session(archived_session());
         let profiles = vec![ImportProfileOption {
@@ -7415,6 +7581,7 @@ mod tests {
             sessions: vec![ImportSessionOption {
                 native_session_id: "legacy-session".into(),
                 title: "Legacy Codex session".into(),
+                project_directory: "/home/user/Projects/hel".into(),
                 details: "2d ago · master · 1.0MB · ~/Projects/hel".into(),
                 unavailable_reason: Some(
                     "Legacy Codex history cannot be imported; run codex migrate-rollouts --apply"
@@ -7426,7 +7593,7 @@ mod tests {
         }];
         dashboard.show_import_dialog(1, profiles.clone());
         dashboard.apply_import_profiles(1, profiles);
-        dashboard.handle_key(key(KeyCode::Right));
+        dashboard.handle_key(key(KeyCode::Enter));
 
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
@@ -7456,6 +7623,7 @@ mod tests {
         let session = |id: &str| ImportSessionOption {
             native_session_id: id.into(),
             title: "Same title".into(),
+            project_directory: "/home/user/Projects/hel".into(),
             details: "just now · master · 1.0KB · ~/Projects/hel".into(),
             unavailable_reason: None,
         };
@@ -7469,7 +7637,7 @@ mod tests {
         let initial = vec![profile(vec![session("a"), session("b")], (2, 3))];
         dashboard.show_import_dialog(1, initial.clone());
         dashboard.apply_import_profiles(1, initial);
-        dashboard.handle_key(key(KeyCode::Tab));
+        dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Down));
 
         dashboard.apply_import_profile(
@@ -7500,6 +7668,7 @@ mod tests {
             sessions: vec![ImportSessionOption {
                 native_session_id: "native-session-1".into(),
                 title: "Native session title".into(),
+                project_directory: "/home/user/Projects/hel".into(),
                 details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
                 unavailable_reason: None,
             }],
@@ -7523,11 +7692,13 @@ mod tests {
 
         assert!(rendered.contains("Profiles"));
         assert!(rendered.contains("Native sessions"));
+        assert!(rendered.contains("Filter:"));
         assert!(rendered.contains("codex-1"));
         assert!(rendered.contains("Native session title"));
         assert!(rendered.contains("1.0MB"));
         assert!(rendered.contains("~/Projects/hel"));
         assert!(rendered.contains("1/1 sessions scanned"));
+        assert!(!rendered.contains("Parsing sessions"));
     }
 
     #[test]
@@ -7539,6 +7710,7 @@ mod tests {
             sessions: vec![ImportSessionOption {
                 native_session_id: "native-session-1".into(),
                 title: "Native session title".into(),
+                project_directory: "/home/user/Projects/hel".into(),
                 details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
                 unavailable_reason: None,
             }],
@@ -7550,6 +7722,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
 
         for (expected_focus, expected_cursors) in [
+            (ImportFocus::Filter, 0),
             (ImportFocus::Profiles, 1),
             (ImportFocus::Sessions, 1),
             (ImportFocus::Cancel, 0),
@@ -7660,6 +7833,7 @@ mod tests {
 
         assert!(rendered.contains("codex-1"));
         assert!(rendered.contains("Scanning native sessions"));
+        assert!(rendered.contains("Parsing sessions"));
     }
 
     #[test]
