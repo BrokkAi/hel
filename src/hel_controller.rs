@@ -1189,14 +1189,48 @@ impl Controller {
             Ok::<_, anyhow::Error>(())
         }
         .await;
-        if let Err(error) = &result {
-            let record = self.state.sessions.get_mut(session_id).unwrap();
-            record.state = SessionState::Error;
-            record.updated_at = now();
-            record.last_error = Some(format!("resume failed: {error:#}"));
-            self.state.save()?;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                Err(self.rollback_failed_resume(session_id, &previous, error, &ProcessExecutor)?)
+            }
         }
-        result
+    }
+
+    fn rollback_failed_resume(
+        &mut self,
+        session_id: &str,
+        previous: &SessionRecord,
+        error: anyhow::Error,
+        executor: &impl CommandExecutor,
+    ) -> Result<anyhow::Error> {
+        let current = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?
+            .clone();
+        let cleanup = match current.target.as_ref() {
+            Some(locator) => (|| -> Result<()> {
+                let backend = backend_locator(locator, &current, &self.config)?;
+                hel_targets::close_plan(&backend, session_id)?
+                    .execute(executor)
+                    .map(|_| ())
+            })(),
+            None => Ok(()),
+        };
+        let original = format!("{error:#}");
+        let record = self.state.sessions.get_mut(session_id).unwrap();
+        let failure = apply_failed_resume_rollback(
+            record,
+            previous,
+            &original,
+            cleanup
+                .err()
+                .map(|cleanup_error| format!("{cleanup_error:#}")),
+        );
+        self.state.save()?;
+        Ok(failure)
     }
 
     /// Materialize and locally verify a complete session checkpoint while the
@@ -1431,6 +1465,36 @@ impl Controller {
         record.target = None;
         record.updated_at = now();
         self.state.save()
+    }
+}
+
+fn apply_failed_resume_rollback(
+    current: &mut SessionRecord,
+    previous: &SessionRecord,
+    original_error: &str,
+    cleanup_error: Option<String>,
+) -> anyhow::Error {
+    match cleanup_error {
+        None => {
+            *current = previous.clone();
+            current.state = SessionState::Archived;
+            current.target = None;
+            current.updated_at = now();
+            let failure = format!(
+                "{original_error}; partial target removed and session returned to archived"
+            );
+            current.last_error = Some(format!("resume failed: {failure}"));
+            anyhow::anyhow!(failure)
+        }
+        Some(cleanup_error) => {
+            let failure = format!(
+                "{original_error}; cleanup of the partial resume target failed: {cleanup_error}"
+            );
+            current.state = SessionState::Error;
+            current.updated_at = now();
+            current.last_error = Some(format!("resume failed: {failure}"));
+            anyhow::anyhow!(failure)
+        }
     }
 }
 
@@ -3688,6 +3752,62 @@ mod tests {
             std::fs::metadata(&cached).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn failed_resume_rolls_back_only_after_target_cleanup() {
+        let previous = SessionRecord {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            title: "imported session".into(),
+            harness_kind: crate::hel_config::HarnessKind::Codex,
+            last_profile: "codex-old".into(),
+            bundle_id: "project".into(),
+            target_template_id: "podman-old".into(),
+            resource_allocation: None,
+            additional_mounts: Vec::new(),
+            state: SessionState::Archived,
+            target: None,
+            native_session_id: Some("native-session".into()),
+            acp_session_title: None,
+            session_title_override: None,
+            created_at: "2026-08-12T00:00:00Z".into(),
+            updated_at: "2026-08-12T00:00:00Z".into(),
+            last_viewed_event_sequence: 0,
+            last_error: None,
+            checkpoint: None,
+        };
+        let partial_target = TargetLocator::LocalPodman {
+            container_id: "partial-container".into(),
+        };
+        let mut cleaned = previous.clone();
+        cleaned.state = SessionState::Error;
+        cleaned.last_profile = "codex-new".into();
+        cleaned.target = Some(partial_target.clone());
+
+        let failure =
+            apply_failed_resume_rollback(&mut cleaned, &previous, "worker upload failed", None);
+
+        assert_eq!(cleaned.state, SessionState::Archived);
+        assert_eq!(cleaned.last_profile, "codex-old");
+        assert_eq!(cleaned.target, None);
+        assert!(failure.to_string().contains("returned to archived"));
+
+        let mut cleanup_failed = previous.clone();
+        cleanup_failed.state = SessionState::Error;
+        cleanup_failed.last_profile = "codex-new".into();
+        cleanup_failed.target = Some(partial_target.clone());
+
+        let failure = apply_failed_resume_rollback(
+            &mut cleanup_failed,
+            &previous,
+            "worker upload failed",
+            Some("podman rm failed".into()),
+        );
+
+        assert_eq!(cleanup_failed.state, SessionState::Error);
+        assert_eq!(cleanup_failed.last_profile, "codex-new");
+        assert_eq!(cleanup_failed.target, Some(partial_target));
+        assert!(failure.to_string().contains("cleanup"));
     }
 
     #[test]
