@@ -2991,10 +2991,10 @@ fn render_sessions(
 
     let archived_rows = archived
         .iter()
-        .map(|session| archived_session_row(session, now_epoch_seconds, &dashboard.config));
+        .map(|session| archived_session_row(session, &dashboard.config));
     let archived_focused = dashboard.focus == Focus::Archived;
-    let archived_table = Table::new(archived_rows, session_column_constraints())
-        .header(session_header())
+    let archived_table = Table::new(archived_rows, archived_session_column_constraints())
+        .header(archived_session_header())
         .row_highlight_style(if archived_focused {
             Style::default().bg(Color::DarkGray).fg(Color::White)
         } else {
@@ -3063,7 +3063,17 @@ fn session_column_constraints() -> [Constraint; 6] {
         Constraint::Length(14),
         Constraint::Length(18),
         Constraint::Length(14),
-        Constraint::Length(34),
+        Constraint::Length(17),
+        Constraint::Min(18),
+    ]
+}
+
+fn archived_session_column_constraints() -> [Constraint; 5] {
+    [
+        Constraint::Length(14),
+        Constraint::Length(18),
+        Constraint::Length(14),
+        Constraint::Length(17),
         Constraint::Min(18),
     ]
 }
@@ -3071,6 +3081,17 @@ fn session_column_constraints() -> [Constraint; 6] {
 fn session_header() -> Row<'static> {
     Row::new([
         "Turn clock",
+        "Profile",
+        "Target",
+        "Checkpoint",
+        "Resources",
+        "Session name",
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD))
+}
+
+fn archived_session_header() -> Row<'static> {
+    Row::new([
         "Profile",
         "Target",
         "Checkpoint",
@@ -3254,20 +3275,18 @@ fn active_session_row(
     .top_margin(top_margin)
 }
 
-fn archived_session_row(
-    session: &SessionRecord,
-    now_epoch_seconds: u64,
-    config: &HelConfig,
-) -> Row<'static> {
-    let (_clock, profile, target, checkpoint, _resources, session_name) =
-        session_values(session, None, now_epoch_seconds, config);
+fn archived_session_row(session: &SessionRecord, config: &HelConfig) -> Row<'static> {
+    let checkpoint = session
+        .checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint_time_display(&checkpoint.created_at))
+        .unwrap_or_else(|| "never".into());
     Row::new([
-        String::new(),
-        profile,
-        target,
+        session.last_profile.clone(),
+        session_target(config, session),
         checkpoint,
         checkpoint_archive_size(session),
-        session_name,
+        session_name(session).to_string(),
     ])
 }
 
@@ -5512,7 +5531,8 @@ mod tests {
         assert!(rendered.contains("Target"));
         assert!(rendered.contains("Checkpoint"));
         assert!(rendered.contains("Resources"));
-        assert!(rendered.contains("C 37% · M 50% · S 4.0K · D 8.0K"));
+        assert!(rendered.contains("C 37% · M 50%"));
+        assert!(!rendered.contains("S 4.0K · D 8.0K"));
         assert!(rendered.contains("Session name"));
         assert!(rendered.contains("ACP pretty name"));
         assert!(!rendered.contains("native-1"));
@@ -5669,7 +5689,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_sessions_leave_the_turn_clock_cell_blank() {
+    fn archived_sessions_omit_the_turn_clock_column() {
         let mut dashboard = dashboard_with_session(archived_session());
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -5684,7 +5704,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.contains("Turn clock"));
+        assert_eq!(rendered.matches("Turn clock").count(), 1);
         assert!(rendered.contains("26-08-09 01:00"));
         assert!(!rendered.contains("2026-08-09T01:00:00Z"));
         assert!(!rendered.contains("idle"));
@@ -6014,7 +6034,7 @@ mod tests {
     }
 
     #[test]
-    fn only_focused_pane_draws_caret_without_shifting_session_columns() {
+    fn only_focused_pane_draws_caret_without_shifting_table_columns() {
         let mut active = archived_session();
         active.id = "session-0".into();
         active.state = SessionState::Running;
@@ -6034,6 +6054,7 @@ mod tests {
         dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut initial_name_columns = None;
 
         for expected_focus in [
             Focus::Active,
@@ -6069,7 +6090,12 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(name_columns.len(), 2);
-            assert_eq!(name_columns[0], name_columns[1]);
+            if let Some(initial_name_columns) = &initial_name_columns {
+                assert_eq!(&name_columns, initial_name_columns);
+            } else {
+                assert_ne!(name_columns[0], name_columns[1]);
+                initial_name_columns = Some(name_columns);
+            }
 
             dashboard.handle_key(key(KeyCode::Tab));
         }
