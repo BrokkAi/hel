@@ -1032,8 +1032,8 @@ impl Controller {
             .get(session_id)
             .with_context(|| format!("unknown session {session_id}"))?
             .clone();
-        if previous.state != SessionState::Archived {
-            bail!("session {session_id} is not archived");
+        if !matches!(previous.state, SessionState::Archived | SessionState::Error) {
+            bail!("session {session_id} is not archived or retryable");
         }
         let checkpoint = previous
             .checkpoint
@@ -1059,6 +1059,14 @@ impl Controller {
         validate_resource_allocation(target_template, resource_allocation.as_ref())?;
         if !previous.additional_mounts.is_empty() && mount_history_host(target_template).is_none() {
             bail!("resuming a session with additional mounts requires a container-backed target");
+        }
+        if previous.state == SessionState::Error
+            && let Some(locator) = &previous.target
+        {
+            let backend = backend_locator(locator, &previous, &self.config)?;
+            hel_targets::close_plan(&backend, session_id)?
+                .execute(&ProcessExecutor)
+                .context("clean up target from failed resume")?;
         }
         let same_harness = profile.kind == archive.manifest.session.harness_kind;
         let canonical_events = archive.payload_by_role(&PayloadRole::CanonicalEvents)?;

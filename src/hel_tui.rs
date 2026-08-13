@@ -1678,7 +1678,7 @@ impl DashboardState {
         let Some(session) = self.selected_session() else {
             return;
         };
-        if session.state.is_active() {
+        if session.state.is_active() && session.state != SessionState::Error {
             self.notice = Some("This session is active; press Enter to open it.".into());
             return;
         }
@@ -1711,12 +1711,16 @@ impl DashboardState {
             return DashboardAction::None;
         };
         if session.state == SessionState::Error {
-            self.notice = Some(
-                session
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "Session failed without a recorded error.".into()),
-            );
+            if session.checkpoint.is_some() {
+                self.begin_resume();
+            } else {
+                self.notice = Some(
+                    session
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "Session failed without a recorded error.".into()),
+                );
+            }
             return DashboardAction::None;
         }
         if session.state.is_active() {
@@ -4754,7 +4758,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_failed_session_preserves_the_actionable_error() {
+    fn opening_a_failed_session_with_a_checkpoint_starts_resume() {
         let mut session = archived_session();
         session.state = SessionState::Error;
         session.last_error = Some("resume failed: worker upload source was replaced".into());
@@ -4764,9 +4768,24 @@ mod tests {
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::None
         );
+        assert!(matches!(dashboard.mode, Mode::Resume(_)));
+    }
+
+    #[test]
+    fn opening_a_failed_session_without_a_checkpoint_preserves_the_actionable_error() {
+        let mut session = archived_session();
+        session.state = SessionState::Error;
+        session.checkpoint = None;
+        session.last_error = Some("worker bootstrap failed: upload failed".into());
+        let mut dashboard = dashboard_with_session(session);
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
         assert_eq!(
             dashboard.notice.as_deref(),
-            Some("resume failed: worker upload source was replaced")
+            Some("worker bootstrap failed: upload failed")
         );
     }
 
