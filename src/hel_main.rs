@@ -2111,7 +2111,7 @@ async fn run_dashboard() -> Result<()> {
                             Ok(()) => {
                                 dashboard.select_active_session(&session_id);
                                 dashboard.set_notice(format!(
-                                    "Target ready for {}; connecting worker",
+                                    "Session {} is ready; press Enter to open it",
                                     short_id(&session_id)
                                 ));
                                 request_dashboard_quota_refresh(
