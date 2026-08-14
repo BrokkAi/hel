@@ -309,12 +309,15 @@ copy with `hel checkpoint --session <id>`.
 
 Recovery archives are versioned ZIPs containing a manifest, a canonical event
 stream, allowlisted native harness artifacts, and the Git state needed to
-rebuild disposable workspaces. Committed work is normally a delta from the
-repository's merge base with its configured remote or Hel seed; staged,
-unstaged, and untracked changes are stored separately. Hel falls back to a full
-Git bundle only when an intact repository has no usable common base. Every
-payload is SHA-256 verified after the archive is atomically installed. Normal
-Pause refuses teardown if that verification fails; explicit force-destroy is
-the data-loss escape hatch.
+rebuild disposable workspaces. Committed work is stored as the set of commits
+that no origin ref contains, where origin is either the configured remote or
+Hel's proxy to your local repository; staged, unstaged, and untracked changes
+are stored separately. There is no full-history fallback: when a repository has
+no origin refs, Hel retries one fetch and otherwise fails the checkpoint and
+leaves the session usable. Local repositories are provisioned by fetching
+through the proxy, and a small bootstrap archive carries their uncommitted
+changes. Every payload is SHA-256 verified after the archive is atomically
+installed. Normal Pause refuses teardown if that verification fails; explicit
+force-destroy is the data-loss escape hatch.
 
 Hel is licensed under `GPL-3.0-only`.

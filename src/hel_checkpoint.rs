@@ -17,9 +17,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::hel_archive::{
-    ArchiveInput, BundleManifest, GitCollectionSpec, GitCommand, GitCommandRunner, NativeArtifact,
-    PayloadRole, RepositorySnapshot, SessionManifest, SystemGit, TargetManifest,
-    collect_git_metadata_snapshot, collect_git_snapshot, read_archive_verified,
+    ArchiveInput, BundleManifest, GitCollectionSpec, GitCommand, GitCommandRunner, GitHistoryMode,
+    NativeArtifact, PayloadRole, RepositorySnapshot, SessionManifest, SystemGit, TargetManifest,
+    collect_git_metadata_snapshot, collect_git_snapshot, has_origin_refs, read_archive_verified,
     restore_git_snapshot, write_archive_atomic,
 };
 use crate::hel_config::HarnessKind;
@@ -36,9 +36,14 @@ const MAX_NATIVE_TOTAL: u64 = 8 * 1024 * 1024 * 1024;
 pub struct CheckpointRepositorySpec {
     pub id: String,
     pub relative_destination: PathBuf,
+    /// Legacy wire field. Target binaries installed before session deltas
+    /// existed require it and use it as the delta base; newer targets read it
+    /// only when `session_delta` is false.
     pub base_commit: String,
+    /// Bundle the commits reachable from HEAD but from no origin ref instead
+    /// of deltaing from `base_commit`.
     #[serde(default)]
-    pub full_history: bool,
+    pub session_delta: bool,
     /// False for raw projects whose existing worktree remains the recovery
     /// source and is deliberately never restored from the checkpoint.
     #[serde(default = "default_true")]
@@ -94,9 +99,6 @@ pub struct TargetCheckpoint {
     pub path: PathBuf,
     pub sha256: String,
     pub event_sequence: u64,
-    /// Repositories that requested a delta but had no usable common base.
-    #[serde(default)]
-    pub full_history_fallbacks: Vec<String>,
 }
 
 /// Hidden target CLI entry point: `hel worker export-checkpoint --spec PATH`.
@@ -514,32 +516,40 @@ pub fn export_checkpoint_with_git(
         .map(|repository| {
             let path = spec.workspace_root.join(&repository.relative_destination);
             ensure!(path.is_dir(), "repository {} is missing", path.display());
-            let collection = GitCollectionSpec {
-                id: repository.id.clone(),
-                relative_destination: repository.relative_destination.clone(),
-                base_commit: repository.base_commit.clone(),
-                full_history: repository.full_history,
-                origin_override: repository.origin_override.clone(),
-            };
-            if repository.capture_contents {
-                reject_dirty_submodules(git, &path)
-                    .with_context(|| format!("repository '{}'", repository.id))?;
-                collect_git_snapshot(git, &path, &collection)
-            } else {
-                collect_git_metadata_snapshot(git, &path, &collection)
+            if !repository.capture_contents {
+                return collect_git_metadata_snapshot(
+                    git,
+                    &path,
+                    &GitCollectionSpec {
+                        id: repository.id.clone(),
+                        relative_destination: repository.relative_destination.clone(),
+                        history: GitHistoryMode::NoBundle,
+                        origin_override: repository.origin_override.clone(),
+                    },
+                )
+                .with_context(|| format!("repository '{}'", repository.id));
             }
+            let history = if repository.session_delta {
+                repair_origin_refs(git, &path, &repository.id)?;
+                GitHistoryMode::SessionDelta
+            } else {
+                GitHistoryMode::DeltaFrom(repository.base_commit.clone())
+            };
+            reject_dirty_submodules(git, &path)
+                .with_context(|| format!("repository '{}'", repository.id))?;
+            collect_git_snapshot(
+                git,
+                &path,
+                &GitCollectionSpec {
+                    id: repository.id.clone(),
+                    relative_destination: repository.relative_destination.clone(),
+                    history,
+                    origin_override: repository.origin_override.clone(),
+                },
+            )
             .with_context(|| format!("repository '{}'", repository.id))
         })
         .collect::<Result<Vec<_>>>()?;
-    let full_history_fallbacks = spec
-        .repositories
-        .iter()
-        .zip(&repositories)
-        .filter(|(requested, collected)| {
-            requested.capture_contents && !requested.full_history && collected.metadata.full_history
-        })
-        .map(|(requested, _)| requested.id.clone())
-        .collect();
     let verified = write_archive_atomic(
         &spec.output_path,
         &ArchiveInput {
@@ -556,8 +566,39 @@ pub fn export_checkpoint_with_git(
         path: spec.output_path.clone(),
         sha256: verified.archive_sha256,
         event_sequence,
-        full_history_fallbacks,
     })
+}
+
+/// A session delta is measured against every origin ref, so a repository that
+/// lost its remote-tracking refs would silently have nothing to exclude. Try
+/// one repair fetch, then fail the checkpoint instead of bundling full history.
+fn repair_origin_refs(git: &dyn GitCommandRunner, path: &Path, id: &str) -> Result<()> {
+    let listed = || has_origin_refs(git, path).with_context(|| format!("repository '{id}'"));
+    if listed()? {
+        return Ok(());
+    }
+    let fetch = git.run(
+        path,
+        &GitCommand {
+            arguments: vec!["fetch".into(), "origin".into()],
+            stdin: Vec::new(),
+        },
+    )?;
+    if listed()? {
+        return Ok(());
+    }
+    let outcome = if fetch.status == 0 {
+        "repair fetch produced no origin refs".to_owned()
+    } else {
+        format!(
+            "repair fetch failed with status {}: {}",
+            fetch.status,
+            String::from_utf8_lossy(&fetch.stderr).trim()
+        )
+    };
+    bail!(
+        "repository '{id}' has no origin refs to delta against; refusing to bundle full history ({outcome})"
+    )
 }
 
 fn validate_export_spec(spec: &CheckpointExportSpec) -> Result<()> {
@@ -1385,12 +1426,61 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::process::Command;
+    use std::sync::Mutex;
 
+    use crate::hel_archive::GitOutput;
     use crate::hel_targets::CommandOutput;
     use crate::hel_worker::DurableWorker;
 
     const SESSION: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
     const NATIVE: &str = "0190aabb-ccdd-7eef-9000-abcdef012345";
+
+    /// Runs real Git, but counts repair fetches and can make them fail without
+    /// reaching a network remote.
+    struct RecordingGit {
+        fetch_failure: bool,
+        fetches: Mutex<usize>,
+    }
+
+    impl RecordingGit {
+        fn forwarding() -> Self {
+            Self {
+                fetch_failure: false,
+                fetches: Mutex::new(0),
+            }
+        }
+
+        fn with_fetch_failure() -> Self {
+            Self {
+                fetch_failure: true,
+                fetches: Mutex::new(0),
+            }
+        }
+
+        fn fetches(&self) -> usize {
+            *self.fetches.lock().unwrap()
+        }
+    }
+
+    impl GitCommandRunner for RecordingGit {
+        fn run(&self, repository: &Path, command: &GitCommand) -> Result<GitOutput> {
+            if command
+                .arguments
+                .first()
+                .is_some_and(|first| first == "fetch")
+            {
+                *self.fetches.lock().unwrap() += 1;
+                if self.fetch_failure {
+                    return Ok(GitOutput {
+                        status: 128,
+                        stdout: Vec::new(),
+                        stderr: b"fatal: could not read from remote repository".to_vec(),
+                    });
+                }
+            }
+            SystemGit.run(repository, command)
+        }
+    }
 
     fn ssh() -> SshTarget {
         SshTarget {
@@ -1623,7 +1713,6 @@ mod tests {
                 relative_destination: "app".into(),
                 origin: "owner/app".into(),
                 base_commit: "a".repeat(40),
-                full_history: false,
                 head_commit: "a".repeat(40),
                 branch: Some("main".into()),
             },
@@ -1651,7 +1740,6 @@ mod tests {
                 relative_destination: "app".into(),
                 origin: "owner/app".into(),
                 base_commit: "a".repeat(40),
-                full_history: false,
                 head_commit: "a".repeat(40),
                 branch: Some("main".into()),
             },
@@ -1802,7 +1890,7 @@ mod tests {
                     id: "app".into(),
                     relative_destination: "app".into(),
                     base_commit: base,
-                    full_history: false,
+                    session_delta: false,
                     capture_contents: true,
                     origin_override: None,
                 }],
@@ -1869,15 +1957,13 @@ mod tests {
         fs::write(repository.join("README.md"), b"dirty").unwrap();
         fs::write(repository.join("untracked.txt"), b"untracked").unwrap();
 
-        let target = export_checkpoint(&spec).unwrap();
-        assert!(target.full_history_fallbacks.is_empty());
+        export_checkpoint(&spec).unwrap();
         let archive = read_archive_verified(&spec.output_path).unwrap();
         let repository = &archive.manifest.repositories[0];
         assert_eq!(
             repository.metadata.base_commit,
             repository.metadata.head_commit
         );
-        assert!(!repository.metadata.full_history);
         for role in [
             PayloadRole::GitBundle {
                 repository_id: "app".into(),
@@ -1897,16 +1983,57 @@ mod tests {
     }
 
     #[test]
-    fn missing_delta_base_is_reported_as_a_full_history_fallback() {
+    fn session_delta_without_origin_refs_repairs_once_then_fails() {
         let temp = tempfile::tempdir().unwrap();
         let (mut spec, _) = fixture(temp.path());
-        spec.repositories[0].base_commit = "refs/hel/missing".into();
+        spec.repositories[0].session_delta = true;
+        let git = RecordingGit::with_fetch_failure();
 
-        let target = export_checkpoint(&spec).unwrap();
+        let error = export_checkpoint_with_git(&spec, &git).unwrap_err();
 
-        assert_eq!(target.full_history_fallbacks, ["app"]);
+        assert_eq!(git.fetches(), 1);
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("repository 'app' has no origin refs"),
+            "{error}"
+        );
+        assert!(error.contains("refusing to bundle full history"), "{error}");
+        assert!(error.contains("repair fetch failed"), "{error}");
+    }
+
+    #[test]
+    fn session_delta_export_succeeds_when_the_repair_fetch_restores_origin_refs() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut spec, _) = fixture(temp.path());
+        spec.repositories[0].session_delta = true;
+        let repository = spec.workspace_root.join("app");
+        let origin = temp.path().join("origin.git");
+        git(
+            &spec.workspace_root,
+            &["clone", "-q", "--bare", "app", origin.to_str().unwrap()],
+        );
+        git(
+            &repository,
+            &["remote", "set-url", "origin", origin.to_str().unwrap()],
+        );
+        fs::write(repository.join("later.txt"), b"later").unwrap();
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "-qm", "later"]);
+        let git_runner = RecordingGit::forwarding();
+
+        export_checkpoint_with_git(&spec, &git_runner).unwrap();
+
+        assert_eq!(git_runner.fetches(), 1);
         let archive = read_archive_verified(&spec.output_path).unwrap();
-        assert!(archive.manifest.repositories[0].metadata.full_history);
+        assert_eq!(archive.manifest.repositories[0].metadata.base_commit, "");
+        assert!(
+            !archive
+                .payload_by_role(&PayloadRole::GitBundle {
+                    repository_id: "app".into(),
+                })
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1930,14 +2057,17 @@ mod tests {
         }))
         .unwrap();
         assert!(repository.capture_contents);
+        assert!(!repository.session_delta);
 
+        // Targets running an older worker still report the removed field.
         let target: TargetCheckpoint = serde_json::from_value(json!({
             "path": "/worker/checkpoint.hel.zip",
             "sha256": "abc",
-            "event_sequence": 7
+            "event_sequence": 7,
+            "full_history_fallbacks": ["app"]
         }))
         .unwrap();
-        assert!(target.full_history_fallbacks.is_empty());
+        assert_eq!(target.event_sequence, 7);
     }
 
     #[test]
@@ -1966,7 +2096,7 @@ mod tests {
             id: "worker".into(),
             relative_destination: "worker".into(),
             base_commit: base,
-            full_history: false,
+            session_delta: false,
             capture_contents: true,
             origin_override: None,
         });

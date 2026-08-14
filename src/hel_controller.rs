@@ -10,8 +10,8 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 
 use crate::hel_archive::{
-    ArchiveInput, BundleManifest, GitCollectionSpec, PayloadRole, SessionManifest, SystemGit,
-    TargetManifest, collect_git_snapshot, read_archive_verified, write_archive_atomic,
+    ArchiveInput, BundleManifest, GitCollectionSpec, GitHistoryMode, PayloadRole, SessionManifest,
+    SystemGit, TargetManifest, collect_git_snapshot, read_archive_verified, write_archive_atomic,
 };
 use crate::hel_checkpoint::{
     CheckpointExportSpec, CheckpointRepositorySpec, CheckpointRestoreSpec, CheckpointTransfer,
@@ -78,7 +78,18 @@ pub struct RecoveryScan {
 pub struct CheckpointArtifact {
     pub metadata: CheckpointMetadata,
     pub native_session_id: String,
-    pub full_history_fallbacks: Vec<String>,
+}
+
+/// Whether connecting local repositories may also carry the user's current
+/// uncommitted changes into a still-empty target checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalBootstrap {
+    /// A fresh target starts from `git init`, so seed its branch and dirty
+    /// state from the local repository.
+    Seed,
+    /// Resume restores the session's own dirty state from the checkpoint
+    /// archive; seeding the local repository's would collide with it.
+    Skip,
 }
 
 pub struct SessionLaunchOptions {
@@ -869,7 +880,13 @@ impl Controller {
     ) -> Result<Option<String>> {
         let (backend, worker_root) = self.prepare_worker_files(session_id, executor, true)?;
         install_attached_resources(&self.state, session_id, &backend, &worker_root, executor)?;
-        self.connect_local_repositories(session_id, &backend, &worker_root, executor)?;
+        self.connect_local_repositories(
+            session_id,
+            &backend,
+            &worker_root,
+            executor,
+            LocalBootstrap::Seed,
+        )?;
         start_worker(executor, &backend, &worker_root)?;
         let reconnect = &hel_targets::reconnect_plan(&backend, session_id)?.commands[0];
         let readiness = async {
@@ -988,12 +1005,16 @@ impl Controller {
         Ok((backend, worker_root))
     }
 
+    /// Point the target's checkouts at the `hel-local` Git proxy and fetch the
+    /// committed history it serves. `bootstrap` decides whether a still-empty
+    /// checkout is also seeded with the local repository's uncommitted changes.
     fn connect_local_repositories(
         &self,
         session_id: &str,
         backend: &hel_targets::TargetLocator,
         worker_root: &str,
         executor: &impl CommandExecutor,
+        bootstrap: LocalBootstrap,
     ) -> Result<()> {
         let session = self
             .state
@@ -1098,18 +1119,10 @@ impl Controller {
                 missing.push((repository, source));
             }
         }
-        if !missing.is_empty() {
-            restore_local_repository_seed(
-                executor,
-                backend,
-                session,
-                bundle,
-                &workspace_root,
-                worker_root,
-                &missing,
-            )?;
-        }
-        for (repository, _) in local {
+        // Fetch before bootstrapping: the proxy delivers every branch, so the
+        // bootstrap archive only has to carry identity and dirty state, and
+        // the commit it checks out is already present.
+        for (repository, _) in &local {
             let destination = format!(
                 "{workspace_root}/{}",
                 repository.destination.to_string_lossy()
@@ -1128,6 +1141,17 @@ impl Controller {
                     ],
                     "fetch local Git origin",
                 )?,
+            )?;
+        }
+        if bootstrap == LocalBootstrap::Seed && !missing.is_empty() {
+            bootstrap_local_repositories(
+                executor,
+                backend,
+                session,
+                bundle,
+                &workspace_root,
+                worker_root,
+                &missing,
             )?;
         }
         Ok(())
@@ -1484,6 +1508,17 @@ impl Controller {
                     if !path.starts_with('/') => PathBuf::from(format!("~/{path}")),
                 _ => PathBuf::from(path),
             };
+            // The restore needs the fetched objects: a committed delta bundle
+            // cannot be applied without its prerequisites, and a bundle-free
+            // snapshot checks out a head commit only the proxy can supply. The
+            // archive carries this session's dirty state, so nothing is seeded.
+            self.connect_local_repositories(
+                session_id,
+                &backend,
+                &worker_root,
+                executor,
+                LocalBootstrap::Skip,
+            )?;
             let remote_archive = format!("{worker_root}/restore.hel.zip");
             let remote_spec = format!("{worker_root}/restore-spec.json");
             let restore = CheckpointRestoreSpec {
@@ -1523,7 +1558,13 @@ impl Controller {
                 &worker_root,
                 executor,
             )?;
-            self.connect_local_repositories(session_id, &backend, &worker_root, executor)?;
+            self.connect_local_repositories(
+                session_id,
+                &backend,
+                &worker_root,
+                executor,
+                LocalBootstrap::Seed,
+            )?;
             start_worker(executor, &backend, &worker_root)?;
             handshake_worker(&hel_targets::reconnect_plan(&backend, session_id)?.commands[0])
                 .await?;
@@ -1743,7 +1784,7 @@ impl Controller {
                         id: "project".into(),
                         relative_destination: PathBuf::from(destination),
                         base_commit: "HEAD".into(),
-                        full_history: false,
+                        session_delta: false,
                         capture_contents: false,
                         origin_override: None,
                     }],
@@ -1764,6 +1805,8 @@ impl Controller {
                     .map(|repository| CheckpointRepositorySpec {
                         id: repository.id.clone(),
                         relative_destination: repository.destination.clone(),
+                        // Legacy field: target binaries installed before
+                        // session deltas existed still delta from it.
                         base_commit: if repository.is_local() {
                             "refs/hel/base".into()
                         } else {
@@ -1773,7 +1816,7 @@ impl Controller {
                                 .map(|git_ref| format!("origin/{git_ref}"))
                                 .unwrap_or_else(|| "origin/HEAD".into())
                         },
-                        full_history: false,
+                        session_delta: true,
                         capture_contents: true,
                         origin_override: repository
                             .is_local()
@@ -1839,13 +1882,6 @@ impl Controller {
                 target_checkpoint.event_sequence
             );
         }
-        if !target_checkpoint.full_history_fallbacks.is_empty() {
-            tracing::warn!(
-                session_id,
-                repositories = %target_checkpoint.full_history_fallbacks.join(", "),
-                "checkpoint used full Git history because no common base was available"
-            );
-        }
 
         let destination = sessions_dir().join(format!(
             "{session_id}-{}.hel.zip",
@@ -1872,7 +1908,6 @@ impl Controller {
         Ok(CheckpointArtifact {
             metadata,
             native_session_id,
-            full_history_fallbacks: target_checkpoint.full_history_fallbacks,
         })
     }
 
@@ -3532,7 +3567,10 @@ fn local_origin_url(worker_root: &str, repository_id: &str) -> String {
     )
 }
 
-fn restore_local_repository_seed(
+/// Carry a local repository's identity and uncommitted changes into a freshly
+/// initialized target checkout. Committed history is never bundled here: the
+/// caller fetches it through the `hel-local` proxy first.
+fn bootstrap_local_repositories(
     executor: &impl CommandExecutor,
     locator: &hel_targets::TargetLocator,
     session: &SessionRecord,
@@ -3550,8 +3588,7 @@ fn restore_local_repository_seed(
                 &GitCollectionSpec {
                     id: repository.id.clone(),
                     relative_destination: repository.destination.clone(),
-                    base_commit: "HEAD".into(),
-                    full_history: true,
+                    history: GitHistoryMode::NoBundle,
                     origin_override: Some(format!("hel-local:{}", repository.id)),
                 },
             )

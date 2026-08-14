@@ -1913,24 +1913,12 @@ fn apply_recovery_result(
 ) {
     let session_id = result.session_id.clone();
     let failure = result.outcome.as_ref().err().cloned();
-    let full_history_fallbacks = result
-        .outcome
-        .as_ref()
-        .ok()
-        .map(|artifact| artifact.full_history_fallbacks.clone())
-        .unwrap_or_default();
     if merge_recovery_result(controller, result) {
         dashboard.set_state(controller.state.clone());
         if let Some(detail) = failure {
             dashboard.set_notice(format!(
                 "Recovery copy for {} failed: {detail}",
                 short_id(&session_id)
-            ));
-        } else if !full_history_fallbacks.is_empty() {
-            dashboard.set_notice(format!(
-                "Checkpoint for {} included full Git history for {} because no common base was available.",
-                short_id(&session_id),
-                full_history_fallbacks.join(", ")
             ));
         }
     }
