@@ -4550,7 +4550,7 @@ fn bridge_launch(
             "sh".into(),
             vec![
                 "-lc".into(),
-                format!("if command -v claude-agent-acp >/dev/null 2>&1; then exec claude-agent-acp; fi; {}; exec npx -y @agentclientprotocol/claude-agent-acp@0.66.0", ensure_node_script()),
+                format!("if command -v claude-agent-acp >/dev/null 2>&1; then exec claude-agent-acp; fi; {}; exec npx -y @agentclientprotocol/claude-agent-acp@0.68.0", ensure_node_script()),
             ],
         ),
         crate::hel_config::HarnessKind::Kimi => (
@@ -5618,7 +5618,7 @@ mod tests {
         assert!(codex_arguments[1].contains("@agentclientprotocol/codex-acp@1.1.14"));
 
         let (_, claude_arguments) = bridge_launch(crate::hel_config::HarnessKind::Claude, None);
-        assert!(claude_arguments[1].contains("@agentclientprotocol/claude-agent-acp@0.66.0"));
+        assert!(claude_arguments[1].contains("@agentclientprotocol/claude-agent-acp@0.68.0"));
     }
 
     #[test]

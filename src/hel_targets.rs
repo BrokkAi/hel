@@ -1646,12 +1646,14 @@ fn container_run_args(
     additional_mounts: &[AdditionalMount],
 ) -> Result<Vec<String>> {
     validate_additional_mounts(additional_mounts)?;
-    let mut args = vec![
-        "run".to_owned(),
-        "--detach".to_owned(),
-        "--name".to_owned(),
-        name.to_owned(),
-    ];
+    let mut args = vec!["run".to_owned()];
+    if engine == "podman" {
+        // PID 1 is `sleep infinity`, which reaps nothing, so every exec that
+        // outlives its parent leaves a zombie behind. Apple's `container`
+        // engine is left alone: its support for the flag is unverified.
+        args.push("--init".to_owned());
+    }
+    args.extend(["--detach".to_owned(), "--name".to_owned(), name.to_owned()]);
     args.extend(managed_resource_identity_args(
         ManagedResourceKind::Container,
         session_id,
@@ -2239,6 +2241,56 @@ mod tests {
                 .unwrap()
                 .contains("gh auth git-credential")
         );
+    }
+
+    #[test]
+    fn podman_containers_reap_zombies_and_apple_containers_keep_their_defaults() {
+        let podman = provision_plan(
+            &TargetTemplate::LocalPodman(ContainerTemplate {
+                image: "ubuntu:24.04".to_owned(),
+                extra_run_args: vec![],
+            }),
+            SESSION,
+            &bundle(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(podman.commands[0].args[0], "run");
+        assert_eq!(podman.commands[0].args[1], "--init");
+
+        let remote = provision_plan(
+            &TargetTemplate::SshPodman {
+                ssh: ssh(),
+                container: ContainerTemplate {
+                    image: "dev:1".to_owned(),
+                    extra_run_args: vec![],
+                },
+            },
+            SESSION,
+            &bundle(),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            remote.commands[0]
+                .args
+                .last()
+                .unwrap()
+                .contains("'podman' 'run' '--init'")
+        );
+
+        let apple = provision_plan(
+            &TargetTemplate::AppleContainer(ContainerTemplate {
+                image: "ubuntu:24.04".to_owned(),
+                extra_run_args: vec![],
+            }),
+            SESSION,
+            &bundle(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(apple.commands[1].args[0], "run");
+        assert!(!apple.commands[1].args.contains(&"--init".to_owned()));
     }
 
     #[test]

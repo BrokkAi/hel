@@ -941,6 +941,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     let credential_sync_handle = credential_sync.handle();
     credential_sync_handle.set_targets(credential_sync_targets(&controller));
     let mut auth_failure_syncs = std::collections::BTreeMap::<String, Instant>::new();
+    let mut credential_sync_notices = CredentialSyncNotices::default();
     let termination = hel::termination::Coordinator::install().token();
     let mut options = ServerOptions::new(bind, snapshot_rx, conversation_rx, action_tx)?;
     options.shutdown = termination.clone();
@@ -1036,7 +1037,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                         changed |= merge_recovery_result(&mut controller, result);
                     }
                     while let Some(result) = credential_sync.try_result() {
-                        if let Some(notice) = credential_sync_notice(&result) {
+                        if let Some(notice) = credential_sync_notices.notice(&result) {
                             eprintln!("Hel: {notice}");
                         }
                     }
@@ -1406,43 +1407,82 @@ fn auth_failure_sync_is_due(
     true
 }
 
-/// Healthy no-op cycles stay out of the UI; only actions, failures, and
-/// answers to an authentication failure are worth a notice.
-fn credential_sync_notice(result: &hel::hel_credentials::CredentialSyncResult) -> Option<String> {
-    if let Some(session_id) = &result.triggered_by {
-        return Some(if result.pushed_to(session_id) {
+/// Turns finished credential syncs into UI notices.
+///
+/// The periodic cycle revisits every profile, so a session that keeps failing
+/// the same way would post the same notice forever. The last failure message
+/// per key is remembered and only a changed one speaks up again. Keys are the
+/// profile for a whole-sync failure and the profile plus session for a
+/// per-session failure.
+#[derive(Debug, Default)]
+struct CredentialSyncNotices {
+    last_failures: std::collections::BTreeMap<(String, Option<String>), String>,
+}
+
+impl CredentialSyncNotices {
+    /// Healthy no-op cycles stay out of the UI; only actions, new failures, and
+    /// answers to an authentication failure are worth a notice.
+    fn notice(&mut self, result: &hel::hel_credentials::CredentialSyncResult) -> Option<String> {
+        // Authentication-triggered syncs always speak: the upstream per-session
+        // cooldown, not this dedup, is what keeps them rare.
+        if let Some(session_id) = &result.triggered_by {
+            return Some(if result.pushed_to(session_id) {
+                format!(
+                    "Session {} hit an authentication failure; refreshed credentials were pushed. Retry the prompt, and if it repeats run `hel login --profile {}`.",
+                    short_id(session_id),
+                    result.profile_id
+                )
+            } else {
+                format!(
+                    "Session {} hit an authentication failure and Hel has nothing fresher to push. Run `hel login --profile {}`.",
+                    short_id(session_id),
+                    result.profile_id
+                )
+            });
+        }
+
+        let mut failures = std::collections::BTreeMap::new();
+        if let Some(detail) = &result.failure {
+            failures.insert(
+                (result.profile_id.clone(), None),
+                format!(
+                    "Credential sync for profile {} failed: {detail}",
+                    result.profile_id
+                ),
+            );
+        }
+        for (session_id, detail) in result.failures() {
+            failures.insert(
+                (result.profile_id.clone(), Some(session_id.to_owned())),
+                format!(
+                    "Credential sync for {} failed: {detail}",
+                    short_id(session_id)
+                ),
+            );
+        }
+        // A key that stopped failing is forgotten silently, so the same failure
+        // after a clean cycle is reported again.
+        self.last_failures
+            .retain(|key, _| key.0 != result.profile_id || failures.contains_key(key));
+        let mut notice = None;
+        for (key, message) in failures {
+            if self.last_failures.get(&key) != Some(&message) {
+                notice.get_or_insert_with(|| message.clone());
+            }
+            self.last_failures.insert(key, message);
+        }
+        if notice.is_some() {
+            return notice;
+        }
+
+        let actions = result.actions();
+        (actions > 0).then(|| {
             format!(
-                "Session {} hit an authentication failure; refreshed credentials were pushed. Retry the prompt, and if it repeats run `hel login --profile {}`.",
-                short_id(session_id),
+                "Refreshed harness credentials for profile {} across {actions} session(s).",
                 result.profile_id
             )
-        } else {
-            format!(
-                "Session {} hit an authentication failure and Hel has nothing fresher to push. Run `hel login --profile {}`.",
-                short_id(session_id),
-                result.profile_id
-            )
-        });
+        })
     }
-    if let Some(detail) = &result.failure {
-        return Some(format!(
-            "Credential sync for profile {} failed: {detail}",
-            result.profile_id
-        ));
-    }
-    if let Some((session_id, detail)) = result.failures().next() {
-        return Some(format!(
-            "Credential sync for {} failed: {detail}",
-            short_id(session_id)
-        ));
-    }
-    let actions = result.actions();
-    (actions > 0).then(|| {
-        format!(
-            "Refreshed harness credentials for profile {} across {actions} session(s).",
-            result.profile_id
-        )
-    })
 }
 
 fn dashboard_resource_targets(controller: &Controller) -> Vec<ResourcePollTarget> {
@@ -2455,6 +2495,7 @@ async fn run_dashboard() -> Result<()> {
     let mut credential_sync = CredentialSyncCoordinator::spawn();
     let credential_sync_handle = credential_sync.handle();
     let mut auth_failure_syncs = std::collections::BTreeMap::<String, Instant>::new();
+    let mut credential_sync_notices = CredentialSyncNotices::default();
     let (resource_targets_tx, resource_triggers_tx, mut resource_updates_rx) =
         spawn_dashboard_resource_poller();
     let (capacity_targets_tx, mut capacity_updates_rx) = spawn_dashboard_capacity_poller();
@@ -2555,7 +2596,7 @@ async fn run_dashboard() -> Result<()> {
             apply_recovery_result(&mut controller, &mut dashboard, result);
         }
         while let Some(result) = credential_sync.try_result() {
-            if let Some(notice) = credential_sync_notice(&result) {
+            if let Some(notice) = credential_sync_notices.notice(&result) {
                 dashboard.set_notice(notice);
             }
         }
@@ -4278,7 +4319,7 @@ mod tests {
             failure: None,
             outcomes: Vec::new(),
         };
-        assert_eq!(credential_sync_notice(&result), None);
+        assert_eq!(CredentialSyncNotices::default().notice(&result), None);
     }
 
     #[test]
@@ -4287,6 +4328,7 @@ mod tests {
             CredentialSyncAction, CredentialSyncOutcome, CredentialSyncResult,
         };
 
+        let mut notices = CredentialSyncNotices::default();
         let pushed = CredentialSyncResult {
             profile_id: "work".into(),
             triggered_by: Some("018f9dd2-a3b4".into()),
@@ -4296,7 +4338,7 @@ mod tests {
                 outcome: Ok(CredentialSyncAction::Pushed),
             }],
         };
-        let notice = credential_sync_notice(&pushed).unwrap();
+        let notice = notices.notice(&pushed).unwrap();
         assert!(notice.contains("were pushed"), "{notice}");
         assert!(notice.contains("hel login --profile work"), "{notice}");
 
@@ -4305,9 +4347,11 @@ mod tests {
             outcomes: Vec::new(),
             ..pushed
         };
-        let notice = credential_sync_notice(&nothing_to_push).unwrap();
+        let notice = notices.notice(&nothing_to_push).unwrap();
         assert!(notice.contains("nothing fresher"), "{notice}");
         assert!(notice.contains("hel login --profile work"), "{notice}");
+        // The per-session cooldown upstream limits these; the dedup must not.
+        assert_eq!(notices.notice(&nothing_to_push), Some(notice));
     }
 
     #[test]
@@ -4323,8 +4367,74 @@ mod tests {
                 outcome: Err("worker proxy disconnected".into()),
             }],
         };
-        let notice = credential_sync_notice(&result).unwrap();
+        let notice = CredentialSyncNotices::default().notice(&result).unwrap();
         assert!(notice.contains("worker proxy disconnected"), "{notice}");
+    }
+
+    #[test]
+    fn a_repeated_credential_failure_is_reported_once_until_it_changes() {
+        use hel::hel_credentials::{
+            CredentialSyncAction, CredentialSyncOutcome, CredentialSyncResult,
+        };
+
+        let failed = |detail: &str| CredentialSyncResult {
+            profile_id: "work".into(),
+            triggered_by: None,
+            failure: None,
+            outcomes: vec![CredentialSyncOutcome {
+                session_id: "018f9dd2-a3b4".into(),
+                outcome: Err(detail.to_owned()),
+            }],
+        };
+        let mut notices = CredentialSyncNotices::default();
+
+        assert!(
+            notices
+                .notice(&failed("worker proxy disconnected"))
+                .is_some()
+        );
+        assert_eq!(notices.notice(&failed("worker proxy disconnected")), None);
+
+        let changed = notices.notice(&failed("container is gone")).unwrap();
+        assert!(changed.contains("container is gone"), "{changed}");
+        assert_eq!(notices.notice(&failed("container is gone")), None);
+
+        // A clean cycle forgets the failure, so a recurrence is reported again.
+        let healthy = CredentialSyncResult {
+            profile_id: "work".into(),
+            triggered_by: None,
+            failure: None,
+            outcomes: vec![CredentialSyncOutcome {
+                session_id: "018f9dd2-a3b4".into(),
+                outcome: Ok(CredentialSyncAction::Pushed),
+            }],
+        };
+        let refreshed = notices.notice(&healthy).unwrap();
+        assert!(
+            refreshed.contains("Refreshed harness credentials"),
+            "{refreshed}"
+        );
+        assert!(notices.notice(&failed("container is gone")).is_some());
+    }
+
+    #[test]
+    fn a_repeated_whole_sync_failure_is_reported_once_per_profile() {
+        use hel::hel_credentials::CredentialSyncResult;
+
+        let failed = |profile_id: &str| CredentialSyncResult {
+            profile_id: profile_id.to_owned(),
+            triggered_by: None,
+            failure: Some("controller home is unreadable".into()),
+            outcomes: Vec::new(),
+        };
+        let mut notices = CredentialSyncNotices::default();
+
+        let notice = notices.notice(&failed("work")).unwrap();
+        assert!(notice.contains("profile work"), "{notice}");
+        assert_eq!(notices.notice(&failed("work")), None);
+        // Another profile failing the same way is its own key.
+        assert!(notices.notice(&failed("personal")).is_some());
+        assert_eq!(notices.notice(&failed("work")), None);
     }
 
     #[test]

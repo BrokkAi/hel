@@ -194,11 +194,14 @@ pub fn write_credential_file(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Full-phrase markers that a harness rejected the session's credentials.
 /// Kept tight on purpose: a false positive costs one redundant sync and one
 /// notice, but a noisy list would train operators to ignore both.
-const AUTH_FAILURE_PHRASES: [&str; 4] = [
+const AUTH_FAILURE_PHRASES: [&str; 5] = [
     "OAuth session expired and could not be refreshed",
     "Please run /login",
     "authentication_error",
     "invalid_grant",
+    // Hel's own marker for a turn the bridge failed with ACP `auth_required`.
+    // The bridge's wording ("Authentication required") is too generic to match.
+    crate::hel_acp::PROMPT_AUTH_REQUIRED_MARKER,
 ];
 
 pub fn auth_failure_signature(_kind: HarnessKind, text: &str) -> bool {
