@@ -3919,6 +3919,7 @@ fn stage_profile(profile: &crate::hel_config::HarnessProfile, destination: &Path
             "skills",
         ],
         crate::hel_config::HarnessKind::Claude => &[
+            ".claude.json",
             ".credentials.json",
             "settings.json",
             "CLAUDE.md",
@@ -4959,6 +4960,34 @@ mod tests {
         assert_eq!(arguments[0], "-lc");
         assert!(arguments[1].contains("install.sh | bash &&"));
         assert!(arguments[1].contains("$HOME/.kimi-code/bin/kimi"));
+    }
+
+    #[test]
+    fn stage_claude_profile_preserves_rollout_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let identity = r#"{
+            "machineID": "stable-machine",
+            "userID": "stable-user",
+            "cachedGrowthBookFeatures": {
+                "tengu_velvet_mallet_fable_5": true
+            }
+        }"#;
+        std::fs::write(home.path().join(".claude.json"), identity).unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let profile = crate::hel_config::HarnessProfile {
+            kind: crate::hel_config::HarnessKind::Claude,
+            home: home.path().to_path_buf(),
+            executable: None,
+            environment: BTreeMap::new(),
+            context_window_bytes: None,
+        };
+
+        stage_profile(&profile, staged.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(staged.path().join(".claude.json")).unwrap(),
+            identity
+        );
     }
 
     #[test]
