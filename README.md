@@ -91,8 +91,9 @@ target-side worker, so they continue to run in order while the TUI is minimized,
 detached, or not running. Archiving preserves pending prompts in the recovery
 copy; resuming asks whether to start with that queue or discard it.
 
-The dashboard lists newest-added sessions first. Press `s` to switch between
-that order and most-recent activity; the current order is shown in the footer.
+The dashboard lists sessions in creation sequence. Press `s` to cycle through
+sequence, most-recent activity, and profile-then-sequence ordering; the current
+order is shown in the footer.
 Returning to the dashboard with `Ctrl+G` preserves the current message draft.
 
 ## Configuration

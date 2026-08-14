@@ -175,22 +175,25 @@ enum Focus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionOrder {
-    Added,
+    Sequence,
     RecentActivity,
+    Profile,
 }
 
 impl SessionOrder {
     fn label(self) -> &'static str {
         match self {
-            Self::Added => "added",
+            Self::Sequence => "sequence",
             Self::RecentActivity => "recent activity",
+            Self::Profile => "profile, then sequence",
         }
     }
 
     fn next(self) -> Self {
         match self {
-            Self::Added => Self::RecentActivity,
-            Self::RecentActivity => Self::Added,
+            Self::Sequence => Self::RecentActivity,
+            Self::RecentActivity => Self::Profile,
+            Self::Profile => Self::Sequence,
         }
     }
 }
@@ -614,7 +617,7 @@ impl DashboardState {
             session_operations: BTreeMap::new(),
             capacity_details: BTreeMap::new(),
             session_index: 0,
-            session_order: SessionOrder::Added,
+            session_order: SessionOrder::Sequence,
             capacity_index: 0,
             quota_index: 0,
             focus: Focus::Active,
@@ -3392,20 +3395,36 @@ fn partition_sessions<'a>(
             archived.push(session);
         }
     }
-    let timestamp = |session: &SessionRecord| match order {
-        SessionOrder::Added => session_timestamp(&session.created_at),
-        SessionOrder::RecentActivity => session_details
+    let activity_timestamp = |session: &SessionRecord| {
+        session_details
             .get(&session.id)
             .and_then(|detail| detail.last_activity_at)
             .map(|timestamp| timestamp as i64)
             .into_iter()
             .chain(session_timestamp(&session.updated_at))
-            .max(),
+            .max()
     };
-    let sort = |left: &&SessionRecord, right: &&SessionRecord| {
-        timestamp(right)
-            .cmp(&timestamp(left))
-            .then_with(|| left.id.cmp(&right.id))
+    let sequence = |left: &&SessionRecord, right: &&SessionRecord| {
+        match (
+            session_timestamp(&left.created_at),
+            session_timestamp(&right.created_at),
+        ) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| left.id.cmp(&right.id))
+    };
+    let sort = |left: &&SessionRecord, right: &&SessionRecord| match order {
+        SessionOrder::Sequence => sequence(left, right),
+        SessionOrder::RecentActivity => activity_timestamp(right)
+            .cmp(&activity_timestamp(left))
+            .then_with(|| sequence(left, right)),
+        SessionOrder::Profile => left
+            .last_profile
+            .cmp(&right.last_profile)
+            .then_with(|| sequence(left, right)),
     };
     active.sort_by(sort);
     archived.sort_by(sort);
@@ -6512,7 +6531,7 @@ mod tests {
         let (active, archived) = partition_sessions(
             state.sessions.values(),
             &BTreeMap::new(),
-            SessionOrder::Added,
+            SessionOrder::Sequence,
         );
         assert_eq!(
             active
@@ -6547,7 +6566,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_are_ordered_by_creation_time_descending_by_default() {
+    fn sessions_are_ordered_by_creation_sequence_ascending_by_default() {
         let mut oldest = archived_session();
         oldest.id = "session-z".into();
         oldest.created_at = "2026-08-09T01:00:00Z".into();
@@ -6561,7 +6580,7 @@ mod tests {
         let (_, archived) = partition_sessions(
             [&invalid_timestamp, &oldest, &newest],
             &BTreeMap::new(),
-            SessionOrder::Added,
+            SessionOrder::Sequence,
         );
 
         assert_eq!(
@@ -6569,23 +6588,26 @@ mod tests {
                 .iter()
                 .map(|session| session.id.as_str())
                 .collect::<Vec<_>>(),
-            ["session-y", "session-z", "session-a"]
+            ["session-z", "session-y", "session-a"]
         );
     }
 
     #[test]
-    fn sort_hotkey_toggles_recent_activity_and_preserves_selection() {
+    fn sort_hotkey_round_robins_sequence_activity_and_profile() {
         let active_session = |id: &str| {
             let mut session = archived_session();
             session.id = id.into();
             session.state = SessionState::Running;
             session
         };
-        let sessions = [
+        let mut sessions = [
             active_session("session-a"),
             active_session("session-b"),
             active_session("session-c"),
         ];
+        sessions[0].last_profile = "z-profile".into();
+        sessions[1].last_profile = "a-profile".into();
+        sessions[2].last_profile = "a-profile".into();
         let state = HelState {
             version: STATE_VERSION,
             sessions: sessions
@@ -6603,7 +6625,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        assert_eq!(dashboard.session_order, SessionOrder::Added);
+        assert_eq!(dashboard.session_order, SessionOrder::Sequence);
         assert_eq!(
             ordered_ids(&dashboard),
             ["session-a", "session-b", "session-c"]
@@ -6652,11 +6674,20 @@ mod tests {
         );
 
         dashboard.handle_key(key(KeyCode::Char('s')));
-        assert_eq!(dashboard.session_order, SessionOrder::Added);
+        assert_eq!(dashboard.session_order, SessionOrder::Profile);
+        assert_eq!(
+            ordered_ids(&dashboard),
+            ["session-b", "session-c", "session-a"]
+        );
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-a");
+
+        dashboard.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(dashboard.session_order, SessionOrder::Sequence);
         assert_eq!(
             ordered_ids(&dashboard),
             ["session-a", "session-b", "session-c"]
         );
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-a");
 
         dashboard.apply_worker_events(
             "session-b",
