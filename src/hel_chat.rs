@@ -291,6 +291,7 @@ pub struct ChatState {
     history_search: Option<HistorySearch>,
     queued_prompts: VecDeque<QueuedPrompt>,
     recovery_busy: bool,
+    goal_prompt_active: bool,
     agent_commands: Vec<AvailableCommand>,
     command_choices: Vec<CommandChoice>,
     model_values: Vec<ConfigValueChoice>,
@@ -326,6 +327,10 @@ impl ChatState {
             history_search: None,
             queued_prompts: VecDeque::new(),
             recovery_busy: false,
+            goal_prompt_active: snapshot
+                .active_prompt
+                .as_ref()
+                .is_some_and(|prompt| is_goal_prompt(&prompt.text)),
             agent_commands: Vec::new(),
             command_choices: builtin_command_choices(),
             model_values: Vec::new(),
@@ -378,9 +383,18 @@ impl ChatState {
         self.latest_seq
     }
 
-    fn mark_prompt_submitted(&mut self) {
+    fn mark_prompt_submitted(&mut self, prompt: &str) {
         self.phase = WorkerPhase::Running;
+        self.goal_prompt_active = is_goal_prompt(prompt);
         self.notice = None;
+    }
+
+    fn pursuing_goal(&self) -> bool {
+        self.goal_prompt_active
+            && self
+                .agent_commands
+                .iter()
+                .any(|command| command.name == "goal")
     }
 
     pub fn entries(&self) -> &[ChatEntry] {
@@ -1367,11 +1381,13 @@ impl ChatState {
         match &event.event {
             WorkerEvent::PromptAccepted { text, .. } => {
                 self.phase = WorkerPhase::Running;
+                self.goal_prompt_active = is_goal_prompt(text);
                 self.entries
                     .push(ChatEntry::plain(event.seq, ChatRole::User, text));
             }
             WorkerEvent::TurnCompleted => {
                 self.phase = WorkerPhase::Idle;
+                self.goal_prompt_active = false;
             }
             // The durable worker records cancellation acceptance before the
             // ACP prompt future resolves. Keep the chat busy until the later
@@ -1658,6 +1674,12 @@ fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> {
     Some((command, args))
 }
 
+fn is_goal_prompt(prompt: &str) -> bool {
+    prompt
+        .strip_prefix("/goal")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
 fn find_config_option<'a>(
     options: &'a [SessionConfigOption],
     key: &str,
@@ -1893,7 +1915,7 @@ pub async fn run_chat(
             match client.prompt(queued.text.clone(), Vec::new()).await {
                 Ok(sequence) => {
                     chat.record_accepted_prompt(sequence, &queued.text);
-                    chat.mark_prompt_submitted();
+                    chat.mark_prompt_submitted(&queued.text);
                 }
                 Err(error) => {
                     let dropped = chat.queued_prompts.len();
@@ -1938,7 +1960,7 @@ pub async fn run_chat(
                     {
                         Ok(sequence) => {
                             chat.record_accepted_prompt(sequence, &text);
-                            chat.mark_prompt_submitted();
+                            chat.mark_prompt_submitted(&text);
                             None
                         }
                         Err(error) => {
@@ -2125,6 +2147,7 @@ fn prompt_title(chat: &ChatState, queued: usize) -> String {
     } else {
         match chat.phase {
             WorkerPhase::Idle => parts.push("Prompt".into()),
+            WorkerPhase::Running if chat.pursuing_goal() => parts.push("Pursuing goal".into()),
             WorkerPhase::Running => parts.push("Running".into()),
             WorkerPhase::Closing => parts.push("Closing".into()),
             WorkerPhase::Closed => parts.push("Closed".into()),
@@ -3019,7 +3042,7 @@ mod tests {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.set_notice("Queued 1: next");
 
-        chat.mark_prompt_submitted();
+        chat.mark_prompt_submitted("hello");
 
         assert_eq!(chat.phase, WorkerPhase::Running);
         assert!(chat.notice.is_none());
@@ -3173,6 +3196,61 @@ mod tests {
         assert!(rendered.contains("gpt-5.6-sol · high · Running · Esc cancels"));
         assert!(!rendered.contains("HEL /"));
         assert_ne!(buffer[(buffer.area.x, buffer.area.y)].symbol(), "┌");
+    }
+
+    #[test]
+    fn composer_title_identifies_an_active_advertised_goal() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.apply_session_update(
+            1,
+            &serde_json::json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {"name": "goal", "description": "set a persistent goal"}
+                ]
+            }),
+        );
+        chat.apply_event(&SequencedEvent {
+            seq: 2,
+            request_id: Some("goal".into()),
+            event: WorkerEvent::PromptAccepted {
+                request_id: "goal".into(),
+                text: "/goal ship the release".into(),
+                attachments: Vec::new(),
+            },
+        });
+
+        assert!(prompt_title(&chat, 0).contains("Pursuing goal"));
+        assert!(!prompt_title(&chat, 0).contains("Running"));
+
+        chat.apply_event(&SequencedEvent {
+            seq: 3,
+            request_id: None,
+            event: WorkerEvent::TurnCompleted,
+        });
+        assert!(prompt_title(&chat, 0).contains("Prompt"));
+        assert!(!prompt_title(&chat, 0).contains("Pursuing goal"));
+    }
+
+    #[test]
+    fn composer_title_does_not_label_ordinary_or_unadvertised_prompts_as_goals() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.mark_prompt_submitted("/goal ship the release");
+        assert!(prompt_title(&chat, 0).contains("Running"));
+        assert!(!prompt_title(&chat, 0).contains("Pursuing goal"));
+
+        chat.apply_session_update(
+            1,
+            &serde_json::json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {"name": "goal", "description": "set a persistent goal"}
+                ]
+            }),
+        );
+        chat.mark_prompt_submitted("please ship the release");
+        assert!(prompt_title(&chat, 0).contains("Running"));
+        assert!(!prompt_title(&chat, 0).contains("Pursuing goal"));
     }
 
     #[test]
