@@ -4351,14 +4351,9 @@ fn render_sessions(
             break;
         }
         visible_sessions += 1;
-        let selected = dashboard.focus == Focus::Active && index == dashboard.session_index;
         let info_y = detail_y.saturating_sub(1);
         if info_y < active_area.bottom().saturating_sub(1) {
-            let style = if selected {
-                Style::default().bg(Color::DarkGray).fg(Color::LightYellow)
-            } else {
-                Style::default().fg(Color::LightYellow)
-            };
+            let style = Style::default().bg(Color::DarkGray).fg(Color::LightYellow);
             frame.buffer_mut().set_style(
                 Rect::new(
                     active_area.x.saturating_add(1),
@@ -4467,12 +4462,12 @@ fn focus_border(focused: bool) -> BorderType {
 
 fn session_column_constraints() -> [Constraint; 6] {
     [
+        Constraint::Length(18),
         Constraint::Length(10),
         // Leave a little air before the profile column.
         Constraint::Length(11),
         Constraint::Length(14),
         Constraint::Length(18),
-        Constraint::Length(17),
         Constraint::Min(18),
     ]
 }
@@ -4489,11 +4484,11 @@ fn archived_session_column_constraints() -> [Constraint; 5] {
 
 fn session_header() -> Row<'static> {
     Row::new([
+        "Project",
         "Unread",
         "Turn clock",
         "Profile",
         "Target",
-        "Project",
         "Session name",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD))
@@ -4647,15 +4642,15 @@ fn active_session_row(
     height: u16,
     top_margin: u16,
 ) -> Row<'static> {
-    let (clock, profile, target, resources, session_name) =
+    let (clock, profile, target, project, session_name) =
         session_values(session, detail, operation, now_epoch_seconds, config);
     let unread_count = detail.map_or(0, |detail| detail.unread_agent_message_sequences.len());
     Row::new([
+        Cell::from(project),
         Cell::from(unread_line(unread_count)),
         Cell::from(clock),
         Cell::from(profile),
         Cell::from(target),
-        Cell::from(resources),
         Cell::from(recovery_warning_name(
             session,
             session_name,
@@ -6812,7 +6807,7 @@ mod tests {
     }
 
     #[test]
-    fn active_status_row_leads_with_unread_and_separates_clock_from_profile() {
+    fn active_status_row_leads_with_project_and_separates_clock_from_profile() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
@@ -6842,6 +6837,7 @@ mod tests {
             .iter()
             .find(|line| line.contains("Turn clock") && line.contains("Profile"))
             .expect("active table header");
+        assert!(header.find("Project") < header.find("Unread"));
         let clock_end = header.find("Turn clock").unwrap() + "Turn clock".len();
         let profile_start = header.find("Profile").unwrap();
         assert!(profile_start.saturating_sub(clock_end) >= 2);
@@ -6851,6 +6847,7 @@ mod tests {
             .position(|line| line.contains("1 unread") && line.contains("codex-1"))
             .expect("active status row");
         let status = &lines[status_y];
+        assert!(status.find("hel") < status.find("1 unread"));
         assert!(status.find("1 unread") < status.find("codex-1"));
         let buffer = terminal.backend().buffer();
         let status_y = buffer.area.y + status_y as u16;
@@ -6858,6 +6855,10 @@ mod tests {
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .filter(|x| !buffer[(*x, status_y)].symbol().trim().is_empty())
                 .all(|x| buffer[(x, status_y)].fg == Color::LightYellow)
+        );
+        assert!(
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .all(|x| buffer[(x, status_y)].bg == Color::DarkGray)
         );
     }
 
