@@ -894,8 +894,87 @@ pub fn collect_git_snapshot_with_progress(
     validate_archive_relative_path(&spec.relative_destination)?;
     ensure!(!spec.base_commit.trim().is_empty(), "base commit is empty");
 
-    let origin = if let Some(origin) = &spec.origin_override {
-        origin.clone()
+    let identity = collect_git_identity(runner, repository, spec.origin_override.as_deref())?;
+    let (base_commit, full_history) = if spec.full_history {
+        (
+            git_text(runner, repository, ["rev-parse", &spec.base_commit])?,
+            true,
+        )
+    } else {
+        match merge_base(runner, repository, &spec.base_commit)? {
+            Some(base_commit) => (base_commit, false),
+            None => (identity.head_commit.clone(), true),
+        }
+    };
+    let count = if full_history {
+        0
+    } else {
+        git_text(
+            runner,
+            repository,
+            ["rev-list", "--count", &format!("{base_commit}..HEAD")],
+        )?
+        .parse::<u64>()
+        .context("parse committed delta count")?
+    };
+    let history = GitHistorySelection {
+        base_commit,
+        full_history,
+        count,
+    };
+    collect_git_contents(
+        runner,
+        repository,
+        spec,
+        identity,
+        history,
+        include_untracked,
+        progress,
+    )
+}
+
+/// Collect only enough Git identity to associate native harness state with an
+/// existing project. The project itself remains the recovery source.
+pub fn collect_git_metadata_snapshot(
+    runner: &dyn GitCommandRunner,
+    repository: &Path,
+    spec: &GitCollectionSpec,
+) -> Result<RepositorySnapshot> {
+    validate_component(&spec.id, "repository id")?;
+    validate_archive_relative_path(&spec.relative_destination)?;
+    let identity = collect_git_identity(runner, repository, spec.origin_override.as_deref())?;
+    Ok(RepositorySnapshot {
+        metadata: RepositoryMetadata {
+            id: spec.id.clone(),
+            relative_destination: spec.relative_destination.clone(),
+            origin: identity.origin,
+            base_commit: identity.head_commit.clone(),
+            full_history: false,
+            head_commit: identity.head_commit,
+            branch: identity.branch,
+        },
+        committed_bundle: Vec::new(),
+        staged_patch: Vec::new(),
+        unstaged_patch: Vec::new(),
+        untracked_tar: Vec::new(),
+    })
+}
+
+struct CollectedGitIdentity {
+    origin: String,
+    head_commit: String,
+    branch: Option<String>,
+}
+
+fn collect_git_identity(
+    runner: &dyn GitCommandRunner,
+    repository: &Path,
+    origin_override: Option<&str>,
+) -> Result<CollectedGitIdentity> {
+    let head_commit = git_text(runner, repository, ["rev-parse", "--verify", "HEAD"])
+        .context("repository has no valid Git HEAD")?;
+    let origin = if let Some(origin) = origin_override {
+        origin.to_owned()
     } else {
         let output = run_git(runner, repository, ["remote", "get-url", "origin"], &[])?;
         if output.status == 0 {
@@ -904,8 +983,6 @@ pub fn collect_git_snapshot_with_progress(
             String::new()
         }
     };
-    let base_commit = git_text(runner, repository, ["rev-parse", &spec.base_commit])?;
-    let head_commit = git_text(runner, repository, ["rev-parse", "HEAD"])?;
     let branch_output = run_git(
         runner,
         repository,
@@ -919,13 +996,62 @@ pub fn collect_git_snapshot_with_progress(
     } else {
         return Err(git_failure("read Git branch", &branch_output));
     };
-    let count = git_text(
+    Ok(CollectedGitIdentity {
+        origin,
+        head_commit,
+        branch,
+    })
+}
+
+fn merge_base(
+    runner: &dyn GitCommandRunner,
+    repository: &Path,
+    base_revision: &str,
+) -> Result<Option<String>> {
+    let base = run_git(
         runner,
         repository,
-        ["rev-list", "--count", &format!("{base_commit}..HEAD")],
-    )?
-    .parse::<u64>()
-    .context("parse committed delta count")?;
+        ["rev-parse", "--verify", base_revision],
+        &[],
+    )?;
+    if base.status != 0 {
+        return Ok(None);
+    }
+    let base = trim_output(&base.stdout, "decode Git base revision")?;
+    if base.is_empty() {
+        return Ok(None);
+    }
+    let merged = run_git(runner, repository, ["merge-base", "HEAD", &base], &[])?;
+    match merged.status {
+        0 => {
+            let merged = trim_output(&merged.stdout, "decode Git merge base")?;
+            Ok((!merged.is_empty()).then_some(merged))
+        }
+        1 => Ok(None),
+        _ => Err(git_failure("find Git merge base", &merged)),
+    }
+}
+
+struct GitHistorySelection {
+    base_commit: String,
+    full_history: bool,
+    count: u64,
+}
+
+fn collect_git_contents(
+    runner: &dyn GitCommandRunner,
+    repository: &Path,
+    spec: &GitCollectionSpec,
+    identity: CollectedGitIdentity,
+    history: GitHistorySelection,
+    include_untracked: bool,
+    progress: &(dyn Fn(GitSnapshotProgress) -> Result<()> + Sync),
+) -> Result<RepositorySnapshot> {
+    let GitHistorySelection {
+        base_commit,
+        full_history,
+        count,
+    } = history;
     // These commands only inspect repository state and produce independent
     // payloads. Nested joins share Rayon's bounded worker pool, including when
     // several repositories are being collected at once.
@@ -933,7 +1059,7 @@ pub fn collect_git_snapshot_with_progress(
         || {
             rayon::join(
                 || {
-                    if spec.full_history {
+                    if full_history {
                         git_bytes(
                             runner,
                             repository,
@@ -1000,11 +1126,11 @@ pub fn collect_git_snapshot_with_progress(
         metadata: RepositoryMetadata {
             id: spec.id.clone(),
             relative_destination: spec.relative_destination.clone(),
-            origin,
+            origin: identity.origin,
             base_commit,
-            full_history: spec.full_history,
-            head_commit,
-            branch,
+            full_history,
+            head_commit: identity.head_commit,
+            branch: identity.branch,
         },
         committed_bundle,
         staged_patch,
@@ -1439,6 +1565,7 @@ mod tests {
             let stdout = match arguments.first().map(|argument| argument.as_ref()) {
                 Some("remote") => b"https://token@github.com/example/repo.git\n".to_vec(),
                 Some("rev-parse") => format!("{}\n", "b".repeat(40)).into_bytes(),
+                Some("merge-base") => format!("{}\n", "b".repeat(40)).into_bytes(),
                 Some("symbolic-ref") => b"feature/hel\n".to_vec(),
                 Some("rev-list") => format!("{}\n", self.delta_count).into_bytes(),
                 Some("bundle") => {
@@ -1742,7 +1869,7 @@ mod tests {
             .map(|entry| entry.unwrap().path().unwrap().into_owned())
             .collect();
         assert_eq!(paths, vec![PathBuf::from("note.txt")]);
-        assert_eq!(runner.commands().len(), 8);
+        assert_eq!(runner.commands().len(), 9);
     }
 
     #[test]
@@ -1806,7 +1933,103 @@ mod tests {
         assert_eq!(snapshot.committed_bundle, b"bundle");
         assert_eq!(snapshot.staged_patch, b"staged");
         assert_eq!(snapshot.unstaged_patch, b"unstaged");
-        assert_eq!(runner.commands().len(), 9);
+        assert_eq!(runner.commands().len(), 10);
+    }
+
+    #[test]
+    fn metadata_snapshot_requires_git_head_but_omits_repository_contents() {
+        let repository = tempfile::tempdir().unwrap();
+        git(repository.path(), &["init", "-q", "-b", "main"]);
+        git(repository.path(), &["config", "user.name", "Hel Test"]);
+        git(
+            repository.path(),
+            &["config", "user.email", "hel@example.test"],
+        );
+        fs::write(repository.path().join("tracked.txt"), b"base\n").unwrap();
+        git(repository.path(), &["add", "."]);
+        git(repository.path(), &["commit", "-qm", "base"]);
+        fs::write(repository.path().join("tracked.txt"), b"dirty\n").unwrap();
+        fs::write(repository.path().join("untracked.txt"), b"untracked\n").unwrap();
+
+        let snapshot = collect_git_metadata_snapshot(
+            &SystemGit,
+            repository.path(),
+            &GitCollectionSpec {
+                id: "project".into(),
+                relative_destination: "project".into(),
+                base_commit: "HEAD".into(),
+                full_history: false,
+                origin_override: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.metadata.base_commit, snapshot.metadata.head_commit);
+        assert!(!snapshot.metadata.full_history);
+        assert!(snapshot.committed_bundle.is_empty());
+        assert!(snapshot.staged_patch.is_empty());
+        assert!(snapshot.unstaged_patch.is_empty());
+        assert!(snapshot.untracked_tar.is_empty());
+
+        fs::remove_dir_all(repository.path().join(".git")).unwrap();
+        let error = collect_git_metadata_snapshot(
+            &SystemGit,
+            repository.path(),
+            &GitCollectionSpec {
+                id: "project".into(),
+                relative_destination: "project".into(),
+                base_commit: "HEAD".into(),
+                full_history: false,
+                origin_override: None,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("repository has no valid Git HEAD"));
+    }
+
+    #[test]
+    fn unrelated_history_falls_back_to_a_self_contained_bundle() {
+        let source = tempfile::tempdir().unwrap();
+        git(source.path(), &["init", "-q", "-b", "main"]);
+        git(source.path(), &["config", "user.name", "Hel Test"]);
+        git(source.path(), &["config", "user.email", "hel@example.test"]);
+        fs::write(source.path().join("old.txt"), b"old\n").unwrap();
+        git(source.path(), &["add", "."]);
+        git(source.path(), &["commit", "-qm", "old root"]);
+        let old_head = String::from_utf8(git(source.path(), &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        git(source.path(), &["update-ref", "refs/hel/base", &old_head]);
+        git(source.path(), &["checkout", "-q", "--orphan", "rewritten"]);
+        git(source.path(), &["rm", "-q", "-rf", "."]);
+        fs::write(source.path().join("new.txt"), b"new root\n").unwrap();
+        git(source.path(), &["add", "."]);
+        git(source.path(), &["commit", "-qm", "new root"]);
+
+        let snapshot = collect_git_snapshot(
+            &SystemGit,
+            source.path(),
+            &GitCollectionSpec {
+                id: "repo".into(),
+                relative_destination: "repo".into(),
+                base_commit: "refs/hel/base".into(),
+                full_history: false,
+                origin_override: None,
+            },
+        )
+        .unwrap();
+        assert!(snapshot.metadata.full_history);
+        assert_eq!(snapshot.metadata.base_commit, snapshot.metadata.head_commit);
+        assert!(!snapshot.committed_bundle.is_empty());
+
+        let restored = tempfile::tempdir().unwrap();
+        git(restored.path(), &["init", "-q", "-b", "main"]);
+        restore_git_snapshot(&SystemGit, restored.path(), &snapshot).unwrap();
+        assert_eq!(
+            fs::read(restored.path().join("new.txt")).unwrap(),
+            b"new root\n"
+        );
     }
 
     #[test]
@@ -1875,6 +2098,8 @@ mod tests {
         )
         .unwrap();
         assert!(!snapshot.committed_bundle.is_empty());
+        assert!(!snapshot.metadata.full_history);
+        assert_eq!(snapshot.metadata.base_commit, base);
 
         let destination_parent = tempfile::tempdir().unwrap();
         let destination = destination_parent.path().join("restore");

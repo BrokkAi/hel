@@ -2142,7 +2142,7 @@ fn prompt_title(chat: &ChatState, queued: usize) -> String {
     .map(str::to_owned)
     .collect::<Vec<_>>();
     if chat.recovery_busy {
-        parts.push("Saving recovery copy…".into());
+        parts.push("Saving checkpoint…".into());
         parts.push(format!("{queued} queued"));
     } else {
         match chat.phase {

@@ -1726,12 +1726,24 @@ fn apply_recovery_result(
 ) {
     let session_id = result.session_id.clone();
     let failure = result.outcome.as_ref().err().cloned();
+    let full_history_fallbacks = result
+        .outcome
+        .as_ref()
+        .ok()
+        .map(|artifact| artifact.full_history_fallbacks.clone())
+        .unwrap_or_default();
     if merge_recovery_result(controller, result) {
         dashboard.set_state(controller.state.clone());
         if let Some(detail) = failure {
             dashboard.set_notice(format!(
                 "Recovery copy for {} failed: {detail}",
                 short_id(&session_id)
+            ));
+        } else if !full_history_fallbacks.is_empty() {
+            dashboard.set_notice(format!(
+                "Checkpoint for {} included full Git history for {} because no common base was available.",
+                short_id(&session_id),
+                full_history_fallbacks.join(", ")
             ));
         }
     }
@@ -2847,7 +2859,7 @@ async fn close_session_with_redraw(
 fn close_progress_notice(session_id: &str, elapsed: Duration, frame: usize) -> String {
     const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
     format!(
-        "{} Saving recovery copy for {}… {}s",
+        "{} Saving checkpoint for {}… {}s",
         SPINNER[frame % SPINNER.len()],
         short_id(session_id),
         elapsed.as_secs()
@@ -3610,7 +3622,7 @@ mod tests {
     fn close_progress_notice_animates_and_reports_elapsed_time() {
         assert_eq!(
             close_progress_notice("0123456789", Duration::from_secs(7), 1),
-            "/ Saving recovery copy for 01234567… 7s"
+            "/ Saving checkpoint for 01234567… 7s"
         );
     }
 

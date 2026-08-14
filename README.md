@@ -242,6 +242,11 @@ unrestricted mode or auto-approve ACP permission requests there. Kimi's normal
 `auto` mode is its no-confirmation mode, so the dashboard displays a prominent
 warning before using Kimi on raw localhost.
 
+Raw-project checkpoints preserve Hel's event stream and native harness state,
+but they do not back up the selected worktree. Resuming requires the same
+project path with a valid Git `HEAD`; Hel leaves that project untouched when
+closing the session.
+
 The dashboard's Deployment Capacity pane groups configured local and SSH
 targets by host and shows current CPU and RAM utilization. Multiple target
 definitions may share a host; their IDs appear together in that host's row.
@@ -287,11 +292,14 @@ separate startup checkpoint. Healthy recovery state stays out of the UI, while
 failures leave the session usable and surface a warning. Operators can force a
 copy with `hel checkpoint --session <id>`.
 
-Recovery archives are versioned ZIPs containing a manifest, a canonical
-event stream, allowlisted native harness artifacts, and Git state for every
-repository (committed bundle, staged and unstaged patches, and untracked
-files). Every payload is SHA-256 verified after the archive is atomically
-installed. Normal Pause refuses teardown if that verification fails; explicit
-force-destroy is the data-loss escape hatch.
+Recovery archives are versioned ZIPs containing a manifest, a canonical event
+stream, allowlisted native harness artifacts, and the Git state needed to
+rebuild disposable workspaces. Committed work is normally a delta from the
+repository's merge base with its configured remote or Hel seed; staged,
+unstaged, and untracked changes are stored separately. Hel falls back to a full
+Git bundle only when an intact repository has no usable common base. Every
+payload is SHA-256 verified after the archive is atomically installed. Normal
+Pause refuses teardown if that verification fails; explicit force-destroy is
+the data-loss escape hatch.
 
 Hel is licensed under `GPL-3.0-only`.

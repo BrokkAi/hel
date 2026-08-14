@@ -4168,7 +4168,7 @@ fn render_sessions(
                     active_area.width.saturating_sub(2),
                     1,
                 ),
-                Style::default().bg(Color::DarkGray).fg(Color::White),
+                Style::default().bg(Color::DarkGray).fg(Color::LightYellow),
             );
         }
         let preview_height = active_area
@@ -4406,7 +4406,7 @@ fn unread_line(unread_count: usize) -> Line<'static> {
         Line::from(Span::styled(
             format!("{unread_count} unread"),
             Style::default()
-                .fg(Color::Blue)
+                .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
         ))
     } else {
@@ -4462,6 +4462,7 @@ fn active_session_row(
             now_epoch_seconds,
         )),
     ])
+    .style(Style::default().fg(Color::LightYellow))
     .height(height)
     .top_margin(top_margin)
 }
@@ -6480,7 +6481,7 @@ mod tests {
         assert_eq!(
             badge.spans[0].style,
             Style::default()
-                .fg(Color::Blue)
+                .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD)
         );
 
@@ -6581,11 +6582,19 @@ mod tests {
         let profile_start = header.find("Profile").unwrap();
         assert!(profile_start.saturating_sub(clock_end) >= 2);
 
-        let status = lines
+        let status_y = lines
             .iter()
-            .find(|line| line.contains("1 unread") && line.contains("codex-1"))
+            .position(|line| line.contains("1 unread") && line.contains("codex-1"))
             .expect("active status row");
+        let status = &lines[status_y];
         assert!(status.find("1 unread") < status.find("codex-1"));
+        let buffer = terminal.backend().buffer();
+        let status_y = buffer.area.y + status_y as u16;
+        assert!(
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .filter(|x| !buffer[(*x, status_y)].symbol().trim().is_empty())
+                .all(|x| buffer[(x, status_y)].fg == Color::LightYellow)
+        );
     }
 
     #[test]
@@ -8349,6 +8358,11 @@ mod tests {
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .all(|x| buffer[(x, info_y)].bg == Color::DarkGray)
+        );
+        assert!(
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .filter(|x| !buffer[(*x, info_y)].symbol().trim().is_empty())
+                .all(|x| buffer[(x, info_y)].fg == Color::LightYellow)
         );
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
