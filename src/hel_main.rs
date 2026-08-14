@@ -295,6 +295,8 @@ struct WorkerArgs {
 const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WORKER_POLL_TIMEOUT: Duration = Duration::from_secs(3);
+const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKER_REPLAY_PAGE_TIMEOUT: Duration = Duration::from_secs(15);
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const RESOURCE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const CAPACITY_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -309,6 +311,7 @@ enum QuotaUpdate {
 struct WorkerPollTarget {
     session_id: String,
     spec: CommandSpec,
+    viewed_through: u64,
 }
 
 #[derive(Debug)]
@@ -328,6 +331,7 @@ enum WorkerPollPayload {
         /// These events predate the connection established by this poll.
         received_while_detached: bool,
     },
+    Hydrated(hel::hel_worker::WorkerSessionSummary),
     /// The worker failed several consecutive polls; the session needs
     /// attention and a diagnosis.
     Unreachable {
@@ -341,6 +345,7 @@ struct WarmWorker {
     chat: hel::hel_chat::ChatState,
     queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
     opening_events: Vec<SequencedEvent>,
+    full_history: bool,
 }
 
 enum WorkerPollCommand {
@@ -965,27 +970,55 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                 _ = termination.cancelled() => break,
                 update = worker_updates_rx.recv() => {
                     let Some(update) = update else { break };
-                    if let WorkerPollPayload::Events { events, phase, transcript, queued_prompts: worker_queue, .. } = update.payload {
-                        if let Some(session) = controller.state.sessions.get(&update.session_id).cloned() {
-                            if hel::hel_credentials::events_report_auth_failure(session.harness_kind, &events)
+                    let mut browser_update = None;
+                    let mut queue_update = None;
+                    let progress = match update.payload {
+                        WorkerPollPayload::Events {
+                            events,
+                            phase,
+                            transcript,
+                            queued_prompts: worker_queue,
+                            ..
+                        } => {
+                            if let Some(session) = controller.state.sessions.get(&update.session_id)
+                                && hel::hel_credentials::events_report_auth_failure(session.harness_kind, &events)
                                 && auth_failure_sync_is_due(&mut auth_failure_syncs, &update.session_id, Instant::now())
                             {
                                 credential_sync_handle.sync_profile_now(&session.last_profile, Some(&update.session_id));
                             }
+                            browser_update = Some(transcript.browser_transcript(None));
+                            queue_update = Some(worker_queue);
+                            Some((
+                                phase,
+                                hel::hel_recovery::latest_completed_turn_seq(&events),
+                            ))
+                        }
+                        WorkerPollPayload::Hydrated(summary) => {
+                            browser_update = Some(
+                                hel::hel_chat::TranscriptSnapshot::from_entries_at(
+                                    summary.transcript_tail.clone(),
+                                    summary.latest_seq,
+                                )
+                                .browser_transcript(None),
+                            );
+                            queue_update = Some(summary.queued_prompts.clone());
+                            Some((summary.phase, summary.latest_completed_turn_seq))
+                        }
+                        WorkerPollPayload::Connected | WorkerPollPayload::Unreachable { .. } => None,
+                    };
+                    if let Some((phase, latest_completed_turn_seq)) = progress {
+                        if let Some(session) = controller.state.sessions.get(&update.session_id).cloned() {
                             recovery_observer
                                 .observe(hel::hel_recovery::RecoveryObservation {
                                     session,
                                     config: controller.config.clone(),
-                                    events,
+                                    latest_completed_turn_seq,
                                     phase,
                                 })
                                 .await;
                         }
-                        conversations.insert(
-                            update.session_id.clone(),
-                            transcript.browser_transcript(None),
-                        );
-                        queued_prompts.insert(update.session_id.clone(), worker_queue);
+                        conversations.insert(update.session_id.clone(), browser_update.unwrap());
+                        queued_prompts.insert(update.session_id.clone(), queue_update.unwrap());
                         revision += 1;
                         conversation_tx.send_replace(conversations.clone());
                         let _ = snapshot_tx.send(viewer_snapshot(
@@ -1320,6 +1353,7 @@ fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPollTarget> {
                 .map(|spec| WorkerPollTarget {
                     session_id: session.id.clone(),
                     spec,
+                    viewed_through: session.last_viewed_event_sequence,
                 })
         })
         .collect()
@@ -1762,6 +1796,7 @@ struct CompletedWorkerPoll {
     phase: WorkerPhase,
     transcript: Option<hel::hel_chat::TranscriptSnapshot>,
     connected: bool,
+    summary: Option<hel::hel_worker::WorkerSessionSummary>,
 }
 
 struct WorkerPollCompletion {
@@ -1872,7 +1907,12 @@ fn spawn_dashboard_worker_poller_with_interval(
                                     payload: WorkerPollPayload::Connected,
                                 });
                             }
-                            if !completed.events.is_empty() || completed.connected {
+                            if let Some(summary) = completed.summary {
+                                let _ = updates_tx.send(WorkerPollUpdate {
+                                    session_id: session_id.clone(),
+                                    payload: WorkerPollPayload::Hydrated(summary),
+                                });
+                            } else if !completed.events.is_empty() || completed.connected {
                                 let _ = updates_tx.send(WorkerPollUpdate {
                                     session_id: session_id.clone(),
                                     payload: WorkerPollPayload::Events {
@@ -1952,48 +1992,86 @@ async fn poll_dashboard_worker(
     worker: Option<WarmWorker>,
 ) -> WorkerPollCompletion {
     let connected = worker.is_none();
-    let result = tokio::time::timeout(WORKER_POLL_TIMEOUT, async {
-        let (worker, events) = match worker {
+    let result = async {
+        let (worker, events, summary) = match worker {
             Some(mut worker) => {
-                let events = worker.client.sync().await?;
+                let events = tokio::time::timeout(WORKER_POLL_TIMEOUT, worker.client.sync())
+                    .await
+                    .context("worker poll timed out")??;
                 worker.chat.apply_events(&events);
                 apply_queued_prompt_events(&mut worker.queued_prompts, &events);
-                (worker, events)
+                (worker, events, None)
             }
             None => {
-                let mut client = WorkerClient::connect(&target.spec, &target.session_id).await?;
-                let bootstrap = client.bootstrap().await?;
-                let events = bootstrap.events.clone();
-                let chat = hel::hel_chat::ChatState::new(&bootstrap.snapshot, &bootstrap.events);
-                (
-                    WarmWorker {
-                        spec: target.spec.clone(),
-                        client,
-                        chat,
-                        queued_prompts: bootstrap.snapshot.queued_prompts.clone(),
-                        opening_events: Vec::new(),
-                    },
-                    events,
+                let mut client = tokio::time::timeout(
+                    WORKER_CONNECT_TIMEOUT,
+                    WorkerClient::connect(&target.spec, &target.session_id),
                 )
+                .await
+                .context("worker connect timed out")??;
+                if client.protocol_version() >= 3 {
+                    let summary = tokio::time::timeout(
+                        WORKER_CONNECT_TIMEOUT,
+                        client.session_summary(target.viewed_through, 10),
+                    )
+                    .await
+                    .context("worker session summary timed out")??;
+                    let chat = hel::hel_chat::ChatState::from_tail(
+                        target.session_id.clone(),
+                        summary.phase,
+                        summary.latest_seq,
+                        summary.transcript_tail.clone(),
+                    );
+                    (
+                        WarmWorker {
+                            spec: target.spec.clone(),
+                            client,
+                            chat,
+                            queued_prompts: summary.queued_prompts.clone(),
+                            opening_events: Vec::new(),
+                            full_history: false,
+                        },
+                        Vec::new(),
+                        Some(summary),
+                    )
+                } else {
+                    let bootstrap = client
+                        .bootstrap_with_timeout(WORKER_REPLAY_PAGE_TIMEOUT)
+                        .await?;
+                    let events = bootstrap.events.clone();
+                    let chat =
+                        hel::hel_chat::ChatState::new(&bootstrap.snapshot, &bootstrap.events);
+                    (
+                        WarmWorker {
+                            spec: target.spec.clone(),
+                            client,
+                            chat,
+                            queued_prompts: bootstrap.snapshot.queued_prompts.clone(),
+                            opening_events: Vec::new(),
+                            full_history: true,
+                        },
+                        events,
+                        None,
+                    )
+                }
             }
         };
         let phase = worker.chat.phase();
-        let transcript =
-            (connected || !events.is_empty()).then(|| worker.chat.transcript_snapshot());
+        let transcript = (summary.is_none() && (connected || !events.is_empty()))
+            .then(|| worker.chat.transcript_snapshot());
         Ok::<_, anyhow::Error>(CompletedWorkerPoll {
             worker,
             events,
             phase,
             transcript,
             connected,
+            summary,
         })
-    })
+    }
     .await;
     let result = match result {
-        Ok(Ok(completed)) => Ok(completed),
-        Ok(Err(error)) => Err(format!("{error:#}")),
-        Err(_) if connected => Err("worker connect timed out".to_string()),
-        Err(_) => Err("worker poll timed out".to_string()),
+        Ok(completed) => Ok(completed),
+        Err(error) => Err(format!("{error:#}")),
     };
     WorkerPollCompletion { target, result }
 }
@@ -2082,7 +2160,19 @@ fn apply_worker_poll_update(
             dashboard.apply_transcript(&update.session_id, transcript);
             dashboard.apply_queued_prompts(&update.session_id, queued_prompts);
         }
+        WorkerPollPayload::Hydrated(summary) => {
+            if let Some(title) = summary.session_title.as_ref()
+                && let Some(session) = controller.state.sessions.get_mut(&update.session_id)
+                && session.acp_session_title.as_deref() != Some(title)
+            {
+                session.acp_session_title = Some(title.clone());
+                controller.state.save()?;
+                dashboard.set_state(controller.state.clone());
+            }
+            dashboard.apply_worker_summary(&update.session_id, summary, current_epoch_seconds());
+        }
         WorkerPollPayload::Unreachable { detail } => {
+            dashboard.mark_transcript_unavailable(&update.session_id);
             let diagnosis = controller.diagnose_worker(&update.session_id);
             let mut message = format!("worker unreachable: {detail}");
             if let Some(diagnosis) = diagnosis {
@@ -2432,8 +2522,22 @@ async fn run_dashboard() -> Result<()> {
                     .observe(hel::hel_recovery::RecoveryObservation {
                         session,
                         config: controller.config.clone(),
-                        events: events.clone(),
+                        latest_completed_turn_seq: hel::hel_recovery::latest_completed_turn_seq(
+                            events,
+                        ),
                         phase: *phase,
+                    })
+                    .await;
+            } else if let WorkerPollPayload::Hydrated(summary) = &update.payload
+                && let Some(sequence) = summary.latest_completed_turn_seq
+                && let Some(session) = controller.state.sessions.get(&session_id).cloned()
+            {
+                recovery_observer
+                    .observe(hel::hel_recovery::RecoveryObservation {
+                        session,
+                        config: controller.config.clone(),
+                        latest_completed_turn_seq: Some(sequence),
+                        phase: summary.phase,
                     })
                     .await;
             }
@@ -3025,60 +3129,87 @@ async fn run_dashboard() -> Result<()> {
                     .context("dashboard worker poller stopped")?;
                 let warm = reply_rx.await.context("dashboard worker poller stopped")?;
                 let result = match warm {
-                    Some(worker) => {
-                        let spec = worker.spec;
-                        if let Err(error) = apply_worker_poll_update(
-                            &mut controller,
-                            &mut dashboard,
-                            WorkerPollUpdate {
-                                session_id: session_id.clone(),
-                                payload: WorkerPollPayload::Connected,
-                            },
-                        ) {
-                            dashboard.set_notice(format!("Could not save worker state: {error:#}"));
-                        }
-                        if !worker.opening_events.is_empty() {
-                            recovery_context
-                                .observe(&worker.opening_events, worker.chat.phase())
-                                .await;
-                            let update = WorkerPollUpdate {
-                                session_id: session_id.clone(),
-                                payload: WorkerPollPayload::Events {
-                                    events: worker.opening_events,
-                                    phase: worker.chat.phase(),
-                                    transcript: worker.chat.transcript_snapshot(),
-                                    queued_prompts: worker.queued_prompts.clone(),
-                                    received_while_detached: true,
+                    Some(mut worker) => {
+                        async {
+                            let spec = worker.spec.clone();
+                            if let Err(error) = apply_worker_poll_update(
+                                &mut controller,
+                                &mut dashboard,
+                                WorkerPollUpdate {
+                                    session_id: session_id.clone(),
+                                    payload: WorkerPollPayload::Connected,
                                 },
-                            };
-                            if let Err(error) =
-                                apply_worker_poll_update(&mut controller, &mut dashboard, update)
-                            {
+                            ) {
                                 dashboard
-                                    .set_notice(format!("Could not save harness title: {error:#}"));
+                                    .set_notice(format!("Could not save worker state: {error:#}"));
                             }
-                        }
-                        hel::hel_chat::run_chat(
-                            &mut terminal.terminal,
-                            worker.client,
-                            Some(worker.chat),
-                            &bundle_id,
-                            Some(recovery_context.clone()),
-                        )
-                        .await
-                        .map(|(exit, client, chat)| {
-                            let queued_prompts = chat.queued_prompt_snapshot();
-                            (
-                                exit,
-                                Some(WarmWorker {
-                                    spec,
-                                    client,
-                                    chat,
-                                    queued_prompts,
-                                    opening_events: Vec::new(),
-                                }),
+                            if !worker.opening_events.is_empty() {
+                                recovery_context
+                                    .observe(&worker.opening_events, worker.chat.phase())
+                                    .await;
+                                let update = WorkerPollUpdate {
+                                    session_id: session_id.clone(),
+                                    payload: WorkerPollPayload::Events {
+                                        events: worker.opening_events,
+                                        phase: worker.chat.phase(),
+                                        transcript: worker.chat.transcript_snapshot(),
+                                        queued_prompts: worker.queued_prompts.clone(),
+                                        received_while_detached: true,
+                                    },
+                                };
+                                if let Err(error) = apply_worker_poll_update(
+                                    &mut controller,
+                                    &mut dashboard,
+                                    update,
+                                ) {
+                                    dashboard.set_notice(format!(
+                                        "Could not save harness title: {error:#}"
+                                    ));
+                                }
+                            }
+                            if !worker.full_history {
+                                dashboard.set_notice(format!(
+                                    "Loading complete conversation for {}…",
+                                    short_id(&session_id)
+                                ));
+                                terminal
+                                    .terminal
+                                    .draw(|frame| render(frame, &mut dashboard))?;
+                                let bootstrap = worker
+                                    .client
+                                    .bootstrap_with_timeout(WORKER_REPLAY_PAGE_TIMEOUT)
+                                    .await?;
+                                worker.chat = hel::hel_chat::ChatState::new(
+                                    &bootstrap.snapshot,
+                                    &bootstrap.events,
+                                );
+                                worker.queued_prompts = bootstrap.snapshot.queued_prompts.clone();
+                                worker.full_history = true;
+                            }
+                            hel::hel_chat::run_chat(
+                                &mut terminal.terminal,
+                                worker.client,
+                                Some(worker.chat),
+                                &bundle_id,
+                                Some(recovery_context.clone()),
                             )
-                        })
+                            .await
+                            .map(|(exit, client, chat)| {
+                                let queued_prompts = chat.queued_prompt_snapshot();
+                                (
+                                    exit,
+                                    Some(WarmWorker {
+                                        spec,
+                                        client,
+                                        chat,
+                                        queued_prompts,
+                                        opening_events: Vec::new(),
+                                        full_history: true,
+                                    }),
+                                )
+                            })
+                        }
+                        .await
                     }
                     None => {
                         async {
@@ -3101,6 +3232,7 @@ async fn run_dashboard() -> Result<()> {
                                     chat,
                                     queued_prompts,
                                     opening_events: Vec::new(),
+                                    full_history: true,
                                 }),
                             ))
                         }
@@ -4098,10 +4230,12 @@ mod tests {
             WorkerPollTarget {
                 session_id: "a-slow".into(),
                 spec: CommandSpec::new("sh", ["-c", "sleep 5"]),
+                viewed_through: 0,
             },
             WorkerPollTarget {
                 session_id: "b-fast".into(),
                 spec: CommandSpec::new("false", std::iter::empty::<&str>()),
+                viewed_through: 0,
             },
         ]);
         tokio::time::sleep(Duration::from_millis(50)).await;

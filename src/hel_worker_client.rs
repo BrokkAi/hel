@@ -13,7 +13,7 @@ use crate::hel_targets::CommandSpec;
 use crate::hel_worker::{
     Attachment, MAX_FRAME_BYTES, PROTOCOL_VERSION, ProtocolError, ProtocolErrorDetail,
     RequestEnvelope, ResponseBody, ResponseEnvelope, ResponsePayload, SequencedEvent, VersionRange,
-    WorkerRequest, WorkerSnapshot, WorkerStatus,
+    WorkerRequest, WorkerSessionSummary, WorkerSnapshot, WorkerStatus,
 };
 
 /// A live stdio connection to `hel worker proxy` on a session target.
@@ -138,17 +138,44 @@ impl WorkerClient {
 
     /// Fetch a coherent snapshot and the complete canonical transcript.
     pub async fn bootstrap(&mut self) -> Result<WorkerBootstrap> {
-        let snapshot = self.snapshot().await?;
-        let mut events = self.replay_after(0).await?;
-        // Replay pages by byte budget; keep paging from the last observed
-        // sequence until a page comes back empty.
+        self.bootstrap_with_page_timeout(None).await
+    }
+
+    pub async fn bootstrap_with_timeout(
+        &mut self,
+        page_timeout: std::time::Duration,
+    ) -> Result<WorkerBootstrap> {
+        self.bootstrap_with_page_timeout(Some(page_timeout)).await
+    }
+
+    async fn bootstrap_with_page_timeout(
+        &mut self,
+        page_timeout: Option<std::time::Duration>,
+    ) -> Result<WorkerBootstrap> {
+        let snapshot = match page_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, self.snapshot())
+                .await
+                .context("worker snapshot timed out")??,
+            None => self.snapshot().await?,
+        };
+        let mut events = Vec::new();
+        let mut cursor = 0;
         loop {
-            let page = self.replay_after(self.latest_seq).await?;
+            let replay = self.replay_page(cursor);
+            let (page, through) = match page_timeout {
+                Some(timeout) => tokio::time::timeout(timeout, replay)
+                    .await
+                    .context("worker replay page timed out")??,
+                None => replay.await?,
+            };
             if page.is_empty() {
+                cursor = through;
                 break;
             }
             events.extend(page);
+            cursor = through;
         }
+        self.latest_seq = cursor;
         Ok(WorkerBootstrap { snapshot, events })
     }
 
@@ -167,25 +194,53 @@ impl WorkerClient {
     }
 
     pub async fn replay_after(&mut self, after_seq: u64) -> Result<Vec<SequencedEvent>> {
+        let (events, latest_seq) = self.replay_page(after_seq).await?;
+        self.latest_seq = latest_seq;
+        Ok(events)
+    }
+
+    async fn replay_page(&mut self, after_seq: u64) -> Result<(Vec<SequencedEvent>, u64)> {
         match self.call(WorkerRequest::Subscribe { after_seq }).await? {
-            ResponsePayload::Replay { events, latest_seq } => {
-                self.latest_seq = self.latest_seq.max(latest_seq);
-                Ok(events)
-            }
+            ResponsePayload::Replay { events, latest_seq } => Ok((events, latest_seq)),
             _ => bail!("worker returned an unexpected replay response"),
+        }
+    }
+
+    pub async fn session_summary(
+        &mut self,
+        viewed_through: u64,
+        transcript_entry_limit: u16,
+    ) -> Result<WorkerSessionSummary> {
+        self.require_protocol("bounded session summaries", 3)?;
+        match self
+            .call(WorkerRequest::SessionSummary {
+                viewed_through,
+                transcript_entry_limit,
+            })
+            .await?
+        {
+            ResponsePayload::SessionSummary(summary) => {
+                self.latest_seq = summary.latest_seq;
+                Ok(summary)
+            }
+            _ => bail!("worker returned an unexpected session summary response"),
         }
     }
 
     /// Poll for events emitted after the most recently observed sequence.
     pub async fn sync(&mut self) -> Result<Vec<SequencedEvent>> {
-        let mut events = self.replay_after(self.latest_seq).await?;
+        let mut cursor = self.latest_seq;
+        let (mut events, through) = self.replay_page(cursor).await?;
+        cursor = through;
         while !events.is_empty() {
-            let page = self.replay_after(self.latest_seq).await?;
+            let (page, through) = self.replay_page(cursor).await?;
+            cursor = through;
             if page.is_empty() {
                 break;
             }
             events.extend(page);
         }
+        self.latest_seq = cursor;
         Ok(events)
     }
 

@@ -19,6 +19,8 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Serialized bytes of events allowed in one replay response, well under
 /// `MAX_FRAME_BYTES` to leave room for the envelope.
 pub const REPLAY_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+pub const TRANSCRIPT_TAIL_BYTE_BUDGET: usize = 512 * 1024;
+pub const MAX_TRANSCRIPT_TAIL_ENTRIES: u16 = 16;
 const NATIVE_SESSION_IDENTITY_VERSION: u32 = 1;
 const NATIVE_SESSION_IDENTITY_FILE: &str = "native-session.json";
 
@@ -26,7 +28,7 @@ const NATIVE_SESSION_IDENTITY_FILE: &str = "native-session.json";
 /// sequence the client is current through: the last included event's seq, or
 /// `latest_seq` when nothing had to be trimmed (also when the replay is empty).
 fn page_events(
-    events: Vec<SequencedEvent>,
+    events: &[SequencedEvent],
     after_seq: u64,
     latest_seq: u64,
 ) -> (Vec<SequencedEvent>, u64) {
@@ -41,7 +43,7 @@ fn page_events(
             return (included, through);
         }
         used = used.saturating_add(size);
-        included.push(event);
+        included.push(event.clone());
     }
     (included, latest_seq)
 }
@@ -83,6 +85,10 @@ pub enum WorkerRequest {
     Snapshot,
     Subscribe {
         after_seq: u64,
+    },
+    SessionSummary {
+        viewed_through: u64,
+        transcript_entry_limit: u16,
     },
     Prompt {
         text: String,
@@ -134,6 +140,7 @@ impl WorkerRequest {
             Self::Status => "status",
             Self::Snapshot => "snapshot",
             Self::Subscribe { .. } => "subscribe",
+            Self::SessionSummary { .. } => "session_summary",
             Self::Prompt { .. } => "prompt",
             Self::EnqueuePrompt { .. } => "enqueue_prompt",
             Self::RemoveQueuedPrompt { .. } => "remove_queued_prompt",
@@ -153,7 +160,8 @@ impl WorkerRequest {
     const fn minimum_protocol(&self) -> u32 {
         match self {
             Self::CheckpointWhenQuiescent { .. } => 2,
-            Self::EnqueuePrompt { .. }
+            Self::SessionSummary { .. }
+            | Self::EnqueuePrompt { .. }
             | Self::RemoveQueuedPrompt { .. }
             | Self::ClearQueuedPrompts => 3,
             _ => 1,
@@ -215,6 +223,7 @@ pub enum ResponsePayload {
         events: Vec<SequencedEvent>,
         latest_seq: u64,
     },
+    SessionSummary(WorkerSessionSummary),
     Accepted {
         seq: u64,
     },
@@ -275,6 +284,22 @@ pub struct WorkerStatus {
     pub phase: WorkerPhase,
     pub latest_seq: u64,
     pub last_checkpoint_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerSessionSummary {
+    pub phase: WorkerPhase,
+    pub latest_seq: u64,
+    pub latest_completed_turn_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
+    pub session_title: Option<String>,
+    pub unread_agent_messages: u64,
+    pub agent_text_stream_open: bool,
+    pub last_agent_message_id: Option<String>,
+    pub transcript_tail: Vec<crate::hel_chat::ChatEntry>,
+    #[serde(default)]
+    pub queued_prompts: Vec<QueuedPrompt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,6 +396,20 @@ impl WorkerSnapshot {
             last_checkpoint_seq: self.last_checkpoint_seq,
         }
     }
+
+    pub(crate) fn summary(session_id: String, phase: WorkerPhase, latest_seq: u64) -> Self {
+        Self {
+            session_id,
+            phase,
+            latest_seq,
+            last_checkpoint_seq: None,
+            active_prompt: None,
+            config: BTreeMap::new(),
+            queued_prompts: Vec::new(),
+            handled_requests: BTreeMap::new(),
+            dispatches: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,6 +488,8 @@ pub struct DurableWorker {
     worker_version: String,
     snapshot: WorkerSnapshot,
     events: Vec<SequencedEvent>,
+    transcript: crate::hel_chat::ChatState,
+    agent_message_start_sequences: Vec<u64>,
     native_session_id: Option<String>,
 }
 
@@ -493,11 +534,16 @@ impl DurableWorker {
         }
 
         let native_session_id = read_native_session_identity(&root)?;
+        let mut transcript = crate::hel_chat::ChatState::new(&snapshot, &events);
+        let agent_message_start_sequences = transcript.agent_message_start_sequences();
+        transcript.retain_transcript_tail(usize::from(MAX_TRANSCRIPT_TAIL_ENTRIES));
         let mut worker = Self {
             root,
             worker_version: worker_version.into(),
             snapshot,
             events,
+            transcript,
+            agent_message_start_sequences,
             native_session_id,
         };
         if !snapshot_path.exists() || snapshot_seq < logged_seq {
@@ -543,6 +589,21 @@ impl DurableWorker {
             .filter(|event| event.seq > after_seq)
             .cloned()
             .collect())
+    }
+
+    fn event_page_after(&self, after_seq: u64) -> Result<(Vec<SequencedEvent>, u64)> {
+        if after_seq > self.snapshot.latest_seq {
+            bail!(
+                "requested sequence {after_seq} is newer than {}",
+                self.snapshot.latest_seq
+            );
+        }
+        let start = self.events.partition_point(|event| event.seq <= after_seq);
+        Ok(page_events(
+            &self.events[start..],
+            after_seq,
+            self.snapshot.latest_seq,
+        ))
     }
 
     /// Record an event produced by the ACP adapter. This uses the same durable
@@ -749,16 +810,8 @@ impl DurableWorker {
             WorkerRequest::Hello { .. } => unreachable!(),
             WorkerRequest::Status => ResponsePayload::Status(self.snapshot.status()),
             WorkerRequest::Snapshot => ResponsePayload::Snapshot(self.snapshot.clone()),
-            WorkerRequest::Subscribe { after_seq } => match self.events_after(*after_seq) {
-                Ok(events) => {
-                    // A full transcript can exceed the protocol frame cap, so
-                    // replay pages by byte budget. latest_seq reports the last
-                    // sequence actually included; clients page until a replay
-                    // comes back empty.
-                    let (events, latest_seq) =
-                        page_events(events, *after_seq, self.snapshot.latest_seq);
-                    ResponsePayload::Replay { events, latest_seq }
-                }
+            WorkerRequest::Subscribe { after_seq } => match self.event_page_after(*after_seq) {
+                Ok((events, latest_seq)) => ResponsePayload::Replay { events, latest_seq },
                 Err(error) => {
                     return Ok(super_error(
                         ErrorCode::SequenceOutOfRange,
@@ -767,6 +820,48 @@ impl DurableWorker {
                     ));
                 }
             },
+            WorkerRequest::SessionSummary {
+                viewed_through,
+                transcript_entry_limit,
+            } => {
+                if *transcript_entry_limit == 0
+                    || *transcript_entry_limit > MAX_TRANSCRIPT_TAIL_ENTRIES
+                {
+                    return Ok(error(
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "transcript_entry_limit must be between 1 and {MAX_TRANSCRIPT_TAIL_ENTRIES}"
+                        ),
+                        false,
+                    ));
+                }
+                let transcript_tail = self.transcript.bounded_entries(
+                    usize::from(*transcript_entry_limit),
+                    TRANSCRIPT_TAIL_BYTE_BUDGET,
+                );
+                let trailing_agent_message = self.transcript.trailing_agent_message_id();
+                ResponsePayload::SessionSummary(WorkerSessionSummary {
+                    phase: self.snapshot.phase,
+                    latest_seq: self.snapshot.latest_seq,
+                    latest_completed_turn_seq: crate::hel_recovery::latest_completed_turn_seq(
+                        &self.events,
+                    ),
+                    native_session_id: self.native_session_id.clone(),
+                    session_title: crate::hel_state::harness_session_title(&self.events),
+                    unread_agent_messages: u64::try_from(
+                        self.agent_message_start_sequences.len().saturating_sub(
+                            self.agent_message_start_sequences
+                                .partition_point(|sequence| *sequence <= *viewed_through),
+                        ),
+                    )
+                    .unwrap_or(u64::MAX),
+                    agent_text_stream_open: self.snapshot.phase == WorkerPhase::Running
+                        && trailing_agent_message.is_some(),
+                    last_agent_message_id: trailing_agent_message.flatten(),
+                    transcript_tail,
+                    queued_prompts: self.snapshot.queued_prompts.clone(),
+                })
+            }
             WorkerRequest::Prompt { text, attachments } => {
                 if self.snapshot.phase != WorkerPhase::Idle {
                     return Ok(error(
@@ -1005,6 +1100,16 @@ impl DurableWorker {
         file.sync_data()?;
 
         apply_event(&mut self.snapshot, &event)?;
+        let previous_agent_message = self.transcript.latest_agent_message_start_sequence();
+        self.transcript.apply_events(std::slice::from_ref(&event));
+        let latest_agent_message = self.transcript.latest_agent_message_start_sequence();
+        if latest_agent_message != previous_agent_message
+            && let Some(sequence) = latest_agent_message
+        {
+            self.agent_message_start_sequences.push(sequence);
+        }
+        self.transcript
+            .retain_transcript_tail(usize::from(MAX_TRANSCRIPT_TAIL_ENTRIES));
         self.events.push(event);
         self.persist_snapshot()?;
         Ok(seq)
@@ -1483,6 +1588,155 @@ mod tests {
         *seq
     }
 
+    fn session_summary(response: ResponseEnvelope) -> WorkerSessionSummary {
+        let ResponseBody::Ok {
+            payload: ResponsePayload::SessionSummary(summary),
+        } = response.body
+        else {
+            panic!("expected session summary response")
+        };
+        summary
+    }
+
+    fn agent_message_payload(text: &str) -> Value {
+        serde_json::to_value(crate::hel_acp::RuntimeEvent::SessionUpdate {
+            update: serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "answer",
+                "content": {"type": "text", "text": text}
+            }),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn session_summary_hydrates_without_waiting_for_a_new_event_and_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        worker
+            .record_native_session_started(
+                "session_started",
+                serde_json::json!({
+                    "type": "session_started",
+                    "native_session_id": "native-session",
+                    "resumed": false
+                }),
+                "native-session",
+            )
+            .unwrap();
+        accepted(&worker.handle(request(
+            "prompt",
+            WorkerRequest::Prompt {
+                text: "work".into(),
+                attachments: Vec::new(),
+            },
+        )));
+        worker
+            .record_adapter_event(
+                "session_update",
+                agent_message_payload(&"x".repeat(1024 * 1024)),
+            )
+            .unwrap();
+        let running_summary = session_summary(worker.handle(request(
+            "running-summary",
+            WorkerRequest::SessionSummary {
+                viewed_through: 0,
+                transcript_entry_limit: 10,
+            },
+        )));
+        assert!(running_summary.agent_text_stream_open);
+        assert_eq!(
+            running_summary.last_agent_message_id.as_deref(),
+            Some("answer")
+        );
+        assert_eq!(
+            running_summary.native_session_id.as_deref(),
+            Some("native-session")
+        );
+        worker.record_turn_completed().unwrap();
+
+        let response = worker.handle(request(
+            "summary",
+            WorkerRequest::SessionSummary {
+                viewed_through: 0,
+                transcript_entry_limit: 10,
+            },
+        ));
+        assert!(serde_json::to_vec(&response).unwrap().len() < TRANSCRIPT_TAIL_BYTE_BUDGET);
+        let summary = session_summary(response);
+        assert_eq!(summary.latest_seq, 4);
+        assert_eq!(summary.latest_completed_turn_seq, Some(4));
+        assert_eq!(summary.unread_agent_messages, 1);
+        assert!(!summary.agent_text_stream_open);
+        assert!(!summary.transcript_tail.is_empty());
+
+        drop(worker);
+        let mut reopened = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let summary = session_summary(reopened.handle(request(
+            "summary-after-restart",
+            WorkerRequest::SessionSummary {
+                viewed_through: 0,
+                transcript_entry_limit: 10,
+            },
+        )));
+        assert_eq!(summary.latest_seq, 4);
+        assert_eq!(summary.native_session_id.as_deref(), Some("native-session"));
+        assert_eq!(summary.unread_agent_messages, 1);
+        assert!(!summary.transcript_tail.is_empty());
+    }
+
+    #[test]
+    fn legacy_session_summary_without_native_identity_remains_compatible() {
+        let summary: WorkerSessionSummary = serde_json::from_value(serde_json::json!({
+            "phase": "idle",
+            "latest_seq": 0,
+            "latest_completed_turn_seq": null,
+            "session_title": null,
+            "unread_agent_messages": 0,
+            "agent_text_stream_open": false,
+            "last_agent_message_id": null,
+            "transcript_tail": [],
+            "queued_prompts": []
+        }))
+        .unwrap();
+
+        assert_eq!(summary.native_session_id, None);
+    }
+
+    #[test]
+    fn protocol_v2_rejects_session_summary_without_affecting_legacy_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let summary = worker.handle(RequestEnvelope {
+            request_id: "summary-v2".into(),
+            protocol_version: 2,
+            request: WorkerRequest::SessionSummary {
+                viewed_through: 0,
+                transcript_entry_limit: 10,
+            },
+        });
+        assert!(matches!(
+            summary.body,
+            ResponseBody::Error {
+                error: ProtocolError {
+                    code: ErrorCode::IncompatibleProtocol,
+                    ..
+                }
+            }
+        ));
+        let replay = worker.handle(RequestEnvelope {
+            request_id: "replay-v2".into(),
+            protocol_version: 2,
+            request: WorkerRequest::Subscribe { after_seq: 0 },
+        });
+        assert!(matches!(
+            replay.body,
+            ResponseBody::Ok {
+                payload: ResponsePayload::Replay { .. }
+            }
+        ));
+    }
+
     #[test]
     fn replay_pages_stop_at_byte_budget_and_report_included_seq() {
         let big_text = "x".repeat(REPLAY_BYTE_BUDGET / 3);
@@ -1498,13 +1752,13 @@ mod tests {
                 },
             })
             .collect();
-        let (page, through) = page_events(events.clone(), 0, 3);
+        let (page, through) = page_events(&events, 0, 3);
         assert_eq!(page.len(), 2, "two half-budget events fill the page");
         assert_eq!(through, 2, "reports the last included sequence");
-        let (rest, through) = page_events(events[2..].to_vec(), 2, 3);
+        let (rest, through) = page_events(&events[2..], 2, 3);
         assert_eq!(rest.len(), 1);
         assert_eq!(through, 3, "an untrimmed page reports the global latest");
-        let (empty, through) = page_events(Vec::new(), 3, 3);
+        let (empty, through) = page_events(&[], 3, 3);
         assert!(empty.is_empty());
         assert_eq!(through, 3);
     }

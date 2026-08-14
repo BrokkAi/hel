@@ -18,8 +18,16 @@ pub const AUTO_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub struct RecoveryObservation {
     pub session: SessionRecord,
     pub config: HelConfig,
-    pub events: Vec<SequencedEvent>,
+    pub latest_completed_turn_seq: Option<u64>,
     pub phase: WorkerPhase,
+}
+
+pub fn latest_completed_turn_seq(events: &[SequencedEvent]) -> Option<u64> {
+    events
+        .iter()
+        .rev()
+        .find(|event| matches!(event.event, WorkerEvent::TurnCompleted))
+        .map(|event| event.seq)
 }
 
 struct RecoveryRequest {
@@ -54,7 +62,7 @@ impl RecoveryContext {
             .observe(RecoveryObservation {
                 session: self.session.clone(),
                 config: self.config.clone(),
-                events: events.to_vec(),
+                latest_completed_turn_seq: latest_completed_turn_seq(events),
                 phase,
             })
             .await;
@@ -116,7 +124,7 @@ impl RecoveryCoordinator {
                         let session_id = observation.session.id.clone();
                         let policy = policies.entry(session_id.clone()).or_default();
                         policy.observe_checkpoint(observation.session.checkpoint.as_ref());
-                        policy.observe_events(&observation.events);
+                        policy.observe_completed_turn(observation.latest_completed_turn_seq);
                         if !busy.contains(&session_id)
                             && policy.due(observation.phase, Utc::now())
                             && let Some(expected_target) = observation.session.target.clone()
@@ -198,13 +206,8 @@ struct PolicyState {
 }
 
 impl PolicyState {
-    fn observe_events(&mut self, events: &[SequencedEvent]) {
-        if let Some(sequence) = events
-            .iter()
-            .filter(|event| matches!(event.event, WorkerEvent::TurnCompleted))
-            .map(|event| event.seq)
-            .max()
-        {
+    fn observe_completed_turn(&mut self, sequence: Option<u64>) {
+        if let Some(sequence) = sequence {
             self.latest_completed_turn = self.latest_completed_turn.max(sequence);
         }
     }
@@ -254,7 +257,7 @@ mod tests {
     #[test]
     fn first_completed_idle_turn_is_due() {
         let mut policy = PolicyState::default();
-        policy.observe_events(&[completed(3)]);
+        policy.observe_completed_turn(latest_completed_turn_seq(&[completed(3)]));
         assert!(policy.due(WorkerPhase::Idle, Utc::now()));
         assert!(!policy.due(WorkerPhase::Running, Utc::now()));
     }

@@ -25,7 +25,7 @@ use crate::hel_targets::{
     AdditionalMount, DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage,
     SessionResourceUsage, default_mount_destination, path_completion,
 };
-use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase};
+use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSessionSummary};
 
 const FORCE_CONFIRMATION: &str = "DESTROY";
 const BASELINE_CPUS: u64 = 8;
@@ -576,9 +576,20 @@ struct SessionDetail {
     last_agent_message_id: Option<String>,
     last_agent_message: Option<String>,
     unread_agent_message_sequences: Vec<u64>,
+    summarized_unread_agent_messages: usize,
+    summarized_unread_through: u64,
     resource_usage: Option<SessionResourceUsage>,
     transcript: Option<TranscriptSnapshot>,
+    transcript_hydration: TranscriptHydration,
     queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum TranscriptHydration {
+    #[default]
+    Loading,
+    Ready,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -641,6 +652,12 @@ impl DashboardState {
             notice: None,
             greeting: "Welcome to Hel".into(),
         };
+        dashboard.session_details = dashboard
+            .state
+            .sessions
+            .keys()
+            .map(|id| (id.clone(), SessionDetail::default()))
+            .collect();
         dashboard.clamp_selections();
         dashboard
     }
@@ -657,6 +674,11 @@ impl DashboardState {
 
     pub fn set_state(&mut self, state: HelState) {
         self.state = state;
+        self.session_details
+            .retain(|session_id, _| self.state.sessions.contains_key(session_id));
+        for session_id in self.state.sessions.keys() {
+            self.session_details.entry(session_id.clone()).or_default();
+        }
         self.apply_operation_projection();
         for (session_id, detail) in &mut self.session_details {
             let viewed_through = self
@@ -667,6 +689,9 @@ impl DashboardState {
             detail
                 .unread_agent_message_sequences
                 .retain(|seq| *seq > viewed_through);
+            if viewed_through >= detail.summarized_unread_through {
+                detail.summarized_unread_agent_messages = 0;
+            }
         }
         self.clamp_selections();
     }
@@ -952,10 +977,43 @@ impl DashboardState {
     }
 
     pub fn apply_transcript(&mut self, session_id: &str, transcript: TranscriptSnapshot) {
+        let detail = self
+            .session_details
+            .entry(session_id.to_string())
+            .or_default();
+        detail.transcript = Some(transcript);
+        detail.transcript_hydration = TranscriptHydration::Ready;
+    }
+
+    pub fn apply_worker_summary(
+        &mut self,
+        session_id: &str,
+        summary: WorkerSessionSummary,
+        observed_at_epoch_seconds: u64,
+    ) {
+        let detail = self
+            .session_details
+            .entry(session_id.to_string())
+            .or_default();
+        detail.last_event_sequence = summary.latest_seq;
+        detail.last_activity_at = (summary.latest_seq > 0).then_some(observed_at_epoch_seconds);
+        detail.current_turn_started_at =
+            (summary.phase == WorkerPhase::Running).then_some(observed_at_epoch_seconds);
+        detail.summarized_unread_agent_messages =
+            usize::try_from(summary.unread_agent_messages).unwrap_or(usize::MAX);
+        detail.summarized_unread_through = summary.latest_seq;
+        detail.agent_text_stream_open = summary.agent_text_stream_open;
+        detail.last_agent_message_id = summary.last_agent_message_id;
+        detail.transcript = Some(TranscriptSnapshot::from_entries(summary.transcript_tail));
+        detail.queued_prompts = summary.queued_prompts;
+        detail.transcript_hydration = TranscriptHydration::Ready;
+    }
+
+    pub fn mark_transcript_unavailable(&mut self, session_id: &str) {
         self.session_details
             .entry(session_id.to_string())
             .or_default()
-            .transcript = Some(transcript);
+            .transcript_hydration = TranscriptHydration::Unavailable;
     }
 
     pub fn apply_queued_prompts(
@@ -4706,14 +4764,29 @@ fn active_transcript_tail(
     scroll: usize,
 ) -> (Vec<Line<'static>>, usize) {
     let Some(detail) = detail else {
-        return (Vec::new(), 0);
+        return (
+            vec![Line::styled(
+                "Loading conversation…",
+                Style::default().fg(Color::DarkGray),
+            )],
+            0,
+        );
     };
     match detail.transcript.as_mut() {
         Some(transcript) => transcript.rich_tail_scrolled(width, maximum_lines, scroll),
-        // Sessions without a projected transcript only ever show the newest
-        // message, so there is no history to scroll through.
-        None => (
+        None if detail.last_agent_message.is_some() => (
             active_message_tail(Some(detail), usize::from(width), maximum_lines),
+            0,
+        ),
+        None => (
+            vec![Line::styled(
+                match detail.transcript_hydration {
+                    TranscriptHydration::Loading => "Loading conversation…",
+                    TranscriptHydration::Unavailable => "Conversation unavailable",
+                    TranscriptHydration::Ready => "No messages yet",
+                },
+                Style::default().fg(Color::DarkGray),
+            )],
             0,
         ),
     }
@@ -4735,7 +4808,11 @@ fn active_session_row(
 ) -> Row<'static> {
     let (clock, profile, target, project, session_name) =
         session_values(session, detail, operation, now_epoch_seconds, config);
-    let unread_count = detail.map_or(0, |detail| detail.unread_agent_message_sequences.len());
+    let unread_count = detail.map_or(0, |detail| {
+        detail
+            .summarized_unread_agent_messages
+            .saturating_add(detail.unread_agent_message_sequences.len())
+    });
     Row::new([
         summary_rule_cell(Line::raw(project), layout.rule_width),
         summary_rule_cell(unread_line(unread_count), layout.rule_width),
@@ -6942,6 +7019,91 @@ mod tests {
                 .unread_agent_message_sequences
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn hydrated_open_message_continuation_does_not_duplicate_unread_count() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.focus = Focus::Quotas;
+        let first_chunk = SequencedEvent {
+            seq: 1,
+            recorded_at_ms: None,
+            request_id: None,
+            event: WorkerEvent::Adapter {
+                kind: "session_update".into(),
+                payload: serde_json::json!({
+                    "type": "session_update",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "answer-1",
+                        "content": { "type": "text", "text": "first " }
+                    }
+                }),
+            },
+        };
+        let snapshot: WorkerSnapshot = serde_json::from_value(serde_json::json!({
+            "session_id": "session-1",
+            "phase": "running",
+            "latest_seq": 1,
+            "last_checkpoint_seq": null,
+            "active_prompt": null,
+            "config": {},
+            "handled_requests": {}
+        }))
+        .unwrap();
+        let transcript_tail = crate::hel_chat::ChatState::new(&snapshot, &[first_chunk])
+            .bounded_entries(10, 512 * 1024);
+        dashboard.apply_worker_summary(
+            "session-1",
+            WorkerSessionSummary {
+                phase: WorkerPhase::Running,
+                latest_seq: 1,
+                latest_completed_turn_seq: None,
+                native_session_id: None,
+                session_title: None,
+                unread_agent_messages: 1,
+                agent_text_stream_open: true,
+                last_agent_message_id: Some("answer-1".into()),
+                transcript_tail,
+                queued_prompts: vec![crate::hel_worker::QueuedPrompt {
+                    id: "queued-1".into(),
+                    text: "next task".into(),
+                    attachments: vec![],
+                    created_at_ms: 0,
+                }],
+            },
+            100,
+        );
+
+        dashboard.apply_worker_events(
+            "session-1",
+            &[SequencedEvent {
+                seq: 2,
+                recorded_at_ms: None,
+                request_id: None,
+                event: WorkerEvent::Adapter {
+                    kind: "session_update".into(),
+                    payload: serde_json::json!({
+                        "type": "session_update",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": "answer-1",
+                            "content": { "type": "text", "text": "continuation" }
+                        }
+                    }),
+                },
+            }],
+            101,
+            false,
+        );
+
+        let detail = &dashboard.session_details["session-1"];
+        assert_eq!(detail.summarized_unread_agent_messages, 1);
+        assert!(detail.unread_agent_message_sequences.is_empty());
+        assert_eq!(detail.last_agent_message.as_deref(), Some("continuation"));
+        assert_eq!(detail.queued_prompts[0].text, "next task");
     }
 
     #[test]

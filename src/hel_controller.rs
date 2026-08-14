@@ -1761,10 +1761,26 @@ impl Controller {
         let expected_sequence = client
             .checkpoint(Some("controller archive checkpoint".into()))
             .await?;
-        let bootstrap = client.bootstrap().await?;
-        let native_session_id = native_session_id_from_events(&bootstrap.events)
-            .or_else(|| session.native_session_id.clone())
-            .context("harness did not report its native session ID")?;
+        let native_session_id = if let Some(native_session_id) = session.native_session_id.clone() {
+            native_session_id
+        } else {
+            let summary_identity = if client.protocol_version() >= 3 {
+                client
+                    .session_summary(expected_sequence, 1)
+                    .await?
+                    .native_session_id
+            } else {
+                None
+            };
+            match summary_identity {
+                Some(native_session_id) => native_session_id,
+                None => {
+                    let bootstrap = client.bootstrap().await?;
+                    native_session_id_from_events(&bootstrap.events)
+                        .context("harness did not report its native session ID")?
+                }
+            }
+        };
         client.detach().await?;
 
         let worker_root = hel_targets::worker_root(&backend, session_id)?;
