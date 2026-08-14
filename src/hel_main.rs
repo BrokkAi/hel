@@ -3490,7 +3490,7 @@ async fn run_dashboard() -> Result<()> {
                         let mut controller = Controller::load()?;
                         let executor = CancellableProcessExecutor::new(cancelled);
                         controller.force_destroy(&operation_session_id, &executor)?;
-                        delete_archived_session(&mut controller, &operation_session_id)
+                        controller.delete_session_controlled(&operation_session_id, &executor)
                     })()
                     .map(|()| LifecycleSuccess::DeletedActive)
                     .map_err(|error| format!("{error:#}"));
@@ -3522,7 +3522,8 @@ async fn run_dashboard() -> Result<()> {
                         if cancelled.load(Ordering::Acquire) {
                             bail!("operation cancelled");
                         }
-                        delete_archived_session(&mut controller, &operation_session_id)
+                        let executor = CancellableProcessExecutor::new(cancelled);
+                        controller.delete_session_controlled(&operation_session_id, &executor)
                     })()
                     .map(|()| LifecycleSuccess::DeletedArchived)
                     .map_err(|error| format!("{error:#}"));
@@ -3555,33 +3556,6 @@ async fn run_dashboard() -> Result<()> {
         println!(
             "Active sessions will continue working; Hel will reattach to them on your next invocation."
         );
-    }
-    Ok(())
-}
-
-fn delete_archived_session(controller: &mut Controller, session_id: &str) -> Result<()> {
-    let session = controller.state.remove_archived_session(session_id)?;
-    let archive_path = session
-        .checkpoint
-        .as_ref()
-        .map(|checkpoint| checkpoint.archive_path.clone());
-    if let Err(error) = hel::hel_database::delete_session(session_id) {
-        controller
-            .state
-            .sessions
-            .insert(session.id.clone(), session);
-        return Err(error).context("delete paused session from state");
-    }
-    if let Some(archive_path) = &archive_path
-        && let Err(error) = std::fs::remove_file(archive_path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(error).with_context(|| {
-            format!(
-                "session was deleted, but its recovery archive could not be removed: {}",
-                archive_path.display()
-            )
-        });
     }
     Ok(())
 }

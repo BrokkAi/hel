@@ -4675,6 +4675,9 @@ fn session_updated_at_epoch_seconds(session: &SessionRecord) -> Option<u64> {
 }
 
 fn session_project(config: &HelConfig, session: &SessionRecord) -> String {
+    if let Some(worktree) = &session.managed_worktree {
+        return path_leaf(&worktree.source_repository);
+    }
     if let Some(project_directory) = &session.project_directory {
         return path_leaf(project_directory);
     }
@@ -5955,6 +5958,7 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
                 Line::raw("Hel will permanently delete the recovery archive and session record."),
+                Line::raw("Any Hel-managed worktree and generated branch will also be deleted."),
                 Line::raw("Press y/Enter to delete, or n/Esc to cancel."),
             ],
         ),
@@ -5976,6 +5980,7 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
+                Line::raw("The Hel-managed worktree and generated branch will be deleted."),
                 Line::raw(format!("Type {FORCE_CONFIRMATION}, then press Enter:")),
                 Line::styled(typed.clone(), Style::default().fg(Color::Red)),
             ],
@@ -6398,6 +6403,7 @@ mod tests {
             last_profile: "codex-1".into(),
             bundle_id: "hel".into(),
             project_directory: None,
+            managed_worktree: None,
             target_template_id: "podman".into(),
             resource_allocation: None,
             additional_mounts: vec![],
@@ -9418,6 +9424,18 @@ mod tests {
 
         session.project_directory = Some(PathBuf::from("/home/user/Projects/raw-project"));
         assert_eq!(session_project(&config, &session), "raw-project");
+
+        session.project_directory = Some(PathBuf::from(
+            "/home/user/Projects/source/.hel/worktrees/session-1",
+        ));
+        session.managed_worktree = Some(crate::hel_state::ManagedWorktree {
+            source_project_directory: PathBuf::from("/home/user/Projects/source"),
+            source_repository: PathBuf::from("/home/user/Projects/source"),
+            worktree_root: PathBuf::from("/home/user/Projects/source/.hel/worktrees/session-1"),
+            branch: "hel/session-1".into(),
+            target: crate::hel_state::ManagedWorktreeTarget::Local,
+        });
+        assert_eq!(session_project(&config, &session), "source");
     }
 
     #[test]

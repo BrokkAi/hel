@@ -150,9 +150,9 @@ image = "ghcr.io/your-org/agent-dev:latest"
 cpus = "8"
 memory = "32g"
 
-# Run directly in a selected existing local Git worktree. Hel uses each
-# profile's configured home in place and does not copy credentials or Git
-# configuration. Closing removes only Hel's per-session worker data.
+# Run in an isolated local Git worktree. Selecting a primary checkout creates
+# .hel/worktrees/<session-id>; selecting an existing linked worktree uses it in
+# place. Hel uses each profile's configured home and does not copy credentials.
 [targets.raw-localhost]
 kind = "local-bare"
 
@@ -250,17 +250,21 @@ archives. Existing live containers are not mutated, while archived sessions
 receive current GitHub authentication when they provision a fresh target on
 resume.
 
-`local-bare` is intentionally different: it runs the ACP bridge in the chosen
-local Git worktree and points `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, or
+`local-bare` is intentionally different: it runs the ACP bridge in a local Git
+worktree and points `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, or
 `KIMI_CODE_HOME` at the configured profile home directly. Hel does not force an
 unrestricted mode or auto-approve ACP permission requests there. Kimi's normal
 `auto` mode is its no-confirmation mode, so the dashboard displays a prominent
 warning before using Kimi on raw localhost.
 
 Raw-project checkpoints preserve Hel's event stream and native harness state,
-but they do not back up the selected worktree. Resuming requires the same
-project path with a valid Git `HEAD`; Hel leaves that project untouched when
-closing the session.
+but they do not back up the selected worktree. When the selected path belongs
+to a primary checkout, Hel requires it to be clean and creates
+`<repository>/.hel/worktrees/<session-id>` on `hel/<session-id>`. That branch
+inherits the primary branch's upstream when one exists. Existing linked
+worktrees remain user-owned and are used unchanged. Pausing preserves either
+worktree for resume; permanently deleting a session also removes its
+Hel-created worktree and branch.
 
 The dashboard's Deployment Capacity pane groups configured local and SSH
 targets by host and shows current CPU and RAM utilization. Multiple target

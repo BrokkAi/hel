@@ -24,8 +24,9 @@ use crate::hel_config::{
 use crate::hel_git_proxy::{GitBrokerSpec, broker_is_alive};
 use crate::hel_local_git::{canonical_repository, dirty_local_repositories};
 use crate::hel_state::{
-    CheckpointMetadata, HelState, SessionRecord, SessionResourceAllocation, SessionState,
-    TargetLocator, new_session_id, normalize_session_title,
+    CheckpointMetadata, HelState, ManagedWorktree, ManagedWorktreeTarget, SessionRecord,
+    SessionResourceAllocation, SessionState, TargetLocator, new_session_id,
+    normalize_session_title,
 };
 use crate::hel_targets::{
     self, AdditionalMount, AwsTemplate, CancellableProcessExecutor, CommandExecutor, CommandOutput,
@@ -322,6 +323,7 @@ impl Controller {
             last_profile: profile_id,
             bundle_id,
             project_directory: None,
+            managed_worktree: None,
             target_template_id: target_id.to_owned(),
             resource_allocation: None,
             additional_mounts: Vec::new(),
@@ -496,6 +498,97 @@ impl Controller {
         }
     }
 
+    fn prepare_managed_raw_worktree(
+        &mut self,
+        session_id: &str,
+        executor: &impl CommandExecutor,
+    ) -> Result<bool> {
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?
+            .clone();
+        let Some(selected) = session.project_directory.as_deref() else {
+            return Ok(false);
+        };
+        if session.managed_worktree.is_some() {
+            return Ok(false);
+        }
+        let template = self
+            .config
+            .targets
+            .get(&session.target_template_id)
+            .context("raw session target template disappeared during provisioning")?;
+        let target = managed_worktree_target(template)?;
+        let inspection = inspect_raw_project(executor, &target, selected)?;
+        if !inspection.primary_checkout {
+            return Ok(false);
+        }
+        let relative_directory = inspection
+            .source_project_directory
+            .strip_prefix(&inspection.source_repository)
+            .context("raw project directory is outside its repository")?
+            .to_path_buf();
+        let worktree_root = inspection
+            .source_repository
+            .join(".hel")
+            .join("worktrees")
+            .join(session_id);
+        let managed = ManagedWorktree {
+            source_project_directory: inspection.source_project_directory,
+            source_repository: inspection.source_repository,
+            worktree_root: worktree_root.clone(),
+            branch: format!("hel/{session_id}"),
+            target,
+        };
+        ensure_managed_worktree_available(executor, &managed)?;
+        let record = self.state.sessions.get_mut(session_id).unwrap();
+        record.project_directory = Some(worktree_root.join(relative_directory));
+        record.managed_worktree = Some(managed.clone());
+        record.updated_at = now();
+        self.persist_session_state(session_id)?;
+        create_managed_worktree(executor, &managed, inspection.upstream.as_deref())?;
+        Ok(true)
+    }
+
+    fn cleanup_new_session_worktree(
+        &self,
+        session_id: &str,
+        executor: &impl CommandExecutor,
+    ) -> Result<()> {
+        let Some(worktree) = self
+            .state
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.managed_worktree.as_ref())
+        else {
+            return Ok(());
+        };
+        cleanup_managed_worktree(executor, worktree)
+    }
+
+    fn fail_new_session_with_cleanup(
+        &mut self,
+        session_id: &str,
+        error: anyhow::Error,
+        executor: &impl CommandExecutor,
+    ) -> Result<anyhow::Error> {
+        let original = format!("{error:#}");
+        let cleanup_error = self
+            .cleanup_new_session_worktree(session_id, executor)
+            .err()
+            .map(|cleanup_error| format!("{cleanup_error:#}"));
+        let failure = apply_failed_new_session_rollback(
+            &mut self.state,
+            session_id,
+            &original,
+            cleanup_error,
+        );
+        self.persist_session_state(session_id)?;
+        Ok(failure)
+    }
+
     pub fn register_session(
         &mut self,
         profile_id: &str,
@@ -617,6 +710,7 @@ impl Controller {
             last_profile: profile_id.to_string(),
             bundle_id: bundle_id.to_string(),
             project_directory,
+            managed_worktree: None,
             target_template_id: target_id.to_string(),
             resource_allocation,
             additional_mounts: additional_mounts.clone(),
@@ -666,7 +760,7 @@ impl Controller {
         &mut self,
         session_id: &str,
         error: anyhow::Error,
-        _executor: &impl CommandExecutor,
+        executor: &impl CommandExecutor,
     ) -> Result<anyhow::Error> {
         let session = self
             .state
@@ -674,7 +768,7 @@ impl Controller {
             .get(session_id)
             .with_context(|| format!("unknown session {session_id}"))?
             .clone();
-        let cleanup = match session.target.as_ref() {
+        let target_cleanup = match session.target.as_ref() {
             Some(locator) => (|| -> Result<()> {
                 let backend = backend_locator(locator, &session, &self.config)?;
                 hel_targets::close_plan(&backend, session_id)?
@@ -687,6 +781,13 @@ impl Controller {
             })(),
             None => Ok(()),
         };
+        let worktree_cleanup = self.cleanup_new_session_worktree(session_id, executor);
+        let cleanup_error = [target_cleanup, worktree_cleanup]
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|error| format!("{error:#}"))
+            .collect::<Vec<_>>()
+            .join("; ");
         let original = format!("{error:#}");
         let original = match persist_launch_failure(session_id, &original) {
             Ok(path) => format!("{original}; full diagnostic saved to {}", path.display()),
@@ -698,9 +799,7 @@ impl Controller {
             &mut self.state,
             session_id,
             &original,
-            cleanup
-                .err()
-                .map(|cleanup_error| format!("{cleanup_error:#}")),
+            (!cleanup_error.is_empty()).then_some(cleanup_error),
         );
         self.persist_session_state(session_id)?;
         Ok(failure)
@@ -760,6 +859,18 @@ impl Controller {
         if session.state != SessionState::Provisioning {
             bail!("session {session_id} is not provisioning");
         }
+        let created_worktree = match self.prepare_managed_raw_worktree(session_id, executor) {
+            Ok(created) => created,
+            Err(error) => {
+                return Err(self.fail_new_session_with_cleanup(session_id, error, executor)?);
+            }
+        };
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .expect("session retained after managed worktree preparation")
+            .clone();
         // Once registration succeeds, every subsequent failure must remove the
         // provisional record. Keep planning, preflight, creation, and locator
         // discovery in one result so no early `?` can strand a session.
@@ -831,10 +942,19 @@ impl Controller {
                 }
             })
         })();
-        let result = apply_new_session_provisioning_result(&mut self.state, session_id, result);
+        let result = match result {
+            Err(error) if created_worktree => {
+                return Err(self.fail_new_session_with_cleanup(session_id, error, executor)?);
+            }
+            result => apply_new_session_provisioning_result(&mut self.state, session_id, result),
+        };
         if result.is_ok()
             && let Some(session) = self.state.sessions.get(session_id)
-            && let Some(directory) = session.project_directory.clone()
+            && let Some(directory) = session
+                .managed_worktree
+                .as_ref()
+                .map(|worktree| worktree.source_project_directory.clone())
+                .or_else(|| session.project_directory.clone())
             && let Some(template) = self.config.targets.get(&session.target_template_id)
         {
             let host = match template {
@@ -1410,18 +1530,25 @@ impl Controller {
             .get(target_id)
             .with_context(|| format!("unknown target template {target_id:?}"))?;
         if let Some(project_directory) = &previous.project_directory {
-            let previous_template = self
-                .config
-                .targets
-                .get(&previous.target_template_id)
-                .context("previous bare target template is missing")?;
-            if !is_bare_project_target(target_template)
-                || matches!(previous_template, TargetTemplate::LocalBare)
-                    != matches!(target_template, TargetTemplate::LocalBare)
-            {
-                bail!("raw project sessions must resume on the same bare target kind");
+            if let Some(worktree) = &previous.managed_worktree {
+                let resume_target = managed_worktree_target(target_template)?;
+                if resume_target != worktree.target {
+                    bail!("managed raw project sessions must resume on their original host");
+                }
+            } else {
+                let previous_template = self
+                    .config
+                    .targets
+                    .get(&previous.target_template_id)
+                    .context("previous bare target template is missing")?;
+                if !is_bare_project_target(target_template)
+                    || matches!(previous_template, TargetTemplate::LocalBare)
+                        != matches!(target_template, TargetTemplate::LocalBare)
+                {
+                    bail!("raw project sessions must resume on the same bare target kind");
+                }
             }
-            self.validate_project_directory(target_id, project_directory, &ProcessExecutor)
+            self.validate_project_directory(target_id, project_directory, executor)
                 .context("raw project is unavailable for resume")?;
         }
         let resource_allocation =
@@ -2010,6 +2137,44 @@ impl Controller {
         record.target = None;
         record.updated_at = now();
         self.persist_session_state(session_id)
+    }
+
+    /// Permanently remove an inactive session and every artifact Hel owns for it.
+    /// External cleanup happens before the durable record is dropped so failures
+    /// remain visible and retryable.
+    pub fn delete_session_controlled(
+        &mut self,
+        session_id: &str,
+        executor: &impl CommandExecutor,
+    ) -> Result<()> {
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?
+            .clone();
+        if session.state.is_active() {
+            bail!("refusing to delete active session {session_id}");
+        }
+        if let Some(worktree) = &session.managed_worktree {
+            cleanup_managed_worktree(executor, worktree)
+                .context("remove managed raw-session worktree")?;
+        }
+        if let Some(checkpoint) = &session.checkpoint
+            && let Err(error) = std::fs::remove_file(&checkpoint.archive_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error).with_context(|| {
+                format!(
+                    "remove session recovery archive {}",
+                    checkpoint.archive_path.display()
+                )
+            });
+        }
+        crate::hel_database::delete_session(session_id)
+            .context("delete paused session from database")?;
+        self.state.remove_archived_session(session_id)?;
+        Ok(())
     }
 }
 
@@ -3068,6 +3233,452 @@ fn backend_target(
             container: backend_container(container, allocation),
         },
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawProjectInspection {
+    source_project_directory: PathBuf,
+    source_repository: PathBuf,
+    primary_checkout: bool,
+    upstream: Option<String>,
+}
+
+fn managed_worktree_target(template: &TargetTemplate) -> Result<ManagedWorktreeTarget> {
+    match template {
+        TargetTemplate::LocalBare => Ok(ManagedWorktreeTarget::Local),
+        TargetTemplate::SshBare { ssh, .. } => {
+            let ssh = backend_ssh(ssh);
+            Ok(ManagedWorktreeTarget::Ssh {
+                destination: ssh.destination,
+                ssh_args: ssh.ssh_args,
+            })
+        }
+        _ => bail!("managed raw worktrees require a bare target"),
+    }
+}
+
+fn managed_target_ssh(target: &ManagedWorktreeTarget) -> Option<SshTarget> {
+    match target {
+        ManagedWorktreeTarget::Local => None,
+        ManagedWorktreeTarget::Ssh {
+            destination,
+            ssh_args,
+        } => Some(SshTarget {
+            destination: destination.clone(),
+            ssh_args: ssh_args.clone(),
+        }),
+    }
+}
+
+fn managed_target_command(
+    target: &ManagedWorktreeTarget,
+    program: &str,
+    args: impl IntoIterator<Item = impl AsRef<str>>,
+) -> CommandSpec {
+    let args = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_owned())
+        .collect::<Vec<_>>();
+    match managed_target_ssh(target) {
+        None => CommandSpec::new(program, args),
+        Some(ssh) => {
+            let mut remote = vec![program.to_owned()];
+            remote.extend(args);
+            ssh_command_spec(&ssh, remote)
+        }
+    }
+}
+
+fn managed_git_command(
+    target: &ManagedWorktreeTarget,
+    directory: &Path,
+    args: impl IntoIterator<Item = impl AsRef<str>>,
+    purpose: impl Into<String>,
+) -> CommandSpec {
+    let mut command_args = vec!["-C".to_owned(), directory.to_string_lossy().into_owned()];
+    command_args.extend(args.into_iter().map(|arg| arg.as_ref().to_owned()));
+    managed_target_command(target, "git", command_args).purpose(purpose)
+}
+
+fn command_stdout(output: CommandOutput, purpose: &str) -> Result<String> {
+    if output.status != 0 {
+        bail!(
+            "{purpose} failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .with_context(|| format!("{purpose} produced non-UTF-8 output"))?;
+    Ok(stdout.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+fn managed_git_stdout(
+    executor: &impl CommandExecutor,
+    target: &ManagedWorktreeTarget,
+    directory: &Path,
+    args: impl IntoIterator<Item = impl AsRef<str>>,
+    purpose: &str,
+) -> Result<String> {
+    let command = managed_git_command(target, directory, args, purpose);
+    command_stdout(executor.execute(&command)?, purpose)
+}
+
+fn inspect_raw_project(
+    executor: &impl CommandExecutor,
+    target: &ManagedWorktreeTarget,
+    selected: &Path,
+) -> Result<RawProjectInspection> {
+    let repository = PathBuf::from(managed_git_stdout(
+        executor,
+        target,
+        selected,
+        ["rev-parse", "--path-format=absolute", "--show-toplevel"],
+        "resolve raw project repository root",
+    )?);
+    let prefix = managed_git_stdout(
+        executor,
+        target,
+        selected,
+        ["rev-parse", "--show-prefix"],
+        "resolve raw project relative directory",
+    )?;
+    let git_dir = PathBuf::from(managed_git_stdout(
+        executor,
+        target,
+        selected,
+        ["rev-parse", "--absolute-git-dir"],
+        "resolve raw project Git directory",
+    )?);
+    let common_git_dir = PathBuf::from(managed_git_stdout(
+        executor,
+        target,
+        selected,
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        "resolve raw project common Git directory",
+    )?);
+    let branch_command = managed_git_command(
+        target,
+        selected,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        "resolve raw project branch",
+    );
+    let branch_output = executor.execute(&branch_command)?;
+    let branch = match branch_output.status {
+        0 => Some(
+            String::from_utf8(branch_output.stdout)
+                .context("raw project branch was not UTF-8")?
+                .trim()
+                .to_owned(),
+        ),
+        1 | 128 => None,
+        status => bail!(
+            "resolve raw project branch failed with status {status}: {}",
+            String::from_utf8_lossy(&branch_output.stderr).trim()
+        ),
+    };
+    let upstream = match branch {
+        Some(branch) => {
+            let reference = format!("refs/heads/{branch}");
+            let upstream = managed_git_stdout(
+                executor,
+                target,
+                selected,
+                ["for-each-ref", "--format=%(upstream:short)", &reference],
+                "resolve raw project upstream",
+            )?;
+            (!upstream.is_empty()).then_some(upstream)
+        }
+        None => None,
+    };
+    Ok(RawProjectInspection {
+        source_project_directory: repository.join(prefix),
+        source_repository: repository,
+        primary_checkout: git_dir == common_git_dir,
+        upstream,
+    })
+}
+
+fn ensure_managed_worktree_excluded(
+    executor: &impl CommandExecutor,
+    target: &ManagedWorktreeTarget,
+    repository: &Path,
+) -> Result<()> {
+    let check = managed_git_command(
+        target,
+        repository,
+        [
+            "check-ignore",
+            "--quiet",
+            "--no-index",
+            "--",
+            ".hel/worktrees/",
+        ],
+        "check managed worktree exclusion",
+    );
+    let output = executor.execute(&check)?;
+    match output.status {
+        0 => return Ok(()),
+        1 => {}
+        status => bail!(
+            "check managed worktree exclusion failed with status {status}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+    let exclude_path = PathBuf::from(managed_git_stdout(
+        executor,
+        target,
+        repository,
+        [
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+        ],
+        "resolve repository-local exclude file",
+    )?);
+    const ENTRY: &str = "/.hel/worktrees/";
+    match target {
+        ManagedWorktreeTarget::Local => {
+            use std::io::Write;
+            let existing = match std::fs::read_to_string(&exclude_path) {
+                Ok(existing) => existing,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(error.into()),
+            };
+            if existing.lines().any(|line| line.trim() == ENTRY) {
+                return Ok(());
+            }
+            if let Some(parent) = exclude_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&exclude_path)
+                .with_context(|| format!("open {}", exclude_path.display()))?;
+            if !existing.is_empty() && !existing.ends_with('\n') {
+                writeln!(file)?;
+            }
+            writeln!(file, "# Hel managed worktrees\n{ENTRY}")?;
+        }
+        ManagedWorktreeTarget::Ssh { .. } => {
+            const SCRIPT: &str = "set -eu\nexclude=$1\nentry=$2\nmkdir -p \"$(dirname \"$exclude\")\"\ntouch \"$exclude\"\nif ! grep -Fqx \"$entry\" \"$exclude\"; then\n  if [ -s \"$exclude\" ] && [ \"$(tail -c 1 \"$exclude\" | wc -l)\" -eq 0 ]; then printf '\\n' >>\"$exclude\"; fi\n  printf '# Hel managed worktrees\\n%s\\n' \"$entry\" >>\"$exclude\"\nfi";
+            let command = managed_target_command(
+                target,
+                "sh",
+                [
+                    "-c",
+                    SCRIPT,
+                    "hel-exclude",
+                    &exclude_path.to_string_lossy(),
+                    ENTRY,
+                ],
+            )
+            .purpose("update remote repository-local exclude file");
+            execute_checked(executor, command)?;
+        }
+    }
+    Ok(())
+}
+
+fn path_exists_on_managed_target(
+    executor: &impl CommandExecutor,
+    target: &ManagedWorktreeTarget,
+    path: &Path,
+) -> Result<bool> {
+    match target {
+        ManagedWorktreeTarget::Local => Ok(path.exists()),
+        ManagedWorktreeTarget::Ssh { .. } => {
+            let command = managed_target_command(target, "test", ["-e", &path.to_string_lossy()])
+                .purpose("check managed worktree path");
+            let output = executor.execute(&command)?;
+            match output.status {
+                0 => Ok(true),
+                1 => Ok(false),
+                status => bail!(
+                    "check managed worktree path failed with status {status}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            }
+        }
+    }
+}
+
+fn create_managed_worktree(
+    executor: &impl CommandExecutor,
+    worktree: &ManagedWorktree,
+    upstream: Option<&str>,
+) -> Result<()> {
+    ensure_managed_worktree_excluded(executor, &worktree.target, &worktree.source_repository)?;
+    let status = managed_git_stdout(
+        executor,
+        &worktree.target,
+        &worktree.source_repository,
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+        "inspect primary checkout changes",
+    )?;
+    if !status.is_empty() {
+        let paths = status.lines().take(20).collect::<Vec<_>>().join("\n  ");
+        bail!(
+            "primary checkout has uncommitted changes; commit or stash them before creating a raw session worktree:\n  {paths}"
+        );
+    }
+    let parent = worktree
+        .worktree_root
+        .parent()
+        .context("managed worktree root has no parent")?;
+    execute_checked(
+        executor,
+        managed_target_command(&worktree.target, "mkdir", ["-p", &parent.to_string_lossy()])
+            .purpose("create managed worktree directory"),
+    )?;
+    execute_checked(
+        executor,
+        managed_git_command(
+            &worktree.target,
+            &worktree.source_repository,
+            [
+                "worktree",
+                "add",
+                "-b",
+                &worktree.branch,
+                &worktree.worktree_root.to_string_lossy(),
+                "HEAD",
+            ],
+            "create managed raw-session worktree",
+        ),
+    )?;
+    if let Some(upstream) = upstream {
+        execute_checked(
+            executor,
+            managed_git_command(
+                &worktree.target,
+                &worktree.worktree_root,
+                ["branch", "--set-upstream-to", upstream, &worktree.branch],
+                "set managed worktree branch upstream",
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_managed_worktree_available(
+    executor: &impl CommandExecutor,
+    worktree: &ManagedWorktree,
+) -> Result<()> {
+    if path_exists_on_managed_target(executor, &worktree.target, &worktree.worktree_root)? {
+        bail!(
+            "managed worktree path already exists: {}",
+            worktree.worktree_root.display()
+        );
+    }
+    let branch_ref = format!("refs/heads/{}", worktree.branch);
+    let check = managed_git_command(
+        &worktree.target,
+        &worktree.source_repository,
+        ["show-ref", "--verify", "--quiet", &branch_ref],
+        "check managed worktree branch availability",
+    );
+    let output = executor.execute(&check)?;
+    match output.status {
+        0 => bail!(
+            "managed worktree branch already exists: {}",
+            worktree.branch
+        ),
+        1 => Ok(()),
+        status => bail!(
+            "check managed worktree branch availability failed with status {status}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+fn cleanup_managed_worktree(
+    executor: &impl CommandExecutor,
+    worktree: &ManagedWorktree,
+) -> Result<()> {
+    if !path_exists_on_managed_target(executor, &worktree.target, &worktree.source_repository)? {
+        return Ok(());
+    }
+    if path_exists_on_managed_target(executor, &worktree.target, &worktree.worktree_root)? {
+        execute_checked(
+            executor,
+            managed_git_command(
+                &worktree.target,
+                &worktree.source_repository,
+                [
+                    "worktree",
+                    "remove",
+                    "--force",
+                    &worktree.worktree_root.to_string_lossy(),
+                ],
+                "remove managed raw-session worktree",
+            ),
+        )?;
+    }
+    execute_checked(
+        executor,
+        managed_git_command(
+            &worktree.target,
+            &worktree.source_repository,
+            ["worktree", "prune"],
+            "prune managed worktree metadata",
+        ),
+    )?;
+    let branch_ref = format!("refs/heads/{}", worktree.branch);
+    let check = managed_git_command(
+        &worktree.target,
+        &worktree.source_repository,
+        ["show-ref", "--verify", "--quiet", &branch_ref],
+        "check managed worktree branch",
+    );
+    let output = executor.execute(&check)?;
+    match output.status {
+        0 => {
+            execute_checked(
+                executor,
+                managed_git_command(
+                    &worktree.target,
+                    &worktree.source_repository,
+                    ["branch", "-D", "--", &worktree.branch],
+                    "delete managed raw-session branch",
+                ),
+            )?;
+        }
+        1 => {}
+        status => bail!(
+            "check managed worktree branch failed with status {status}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+    let worktrees = worktree.source_repository.join(".hel").join("worktrees");
+    let hel = worktree.source_repository.join(".hel");
+    match &worktree.target {
+        ManagedWorktreeTarget::Local => {
+            for directory in [&worktrees, &hel] {
+                match std::fs::remove_dir(directory) {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                        ) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        ManagedWorktreeTarget::Ssh { .. } => {
+            let command = managed_target_command(
+                &worktree.target,
+                "rmdir",
+                ["--", &worktrees.to_string_lossy(), &hel.to_string_lossy()],
+            )
+            .purpose("remove empty managed worktree directories");
+            let _ = executor.execute(&command)?;
+        }
+    }
+    Ok(())
 }
 
 fn controller_github_token() -> Option<String> {
@@ -4719,6 +5330,7 @@ mod tests {
             last_profile: "codex".into(),
             bundle_id: "project".into(),
             project_directory: None,
+            managed_worktree: None,
             target_template_id: "podman".into(),
             resource_allocation: None,
             additional_mounts: Vec::new(),
@@ -4757,6 +5369,7 @@ mod tests {
             last_profile: "kimi".into(),
             bundle_id: "raw-project".into(),
             project_directory: Some("/srv/project".into()),
+            managed_worktree: None,
             target_template_id: "remote".into(),
             resource_allocation: None,
             additional_mounts: Vec::new(),
@@ -4842,6 +5455,7 @@ mod tests {
             last_profile: "codex-old".into(),
             bundle_id: "project".into(),
             project_directory: None,
+            managed_worktree: None,
             target_template_id: "podman-old".into(),
             resource_allocation: None,
             additional_mounts: Vec::new(),
@@ -4936,6 +5550,7 @@ mod tests {
             last_profile: "codex".into(),
             bundle_id: "project".into(),
             project_directory: None,
+            managed_worktree: None,
             target_template_id: "aws".into(),
             resource_allocation: None,
             additional_mounts: vec![AdditionalMount {
@@ -5531,5 +6146,193 @@ mod tests {
             TargetLocator::AwsEc2 { instance_id, address }
                 if instance_id == "i-exact" && address.as_deref() == Some("10.0.0.7")
         ));
+    }
+
+    fn test_git(directory: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn committed_repository() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        test_git(directory.path(), &["init", "--initial-branch=master"]);
+        test_git(directory.path(), &["config", "user.name", "Hel Tests"]);
+        test_git(
+            directory.path(),
+            &["config", "user.email", "hel@example.invalid"],
+        );
+        std::fs::create_dir(directory.path().join("nested")).unwrap();
+        std::fs::write(directory.path().join("nested/file.txt"), "base\n").unwrap();
+        test_git(directory.path(), &["add", "."]);
+        test_git(directory.path(), &["commit", "-m", "base"]);
+        directory
+    }
+
+    #[test]
+    fn managed_raw_worktree_inherits_upstream_and_cleans_up_owned_artifacts() {
+        let repository = committed_repository();
+        let remote_parent = tempfile::tempdir().unwrap();
+        let remote = remote_parent.path().join("remote.git");
+        let output = Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        test_git(
+            repository.path(),
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        test_git(
+            repository.path(),
+            &["push", "--set-upstream", "origin", "master"],
+        );
+
+        let target = ManagedWorktreeTarget::Local;
+        let inspection =
+            inspect_raw_project(&ProcessExecutor, &target, &repository.path().join("nested"))
+                .unwrap();
+        assert!(inspection.primary_checkout);
+        assert_eq!(inspection.upstream.as_deref(), Some("origin/master"));
+        assert_eq!(
+            inspection.source_project_directory,
+            repository.path().join("nested")
+        );
+
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let worktree = ManagedWorktree {
+            source_project_directory: inspection.source_project_directory,
+            source_repository: inspection.source_repository,
+            worktree_root: repository.path().join(".hel/worktrees").join(session_id),
+            branch: format!("hel/{session_id}"),
+            target,
+        };
+        create_managed_worktree(&ProcessExecutor, &worktree, inspection.upstream.as_deref())
+            .unwrap();
+        assert!(worktree.worktree_root.join("nested/file.txt").is_file());
+        assert_eq!(
+            test_git(
+                &worktree.worktree_root,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}"
+                ]
+            ),
+            "origin/master"
+        );
+        assert_eq!(test_git(repository.path(), &["status", "--porcelain"]), "");
+        std::fs::write(worktree.worktree_root.join("dirty.txt"), "session\n").unwrap();
+
+        cleanup_managed_worktree(&ProcessExecutor, &worktree).unwrap();
+        assert!(!worktree.worktree_root.exists());
+        assert!(!repository.path().join(".hel").exists());
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repository.path())
+            .args([
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{}", worktree.branch),
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+    }
+
+    #[test]
+    fn managed_raw_worktree_refuses_dirty_primary_and_skips_existing_worktree() {
+        let repository = committed_repository();
+        std::fs::write(repository.path().join("dirty.txt"), "dirty\n").unwrap();
+        let target = ManagedWorktreeTarget::Local;
+        let inspection = inspect_raw_project(&ProcessExecutor, &target, repository.path()).unwrap();
+        let session_id = "fedcba9876543210fedcba9876543210";
+        let managed = ManagedWorktree {
+            source_project_directory: inspection.source_project_directory,
+            source_repository: inspection.source_repository,
+            worktree_root: repository.path().join(".hel/worktrees").join(session_id),
+            branch: format!("hel/{session_id}"),
+            target: target.clone(),
+        };
+        let error = create_managed_worktree(&ProcessExecutor, &managed, None).unwrap_err();
+        assert!(error.to_string().contains("uncommitted changes"));
+        assert!(!managed.worktree_root.exists());
+
+        std::fs::remove_file(repository.path().join("dirty.txt")).unwrap();
+        let existing = repository.path().join("existing-worktree");
+        test_git(
+            repository.path(),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &existing.to_string_lossy(),
+                "HEAD",
+            ],
+        );
+        let linked = inspect_raw_project(&ProcessExecutor, &target, &existing).unwrap();
+        assert!(!linked.primary_checkout);
+    }
+
+    #[test]
+    fn managed_worktree_preflight_preserves_colliding_branch_and_directory() {
+        let repository = committed_repository();
+        let target = ManagedWorktreeTarget::Local;
+        let session_id = "abcdef0123456789abcdef0123456789";
+        let branch = format!("hel/{session_id}");
+        test_git(repository.path(), &["branch", &branch]);
+        let worktree = ManagedWorktree {
+            source_project_directory: repository.path().to_path_buf(),
+            source_repository: repository.path().to_path_buf(),
+            worktree_root: repository.path().join(".hel/worktrees").join(session_id),
+            branch: branch.clone(),
+            target,
+        };
+
+        let error = ensure_managed_worktree_available(&ProcessExecutor, &worktree).unwrap_err();
+        assert!(error.to_string().contains("branch already exists"));
+        assert!(
+            !test_git(
+                repository.path(),
+                &["show-ref", "--verify", &format!("refs/heads/{branch}")]
+            )
+            .is_empty()
+        );
+        std::fs::create_dir_all(&worktree.worktree_root).unwrap();
+        let error = ensure_managed_worktree_available(&ProcessExecutor, &worktree).unwrap_err();
+        assert!(error.to_string().contains("path already exists"));
+        assert!(worktree.worktree_root.is_dir());
+    }
+
+    #[test]
+    fn managed_worktree_ssh_commands_preserve_hostile_path_boundaries() {
+        let target = ManagedWorktreeTarget::Ssh {
+            destination: "builder".into(),
+            ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
+        };
+        let command = managed_git_command(
+            &target,
+            Path::new("/srv/project with ' quote"),
+            ["worktree", "prune"],
+            "prune test",
+        );
+        assert_eq!(command.program, "ssh");
+        assert_eq!(&command.args[..3], ["-o", "BatchMode=yes", "builder"]);
+        assert_eq!(
+            command.args[3],
+            "'git' '-C' '/srv/project with '\\'' quote' 'worktree' 'prune'"
+        );
     }
 }

@@ -11,12 +11,12 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::hel_config::{HarnessKind, data_dir};
 use crate::hel_state::{
-    CheckpointMetadata, HelState, SessionRecord, SessionResourceAllocation, SessionState,
-    TargetLocator,
+    CheckpointMetadata, HelState, ManagedWorktree, SessionRecord, SessionResourceAllocation,
+    SessionState, TargetLocator,
 };
 use crate::hel_targets::AdditionalMount;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryScope {
@@ -214,6 +214,16 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 6 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE sessions ADD COLUMN managed_worktree TEXT;
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 6;
+             COMMIT;",
+        )?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -240,7 +250,7 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
                 s.target_template_id, s.state, s.native_session_id, s.acp_session_title,
                 s.session_title_override, c.created_at, s.updated_at,
                 s.last_viewed_event_sequence, s.last_error, s.resource_allocation,
-                s.last_checkpoint_error, s.project_directory
+                s.last_checkpoint_error, s.project_directory, s.managed_worktree
          FROM sessions s JOIN session_contexts c USING(session_id)
          ORDER BY s.session_id",
     )?;
@@ -252,6 +262,17 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
             last_profile: row.get(3)?,
             bundle_id: row.get(4)?,
             project_directory: row.get_ref(16)?.blob_or_null()?.map(blob_to_path),
+            managed_worktree: row
+                .get::<_, Option<String>>(17)?
+                .map(|json| serde_json::from_str::<ManagedWorktree>(&json))
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        17,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
             target_template_id: row.get(5)?,
             resource_allocation: row
                 .get::<_, Option<String>>(14)?
@@ -503,8 +524,8 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
              session_id, title, harness_kind, last_profile, target_template_id, state,
              native_session_id, acp_session_title, session_title_override, updated_at,
              last_viewed_event_sequence, last_error, resource_allocation,
-             last_checkpoint_error, project_directory
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+             last_checkpoint_error, project_directory, managed_worktree
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         params![
             session.id,
             session.title,
@@ -528,6 +549,11 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
                 .project_directory
                 .as_ref()
                 .map(|path| path_to_blob(path)),
+            session
+                .managed_worktree
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
         ],
     )?;
     if let Some(target) = &session.target {
@@ -964,6 +990,7 @@ impl<'a> ValueRefExt<'a> for rusqlite::types::ValueRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hel_state::ManagedWorktreeTarget;
     use rusqlite::OptionalExtension;
 
     fn session(id: &str, bundle: &str) -> SessionRecord {
@@ -974,6 +1001,7 @@ mod tests {
             last_profile: "codex".into(),
             bundle_id: bundle.into(),
             project_directory: None,
+            managed_worktree: None,
             target_template_id: "local".into(),
             resource_allocation: Some(SessionResourceAllocation::Container {
                 cpus: 8,
@@ -1010,7 +1038,17 @@ mod tests {
         let database = directory.path().join("hel.sqlite3");
         let mut state = HelState::default();
         let mut record = session("session-1", "project-1");
-        record.project_directory = Some(PathBuf::from("/srv/project-1"));
+        record.project_directory = Some(PathBuf::from("/srv/project-1/.hel/worktrees/session-1"));
+        record.managed_worktree = Some(ManagedWorktree {
+            source_project_directory: PathBuf::from("/srv/project-1"),
+            source_repository: PathBuf::from("/srv/project-1"),
+            worktree_root: PathBuf::from("/srv/project-1/.hel/worktrees/session-1"),
+            branch: "hel/session-1".into(),
+            target: ManagedWorktreeTarget::Ssh {
+                destination: "builder".into(),
+                ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
+            },
+        });
         record.resource_allocation = None;
         record.target = Some(TargetLocator::LocalBare {
             worker_root: PathBuf::from("/var/lib/hel/workers/session-1"),
@@ -1025,6 +1063,12 @@ mod tests {
 
         assert_eq!(load_state_from(&database).unwrap(), state);
         let connection = open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
         assert_eq!(
             connection
                 .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
@@ -1068,6 +1112,21 @@ mod tests {
         let connection = open(&database).unwrap();
         assert_eq!(
             connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT managed_worktree IS NULL FROM sessions WHERE session_id = 'old-session'",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            connection
                 .query_row(
                     "SELECT resource_id FROM session_targets WHERE session_id = 'old-session'",
                     [],
@@ -1077,7 +1136,10 @@ mod tests {
             "container-1"
         );
         connection
-            .execute("INSERT INTO sessions VALUES ('local-session')", [])
+            .execute(
+                "INSERT INTO sessions(session_id) VALUES ('local-session')",
+                [],
+            )
             .unwrap();
         connection
             .execute(
