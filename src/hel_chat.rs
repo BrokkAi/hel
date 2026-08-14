@@ -22,6 +22,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use serde::Serialize;
 use similar::{ChangeTag, TextDiff};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -47,6 +48,7 @@ pub enum ChatExit {
 pub enum ChatAction {
     None,
     Prompt(String),
+    RemoveQueuedPrompt { id: String, text: String },
     SetConfig { key: String, value: String },
     Cancel,
     ToggleVoice,
@@ -98,6 +100,7 @@ struct Autocomplete {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QueuedPrompt {
+    id: String,
     text: String,
 }
 
@@ -128,10 +131,11 @@ pub enum ChatRole {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChatEntry {
     #[serde(default)]
-    started_seq: u64,
+    start_seq: u64,
     pub seq: u64,
     pub role: ChatRole,
     pub text: String,
+    recorded_at_ms: Option<i64>,
     revision: u64,
     message_id: Option<String>,
     tool_call_id: Option<String>,
@@ -147,10 +151,11 @@ pub struct ChatEntry {
 impl ChatEntry {
     fn plain(seq: u64, role: ChatRole, text: impl Into<String>) -> Self {
         Self {
-            started_seq: seq,
+            start_seq: seq,
             seq,
             role,
             text: sanitize_terminal_text(&text.into()),
+            recorded_at_ms: None,
             revision: 0,
             message_id: None,
             tool_call_id: None,
@@ -170,10 +175,11 @@ impl ChatEntry {
         tool_status: ToolStatus,
     ) -> Self {
         Self {
-            started_seq: seq,
+            start_seq: seq,
             seq,
             role: ChatRole::Tool,
             text: sanitize_terminal_text(&title.into()),
+            recorded_at_ms: None,
             revision: 0,
             message_id: None,
             tool_call_id,
@@ -188,10 +194,11 @@ impl ChatEntry {
 
     fn plan(seq: u64, plan: Vec<PlanLine>) -> Self {
         Self {
-            started_seq: seq,
+            start_seq: seq,
             seq,
             role: ChatRole::Plan,
             text: String::new(),
+            recorded_at_ms: None,
             revision: 0,
             message_id: None,
             tool_call_id: None,
@@ -234,6 +241,11 @@ impl ChatEntry {
         for line in &mut self.plan {
             truncate_string_start(&mut line.text, DETAIL_BYTES);
         }
+    }
+
+    fn with_recorded_at(mut self, recorded_at_ms: Option<i64>) -> Self {
+        self.recorded_at_ms = recorded_at_ms;
+        self
     }
 }
 
@@ -293,13 +305,43 @@ struct TranscriptRenderCache {
 #[derive(Debug)]
 pub struct TranscriptSnapshot {
     entries: Vec<ChatEntry>,
+    latest_seq: u64,
+    last_compaction_seq: u64,
     render_cache: TranscriptRenderCache,
+}
+
+const BROWSER_TRANSCRIPT_LINES: usize = 1_000;
+const BROWSER_LINE_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowserTranscript {
+    pub latest_seq: u64,
+    pub window_start_seq: u64,
+    pub reset: bool,
+    pub entries: Vec<BrowserTranscriptEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowserTranscriptEntry {
+    pub id: u64,
+    pub updated_seq: u64,
+    pub role: &'static str,
+    pub label: String,
+    pub recorded_at_ms: Option<i64>,
+    pub lines: Vec<String>,
 }
 
 impl TranscriptSnapshot {
     pub fn from_entries(entries: Vec<ChatEntry>) -> Self {
+        let latest_seq = entries.last().map_or(0, |entry| entry.seq);
+        Self::from_entries_at(entries, latest_seq)
+    }
+
+    pub fn from_entries_at(entries: Vec<ChatEntry>, latest_seq: u64) -> Self {
         Self {
             entries,
+            latest_seq,
+            last_compaction_seq: 0,
             render_cache: TranscriptRenderCache::default(),
         }
     }
@@ -310,19 +352,222 @@ impl TranscriptSnapshot {
             .any(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty())
     }
 
-    pub(crate) fn rich_tail(&mut self, width: u16, maximum_lines: usize) -> Vec<Line<'static>> {
-        let lines = transcript_entry_lines(
+    #[cfg(test)]
+    fn rich_tail(&mut self, width: u16, maximum_lines: usize) -> Vec<Line<'static>> {
+        self.rich_tail_scrolled(width, maximum_lines, 0).0
+    }
+
+    /// The last `maximum_lines` non-empty rows, skipping `scroll` rows above the
+    /// live tail. Renders only the entries the window touches. Returns the rows
+    /// and the scroll actually applied, clamped to the history available.
+    pub(crate) fn rich_tail_scrolled(
+        &mut self,
+        width: u16,
+        maximum_lines: usize,
+        scroll: usize,
+    ) -> (Vec<Line<'static>>, usize) {
+        prepare_render_cache(
             &self.entries,
             &mut self.render_cache,
             width,
             TranscriptRenderMode::Rich,
-        )
-        .into_iter()
-        .filter(|line| !line_is_empty(line))
-        .collect::<Vec<_>>();
-        let start = lines.len().saturating_sub(maximum_lines);
-        lines.into_iter().skip(start).collect()
+        );
+        let wanted = maximum_lines.saturating_add(scroll);
+        let mut collected: VecDeque<Line<'static>> = VecDeque::new();
+        'entries: for index in (0..self.entries.len()).rev() {
+            let lines = cached_entry_lines(&self.entries, &mut self.render_cache, index);
+            for line in lines.iter().rev().filter(|line| !line_is_empty(line)) {
+                if collected.len() >= wanted {
+                    break 'entries;
+                }
+                collected.push_front(line.clone());
+            }
+        }
+        let applied = scroll.min(collected.len().saturating_sub(maximum_lines));
+        let end = collected.len() - applied;
+        let start = end.saturating_sub(maximum_lines);
+        (collected.drain(start..end).collect(), applied)
     }
+
+    pub fn browser_transcript(&self, after_seq: Option<u64>) -> BrowserTranscript {
+        let mut entries = self
+            .entries
+            .iter()
+            .filter(|entry| entry.start_seq > self.last_compaction_seq)
+            .map(browser_entry)
+            .collect::<Vec<_>>();
+        let mut remaining = BROWSER_TRANSCRIPT_LINES;
+        for entry in entries.iter_mut().rev() {
+            if entry.lines.len() > remaining {
+                let drop = entry.lines.len() - remaining;
+                entry.lines.drain(..drop);
+            }
+            remaining = remaining.saturating_sub(entry.lines.len());
+        }
+        entries.retain(|entry| !entry.lines.is_empty());
+        if remaining == 0 {
+            while entries.first().is_some_and(|entry| entry.lines.is_empty()) {
+                entries.remove(0);
+            }
+        }
+        let window_start_seq = entries.first().map_or(self.latest_seq, |entry| entry.id);
+        let reset = after_seq.is_some_and(|after| after < window_start_seq);
+        if let Some(after) = after_seq.filter(|_| !reset) {
+            entries.retain(|entry| entry.updated_seq > after);
+        }
+        BrowserTranscript {
+            latest_seq: self.latest_seq,
+            window_start_seq,
+            reset,
+            entries,
+        }
+    }
+
+    pub fn browser_tail(&self, maximum_lines: usize) -> Vec<String> {
+        let mut lines = self
+            .browser_transcript(None)
+            .entries
+            .into_iter()
+            .flat_map(|entry| {
+                entry
+                    .lines
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(move |(index, line)| {
+                        let line = line.trim().to_owned();
+                        (!line.is_empty()).then(|| {
+                            if index == 0 {
+                                format!("{}: {line}", entry.label)
+                            } else {
+                                line
+                            }
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        let start = lines.len().saturating_sub(maximum_lines);
+        lines.drain(..start);
+        lines
+    }
+}
+
+fn browser_entry(entry: &ChatEntry) -> BrowserTranscriptEntry {
+    let (role, label) = match entry.role {
+        ChatRole::User => ("user", "You".to_owned()),
+        ChatRole::Agent => ("agent", "Agent".to_owned()),
+        ChatRole::Thought => ("thought", "Thinking".to_owned()),
+        ChatRole::Tool => (
+            "tool",
+            format!(
+                "Tool · {}",
+                tool_status_name(entry.tool_status.unwrap_or(ToolStatus::Pending))
+            ),
+        ),
+        ChatRole::Plan => ("plan", "Plan".to_owned()),
+        ChatRole::System => ("system", "Hel".to_owned()),
+    };
+    let source = if entry.role == ChatRole::Plan {
+        entry
+            .plan
+            .iter()
+            .map(|line| {
+                let marker = match line.status {
+                    PlanStatus::Pending => "○",
+                    PlanStatus::Running => "●",
+                    PlanStatus::Completed => "✓",
+                };
+                format!("{marker} {}", line.text)
+            })
+            .collect::<Vec<_>>()
+    } else if entry.role == ChatRole::Tool && !entry.tool_diffstats.is_empty() {
+        std::iter::once(entry.text.clone())
+            .chain(entry.tool_diffstats.clone())
+            .collect()
+    } else {
+        entry.text.lines().map(str::to_owned).collect()
+    };
+    BrowserTranscriptEntry {
+        id: entry.start_seq,
+        updated_seq: entry.seq,
+        role,
+        label,
+        recorded_at_ms: entry.recorded_at_ms,
+        lines: source
+            .into_iter()
+            .map(|line| truncate_browser_line(&line))
+            .collect(),
+    }
+}
+
+fn truncate_browser_line(line: &str) -> String {
+    if line.len() <= BROWSER_LINE_BYTES {
+        return line.to_owned();
+    }
+    const SUFFIX: &str = "… [truncated]";
+    let mut end = BROWSER_LINE_BYTES - SUFFIX.len();
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{SUFFIX}", &line[..end])
+}
+
+const fn tool_status_name(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Pending => "waiting",
+        ToolStatus::Running => "running",
+        ToolStatus::Completed => "done",
+        ToolStatus::Failed => "failed",
+    }
+}
+
+/// Where the transcript viewport is pinned. Anchoring to an entry rather than an
+/// absolute row keeps the view stable while the agent appends new rows below,
+/// and lets the renderer touch only the entries the viewport covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptAnchor {
+    /// Follow the newest rows.
+    Bottom,
+    /// The top visible row is `row` rows into `entry`.
+    Row { entry: usize, row: usize },
+}
+
+/// Drop cached rows that a width or mode change invalidated, and size the cache
+/// to the current entry count.
+fn prepare_render_cache(
+    entries: &[ChatEntry],
+    cache: &mut TranscriptRenderCache,
+    width: u16,
+    mode: TranscriptRenderMode,
+) {
+    if cache.width != width || cache.mode != mode {
+        cache.width = width;
+        cache.mode = mode;
+        cache.entries.clear();
+    }
+    cache.entries.resize(entries.len(), None);
+}
+
+/// Rendered rows for one entry, rendering and caching it on first use.
+/// `prepare_render_cache` must have run for the current width and mode.
+fn cached_entry_lines<'cache>(
+    entries: &[ChatEntry],
+    cache: &'cache mut TranscriptRenderCache,
+    index: usize,
+) -> &'cache [Line<'static>] {
+    let entry = &entries[index];
+    let stale = cache.entries[index]
+        .as_ref()
+        .is_none_or(|cached| cached.revision != entry.revision);
+    if stale {
+        cache.entries[index] = Some(CachedEntry {
+            revision: entry.revision,
+            lines: render_transcript_entry(entry, usize::from(cache.width), cache.mode),
+        });
+    }
+    &cache.entries[index]
+        .as_ref()
+        .expect("the entry was just rendered")
+        .lines
 }
 
 impl Default for TranscriptRenderCache {
@@ -340,6 +585,7 @@ pub struct ChatState {
     bundle_id: Option<String>,
     phase: WorkerPhase,
     latest_seq: u64,
+    last_compaction_seq: u64,
     entries: Vec<ChatEntry>,
     input: String,
     input_cursor: usize,
@@ -359,9 +605,7 @@ pub struct ChatState {
     current_model: Option<String>,
     current_effort: Option<String>,
     autocomplete: Option<Autocomplete>,
-    scroll_top: usize,
-    follow_bottom: bool,
-    last_content_height: usize,
+    anchor: TranscriptAnchor,
     last_viewport_height: usize,
     render_mode: TranscriptRenderMode,
     render_cache: TranscriptRenderCache,
@@ -376,6 +620,7 @@ impl ChatState {
             bundle_id: None,
             phase: snapshot.phase,
             latest_seq: 0,
+            last_compaction_seq: 0,
             entries: Vec::new(),
             input: String::new(),
             input_cursor: 0,
@@ -406,9 +651,7 @@ impl ChatState {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
             autocomplete: None,
-            scroll_top: 0,
-            follow_bottom: true,
-            last_content_height: 0,
+            anchor: TranscriptAnchor::Bottom,
             last_viewport_height: 0,
             render_mode: TranscriptRenderMode::Rich,
             render_cache: TranscriptRenderCache::default(),
@@ -416,6 +659,16 @@ impl ChatState {
             voice_active: false,
         };
         state.apply_events(events);
+        // Bootstrap replays the full canonical log for transcript projection,
+        // while the snapshot is authoritative for the queue at that frontier.
+        state.queued_prompts = snapshot
+            .queued_prompts
+            .iter()
+            .map(|prompt| QueuedPrompt {
+                id: prompt.id.clone(),
+                text: prompt.text.clone(),
+            })
+            .collect();
         state.latest_seq = state.latest_seq.max(snapshot.latest_seq);
         state
     }
@@ -455,7 +708,7 @@ impl ChatState {
         self.entries
             .iter()
             .filter(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty())
-            .map(|entry| entry.started_seq)
+            .map(|entry| entry.start_seq)
             .collect()
     }
 
@@ -464,7 +717,7 @@ impl ChatState {
             .iter()
             .rev()
             .find(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty())
-            .map(|entry| entry.started_seq)
+            .map(|entry| entry.start_seq)
     }
 
     pub(crate) fn trailing_agent_message_id(&self) -> Option<Option<String>> {
@@ -521,7 +774,6 @@ impl ChatState {
                 .iter()
                 .any(|command| command.name == "goal")
     }
-
     pub fn entries(&self) -> &[ChatEntry] {
         &self.entries
     }
@@ -529,8 +781,22 @@ impl ChatState {
     pub fn transcript_snapshot(&self) -> TranscriptSnapshot {
         TranscriptSnapshot {
             entries: self.entries.clone(),
+            latest_seq: self.latest_seq,
+            last_compaction_seq: self.last_compaction_seq,
             render_cache: TranscriptRenderCache::default(),
         }
+    }
+
+    pub fn queued_prompt_snapshot(&self) -> Vec<crate::hel_worker::QueuedPrompt> {
+        self.queued_prompts
+            .iter()
+            .map(|prompt| crate::hel_worker::QueuedPrompt {
+                id: prompt.id.clone(),
+                text: prompt.text.clone(),
+                attachments: Vec::new(),
+                created_at_ms: 0,
+            })
+            .collect()
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
@@ -555,9 +821,7 @@ impl ChatState {
         self.history_search = None;
         self.queued_prompts.clear();
         self.autocomplete = None;
-        self.scroll_top = 0;
-        self.follow_bottom = true;
-        self.last_content_height = 0;
+        self.anchor = TranscriptAnchor::Bottom;
         self.last_viewport_height = 0;
         self.render_mode = TranscriptRenderMode::Rich;
         self.notice = None;
@@ -1098,22 +1362,16 @@ impl ChatState {
         self.update_autocomplete();
     }
 
-    fn edit_latest_queued_prompt(&mut self) {
+    fn edit_latest_queued_prompt(&mut self) -> ChatAction {
         let Some(queued) = self.queued_prompts.pop_back() else {
-            return;
+            return ChatAction::None;
         };
-        self.set_input(queued.text);
+        self.set_input(queued.text.clone());
         self.set_notice("Editing the most recently queued prompt");
-    }
-
-    fn queue_prompt(&mut self, text: String) {
-        self.queued_prompts
-            .push_back(QueuedPrompt { text: text.clone() });
-        self.set_notice(format!(
-            "Queued {}: {}",
-            self.queued_prompts.len(),
-            queued_prompt_preview(&text)
-        ));
+        ChatAction::RemoveQueuedPrompt {
+            id: queued.id,
+            text: queued.text,
+        }
     }
 
     fn show_help(&mut self) {
@@ -1191,19 +1449,7 @@ impl ChatState {
         }
         self.record_prompt_history(&prompt);
         self.clear_input();
-        if self.phase == WorkerPhase::Running {
-            self.queued_prompts.push_back(QueuedPrompt {
-                text: prompt.clone(),
-            });
-            self.set_notice(format!(
-                "Queued {}: {}",
-                self.queued_prompts.len(),
-                queued_prompt_preview(&prompt)
-            ));
-            ChatAction::None
-        } else {
-            ChatAction::Prompt(prompt)
-        }
+        ChatAction::Prompt(prompt)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ChatAction {
@@ -1330,7 +1576,7 @@ impl ChatState {
                 KeyCode::Char('j') | KeyCode::Char('m') => self.insert_character('\n'),
                 KeyCode::Char('p') => {
                     if self.input.is_empty() && !self.queued_prompts.is_empty() {
-                        self.edit_latest_queued_prompt();
+                        return self.edit_latest_queued_prompt();
                     } else if self.input.is_empty() || self.history_index.is_some() {
                         self.move_history(-1);
                     } else {
@@ -1355,10 +1601,9 @@ impl ChatState {
                     self.kill_range(self.input_cursor..end);
                 }
                 KeyCode::Home => {
-                    self.scroll_top = 0;
-                    self.follow_bottom = false;
+                    self.anchor = TranscriptAnchor::Row { entry: 0, row: 0 };
                 }
-                KeyCode::End => self.follow_bottom = true,
+                KeyCode::End => self.anchor = TranscriptAnchor::Bottom,
                 _ => {}
             }
             return ChatAction::None;
@@ -1376,7 +1621,9 @@ impl ChatState {
                     self.kill_range(start..self.input_cursor);
                 }
                 KeyCode::Enter => self.insert_character('\n'),
-                KeyCode::Up if !self.queued_prompts.is_empty() => self.edit_latest_queued_prompt(),
+                KeyCode::Up if !self.queued_prompts.is_empty() => {
+                    return self.edit_latest_queued_prompt();
+                }
                 _ => {}
             }
             return ChatAction::None;
@@ -1421,7 +1668,7 @@ impl ChatState {
             }
             KeyCode::Up => {
                 if self.input.is_empty() && !self.queued_prompts.is_empty() {
-                    self.edit_latest_queued_prompt();
+                    return self.edit_latest_queued_prompt();
                 } else if self.input.is_empty() || self.history_index.is_some() {
                     self.move_history(-1);
                 } else {
@@ -1440,8 +1687,7 @@ impl ChatState {
             KeyCode::Left
                 if modifiers.contains(KeyModifiers::SHIFT) && !self.queued_prompts.is_empty() =>
             {
-                self.edit_latest_queued_prompt();
-                ChatAction::None
+                self.edit_latest_queued_prompt()
             }
             KeyCode::Left => {
                 self.move_input_cursor(-1);
@@ -1479,34 +1725,170 @@ impl ChatState {
         }
     }
 
-    fn scroll_history_up(&mut self, rows: usize) {
-        if self.follow_bottom {
-            self.scroll_top = self
-                .last_content_height
-                .saturating_sub(self.last_viewport_height);
+    /// Rows for the current anchor, rendering only the entries the viewport
+    /// covers rather than the whole transcript.
+    fn viewport(&mut self, width: u16, height: usize) -> TranscriptViewport {
+        prepare_render_cache(
+            &self.entries,
+            &mut self.render_cache,
+            width,
+            self.render_mode,
+        );
+        let top = TranscriptAnchor::Row { entry: 0, row: 0 };
+        if self.entries.is_empty() {
+            return TranscriptViewport {
+                rows: vec![empty_transcript_row()],
+                anchor: TranscriptAnchor::Bottom,
+                top,
+            };
         }
-        self.follow_bottom = false;
-        self.scroll_top = self.scroll_top.saturating_sub(rows);
+        if let TranscriptAnchor::Row { entry, row } = self.anchor
+            && entry < self.entries.len()
+        {
+            let mut rows = Vec::with_capacity(height);
+            let mut skip = row;
+            for index in entry..self.entries.len() {
+                let lines = cached_entry_lines(&self.entries, &mut self.render_cache, index);
+                for line in lines.iter().skip(skip) {
+                    if rows.len() == height {
+                        break;
+                    }
+                    rows.push(line.clone());
+                }
+                skip = 0;
+                if rows.len() == height {
+                    break;
+                }
+            }
+            // Anchors inside the final screenful cannot fill the viewport; those
+            // views already reach the newest row, so follow the tail instead of
+            // painting a short page.
+            if rows.len() == height {
+                let anchor = TranscriptAnchor::Row { entry, row };
+                return TranscriptViewport {
+                    rows,
+                    anchor,
+                    top: anchor,
+                };
+            }
+        }
+        self.tail_viewport(height)
+    }
+
+    /// The last `height` rows, walking backwards from the newest entry. These
+    /// rows always reach the newest row, so the anchor to store is `Bottom`.
+    fn tail_viewport(&mut self, height: usize) -> TranscriptViewport {
+        let mut rows: VecDeque<Line<'static>> = VecDeque::with_capacity(height);
+        let mut top = TranscriptAnchor::Row { entry: 0, row: 0 };
+        if height == 0 {
+            return TranscriptViewport {
+                rows: rows.into(),
+                anchor: TranscriptAnchor::Bottom,
+                top,
+            };
+        }
+        for index in (0..self.entries.len()).rev() {
+            let lines = cached_entry_lines(&self.entries, &mut self.render_cache, index);
+            let take = height.saturating_sub(rows.len());
+            let start = lines.len().saturating_sub(take);
+            for line in lines[start..].iter().rev() {
+                rows.push_front(line.clone());
+            }
+            top = TranscriptAnchor::Row {
+                entry: index,
+                row: start,
+            };
+            if rows.len() >= height {
+                break;
+            }
+        }
+        TranscriptViewport {
+            rows: rows.into(),
+            anchor: TranscriptAnchor::Bottom,
+            top,
+        }
+    }
+
+    /// Rendered row count for one entry, filling the cache on demand.
+    fn entry_rows(&mut self, index: usize) -> usize {
+        let width = self.render_cache.width;
+        prepare_render_cache(
+            &self.entries,
+            &mut self.render_cache,
+            width,
+            self.render_mode,
+        );
+        cached_entry_lines(&self.entries, &mut self.render_cache, index).len()
+    }
+
+    /// The anchor the current view is showing, resolving `Bottom` into the
+    /// concrete entry and row at the top of the viewport. `None` before the
+    /// first draw, when no width is known to wrap against.
+    fn resolved_anchor(&mut self) -> Option<TranscriptAnchor> {
+        if self.render_cache.width == 0 {
+            return None;
+        }
+        Some(match self.anchor {
+            TranscriptAnchor::Row { entry, row } if entry < self.entries.len() => {
+                TranscriptAnchor::Row { entry, row }
+            }
+            _ => self.tail_viewport(self.last_viewport_height.max(1)).top,
+        })
+    }
+
+    fn scroll_history_up(&mut self, rows: usize) {
+        let Some(TranscriptAnchor::Row { mut entry, mut row }) = self.resolved_anchor() else {
+            // Either no draw has happened yet, or the transcript is shorter than
+            // the viewport and has nothing above it.
+            return;
+        };
+        let mut remaining = rows;
+        while remaining > 0 {
+            if row > 0 {
+                let step = remaining.min(row);
+                row -= step;
+                remaining -= step;
+            } else if entry > 0 {
+                entry -= 1;
+                row = self.entry_rows(entry);
+            } else {
+                break;
+            }
+        }
+        self.anchor = TranscriptAnchor::Row { entry, row };
     }
 
     fn scroll_history_down(&mut self, rows: usize) {
-        let maximum = self
-            .last_content_height
-            .saturating_sub(self.last_viewport_height);
-        self.scroll_top = self.scroll_top.saturating_add(rows);
-        if self.scroll_top >= maximum {
-            self.scroll_top = maximum;
-            self.follow_bottom = true;
+        let Some(TranscriptAnchor::Row { mut entry, mut row }) = self.resolved_anchor() else {
+            return;
+        };
+        let mut remaining = rows;
+        while remaining > 0 {
+            let below = self.entry_rows(entry).saturating_sub(row + 1);
+            if below >= remaining {
+                row += remaining;
+                break;
+            }
+            if entry + 1 >= self.entries.len() {
+                self.anchor = TranscriptAnchor::Bottom;
+                return;
+            }
+            remaining -= below + 1;
+            entry += 1;
+            row = 0;
         }
+        self.anchor = TranscriptAnchor::Row { entry, row };
     }
 
     fn apply_event(&mut self, event: &SequencedEvent) {
         match &event.event {
             WorkerEvent::PromptAccepted { text, .. } => {
-                self.phase = WorkerPhase::Running;
-                self.goal_prompt_active = is_goal_prompt(text);
-                self.entries
-                    .push(ChatEntry::plain(event.seq, ChatRole::User, text));
+                self.mark_prompt_submitted(text);
+                self.record_accepted_prompt(event.seq, text);
+                self.entries.push(
+                    ChatEntry::plain(event.seq, ChatRole::User, text)
+                        .with_recorded_at(event.recorded_at_ms),
+                );
             }
             WorkerEvent::TurnCompleted => {
                 self.phase = WorkerPhase::Idle;
@@ -1521,17 +1903,48 @@ impl ChatState {
             WorkerEvent::Closing => self.phase = WorkerPhase::Closing,
             WorkerEvent::Closed => self.phase = WorkerPhase::Closed,
             WorkerEvent::Checkpointed { .. } => {}
-            WorkerEvent::Adapter { payload, .. } => self.apply_adapter(event.seq, payload),
+            WorkerEvent::Adapter { payload, .. } => {
+                if is_compaction_artifact(payload) {
+                    self.last_compaction_seq = event.seq;
+                }
+                self.apply_adapter(event.seq, event.recorded_at_ms, payload)
+            }
+            WorkerEvent::QueuedPromptAdded { prompt } => {
+                self.queued_prompts.push_back(QueuedPrompt {
+                    id: prompt.id.clone(),
+                    text: prompt.text.clone(),
+                });
+            }
+            WorkerEvent::QueuedPromptRemoved { queue_id } => {
+                self.queued_prompts.retain(|prompt| prompt.id != *queue_id);
+            }
+            WorkerEvent::QueuedPromptPromoted { prompt, .. } => {
+                self.queued_prompts.retain(|queued| queued.id != prompt.id);
+                self.phase = WorkerPhase::Running;
+                self.record_accepted_prompt(event.seq, &prompt.text);
+                self.entries.push(
+                    ChatEntry::plain(event.seq, ChatRole::User, &prompt.text)
+                        .with_recorded_at(event.recorded_at_ms),
+                );
+            }
+            WorkerEvent::QueuedPromptsCleared => self.queued_prompts.clear(),
             WorkerEvent::ConfigChanged { .. } => {}
         }
     }
 
-    fn apply_adapter(&mut self, seq: u64, payload: &serde_json::Value) {
+    fn apply_adapter(
+        &mut self,
+        seq: u64,
+        recorded_at_ms: Option<i64>,
+        payload: &serde_json::Value,
+    ) {
         let Ok(runtime) = serde_json::from_value::<RuntimeEvent>(payload.clone()) else {
             return;
         };
         match runtime {
-            RuntimeEvent::SessionUpdate { update } => self.apply_session_update(seq, &update),
+            RuntimeEvent::SessionUpdate { update } => {
+                self.apply_session_update_at(seq, recorded_at_ms, &update)
+            }
             RuntimeEvent::Warning { message } => self.entries.push(ChatEntry::plain(
                 seq,
                 ChatRole::System,
@@ -1561,7 +1974,17 @@ impl ChatState {
     /// Project one typed ACP update into stable transcript items. The runtime
     /// keeps JSON at the persistence boundary so old event logs remain wire
     /// compatible; rendering never guesses at arbitrary JSON shapes.
+    #[cfg(test)]
     fn apply_session_update(&mut self, seq: u64, update: &serde_json::Value) {
+        self.apply_session_update_at(seq, None, update);
+    }
+
+    fn apply_session_update_at(
+        &mut self,
+        seq: u64,
+        recorded_at_ms: Option<i64>,
+        update: &serde_json::Value,
+    ) {
         let parsed = match serde_json::from_value::<SessionUpdate>(update.clone()) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -1573,13 +1996,13 @@ impl ChatState {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 let message_id = chunk.message_id.map(|id| id.to_string());
                 if let Some(text) = content_block_text(&chunk.content) {
-                    self.push_streamed(seq, ChatRole::Agent, message_id, &text);
+                    self.push_streamed(seq, recorded_at_ms, ChatRole::Agent, message_id, &text);
                 }
             }
             SessionUpdate::AgentThoughtChunk(chunk) => {
                 let message_id = chunk.message_id.map(|id| id.to_string());
                 if let Some(text) = content_block_text(&chunk.content) {
-                    self.push_streamed(seq, ChatRole::Thought, message_id, &text);
+                    self.push_streamed(seq, recorded_at_ms, ChatRole::Thought, message_id, &text);
                 }
             }
             // PromptAccepted is the canonical local user-message event. ACP
@@ -1658,7 +2081,14 @@ impl ChatState {
         }
     }
 
-    fn push_streamed(&mut self, seq: u64, role: ChatRole, message_id: Option<String>, text: &str) {
+    fn push_streamed(
+        &mut self,
+        seq: u64,
+        recorded_at_ms: Option<i64>,
+        role: ChatRole,
+        message_id: Option<String>,
+        text: &str,
+    ) {
         let text = sanitize_terminal_text(text);
         if let Some(last) = self.entries.last_mut()
             && last.role == role
@@ -1680,10 +2110,21 @@ impl ChatState {
             }
             return;
         }
-        let mut entry = ChatEntry::plain(seq, role, text);
+        let mut entry = ChatEntry::plain(seq, role, text).with_recorded_at(recorded_at_ms);
         entry.message_id = message_id;
         self.entries.push(entry);
     }
+}
+
+fn is_compaction_artifact(payload: &serde_json::Value) -> bool {
+    let update = payload.get("update").unwrap_or(payload);
+    matches!(
+        update
+            .get("sessionUpdate")
+            .and_then(serde_json::Value::as_str),
+        Some("compaction" | "context_compaction" | "compaction_summary")
+    ) || update.get("encrypted_content").is_some()
+        || update.get("encryptedContent").is_some()
 }
 
 fn previous_grapheme_boundary(input: &str, cursor: usize) -> usize {
@@ -2033,29 +2474,6 @@ pub async fn run_chat(
                 }
             }
         }
-        if chat.phase == WorkerPhase::Idle
-            && !chat.recovery_busy
-            && let Some(queued) = chat.queued_prompts.pop_front()
-        {
-            match client.prompt(queued.text.clone(), Vec::new()).await {
-                Ok(sequence) => {
-                    chat.record_accepted_prompt(sequence, &queued.text);
-                    chat.mark_prompt_submitted(&queued.text);
-                }
-                Err(error) => {
-                    let dropped = chat.queued_prompts.len();
-                    chat.queued_prompts.clear();
-                    chat.set_input(queued.text);
-                    chat.set_notice(if dropped == 0 {
-                        format!("Queued prompt failed: {error:#}")
-                    } else {
-                        format!(
-                            "Queued prompt failed: {error:#}; dropped {dropped} later prompt(s)"
-                        )
-                    });
-                }
-            }
-        }
         terminal.draw(|frame| render(frame, &mut chat))?;
         // Drain every queued input event before redrawing or syncing: a paste
         // delivers thousands of key events, and one draw + worker sync per
@@ -2077,22 +2495,30 @@ pub async fn run_chat(
             if let Some(action) = action {
                 let result = match action {
                     ChatAction::None => None,
-                    ChatAction::Prompt(text) if chat.recovery_busy => {
-                        chat.queue_prompt(text);
-                        None
+                    ChatAction::Prompt(text) => {
+                        match client.enqueue_prompt(text.clone(), Vec::new()).await {
+                            Ok(_) => {
+                                chat.set_notice(format!(
+                                    "Prompt accepted by worker: {}",
+                                    queued_prompt_preview(&text)
+                                ));
+                                None
+                            }
+                            Err(error) => {
+                                chat.set_input(text);
+                                Some(error)
+                            }
+                        }
                     }
-                    ChatAction::Prompt(text) => match client.prompt(text.clone(), Vec::new()).await
-                    {
-                        Ok(sequence) => {
-                            chat.record_accepted_prompt(sequence, &text);
-                            chat.mark_prompt_submitted(&text);
-                            None
+                    ChatAction::RemoveQueuedPrompt { id, text } => {
+                        match client.remove_queued_prompt(id.clone()).await {
+                            Ok(_) => None,
+                            Err(error) => {
+                                chat.queued_prompts.push_back(QueuedPrompt { id, text });
+                                Some(error)
+                            }
                         }
-                        Err(error) => {
-                            chat.set_input(text);
-                            Some(error)
-                        }
-                    },
+                    }
                     ChatAction::SetConfig { key, value } => {
                         client.set_config(key, value).await.err()
                     }
@@ -2687,28 +3113,22 @@ fn append_dictation(prefix: &str, transcript: &str) -> String {
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatState) {
-    let lines = transcript_lines(chat, area.width);
     let viewport_height = usize::from(area.height.saturating_sub(2));
-    let maximum = lines.len().saturating_sub(viewport_height);
-    chat.last_content_height = lines.len();
     chat.last_viewport_height = viewport_height;
-    if chat.follow_bottom {
-        chat.scroll_top = maximum;
-    } else {
-        chat.scroll_top = chat.scroll_top.min(maximum);
-    }
-    let title = if chat.follow_bottom {
-        match chat.render_mode {
-            TranscriptRenderMode::Rich => " Conversation ".to_owned(),
-            TranscriptRenderMode::Raw => " Conversation · raw source ".to_owned(),
+    let window = chat.viewport(area.width, viewport_height);
+    // The window resolves and clamps the anchor: an anchor inside the last
+    // screenful snaps back to following the tail.
+    chat.anchor = window.anchor;
+    let title = match (chat.anchor, chat.render_mode) {
+        (TranscriptAnchor::Bottom, TranscriptRenderMode::Rich) => " Conversation ".to_owned(),
+        (TranscriptAnchor::Bottom, TranscriptRenderMode::Raw) => {
+            " Conversation · raw source ".to_owned()
         }
-    } else {
-        format!(
-            " Conversation · rows {}–{} of {} · End to follow ",
-            chat.scroll_top.saturating_add(1),
-            (chat.scroll_top + viewport_height).min(lines.len()),
-            lines.len()
-        )
+        (TranscriptAnchor::Row { entry, .. }, _) => format!(
+            " Conversation · message {} of {} · End to follow ",
+            entry.saturating_add(1),
+            chat.entries.len()
+        ),
     };
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
@@ -2716,9 +3136,9 @@ fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatState) {
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let visible = lines
+    let visible = window
+        .rows
         .into_iter()
-        .skip(chat.scroll_top)
         .take(usize::from(inner.height))
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(visible), inner);
@@ -2757,65 +3177,51 @@ fn render_agent_message_lines(
     )
     .into_iter()
     .flat_map(|logical| wrap_styled_line(logical.line, content_width, logical.continuation_indent))
-    .map(|line| {
-        if line_is_empty(&line) {
-            Line::from("")
-        } else {
-            with_role_gutter(line, agent_style)
-        }
-    })
+    .map(|line| with_role_gutter(line, agent_style))
     .collect()
 }
 
-/// Render the complete transcript into already-wrapped visual rows. Keeping
-/// layout separate from painting makes scrolling a count of actual terminal
-/// rows rather than logical message lines.
+/// Render every row of the transcript. Rendering surfaces are all incremental
+/// now, so this exists only for tests that assert on the whole projection.
+#[cfg(test)]
 fn transcript_lines(chat: &mut ChatState, width: u16) -> Vec<Line<'static>> {
-    transcript_entry_lines(
+    prepare_render_cache(
         &chat.entries,
         &mut chat.render_cache,
         width,
         chat.render_mode,
-    )
-}
-
-fn transcript_entry_lines(
-    entries: &[ChatEntry],
-    render_cache: &mut TranscriptRenderCache,
-    width: u16,
-    mode: TranscriptRenderMode,
-) -> Vec<Line<'static>> {
-    if render_cache.width != width || render_cache.mode != mode {
-        render_cache.width = width;
-        render_cache.mode = mode;
-        render_cache.entries.clear();
-    }
-    render_cache.entries.resize(entries.len(), None);
+    );
     let mut lines = Vec::new();
-    for (index, entry) in entries.iter().enumerate() {
-        let cached = render_cache.entries[index]
-            .as_ref()
-            .filter(|cached| cached.revision == entry.revision)
-            .map(|cached| cached.lines.clone());
-        let entry_lines = cached.unwrap_or_else(|| {
-            let rendered = render_transcript_entry(entry, usize::from(width), mode);
-            render_cache.entries[index] = Some(CachedEntry {
-                revision: entry.revision,
-                lines: rendered.clone(),
-            });
-            rendered
-        });
-        lines.extend(entry_lines);
+    for index in 0..chat.entries.len() {
+        lines.extend_from_slice(cached_entry_lines(
+            &chat.entries,
+            &mut chat.render_cache,
+            index,
+        ));
     }
     if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No messages yet — send a prompt to begin.",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        )));
+        lines.push(empty_transcript_row());
     }
     lines
+}
+
+fn empty_transcript_row() -> Line<'static> {
+    Line::from(Span::styled(
+        "No messages yet — send a prompt to begin.",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    ))
+}
+
+/// The rows a viewport shows, with both the anchor to persist and the concrete
+/// position the rows start at.
+struct TranscriptViewport {
+    rows: Vec<Line<'static>>,
+    /// The anchor to store: `Bottom` whenever these rows reach the newest row.
+    anchor: TranscriptAnchor,
+    /// The entry and row the first visible row came from.
+    top: TranscriptAnchor,
 }
 
 fn render_transcript_entry(
@@ -2825,15 +3231,19 @@ fn render_transcript_entry(
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let visual = entry_visual(entry);
+    let label = match entry.role {
+        ChatRole::User | ChatRole::Agent => format_event_time(entry.recorded_at_ms).map_or_else(
+            || visual.label.clone(),
+            |time| format!("{} · {time}", visual.label),
+        ),
+        _ => visual.label.clone(),
+    };
     let header = Line::from(vec![
         Span::styled(
             format!("{} ", visual.glyph),
             visual.header_style.add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            visual.label.clone(),
-            visual.header_style.add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(label, visual.header_style.add_modifier(Modifier::BOLD)),
     ]);
     out.extend(wrap_styled_line(header, width, ROLE_GUTTER_WIDTH));
 
@@ -2841,15 +3251,19 @@ fn render_transcript_entry(
     let logical_lines = entry_logical_lines(entry, mode, &visual, content_width);
     for logical in logical_lines {
         for row in wrap_styled_line(logical.line, content_width, logical.continuation_indent) {
-            if line_is_empty(&row) {
-                out.push(Line::from(""));
-            } else {
-                out.push(with_role_gutter(row, visual.rail_style));
-            }
+            out.push(with_role_gutter(row, visual.rail_style));
         }
     }
     out.push(Line::from(""));
     out
+}
+
+fn format_event_time(recorded_at_ms: Option<i64>) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(recorded_at_ms?).map(|time| {
+        time.with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string()
+    })
 }
 
 fn entry_logical_lines(
@@ -2999,7 +3413,9 @@ fn with_role_gutter(line: Line<'static>, style: Style) -> Line<'static> {
 }
 
 fn line_is_empty(line: &Line<'_>) -> bool {
-    line.spans.iter().all(|span| span.content.trim().is_empty())
+    line.spans
+        .iter()
+        .all(|span| span.content.trim().is_empty() || span.content.as_ref() == ROLE_GUTTER)
 }
 
 #[cfg(test)]
@@ -3036,6 +3452,13 @@ mod tests {
 
     fn ctrl(character: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
+    }
+
+    fn queued(id: &str, text: &str) -> QueuedPrompt {
+        QueuedPrompt {
+            id: id.into(),
+            text: text.into(),
+        }
     }
 
     fn transcript_text(chat: &mut ChatState, width: u16) -> Vec<String> {
@@ -3085,11 +3508,8 @@ mod tests {
         let _ = transcript_text(&mut chat, 80);
         chat.set_input("draft".into());
         chat.prompt_history.push("previous".into());
-        chat.queued_prompts.push_back(QueuedPrompt {
-            text: "queued".into(),
-        });
-        chat.scroll_top = 4;
-        chat.follow_bottom = false;
+        chat.queued_prompts.push_back(queued("queued-1", "queued"));
+        chat.anchor = TranscriptAnchor::Row { entry: 0, row: 4 };
         chat.notice = Some("temporary".into());
         chat.voice_active = true;
 
@@ -3101,8 +3521,7 @@ mod tests {
         assert_eq!(chat.input_cursor, "draft".len());
         assert!(chat.prompt_history.is_empty());
         assert!(chat.queued_prompts.is_empty());
-        assert_eq!(chat.scroll_top, 0);
-        assert!(chat.follow_bottom);
+        assert_eq!(chat.anchor, TranscriptAnchor::Bottom);
         assert!(chat.notice.is_none());
         assert!(!chat.voice_active);
     }
@@ -3122,7 +3541,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_sends_while_idle_and_queues_while_running() {
+    fn enter_submits_to_the_worker_while_idle_or_running() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.handle_key(key(KeyCode::Char('h')));
         chat.handle_key(key(KeyCode::Char('i')));
@@ -3140,10 +3559,50 @@ mod tests {
         });
         let mut chat = ChatState::new(&running, &[]);
         chat.handle_key(key(KeyCode::Char('x')));
-        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
-        assert_eq!(chat.queued_prompts.len(), 1);
-        assert_eq!(chat.queued_prompts[0].text, "x");
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::Prompt("x".into())
+        );
+        assert!(chat.queued_prompts.is_empty());
         assert!(chat.entries.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_uses_snapshot_queue_without_duplicating_replayed_additions() {
+        let worker: WorkerSnapshot = serde_json::from_value(serde_json::json!({
+            "session_id": "1234567890",
+            "phase": "running",
+            "latest_seq": 1,
+            "last_checkpoint_seq": null,
+            "active_prompt": null,
+            "config": {},
+            "queued_prompts": [{
+                "id": "queued-0001",
+                "text": "next",
+                "attachments": [],
+                "created_at_ms": 1
+            }],
+            "handled_requests": {}
+        }))
+        .unwrap();
+        let events = [SequencedEvent {
+            seq: 1,
+            recorded_at_ms: Some(1),
+            request_id: Some("enqueue-1".into()),
+            event: WorkerEvent::QueuedPromptAdded {
+                prompt: crate::hel_worker::QueuedPrompt {
+                    id: "queued-0001".into(),
+                    text: "next".into(),
+                    attachments: vec![],
+                    created_at_ms: 1,
+                },
+            },
+        }];
+
+        let chat = ChatState::new(&worker, &events);
+
+        assert_eq!(chat.queued_prompts.len(), 1);
+        assert_eq!(chat.queued_prompts[0].id, "queued-0001");
     }
 
     #[test]
@@ -3161,9 +3620,11 @@ mod tests {
 
         assert_eq!(chat.input, "first\nsecond\nthird");
         assert!(chat.queued_prompts.is_empty());
-        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
-        assert_eq!(chat.queued_prompts.len(), 1);
-        assert_eq!(chat.queued_prompts[0].text, "first\nsecond\nthird");
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::Prompt("first\nsecond\nthird".into())
+        );
+        assert!(chat.queued_prompts.is_empty());
     }
 
     #[test]
@@ -3195,11 +3656,10 @@ mod tests {
     fn cancellation_waits_for_turn_completion_before_queue_can_drain() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.phase = WorkerPhase::Running;
-        chat.queued_prompts.push_back(QueuedPrompt {
-            text: "next".into(),
-        });
+        chat.queued_prompts.push_back(queued("queued-1", "next"));
         chat.apply_event(&SequencedEvent {
             seq: 1,
+            recorded_at_ms: None,
             request_id: Some("cancel".into()),
             event: WorkerEvent::Cancelled,
         });
@@ -3207,6 +3667,7 @@ mod tests {
 
         chat.apply_event(&SequencedEvent {
             seq: 2,
+            recorded_at_ms: None,
             request_id: None,
             event: WorkerEvent::TurnCompleted,
         });
@@ -3217,14 +3678,16 @@ mod tests {
     #[test]
     fn alt_up_recovers_the_latest_queued_prompt_for_editing() {
         let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.queued_prompts.push_back(QueuedPrompt {
-            text: "first".into(),
-        });
-        chat.queued_prompts.push_back(QueuedPrompt {
-            text: "second".into(),
-        });
+        chat.queued_prompts.push_back(queued("queued-1", "first"));
+        chat.queued_prompts.push_back(queued("queued-2", "second"));
 
-        chat.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(
+            chat.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+            ChatAction::RemoveQueuedPrompt {
+                id: "queued-2".into(),
+                text: "second".into(),
+            }
+        );
 
         assert_eq!(chat.input, "second");
         assert_eq!(chat.queued_prompts.len(), 1);
@@ -3234,9 +3697,12 @@ mod tests {
     #[test]
     fn up_and_control_p_peel_queued_prompts_back_into_the_editor() {
         let mut chat = ChatState::new(&snapshot(), &[]);
-        for text in ["first", "second", "third"] {
-            chat.queued_prompts
-                .push_back(QueuedPrompt { text: text.into() });
+        for (id, text) in [
+            ("queued-1", "first"),
+            ("queued-2", "second"),
+            ("queued-3", "third"),
+        ] {
+            chat.queued_prompts.push_back(queued(id, text));
         }
 
         chat.handle_key(key(KeyCode::Up));
@@ -3341,6 +3807,7 @@ mod tests {
         );
         chat.apply_event(&SequencedEvent {
             seq: 2,
+            recorded_at_ms: None,
             request_id: Some("goal".into()),
             event: WorkerEvent::PromptAccepted {
                 request_id: "goal".into(),
@@ -3354,6 +3821,7 @@ mod tests {
 
         chat.apply_event(&SequencedEvent {
             seq: 3,
+            recorded_at_ms: None,
             request_id: None,
             event: WorkerEvent::TurnCompleted,
         });
@@ -3696,6 +4164,7 @@ mod tests {
         let events = vec![
             SequencedEvent {
                 seq: 1,
+                recorded_at_ms: None,
                 request_id: Some("p".into()),
                 event: WorkerEvent::PromptAccepted {
                     request_id: "p".into(),
@@ -3705,6 +4174,7 @@ mod tests {
             },
             SequencedEvent {
                 seq: 2,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
@@ -3731,6 +4201,7 @@ mod tests {
         };
         let event = SequencedEvent {
             seq: 1,
+            recorded_at_ms: None,
             request_id: None,
             event: WorkerEvent::Adapter {
                 kind: "session_update".into(),
@@ -3752,6 +4223,7 @@ mod tests {
         };
         tail.apply_events(&[SequencedEvent {
             seq: 2,
+            recorded_at_ms: None,
             request_id: None,
             event: WorkerEvent::Adapter {
                 kind: "session_update".into(),
@@ -3761,6 +4233,57 @@ mod tests {
 
         assert_eq!(tail.entries.len(), 1);
         assert_eq!(tail.entries[0].text, "hello world");
+    }
+
+    #[test]
+    fn user_and_agent_headers_show_first_event_time_as_local_hours_and_minutes() {
+        let expected = format_event_time(Some(0)).unwrap();
+        let runtime = |text| RuntimeEvent::SessionUpdate {
+            update: serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "message-1",
+                "content": {"type": "text", "text": text}
+            }),
+        };
+        let events = vec![
+            SequencedEvent {
+                seq: 1,
+                recorded_at_ms: Some(0),
+                request_id: Some("p".into()),
+                event: WorkerEvent::PromptAccepted {
+                    request_id: "p".into(),
+                    text: "work".into(),
+                    attachments: vec![],
+                },
+            },
+            SequencedEvent {
+                seq: 2,
+                recorded_at_ms: Some(0),
+                request_id: None,
+                event: WorkerEvent::Adapter {
+                    kind: "session_update".into(),
+                    payload: serde_json::to_value(runtime("do")).unwrap(),
+                },
+            },
+            SequencedEvent {
+                seq: 3,
+                recorded_at_ms: Some(60_000),
+                request_id: None,
+                event: WorkerEvent::Adapter {
+                    kind: "session_update".into(),
+                    payload: serde_json::to_value(runtime("ne")).unwrap(),
+                },
+            },
+        ];
+        let mut initial = snapshot();
+        initial.latest_seq = 3;
+        let mut chat = ChatState::new(&initial, &events);
+        let lines = transcript_text(&mut chat, 80);
+
+        assert!(lines.contains(&format!("❯ You · {expected}")));
+        assert!(lines.contains(&format!("● Agent · {expected}")));
+        assert_eq!(chat.entries[1].text, "done");
+        assert_eq!(chat.entries[1].recorded_at_ms, Some(0));
     }
 
     #[test]
@@ -3947,6 +4470,31 @@ mod tests {
     }
 
     #[test]
+    fn blank_rows_inside_messages_keep_the_role_gutter() {
+        for (role, color) in [
+            (ChatRole::User, Color::Cyan),
+            (ChatRole::Agent, Color::Green),
+        ] {
+            let entry = ChatEntry::plain(1, role, "1. first\n\n2. second");
+            let lines = render_transcript_entry(&entry, 80, TranscriptRenderMode::Rich);
+            let blank = lines
+                .iter()
+                .find(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                        == ROLE_GUTTER
+                })
+                .expect("blank row with role gutter");
+
+            assert_eq!(blank.spans[0].style.fg, Some(color));
+            assert!(lines.last().is_some_and(line_is_empty));
+            assert!(lines.last().is_some_and(|line| line.spans.is_empty()));
+        }
+    }
+
+    #[test]
     fn transcript_snapshot_tail_matches_rich_conversation_rows() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.entries
@@ -3956,10 +4504,11 @@ mod tests {
             ChatRole::Agent,
             "**Done.**\n\n- shared renderer\n- live tail",
         ));
-        let expected = transcript_text(&mut chat, 32)
+        let expected = transcript_lines(&mut chat, 32)
             .into_iter()
-            .filter(|line| !line.trim().is_empty())
+            .filter(|line| !line_is_empty(line))
             .collect::<Vec<_>>();
+        let expected = line_text(expected);
         let expected = expected[expected.len().saturating_sub(6)..].to_vec();
 
         let mut snapshot = chat.transcript_snapshot();
@@ -3984,6 +4533,65 @@ mod tests {
     }
 
     #[test]
+    fn browser_transcript_is_bounded_utf8_safe_and_supports_deltas() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(ChatEntry::plain(
+            1,
+            ChatRole::Agent,
+            (0..1_005)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        chat.entries.push(ChatEntry::plain(
+            2,
+            ChatRole::Thought,
+            "🦀".repeat(BROWSER_LINE_BYTES),
+        ));
+        chat.latest_seq = 2;
+
+        let full = chat.transcript_snapshot().browser_transcript(None);
+        assert_eq!(
+            full.entries
+                .iter()
+                .map(|entry| entry.lines.len())
+                .sum::<usize>(),
+            BROWSER_TRANSCRIPT_LINES
+        );
+        assert_eq!(full.entries.last().unwrap().role, "thought");
+        let truncated = &full.entries.last().unwrap().lines[0];
+        assert!(truncated.ends_with("… [truncated]"));
+        assert!(truncated.len() <= BROWSER_LINE_BYTES);
+        assert!(!full.reset);
+
+        let delta = chat.transcript_snapshot().browser_transcript(Some(1));
+        assert!(!delta.reset);
+        assert_eq!(delta.entries.len(), 1);
+        assert_eq!(delta.entries[0].updated_seq, 2);
+        assert!(chat.transcript_snapshot().browser_transcript(Some(0)).reset);
+    }
+
+    #[test]
+    fn browser_transcript_excludes_entries_before_provider_compaction() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries
+            .push(ChatEntry::plain(1, ChatRole::User, "old"));
+        chat.entries
+            .push(ChatEntry::plain(3, ChatRole::Agent, "current"));
+        chat.latest_seq = 3;
+        chat.last_compaction_seq = 2;
+
+        let browser = chat.transcript_snapshot().browser_transcript(None);
+        assert_eq!(browser.entries.len(), 1);
+        assert_eq!(browser.entries[0].lines, ["current"]);
+        assert_eq!(browser_tail_label(&browser.entries[0]), "Agent: current");
+    }
+
+    fn browser_tail_label(entry: &BrowserTranscriptEntry) -> String {
+        format!("{}: {}", entry.label, entry.lines[0])
+    }
+
+    #[test]
     fn markdown_list_wrapping_uses_a_hanging_indent() {
         let entry = ChatEntry::plain(1, ChatRole::Agent, "- alpha beta gamma");
         let mut chat = ChatState::new(&snapshot(), &[]);
@@ -3995,35 +4603,138 @@ mod tests {
         assert!(text.iter().any(|line| line == "│   gamma"));
     }
 
+    /// A chat with `count` single-line user messages, each naming its index so
+    /// scroll assertions can name the row they expect to see.
+    fn numbered_chat(count: usize) -> ChatState {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries = (0..count)
+            .map(|index| ChatEntry::plain(index as u64, ChatRole::User, format!("message {index}")))
+            .collect();
+        chat
+    }
+
+    /// Draw the chat and return the transcript rows currently on screen.
+    fn drawn_transcript(chat: &mut ChatState, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, chat))
+            .expect("draw chat");
+        let buffer = terminal.backend().buffer();
+        (buffer.area.y..buffer.area.bottom())
+            .map(|y| {
+                (buffer.area.x..buffer.area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn shows(rows: &[String], needle: &str) -> bool {
+        rows.iter().any(|row| row.contains(needle))
+    }
+
+    /// The message bodies on screen, ignoring the title and composer chrome.
+    fn visible_messages(rows: &[String]) -> Vec<String> {
+        rows.iter()
+            .filter(|row| row.starts_with("│ message "))
+            .cloned()
+            .collect()
+    }
+
     #[test]
     fn page_navigation_keeps_end_attached_to_the_latest_message() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.last_content_height = 30;
-        chat.last_viewport_height = 10;
+        let mut chat = numbered_chat(40);
+        let rows = drawn_transcript(&mut chat, 60, 24);
+        assert!(shows(&rows, "message 39"), "opens on the newest message");
+        assert!(!shows(&rows, "End to follow"), "the tail needs no hint");
+
         chat.handle_key(key(KeyCode::PageUp));
-        assert_eq!(chat.scroll_top, 10);
-        assert!(!chat.follow_bottom);
+        let rows = drawn_transcript(&mut chat, 60, 24);
+        assert!(!shows(&rows, "message 39"), "page up leaves the tail");
+        assert!(
+            shows(&rows, "End to follow"),
+            "scrolled back says how to return"
+        );
+
         chat.handle_key(key(KeyCode::PageDown));
-        assert_eq!(chat.scroll_top, 20);
-        assert!(chat.follow_bottom);
+        let rows = drawn_transcript(&mut chat, 60, 24);
+        assert!(shows(&rows, "message 39"), "page down returns to the tail");
+
         chat.handle_key(key(KeyCode::PageUp));
         chat.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
-        assert!(chat.follow_bottom);
+        let rows = drawn_transcript(&mut chat, 60, 24);
+        assert!(
+            shows(&rows, "message 39"),
+            "Ctrl-End follows the tail again"
+        );
+        assert!(!shows(&rows, "End to follow"));
+    }
+
+    #[test]
+    fn control_home_and_end_reach_both_ends_of_a_long_transcript() {
+        let mut chat = numbered_chat(200);
+        let _ = drawn_transcript(&mut chat, 40, 24);
+
+        chat.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+        let rows = drawn_transcript(&mut chat, 40, 24);
+        assert!(shows(&rows, "message 0"), "Ctrl-Home reaches the first row");
+        assert!(!shows(&rows, "message 199"));
+
+        chat.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+        let rows = drawn_transcript(&mut chat, 40, 24);
+        assert!(shows(&rows, "message 199"), "Ctrl-End reaches the last row");
     }
 
     #[test]
     fn mouse_wheel_scrolls_chat_history_and_resumes_following_at_bottom() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.last_content_height = 30;
-        chat.last_viewport_height = 10;
+        let mut chat = numbered_chat(40);
+        let _ = drawn_transcript(&mut chat, 40, 24);
 
         chat.handle_mouse(mouse(MouseEventKind::ScrollUp));
-        assert_eq!(chat.scroll_top, 17);
-        assert!(!chat.follow_bottom);
+        let scrolled = drawn_transcript(&mut chat, 40, 24);
+        assert!(!shows(&scrolled, "message 39"), "wheel up leaves the tail");
 
         chat.handle_mouse(mouse(MouseEventKind::ScrollDown));
-        assert_eq!(chat.scroll_top, 20);
-        assert!(chat.follow_bottom);
+        let rows = drawn_transcript(&mut chat, 40, 24);
+        assert!(shows(&rows, "message 39"), "wheel down resumes following");
+        assert!(!rows.iter().any(|row| row.contains("End to follow")));
+    }
+
+    #[test]
+    fn scrolled_history_stays_put_while_new_messages_stream_in() {
+        let mut chat = numbered_chat(40);
+        let _ = drawn_transcript(&mut chat, 40, 24);
+        chat.handle_key(key(KeyCode::PageUp));
+        let before = drawn_transcript(&mut chat, 40, 24);
+
+        for index in 40..50 {
+            chat.entries.push(ChatEntry::plain(
+                index as u64,
+                ChatRole::User,
+                format!("message {index}"),
+            ));
+        }
+        let after = drawn_transcript(&mut chat, 40, 24);
+
+        assert_eq!(
+            visible_messages(&before),
+            visible_messages(&after),
+            "appending messages must not move a scrolled-back viewport"
+        );
+        assert!(!visible_messages(&after).is_empty());
+    }
+
+    #[test]
+    fn a_transcript_shorter_than_the_viewport_cannot_scroll() {
+        let mut chat = numbered_chat(2);
+        let rows = drawn_transcript(&mut chat, 40, 24);
+
+        chat.handle_mouse(mouse(MouseEventKind::ScrollUp));
+        chat.handle_key(key(KeyCode::PageUp));
+
+        assert_eq!(rows, drawn_transcript(&mut chat, 40, 24));
     }
 
     #[test]

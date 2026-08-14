@@ -288,6 +288,13 @@ fn parse_complete_raw_history(bytes: &[u8]) -> Result<Vec<Turn>> {
                     });
                 }
             }
+            WorkerEvent::QueuedPromptPromoted { prompt, .. } => {
+                skip_synthetic_turn = false;
+                turns.push(Turn {
+                    user: prompt.text,
+                    events: Vec::new(),
+                });
+            }
             WorkerEvent::Adapter { payload, .. } => {
                 if is_provider_compaction_artifact(&payload) {
                     saw_compaction_artifact = true;
@@ -550,6 +557,7 @@ mod tests {
                 &mut output,
                 SequencedEvent {
                     seq,
+                    recorded_at_ms: None,
                     request_id: None,
                     event: WorkerEvent::PromptAccepted {
                         request_id: format!("r{seq}"),
@@ -563,6 +571,7 @@ mod tests {
                 &mut output,
                 SequencedEvent {
                     seq,
+                    recorded_at_ms: None,
                     request_id: None,
                     event: WorkerEvent::Adapter {
                         kind: "session_update".into(),
@@ -661,6 +670,7 @@ mod tests {
             &mut input,
             SequencedEvent {
                 seq: 3,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
@@ -685,6 +695,7 @@ mod tests {
             &mut input,
             SequencedEvent {
                 seq: 1,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
@@ -713,6 +724,7 @@ mod tests {
             &mut input,
             SequencedEvent {
                 seq: 3,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::PromptAccepted {
                     request_id: "handoff".into(),
@@ -729,6 +741,7 @@ mod tests {
             &mut input,
             SequencedEvent {
                 seq: 4,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),

@@ -438,72 +438,161 @@ fn wrap_single_span(
     out
 }
 
+/// One grapheme of a line being wrapped, kept as a byte range into a shared
+/// buffer so wrapping a long transcript does not allocate per grapheme.
+#[derive(Debug, Clone, Copy)]
+struct Grapheme {
+    start: usize,
+    end: usize,
+    /// Index into the wrapper's style table.
+    style: usize,
+    width: u8,
+    whitespace: bool,
+}
+
+/// The text and styles of a logical line, flattened for wrapping.
+struct StyledBuffer {
+    text: String,
+    styles: Vec<Style>,
+    graphemes: Vec<Grapheme>,
+    /// The single trailing space that continuation indents point at.
+    space: usize,
+}
+
+impl StyledBuffer {
+    fn new(line: &Line<'static>) -> Self {
+        let capacity: usize = line.spans.iter().map(|span| span.content.len()).sum();
+        let mut text = String::with_capacity(capacity + 1);
+        let mut styles = Vec::with_capacity(line.spans.len() + 1);
+        let mut graphemes = Vec::new();
+        for span in &line.spans {
+            let style = styles.len();
+            styles.push(span.style);
+            let base = text.len();
+            text.push_str(span.content.as_ref());
+            for (offset, grapheme) in text[base..].grapheme_indices(true) {
+                let start = base + offset;
+                graphemes.push(Grapheme {
+                    start,
+                    end: start + grapheme.len(),
+                    style,
+                    // Graphemes render as at most two columns.
+                    width: display_width(grapheme).min(u8::MAX as usize) as u8,
+                    whitespace: grapheme.chars().all(char::is_whitespace),
+                });
+            }
+        }
+        // Continuation indents reuse one space rather than allocating their own.
+        let space = text.len();
+        text.push(' ');
+        styles.push(
+            line.spans
+                .first()
+                .map(|span| span.style)
+                .unwrap_or_default(),
+        );
+        Self {
+            text,
+            styles,
+            graphemes,
+            space,
+        }
+    }
+
+    fn indent(&self) -> Grapheme {
+        Grapheme {
+            start: self.space,
+            end: self.space + 1,
+            style: self.styles.len() - 1,
+            width: 1,
+            whitespace: true,
+        }
+    }
+
+    /// Join `row` into spans, merging runs that share a style.
+    fn line(&self, row: &[Grapheme]) -> Line<'static> {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut style: Option<usize> = None;
+        let mut text = String::new();
+        for grapheme in row {
+            if style != Some(grapheme.style) {
+                if let Some(style) = style {
+                    spans.push(Span::styled(std::mem::take(&mut text), self.styles[style]));
+                }
+                style = Some(grapheme.style);
+            }
+            text.push_str(&self.text[grapheme.start..grapheme.end]);
+        }
+        if let Some(style) = style {
+            spans.push(Span::styled(text, self.styles[style]));
+        }
+        Line::from(spans)
+    }
+}
+
 fn wrap_styled_graphemes(
     line: Line<'static>,
     width: usize,
     continuation_indent: usize,
 ) -> Vec<Line<'static>> {
-    let continuation_style = line
-        .spans
-        .first()
-        .map(|span| span.style)
-        .unwrap_or_default();
-    let continuation = vec![(" ".to_owned(), continuation_style); continuation_indent];
-    let mut tokens: Vec<Vec<(String, Style)>> = Vec::new();
-    let mut token = Vec::new();
+    let buffer = StyledBuffer::new(&line);
+    let indent = buffer.indent();
+
+    // Split into runs of whitespace and non-whitespace graphemes.
+    let mut tokens: Vec<std::ops::Range<usize>> = Vec::new();
     let mut whitespace = None;
-    for span in &line.spans {
-        for grapheme in span.content.graphemes(true) {
-            let is_whitespace = grapheme.chars().all(char::is_whitespace);
-            if whitespace != Some(is_whitespace) {
-                if !token.is_empty() {
-                    tokens.push(std::mem::take(&mut token));
-                }
-                whitespace = Some(is_whitespace);
-            }
-            token.push((grapheme.to_owned(), span.style));
+    for (index, grapheme) in buffer.graphemes.iter().enumerate() {
+        if whitespace == Some(grapheme.whitespace) {
+            tokens
+                .last_mut()
+                .expect("a token exists once whitespace is set")
+                .end = index + 1;
+        } else {
+            tokens.push(index..index + 1);
+            whitespace = Some(grapheme.whitespace);
         }
     }
-    if !token.is_empty() {
-        tokens.push(token);
-    }
 
-    let mut rows = Vec::new();
-    let mut current = Vec::new();
+    let mut rows: Vec<Vec<Grapheme>> = Vec::new();
+    let mut current: Vec<Grapheme> = Vec::new();
     let mut current_width = 0;
     for token in tokens {
-        let token_width = styled_token_width(&token);
-        let is_whitespace = token
-            .first()
-            .is_some_and(|(text, _)| text.chars().all(char::is_whitespace));
+        let token = &buffer.graphemes[token];
+        let token_width: usize = token
+            .iter()
+            .map(|grapheme| usize::from(grapheme.width))
+            .sum();
+        let is_whitespace = token.first().is_some_and(|grapheme| grapheme.whitespace);
         if current_width + token_width <= width {
-            current.extend(token);
+            current.extend_from_slice(token);
             current_width += token_width;
         } else if is_whitespace {
             trim_trailing_whitespace(&mut current);
             if !current.is_empty() {
                 rows.push(std::mem::take(&mut current));
             }
-            current = continuation.clone();
+            current.clear();
+            current.resize(continuation_indent, indent);
             current_width = continuation_indent;
         } else if token_width + continuation_indent <= width {
-            if current.len() > continuation.len() {
+            if current.len() > continuation_indent {
                 trim_trailing_whitespace(&mut current);
                 rows.push(std::mem::take(&mut current));
             }
-            current = continuation.clone();
-            current.extend(token);
+            current.clear();
+            current.resize(continuation_indent, indent);
+            current.extend_from_slice(token);
             current_width = continuation_indent + token_width;
         } else {
-            for (grapheme, style) in token {
-                let grapheme_width = display_width(&grapheme);
+            for grapheme in token {
+                let grapheme_width = usize::from(grapheme.width);
                 if current_width + grapheme_width > width && !current.is_empty() {
                     trim_trailing_whitespace(&mut current);
                     rows.push(std::mem::take(&mut current));
-                    current = continuation.clone();
+                    current.resize(continuation_indent, indent);
                     current_width = continuation_indent;
                 }
-                current.push((grapheme, style));
+                current.push(*grapheme);
                 current_width += grapheme_width;
             }
         }
@@ -512,43 +601,17 @@ fn wrap_styled_graphemes(
     if !current.is_empty() || rows.is_empty() {
         rows.push(current);
     }
-    rows.into_iter().map(styled_graphemes_line).collect()
+    rows.iter().map(|row| buffer.line(row)).collect()
 }
 
-fn styled_token_width(token: &[(String, Style)]) -> usize {
-    token.iter().map(|(text, _)| display_width(text)).sum()
-}
-
-fn trim_trailing_whitespace(graphemes: &mut Vec<(String, Style)>) {
-    while graphemes
-        .last()
-        .is_some_and(|(text, _)| text.chars().all(char::is_whitespace))
-    {
+fn trim_trailing_whitespace(graphemes: &mut Vec<Grapheme>) {
+    while graphemes.last().is_some_and(|grapheme| grapheme.whitespace) {
         graphemes.pop();
     }
 }
 
-fn styled_graphemes_line(graphemes: Vec<(String, Style)>) -> Line<'static> {
-    let mut spans = Vec::new();
-    let mut text = String::new();
-    let mut style = None;
-    for (grapheme, next_style) in graphemes {
-        if style != Some(next_style) {
-            if let Some(style) = style {
-                spans.push(Span::styled(std::mem::take(&mut text), style));
-            }
-            style = Some(next_style);
-        }
-        text.push_str(&grapheme);
-    }
-    if let Some(style) = style {
-        spans.push(Span::styled(text, style));
-    }
-    Line::from(spans)
-}
-
 pub(super) fn display_width(text: &str) -> usize {
-    Line::raw(text.to_owned()).width()
+    unicode_width::UnicodeWidthStr::width(text)
 }
 
 #[cfg(test)]

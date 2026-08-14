@@ -10,8 +10,8 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 
 use crate::hel_archive::{
-    ArchiveInput, BundleManifest, GitCollectionSpec, PayloadRole, SessionManifest, SystemGit,
-    TargetManifest, collect_git_snapshot, read_archive_verified, write_archive_atomic,
+    ArchiveInput, BundleManifest, GitCollectionSpec, GitHistoryMode, PayloadRole, SessionManifest,
+    SystemGit, TargetManifest, collect_git_snapshot, read_archive_verified, write_archive_atomic,
 };
 use crate::hel_checkpoint::{
     CheckpointExportSpec, CheckpointRepositorySpec, CheckpointRestoreSpec, CheckpointTransfer,
@@ -28,8 +28,8 @@ use crate::hel_state::{
     TargetLocator, new_session_id, normalize_session_title,
 };
 use crate::hel_targets::{
-    self, AdditionalMount, AwsTemplate, CommandExecutor, CommandOutput, CommandSpec,
-    ContainerTemplate, ProcessExecutor, ProjectBundleSpec, RepositorySpec, SshTarget,
+    self, AdditionalMount, AwsTemplate, CancellableProcessExecutor, CommandExecutor, CommandOutput,
+    CommandSpec, ContainerTemplate, ProcessExecutor, ProjectBundleSpec, RepositorySpec, SshTarget,
 };
 use crate::hel_worker::{
     PROTOCOL_VERSION, RequestEnvelope, ResponseBody, ResponsePayload, VersionRange, WorkerEvent,
@@ -78,7 +78,18 @@ pub struct RecoveryScan {
 pub struct CheckpointArtifact {
     pub metadata: CheckpointMetadata,
     pub native_session_id: String,
-    pub full_history_fallbacks: Vec<String>,
+}
+
+/// Whether connecting local repositories may also carry the user's current
+/// uncommitted changes into a still-empty target checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalBootstrap {
+    /// A fresh target starts from `git init`, so seed its branch and dirty
+    /// state from the local repository.
+    Seed,
+    /// Resume restores the session's own dirty state from the checkpoint
+    /// archive; seeding the local repository's would collide with it.
+    Skip,
 }
 
 pub struct SessionLaunchOptions {
@@ -86,6 +97,12 @@ pub struct SessionLaunchOptions {
     pub allow_dirty_local: bool,
     pub resource_allocation: Option<SessionResourceAllocation>,
     pub project_directory: Option<PathBuf>,
+}
+
+pub struct SessionResumeOptions {
+    pub additional_mounts: Option<Vec<AdditionalMount>>,
+    pub resource_allocation: Option<SessionResourceAllocation>,
+    pub discard_queue: bool,
 }
 
 impl Controller {
@@ -215,6 +232,13 @@ impl Controller {
         Ok(())
     }
 
+    fn persist_session_state(&self, session_id: &str) -> Result<()> {
+        match self.state.sessions.get(session_id) {
+            Some(session) => crate::hel_database::save_session(session),
+            None => crate::hel_database::delete_session(session_id),
+        }
+    }
+
     /// Find managed resources which are not represented by the controller's
     /// current state. Labels/tags establish Hel ownership; the worker marker
     /// supplies profile and bundle metadata when it is available.
@@ -331,7 +355,7 @@ impl Controller {
         record.native_session_id = crate::hel_worker::recover_native_session_id(&bootstrap.events);
         record.acp_session_title = crate::hel_state::harness_session_title(&bootstrap.events);
         self.state.sessions.insert(session_id.to_owned(), record);
-        self.state.save()
+        self.persist_session_state(session_id)
     }
 
     pub fn destroy_orphan_worker(
@@ -612,21 +636,29 @@ impl Controller {
         if let Some(host) = mount_history_host(template) {
             self.state.remember_mount_sources(&host, &additional_mounts);
         }
-        self.state.save()?;
+        self.persist_session_state(&id)?;
+        if let Some(host) = mount_history_host(template) {
+            crate::hel_database::remember_mount_sources(&host, &additional_mounts)?;
+        }
         Ok(id)
     }
 
     pub async fn provision_session(&mut self, session_id: &str) -> Result<()> {
-        self.provision_session_with(session_id, &ProcessExecutor)
-            .await?;
-        match self
-            .install_and_connect_worker(session_id, &ProcessExecutor)
+        self.provision_session_controlled(session_id, &ProcessExecutor)
             .await
-        {
+    }
+
+    pub async fn provision_session_controlled(
+        &mut self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+    ) -> Result<()> {
+        let github_token = controller_github_token();
+        self.provision_session_with_github_token(session_id, executor, github_token.as_deref())
+            .await?;
+        match self.install_and_connect_worker(session_id, executor).await {
             Ok(native_session_id) => self.mark_worker_connected(session_id, native_session_id),
-            Err(error) => {
-                Err(self.rollback_failed_new_session(session_id, error, &ProcessExecutor)?)
-            }
+            Err(error) => Err(self.rollback_failed_new_session(session_id, error, executor)?),
         }
     }
 
@@ -634,7 +666,7 @@ impl Controller {
         &mut self,
         session_id: &str,
         error: anyhow::Error,
-        executor: &impl CommandExecutor,
+        _executor: &impl CommandExecutor,
     ) -> Result<anyhow::Error> {
         let session = self
             .state
@@ -646,7 +678,11 @@ impl Controller {
             Some(locator) => (|| -> Result<()> {
                 let backend = backend_locator(locator, &session, &self.config)?;
                 hel_targets::close_plan(&backend, session_id)?
-                    .execute(executor)
+                    // Rollback must remain possible after the foreground
+                    // operation's cancellation token has been set.
+                    .execute(&CancellableProcessExecutor::with_timeout(
+                        Duration::from_secs(15),
+                    ))
                     .map(|_| ())
             })(),
             None => Ok(()),
@@ -666,7 +702,7 @@ impl Controller {
                 .err()
                 .map(|cleanup_error| format!("{cleanup_error:#}")),
         );
-        self.state.save()?;
+        self.persist_session_state(session_id)?;
         Ok(failure)
     }
 
@@ -679,7 +715,7 @@ impl Controller {
             .with_context(|| format!("unknown session {session_id}"))?;
         record.session_title_override = Some(title.clone());
         record.updated_at = now();
-        self.state.save()?;
+        self.persist_session_state(session_id)?;
         Ok(title)
     }
 
@@ -695,7 +731,7 @@ impl Controller {
             .with_context(|| format!("unknown session {session_id}"))?;
         if event_sequence > record.last_viewed_event_sequence {
             record.last_viewed_event_sequence = event_sequence;
-            self.state.save()?;
+            self.persist_session_state(session_id)?;
         }
         Ok(())
     }
@@ -704,6 +740,16 @@ impl Controller {
         &mut self,
         session_id: &str,
         executor: &(impl CommandExecutor + Sync),
+    ) -> Result<()> {
+        self.provision_session_with_github_token(session_id, executor, None)
+            .await
+    }
+
+    async fn provision_session_with_github_token(
+        &mut self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+        github_token: Option<&str>,
     ) -> Result<()> {
         let session = self
             .state
@@ -732,19 +778,25 @@ impl Controller {
                     );
                 }
             }
-            let target = backend_target(template, session.resource_allocation.as_ref())?;
+            let mut target = backend_target(template, session.resource_allocation.as_ref())?;
             let runtime_mounts = if matches!(target, hel_targets::TargetTemplate::AwsEc2(_)) {
                 &[][..]
             } else {
                 session.additional_mounts.as_slice()
             };
-            let bundle = session
+            let mut bundle = session
                 .project_directory
                 .is_none()
                 .then(|| self.config.bundles.get(&session.bundle_id))
                 .flatten()
                 .map(backend_bundle)
                 .transpose()?;
+            if let Some(token) = github_token
+                && inject_github_token(&mut target, token)
+                && let Some(bundle) = bundle.as_mut()
+            {
+                use_github_https_urls(bundle);
+            }
             let provision = if let Some(project_directory) = &session.project_directory {
                 hel_targets::provision_bare_project_plan(
                     &target,
@@ -792,9 +844,10 @@ impl Controller {
             };
             if let Some(host) = host {
                 self.state.remember_project_directory(host, &directory);
+                crate::hel_database::remember_project_directory(host, &directory)?;
             }
         }
-        self.state.save()?;
+        self.persist_session_state(session_id)?;
         result
     }
 
@@ -817,7 +870,7 @@ impl Controller {
         }
         session.updated_at = now();
         session.last_error = None;
-        self.state.save()
+        self.persist_session_state(session_id)
     }
 
     async fn install_and_connect_worker(
@@ -827,7 +880,13 @@ impl Controller {
     ) -> Result<Option<String>> {
         let (backend, worker_root) = self.prepare_worker_files(session_id, executor, true)?;
         install_attached_resources(&self.state, session_id, &backend, &worker_root, executor)?;
-        self.connect_local_repositories(session_id, &backend, &worker_root, executor)?;
+        self.connect_local_repositories(
+            session_id,
+            &backend,
+            &worker_root,
+            executor,
+            LocalBootstrap::Seed,
+        )?;
         start_worker(executor, &backend, &worker_root)?;
         let reconnect = &hel_targets::reconnect_plan(&backend, session_id)?.commands[0];
         let readiness = async {
@@ -946,12 +1005,16 @@ impl Controller {
         Ok((backend, worker_root))
     }
 
+    /// Point the target's checkouts at the `hel-local` Git proxy and fetch the
+    /// committed history it serves. `bootstrap` decides whether a still-empty
+    /// checkout is also seeded with the local repository's uncommitted changes.
     fn connect_local_repositories(
         &self,
         session_id: &str,
         backend: &hel_targets::TargetLocator,
         worker_root: &str,
         executor: &impl CommandExecutor,
+        bootstrap: LocalBootstrap,
     ) -> Result<()> {
         let session = self
             .state
@@ -1056,18 +1119,10 @@ impl Controller {
                 missing.push((repository, source));
             }
         }
-        if !missing.is_empty() {
-            restore_local_repository_seed(
-                executor,
-                backend,
-                session,
-                bundle,
-                &workspace_root,
-                worker_root,
-                &missing,
-            )?;
-        }
-        for (repository, _) in local {
+        // Fetch before bootstrapping: the proxy delivers every branch, so the
+        // bootstrap archive only has to carry identity and dirty state, and
+        // the commit it checks out is already present.
+        for (repository, _) in &local {
             let destination = format!(
                 "{workspace_root}/{}",
                 repository.destination.to_string_lossy()
@@ -1086,6 +1141,17 @@ impl Controller {
                     ],
                     "fetch local Git origin",
                 )?,
+            )?;
+        }
+        if bootstrap == LocalBootstrap::Seed && !missing.is_empty() {
+            bootstrap_local_repositories(
+                executor,
+                backend,
+                session,
+                bundle,
+                &workspace_root,
+                worker_root,
+                &missing,
             )?;
         }
         Ok(())
@@ -1248,6 +1314,72 @@ impl Controller {
         additional_mounts: Option<Vec<AdditionalMount>>,
         resource_allocation: Option<SessionResourceAllocation>,
     ) -> Result<WorkerBootstrap> {
+        self.resume_session_with_options_and_queue_disposition(
+            session_id,
+            profile_id,
+            target_id,
+            additional_mounts,
+            resource_allocation,
+            false,
+        )
+        .await
+    }
+
+    pub async fn resume_session_with_queue_disposition(
+        &mut self,
+        session_id: &str,
+        profile_id: &str,
+        target_id: &str,
+        discard_queue: bool,
+    ) -> Result<()> {
+        self.resume_session_with_options_and_queue_disposition(
+            session_id,
+            profile_id,
+            target_id,
+            None,
+            None,
+            discard_queue,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn resume_session_with_options_and_queue_disposition(
+        &mut self,
+        session_id: &str,
+        profile_id: &str,
+        target_id: &str,
+        additional_mounts: Option<Vec<AdditionalMount>>,
+        resource_allocation: Option<SessionResourceAllocation>,
+        discard_queue: bool,
+    ) -> Result<WorkerBootstrap> {
+        self.resume_session_controlled(
+            session_id,
+            profile_id,
+            target_id,
+            SessionResumeOptions {
+                additional_mounts,
+                resource_allocation,
+                discard_queue,
+            },
+            &ProcessExecutor,
+        )
+        .await
+    }
+
+    pub async fn resume_session_controlled(
+        &mut self,
+        session_id: &str,
+        profile_id: &str,
+        target_id: &str,
+        options: SessionResumeOptions,
+        executor: &(impl CommandExecutor + Sync),
+    ) -> Result<WorkerBootstrap> {
+        let SessionResumeOptions {
+            additional_mounts,
+            resource_allocation,
+            discard_queue,
+        } = options;
         let previous = self
             .state
             .sessions
@@ -1308,16 +1440,23 @@ impl Controller {
         {
             let backend = backend_locator(locator, &previous, &self.config)?;
             hel_targets::close_plan(&backend, session_id)?
-                .execute(&ProcessExecutor)
+                .execute(executor)
                 .context("clean up target from failed resume")?;
         }
         let same_harness = profile.kind == archive.manifest.session.harness_kind;
         let canonical_events = archive.payload_by_role(&PayloadRole::CanonicalEvents)?;
         let source_latest_seq = canonical_latest_sequence(canonical_events)?;
+        let archived_queue = canonical_events
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_slice)
+            .collect::<serde_json::Result<Vec<crate::hel_worker::SequencedEvent>>>()
+            .map(|events| crate::hel_worker::queued_prompts_from_events(&events))?;
         let context_bytes = profile
             .context_window_bytes
             .unwrap_or(crate::hel_compaction::DEFAULT_CONTEXT_BYTES);
         let portable_events = (!same_harness).then(|| canonical_events.to_vec());
+        let github_token = controller_github_token();
 
         let record = self.state.sessions.get_mut(session_id).unwrap();
         record.harness_kind = profile.kind;
@@ -1333,14 +1472,19 @@ impl Controller {
         record.last_error = None;
         if let Some(host) = history_host {
             self.state.remember_mount_sources(&host, &history_mounts);
+            crate::hel_database::remember_mount_sources(&host, &history_mounts)?;
         }
-        self.state.save()?;
+        self.persist_session_state(session_id)?;
 
         let result = async {
-            self.provision_session_with(session_id, &ProcessExecutor)
-                .await?;
+            self.provision_session_with_github_token(
+                session_id,
+                executor,
+                github_token.as_deref(),
+            )
+            .await?;
             let (backend, worker_root) =
-                self.prepare_worker_files(session_id, &ProcessExecutor, same_harness)?;
+                self.prepare_worker_files(session_id, executor, same_harness)?;
             let harness_home = target_profile_home(&backend, session_id, &profile);
             let workspace_root = if let Some(project_directory) = &previous.project_directory {
                 project_directory
@@ -1364,6 +1508,17 @@ impl Controller {
                     if !path.starts_with('/') => PathBuf::from(format!("~/{path}")),
                 _ => PathBuf::from(path),
             };
+            // The restore needs the fetched objects: a committed delta bundle
+            // cannot be applied without its prerequisites, and a bundle-free
+            // snapshot checks out a head commit only the proxy can supply. The
+            // archive carries this session's dirty state, so nothing is seeded.
+            self.connect_local_repositories(
+                session_id,
+                &backend,
+                &worker_root,
+                executor,
+                LocalBootstrap::Skip,
+            )?;
             let remote_archive = format!("{worker_root}/restore.hel.zip");
             let remote_spec = format!("{worker_root}/restore-spec.json");
             let restore = CheckpointRestoreSpec {
@@ -1373,26 +1528,27 @@ impl Controller {
                 harness_home: target_path(&harness_home),
                 restore_repositories: previous.project_directory.is_none(),
                 restore_native: same_harness,
+                discard_queued_prompts: discard_queue || !same_harness,
             };
             let staging = tempfile::tempdir().context("create restore staging")?;
             let local_spec = staging.path().join("restore-spec.json");
             std::fs::write(&local_spec, serde_json::to_vec_pretty(&restore)?)?;
             upload_checkpoint_spec(
-                &ProcessExecutor,
+                executor,
                 &backend,
                 session_id,
                 &checkpoint.archive_path,
                 &remote_archive,
             )?;
             upload_checkpoint_spec(
-                &ProcessExecutor,
+                executor,
                 &backend,
                 session_id,
                 &local_spec,
                 &remote_spec,
             )?;
             execute_checked(
-                &ProcessExecutor,
+                executor,
                 restore_command(&backend, session_id, &remote_spec)?,
             )?;
             install_attached_resources(
@@ -1400,15 +1556,16 @@ impl Controller {
                 session_id,
                 &backend,
                 &worker_root,
-                &ProcessExecutor,
+                executor,
             )?;
             self.connect_local_repositories(
                 session_id,
                 &backend,
                 &worker_root,
-                &ProcessExecutor,
+                executor,
+                LocalBootstrap::Seed,
             )?;
-            start_worker(&ProcessExecutor, &backend, &worker_root)?;
+            start_worker(executor, &backend, &worker_root)?;
             handshake_worker(&hel_targets::reconnect_plan(&backend, session_id)?.commands[0])
                 .await?;
             let spec = self.reconnect_command(session_id)?;
@@ -1448,6 +1605,13 @@ impl Controller {
                         }],
                     )
                     .await?;
+                if !discard_queue {
+                    for prompt in &archived_queue {
+                        client
+                            .enqueue_prompt(prompt.text.clone(), prompt.attachments.clone())
+                            .await?;
+                    }
+                }
             }
             self.mark_worker_connected(session_id, Some(native_session_id))?;
             let bootstrap = client.bootstrap().await?;
@@ -1457,9 +1621,7 @@ impl Controller {
         .await;
         match result {
             Ok(bootstrap) => Ok(bootstrap),
-            Err(error) => {
-                Err(self.rollback_failed_resume(session_id, &previous, error, &ProcessExecutor)?)
-            }
+            Err(error) => Err(self.rollback_failed_resume(session_id, &previous, error, executor)?),
         }
     }
 
@@ -1468,7 +1630,7 @@ impl Controller {
         session_id: &str,
         previous: &SessionRecord,
         error: anyhow::Error,
-        executor: &impl CommandExecutor,
+        _executor: &impl CommandExecutor,
     ) -> Result<anyhow::Error> {
         let current = self
             .state
@@ -1480,7 +1642,11 @@ impl Controller {
             Some(locator) => (|| -> Result<()> {
                 let backend = backend_locator(locator, &current, &self.config)?;
                 hel_targets::close_plan(&backend, session_id)?
-                    .execute(executor)
+                    // Use a fresh executor: cancellation applies to the
+                    // requested operation, not to its compensating cleanup.
+                    .execute(&CancellableProcessExecutor::with_timeout(
+                        Duration::from_secs(15),
+                    ))
                     .map(|_| ())
             })(),
             None => Ok(()),
@@ -1495,7 +1661,7 @@ impl Controller {
                 .err()
                 .map(|cleanup_error| format!("{cleanup_error:#}")),
         );
-        self.state.save()?;
+        self.persist_session_state(session_id)?;
         Ok(failure)
     }
 
@@ -1503,6 +1669,15 @@ impl Controller {
     /// target remains live. A failed export or transfer leaves the previous
     /// archive and target untouched.
     pub async fn checkpoint_session(&mut self, session_id: &str) -> Result<CheckpointMetadata> {
+        self.checkpoint_session_controlled(session_id, &ProcessExecutor)
+            .await
+    }
+
+    pub async fn checkpoint_session_controlled(
+        &mut self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+    ) -> Result<CheckpointMetadata> {
         let previous = self
             .state
             .sessions
@@ -1513,12 +1688,9 @@ impl Controller {
         record.state = SessionState::Checkpointing;
         record.updated_at = now();
         record.last_checkpoint_error = None;
-        self.state.save()?;
+        self.persist_session_state(session_id)?;
 
-        match self
-            .checkpoint_session_with(session_id, &ProcessExecutor)
-            .await
-        {
+        match self.checkpoint_session_with(session_id, executor).await {
             Ok(artifact) => {
                 let record = self.state.sessions.get_mut(session_id).unwrap();
                 record.state = SessionState::Running;
@@ -1527,7 +1699,7 @@ impl Controller {
                 record.updated_at = now();
                 record.last_error = None;
                 record.last_checkpoint_error = None;
-                self.state.save()?;
+                self.persist_session_state(session_id)?;
                 prune_replaced_checkpoint(previous.checkpoint.as_ref(), &artifact.metadata);
                 Ok(artifact.metadata)
             }
@@ -1540,7 +1712,7 @@ impl Controller {
                     };
                     record.updated_at = now();
                     record.last_checkpoint_error = Some(format!("{error:#}"));
-                    self.state.save()?;
+                    self.persist_session_state(session_id)?;
                 }
                 Err(error)
             }
@@ -1612,7 +1784,7 @@ impl Controller {
                         id: "project".into(),
                         relative_destination: PathBuf::from(destination),
                         base_commit: "HEAD".into(),
-                        full_history: false,
+                        session_delta: false,
                         capture_contents: false,
                         origin_override: None,
                     }],
@@ -1633,6 +1805,8 @@ impl Controller {
                     .map(|repository| CheckpointRepositorySpec {
                         id: repository.id.clone(),
                         relative_destination: repository.destination.clone(),
+                        // Legacy field: target binaries installed before
+                        // session deltas existed still delta from it.
                         base_commit: if repository.is_local() {
                             "refs/hel/base".into()
                         } else {
@@ -1642,7 +1816,7 @@ impl Controller {
                                 .map(|git_ref| format!("origin/{git_ref}"))
                                 .unwrap_or_else(|| "origin/HEAD".into())
                         },
-                        full_history: false,
+                        session_delta: true,
                         capture_contents: true,
                         origin_override: repository
                             .is_local()
@@ -1708,13 +1882,6 @@ impl Controller {
                 target_checkpoint.event_sequence
             );
         }
-        if !target_checkpoint.full_history_fallbacks.is_empty() {
-            tracing::warn!(
-                session_id,
-                repositories = %target_checkpoint.full_history_fallbacks.join(", "),
-                "checkpoint used full Git history because no common base was available"
-            );
-        }
 
         let destination = sessions_dir().join(format!(
             "{session_id}-{}.hel.zip",
@@ -1741,19 +1908,43 @@ impl Controller {
         Ok(CheckpointArtifact {
             metadata,
             native_session_id,
-            full_history_fallbacks: target_checkpoint.full_history_fallbacks,
         })
     }
 
     /// Checkpoint, ask the harness to close, and only then tear down the exact
     /// provisioned target. Checkpoint failure is deliberately non-destructive.
     pub async fn close_session(&mut self, session_id: &str) -> Result<()> {
-        self.checkpoint_session(session_id).await?;
-        let spec = self.reconnect_command(session_id)?;
-        let mut client = WorkerClient::connect(&spec, session_id).await?;
-        client.close().await?;
-        client.detach().await?;
-        self.destroy_after_verified_checkpoint(session_id, &ProcessExecutor)
+        self.close_session_controlled(session_id, &ProcessExecutor)
+            .await
+    }
+
+    pub async fn close_session_controlled(
+        &mut self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+    ) -> Result<()> {
+        self.checkpoint_session_controlled(session_id, executor)
+            .await?;
+        let result = async {
+            let spec = self.reconnect_command(session_id)?;
+            let mut client = WorkerClient::connect(&spec, session_id).await?;
+            client.close().await?;
+            client.detach().await?;
+            self.destroy_after_verified_checkpoint(session_id, executor)
+        }
+        .await;
+        if let Err(error) = result {
+            if let Some(record) = self.state.sessions.get_mut(session_id) {
+                record.state = SessionState::Error;
+                record.updated_at = now();
+                record.last_error = Some(format!(
+                    "pause failed after recovery copy was saved: {error:#}"
+                ));
+                self.persist_session_state(session_id)?;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Execute cleanup only after the close state machine has installed a
@@ -1780,7 +1971,7 @@ impl Controller {
         record.target = None;
         record.updated_at = now();
         record.last_error = None;
-        self.state.save()
+        self.persist_session_state(session_id)
     }
 
     pub fn force_destroy(
@@ -1802,7 +1993,7 @@ impl Controller {
         record.state = SessionState::DestroyedWithDataLoss;
         record.target = None;
         record.updated_at = now();
-        self.state.save()
+        self.persist_session_state(session_id)
     }
 }
 
@@ -2863,6 +3054,64 @@ fn backend_target(
     })
 }
 
+fn controller_github_token() -> Option<String> {
+    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(token) = std::env::var(name)
+            && let Some(token) = usable_github_token(&token)
+        {
+            return Some(token.to_owned());
+        }
+    }
+    let output = Command::new("gh")
+        .args(["auth", "token", "--hostname", "github.com"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then_some(())
+        .and_then(|()| std::str::from_utf8(&output.stdout).ok())
+        .and_then(usable_github_token)
+        .map(str::to_owned)
+}
+
+fn usable_github_token(token: &str) -> Option<&str> {
+    let token = token.trim();
+    (!token.is_empty() && !token.chars().any(char::is_whitespace)).then_some(token)
+}
+
+fn inject_github_token(target: &mut hel_targets::TargetTemplate, token: &str) -> bool {
+    let container = match target {
+        hel_targets::TargetTemplate::LocalPodman(container)
+        | hel_targets::TargetTemplate::AppleContainer(container)
+        | hel_targets::TargetTemplate::SshPodman { container, .. } => container,
+        hel_targets::TargetTemplate::LocalBare
+        | hel_targets::TargetTemplate::AwsEc2(_)
+        | hel_targets::TargetTemplate::SshBare { .. } => return false,
+    };
+    container
+        .extra_run_args
+        .extend(["--env".to_owned(), format!("GH_TOKEN={token}")]);
+    true
+}
+
+fn use_github_https_urls(bundle: &mut hel_targets::ProjectBundleSpec) {
+    for repository in &mut bundle.repositories {
+        let Some(source) = repository.url.as_deref() else {
+            continue;
+        };
+        let Some(github) = crate::hel_setup::github_repository_from_origin(source) else {
+            continue;
+        };
+        repository.url = Some(format!(
+            "https://github.com/{}/{}.git",
+            github.owner, github.repository
+        ));
+    }
+}
+
 fn mount_history_host(template: &TargetTemplate) -> Option<String> {
     match template {
         TargetTemplate::LocalPodman { .. }
@@ -3318,7 +3567,10 @@ fn local_origin_url(worker_root: &str, repository_id: &str) -> String {
     )
 }
 
-fn restore_local_repository_seed(
+/// Carry a local repository's identity and uncommitted changes into a freshly
+/// initialized target checkout. Committed history is never bundled here: the
+/// caller fetches it through the `hel-local` proxy first.
+fn bootstrap_local_repositories(
     executor: &impl CommandExecutor,
     locator: &hel_targets::TargetLocator,
     session: &SessionRecord,
@@ -3336,8 +3588,7 @@ fn restore_local_repository_seed(
                 &GitCollectionSpec {
                     id: repository.id.clone(),
                     relative_destination: repository.destination.clone(),
-                    base_commit: "HEAD".into(),
-                    full_history: true,
+                    history: GitHistoryMode::NoBundle,
                     origin_override: Some(format!("hel-local:{}", repository.id)),
                 },
             )
@@ -3705,6 +3956,7 @@ fn stage_profile(profile: &crate::hel_config::HarnessProfile, destination: &Path
             "skills",
         ],
         crate::hel_config::HarnessKind::Claude => &[
+            ".claude.json",
             ".credentials.json",
             "settings.json",
             "CLAUDE.md",
@@ -4748,6 +5000,34 @@ mod tests {
     }
 
     #[test]
+    fn stage_claude_profile_preserves_rollout_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let identity = r#"{
+            "machineID": "stable-machine",
+            "userID": "stable-user",
+            "cachedGrowthBookFeatures": {
+                "tengu_velvet_mallet_fable_5": true
+            }
+        }"#;
+        std::fs::write(home.path().join(".claude.json"), identity).unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let profile = crate::hel_config::HarnessProfile {
+            kind: crate::hel_config::HarnessKind::Claude,
+            home: home.path().to_path_buf(),
+            executable: None,
+            environment: BTreeMap::new(),
+            context_window_bytes: None,
+        };
+
+        stage_profile(&profile, staged.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(staged.path().join(".claude.json")).unwrap(),
+            identity
+        );
+    }
+
+    #[test]
     fn stage_kimi_profile_preserves_device_identity() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("config.toml"), "default_model = \"k3\"\n").unwrap();
@@ -4964,6 +5244,44 @@ mod tests {
         };
         assert!(container.extra_run_args.contains(&"--cpus=4".into()));
         assert!(container.extra_run_args.contains(&"A=b c".into()));
+    }
+
+    #[test]
+    fn github_token_is_injected_only_into_managed_containers() {
+        let mut podman = hel_targets::TargetTemplate::LocalPodman(ContainerTemplate {
+            image: "dev:1".into(),
+            extra_run_args: vec![],
+        });
+        assert!(inject_github_token(&mut podman, "github-token"));
+        let hel_targets::TargetTemplate::LocalPodman(container) = podman else {
+            unreachable!()
+        };
+        assert!(
+            container
+                .extra_run_args
+                .windows(2)
+                .any(|arguments| arguments == ["--env", "GH_TOKEN=github-token"])
+        );
+
+        let mut bare = hel_targets::TargetTemplate::LocalBare;
+        assert!(!inject_github_token(&mut bare, "github-token"));
+        assert_eq!(bare, hel_targets::TargetTemplate::LocalBare);
+        assert_eq!(usable_github_token("  token-value\n"), Some("token-value"));
+        assert_eq!(usable_github_token("not a token"), None);
+
+        let mut bundle = hel_targets::ProjectBundleSpec {
+            primary: "app".into(),
+            repositories: vec![hel_targets::RepositorySpec {
+                url: Some("git@github.com:example/app.git".into()),
+                destination: "app".into(),
+                git_ref: None,
+            }],
+        };
+        use_github_https_urls(&mut bundle);
+        assert_eq!(
+            bundle.repositories[0].url.as_deref(),
+            Some("https://github.com/example/app.git")
+        );
     }
 
     #[test]

@@ -248,6 +248,7 @@ mod tests {
     fn completed(seq: u64) -> SequencedEvent {
         SequencedEvent {
             seq,
+            recorded_at_ms: None,
             request_id: None,
             event: WorkerEvent::TurnCompleted,
         }

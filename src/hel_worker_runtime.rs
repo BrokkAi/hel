@@ -241,6 +241,7 @@ mod unix {
             event_worker,
             acp_events_rx,
             checkpoint_rx,
+            acp_commands_tx.clone(),
         ));
 
         loop {
@@ -278,6 +279,7 @@ mod unix {
         worker: Arc<Mutex<DurableWorker>>,
         mut events: mpsc::UnboundedReceiver<RuntimeEvent>,
         mut checkpoints: mpsc::UnboundedReceiver<CheckpointBarrier>,
+        commands: mpsc::Sender<CommandRequest>,
     ) -> Result<()> {
         const DRAIN_BATCH: usize = 256;
 
@@ -289,6 +291,9 @@ mod unix {
                 event = events.recv() => {
                     let Some(event) = event else { return Ok(()) };
                     record_runtime_event(&worker, &mut activity, &event)?;
+                    if matches!(event, RuntimeEvent::PromptFinished { .. }) {
+                        dispatch_pending(&worker, &commands).await?;
+                    }
                 }
                 checkpoint = checkpoints.recv(), if checkpoints_open => {
                     match checkpoint {
@@ -303,6 +308,9 @@ mod unix {
                 match events.try_recv() {
                     Ok(event) => {
                         record_runtime_event(&worker, &mut activity, &event)?;
+                        if matches!(event, RuntimeEvent::PromptFinished { .. }) {
+                            dispatch_pending(&worker, &commands).await?;
+                        }
                         drained += 1;
                         if drained == DRAIN_BATCH {
                             drained = 0;
@@ -794,7 +802,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
-    use crate::hel_acp;
+    use crate::hel_acp::{self, CommandRequest, RuntimeEvent};
     use tokio::sync::{mpsc, oneshot};
 
     fn launch_config(profile_home: &str) -> WorkerLaunchConfig {
@@ -867,10 +875,12 @@ mod tests {
         ));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (checkpoint_tx, checkpoint_rx) = mpsc::unbounded_channel();
+        let (command_tx, _command_rx) = mpsc::channel(1);
         let coordinator = tokio::spawn(unix::run_event_coordinator(
             worker.clone(),
             event_rx,
             checkpoint_rx,
+            command_tx,
         ));
 
         event_tx.send(tool_event("one", "in_progress")).unwrap();
@@ -916,6 +926,68 @@ mod tests {
 
         drop(event_tx);
         drop(checkpoint_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_turn_dispatches_worker_owned_queue_without_a_client() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = crate::hel_worker::DurableWorker::open(
+            temp.path(),
+            "018f9dd2-a3b4-7c8d-9000-123456789abc",
+            "1.0.0",
+        )
+        .unwrap();
+        let accepted = |response: crate::hel_worker::ResponseEnvelope| {
+            assert!(matches!(
+                response.body,
+                crate::hel_worker::ResponseBody::Ok {
+                    payload: crate::hel_worker::ResponsePayload::Accepted { .. }
+                }
+            ));
+        };
+        accepted(durable.handle(crate::hel_worker::RequestEnvelope {
+            request_id: "running-prompt".into(),
+            protocol_version: crate::hel_worker::PROTOCOL_VERSION,
+            request: crate::hel_worker::WorkerRequest::Prompt {
+                text: "running".into(),
+                attachments: vec![],
+            },
+        }));
+        durable.claim_pending_dispatches().unwrap();
+        accepted(durable.handle(crate::hel_worker::RequestEnvelope {
+            request_id: "enqueue-prompt".into(),
+            protocol_version: crate::hel_worker::PROTOCOL_VERSION,
+            request: crate::hel_worker::WorkerRequest::EnqueuePrompt {
+                queue_id: "queued-0001".into(),
+                text: "next".into(),
+                attachments: vec![],
+            },
+        }));
+        let worker = Arc::new(Mutex::new(durable));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (_checkpoint_tx, checkpoint_rx) = mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let coordinator = tokio::spawn(unix::run_event_coordinator(
+            worker,
+            event_rx,
+            checkpoint_rx,
+            command_tx,
+        ));
+
+        event_tx
+            .send(RuntimeEvent::PromptFinished {
+                request_id: "running-prompt".into(),
+                stop_reason: "end_turn".into(),
+            })
+            .unwrap();
+        let command = command_rx.recv().await.unwrap();
+        assert!(matches!(
+            command,
+            CommandRequest::Prompt { request_id, text }
+                if request_id == "queue-queued-0001" && text == "next"
+        ));
+        drop(event_tx);
         coordinator.await.unwrap().unwrap();
     }
 

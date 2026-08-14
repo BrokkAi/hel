@@ -127,7 +127,7 @@ pub(crate) fn format_turn_clock(
 ) -> String {
     if let Some(started_at) = current_turn_started_at {
         let elapsed = now_epoch_seconds.saturating_sub(started_at);
-        return format!("turn {:02}:{:02}", elapsed / 60, elapsed % 60);
+        return format!("{:02}:{:02}", elapsed / 60, elapsed % 60);
     }
     String::new()
 }
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn turn_clock_formats_running_periods_and_leaves_idle_blank() {
-        assert_eq!(format_turn_clock(500, Some(375)), "turn 02:05");
+        assert_eq!(format_turn_clock(500, Some(375)), "02:05");
         assert_eq!(format_turn_clock(5_000, None), "");
     }
 }

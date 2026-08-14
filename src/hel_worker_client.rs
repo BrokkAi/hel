@@ -246,6 +246,40 @@ impl WorkerClient {
             .await
     }
 
+    pub async fn enqueue_prompt(
+        &mut self,
+        text: String,
+        attachments: Vec<Attachment>,
+    ) -> Result<(String, u64)> {
+        self.require_protocol("durable prompt queue", 3)?;
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|error| anyhow!("generate queued prompt id: {error}"))?;
+        let queue_id = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let seq = self
+            .accepted(WorkerRequest::EnqueuePrompt {
+                queue_id: queue_id.clone(),
+                text,
+                attachments,
+            })
+            .await?;
+        Ok((queue_id, seq))
+    }
+
+    pub async fn remove_queued_prompt(&mut self, queue_id: String) -> Result<u64> {
+        self.require_protocol("durable prompt queue", 3)?;
+        self.accepted(WorkerRequest::RemoveQueuedPrompt { queue_id })
+            .await
+    }
+
+    pub async fn clear_queued_prompts(&mut self) -> Result<u64> {
+        self.require_protocol("durable prompt queue", 3)?;
+        self.accepted(WorkerRequest::ClearQueuedPrompts).await
+    }
+
     pub async fn compact(&mut self, text: String) -> Result<String> {
         match self.call(WorkerRequest::Compact { text }).await? {
             ResponsePayload::Compacted { text } => Ok(text),

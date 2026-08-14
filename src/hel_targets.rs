@@ -9,6 +9,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -310,6 +313,187 @@ impl CommandExecutor for ProcessExecutor {
             copy.context("stream command input")?;
             flush.context("flush command input")?;
         }
+        Ok(CommandOutput {
+            status: status.code().unwrap_or(-1),
+            stdout,
+            stderr,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct CancellableProcessExecutor {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellableProcessExecutor {
+    pub fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self { cancelled }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn with_timeout(timeout: Duration) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let deadline = cancelled.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            deadline.store(true, Ordering::Release);
+        });
+        Self { cancelled }
+    }
+
+    fn check_cancelled(&self) -> Result<()> {
+        if self.is_cancelled() {
+            bail!("operation cancelled");
+        }
+        Ok(())
+    }
+}
+
+fn cancellable_command(command: &CommandSpec) -> Command {
+    let mut process = Command::new(&command.program);
+    process.args(&command.args).envs(&command.env);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        process.process_group(0);
+    }
+    process
+}
+
+fn terminate_cancellable_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // The child owns a fresh process group, so descendants such as an SSH or
+    // shell helper cannot keep its output pipes open after cancellation.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+impl CommandExecutor for CancellableProcessExecutor {
+    fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        self.check_cancelled()?;
+        let mut child = cancellable_command(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("run {} for {}", command.program, command.purpose))?;
+        let mut stdout = child.stdout.take().context("command stdout missing")?;
+        let mut stderr = child.stderr.take().context("command stderr missing")?;
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::io::copy(&mut stdout, &mut bytes).map(|_| bytes)
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::io::copy(&mut stderr, &mut bytes).map(|_| bytes)
+        });
+        let status = loop {
+            if self.is_cancelled() {
+                terminate_cancellable_child(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                bail!("operation cancelled while {}", command.purpose);
+            }
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("wait for {}", command.purpose))?
+            {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("command stdout reader panicked"))??;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("command stderr reader panicked"))??;
+        Ok(CommandOutput {
+            status: status.code().unwrap_or(-1),
+            stdout,
+            stderr,
+        })
+    }
+
+    fn execute_with_stdin(
+        &self,
+        command: &CommandSpec,
+        input: &mut dyn Read,
+    ) -> Result<CommandOutput> {
+        self.check_cancelled()?;
+        // Streamed transfers already isolate stdout/stderr reader threads.
+        // Checking before each input chunk makes large checkpoint copies
+        // cooperatively cancellable without changing the executor interface.
+        let mut child = cancellable_command(command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("run {} for {}", command.program, command.purpose))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("streamed command stdin missing")?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("streamed command stdout missing")?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .context("streamed command stderr missing")?;
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::io::copy(&mut stdout, &mut bytes).map(|_| bytes)
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::io::copy(&mut stderr, &mut bytes).map(|_| bytes)
+        });
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            self.check_cancelled().inspect_err(|_| {
+                terminate_cancellable_child(&mut child);
+            })?;
+            let count = input.read(&mut buffer).context("read command input")?;
+            if count == 0 {
+                break;
+            }
+            stdin
+                .write_all(&buffer[..count])
+                .context("stream command input")?;
+        }
+        stdin.flush().context("flush command input")?;
+        drop(stdin);
+        let status = loop {
+            if self.is_cancelled() {
+                terminate_cancellable_child(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                bail!("operation cancelled while {}", command.purpose);
+            }
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("wait for {}", command.purpose))?
+            {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("streamed command stdout reader panicked"))??;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("streamed command stderr reader panicked"))??;
         Ok(CommandOutput {
             status: status.code().unwrap_or(-1),
             stdout,
@@ -1382,9 +1566,18 @@ pub fn bootstrap_probe_plan(
     })
 }
 
-/// Thin Linux Git bootstrap. This is used only after `git --version` fails.
+/// Thin Linux Git bootstrap. Managed containers also receive GitHub CLI and
+/// its HTTPS credential helper so an injected `GH_TOKEN` works before clone.
 pub fn install_git_plan(boundary: ExecutionBoundary<'_>) -> CommandPlan {
-    let script = "set -eu; if command -v git >/dev/null 2>&1; then exit 0; fi; SUDO=''; if [ \"$(id -u)\" != 0 ]; then command -v sudo >/dev/null 2>&1 && sudo -n true || { echo 'Git installation requires root or passwordless sudo' >&2; exit 1; }; SUDO='sudo -n'; fi; if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update; $SUDO apt-get install -y git ca-certificates curl; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y git ca-certificates curl; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y git ca-certificates curl; elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache git ca-certificates curl; else echo 'Unsupported package manager; install Git manually' >&2; exit 1; fi";
+    let managed_container = matches!(
+        boundary,
+        ExecutionBoundary::Container { .. } | ExecutionBoundary::SshPodman { .. }
+    );
+    let script = if managed_container {
+        "set -eu; if ! command -v git >/dev/null 2>&1 || ! command -v gh >/dev/null 2>&1; then SUDO=''; if [ \"$(id -u)\" != 0 ]; then command -v sudo >/dev/null 2>&1 && sudo -n true || { echo 'Git and GitHub CLI installation requires root or passwordless sudo' >&2; exit 1; }; SUDO='sudo -n'; fi; if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update; $SUDO apt-get install -y git gh ca-certificates curl; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y git gh ca-certificates curl; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y git gh ca-certificates curl; elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache git github-cli ca-certificates curl; else echo 'Unsupported package manager; install Git and GitHub CLI in the image' >&2; exit 1; fi; fi; git config --global credential.https://github.com.helper '!gh auth git-credential'; git config --global credential.https://gist.github.com.helper '!gh auth git-credential'"
+    } else {
+        "set -eu; if command -v git >/dev/null 2>&1; then exit 0; fi; SUDO=''; if [ \"$(id -u)\" != 0 ]; then command -v sudo >/dev/null 2>&1 && sudo -n true || { echo 'Git installation requires root or passwordless sudo' >&2; exit 1; }; SUDO='sudo -n'; fi; if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update; $SUDO apt-get install -y git ca-certificates curl; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y git ca-certificates curl; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y git ca-certificates curl; elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache git ca-certificates curl; else echo 'Unsupported package manager; install Git manually' >&2; exit 1; fi"
+    };
     CommandPlan {
         description: "install missing Git".to_owned(),
         commands: vec![
@@ -2038,6 +2231,14 @@ mod tests {
             .find(|command| command.purpose == "install Git")
             .unwrap();
         assert!(bootstrap.args.last().unwrap().contains("command -v git"));
+        assert!(bootstrap.args.last().unwrap().contains("command -v gh"));
+        assert!(
+            bootstrap
+                .args
+                .last()
+                .unwrap()
+                .contains("gh auth git-credential")
+        );
     }
 
     #[test]
@@ -2568,6 +2769,25 @@ mod tests {
         };
         assert!(plan.execute(&executor).is_err());
         assert_eq!(executor.seen.borrow().len(), 2);
+    }
+
+    #[test]
+    fn cancellable_executor_terminates_a_running_process() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let executor = CancellableProcessExecutor::new(cancelled.clone());
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            cancelled.store(true, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        let error = executor
+            .execute(
+                &CommandSpec::new("sh", ["-c", "sleep 30"]).purpose("test cancellable process"),
+            )
+            .unwrap_err();
+        cancel.join().unwrap();
+        assert!(error.to_string().contains("operation cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

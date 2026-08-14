@@ -37,6 +37,8 @@ const SUMMARY_RULE: &str = "─";
 const DASHBOARD_FIXED_HEIGHT: u16 = 3;
 const DASHBOARD_PANE_COUNT: usize = 4;
 const MOUSE_SCROLL_ROWS: isize = 3;
+/// Rows one wheel notch moves the selected session's conversation preview.
+const PREVIEW_SCROLL_ROWS: usize = 3;
 const IMPORT_STALL_WARNING_AFTER: Duration = Duration::from_secs(10);
 
 /// A side effect requested by the dashboard.
@@ -73,6 +75,10 @@ pub enum DashboardAction {
         target_template_id: String,
         additional_mounts: Vec<AdditionalMount>,
         resource_allocation: Option<SessionResourceAllocation>,
+        discard_queue: bool,
+    },
+    CancelOperation {
+        session_id: String,
     },
     ResolveAwsResourceOptions {
         target_template_ids: Vec<String>,
@@ -112,6 +118,38 @@ pub enum DashboardAction {
     QuitDetach,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOperationKind {
+    Launching,
+    Resuming,
+    Pausing,
+    Destroying,
+    Deleting,
+    Connecting,
+    Importing,
+}
+
+impl SessionOperationKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Launching => "Launching",
+            Self::Resuming => "Resuming",
+            Self::Pausing => "Pausing",
+            Self::Destroying => "Destroying",
+            Self::Deleting => "Deleting",
+            Self::Connecting => "Connecting",
+            Self::Importing => "Importing",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SessionOperationDisplay {
+    kind: SessionOperationKind,
+    started_at_epoch_seconds: u64,
+    placeholder: Option<SessionRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportSessionOption {
     pub native_session_id: String,
@@ -140,22 +178,25 @@ enum Focus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionOrder {
-    Added,
+    Sequence,
     RecentActivity,
+    Profile,
 }
 
 impl SessionOrder {
     fn label(self) -> &'static str {
         match self {
-            Self::Added => "added",
+            Self::Sequence => "sequence",
             Self::RecentActivity => "recent activity",
+            Self::Profile => "profile, then sequence",
         }
     }
 
     fn next(self) -> Self {
         match self {
-            Self::Added => Self::RecentActivity,
-            Self::RecentActivity => Self::Added,
+            Self::Sequence => Self::RecentActivity,
+            Self::RecentActivity => Self::Profile,
+            Self::Profile => Self::Sequence,
         }
     }
 }
@@ -284,6 +325,7 @@ struct ResumeWizard {
     resource_allocation: Option<SessionResourceAllocation>,
     aws_options: BTreeMap<String, Vec<SessionResourceAllocation>>,
     sizing_error: Option<String>,
+    discard_queue: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,6 +581,7 @@ struct SessionDetail {
     resource_usage: Option<SessionResourceUsage>,
     transcript: Option<TranscriptSnapshot>,
     transcript_hydration: TranscriptHydration,
+    queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -563,6 +606,7 @@ pub struct DashboardState {
     quotas: BTreeMap<String, ProfileQuota>,
     quota_refreshing: BTreeSet<String>,
     session_details: BTreeMap<String, SessionDetail>,
+    session_operations: BTreeMap<String, SessionOperationDisplay>,
     capacity_details: BTreeMap<String, CapacityDetail>,
     session_index: usize,
     session_order: SessionOrder,
@@ -571,6 +615,14 @@ pub struct DashboardState {
     focus: Focus,
     pane_areas: Option<[Rect; DASHBOARD_PANE_COUNT]>,
     import_sessions_area: Option<Rect>,
+    /// Hitbox of the selected session's conversation preview, so the wheel can
+    /// scroll that preview instead of moving the selection.
+    selected_preview_area: Option<Rect>,
+    /// Rows the selected session's preview sits above its live tail. Only one
+    /// preview scrolls at a time; selecting another session snaps this back to
+    /// the tail, which is why the owning session is tracked alongside it.
+    preview_scroll: usize,
+    preview_scroll_session: Option<String>,
     mode: Mode,
     notice: Option<String>,
     greeting: String,
@@ -584,14 +636,18 @@ impl DashboardState {
             quotas,
             quota_refreshing: BTreeSet::new(),
             session_details: BTreeMap::new(),
+            session_operations: BTreeMap::new(),
             capacity_details: BTreeMap::new(),
             session_index: 0,
-            session_order: SessionOrder::Added,
+            session_order: SessionOrder::Sequence,
             capacity_index: 0,
             quota_index: 0,
             focus: Focus::Active,
             pane_areas: None,
             import_sessions_area: None,
+            selected_preview_area: None,
+            preview_scroll: 0,
+            preview_scroll_session: None,
             mode: Mode::Dashboard,
             notice: None,
             greeting: "Welcome to Hel".into(),
@@ -623,6 +679,7 @@ impl DashboardState {
         for session_id in self.state.sessions.keys() {
             self.session_details.entry(session_id.clone()).or_default();
         }
+        self.apply_operation_projection();
         for (session_id, detail) in &mut self.session_details {
             let viewed_through = self
                 .state
@@ -637,6 +694,69 @@ impl DashboardState {
             }
         }
         self.clamp_selections();
+    }
+
+    pub fn begin_session_operation(
+        &mut self,
+        session_id: String,
+        kind: SessionOperationKind,
+        placeholder: Option<SessionRecord>,
+    ) {
+        self.session_operations.insert(
+            session_id,
+            SessionOperationDisplay {
+                kind,
+                started_at_epoch_seconds: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                placeholder,
+            },
+        );
+        self.apply_operation_projection();
+        self.clamp_selections();
+    }
+
+    pub fn rekey_session_operation(&mut self, previous: &str, session_id: String) {
+        if let Some(mut operation) = self.session_operations.remove(previous) {
+            operation.placeholder = None;
+            self.session_operations.insert(session_id, operation);
+        }
+        self.apply_operation_projection();
+        self.clamp_selections();
+    }
+
+    pub fn finish_session_operation(&mut self, session_id: &str) {
+        self.session_operations.remove(session_id);
+        if self
+            .state
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.id.starts_with("pending-"))
+        {
+            self.state.sessions.remove(session_id);
+        }
+        self.clamp_selections();
+    }
+
+    fn apply_operation_projection(&mut self) {
+        for (session_id, operation) in &self.session_operations {
+            if let Some(placeholder) = &operation.placeholder {
+                self.state
+                    .sessions
+                    .entry(session_id.clone())
+                    .or_insert_with(|| placeholder.clone());
+            }
+            if matches!(
+                operation.kind,
+                SessionOperationKind::Launching
+                    | SessionOperationKind::Resuming
+                    | SessionOperationKind::Importing
+            ) && let Some(session) = self.state.sessions.get_mut(session_id)
+            {
+                session.state = SessionState::Provisioning;
+            }
+        }
     }
 
     pub fn select_active_session(&mut self, session_id: &str) {
@@ -672,18 +792,9 @@ impl DashboardState {
         session_id: &str,
         events: &[SequencedEvent],
         observed_at_epoch_seconds: u64,
+        received_while_detached: bool,
     ) -> bool {
         let mut updated_latest_message = false;
-        let message_is_visible = matches!(self.mode, Mode::Dashboard)
-            && self.focus == Focus::Active
-            && partition_sessions(
-                self.state.sessions.values(),
-                &self.session_details,
-                self.session_order,
-            )
-            .0
-            .get(self.session_index)
-            .is_some_and(|session| session.id == session_id);
         let viewed_through = self
             .state
             .sessions
@@ -717,7 +828,7 @@ impl DashboardState {
                                 && detail.last_agent_message_id == message_id;
                             if !continues_message
                                 && event.seq > viewed_through
-                                && !message_is_visible
+                                && received_while_detached
                             {
                                 detail.unread_agent_message_sequences.push(event.seq);
                             }
@@ -738,6 +849,10 @@ impl DashboardState {
                     }
                 }
                 WorkerEvent::ConfigChanged { .. }
+                | WorkerEvent::QueuedPromptAdded { .. }
+                | WorkerEvent::QueuedPromptRemoved { .. }
+                | WorkerEvent::QueuedPromptPromoted { .. }
+                | WorkerEvent::QueuedPromptsCleared
                 | WorkerEvent::Checkpointed { .. }
                 | WorkerEvent::Closing
                 | WorkerEvent::Closed => {
@@ -756,8 +871,14 @@ impl DashboardState {
         events: &[SequencedEvent],
         phase: WorkerPhase,
         observed_at_epoch_seconds: u64,
+        received_while_detached: bool,
     ) -> bool {
-        let updated = self.apply_worker_events(session_id, events, observed_at_epoch_seconds);
+        let updated = self.apply_worker_events(
+            session_id,
+            events,
+            observed_at_epoch_seconds,
+            received_while_detached,
+        );
         let detail = self
             .session_details
             .entry(session_id.to_string())
@@ -884,6 +1005,7 @@ impl DashboardState {
         detail.agent_text_stream_open = summary.agent_text_stream_open;
         detail.last_agent_message_id = summary.last_agent_message_id;
         detail.transcript = Some(TranscriptSnapshot::from_entries(summary.transcript_tail));
+        detail.queued_prompts = summary.queued_prompts;
         detail.transcript_hydration = TranscriptHydration::Ready;
     }
 
@@ -892,6 +1014,17 @@ impl DashboardState {
             .entry(session_id.to_string())
             .or_default()
             .transcript_hydration = TranscriptHydration::Unavailable;
+    }
+
+    pub fn apply_queued_prompts(
+        &mut self,
+        session_id: &str,
+        queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
+    ) {
+        self.session_details
+            .entry(session_id.to_owned())
+            .or_default()
+            .queued_prompts = queued_prompts;
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
@@ -1161,6 +1294,22 @@ impl DashboardState {
         if !matches!(self.mode, Mode::Dashboard) {
             return;
         }
+        // The selected session's conversation preview scrolls its own history;
+        // anywhere else the wheel moves the hovered list's selection.
+        if let Some(area) = self.selected_preview_area
+            && rect_contains(area, mouse.column, mouse.row)
+        {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.preview_scroll = self.preview_scroll.saturating_add(PREVIEW_SCROLL_ROWS);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.preview_scroll = self.preview_scroll.saturating_sub(PREVIEW_SCROLL_ROWS);
+                }
+                _ => {}
+            }
+            return;
+        }
         let hovered = self.pane_areas.and_then(|areas| {
             areas
                 .into_iter()
@@ -1219,12 +1368,24 @@ impl DashboardState {
                 DashboardAction::None
             }
             (KeyCode::Char('n'), true) => self.begin_new(),
+            (KeyCode::Char('x'), true) => {
+                let session_id = self.selected_session().and_then(|session| {
+                    self.session_operations
+                        .contains_key(&session.id)
+                        .then(|| session.id.clone())
+                });
+                session_id.map_or(DashboardAction::None, |session_id| {
+                    DashboardAction::CancelOperation { session_id }
+                })
+            }
             (KeyCode::Char('i') | KeyCode::Char('t'), true) => DashboardAction::OpenImport,
             (KeyCode::Char('r'), true) => {
                 if self.focus == Focus::Quotas {
                     DashboardAction::RefreshQuotas
                 } else if matches!(self.focus, Focus::Active | Focus::Archived) {
-                    self.begin_rename();
+                    if !self.reject_selected_operation() {
+                        self.begin_rename();
+                    }
                     DashboardAction::None
                 } else {
                     DashboardAction::None
@@ -1233,6 +1394,9 @@ impl DashboardState {
             (KeyCode::Char('u'), true) => DashboardAction::RefreshQuotas,
             (KeyCode::Char('e'), true) if self.config_is_empty() => DashboardAction::OpenConfig,
             (KeyCode::Char('p'), true) if self.focus == Focus::Active => {
+                if self.reject_selected_operation() {
+                    return DashboardAction::None;
+                }
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(Confirmation::Close {
                         session_id: session.id.clone(),
@@ -1241,6 +1405,9 @@ impl DashboardState {
                 DashboardAction::None
             }
             (KeyCode::Char('d'), true) | (KeyCode::Delete, _) if self.focus == Focus::Archived => {
+                if self.reject_selected_operation() {
+                    return DashboardAction::None;
+                }
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(Confirmation::DeleteArchived {
                         session_id: session.id.clone(),
@@ -1249,6 +1416,9 @@ impl DashboardState {
                 DashboardAction::None
             }
             (KeyCode::Char('d'), true) | (KeyCode::Delete, _) if self.focus == Focus::Active => {
+                if self.reject_selected_operation() {
+                    return DashboardAction::None;
+                }
                 if let Some(session) = self.selected_session() {
                     let session_id = session.id.clone();
                     let has_assistant_messages =
@@ -1444,6 +1614,23 @@ impl DashboardState {
                 .cloned()
                 .unwrap_or_default(),
         });
+    }
+
+    fn reject_selected_operation(&mut self) -> bool {
+        let operation = self.selected_session().and_then(|session| {
+            self.session_operations
+                .get(&session.id)
+                .map(|operation| operation.kind)
+        });
+        if let Some(operation) = operation {
+            self.notice = Some(format!(
+                "{} is in progress; press Ctrl+X to cancel it.",
+                operation.label()
+            ));
+            true
+        } else {
+            false
+        }
     }
 
     fn handle_rename_key(&mut self, code: KeyCode, mut editor: RenameEditor) -> DashboardAction {
@@ -2501,6 +2688,16 @@ impl DashboardState {
             mount_history_host(&self.config.targets[&nth_key(&self.config.targets, wizard.target)])
                 .is_some();
         let order = review_focus_order(can_attach, !wizard.mounts.mounts.is_empty());
+        if code == KeyCode::Char('q')
+            && self
+                .session_details
+                .get(&wizard.session_id)
+                .is_some_and(|detail| !detail.queued_prompts.is_empty())
+        {
+            wizard.discard_queue = !wizard.discard_queue;
+            self.mode = Mode::Resume(wizard);
+            return DashboardAction::None;
+        }
         match code {
             KeyCode::Tab | KeyCode::BackTab => {
                 wizard.review_focus =
@@ -2772,6 +2969,7 @@ impl DashboardState {
             target_template_id: nth_key(&self.config.targets, wizard.target),
             additional_mounts: wizard.mounts.mounts,
             resource_allocation: wizard.resource_allocation,
+            discard_queue: wizard.discard_queue,
         };
         self.cancel_modal();
         action
@@ -3000,6 +3198,7 @@ impl DashboardState {
             resource_allocation: None,
             aws_options: BTreeMap::new(),
             sizing_error: None,
+            discard_queue: false,
         });
         self.resolve_all_aws_resource_options_action()
     }
@@ -3026,6 +3225,13 @@ impl DashboardState {
         let Some(session) = self.selected_session() else {
             return DashboardAction::None;
         };
+        if let Some(operation) = self.session_operations.get(&session.id) {
+            self.notice = Some(format!(
+                "{} is in progress; press Ctrl+X to cancel it.",
+                operation.kind.label()
+            ));
+            return DashboardAction::None;
+        }
         if session.state == SessionState::Error {
             if session.checkpoint.is_some() {
                 return self.begin_resume();
@@ -3277,20 +3483,36 @@ fn partition_sessions<'a>(
             archived.push(session);
         }
     }
-    let timestamp = |session: &SessionRecord| match order {
-        SessionOrder::Added => session_timestamp(&session.created_at),
-        SessionOrder::RecentActivity => session_details
+    let activity_timestamp = |session: &SessionRecord| {
+        session_details
             .get(&session.id)
             .and_then(|detail| detail.last_activity_at)
             .map(|timestamp| timestamp as i64)
             .into_iter()
             .chain(session_timestamp(&session.updated_at))
-            .max(),
+            .max()
     };
-    let sort = |left: &&SessionRecord, right: &&SessionRecord| {
-        timestamp(right)
-            .cmp(&timestamp(left))
-            .then_with(|| left.id.cmp(&right.id))
+    let sequence = |left: &&SessionRecord, right: &&SessionRecord| {
+        match (
+            session_timestamp(&left.created_at),
+            session_timestamp(&right.created_at),
+        ) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| left.id.cmp(&right.id))
+    };
+    let sort = |left: &&SessionRecord, right: &&SessionRecord| match order {
+        SessionOrder::Sequence => sequence(left, right),
+        SessionOrder::RecentActivity => activity_timestamp(right)
+            .cmp(&activity_timestamp(left))
+            .then_with(|| sequence(left, right)),
+        SessionOrder::Profile => left
+            .last_profile
+            .cmp(&right.last_profile)
+            .then_with(|| sequence(left, right)),
     };
     active.sort_by(sort);
     archived.sort_by(sort);
@@ -3524,6 +3746,7 @@ impl ResumeWizard {
 
 pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     dashboard.pane_areas = None;
+    dashboard.selected_preview_area = None;
     let area = frame.area();
     dashboard.import_sessions_area =
         matches!(dashboard.mode, Mode::Import(_)).then(|| import_sessions_pane(area));
@@ -3652,8 +3875,10 @@ fn render_adaptive_dashboard(
     dashboard: &mut DashboardState,
 ) {
     let preview_width = inner.width.saturating_sub(4);
+    // A provisional pass sizes the rows; the authoritative pass below runs once
+    // the pane height, and with it the selected session's line budget, is known.
     let full_active_previews =
-        prepare_active_previews(dashboard, preview_width, SELECTED_TRANSCRIPT_LINES);
+        prepare_active_previews(dashboard, preview_width, SELECTED_TRANSCRIPT_LINES).previews;
     let (active_count, archived_count) = {
         let (active, archived) = partition_sessions(
             dashboard.state.sessions.values(),
@@ -3730,7 +3955,14 @@ fn render_adaptive_dashboard(
     )
     .min(SELECTED_TRANSCRIPT_LINES);
     let active_previews = prepare_active_previews(dashboard, preview_width, selected_lines);
-    render_sessions(frame, panes[0], panes[1], dashboard, &active_previews);
+    dashboard.preview_scroll = active_previews.applied_scroll;
+    render_sessions(
+        frame,
+        panes[0],
+        panes[1],
+        dashboard,
+        &active_previews.previews,
+    );
     render_capacity(frame, panes[2], dashboard);
     render_quotas(frame, panes[3], dashboard);
     render_footer(frame, fixed[2], dashboard);
@@ -3781,7 +4013,7 @@ fn prepare_active_previews(
     dashboard: &mut DashboardState,
     preview_width: u16,
     maximum_selected_lines: usize,
-) -> Vec<Vec<Line<'static>>> {
+) -> ActivePreviews {
     let active_ids = partition_sessions(
         dashboard.state.sessions.values(),
         &dashboard.session_details,
@@ -3794,18 +4026,43 @@ fn prepare_active_previews(
     let selected_active = (dashboard.focus == Focus::Active)
         .then_some(dashboard.session_index)
         .filter(|index| *index < active_ids.len());
-    active_ids
-        .iter()
-        .enumerate()
-        .map(|(index, session_id)| {
-            let detail = dashboard.session_details.get_mut(session_id);
-            if selected_active == Some(index) {
-                active_transcript_tail(detail, preview_width, maximum_selected_lines)
-            } else {
-                active_transcript_tail(detail, preview_width, ACTIVE_MESSAGE_LINES)
-            }
-        })
-        .collect()
+    // Only the selected preview scrolls; moving the selection snaps the one
+    // left behind back to its live tail.
+    let selected_id = selected_active.map(|index| active_ids[index].clone());
+    if dashboard.preview_scroll_session != selected_id {
+        dashboard.preview_scroll_session = selected_id;
+        dashboard.preview_scroll = 0;
+    }
+    let mut previews = Vec::with_capacity(active_ids.len());
+    let mut applied_scroll = 0;
+    for (index, session_id) in active_ids.iter().enumerate() {
+        let selected = selected_active == Some(index);
+        let (maximum_lines, scroll) = if selected {
+            (maximum_selected_lines, dashboard.preview_scroll)
+        } else {
+            (ACTIVE_MESSAGE_LINES, 0)
+        };
+        let detail = dashboard.session_details.get_mut(session_id);
+        let (preview, applied) =
+            active_transcript_tail(detail, preview_width, maximum_lines, scroll);
+        if selected {
+            applied_scroll = applied;
+        }
+        previews.push(preview);
+    }
+    ActivePreviews {
+        previews,
+        applied_scroll,
+    }
+}
+
+/// Preview rows for every active session, plus the scroll the selected
+/// session's preview settled on. The caller decides whether to keep the clamped
+/// scroll, because the pass that measures row heights runs against a provisional
+/// line budget and would otherwise narrow how far the preview can scroll.
+struct ActivePreviews {
+    previews: Vec<Vec<Line<'static>>>,
+    applied_scroll: usize,
 }
 
 fn render_terminal_too_small(frame: &mut Frame, area: Rect, required_height: u16) {
@@ -4182,11 +4439,14 @@ fn render_sessions(
                 active_session_row(
                     session,
                     dashboard.session_details.get(&session.id),
+                    dashboard.session_operations.get(&session.id),
                     now_epoch_seconds,
                     &dashboard.config,
-                    preview.len() as u16 + 1,
-                    u16::from(index > 0),
-                    usize::from(active_area.width),
+                    ActiveSessionRowLayout {
+                        height: preview.len() as u16 + 1,
+                        top_margin: u16::from(index > 0),
+                        rule_width: usize::from(active_area.width),
+                    },
                 )
             });
     let active_focused = dashboard.focus == Focus::Active;
@@ -4220,16 +4480,23 @@ fn render_sessions(
         let selected = dashboard.focus == Focus::Active && index == dashboard.session_index;
         let info_y = detail_y.saturating_sub(1);
         if selected && info_y < active_area.bottom().saturating_sub(1) {
-            frame.buffer_mut().set_style(
-                Rect::new(
-                    active_area.x.saturating_add(1),
-                    info_y,
-                    active_area.width.saturating_sub(2),
-                    1,
-                ),
-                // Background only: the summary keeps its own text and rule colors.
-                Style::default().bg(Color::DarkGray),
+            let summary_area = Rect::new(
+                active_area.x.saturating_add(1),
+                info_y,
+                active_area.width.saturating_sub(2),
+                1,
             );
+            let buffer = frame.buffer_mut();
+            buffer.set_style(
+                summary_area,
+                Style::default().bg(Color::DarkGray).fg(Color::LightYellow),
+            );
+            for x in summary_area.x..summary_area.right() {
+                let cell = &mut buffer[(x, info_y)];
+                if cell.symbol() == SUMMARY_RULE {
+                    cell.fg = Color::Reset;
+                }
+            }
         }
         let preview_height = active_area
             .bottom()
@@ -4237,10 +4504,12 @@ fn render_sessions(
             .saturating_sub(detail_y)
             .min(preview.len() as u16);
         if preview_height > 0 {
-            frame.render_widget(
-                Paragraph::new(preview.clone()),
-                Rect::new(active_area.x + 3, detail_y, preview_width, preview_height),
-            );
+            let preview_area =
+                Rect::new(active_area.x + 3, detail_y, preview_width, preview_height);
+            if selected {
+                dashboard.selected_preview_area = Some(preview_area);
+            }
+            frame.render_widget(Paragraph::new(preview.clone()), preview_area);
         }
         row_y = row_y.saturating_add(preview.len() as u16 + 1 + spacer);
     }
@@ -4252,9 +4521,13 @@ fn render_sessions(
         visible_sessions,
     );
 
-    let archived_rows = archived
-        .iter()
-        .map(|session| archived_session_row(session, &dashboard.config));
+    let archived_rows = archived.iter().map(|session| {
+        archived_session_row(
+            session,
+            &dashboard.config,
+            dashboard.session_operations.get(&session.id),
+        )
+    });
     let archived_focused = dashboard.focus == Focus::Archived;
     let archived_table = Table::new(archived_rows, archived_session_column_constraints())
         .header(archived_session_header())
@@ -4325,12 +4598,12 @@ fn focus_border(focused: bool) -> BorderType {
 
 fn session_column_constraints() -> [Constraint; 6] {
     [
+        Constraint::Length(18),
         Constraint::Length(10),
         // Leave a little air before the profile column.
         Constraint::Length(11),
         Constraint::Length(14),
         Constraint::Length(18),
-        Constraint::Length(17),
         Constraint::Min(18),
     ]
 }
@@ -4347,28 +4620,35 @@ fn archived_session_column_constraints() -> [Constraint; 5] {
 
 fn session_header() -> Row<'static> {
     Row::new([
+        "Project",
         "Unread",
         "Turn clock",
         "Profile",
         "Target",
-        "Resources",
         "Session name",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD))
 }
 
 fn archived_session_header() -> Row<'static> {
-    Row::new(["Target", "Profile", "Archived", "Archive", "Session name"])
+    Row::new(["Project", "Profile", "Archived", "Archive", "Session name"])
         .style(Style::default().add_modifier(Modifier::BOLD))
 }
 
 fn session_values(
     session: &SessionRecord,
     detail: Option<&SessionDetail>,
+    operation: Option<&SessionOperationDisplay>,
     now_epoch_seconds: u64,
     config: &HelConfig,
 ) -> (String, String, String, String, String) {
-    let clock = if session.state == SessionState::Provisioning {
+    let clock = if let Some(operation) = operation {
+        format!(
+            "{} {}s",
+            operation.kind.label(),
+            now_epoch_seconds.saturating_sub(operation.started_at_epoch_seconds)
+        )
+    } else if session.state == SessionState::Provisioning {
         let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
         format!("Launch {}s", now_epoch_seconds.saturating_sub(started_at))
     } else {
@@ -4380,11 +4660,8 @@ fn session_values(
     (
         clock,
         session.last_profile.clone(),
-        session_target(config, session),
-        detail
-            .and_then(|detail| detail.resource_usage.as_ref())
-            .map(resource_summary)
-            .unwrap_or_else(|| "—".into()),
+        session.target_template_id.clone(),
+        session_project(config, session),
         session_name(session).to_string(),
     )
 }
@@ -4397,39 +4674,29 @@ fn session_updated_at_epoch_seconds(session: &SessionRecord) -> Option<u64> {
         .ok()
 }
 
-fn session_target(config: &HelConfig, session: &SessionRecord) -> String {
-    let Some(bundle) = config.bundles.get(&session.bundle_id) else {
-        return session.target_template_id.clone();
-    };
-    let project_dirs = bundle
-        .repositories
-        .iter()
-        .map(|repository| repository.destination.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{}: {project_dirs}", session.target_template_id)
+fn session_project(config: &HelConfig, session: &SessionRecord) -> String {
+    if let Some(project_directory) = &session.project_directory {
+        return path_leaf(project_directory);
+    }
+    config
+        .bundles
+        .get(&session.bundle_id)
+        .and_then(|bundle| {
+            bundle
+                .repositories
+                .iter()
+                .find(|repository| repository.id == bundle.primary_repo)
+                .or_else(|| bundle.repositories.first())
+        })
+        .map(|repository| path_leaf(&repository.destination))
+        .unwrap_or_else(|| path_leaf(std::path::Path::new(&session.bundle_id)))
 }
 
-fn resource_summary(usage: &SessionResourceUsage) -> String {
-    let memory = match usage.memory_limit_bytes {
-        Some(limit) if limit > 0 => format!(
-            "M {}%",
-            u128::from(usage.memory_current_bytes) * 100 / u128::from(limit)
-        ),
-        _ => format!("M {}", format_resource_bytes(usage.memory_current_bytes)),
-    };
-    let mut resources = Vec::new();
-    if let Some(cpu) = usage.cpu_percent {
-        resources.push(format!("C {cpu}%"));
-    }
-    resources.push(memory);
-    if let Some(swap) = usage.swap_current_bytes.filter(|swap| *swap > 0) {
-        resources.push(format!("S {}", format_resource_bytes(swap)));
-    }
-    if let Some(disk) = usage.writable_disk_bytes {
-        resources.push(format!("D {}", format_resource_bytes(disk)));
-    }
-    resources.join(" · ")
+fn path_leaf(path: &std::path::Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn checkpoint_archive_size(session: &SessionRecord) -> String {
@@ -4488,67 +4755,81 @@ fn active_message_tail(
         .unwrap_or_default()
 }
 
+/// The preview rows for one active session, plus the scroll actually applied
+/// after clamping to the history available.
 fn active_transcript_tail(
     detail: Option<&mut SessionDetail>,
     width: u16,
     maximum_lines: usize,
-) -> Vec<Line<'static>> {
+    scroll: usize,
+) -> (Vec<Line<'static>>, usize) {
     let Some(detail) = detail else {
-        return vec![Line::styled(
-            "Loading conversation…",
-            Style::default().fg(Color::DarkGray),
-        )];
+        return (
+            vec![Line::styled(
+                "Loading conversation…",
+                Style::default().fg(Color::DarkGray),
+            )],
+            0,
+        );
     };
     match detail.transcript.as_mut() {
-        Some(transcript) => transcript.rich_tail(width, maximum_lines),
-        None if detail.last_agent_message.is_some() => {
-            active_message_tail(Some(detail), usize::from(width), maximum_lines)
-        }
-        None => vec![Line::styled(
-            match detail.transcript_hydration {
-                TranscriptHydration::Loading => "Loading conversation…",
-                TranscriptHydration::Unavailable => "Conversation unavailable",
-                TranscriptHydration::Ready => "No messages yet",
-            },
-            Style::default().fg(Color::DarkGray),
-        )],
+        Some(transcript) => transcript.rich_tail_scrolled(width, maximum_lines, scroll),
+        None if detail.last_agent_message.is_some() => (
+            active_message_tail(Some(detail), usize::from(width), maximum_lines),
+            0,
+        ),
+        None => (
+            vec![Line::styled(
+                match detail.transcript_hydration {
+                    TranscriptHydration::Loading => "Loading conversation…",
+                    TranscriptHydration::Unavailable => "Conversation unavailable",
+                    TranscriptHydration::Ready => "No messages yet",
+                },
+                Style::default().fg(Color::DarkGray),
+            )],
+            0,
+        ),
     }
+}
+
+struct ActiveSessionRowLayout {
+    height: u16,
+    top_margin: u16,
+    rule_width: usize,
 }
 
 fn active_session_row(
     session: &SessionRecord,
     detail: Option<&SessionDetail>,
+    operation: Option<&SessionOperationDisplay>,
     now_epoch_seconds: u64,
     config: &HelConfig,
-    height: u16,
-    top_margin: u16,
-    rule_width: usize,
+    layout: ActiveSessionRowLayout,
 ) -> Row<'static> {
-    let (clock, profile, target, resources, session_name) =
-        session_values(session, detail, now_epoch_seconds, config);
+    let (clock, profile, target, project, session_name) =
+        session_values(session, detail, operation, now_epoch_seconds, config);
     let unread_count = detail.map_or(0, |detail| {
         detail
             .summarized_unread_agent_messages
             .saturating_add(detail.unread_agent_message_sequences.len())
     });
     Row::new([
-        summary_rule_cell(unread_line(unread_count), rule_width),
-        summary_rule_cell(Line::raw(clock), rule_width),
-        summary_rule_cell(Line::raw(profile), rule_width),
-        summary_rule_cell(Line::raw(target), rule_width),
-        summary_rule_cell(Line::raw(resources), rule_width),
+        summary_rule_cell(Line::raw(project), layout.rule_width),
+        summary_rule_cell(unread_line(unread_count), layout.rule_width),
+        summary_rule_cell(Line::raw(clock), layout.rule_width),
+        summary_rule_cell(Line::raw(profile), layout.rule_width),
+        summary_rule_cell(Line::raw(target), layout.rule_width),
         summary_rule_cell(
             Line::raw(recovery_warning_name(
                 session,
                 session_name,
                 now_epoch_seconds,
             )),
-            rule_width,
+            layout.rule_width,
         ),
     ])
-    .style(Style::default().fg(Color::LightYellow))
-    .height(height)
-    .top_margin(top_margin)
+    .height(layout.height)
+    .top_margin(layout.top_margin)
 }
 
 /// Trails each summary column with the block's rule glyph so every active
@@ -4556,6 +4837,9 @@ fn active_session_row(
 /// so one pane-wide run works for every column.
 fn summary_rule_cell(content: Line<'static>, rule_width: usize) -> Cell<'static> {
     let mut spans = content.spans;
+    for span in &mut spans {
+        span.style = span.style.fg(Color::LightYellow);
+    }
     let gap = if spans.iter().all(|span| span.content.is_empty()) {
         ""
     } else {
@@ -4569,39 +4853,25 @@ fn summary_rule_cell(content: Line<'static>, rule_width: usize) -> Cell<'static>
     Cell::from(Line::from(spans))
 }
 
-fn paused_session_target(config: &HelConfig, session: &SessionRecord) -> String {
-    if let Some(project_directory) = &session.project_directory {
-        return project_directory
-            .file_name()
-            .unwrap_or(project_directory.as_os_str())
-            .to_string_lossy()
-            .into_owned();
-    }
-    config.bundles.get(&session.bundle_id).map_or_else(
-        || session.bundle_id.clone(),
-        |bundle| {
-            bundle
-                .repositories
-                .iter()
-                .map(|repository| repository.destination.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        },
-    )
-}
-
-fn archived_session_row(session: &SessionRecord, config: &HelConfig) -> Row<'static> {
+fn archived_session_row(
+    session: &SessionRecord,
+    config: &HelConfig,
+    operation: Option<&SessionOperationDisplay>,
+) -> Row<'static> {
     let checkpoint = session
         .checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint_time_display(&checkpoint.created_at))
         .unwrap_or_else(|| "never".into());
     Row::new([
-        paused_session_target(config, session),
+        session_project(config, session),
         session.last_profile.clone(),
         checkpoint,
         checkpoint_archive_size(session),
-        session_name(session).to_string(),
+        operation.map_or_else(
+            || session_name(session).to_string(),
+            |operation| format!("{}… {}", operation.kind.label(), session_name(session)),
+        ),
     ])
 }
 
@@ -4977,6 +5247,7 @@ fn render_new_wizard(
                 focus: wizard.review_focus,
                 title: " New session · 4/4 review ",
                 submit_label: "Create",
+                queue: None,
             },
         );
         return;
@@ -5174,6 +5445,7 @@ struct ReviewWizardView<'a> {
     focus: ReviewFocus,
     title: &'a str,
     submit_label: &'a str,
+    queue: Option<(usize, bool)>,
 }
 
 fn render_review_wizard(
@@ -5191,6 +5463,7 @@ fn render_review_wizard(
         focus,
         title,
         submit_label,
+        queue,
     } = view;
     let target = &dashboard.config.targets[target_id];
     let can_attach = mount_history_host(target).is_some();
@@ -5203,6 +5476,16 @@ fn render_review_wizard(
             resource_allocation_label(allocation, None)
         )),
     ];
+    if let Some((count, discard)) = queue {
+        lines.push(Line::raw(format!(
+            "Queued prompts: {count} · {} (q toggles)",
+            if discard {
+                "discard on resume"
+            } else {
+                "start after resume"
+            }
+        )));
+    }
     if matches!(target, TargetTemplate::LocalBare)
         && dashboard
             .config
@@ -5464,6 +5747,12 @@ fn render_resume_wizard(
                 focus: wizard.review_focus,
                 title: " Resume · 3/3 review ",
                 submit_label: "Resume",
+                queue: dashboard
+                    .session_details
+                    .get(&wizard.session_id)
+                    .map(|detail| detail.queued_prompts.len())
+                    .filter(|count| *count > 0)
+                    .map(|count| (count, wizard.discard_queue)),
             },
         );
         return;
@@ -6145,6 +6434,21 @@ mod tests {
     }
 
     #[test]
+    fn resume_is_projected_into_active_while_background_work_runs() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Resuming, None);
+
+        assert_eq!(
+            dashboard.state.sessions["session-1"].state,
+            SessionState::Provisioning
+        );
+        assert_eq!(
+            dashboard.session_operations["session-1"].kind,
+            SessionOperationKind::Resuming
+        );
+    }
+
+    #[test]
     fn pane_allocator_fills_complete_tables_then_gives_surplus_to_active() {
         let allocation = allocate_pane_heights(
             37,
@@ -6372,6 +6676,7 @@ mod tests {
     fn adapter_text_event(seq: u64, kind: &str, text: &str) -> SequencedEvent {
         SequencedEvent {
             seq,
+            recorded_at_ms: None,
             request_id: None,
             event: WorkerEvent::Adapter {
                 kind: "session_update".into(),
@@ -6387,8 +6692,16 @@ mod tests {
     }
 
     fn apply_transcript(dashboard: &mut DashboardState, events: &[SequencedEvent]) {
+        apply_transcript_for(dashboard, "session-1", events);
+    }
+
+    fn apply_transcript_for(
+        dashboard: &mut DashboardState,
+        session_id: &str,
+        events: &[SequencedEvent],
+    ) {
         let snapshot: WorkerSnapshot = serde_json::from_value(serde_json::json!({
-            "session_id": "session-1",
+            "session_id": session_id,
             "phase": "running",
             "latest_seq": events.last().map_or(0, |event| event.seq),
             "last_checkpoint_seq": null,
@@ -6398,8 +6711,57 @@ mod tests {
         }))
         .unwrap();
         let chat = crate::hel_chat::ChatState::new(&snapshot, events);
-        dashboard.apply_worker_events("session-1", events, 100);
-        dashboard.apply_transcript("session-1", chat.transcript_snapshot());
+        dashboard.apply_worker_events(session_id, events, 100, false);
+        dashboard.apply_transcript(session_id, chat.transcript_snapshot());
+    }
+
+    /// A conversation of `count` numbered exchanges, so preview scroll
+    /// assertions can name the message they expect to see. Agent chunks
+    /// coalesce unless separated, so each pairs with its own prompt.
+    fn numbered_conversation(count: u64) -> Vec<SequencedEvent> {
+        (0..count)
+            .flat_map(|index| {
+                [
+                    SequencedEvent {
+                        seq: index * 2 + 1,
+                        recorded_at_ms: None,
+                        request_id: None,
+                        event: WorkerEvent::PromptAccepted {
+                            request_id: format!("request-{index}"),
+                            text: format!("question {index}"),
+                            attachments: Vec::new(),
+                        },
+                    },
+                    adapter_text_event(
+                        index * 2 + 2,
+                        "agent_message_chunk",
+                        &format!("answer {index}"),
+                    ),
+                ]
+            })
+            .collect()
+    }
+
+    /// The text inside one rect, row by row. Session summary rows repeat the
+    /// newest agent message, so preview assertions must look only at the
+    /// preview itself.
+    fn rows_in(terminal: &Terminal<TestBackend>, area: Rect) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn rect_shows(terminal: &Terminal<TestBackend>, area: Rect, needle: &str) -> bool {
+        rows_in(terminal, area)
+            .iter()
+            .any(|row| row.contains(needle))
     }
 
     #[test]
@@ -6423,7 +6785,7 @@ mod tests {
         let (active, archived) = partition_sessions(
             state.sessions.values(),
             &BTreeMap::new(),
-            SessionOrder::Added,
+            SessionOrder::Sequence,
         );
         assert_eq!(
             active
@@ -6458,7 +6820,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_are_ordered_by_creation_time_descending_by_default() {
+    fn sessions_are_ordered_by_creation_sequence_ascending_by_default() {
         let mut oldest = archived_session();
         oldest.id = "session-z".into();
         oldest.created_at = "2026-08-09T01:00:00Z".into();
@@ -6472,7 +6834,7 @@ mod tests {
         let (_, archived) = partition_sessions(
             [&invalid_timestamp, &oldest, &newest],
             &BTreeMap::new(),
-            SessionOrder::Added,
+            SessionOrder::Sequence,
         );
 
         assert_eq!(
@@ -6480,23 +6842,26 @@ mod tests {
                 .iter()
                 .map(|session| session.id.as_str())
                 .collect::<Vec<_>>(),
-            ["session-y", "session-z", "session-a"]
+            ["session-z", "session-y", "session-a"]
         );
     }
 
     #[test]
-    fn sort_hotkey_toggles_recent_activity_and_preserves_selection() {
+    fn sort_hotkey_round_robins_sequence_activity_and_profile() {
         let active_session = |id: &str| {
             let mut session = archived_session();
             session.id = id.into();
             session.state = SessionState::Running;
             session
         };
-        let sessions = [
+        let mut sessions = [
             active_session("session-a"),
             active_session("session-b"),
             active_session("session-c"),
         ];
+        sessions[0].last_profile = "z-profile".into();
+        sessions[1].last_profile = "a-profile".into();
+        sessions[2].last_profile = "a-profile".into();
         let state = HelState {
             version: STATE_VERSION,
             sessions: sessions
@@ -6514,7 +6879,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        assert_eq!(dashboard.session_order, SessionOrder::Added);
+        assert_eq!(dashboard.session_order, SessionOrder::Sequence);
         assert_eq!(
             ordered_ids(&dashboard),
             ["session-a", "session-b", "session-c"]
@@ -6526,6 +6891,7 @@ mod tests {
             "session-b",
             &[adapter_text_event(1, "agent_message_chunk", "second")],
             2_000_000_100,
+            false,
         );
         dashboard.handle_key(key(KeyCode::Char('s')));
         assert_eq!(dashboard.session_order, SessionOrder::RecentActivity);
@@ -6543,6 +6909,7 @@ mod tests {
                 "later thought",
             )],
             2_000_000_200,
+            false,
         );
         assert_eq!(
             ordered_ids(&dashboard),
@@ -6553,6 +6920,7 @@ mod tests {
             "session-a",
             &[adapter_text_event(1, "agent_message_chunk", "newest")],
             2_000_000_300,
+            false,
         );
         assert_eq!(
             ordered_ids(&dashboard),
@@ -6560,16 +6928,26 @@ mod tests {
         );
 
         dashboard.handle_key(key(KeyCode::Char('s')));
-        assert_eq!(dashboard.session_order, SessionOrder::Added);
+        assert_eq!(dashboard.session_order, SessionOrder::Profile);
+        assert_eq!(
+            ordered_ids(&dashboard),
+            ["session-b", "session-c", "session-a"]
+        );
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-a");
+
+        dashboard.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(dashboard.session_order, SessionOrder::Sequence);
         assert_eq!(
             ordered_ids(&dashboard),
             ["session-a", "session-b", "session-c"]
         );
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-a");
 
         dashboard.apply_worker_events(
             "session-b",
             &[SequencedEvent {
                 seq: 2,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
@@ -6579,7 +6957,8 @@ mod tests {
                     }),
                 },
             }],
-            400,
+            2_000_000_400,
+            false,
         );
         assert_eq!(
             ordered_ids(&dashboard),
@@ -6588,7 +6967,7 @@ mod tests {
     }
 
     #[test]
-    fn unread_badge_counts_messages_not_chunks_and_clears_through_viewed_sequence() {
+    fn messages_recovered_after_attach_are_unread_by_message_not_chunk() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
@@ -6602,6 +6981,7 @@ mod tests {
                 adapter_text_event(4, "agent_message_chunk", "second message"),
             ],
             100,
+            true,
         );
 
         let detail = dashboard.session_details.get("session-1").unwrap();
@@ -6649,6 +7029,7 @@ mod tests {
         dashboard.focus = Focus::Quotas;
         let first_chunk = SequencedEvent {
             seq: 1,
+            recorded_at_ms: None,
             request_id: None,
             event: WorkerEvent::Adapter {
                 kind: "session_update".into(),
@@ -6685,6 +7066,12 @@ mod tests {
                 agent_text_stream_open: true,
                 last_agent_message_id: Some("answer-1".into()),
                 transcript_tail,
+                queued_prompts: vec![crate::hel_worker::QueuedPrompt {
+                    id: "queued-1".into(),
+                    text: "next task".into(),
+                    attachments: vec![],
+                    created_at_ms: 0,
+                }],
             },
             100,
         );
@@ -6693,6 +7080,7 @@ mod tests {
             "session-1",
             &[SequencedEvent {
                 seq: 2,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
@@ -6707,16 +7095,18 @@ mod tests {
                 },
             }],
             101,
+            false,
         );
 
         let detail = &dashboard.session_details["session-1"];
         assert_eq!(detail.summarized_unread_agent_messages, 1);
         assert!(detail.unread_agent_message_sequences.is_empty());
         assert_eq!(detail.last_agent_message.as_deref(), Some("continuation"));
+        assert_eq!(detail.queued_prompts[0].text, "next task");
     }
 
     #[test]
-    fn expanded_active_session_treats_incoming_messages_as_already_read() {
+    fn messages_received_while_attached_are_read_regardless_of_dashboard_focus() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
@@ -6729,6 +7119,7 @@ mod tests {
                 "visible response",
             )],
             100,
+            false,
         );
 
         assert!(
@@ -6745,15 +7136,17 @@ mod tests {
                 adapter_text_event(3, "agent_message_chunk", "hidden response"),
             ],
             101,
+            false,
         );
-        assert_eq!(
-            dashboard.session_details["session-1"].unread_agent_message_sequences,
-            [3]
+        assert!(
+            dashboard.session_details["session-1"]
+                .unread_agent_message_sequences
+                .is_empty()
         );
     }
 
     #[test]
-    fn active_status_row_leads_with_unread_and_separates_clock_from_profile() {
+    fn active_status_row_leads_with_project_and_separates_clock_from_profile() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
@@ -6766,6 +7159,7 @@ mod tests {
                 "hidden response",
             )],
             100,
+            true,
         );
         let mut terminal = Terminal::new(TestBackend::new(140, 28)).expect("terminal");
         terminal
@@ -6782,6 +7176,7 @@ mod tests {
             .iter()
             .find(|line| line.contains("Turn clock") && line.contains("Profile"))
             .expect("active table header");
+        assert!(header.find("Project") < header.find("Unread"));
         let clock_end = header.find("Turn clock").unwrap() + "Turn clock".len();
         let profile_start = header.find("Profile").unwrap();
         assert!(profile_start.saturating_sub(clock_end) >= 2);
@@ -6791,6 +7186,7 @@ mod tests {
             .position(|line| line.contains("1 unread") && line.contains("codex-1"))
             .expect("active status row");
         let status = &lines[status_y];
+        assert!(status.find("hel") < status.find("1 unread"));
         assert!(status.find("1 unread") < status.find("codex-1"));
         let buffer = terminal.backend().buffer();
         let status_y = buffer.area.y + status_y as u16;
@@ -6798,6 +7194,10 @@ mod tests {
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .filter(|x| summary_text_cell(&buffer[(*x, status_y)]))
                 .all(|x| buffer[(x, status_y)].fg == Color::LightYellow)
+        );
+        assert!(
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .all(|x| buffer[(x, status_y)].bg != Color::DarkGray)
         );
         assert!(status.contains(SUMMARY_RULE));
         assert!(
@@ -6814,6 +7214,7 @@ mod tests {
         let mut dashboard = dashboard_with_session(session);
         let unrelated = SequencedEvent {
             seq: 2,
+            recorded_at_ms: None,
             request_id: None,
             event: WorkerEvent::Adapter {
                 kind: "usage_update".into(),
@@ -6833,6 +7234,7 @@ mod tests {
                 adapter_text_event(4, "agent_message_chunk", "3 directly."),
             ],
             100,
+            false,
         );
 
         assert_eq!(
@@ -7176,6 +7578,7 @@ mod tests {
             "session-1",
             &[adapter_text_event(1, "agent_message_chunk", "hello")],
             1,
+            false,
         );
         assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
         assert!(matches!(
@@ -7447,6 +7850,7 @@ mod tests {
                     cpus: BASELINE_CPUS,
                     memory_bytes: BASELINE_MEMORY_BYTES,
                 }),
+                discard_queue: false,
             }
         );
     }
@@ -7513,6 +7917,7 @@ mod tests {
                     cpus: BASELINE_CPUS,
                     memory_bytes: BASELINE_MEMORY_BYTES,
                 }),
+                discard_queue: false,
             }
         );
     }
@@ -7757,6 +8162,183 @@ mod tests {
         assert_eq!(dashboard.quota_index, 2);
         assert_eq!(dashboard.session_index, 0);
         assert_eq!(dashboard.focus, Focus::Active);
+    }
+
+    /// A dashboard with `count` running sessions, each carrying a numbered
+    /// conversation long enough to scroll.
+    fn dashboard_with_conversations(count: usize) -> DashboardState {
+        let sessions = (0..count)
+            .map(|index| {
+                let mut session = archived_session();
+                session.id = format!("session-{index}");
+                session.state = SessionState::Running;
+                (session.id.clone(), session)
+            })
+            .collect();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        let events = numbered_conversation(14);
+        for index in 0..count {
+            apply_transcript_for(&mut dashboard, &format!("session-{index}"), &events);
+        }
+        dashboard
+    }
+
+    #[test]
+    fn wheel_over_the_selected_preview_scrolls_its_conversation_not_the_session_list() {
+        let mut dashboard = dashboard_with_conversations(3);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw previews");
+        let preview = dashboard
+            .selected_preview_area
+            .expect("the selected session exposes a preview hitbox");
+        assert!(
+            rect_shows(&terminal, preview, "answer 13"),
+            "opens on the tail"
+        );
+
+        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw scrolled preview");
+
+        assert!(
+            !rect_shows(&terminal, preview, "answer 13"),
+            "the wheel scrolled the preview above its live tail"
+        );
+        assert!(
+            rect_shows(&terminal, preview, "question 12"),
+            "older rows came into view"
+        );
+        assert_eq!(
+            dashboard.session_index, 0,
+            "scrolling a preview must not move the selection"
+        );
+        assert_eq!(dashboard.focus, Focus::Active);
+    }
+
+    #[test]
+    fn wheel_below_the_selected_preview_still_moves_the_session_selection() {
+        let mut dashboard = dashboard_with_conversations(3);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw previews");
+        let pane_areas = dashboard.pane_areas.expect("dashboard pane hitboxes");
+        assert!(dashboard.selected_preview_area.is_some());
+
+        // The Active pane's own header sits outside every preview hitbox.
+        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane_areas[0]));
+
+        assert_eq!(dashboard.session_index, 2);
+        assert_eq!(dashboard.preview_scroll, 0);
+    }
+
+    #[test]
+    fn selecting_another_session_snaps_the_previous_preview_back_to_its_tail() {
+        let mut dashboard = dashboard_with_conversations(3);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw previews");
+        let preview = dashboard.selected_preview_area.expect("preview hitbox");
+        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw scrolled preview");
+        assert!(dashboard.preview_scroll > 0, "the preview is scrolled back");
+
+        dashboard.move_selection(1);
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw after moving the selection");
+        assert_eq!(
+            dashboard.preview_scroll, 0,
+            "the new selection starts at its own tail"
+        );
+
+        dashboard.move_selection(-1);
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw after returning to the first session");
+
+        assert_eq!(dashboard.preview_scroll, 0);
+        let preview = dashboard.selected_preview_area.expect("preview hitbox");
+        assert!(
+            rect_shows(&terminal, preview, "answer 13"),
+            "the preview left behind snapped back to its live tail"
+        );
+    }
+
+    #[test]
+    fn preview_scroll_reaches_the_oldest_row_in_a_constrained_terminal() {
+        // A short pane gives the selected preview fewer lines than
+        // SELECTED_TRANSCRIPT_LINES, so the provisional sizing pass must not cap
+        // how far the preview can scroll.
+        let mut dashboard = dashboard_with_conversations(1);
+        let mut terminal = Terminal::new(TestBackend::new(120, 26)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw previews");
+        let preview = dashboard
+            .selected_preview_area
+            .expect("preview hitbox in a short terminal");
+        assert!(
+            preview.height < SELECTED_TRANSCRIPT_LINES as u16,
+            "the preview must be line-constrained for this test to mean anything"
+        );
+
+        for _ in 0..60 {
+            dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
+            terminal
+                .draw(|frame| render(frame, &mut dashboard))
+                .expect("draw scrolled preview");
+        }
+
+        assert!(
+            rect_shows(&terminal, preview, "question 0"),
+            "a constrained preview still reaches the oldest message"
+        );
+    }
+
+    #[test]
+    fn preview_scroll_stops_at_the_oldest_row_of_the_conversation() {
+        let mut dashboard = dashboard_with_conversations(1);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw previews");
+        let preview = dashboard.selected_preview_area.expect("preview hitbox");
+
+        for _ in 0..40 {
+            dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
+            terminal
+                .draw(|frame| render(frame, &mut dashboard))
+                .expect("draw scrolled preview");
+        }
+        let clamped = dashboard.preview_scroll;
+
+        assert!(
+            rect_shows(&terminal, preview, "question 0"),
+            "reaches the oldest message"
+        );
+        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw at the top");
+        assert_eq!(
+            dashboard.preview_scroll, clamped,
+            "scrolling past the oldest row is clamped"
+        );
     }
 
     #[test]
@@ -8426,6 +9008,7 @@ mod tests {
             "session-1",
             &[adapter_text_event(1, "agent_message_chunk", "updated")],
             100,
+            false,
         ));
         assert!(!dashboard.apply_worker_events(
             "session-1",
@@ -8435,6 +9018,7 @@ mod tests {
                 "not a message"
             )],
             101,
+            false,
         ));
     }
 
@@ -8462,6 +9046,7 @@ mod tests {
                 adapter_text_event(3, "agent_thought_chunk", "later thought"),
             ],
             100,
+            false,
         );
         assert_eq!(
             dashboard.session_details["session-1"]
@@ -8489,8 +9074,9 @@ mod tests {
         assert!(rendered.contains("Profile"));
         assert!(rendered.contains("Target"));
         assert!(!rendered.contains("Checkpoint"));
-        assert!(rendered.contains("Resources"));
-        assert!(rendered.contains("C 37% · M 50%"));
+        assert!(rendered.contains("Project"));
+        assert!(rendered.contains("hel"));
+        assert!(!rendered.contains("C 37% · M 50%"));
         assert!(!rendered.contains("S 4.0K · D 8.0K"));
         assert!(rendered.contains("Session name"));
         assert!(rendered.contains("ACP pretty name"));
@@ -8506,6 +9092,7 @@ mod tests {
         let events = vec![
             SequencedEvent {
                 seq: 1,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::PromptAccepted {
                     request_id: "request-1".into(),
@@ -8516,6 +9103,7 @@ mod tests {
             adapter_text_event(2, "agent_message_chunk", "**Rendered answer**"),
             SequencedEvent {
                 seq: 3,
+                recorded_at_ms: None,
                 request_id: None,
                 event: WorkerEvent::Adapter {
                     kind: "session_update".into(),
@@ -8588,6 +9176,13 @@ mod tests {
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .all(|x| buffer[(x, conversation_y)].bg != Color::DarkGray)
+        );
+        let answer_x = row_text(conversation_y)
+            .find("Rendered answer")
+            .expect("conversation text") as u16;
+        assert_ne!(
+            buffer[(buffer.area.x + answer_x, conversation_y)].fg,
+            Color::LightYellow
         );
 
         dashboard.handle_key(key(KeyCode::Tab));
@@ -8662,6 +9257,7 @@ mod tests {
                     "one\ntwo\nthree\nfour",
                 )],
                 100,
+                false,
             );
         }
         let backend = TestBackend::new(120, 36);
@@ -8747,7 +9343,7 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(rendered.matches("Turn clock").count(), 1);
-        assert!(rendered.contains("Target"));
+        assert!(rendered.contains("Project"));
         assert!(rendered.contains("hel"));
         assert!(!rendered.contains("podman: hel"));
         assert!(rendered.contains("26-08-09 01:00"));
@@ -8778,13 +9374,13 @@ mod tests {
         let header = lines
             .iter()
             .find(|line| {
-                line.contains("Target")
+                line.contains("Project")
                     && line.contains("Profile")
                     && line.contains("Archived")
                     && line.contains("Session name")
             })
             .expect("archived header");
-        let target = header.find("Target").unwrap();
+        let project = header.find("Project").unwrap();
         let profile = header.find("Profile").unwrap();
         let archived = header.find("Archived").unwrap();
         let archive = header[archived + "Archived".len()..]
@@ -8793,7 +9389,7 @@ mod tests {
             .unwrap();
         let session_name = header.find("Session name").unwrap();
 
-        assert_eq!(profile - target, 19);
+        assert_eq!(profile - project, 19);
         assert_eq!(archived - profile, 15);
         assert_eq!(archive - archived, 16);
         assert_eq!(session_name - archive, 8);
@@ -8801,7 +9397,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_target_lists_bundle_directories_and_uses_raw_directory_leaf() {
+    fn project_uses_primary_bundle_leaf_or_raw_directory_leaf() {
         let mut config = config();
         config
             .bundles
@@ -8817,13 +9413,10 @@ mod tests {
             });
         let mut session = archived_session();
 
-        assert_eq!(
-            paused_session_target(&config, &session),
-            "hel, documentation"
-        );
+        assert_eq!(session_project(&config, &session), "hel");
 
         session.project_directory = Some(PathBuf::from("/home/user/Projects/raw-project"));
-        assert_eq!(paused_session_target(&config, &session), "raw-project");
+        assert_eq!(session_project(&config, &session), "raw-project");
     }
 
     #[test]
@@ -8887,7 +9480,7 @@ mod tests {
             ..SessionDetail::default()
         };
 
-        let (clock, _, _, _, _) = session_values(&session, Some(&detail), 1_480, &config());
+        let (clock, _, _, _, _) = session_values(&session, Some(&detail), None, 1_480, &config());
         assert_eq!(clock, "");
     }
 
@@ -8896,6 +9489,7 @@ mod tests {
         let mut dashboard = dashboard_with_session(archived_session());
         let prompt = SequencedEvent {
             seq: 1,
+            recorded_at_ms: None,
             request_id: None,
             event: WorkerEvent::PromptAccepted {
                 request_id: "request-1".into(),
@@ -8904,7 +9498,7 @@ mod tests {
             },
         };
 
-        dashboard.apply_worker_update("session-1", &[prompt], WorkerPhase::Idle, 1_000);
+        dashboard.apply_worker_update("session-1", &[prompt], WorkerPhase::Idle, 1_000, false);
 
         assert_eq!(
             dashboard.session_details["session-1"].current_turn_started_at,
@@ -8916,7 +9510,7 @@ mod tests {
     fn checked_in_running_worker_starts_clock_without_unseen_events() {
         let mut dashboard = dashboard_with_session(archived_session());
 
-        dashboard.apply_worker_update("session-1", &[], WorkerPhase::Running, 1_000);
+        dashboard.apply_worker_update("session-1", &[], WorkerPhase::Running, 1_000, false);
 
         assert_eq!(
             dashboard.session_details["session-1"].current_turn_started_at,
@@ -8978,12 +9572,12 @@ mod tests {
         session.state = SessionState::Provisioning;
         session.updated_at = "1970-01-01T00:16:40Z".into();
 
-        let (clock, _, _, _, _) = session_values(&session, None, 1_012, &config());
+        let (clock, _, _, _, _) = session_values(&session, None, None, 1_012, &config());
         assert_eq!(clock, "Launch 12s");
     }
 
     #[test]
-    fn target_cell_combines_infrastructure_and_project_directories() {
+    fn active_target_and_project_are_separate_cells() {
         let mut config = config();
         config
             .bundles
@@ -8998,10 +9592,10 @@ mod tests {
                 git_ref: None,
             });
 
-        assert_eq!(
-            session_target(&config, &archived_session()),
-            "podman: hel, anvil"
-        );
+        let (_, _, target, project, _) =
+            session_values(&archived_session(), None, None, 0, &config);
+        assert_eq!(target, "podman");
+        assert_eq!(project, "hel");
     }
 
     #[test]

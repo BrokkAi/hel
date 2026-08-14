@@ -62,11 +62,10 @@ pub struct RepositoryMetadata {
     pub id: String,
     pub relative_destination: PathBuf,
     pub origin: String,
-    pub base_commit: String,
-    /// The committed bundle includes the base commit and is sufficient to
-    /// populate an empty repository.
+    /// Informational provenance. Session deltas exclude every origin ref rather
+    /// than a single base, so they record an empty string.
     #[serde(default)]
-    pub full_history: bool,
+    pub base_commit: String,
     pub head_commit: String,
     pub branch: Option<String>,
 }
@@ -857,12 +856,27 @@ impl GitCommandRunner for SystemGit {
     }
 }
 
+/// How much committed history a snapshot has to carry. Committed work that is
+/// already reachable from an origin ref is durable at its source, so it is
+/// never bundled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitHistoryMode {
+    /// Bundle commits reachable from HEAD but from no `refs/remotes/origin/*`
+    /// ref. Errors when the repository has no origin refs at all.
+    SessionDelta,
+    /// Bundle commits since `merge-base(HEAD, rev)`. Errors when the revision
+    /// or the merge base cannot be resolved.
+    DeltaFrom(String),
+    /// No committed bundle: origin serves all committed history. Dirty state
+    /// and identity are still collected.
+    NoBundle,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitCollectionSpec {
     pub id: String,
     pub relative_destination: PathBuf,
-    pub base_commit: String,
-    pub full_history: bool,
+    pub history: GitHistoryMode,
     pub origin_override: Option<String>,
 }
 
@@ -892,36 +906,9 @@ pub fn collect_git_snapshot_with_progress(
 ) -> Result<RepositorySnapshot> {
     validate_component(&spec.id, "repository id")?;
     validate_archive_relative_path(&spec.relative_destination)?;
-    ensure!(!spec.base_commit.trim().is_empty(), "base commit is empty");
 
     let identity = collect_git_identity(runner, repository, spec.origin_override.as_deref())?;
-    let (base_commit, full_history) = if spec.full_history {
-        (
-            git_text(runner, repository, ["rev-parse", &spec.base_commit])?,
-            true,
-        )
-    } else {
-        match merge_base(runner, repository, &spec.base_commit)? {
-            Some(base_commit) => (base_commit, false),
-            None => (identity.head_commit.clone(), true),
-        }
-    };
-    let count = if full_history {
-        0
-    } else {
-        git_text(
-            runner,
-            repository,
-            ["rev-list", "--count", &format!("{base_commit}..HEAD")],
-        )?
-        .parse::<u64>()
-        .context("parse committed delta count")?
-    };
-    let history = GitHistorySelection {
-        base_commit,
-        full_history,
-        count,
-    };
+    let history = select_git_history(runner, repository, &spec.history, &identity.head_commit)?;
     collect_git_contents(
         runner,
         repository,
@@ -949,7 +936,6 @@ pub fn collect_git_metadata_snapshot(
             relative_destination: spec.relative_destination.clone(),
             origin: identity.origin,
             base_commit: identity.head_commit.clone(),
-            full_history: false,
             head_commit: identity.head_commit,
             branch: identity.branch,
         },
@@ -1032,10 +1018,88 @@ fn merge_base(
     }
 }
 
+/// True when the repository has at least one `refs/remotes/origin/*` ref, the
+/// exclusion set every session delta is measured against.
+pub fn has_origin_refs(runner: &dyn GitCommandRunner, repository: &Path) -> Result<bool> {
+    let refs = git_text(
+        runner,
+        repository,
+        [
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/remotes/origin",
+        ],
+    )
+    .context("list origin refs")?;
+    Ok(!refs.is_empty())
+}
+
 struct GitHistorySelection {
+    /// Informational only; an empty string for session deltas.
     base_commit: String,
-    full_history: bool,
-    count: u64,
+    /// Arguments for the bundle command, or None when nothing has to be sent.
+    bundle_arguments: Option<Vec<String>>,
+}
+
+fn select_git_history(
+    runner: &dyn GitCommandRunner,
+    repository: &Path,
+    mode: &GitHistoryMode,
+    head_commit: &str,
+) -> Result<GitHistorySelection> {
+    match mode {
+        GitHistoryMode::SessionDelta => {
+            // Collection stays side-effect free; callers repair missing origin
+            // refs before asking for a session delta.
+            ensure!(
+                has_origin_refs(runner, repository)?,
+                "repository has no origin refs to delta against"
+            );
+            let count = git_text(
+                runner,
+                repository,
+                ["rev-list", "--count", "HEAD", "--not", "--remotes=origin"],
+            )?
+            .parse::<u64>()
+            .context("parse committed delta count")?;
+            Ok(GitHistorySelection {
+                base_commit: String::new(),
+                bundle_arguments: (count > 0).then(|| {
+                    ["bundle", "create", "-", "HEAD", "--not", "--remotes=origin"]
+                        .map(String::from)
+                        .to_vec()
+                }),
+            })
+        }
+        GitHistoryMode::DeltaFrom(revision) => {
+            let base_commit = merge_base(runner, repository, revision)?
+                .with_context(|| format!("delta base {revision} is unresolvable"))?;
+            let count = git_text(
+                runner,
+                repository,
+                ["rev-list", "--count", &format!("{base_commit}..HEAD")],
+            )?
+            .parse::<u64>()
+            .context("parse committed delta count")?;
+            let bundle_arguments = (count > 0).then(|| {
+                vec![
+                    "bundle".to_owned(),
+                    "create".to_owned(),
+                    "-".to_owned(),
+                    "HEAD".to_owned(),
+                    format!("^{base_commit}"),
+                ]
+            });
+            Ok(GitHistorySelection {
+                base_commit,
+                bundle_arguments,
+            })
+        }
+        GitHistoryMode::NoBundle => Ok(GitHistorySelection {
+            base_commit: head_commit.to_owned(),
+            bundle_arguments: None,
+        }),
+    }
 }
 
 fn collect_git_contents(
@@ -1049,8 +1113,7 @@ fn collect_git_contents(
 ) -> Result<RepositorySnapshot> {
     let GitHistorySelection {
         base_commit,
-        full_history,
-        count,
+        bundle_arguments,
     } = history;
     // These commands only inspect repository state and produce independent
     // payloads. Nested joins share Rayon's bounded worker pool, including when
@@ -1058,26 +1121,14 @@ fn collect_git_contents(
     let ((committed_bundle, staged_patch), (unstaged_patch, untracked_tar)) = rayon::join(
         || {
             rayon::join(
-                || {
-                    if full_history {
-                        git_bytes(
-                            runner,
-                            repository,
-                            ["bundle", "create", "-", "HEAD"],
-                            &[],
-                            "create full Git bundle",
-                        )
-                    } else if count == 0 {
-                        Ok(Vec::new())
-                    } else {
-                        git_bytes(
-                            runner,
-                            repository,
-                            ["bundle", "create", "-", "HEAD", &format!("^{base_commit}")],
-                            &[],
-                            "create committed delta bundle",
-                        )
-                    }
+                || match &bundle_arguments {
+                    Some(arguments) => git_bytes_owned(
+                        runner,
+                        repository,
+                        arguments,
+                        "create committed delta bundle",
+                    ),
+                    None => Ok(Vec::new()),
                 },
                 || {
                     git_bytes(
@@ -1128,7 +1179,6 @@ fn collect_git_contents(
             relative_destination: spec.relative_destination.clone(),
             origin: identity.origin,
             base_commit,
-            full_history,
             head_commit: identity.head_commit,
             branch: identity.branch,
         },
@@ -1162,19 +1212,6 @@ pub fn restore_git_snapshot(
             "fetch committed delta bundle",
         )?;
     }
-    if snapshot.metadata.full_history {
-        git_bytes(
-            runner,
-            repository,
-            [
-                "update-ref",
-                "refs/hel/base",
-                &snapshot.metadata.base_commit,
-            ],
-            &[],
-            "record Hel repository base",
-        )?;
-    }
     let checkout_target = if snapshot.committed_bundle.is_empty() {
         snapshot.metadata.head_commit.as_str()
     } else {
@@ -1194,7 +1231,8 @@ pub fn restore_git_snapshot(
             ["checkout", "-B", branch, checkout_target],
             &[],
             "restore committed branch",
-        )?;
+        )
+        .with_context(|| checkout_advice(snapshot))?;
     } else {
         git_bytes(
             runner,
@@ -1202,7 +1240,8 @@ pub fn restore_git_snapshot(
             ["checkout", "--detach", checkout_target],
             &[],
             "restore detached commit",
-        )?;
+        )
+        .with_context(|| checkout_advice(snapshot))?;
     }
     if !snapshot.staged_patch.is_empty() {
         git_bytes(
@@ -1223,6 +1262,19 @@ pub fn restore_git_snapshot(
         )?;
     }
     restore_untracked_tar(repository, &snapshot.untracked_tar)
+}
+
+/// A snapshot without a bundle relies on origin for its committed history, so
+/// name the missing commit and how to make it reachable again.
+fn checkout_advice(snapshot: &RepositorySnapshot) -> String {
+    let head_commit = &snapshot.metadata.head_commit;
+    if snapshot.committed_bundle.is_empty() {
+        format!(
+            "restore commit {head_commit}: the archive carries no committed bundle, so this commit must be reachable from the repository's origin; fetch the origin ref that contains it and retry"
+        )
+    } else {
+        format!("restore commit {head_commit}")
+    }
 }
 
 fn run_git<const N: usize>(
@@ -1259,6 +1311,23 @@ fn git_bytes<const N: usize>(
     action: &str,
 ) -> Result<Vec<u8>> {
     let output = run_git(runner, repository, arguments, stdin)?;
+    ensure!(output.status == 0, "{}", git_failure(action, &output));
+    Ok(output.stdout)
+}
+
+fn git_bytes_owned(
+    runner: &dyn GitCommandRunner,
+    repository: &Path,
+    arguments: &[String],
+    action: &str,
+) -> Result<Vec<u8>> {
+    let output = runner.run(
+        repository,
+        &GitCommand {
+            arguments: arguments.iter().map(OsString::from).collect(),
+            stdin: Vec::new(),
+        },
+    )?;
     ensure!(output.status == 0, "{}", git_failure(action, &output));
     Ok(output.stdout)
 }
@@ -1566,6 +1635,7 @@ mod tests {
                 Some("remote") => b"https://token@github.com/example/repo.git\n".to_vec(),
                 Some("rev-parse") => format!("{}\n", "b".repeat(40)).into_bytes(),
                 Some("merge-base") => format!("{}\n", "b".repeat(40)).into_bytes(),
+                Some("for-each-ref") => format!("{}\n", "c".repeat(40)).into_bytes(),
                 Some("symbolic-ref") => b"feature/hel\n".to_vec(),
                 Some("rev-list") => format!("{}\n", self.delta_count).into_bytes(),
                 Some("bundle") => {
@@ -1616,6 +1686,42 @@ mod tests {
         output.stdout
     }
 
+    fn git_line(repository: &Path, arguments: &[&str]) -> String {
+        String::from_utf8(git(repository, arguments))
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    fn initialize_repository(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        git(path, &["init", "-q", "-b", "main"]);
+        git(path, &["config", "user.name", "Hel Test"]);
+        git(path, &["config", "user.email", "hel@example.test"]);
+    }
+
+    fn clone_repository(parent: &Path, origin: &Path, name: &str) -> PathBuf {
+        let destination = parent.join(name);
+        git(
+            parent,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                destination.to_str().unwrap(),
+            ],
+        );
+        git(&destination, &["config", "user.name", "Hel Test"]);
+        git(&destination, &["config", "user.email", "hel@example.test"]);
+        destination
+    }
+
+    fn commit_file(repository: &Path, name: &str, contents: &[u8], message: &str) {
+        fs::write(repository.join(name), contents).unwrap();
+        git(repository, &["add", "."]);
+        git(repository, &["commit", "-qm", message]);
+    }
+
     fn tar_with_file(path: &str, contents: &[u8], mode: u32) -> Vec<u8> {
         let mut output = Vec::new();
         {
@@ -1638,7 +1744,6 @@ mod tests {
                 relative_destination: PathBuf::from(id),
                 origin: format!("https://github.com/example/{id}.git"),
                 base_commit: "a".repeat(40),
-                full_history: false,
                 head_commit: "b".repeat(40),
                 branch: Some("feature/hel".to_string()),
             },
@@ -1852,8 +1957,7 @@ mod tests {
             &GitCollectionSpec {
                 id: "repo".into(),
                 relative_destination: PathBuf::from("repo"),
-                base_commit: "a".repeat(40),
-                full_history: false,
+                history: GitHistoryMode::DeltaFrom("a".repeat(40)),
                 origin_override: None,
             },
         )
@@ -1883,8 +1987,7 @@ mod tests {
             &GitCollectionSpec {
                 id: "repo".into(),
                 relative_destination: PathBuf::from("repo"),
-                base_commit: "a".repeat(40),
-                full_history: false,
+                history: GitHistoryMode::DeltaFrom("a".repeat(40)),
                 origin_override: None,
             },
             false,
@@ -1922,8 +2025,7 @@ mod tests {
                     &GitCollectionSpec {
                         id: "repo".into(),
                         relative_destination: PathBuf::from("repo"),
-                        base_commit: "a".repeat(40),
-                        full_history: false,
+                        history: GitHistoryMode::DeltaFrom("a".repeat(40)),
                         origin_override: None,
                     },
                 )
@@ -1957,15 +2059,13 @@ mod tests {
             &GitCollectionSpec {
                 id: "project".into(),
                 relative_destination: "project".into(),
-                base_commit: "HEAD".into(),
-                full_history: false,
+                history: GitHistoryMode::NoBundle,
                 origin_override: None,
             },
         )
         .unwrap();
 
         assert_eq!(snapshot.metadata.base_commit, snapshot.metadata.head_commit);
-        assert!(!snapshot.metadata.full_history);
         assert!(snapshot.committed_bundle.is_empty());
         assert!(snapshot.staged_patch.is_empty());
         assert!(snapshot.unstaged_patch.is_empty());
@@ -1978,8 +2078,7 @@ mod tests {
             &GitCollectionSpec {
                 id: "project".into(),
                 relative_destination: "project".into(),
-                base_commit: "HEAD".into(),
-                full_history: false,
+                history: GitHistoryMode::NoBundle,
                 origin_override: None,
             },
         )
@@ -1988,47 +2087,244 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_history_falls_back_to_a_self_contained_bundle() {
-        let source = tempfile::tempdir().unwrap();
-        git(source.path(), &["init", "-q", "-b", "main"]);
-        git(source.path(), &["config", "user.name", "Hel Test"]);
-        git(source.path(), &["config", "user.email", "hel@example.test"]);
-        fs::write(source.path().join("old.txt"), b"old\n").unwrap();
-        git(source.path(), &["add", "."]);
-        git(source.path(), &["commit", "-qm", "old root"]);
-        let old_head = String::from_utf8(git(source.path(), &["rev-parse", "HEAD"]))
-            .unwrap()
-            .trim()
-            .to_owned();
-        git(source.path(), &["update-ref", "refs/hel/base", &old_head]);
-        git(source.path(), &["checkout", "-q", "--orphan", "rewritten"]);
-        git(source.path(), &["rm", "-q", "-rf", "."]);
-        fs::write(source.path().join("new.txt"), b"new root\n").unwrap();
-        git(source.path(), &["add", "."]);
-        git(source.path(), &["commit", "-qm", "new root"]);
+    fn session_delta_bundles_commits_missing_from_every_origin_ref() {
+        let directory = tempfile::tempdir().unwrap();
+        let origin = directory.path().join("origin");
+        initialize_repository(&origin);
+        commit_file(&origin, "base.txt", b"base\n", "base");
+        git(&origin, &["checkout", "-q", "-b", "release"]);
+        commit_file(&origin, "release.txt", b"release\n", "release");
+        git(&origin, &["checkout", "-q", "main"]);
+        let source = clone_repository(directory.path(), &origin, "source");
+        commit_file(&source, "first.txt", b"first\n", "first");
+        commit_file(&source, "second.txt", b"second\n", "second");
+        let head = git_line(&source, &["rev-parse", "HEAD"]);
 
         let snapshot = collect_git_snapshot(
+            &SystemGit,
+            &source,
+            &GitCollectionSpec {
+                id: "repo".into(),
+                relative_destination: "repo".into(),
+                history: GitHistoryMode::SessionDelta,
+                origin_override: None,
+            },
+        )
+        .unwrap();
+
+        assert!(!snapshot.committed_bundle.is_empty());
+        assert_eq!(snapshot.metadata.base_commit, "");
+        assert_eq!(snapshot.metadata.head_commit, head);
+
+        let destination = clone_repository(directory.path(), &origin, "restored");
+        restore_git_snapshot(&SystemGit, &destination, &snapshot).unwrap();
+        assert_eq!(git_line(&destination, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            git_line(
+                &destination,
+                &["rev-list", "--count", "HEAD", "--not", "--remotes=origin"]
+            ),
+            "2"
+        );
+        assert_eq!(
+            fs::read(destination.join("release.txt"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    /// Provisioning must fetch a local repository's history before restoring
+    /// into it: the delta bundle carries only the commits origin lacks.
+    #[test]
+    fn session_delta_restore_requires_the_fetched_origin_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let origin = directory.path().join("origin");
+        initialize_repository(&origin);
+        commit_file(&origin, "base.txt", b"base\n", "base");
+        let source = clone_repository(directory.path(), &origin, "source");
+        commit_file(&source, "session.txt", b"session\n", "session work");
+        let head = git_line(&source, &["rev-parse", "HEAD"]);
+        let snapshot = collect_git_snapshot(
+            &SystemGit,
+            &source,
+            &GitCollectionSpec {
+                id: "repo".into(),
+                relative_destination: "repo".into(),
+                history: GitHistoryMode::SessionDelta,
+                origin_override: None,
+            },
+        )
+        .unwrap();
+
+        let destination = directory.path().join("target");
+        initialize_repository(&destination);
+        let unfetched = restore_git_snapshot(&SystemGit, &destination, &snapshot).unwrap_err();
+        assert!(
+            format!("{unfetched:#}").contains("fetch committed delta bundle"),
+            "{unfetched:#}"
+        );
+
+        git(
+            &destination,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&destination, &["fetch", "-q", "origin"]);
+        restore_git_snapshot(&SystemGit, &destination, &snapshot).unwrap();
+
+        assert_eq!(git_line(&destination, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            fs::read(destination.join("session.txt")).unwrap(),
+            b"session\n"
+        );
+    }
+
+    #[test]
+    fn session_delta_errors_without_origin_refs() {
+        let source = tempfile::tempdir().unwrap();
+        initialize_repository(source.path());
+        commit_file(source.path(), "base.txt", b"base\n", "base");
+
+        let error = collect_git_snapshot(
             &SystemGit,
             source.path(),
             &GitCollectionSpec {
                 id: "repo".into(),
                 relative_destination: "repo".into(),
-                base_commit: "refs/hel/base".into(),
-                full_history: false,
+                history: GitHistoryMode::SessionDelta,
+                origin_override: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("repository has no origin refs to delta against"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn delta_from_errors_when_the_base_is_unresolvable() {
+        let source = tempfile::tempdir().unwrap();
+        initialize_repository(source.path());
+        commit_file(source.path(), "old.txt", b"old\n", "old root");
+
+        let missing = collect_git_snapshot(
+            &SystemGit,
+            source.path(),
+            &GitCollectionSpec {
+                id: "repo".into(),
+                relative_destination: "repo".into(),
+                history: GitHistoryMode::DeltaFrom("refs/hel/missing".into()),
+                origin_override: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("delta base refs/hel/missing is unresolvable"),
+            "{missing:#}"
+        );
+
+        let old_head = git_line(source.path(), &["rev-parse", "HEAD"]);
+        git(source.path(), &["checkout", "-q", "--orphan", "rewritten"]);
+        git(source.path(), &["rm", "-q", "-rf", "."]);
+        commit_file(source.path(), "new.txt", b"new root\n", "new root");
+        let unrelated = collect_git_snapshot(
+            &SystemGit,
+            source.path(),
+            &GitCollectionSpec {
+                id: "repo".into(),
+                relative_destination: "repo".into(),
+                history: GitHistoryMode::DeltaFrom(old_head.clone()),
+                origin_override: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{unrelated:#}").contains(&format!("delta base {old_head} is unresolvable")),
+            "{unrelated:#}"
+        );
+    }
+
+    #[test]
+    fn no_bundle_snapshot_carries_dirty_state_without_committed_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let origin = directory.path().join("origin");
+        initialize_repository(&origin);
+        commit_file(&origin, "tracked.txt", b"base\n", "base");
+        commit_file(&origin, "dirty.txt", b"clean\n", "clean");
+        let source = clone_repository(directory.path(), &origin, "source");
+        fs::write(source.join("staged.txt"), b"staged\n").unwrap();
+        git(&source, &["add", "staged.txt"]);
+        fs::write(source.join("dirty.txt"), b"dirty\n").unwrap();
+        fs::write(source.join("new.txt"), b"untracked\n").unwrap();
+        let head = git_line(&source, &["rev-parse", "HEAD"]);
+
+        let snapshot = collect_git_snapshot(
+            &SystemGit,
+            &source,
+            &GitCollectionSpec {
+                id: "repo".into(),
+                relative_destination: "repo".into(),
+                history: GitHistoryMode::NoBundle,
+                origin_override: Some("hel-local:repo".into()),
+            },
+        )
+        .unwrap();
+
+        assert!(snapshot.committed_bundle.is_empty());
+        assert_eq!(snapshot.metadata.origin, "hel-local:repo");
+        assert_eq!(snapshot.metadata.base_commit, head);
+        assert!(!snapshot.staged_patch.is_empty());
+        assert!(!snapshot.unstaged_patch.is_empty());
+        assert!(!snapshot.untracked_tar.is_empty());
+
+        let destination = clone_repository(directory.path(), &origin, "restored");
+        git(&destination, &["checkout", "-q", "--detach", "HEAD"]);
+        restore_git_snapshot(&SystemGit, &destination, &snapshot).unwrap();
+
+        assert_eq!(git_line(&destination, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            git_line(&destination, &["symbolic-ref", "--short", "HEAD"]),
+            "main"
+        );
+        assert_eq!(fs::read(destination.join("dirty.txt")).unwrap(), b"dirty\n");
+        assert_eq!(
+            fs::read(destination.join("new.txt")).unwrap(),
+            b"untracked\n"
+        );
+        let status = String::from_utf8(git(&destination, &["status", "--short"])).unwrap();
+        assert!(status.contains("A  staged.txt"), "{status}");
+        assert!(status.contains(" M dirty.txt"), "{status}");
+        assert!(status.contains("?? new.txt"), "{status}");
+    }
+
+    #[test]
+    fn restore_without_a_bundle_reports_an_unreachable_commit_actionably() {
+        let directory = tempfile::tempdir().unwrap();
+        let origin = directory.path().join("origin");
+        initialize_repository(&origin);
+        commit_file(&origin, "base.txt", b"base\n", "base");
+        let source = clone_repository(directory.path(), &origin, "source");
+        commit_file(&source, "local.txt", b"local\n", "local only");
+        let snapshot = collect_git_snapshot(
+            &SystemGit,
+            &source,
+            &GitCollectionSpec {
+                id: "repo".into(),
+                relative_destination: "repo".into(),
+                history: GitHistoryMode::NoBundle,
                 origin_override: None,
             },
         )
         .unwrap();
-        assert!(snapshot.metadata.full_history);
-        assert_eq!(snapshot.metadata.base_commit, snapshot.metadata.head_commit);
-        assert!(!snapshot.committed_bundle.is_empty());
 
-        let restored = tempfile::tempdir().unwrap();
-        git(restored.path(), &["init", "-q", "-b", "main"]);
-        restore_git_snapshot(&SystemGit, restored.path(), &snapshot).unwrap();
-        assert_eq!(
-            fs::read(restored.path().join("new.txt")).unwrap(),
-            b"new root\n"
+        let destination = clone_repository(directory.path(), &origin, "restored");
+        let error = restore_git_snapshot(&SystemGit, &destination, &snapshot).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("must be reachable from the repository's origin"),
+            "{error:#}"
         );
     }
 
@@ -2091,14 +2387,12 @@ mod tests {
             &GitCollectionSpec {
                 id: "repo".into(),
                 relative_destination: PathBuf::from("repo"),
-                base_commit: base.clone(),
-                full_history: false,
+                history: GitHistoryMode::DeltaFrom(base.clone()),
                 origin_override: None,
             },
         )
         .unwrap();
         assert!(!snapshot.committed_bundle.is_empty());
-        assert!(!snapshot.metadata.full_history);
         assert_eq!(snapshot.metadata.base_commit, base);
 
         let destination_parent = tempfile::tempdir().unwrap();

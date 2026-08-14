@@ -16,8 +16,9 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use hel::hel_archive::{PayloadRole, read_archive_verified};
 use hel::hel_config::{HelConfig, ProjectBundle, ProjectRepository, config_path, sessions_dir};
-use hel::hel_controller::{Controller, SessionLaunchOptions};
+use hel::hel_controller::{Controller, SessionLaunchOptions, SessionResumeOptions};
 use hel::hel_greeting::{GreetingFacts, RepositoryGreetingFacts};
 use hel::hel_import::{
     BundleResolution, ClaudeImportRequest, ClaudeSessionSelection, CodexImportRequest,
@@ -31,20 +32,25 @@ use hel::hel_import::{
     scan_codex_sessions, scan_kimi_sessions, session_edit_targets,
 };
 use hel::hel_quota::{ProfileQuota, QuotaManager, QuotaRefreshRequest};
-use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapshot};
+use hel::hel_server::{
+    ControllerAction, ControllerRequest, ResumeQueueDisposition, ServerOptions, ViewerQueuedPrompt,
+    ViewerQuota, ViewerSnapshot,
+};
 use hel::hel_setup::{SetupOutcome, github_repository_from_origin, run_setup_dialog};
 use hel::hel_state::{
     HelState, SessionResourceAllocation, SessionState, TargetLocator, harness_session_title,
 };
 use hel::hel_targets::{
-    CommandOutput, CommandSpec, DeploymentCapacityKind, DeploymentCapacityTarget,
-    DeploymentCapacityUsage, ProcessExecutor, SessionResourceProbe, SessionResourceUsage,
+    CancellableProcessExecutor, CommandOutput, CommandSpec, DeploymentCapacityKind,
+    DeploymentCapacityTarget, DeploymentCapacityUsage, ProcessExecutor, SessionResourceProbe,
+    SessionResourceUsage,
 };
 use hel::hel_tui::{
-    DashboardAction, DashboardState, ImportProfileOption, ImportSessionOption, render,
+    DashboardAction, DashboardState, ImportProfileOption, ImportSessionOption,
+    SessionOperationKind, render,
 };
 use hel::hel_worker::{SequencedEvent, WorkerPhase};
-use hel::hel_worker_client::WorkerClient;
+use hel::hel_worker_client::{WorkerBootstrap, WorkerClient};
 use hel::hel_worker_runtime::{
     AcpSupervisorSpec, WorkerLaunchConfig, proxy, run_acp_supervisor, run_daemon,
 };
@@ -311,6 +317,9 @@ enum WorkerPollPayload {
         events: Vec<SequencedEvent>,
         phase: WorkerPhase,
         transcript: hel::hel_chat::TranscriptSnapshot,
+        queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
+        /// These events predate the connection established by this poll.
+        received_while_detached: bool,
     },
     Hydrated(hel::hel_worker::WorkerSessionSummary),
     /// The worker failed several consecutive polls; the session needs
@@ -324,6 +333,7 @@ struct WarmWorker {
     spec: CommandSpec,
     client: WorkerClient,
     chat: hel::hel_chat::ChatState,
+    queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
     opening_events: Vec<SequencedEvent>,
     full_history: bool,
 }
@@ -620,7 +630,12 @@ fn import_claude(args: ClaudeImportArgs) -> Result<()> {
     // `write_archive_atomic`; persist a synthesized config before the state
     // record that references it.
     config.save()?;
-    state.save()?;
+    hel::hel_database::save_session(
+        state
+            .sessions
+            .get(&imported.session_id)
+            .context("import did not add its session to controller state")?,
+    )?;
     println!(
         "Imported {} as Hel session {} (bundle {}, archive {})",
         imported.native_session_id,
@@ -670,7 +685,12 @@ fn import_codex(args: CodexImportArgs) -> Result<()> {
         },
     )?;
     config.save()?;
-    state.save()?;
+    hel::hel_database::save_session(
+        state
+            .sessions
+            .get(&imported.session_id)
+            .context("import did not add its session to controller state")?,
+    )?;
     println!(
         "Imported {} as Hel session {} (bundle {}, archive {})",
         imported.native_session_id,
@@ -720,7 +740,12 @@ fn import_kimi(args: KimiImportArgs) -> Result<()> {
         },
     )?;
     config.save()?;
-    state.save()?;
+    hel::hel_database::save_session(
+        state
+            .sessions
+            .get(&imported.session_id)
+            .context("import did not add its session to controller state")?,
+    )?;
     println!(
         "Imported {} as Hel session {} (bundle {}, archive {})",
         imported.native_session_id,
@@ -809,8 +834,16 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     let mut quotas = QuotaManager::default();
     refresh_all_quotas(&controller, &mut quotas).await;
     let mut revision = 1;
-    let (snapshot_tx, snapshot_rx) =
-        tokio::sync::watch::channel(viewer_snapshot(&controller, &quotas, revision));
+    let mut conversations = std::collections::BTreeMap::new();
+    let mut queued_prompts = archived_queued_prompts(&controller);
+    let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(viewer_snapshot(
+        &controller,
+        &quotas,
+        &conversations,
+        &queued_prompts,
+        revision,
+    ));
+    let (conversation_tx, conversation_rx) = tokio::sync::watch::channel(conversations.clone());
     let (action_tx, mut action_rx) = tokio::sync::mpsc::channel(32);
     let (worker_targets_tx, mut worker_updates_rx, _worker_commands_tx) =
         spawn_dashboard_worker_poller();
@@ -818,7 +851,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn();
     let recovery_observer = recovery.observer();
     let termination = hel::termination::Coordinator::install().token();
-    let mut options = ServerOptions::new(bind, snapshot_rx, action_tx)?;
+    let mut options = ServerOptions::new(bind, snapshot_rx, conversation_rx, action_tx)?;
     options.shutdown = termination.clone();
     if let (Some(cert), Some(key)) = (args.tls_cert, args.tls_key) {
         options.set_tls_config(
@@ -835,32 +868,69 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     let serve = hel::hel_server::run_server(options);
     let control = async {
         let mut recovery_tick = tokio::time::interval(Duration::from_millis(250));
+        let (action_done_tx, mut action_done_rx) = tokio::sync::mpsc::unbounded_channel::<(
+            Option<String>,
+            tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+            std::result::Result<(), String>,
+        )>();
+        let mut active_actions = std::collections::BTreeSet::new();
         loop {
             tokio::select! {
                 _ = termination.cancelled() => break,
                 update = worker_updates_rx.recv() => {
                     let Some(update) = update else { break };
+                    let mut browser_update = None;
+                    let mut queue_update = None;
                     let progress = match update.payload {
-                        WorkerPollPayload::Events { events, phase, .. } => Some((
+                        WorkerPollPayload::Events {
+                            events,
                             phase,
-                            hel::hel_recovery::latest_completed_turn_seq(&events),
-                        )),
+                            transcript,
+                            queued_prompts: worker_queue,
+                            ..
+                        } => {
+                            browser_update = Some(transcript.browser_transcript(None));
+                            queue_update = Some(worker_queue);
+                            Some((
+                                phase,
+                                hel::hel_recovery::latest_completed_turn_seq(&events),
+                            ))
+                        }
                         WorkerPollPayload::Hydrated(summary) => {
+                            browser_update = Some(
+                                hel::hel_chat::TranscriptSnapshot::from_entries_at(
+                                    summary.transcript_tail.clone(),
+                                    summary.latest_seq,
+                                )
+                                .browser_transcript(None),
+                            );
+                            queue_update = Some(summary.queued_prompts.clone());
                             Some((summary.phase, summary.latest_completed_turn_seq))
                         }
                         WorkerPollPayload::Connected | WorkerPollPayload::Unreachable { .. } => None,
                     };
-                    if let Some((phase, latest_completed_turn_seq)) = progress
-                        && let Some(session) = controller.state.sessions.get(&update.session_id).cloned()
-                    {
-                        recovery_observer
-                            .observe(hel::hel_recovery::RecoveryObservation {
-                                session,
-                                config: controller.config.clone(),
-                                latest_completed_turn_seq,
-                                phase,
-                            })
-                            .await;
+                    if let Some((phase, latest_completed_turn_seq)) = progress {
+                        if let Some(session) = controller.state.sessions.get(&update.session_id).cloned() {
+                            recovery_observer
+                                .observe(hel::hel_recovery::RecoveryObservation {
+                                    session,
+                                    config: controller.config.clone(),
+                                    latest_completed_turn_seq,
+                                    phase,
+                                })
+                                .await;
+                        }
+                        conversations.insert(update.session_id.clone(), browser_update.unwrap());
+                        queued_prompts.insert(update.session_id.clone(), queue_update.unwrap());
+                        revision += 1;
+                        conversation_tx.send_replace(conversations.clone());
+                        let _ = snapshot_tx.send(viewer_snapshot(
+                            &controller,
+                            &quotas,
+                            &conversations,
+                            &queued_prompts,
+                            revision,
+                        ));
                     }
                 }
                 _ = recovery_tick.tick() => {
@@ -870,23 +940,54 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                     }
                     if changed {
                         revision += 1;
-                        let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, revision));
+                        let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, revision));
                     }
                 }
                 action = action_rx.recv() => {
-                    let Some(action) = action else { break };
-                    if let ControllerAction::Prompt { session_id, .. }
-                        | ControllerAction::Close { session_id } = &action
-                    {
-                        recovery_observer.wait_idle(session_id).await;
-                        while let Some(result) = recovery.try_result() {
-                            merge_recovery_result(&mut controller, result);
-                        }
+                    let Some(request) = action else { break };
+                    let session_id = controller_action_session_id(&request.action);
+                    if session_id.as_ref().is_some_and(|id| !active_actions.insert(id.clone())) {
+                        let _ = request.reply.send(Err("another operation is already running for this session".into()));
+                        continue;
                     }
-                    apply_phone_action(&mut controller, action).await;
+                    let ControllerRequest { action, reply } = request;
+                    let done = action_done_tx.clone();
+                    let observer = recovery_observer.clone();
+                    tokio::spawn(async move {
+                        if let ControllerAction::Prompt { session_id, .. }
+                            | ControllerAction::Close { session_id } = &action
+                        {
+                            observer.wait_idle(session_id).await;
+                        }
+                        let result = async {
+                            let mut operation_controller = Controller::load()?;
+                            apply_phone_action(&mut operation_controller, action).await
+                        }
+                        .await
+                        .map_err(|error| format!("{error:#}"));
+                        let _ = done.send((session_id, reply, result));
+                    });
+                }
+                completed = action_done_rx.recv() => {
+                    let Some((session_id, reply, result)) = completed else { break };
+                    if let Some(session_id) = session_id {
+                        active_actions.remove(&session_id);
+                    }
+                    if let Err(error) = &result {
+                        eprintln!("Hel phone action failed: {error}");
+                    }
+                    if let Err(error) = controller.reload() {
+                        let _ = reply.send(Err(format!("action completed but state reload failed: {error:#}")));
+                        continue;
+                    }
                     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                    conversations.retain(|id, _| {
+                        controller.state.sessions.get(id).is_some_and(|session| session.state.is_active())
+                    });
                     revision += 1;
-                    let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, revision));
+                    conversation_tx.send_replace(conversations.clone());
+                    let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, revision));
+                    let _ = reply.send(result);
                 }
             }
         }
@@ -900,8 +1001,19 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     Ok(())
 }
 
-async fn apply_phone_action(controller: &mut Controller, action: ControllerAction) {
-    let result = match action {
+fn controller_action_session_id(action: &ControllerAction) -> Option<String> {
+    match action {
+        ControllerAction::New { .. } => None,
+        ControllerAction::Prompt { session_id, .. }
+        | ControllerAction::Close { session_id }
+        | ControllerAction::Resume { session_id, .. }
+        | ControllerAction::Open { session_id }
+        | ControllerAction::RemoveQueuedPrompt { session_id, .. } => Some(session_id.clone()),
+    }
+}
+
+async fn apply_phone_action(controller: &mut Controller, action: ControllerAction) -> Result<()> {
+    match action {
         ControllerAction::New {
             profile_id,
             bundle_id,
@@ -912,28 +1024,72 @@ async fn apply_phone_action(controller: &mut Controller, action: ControllerActio
             Err(error) => Err(error),
         },
         ControllerAction::Prompt { session_id, text } => {
-            worker_prompt(controller, &session_id, text).await
+            let spec = controller.reconnect_command(&session_id)?;
+            let mut client = WorkerClient::connect(&spec, &session_id).await?;
+            client.enqueue_prompt(text, Vec::new()).await?;
+            client.detach().await
         }
         ControllerAction::Close { session_id } => controller.close_session(&session_id).await,
         ControllerAction::Resume {
             session_id,
             profile_id,
             target_id,
+            queue,
         } => {
             controller
-                .resume_session(&session_id, &profile_id, &target_id)
+                .resume_session_with_queue_disposition(
+                    &session_id,
+                    &profile_id,
+                    &target_id,
+                    queue == ResumeQueueDisposition::Discard,
+                )
                 .await
         }
         ControllerAction::Open { .. } => Ok(()),
-    };
-    if let Err(error) = result {
-        eprintln!("Hel phone action failed: {error:#}");
+        ControllerAction::RemoveQueuedPrompt {
+            session_id,
+            queue_id,
+        } => {
+            let spec = controller.reconnect_command(&session_id)?;
+            let mut client = WorkerClient::connect(&spec, &session_id).await?;
+            client.remove_queued_prompt(queue_id).await?;
+            client.detach().await
+        }
     }
+}
+
+fn archived_queued_prompts(
+    controller: &Controller,
+) -> std::collections::BTreeMap<String, Vec<hel::hel_worker::QueuedPrompt>> {
+    controller
+        .state
+        .sessions
+        .values()
+        .filter_map(|session| {
+            let checkpoint = session.checkpoint.as_ref()?;
+            let archive = read_archive_verified(&checkpoint.archive_path).ok()?;
+            let bytes = archive
+                .payload_by_role(&PayloadRole::CanonicalEvents)
+                .ok()?;
+            let events = bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(serde_json::from_slice)
+                .collect::<serde_json::Result<Vec<SequencedEvent>>>()
+                .ok()?;
+            Some((
+                session.id.clone(),
+                hel::hel_worker::queued_prompts_from_events(&events),
+            ))
+        })
+        .collect()
 }
 
 fn viewer_snapshot(
     controller: &Controller,
     quotas: &QuotaManager,
+    conversations: &std::collections::BTreeMap<String, hel::hel_chat::BrowserTranscript>,
+    queued_prompts: &std::collections::BTreeMap<String, Vec<hel::hel_worker::QueuedPrompt>>,
     revision: u64,
 ) -> ViewerSnapshot {
     let mut snapshot =
@@ -956,6 +1112,42 @@ fn viewer_snapshot(
             has_error: quota.error.is_some(),
         });
     }
+    for session in &mut snapshot.sessions {
+        session.queued_prompts = queued_prompts
+            .get(&session.id)
+            .into_iter()
+            .flatten()
+            .map(|prompt| ViewerQueuedPrompt {
+                id: prompt.id.clone(),
+                text: prompt.text.clone(),
+                created_at: prompt.created_at_ms.to_string(),
+            })
+            .collect();
+        if let Some(transcript) = conversations.get(&session.id) {
+            session.conversation_available = true;
+            let mut lines = transcript
+                .entries
+                .iter()
+                .flat_map(|entry| {
+                    entry
+                        .lines
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(index, line)| {
+                            let line = line.trim();
+                            (!line.is_empty()).then(|| {
+                                if index == 0 {
+                                    format!("{}: {line}", entry.label)
+                                } else {
+                                    line.to_owned()
+                                }
+                            })
+                        })
+                })
+                .collect::<Vec<_>>();
+            session.preview = lines.split_off(lines.len().saturating_sub(4));
+        }
+    }
     snapshot
 }
 
@@ -963,28 +1155,6 @@ async fn refresh_all_quotas(controller: &Controller, quotas: &mut QuotaManager) 
     quotas
         .refresh_profiles(quota_refresh_profiles(controller))
         .await;
-}
-
-async fn worker_prompt(controller: &Controller, session_id: &str, text: String) -> Result<()> {
-    let bundle_id = controller
-        .state
-        .sessions
-        .get(session_id)
-        .with_context(|| format!("unknown session {session_id}"))?
-        .bundle_id
-        .clone();
-    let spec = controller.reconnect_command(session_id)?;
-    let mut client = WorkerClient::connect(&spec, session_id).await?;
-    let sequence = client.prompt(text.clone(), Vec::new()).await?;
-    if let Err(error) =
-        hel::hel_database::record_prompt(session_id, &bundle_id, sequence, None, &text)
-    {
-        tracing::warn!(
-            session_id,
-            "prompt sent but history was not saved: {error:#}"
-        );
-    }
-    client.detach().await
 }
 
 fn quota_refresh_profiles(controller: &Controller) -> Vec<QuotaRefreshRequest> {
@@ -1108,9 +1278,14 @@ fn refresh_dashboard_poll_targets(
     controller: &Controller,
     worker_targets_tx: &tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
     resource_targets_tx: &tokio::sync::watch::Sender<Vec<ResourcePollTarget>>,
+    excluded_sessions: &std::collections::BTreeSet<String>,
 ) {
-    worker_targets_tx.send_replace(dashboard_worker_targets(controller));
-    resource_targets_tx.send_replace(dashboard_resource_targets(controller));
+    let mut worker_targets = dashboard_worker_targets(controller);
+    worker_targets.retain(|target| !excluded_sessions.contains(&target.session_id));
+    worker_targets_tx.send_replace(worker_targets);
+    let mut resource_targets = dashboard_resource_targets(controller);
+    resource_targets.retain(|target| !excluded_sessions.contains(&target.session_id));
+    resource_targets_tx.send_replace(resource_targets);
 }
 
 fn spawn_aws_resource_options_resolution(
@@ -1553,6 +1728,8 @@ fn spawn_dashboard_worker_poller_with_interval(
                                         transcript: completed
                                             .transcript
                                             .expect("changed worker poll includes transcript"),
+                                        queued_prompts: completed.worker.queued_prompts.clone(),
+                                        received_while_detached: completed.connected,
                                     },
                                 });
                             }
@@ -1629,6 +1806,7 @@ async fn poll_dashboard_worker(
                     .await
                     .context("worker poll timed out")??;
                 worker.chat.apply_events(&events);
+                apply_queued_prompt_events(&mut worker.queued_prompts, &events);
                 (worker, events, None)
             }
             None => {
@@ -1656,6 +1834,7 @@ async fn poll_dashboard_worker(
                             spec: target.spec.clone(),
                             client,
                             chat,
+                            queued_prompts: summary.queued_prompts.clone(),
                             opening_events: Vec::new(),
                             full_history: false,
                         },
@@ -1674,6 +1853,7 @@ async fn poll_dashboard_worker(
                             spec: target.spec.clone(),
                             client,
                             chat,
+                            queued_prompts: bootstrap.snapshot.queued_prompts.clone(),
                             opening_events: Vec::new(),
                             full_history: true,
                         },
@@ -1701,6 +1881,27 @@ async fn poll_dashboard_worker(
         Err(error) => Err(format!("{error:#}")),
     };
     WorkerPollCompletion { target, result }
+}
+
+fn apply_queued_prompt_events(
+    queued: &mut Vec<hel::hel_worker::QueuedPrompt>,
+    events: &[SequencedEvent],
+) {
+    for event in events {
+        match &event.event {
+            hel::hel_worker::WorkerEvent::QueuedPromptAdded { prompt } => {
+                queued.push(prompt.clone());
+            }
+            hel::hel_worker::WorkerEvent::QueuedPromptRemoved { queue_id } => {
+                queued.retain(|prompt| prompt.id != *queue_id);
+            }
+            hel::hel_worker::WorkerEvent::QueuedPromptPromoted { prompt, .. } => {
+                queued.retain(|queued| queued.id != prompt.id);
+            }
+            hel::hel_worker::WorkerEvent::QueuedPromptsCleared => queued.clear(),
+            _ => {}
+        }
+    }
 }
 
 fn current_epoch_seconds() -> u64 {
@@ -1737,7 +1938,7 @@ fn apply_worker_poll_update(
             {
                 session.state = SessionState::Running;
                 session.last_error = None;
-                controller.state.save()?;
+                hel::hel_database::save_session(session)?;
                 dashboard.set_state(controller.state.clone());
             }
         }
@@ -1745,13 +1946,15 @@ fn apply_worker_poll_update(
             events,
             phase,
             transcript,
+            received_while_detached,
+            queued_prompts,
         } => {
             if let Some(title) = harness_session_title(&events)
                 && let Some(session) = controller.state.sessions.get_mut(&update.session_id)
                 && session.acp_session_title.as_deref() != Some(&title)
             {
                 session.acp_session_title = Some(title);
-                controller.state.save()?;
+                hel::hel_database::save_session(session)?;
                 dashboard.set_state(controller.state.clone());
             }
             latest_message_updated = dashboard.apply_worker_update(
@@ -1759,8 +1962,10 @@ fn apply_worker_poll_update(
                 &events,
                 phase,
                 current_epoch_seconds(),
+                received_while_detached,
             );
             dashboard.apply_transcript(&update.session_id, transcript);
+            dashboard.apply_queued_prompts(&update.session_id, queued_prompts);
         }
         WorkerPollPayload::Hydrated(summary) => {
             if let Some(title) = summary.session_title.as_ref()
@@ -1797,24 +2002,12 @@ fn apply_recovery_result(
 ) {
     let session_id = result.session_id.clone();
     let failure = result.outcome.as_ref().err().cloned();
-    let full_history_fallbacks = result
-        .outcome
-        .as_ref()
-        .ok()
-        .map(|artifact| artifact.full_history_fallbacks.clone())
-        .unwrap_or_default();
     if merge_recovery_result(controller, result) {
         dashboard.set_state(controller.state.clone());
         if let Some(detail) = failure {
             dashboard.set_notice(format!(
                 "Recovery copy for {} failed: {detail}",
                 short_id(&session_id)
-            ));
-        } else if !full_history_fallbacks.is_empty() {
-            dashboard.set_notice(format!(
-                "Checkpoint for {} included full Git history for {} because no common base was available.",
-                short_id(&session_id),
-                full_history_fallbacks.join(", ")
             ));
         }
     }
@@ -1897,6 +2090,44 @@ enum DashboardImportUpdate {
 struct ActiveDashboardImport {
     task_id: u64,
     cancelled: Arc<AtomicBool>,
+}
+
+struct ActiveLifecycleOperation {
+    cancelled: Arc<AtomicBool>,
+    kind: SessionOperationKind,
+}
+
+enum LifecycleSuccess {
+    Created,
+    Resumed {
+        profile_id: String,
+        target_id: String,
+        bootstrap: Box<WorkerBootstrap>,
+    },
+    Closed,
+    Destroyed,
+    DeletedActive,
+    DeletedArchived,
+}
+
+struct LifecycleUpdate {
+    session_id: String,
+    result: std::result::Result<LifecycleSuccess, String>,
+}
+
+enum DashboardIoUpdate {
+    MountCompletions {
+        prefix: String,
+        result: std::result::Result<Vec<String>, String>,
+    },
+    MountValidation {
+        source: String,
+        result: std::result::Result<(), String>,
+    },
+    ProjectValidation {
+        directory: String,
+        result: std::result::Result<(), String>,
+    },
 }
 
 fn startup_greeting(controller: &Controller) -> String {
@@ -2003,6 +2234,9 @@ async fn run_dashboard() -> Result<()> {
         controller.state.clone(),
         std::collections::BTreeMap::new(),
     );
+    for (session_id, queued) in archived_queued_prompts(&controller) {
+        dashboard.apply_queued_prompts(&session_id, queued);
+    }
     dashboard.set_greeting(greeting);
     let mut terminal = TerminalGuard::enter()?;
     if configuration_needs_setup(&controller.config) {
@@ -2034,7 +2268,12 @@ async fn run_dashboard() -> Result<()> {
             std::result::Result<Vec<SessionResourceAllocation>, String>,
         )>();
     let mut resolving_aws_resource_options = std::collections::BTreeSet::new();
-    refresh_dashboard_poll_targets(&controller, &worker_targets_tx, &resource_targets_tx);
+    refresh_dashboard_poll_targets(
+        &controller,
+        &worker_targets_tx,
+        &resource_targets_tx,
+        &std::collections::BTreeSet::new(),
+    );
     let capacity_targets = controller.deployment_capacity_targets();
     capacity_targets_tx.send_replace(capacity_targets.clone());
     dashboard.set_deployment_capacity_targets(capacity_targets);
@@ -2047,6 +2286,12 @@ async fn run_dashboard() -> Result<()> {
     let mut quit_detached = false;
     let mut next_import_task_id = 0_u64;
     let mut active_import: Option<ActiveDashboardImport> = None;
+    let (lifecycle_updates_tx, mut lifecycle_updates_rx) =
+        tokio::sync::mpsc::unbounded_channel::<LifecycleUpdate>();
+    let (dashboard_io_tx, mut dashboard_io_rx) =
+        tokio::sync::mpsc::unbounded_channel::<DashboardIoUpdate>();
+    let mut lifecycle_operations =
+        std::collections::BTreeMap::<String, ActiveLifecycleOperation>::new();
     let termination = hel::termination::Coordinator::install().token();
 
     loop {
@@ -2179,7 +2424,13 @@ async fn run_dashboard() -> Result<()> {
                                     .sessions
                                     .insert(session.id.clone(), session);
                                 controller.config.save()?;
-                                controller.state.save()?;
+                                hel::hel_database::save_session(
+                                    controller
+                                        .state
+                                        .sessions
+                                        .get(&imported.session_id)
+                                        .context("imported session disappeared before save")?,
+                                )?;
                                 Ok(())
                             })();
                             dashboard.finish_import();
@@ -2191,6 +2442,7 @@ async fn run_dashboard() -> Result<()> {
                                         &controller,
                                         &worker_targets_tx,
                                         &resource_targets_tx,
+                                        &lifecycle_operations.keys().cloned().collect(),
                                     );
                                     dashboard.set_notice(format!(
                                         "Imported {} session {}.",
@@ -2211,6 +2463,96 @@ async fn run_dashboard() -> Result<()> {
                             dashboard.set_notice(format!("Import failed: {error:#}"));
                         }
                     }
+                }
+            }
+        }
+        while let Ok(update) = lifecycle_updates_rx.try_recv() {
+            let session_id = update.session_id;
+            let operation = lifecycle_operations.remove(&session_id);
+            dashboard.finish_session_operation(&session_id);
+            if let Err(error) = controller.reload() {
+                dashboard.set_notice(format!("Could not reload completed operation: {error:#}"));
+                continue;
+            }
+            dashboard.set_state(controller.state.clone());
+            match update.result {
+                Ok(LifecycleSuccess::Created) => {
+                    dashboard.select_active_session(&session_id);
+                    dashboard.set_notice(format!(
+                        "Session {} is ready; press Enter to open it",
+                        short_id(&session_id)
+                    ));
+                    request_dashboard_quota_refresh(
+                        &controller,
+                        &mut dashboard,
+                        &quota_profiles_tx,
+                    );
+                }
+                Ok(LifecycleSuccess::Resumed {
+                    profile_id,
+                    target_id,
+                    bootstrap,
+                }) => {
+                    let chat =
+                        hel::hel_chat::ChatState::new(&bootstrap.snapshot, &bootstrap.events);
+                    dashboard.apply_transcript(&session_id, chat.transcript_snapshot());
+                    dashboard.select_active_session(&session_id);
+                    dashboard.set_notice(format!(
+                        "Resumed {} with {profile_id} on {target_id}",
+                        short_id(&session_id)
+                    ));
+                    request_dashboard_quota_refresh(
+                        &controller,
+                        &mut dashboard,
+                        &quota_profiles_tx,
+                    );
+                }
+                Ok(LifecycleSuccess::Closed) => {
+                    dashboard.set_notice(format!("Paused {}", short_id(&session_id)));
+                }
+                Ok(LifecycleSuccess::Destroyed) => dashboard.set_notice(format!(
+                    "Destroyed {} without an archive",
+                    short_id(&session_id)
+                )),
+                Ok(LifecycleSuccess::DeletedActive) => dashboard.set_notice(format!(
+                    "Deleted active session {} without checkpointing",
+                    short_id(&session_id)
+                )),
+                Ok(LifecycleSuccess::DeletedArchived) => dashboard.set_notice(format!(
+                    "Permanently deleted paused session {}",
+                    short_id(&session_id)
+                )),
+                Err(error) => {
+                    if operation
+                        .as_ref()
+                        .is_some_and(|operation| operation.kind == SessionOperationKind::Pausing)
+                    {
+                        dashboard.show_close_failure(session_id.clone(), error);
+                    } else {
+                        let label =
+                            operation.map_or("Operation", |operation| operation.kind.label());
+                        dashboard.set_notice(format!("{label} failed: {error}"));
+                    }
+                }
+            }
+            refresh_dashboard_poll_targets(
+                &controller,
+                &worker_targets_tx,
+                &resource_targets_tx,
+                &lifecycle_operations.keys().cloned().collect(),
+            );
+        }
+        while let Ok(update) = dashboard_io_rx.try_recv() {
+            match update {
+                DashboardIoUpdate::MountCompletions { prefix, result } => match result {
+                    Ok(candidates) => dashboard.apply_mount_source_completions(&prefix, candidates),
+                    Err(error) => dashboard.set_notice(format!("Path completion failed: {error}")),
+                },
+                DashboardIoUpdate::MountValidation { source, result } => {
+                    dashboard.apply_mount_source_validation(&source, result)
+                }
+                DashboardIoUpdate::ProjectValidation { directory, result } => {
+                    dashboard.apply_project_directory_validation(&directory, result)
                 }
             }
         }
@@ -2238,6 +2580,12 @@ async fn run_dashboard() -> Result<()> {
         match action {
             DashboardAction::None => {}
             DashboardAction::QuitDetach => {
+                for operation in lifecycle_operations.values() {
+                    operation.cancelled.store(true, Ordering::Release);
+                }
+                if let Some(active) = active_import.as_ref() {
+                    active.cancelled.store(true, Ordering::Release);
+                }
                 quit_detached = true;
                 break;
             }
@@ -2259,6 +2607,7 @@ async fn run_dashboard() -> Result<()> {
                             &controller,
                             &worker_targets_tx,
                             &resource_targets_tx,
+                            &lifecycle_operations.keys().cloned().collect(),
                         );
                         dashboard.set_notice(
                             "Setup complete. Press Ctrl+N to start your first session.",
@@ -2377,39 +2726,62 @@ async fn run_dashboard() -> Result<()> {
             DashboardAction::CompleteMountSource {
                 target_template_id,
                 prefix,
-            } => match controller.complete_mount_source(
-                &target_template_id,
-                &prefix,
-                &ProcessExecutor,
-            ) {
-                Ok(candidates) => dashboard.apply_mount_source_completions(&prefix, candidates),
-                Err(error) => dashboard.set_notice(format!("Path completion failed: {error:#}")),
-            },
+            } => {
+                let config = controller.config.clone();
+                let updates = dashboard_io_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let operation_controller = Controller {
+                        config,
+                        state: HelState::default(),
+                    };
+                    let result = operation_controller
+                        .complete_mount_source(&target_template_id, &prefix, &ProcessExecutor)
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = updates.send(DashboardIoUpdate::MountCompletions { prefix, result });
+                });
+            }
             DashboardAction::ValidateMountSource {
                 target_template_id,
                 source,
             } => {
-                let result = controller
-                    .validate_mount_source(
-                        &target_template_id,
-                        std::path::Path::new(&source),
-                        &ProcessExecutor,
-                    )
-                    .map_err(|error| format!("{error:#}"));
-                dashboard.apply_mount_source_validation(&source, result);
+                let config = controller.config.clone();
+                let updates = dashboard_io_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let operation_controller = Controller {
+                        config,
+                        state: HelState::default(),
+                    };
+                    let result = operation_controller
+                        .validate_mount_source(
+                            &target_template_id,
+                            std::path::Path::new(&source),
+                            &ProcessExecutor,
+                        )
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = updates.send(DashboardIoUpdate::MountValidation { source, result });
+                });
             }
             DashboardAction::ValidateProjectDirectory {
                 target_template_id,
                 directory,
             } => {
-                let result = controller
-                    .validate_project_directory(
-                        &target_template_id,
-                        std::path::Path::new(&directory),
-                        &ProcessExecutor,
-                    )
-                    .map_err(|error| format!("{error:#}"));
-                dashboard.apply_project_directory_validation(&directory, result);
+                let config = controller.config.clone();
+                let updates = dashboard_io_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let operation_controller = Controller {
+                        config,
+                        state: HelState::default(),
+                    };
+                    let result = operation_controller
+                        .validate_project_directory(
+                            &target_template_id,
+                            std::path::Path::new(&directory),
+                            &ProcessExecutor,
+                        )
+                        .map_err(|error| format!("{error:#}"));
+                    let _ =
+                        updates.send(DashboardIoUpdate::ProjectValidation { directory, result });
+                });
             }
             DashboardAction::CreateSession {
                 profile_id,
@@ -2479,57 +2851,40 @@ async fn run_dashboard() -> Result<()> {
                 ) {
                     Ok(session_id) => {
                         dashboard.set_state(controller.state.clone());
-                        dashboard.set_notice(format!("Provisioning {}…", short_id(&session_id)));
-                        terminal
-                            .terminal
-                            .draw(|frame| render(frame, &mut dashboard))?;
-                        let mut provisioning_controller = Controller {
-                            config: controller.config.clone(),
-                            state: controller.state.clone(),
-                        };
-                        let provisioning_session_id = session_id.clone();
-                        let mut provisioning = tokio::spawn(async move {
-                            let result = provisioning_controller
-                                .provision_session(&provisioning_session_id)
-                                .await;
-                            (provisioning_controller, result)
-                        });
-                        let (updated_controller, provision_result) = loop {
-                            tokio::select! {
-                                result = &mut provisioning => {
-                                    break result.context("provisioning task failed")?;
-                                }
-                                _ = tokio::time::sleep(Duration::from_millis(250)) => {
-                                    terminal
-                                        .terminal
-                                        .draw(|frame| render(frame, &mut dashboard))?;
-                                }
-                            }
-                        };
-                        controller = updated_controller;
-                        dashboard.set_state(controller.state.clone());
-                        match provision_result {
-                            Ok(()) => {
-                                dashboard.select_active_session(&session_id);
-                                dashboard.set_notice(format!(
-                                    "Session {} is ready; press Enter to open it",
-                                    short_id(&session_id)
-                                ));
-                                request_dashboard_quota_refresh(
-                                    &controller,
-                                    &mut dashboard,
-                                    &quota_profiles_tx,
-                                );
-                            }
-                            Err(error) => {
-                                dashboard.set_notice(format!("Provisioning failed: {error:#}"))
-                            }
-                        }
-                        refresh_dashboard_poll_targets(
-                            &controller,
-                            &worker_targets_tx,
-                            &resource_targets_tx,
+                        dashboard.begin_session_operation(
+                            session_id.clone(),
+                            SessionOperationKind::Launching,
+                            None,
                         );
+                        dashboard.set_notice(format!("Launching {}…", short_id(&session_id)));
+                        let cancelled = Arc::new(AtomicBool::new(false));
+                        lifecycle_operations.insert(
+                            session_id.clone(),
+                            ActiveLifecycleOperation {
+                                cancelled: cancelled.clone(),
+                                kind: SessionOperationKind::Launching,
+                            },
+                        );
+                        let updates = lifecycle_updates_tx.clone();
+                        let operation_session_id = session_id.clone();
+                        let runtime = tokio::runtime::Handle::current();
+                        tokio::task::spawn_blocking(move || {
+                            let result =
+                                (|| -> Result<()> {
+                                    let mut controller = Controller::load()?;
+                                    let executor = CancellableProcessExecutor::new(cancelled);
+                                    runtime.block_on(controller.provision_session_controlled(
+                                        &operation_session_id,
+                                        &executor,
+                                    ))
+                                })()
+                                .map(|()| LifecycleSuccess::Created)
+                                .map_err(|error| format!("{error:#}"));
+                            let _ = updates.send(LifecycleUpdate {
+                                session_id: operation_session_id,
+                                result,
+                            });
+                        });
                     }
                     Err(error) => {
                         dashboard.set_notice(format!("Could not create session: {error:#}"))
@@ -2583,6 +2938,8 @@ async fn run_dashboard() -> Result<()> {
                                         events: worker.opening_events,
                                         phase: worker.chat.phase(),
                                         transcript: worker.chat.transcript_snapshot(),
+                                        queued_prompts: worker.queued_prompts.clone(),
+                                        received_while_detached: true,
                                     },
                                 };
                                 if let Err(error) = apply_worker_poll_update(
@@ -2611,6 +2968,7 @@ async fn run_dashboard() -> Result<()> {
                                     &bootstrap.snapshot,
                                     &bootstrap.events,
                                 );
+                                worker.queued_prompts = bootstrap.snapshot.queued_prompts.clone();
                                 worker.full_history = true;
                             }
                             hel::hel_chat::run_chat(
@@ -2622,12 +2980,14 @@ async fn run_dashboard() -> Result<()> {
                             )
                             .await
                             .map(|(exit, client, chat)| {
+                                let queued_prompts = chat.queued_prompt_snapshot();
                                 (
                                     exit,
                                     Some(WarmWorker {
                                         spec,
                                         client,
                                         chat,
+                                        queued_prompts,
                                         opening_events: Vec::new(),
                                         full_history: true,
                                     }),
@@ -2648,12 +3008,14 @@ async fn run_dashboard() -> Result<()> {
                                 Some(recovery_context),
                             )
                             .await?;
+                            let queued_prompts = chat.queued_prompt_snapshot();
                             Ok((
                                 exit,
                                 Some(WarmWorker {
                                     spec,
                                     client,
                                     chat,
+                                    queued_prompts,
                                     opening_events: Vec::new(),
                                     full_history: true,
                                 }),
@@ -2678,9 +3040,12 @@ async fn run_dashboard() -> Result<()> {
                                 &[],
                                 worker.chat.phase(),
                                 current_epoch_seconds(),
+                                false,
                             );
                             dashboard
                                 .apply_transcript(&session_id, worker.chat.transcript_snapshot());
+                            dashboard
+                                .apply_queued_prompts(&session_id, worker.queued_prompts.clone());
                         }
                         worker_commands_tx
                             .send(WorkerPollCommand::Checkin {
@@ -2725,81 +3090,99 @@ async fn run_dashboard() -> Result<()> {
                 target_template_id,
                 additional_mounts,
                 resource_allocation,
+                discard_queue,
             } => {
                 dashboard.set_notice(resume_progress_notice(
                     &session_id,
                     &profile_id,
                     &target_template_id,
                 ));
-                terminal
-                    .terminal
-                    .draw(|frame| render(frame, &mut dashboard))?;
-                let resumed_chat = match controller
-                    .resume_session_with_options(
-                        &session_id,
-                        &profile_id,
-                        &target_template_id,
-                        Some(additional_mounts),
-                        resource_allocation,
-                    )
-                    .await
-                {
-                    Ok(bootstrap) => {
-                        dashboard.set_notice(format!(
-                            "Resumed {} with {profile_id} on {target_template_id}",
-                            short_id(&session_id)
-                        ));
-                        request_dashboard_quota_refresh(
-                            &controller,
-                            &mut dashboard,
-                            &quota_profiles_tx,
-                        );
-                        Some(hel::hel_chat::ChatState::new(
-                            &bootstrap.snapshot,
-                            &bootstrap.events,
-                        ))
-                    }
-                    Err(error) => {
-                        dashboard.set_notice(format!("Resume failed: {error:#}"));
-                        None
-                    }
-                };
-                dashboard.set_state(controller.state.clone());
-                if let Some(chat) = resumed_chat {
-                    dashboard.apply_transcript(&session_id, chat.transcript_snapshot());
-                    dashboard.select_active_session(&session_id);
-                }
-                refresh_dashboard_poll_targets(
-                    &controller,
-                    &worker_targets_tx,
-                    &resource_targets_tx,
+                dashboard.begin_session_operation(
+                    session_id.clone(),
+                    SessionOperationKind::Resuming,
+                    None,
                 );
+                let cancelled = Arc::new(AtomicBool::new(false));
+                lifecycle_operations.insert(
+                    session_id.clone(),
+                    ActiveLifecycleOperation {
+                        cancelled: cancelled.clone(),
+                        kind: SessionOperationKind::Resuming,
+                    },
+                );
+                let updates = lifecycle_updates_tx.clone();
+                let operation_session_id = session_id.clone();
+                let operation_profile_id = profile_id.clone();
+                let operation_target_id = target_template_id.clone();
+                let runtime = tokio::runtime::Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    let result = (|| -> Result<WorkerBootstrap> {
+                        let mut controller = Controller::load()?;
+                        let executor = CancellableProcessExecutor::new(cancelled);
+                        runtime.block_on(controller.resume_session_controlled(
+                            &operation_session_id,
+                            &operation_profile_id,
+                            &operation_target_id,
+                            SessionResumeOptions {
+                                additional_mounts: Some(additional_mounts),
+                                resource_allocation,
+                                discard_queue,
+                            },
+                            &executor,
+                        ))
+                    })()
+                    .map(|bootstrap| LifecycleSuccess::Resumed {
+                        profile_id: operation_profile_id,
+                        target_id: operation_target_id,
+                        bootstrap: Box::new(bootstrap),
+                    })
+                    .map_err(|error| format!("{error:#}"));
+                    let _ = updates.send(LifecycleUpdate {
+                        session_id: operation_session_id,
+                        result,
+                    });
+                });
             }
             DashboardAction::Close { session_id } => {
-                recovery_observer.wait_idle(&session_id).await;
-                while let Some(result) = recovery.try_result() {
-                    apply_recovery_result(&mut controller, &mut dashboard, result);
-                }
-                let (returned_controller, result) = close_session_with_redraw(
-                    controller,
-                    &session_id,
-                    &mut dashboard,
-                    &mut terminal,
-                )
-                .await?;
-                controller = returned_controller;
-                match result {
-                    Ok(()) => dashboard.set_notice(format!("Paused {}", short_id(&session_id))),
-                    Err(error) => {
-                        dashboard.show_close_failure(session_id.clone(), format!("{error:#}"))
-                    }
-                }
-                dashboard.set_state(controller.state.clone());
-                refresh_dashboard_poll_targets(
-                    &controller,
-                    &worker_targets_tx,
-                    &resource_targets_tx,
+                dashboard.begin_session_operation(
+                    session_id.clone(),
+                    SessionOperationKind::Pausing,
+                    None,
                 );
+                dashboard.set_notice(format!("Pausing {}…", short_id(&session_id)));
+                let cancelled = Arc::new(AtomicBool::new(false));
+                lifecycle_operations.insert(
+                    session_id.clone(),
+                    ActiveLifecycleOperation {
+                        cancelled: cancelled.clone(),
+                        kind: SessionOperationKind::Pausing,
+                    },
+                );
+                let observer = recovery_observer.clone();
+                let updates = lifecycle_updates_tx.clone();
+                let operation_session_id = session_id.clone();
+                let runtime = tokio::runtime::Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    let result = (|| -> Result<()> {
+                        while observer.is_busy(&operation_session_id) {
+                            if cancelled.load(Ordering::Acquire) {
+                                bail!("operation cancelled while waiting for recovery copy");
+                            }
+                            std::thread::sleep(Duration::from_millis(25));
+                        }
+                        let mut controller = Controller::load()?;
+                        let executor = CancellableProcessExecutor::new(cancelled.clone());
+                        runtime.block_on(
+                            controller.close_session_controlled(&operation_session_id, &executor),
+                        )
+                    })()
+                    .map(|()| LifecycleSuccess::Closed)
+                    .map_err(|error| format!("{error:#}"));
+                    let _ = updates.send(LifecycleUpdate {
+                        session_id: operation_session_id,
+                        result,
+                    });
+                });
             }
             DashboardAction::ResolveAwsResourceOptions {
                 target_template_ids,
@@ -2842,54 +3225,115 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
             DashboardAction::ForceDestroy { session_id } => {
-                match controller.force_destroy(&session_id, &ProcessExecutor) {
-                    Ok(()) => dashboard.set_notice(format!(
-                        "Destroyed {} without an archive",
-                        short_id(&session_id)
-                    )),
-                    Err(error) => dashboard.set_notice(format!("Destroy failed: {error:#}")),
-                }
-                dashboard.set_state(controller.state.clone());
-                refresh_dashboard_poll_targets(
-                    &controller,
-                    &worker_targets_tx,
-                    &resource_targets_tx,
+                dashboard.begin_session_operation(
+                    session_id.clone(),
+                    SessionOperationKind::Destroying,
+                    None,
                 );
+                let cancelled = Arc::new(AtomicBool::new(false));
+                lifecycle_operations.insert(
+                    session_id.clone(),
+                    ActiveLifecycleOperation {
+                        cancelled: cancelled.clone(),
+                        kind: SessionOperationKind::Destroying,
+                    },
+                );
+                let updates = lifecycle_updates_tx.clone();
+                let operation_session_id = session_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = (|| -> Result<()> {
+                        let mut controller = Controller::load()?;
+                        let executor = CancellableProcessExecutor::new(cancelled);
+                        controller.force_destroy(&operation_session_id, &executor)
+                    })()
+                    .map(|()| LifecycleSuccess::Destroyed)
+                    .map_err(|error| format!("{error:#}"));
+                    let _ = updates.send(LifecycleUpdate {
+                        session_id: operation_session_id,
+                        result,
+                    });
+                });
             }
             DashboardAction::DeleteActive { session_id } => {
-                let result = controller
-                    .force_destroy(&session_id, &ProcessExecutor)
-                    .and_then(|()| delete_archived_session(&mut controller, &session_id));
-                match result {
-                    Ok(()) => dashboard.set_notice(format!(
-                        "Deleted active session {} without checkpointing",
-                        short_id(&session_id)
-                    )),
-                    Err(error) => dashboard.set_notice(format!("Delete failed: {error:#}")),
-                }
-                dashboard.set_state(controller.state.clone());
-                refresh_dashboard_poll_targets(
-                    &controller,
-                    &worker_targets_tx,
-                    &resource_targets_tx,
+                dashboard.begin_session_operation(
+                    session_id.clone(),
+                    SessionOperationKind::Deleting,
+                    None,
                 );
+                let cancelled = Arc::new(AtomicBool::new(false));
+                lifecycle_operations.insert(
+                    session_id.clone(),
+                    ActiveLifecycleOperation {
+                        cancelled: cancelled.clone(),
+                        kind: SessionOperationKind::Deleting,
+                    },
+                );
+                let updates = lifecycle_updates_tx.clone();
+                let operation_session_id = session_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = (|| -> Result<()> {
+                        let mut controller = Controller::load()?;
+                        let executor = CancellableProcessExecutor::new(cancelled);
+                        controller.force_destroy(&operation_session_id, &executor)?;
+                        delete_archived_session(&mut controller, &operation_session_id)
+                    })()
+                    .map(|()| LifecycleSuccess::DeletedActive)
+                    .map_err(|error| format!("{error:#}"));
+                    let _ = updates.send(LifecycleUpdate {
+                        session_id: operation_session_id,
+                        result,
+                    });
+                });
             }
             DashboardAction::DeleteArchived { session_id } => {
-                match delete_archived_session(&mut controller, &session_id) {
-                    Ok(()) => dashboard.set_notice(format!(
-                        "Permanently deleted paused session {}",
-                        short_id(&session_id)
-                    )),
-                    Err(error) => dashboard.set_notice(format!("Delete failed: {error:#}")),
-                }
-                dashboard.set_state(controller.state.clone());
-                refresh_dashboard_poll_targets(
-                    &controller,
-                    &worker_targets_tx,
-                    &resource_targets_tx,
+                dashboard.begin_session_operation(
+                    session_id.clone(),
+                    SessionOperationKind::Deleting,
+                    None,
                 );
+                let cancelled = Arc::new(AtomicBool::new(false));
+                lifecycle_operations.insert(
+                    session_id.clone(),
+                    ActiveLifecycleOperation {
+                        cancelled: cancelled.clone(),
+                        kind: SessionOperationKind::Deleting,
+                    },
+                );
+                let updates = lifecycle_updates_tx.clone();
+                let operation_session_id = session_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = (|| -> Result<()> {
+                        let mut controller = Controller::load()?;
+                        if cancelled.load(Ordering::Acquire) {
+                            bail!("operation cancelled");
+                        }
+                        delete_archived_session(&mut controller, &operation_session_id)
+                    })()
+                    .map(|()| LifecycleSuccess::DeletedArchived)
+                    .map_err(|error| format!("{error:#}"));
+                    let _ = updates.send(LifecycleUpdate {
+                        session_id: operation_session_id,
+                        result,
+                    });
+                });
+            }
+            DashboardAction::CancelOperation { session_id } => {
+                if let Some(operation) = lifecycle_operations.get(&session_id) {
+                    operation.cancelled.store(true, Ordering::Release);
+                    dashboard.set_notice(format!(
+                        "Cancelling {} for {}…",
+                        operation.kind.label().to_ascii_lowercase(),
+                        short_id(&session_id)
+                    ));
+                }
             }
         }
+    }
+    for operation in lifecycle_operations.values() {
+        operation.cancelled.store(true, Ordering::Release);
+    }
+    if let Some(active) = active_import.as_ref() {
+        active.cancelled.store(true, Ordering::Release);
     }
     drop(terminal);
     if quit_detached {
@@ -2906,76 +3350,25 @@ fn delete_archived_session(controller: &mut Controller, session_id: &str) -> Res
         .checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.archive_path.clone());
+    if let Err(error) = hel::hel_database::delete_session(session_id) {
+        controller
+            .state
+            .sessions
+            .insert(session.id.clone(), session);
+        return Err(error).context("delete paused session from state");
+    }
     if let Some(archive_path) = &archive_path
         && let Err(error) = std::fs::remove_file(archive_path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        controller
-            .state
-            .sessions
-            .insert(session.id.clone(), session);
-        return Err(error)
-            .with_context(|| format!("delete recovery archive {}", archive_path.display()));
-    }
-    if let Err(error) = controller.state.save() {
-        controller
-            .state
-            .sessions
-            .insert(session.id.clone(), session);
-        return Err(error).context("save state after deleting paused session");
+        return Err(error).with_context(|| {
+            format!(
+                "session was deleted, but its recovery archive could not be removed: {}",
+                archive_path.display()
+            )
+        });
     }
     Ok(())
-}
-
-async fn close_session_with_redraw(
-    mut controller: Controller,
-    session_id: &str,
-    dashboard: &mut DashboardState,
-    terminal: &mut TerminalGuard,
-) -> Result<(Controller, Result<()>)> {
-    let mut visible_state = controller.state.clone();
-    if let Some(session) = visible_state.sessions.get_mut(session_id) {
-        session.state = SessionState::Checkpointing;
-    }
-    dashboard.set_state(visible_state);
-
-    let session_id = session_id.to_string();
-    let task_session_id = session_id.clone();
-    let mut close = tokio::spawn(async move {
-        let result = controller.close_session(&task_session_id).await;
-        (controller, result)
-    });
-    let started = Instant::now();
-    let mut interval = tokio::time::interval(Duration::from_millis(125));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut frame = 0;
-
-    loop {
-        tokio::select! {
-            joined = &mut close => {
-                return joined.context("close task failed");
-            }
-            _ = interval.tick() => {
-                dashboard.set_notice(close_progress_notice(
-                    &session_id,
-                    started.elapsed(),
-                    frame,
-                ));
-                frame += 1;
-                terminal.terminal.draw(|frame| render(frame, dashboard))?;
-            }
-        }
-    }
-}
-
-fn close_progress_notice(session_id: &str, elapsed: Duration, frame: usize) -> String {
-    const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
-    format!(
-        "{} Saving checkpoint for {}… {}s",
-        SPINNER[frame % SPINNER.len()],
-        short_id(session_id),
-        elapsed.as_secs()
-    )
 }
 
 fn discover_import_profile(
@@ -3729,14 +4122,6 @@ mod tests {
         assert_eq!(
             resume_progress_notice("0123456789", "codex-1", "podman"),
             "Preparing 01234567: verifying checkpoint, provisioning podman, and restoring codex-1…"
-        );
-    }
-
-    #[test]
-    fn close_progress_notice_animates_and_reports_elapsed_time() {
-        assert_eq!(
-            close_progress_notice("0123456789", Duration::from_secs(7), 1),
-            "/ Saving checkpoint for 01234567… 7s"
         );
     }
 

@@ -49,9 +49,9 @@ podman build --pull=always \
   containers
 ```
 
-The image includes Rust, Node 24, Git, the Codex ACP bridge, and the Claude ACP
-bridge. Hel copies its worker and the selected harness profile into each new
-container. Kimi Code uses Hel's official on-demand installer fallback.
+The image includes Rust, Node 24, Git, GitHub CLI, the Codex ACP bridge, and the
+Claude ACP bridge. Hel copies its worker and the selected harness profile into
+each new container. Kimi Code uses Hel's official on-demand installer fallback.
 
 Configure it as a target with:
 
@@ -83,8 +83,17 @@ hel server
 hel server --bind 0.0.0.0:3765 --tls-cert ./hel.crt --tls-key ./hel.key
 ```
 
-The dashboard lists newest-added sessions first. Press `s` to switch between
-that order and most-recent activity; the current order is shown in the footer.
+The web dashboard lists every managed conversation and shows the latest four
+nonempty transcript lines for active sessions. Opening an active conversation
+shows a live feed (including thoughts, tools, and plans) and lets the viewer
+send prompts or remove queued prompts. Prompts are queued durably by the
+target-side worker, so they continue to run in order while the TUI is minimized,
+detached, or not running. Archiving preserves pending prompts in the recovery
+copy; resuming asks whether to start with that queue or discard it.
+
+The dashboard lists sessions in creation sequence. Press `s` to cycle through
+sequence, most-recent activity, and profile-then-sequence ordering; the current
+order is shown in the footer.
 Returning to the dashboard with `Ctrl+G` preserves the current message draft.
 
 ## Configuration
@@ -223,7 +232,7 @@ effective global Git configuration: `user.name`, `user.email`,
 `diff.algorithm`. Hel applies these settings after cloning, so they do not
 provide repository credentials, and repository-local configuration still
 wins. Raw localhost and named `ssh-bare` machines keep their own Git
-configuration. Hel does not copy Git aliases, credentials, URL rewrites, includes, LFS filters, signing
+configuration. Hel does not copy Git aliases, stored Git credentials, URL rewrites, includes, LFS filters, signing
 settings, hooks, editor or pager commands, custom drivers, proxies,
 `safe.directory`, line-ending settings, or the controller's global excludes
 file.
@@ -231,9 +240,15 @@ file.
 For isolated and remote targets, harness homes are whitelists rather than
 complete dot-directory copies. For Claude, Hel copies `.credentials.json`, `settings.json`, `CLAUDE.md`,
 `skills/`, and `plugins/`; it does not copy transcripts, project history, or
-caches. SSH and GPG keys, GitHub CLI and package-registry credentials, cloud
-configuration, shell dotfiles, editor configuration, and toolchain state are
-not transferred automatically.
+caches. SSH and GPG keys, package-registry credentials, cloud configuration,
+shell dotfiles, editor configuration, and toolchain state are not transferred
+automatically. The standard container image includes GitHub CLI. When the
+controller's `gh` is authenticated, Hel passes its active GitHub token to each
+freshly provisioned managed container as `GH_TOKEN`; this supports `gh` and
+HTTPS Git pushes without copying SSH keys. The token is not added to recovery
+archives. Existing live containers are not mutated, while archived sessions
+receive current GitHub authentication when they provision a fresh target on
+resume.
 
 `local-bare` is intentionally different: it runs the ACP bridge in the chosen
 local Git worktree and points `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, or
@@ -294,12 +309,15 @@ copy with `hel checkpoint --session <id>`.
 
 Recovery archives are versioned ZIPs containing a manifest, a canonical event
 stream, allowlisted native harness artifacts, and the Git state needed to
-rebuild disposable workspaces. Committed work is normally a delta from the
-repository's merge base with its configured remote or Hel seed; staged,
-unstaged, and untracked changes are stored separately. Hel falls back to a full
-Git bundle only when an intact repository has no usable common base. Every
-payload is SHA-256 verified after the archive is atomically installed. Normal
-Pause refuses teardown if that verification fails; explicit force-destroy is
-the data-loss escape hatch.
+rebuild disposable workspaces. Committed work is stored as the set of commits
+that no origin ref contains, where origin is either the configured remote or
+Hel's proxy to your local repository; staged, unstaged, and untracked changes
+are stored separately. There is no full-history fallback: when a repository has
+no origin refs, Hel retries one fetch and otherwise fails the checkpoint and
+leaves the session usable. Local repositories are provisioned by fetching
+through the proxy, and a small bootstrap archive carries their uncommitted
+changes. Every payload is SHA-256 verified after the archive is atomically
+installed. Normal Pause refuses teardown if that verification fails; explicit
+force-destroy is the data-loss escape hatch.
 
 Hel is licensed under `GPL-3.0-only`.

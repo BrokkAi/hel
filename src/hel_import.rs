@@ -15,8 +15,8 @@ use rayon::prelude::*;
 use serde_json::{Value, json};
 
 use crate::hel_archive::{
-    ArchiveInput, BundleManifest, GitCollectionSpec, GitSnapshotProgress, SystemGit,
-    TargetManifest, collect_git_snapshot_with_progress, write_archive_atomic,
+    ArchiveInput, BundleManifest, GitCollectionSpec, GitHistoryMode, GitSnapshotProgress,
+    SystemGit, TargetManifest, collect_git_snapshot_with_progress, write_archive_atomic,
 };
 use crate::hel_checkpoint::{collect_import_native_artifacts, collect_native_artifacts};
 use crate::hel_config::{
@@ -1811,6 +1811,7 @@ fn finish_imported_turn(events: &mut Vec<SequencedEvent>) {
 fn push_event(events: &mut Vec<SequencedEvent>, event: WorkerEvent) {
     events.push(SequencedEvent {
         seq: events.len() as u64 + 1,
+        recorded_at_ms: None,
         request_id: None,
         event,
     });
@@ -2547,18 +2548,24 @@ fn collect_local_repositories(
                 repository.id,
                 path.display()
             );
-            let (base_commit, full_history) = import_base_commit(&path)?;
+            let history = if repository.is_local() {
+                // The local-repository proxy serves committed history and
+                // provisioning fetches it, so the archive only has to carry
+                // identity and dirty state.
+                GitHistoryMode::NoBundle
+            } else {
+                // Import starts from the common ancestor of the local checkout
+                // and the tracked remote, so unpushed commits are included in
+                // the committed delta bundle.
+                GitHistoryMode::DeltaFrom(import_delta_base(&path)?)
+            };
             collect_git_snapshot_with_progress(
                 &git,
                 &path,
                 &GitCollectionSpec {
                     id: repository.id.clone(),
                     relative_destination: repository.destination.clone(),
-                    // Import starts from the common ancestor of the local
-                    // checkout and the tracked remote, so unpushed commits
-                    // are included in the committed delta bundle.
-                    base_commit,
-                    full_history,
+                    history,
                     origin_override: repository
                         .is_local()
                         .then(|| format!("hel-local:{}", repository.id)),
@@ -2636,7 +2643,10 @@ fn import_profile_id(
     Ok(requested.to_owned())
 }
 
-fn import_base_commit(path: &Path) -> Result<(String, bool)> {
+/// The upstream revision an imported repository deltas from. A repository
+/// without remote-tracking refs cannot tell us which ancestry a newly
+/// provisioned clone has, and Hel never bundles full history, so it fails here.
+fn import_delta_base(path: &Path) -> Result<String> {
     let upstream = git_optional_text(path, ["rev-parse", "--verify", "--quiet", "@{upstream}"])?
         .or(git_optional_text(
             path,
@@ -2647,13 +2657,12 @@ fn import_base_commit(path: &Path) -> Result<(String, bool)> {
                 "refs/remotes/origin/HEAD",
             ],
         )?);
-    let Some(upstream) = upstream else {
-        // A repository without remote refs cannot tell us which ancestry a
-        // newly provisioned clone has. Preserve the previous HEAD-only
-        // behavior; normal tracked checkouts take the bundle-preserving path.
-        return Ok((git_text(path, ["rev-parse", "HEAD"])?, true));
-    };
-    Ok((git_text(path, ["merge-base", "HEAD", &upstream])?, false))
+    upstream.with_context(|| {
+        format!(
+            "repository {} has no remote-tracking refs to import against; fetch its remote first",
+            path.display()
+        )
+    })
 }
 
 fn git_optional_text<const N: usize>(cwd: &Path, arguments: [&str; N]) -> Result<Option<String>> {
@@ -2667,29 +2676,6 @@ fn git_optional_text<const N: usize>(cwd: &Path, arguments: [&str; N]) -> Result
     }
     let text = String::from_utf8(output.stdout).context("decode Git output")?;
     Ok((!text.trim().is_empty()).then(|| text.trim().to_owned()))
-}
-
-fn git_text<const N: usize>(cwd: &Path, arguments: [&str; N]) -> Result<String> {
-    let output = Command::new("git")
-        .args(arguments)
-        .current_dir(cwd)
-        .output()
-        .with_context(|| format!("start git in {}", cwd.display()))?;
-    if !output.status.success() {
-        bail!(
-            "git in {} failed: {}",
-            cwd.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let text = String::from_utf8(output.stdout).context("decode Git output")?;
-    let text = text.trim();
-    ensure!(
-        !text.is_empty(),
-        "git in {} returned no output",
-        cwd.display()
-    );
-    Ok(text.into())
 }
 
 fn timestamp() -> String {
@@ -2785,6 +2771,23 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
+        // Import deltas against the tracked remote, so a realistic checkout
+        // needs a remote-tracking ref.
+        for arguments in [
+            vec!["update-ref", "refs/remotes/origin/main", "HEAD"],
+            vec!["branch", "--set-upstream-to", "origin/main", "main"],
+        ] {
+            let output = Command::new("git")
+                .args(arguments)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
@@ -3108,6 +3111,66 @@ mod tests {
             .map(|snapshot| snapshot.metadata.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, ["worker", "app"]);
+    }
+
+    #[test]
+    fn local_source_repository_import_carries_no_committed_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        initialize_repository(&app, "app");
+        let output = Command::new("git")
+            .args(["remote", "remove", "origin"])
+            .current_dir(&app)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        fs::write(app.join("dirty.txt"), "dirty").unwrap();
+        let bundle = ProjectBundle {
+            primary_repo: "app".into(),
+            repositories: vec![ProjectRepository {
+                id: "app".into(),
+                github: None,
+                local: Some(app.clone()),
+                destination: "app".into(),
+                git_ref: None,
+            }],
+        };
+
+        let snapshots = collect_local_repositories(&bundle, &[app], None).unwrap();
+
+        assert!(snapshots[0].committed_bundle.is_empty());
+        assert_eq!(snapshots[0].metadata.origin, "hel-local:app");
+        assert!(!snapshots[0].untracked_tar.is_empty());
+    }
+
+    #[test]
+    fn import_without_remote_tracking_refs_reports_how_to_recover() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        initialize_repository(&app, "app");
+        let output = Command::new("git")
+            .args(["update-ref", "-d", "refs/remotes/origin/main"])
+            .current_dir(&app)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let bundle = ProjectBundle {
+            primary_repo: "app".into(),
+            repositories: vec![ProjectRepository {
+                id: "app".into(),
+                github: Some("example/app".into()),
+                local: None,
+                destination: "app".into(),
+                git_ref: None,
+            }],
+        };
+
+        let error = collect_local_repositories(&bundle, &[app], None).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("has no remote-tracking refs to import against"),
+            "{error:#}"
+        );
     }
 
     #[test]
