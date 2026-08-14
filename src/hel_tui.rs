@@ -4353,7 +4353,12 @@ fn render_sessions(
         visible_sessions += 1;
         let selected = dashboard.focus == Focus::Active && index == dashboard.session_index;
         let info_y = detail_y.saturating_sub(1);
-        if selected && info_y < active_area.bottom().saturating_sub(1) {
+        if info_y < active_area.bottom().saturating_sub(1) {
+            let style = if selected {
+                Style::default().bg(Color::DarkGray).fg(Color::LightYellow)
+            } else {
+                Style::default().fg(Color::LightYellow)
+            };
             frame.buffer_mut().set_style(
                 Rect::new(
                     active_area.x.saturating_add(1),
@@ -4361,7 +4366,7 @@ fn render_sessions(
                     active_area.width.saturating_sub(2),
                     1,
                 ),
-                Style::default().bg(Color::DarkGray).fg(Color::LightYellow),
+                style,
             );
         }
         let preview_height = active_area
@@ -4657,7 +4662,6 @@ fn active_session_row(
             now_epoch_seconds,
         )),
     ])
-    .style(Style::default().fg(Color::LightYellow))
     .height(height)
     .top_margin(top_margin)
 }
@@ -8638,6 +8642,13 @@ mod tests {
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .all(|x| buffer[(x, conversation_y)].bg != Color::DarkGray)
+        );
+        let answer_x = row_text(conversation_y)
+            .find("Rendered answer")
+            .expect("conversation text") as u16;
+        assert_ne!(
+            buffer[(buffer.area.x + answer_x, conversation_y)].fg,
+            Color::LightYellow
         );
 
         dashboard.handle_key(key(KeyCode::Tab));
