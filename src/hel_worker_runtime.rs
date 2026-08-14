@@ -117,7 +117,7 @@ mod unix {
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::{mpsc, oneshot};
 
-    use super::{AcpSupervisorSpec, WorkerLaunchConfig};
+    use super::{AcpSupervisorSpec, CredentialEndpoint, WorkerLaunchConfig};
     use crate::hel_acp::{self, CommandRequest, LaunchSpec, RuntimeEvent};
     use crate::hel_worker::{
         DurableWorker, ErrorCode, PROTOCOL_VERSION, ProtocolError, RequestEnvelope, ResponseBody,
@@ -205,6 +205,8 @@ mod unix {
         }
 
         let resume_session = select_resume_session(&config, &durable_worker);
+        // Resolved before the launch config's environment is consumed below.
+        let credentials = super::credential_endpoint(&config);
         let worker = Arc::new(Mutex::new(durable_worker));
         let (acp_commands_tx, acp_commands_rx) = mpsc::channel(32);
         let (acp_events_tx, acp_events_rx) = mpsc::unbounded_channel();
@@ -251,12 +253,14 @@ mod unix {
                     let client_worker = worker.clone();
                     let client_commands = acp_commands_tx.clone();
                     let client_checkpoints = checkpoint_tx.clone();
+                    let client_credentials = credentials.clone();
                     tokio::spawn(async move {
                         if let Err(error) = serve_client(
                             stream,
                             client_worker,
                             client_commands,
                             client_checkpoints,
+                            client_credentials,
                         ).await {
                             tracing::warn!(%error, "worker proxy client disconnected");
                         }
@@ -396,6 +400,7 @@ mod unix {
         worker: Arc<Mutex<DurableWorker>>,
         commands: mpsc::Sender<CommandRequest>,
         checkpoints: mpsc::UnboundedSender<CheckpointBarrier>,
+        credentials: std::result::Result<CredentialEndpoint, String>,
     ) -> Result<()> {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
@@ -435,6 +440,18 @@ mod unix {
             let request = envelope.request.clone();
             if let WorkerRequest::Compact { text } = request {
                 let response = compact_response(envelope, text, &commands).await;
+                write_response(&mut writer, &response).await?;
+                continue;
+            }
+            if matches!(
+                request,
+                WorkerRequest::CredentialState
+                    | WorkerRequest::ReadCredentials
+                    | WorkerRequest::InstallCredentials { .. }
+            ) {
+                // Answered here so credential bytes stay on this socket and out
+                // of the durable event stream and idempotency ledger.
+                let response = credential_response(envelope, &credentials).await;
                 write_response(&mut writer, &response).await?;
                 continue;
             }
@@ -562,6 +579,107 @@ mod unix {
             request_id: envelope.request_id,
             protocol_version: envelope.protocol_version,
             body,
+        }
+    }
+
+    /// Serve a credential request against this worker's own harness home. File
+    /// work runs on a blocking thread so the connection task never stalls.
+    async fn credential_response(
+        envelope: RequestEnvelope,
+        credentials: &std::result::Result<CredentialEndpoint, String>,
+    ) -> ResponseEnvelope {
+        let body = match credentials {
+            Err(message) => ResponseBody::Error {
+                error: ProtocolError {
+                    code: ErrorCode::InvalidState,
+                    message: message.clone(),
+                    retryable: false,
+                    detail: None,
+                },
+            },
+            Ok(endpoint) => {
+                let endpoint = endpoint.clone();
+                let request = envelope.request.clone();
+                match tokio::task::spawn_blocking(move || {
+                    apply_credential_request(&endpoint, &request)
+                })
+                .await
+                {
+                    Ok(Ok(payload)) => ResponseBody::Ok { payload },
+                    Ok(Err(error)) => ResponseBody::Error {
+                        error: ProtocolError {
+                            code: ErrorCode::InvalidRequest,
+                            message: format!("{error:#}"),
+                            retryable: false,
+                            detail: None,
+                        },
+                    },
+                    Err(error) => ResponseBody::Error {
+                        error: ProtocolError {
+                            code: ErrorCode::Internal,
+                            message: format!("credential task stopped: {error}"),
+                            retryable: true,
+                            detail: None,
+                        },
+                    },
+                }
+            }
+        };
+        ResponseEnvelope {
+            request_id: envelope.request_id,
+            protocol_version: envelope.protocol_version,
+            body,
+        }
+    }
+
+    pub(super) fn apply_credential_request(
+        endpoint: &CredentialEndpoint,
+        request: &WorkerRequest,
+    ) -> Result<ResponsePayload> {
+        use crate::hel_credentials::{
+            CredentialSnapshot, MAX_CREDENTIAL_BYTES, read_credential_file, write_credential_file,
+        };
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        match request {
+            WorkerRequest::CredentialState => {
+                let (snapshot, _) = read_credential_file(endpoint.harness, &endpoint.marker)?;
+                Ok(credential_state_payload(&snapshot))
+            }
+            WorkerRequest::ReadCredentials => {
+                let (snapshot, bytes) = read_credential_file(endpoint.harness, &endpoint.marker)?;
+                if !snapshot.present {
+                    bail!("session has no {} credentials", endpoint.marker.display());
+                }
+                Ok(ResponsePayload::Credentials {
+                    data: BASE64.encode(&bytes),
+                })
+            }
+            WorkerRequest::InstallCredentials { data } => {
+                if data.len() > MAX_CREDENTIAL_BYTES * 2 {
+                    bail!("credential payload is above the {MAX_CREDENTIAL_BYTES} byte limit");
+                }
+                let bytes = BASE64
+                    .decode(data.as_bytes())
+                    .context("decode credential payload")?;
+                write_credential_file(&endpoint.marker, &bytes)?;
+                Ok(credential_state_payload(&CredentialSnapshot::of(
+                    endpoint.harness,
+                    &bytes,
+                )))
+            }
+            other => bail!("{} is not a credential request", other.method_name()),
+        }
+    }
+
+    fn credential_state_payload(
+        snapshot: &crate::hel_credentials::CredentialSnapshot,
+    ) -> ResponsePayload {
+        ResponsePayload::CredentialState {
+            present: snapshot.present,
+            fingerprint: snapshot.fingerprint.clone(),
+            freshness_epoch_ms: snapshot.freshness_epoch_ms,
         }
     }
 
@@ -752,6 +870,32 @@ mod unix {
             libc::kill(-pid, signal);
         }
     }
+}
+
+/// Where this worker's harness keeps its credentials, resolved from the launch
+/// config alone. Credential requests never carry a path, so a caller cannot
+/// steer a read or a write outside the session's own harness home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialEndpoint {
+    pub harness: HarnessKind,
+    pub marker: PathBuf,
+}
+
+#[cfg(unix)]
+fn credential_endpoint(
+    config: &WorkerLaunchConfig,
+) -> std::result::Result<CredentialEndpoint, String> {
+    let key = config.harness.home_env();
+    let home = config.environment.get(key).ok_or_else(|| {
+        format!("worker launch config has no {key} entry, so it cannot locate harness credentials")
+    })?;
+    Ok(CredentialEndpoint {
+        harness: config.harness,
+        marker: crate::hel_setup::harness_authentication_marker(
+            config.harness,
+            Path::new(home.as_str()),
+        ),
+    })
 }
 
 #[cfg(unix)]
@@ -989,6 +1133,171 @@ mod tests {
         ));
         drop(event_tx);
         coordinator.await.unwrap().unwrap();
+    }
+
+    fn codex_credentials(last_refresh: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": { "access_token": "access", "refresh_token": "refresh" },
+            "last_refresh": last_refresh,
+        }))
+        .unwrap()
+    }
+
+    fn install_request(bytes: &[u8]) -> crate::hel_worker::WorkerRequest {
+        use base64::Engine as _;
+        crate::hel_worker::WorkerRequest::InstallCredentials {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
+    #[test]
+    fn credential_state_reports_absence_then_the_installed_fingerprint() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = launch_config(&home.path().to_string_lossy());
+        config.harness = HarnessKind::Codex;
+        let endpoint = credential_endpoint(&config).unwrap();
+
+        let absent = unix::apply_credential_request(
+            &endpoint,
+            &crate::hel_worker::WorkerRequest::CredentialState,
+        )
+        .unwrap();
+        assert!(matches!(
+            absent,
+            crate::hel_worker::ResponsePayload::CredentialState { present: false, .. }
+        ));
+
+        let bytes = codex_credentials("2026-08-05T02:51:00.864587231Z");
+        let installed =
+            unix::apply_credential_request(&endpoint, &install_request(&bytes)).unwrap();
+        let crate::hel_worker::ResponsePayload::CredentialState {
+            present,
+            fingerprint,
+            freshness_epoch_ms,
+        } = installed
+        else {
+            panic!("install did not report credential state");
+        };
+        assert!(present);
+        assert_eq!(
+            fingerprint,
+            crate::hel_credentials::credential_fingerprint(&bytes)
+        );
+        assert_eq!(freshness_epoch_ms, Some(1_785_898_260_864));
+        assert_eq!(std::fs::read(home.path().join("auth.json")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn installed_credentials_are_owner_only_and_round_trip_through_a_read() {
+        use base64::Engine as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let mut config = launch_config(&home.path().to_string_lossy());
+        config.harness = HarnessKind::Codex;
+        let endpoint = credential_endpoint(&config).unwrap();
+        let bytes = codex_credentials("2026-08-05T02:51:00Z");
+
+        unix::apply_credential_request(&endpoint, &install_request(&bytes)).unwrap();
+        let mode = std::fs::metadata(home.path().join("auth.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let read = unix::apply_credential_request(
+            &endpoint,
+            &crate::hel_worker::WorkerRequest::ReadCredentials,
+        )
+        .unwrap();
+        let crate::hel_worker::ResponsePayload::Credentials { data } = read else {
+            panic!("read did not return credentials");
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn installing_kimi_credentials_creates_the_missing_parent_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = launch_config(&home.path().to_string_lossy());
+        config.harness = HarnessKind::Kimi;
+        config.environment = BTreeMap::from([(
+            "KIMI_CODE_HOME".to_owned(),
+            home.path().to_string_lossy().into_owned(),
+        )]);
+        let endpoint = credential_endpoint(&config).unwrap();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "access_token": "access",
+            "expires_at": 1_755_000_000,
+        }))
+        .unwrap();
+
+        unix::apply_credential_request(&endpoint, &install_request(&bytes)).unwrap();
+
+        assert_eq!(
+            std::fs::read(home.path().join("credentials/kimi-code.json")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn reading_absent_credentials_and_installing_junk_are_both_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = launch_config(&home.path().to_string_lossy());
+        config.harness = HarnessKind::Codex;
+        let endpoint = credential_endpoint(&config).unwrap();
+
+        let error = unix::apply_credential_request(
+            &endpoint,
+            &crate::hel_worker::WorkerRequest::ReadCredentials,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("no"), "{error:#}");
+
+        let error =
+            unix::apply_credential_request(&endpoint, &install_request(b"not json")).unwrap_err();
+        assert!(format!("{error:#}").contains("JSON"), "{error:#}");
+
+        let oversized = vec![b'a'; crate::hel_credentials::MAX_CREDENTIAL_BYTES + 1];
+        let error =
+            unix::apply_credential_request(&endpoint, &install_request(&oversized)).unwrap_err();
+        assert!(format!("{error:#}").contains("limit"), "{error:#}");
+    }
+
+    #[test]
+    fn installing_over_a_symlink_leaves_the_link_target_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = home.path().join("stolen.json");
+        std::fs::write(&elsewhere, b"{}").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.path().join("auth.json")).unwrap();
+        let mut config = launch_config(&home.path().to_string_lossy());
+        config.harness = HarnessKind::Codex;
+        let endpoint = credential_endpoint(&config).unwrap();
+
+        let error = unix::apply_credential_request(
+            &endpoint,
+            &install_request(&codex_credentials("2026-08-05T02:51:00Z")),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("symbolic link"), "{error:#}");
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn a_launch_config_without_a_harness_home_cannot_serve_credentials() {
+        let mut config = launch_config("/profile");
+        config.environment.clear();
+
+        let error = credential_endpoint(&config).unwrap_err();
+
+        assert!(error.contains("CODEX_HOME"), "{error}");
     }
 
     #[test]

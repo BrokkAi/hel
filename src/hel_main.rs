@@ -19,6 +19,7 @@ use crossterm::terminal::{
 use hel::hel_archive::{PayloadRole, read_archive_verified};
 use hel::hel_config::{HelConfig, ProjectBundle, ProjectRepository, config_path, sessions_dir};
 use hel::hel_controller::{Controller, SessionLaunchOptions, SessionResumeOptions};
+use hel::hel_credentials::{CredentialSyncCoordinator, CredentialSyncHandle, CredentialSyncTarget};
 use hel::hel_greeting::{GreetingFacts, RepositoryGreetingFacts};
 use hel::hel_import::{
     BundleResolution, ClaudeImportRequest, ClaudeSessionSelection, CodexImportRequest,
@@ -84,12 +85,21 @@ enum Command {
     Recover(RecoverArgs),
     /// Create a verified recovery copy for an active session.
     Checkpoint(CheckpointArgs),
+    /// Run a harness login for a profile so live sessions pick up fresh credentials.
+    Login(LoginArgs),
 }
 
 #[derive(Debug, Args)]
 struct CheckpointArgs {
     #[arg(long)]
     session: String,
+}
+
+#[derive(Debug, Args)]
+struct LoginArgs {
+    /// Profile to authenticate. Optional when exactly one profile exists.
+    #[arg(long)]
+    profile: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -501,6 +511,83 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Some(Command::Login(args)) => login(args).await,
+    }
+}
+
+/// Run the harness's own interactive login against a profile's canonical home.
+/// Hel never sees the credential contents; it compares fingerprints before and
+/// after so it can tell the operator whether anything changed.
+async fn login(args: LoginArgs) -> Result<()> {
+    let controller = Controller::load()?;
+    let profile_id = resolve_login_profile(&controller.config, args.profile.as_deref())?;
+    let profile = controller
+        .config
+        .profiles
+        .get(&profile_id)
+        .with_context(|| {
+            format!(
+                "unknown profile {profile_id:?}; configured profiles: {}",
+                profile_ids(&controller.config)
+            )
+        })?;
+    let marker = hel::hel_setup::harness_authentication_marker(profile.kind, &profile.home);
+    let (before, _) = hel::hel_credentials::read_credential_file(profile.kind, &marker)?;
+    let (program, arguments) = hel::hel_credentials::login_command(profile);
+
+    println!(
+        "Running `{program} {}` against {}.",
+        arguments.join(" "),
+        profile.home.display()
+    );
+    let status = tokio::process::Command::new(&program)
+        .args(&arguments)
+        .envs(&profile.environment)
+        .env(profile.home_env(), &profile.home)
+        .status()
+        .await
+        .with_context(|| {
+            format!(
+                "run `{program} {}` for profile {profile_id}",
+                arguments.join(" ")
+            )
+        })?;
+
+    let (after, _) = hel::hel_credentials::read_credential_file(profile.kind, &marker)?;
+    if after.present && after.fingerprint != before.fingerprint {
+        println!(
+            "Credentials updated for profile {profile_id}. Live sessions pick them up within about a minute while the Hel TUI or server is running."
+        );
+    } else {
+        println!("Credentials for profile {profile_id} are unchanged.");
+    }
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+fn profile_ids(config: &HelConfig) -> String {
+    config
+        .profiles
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn resolve_login_profile(config: &HelConfig, requested: Option<&str>) -> Result<String> {
+    if let Some(profile) = requested {
+        return Ok(profile.to_owned());
+    }
+    let mut profiles = config.profiles.keys();
+    match (profiles.next(), profiles.next()) {
+        (Some(only), None) => Ok(only.clone()),
+        (Some(_), Some(_)) => bail!(
+            "several profiles are configured; pass --profile with one of: {}",
+            profile_ids(config)
+        ),
+        (None, _) => bail!("no harness profiles are configured; run `hel setup` first"),
     }
 }
 
@@ -845,6 +932,10 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
     let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn();
     let recovery_observer = recovery.observer();
+    let mut credential_sync = CredentialSyncCoordinator::spawn();
+    let credential_sync_handle = credential_sync.handle();
+    credential_sync_handle.set_targets(credential_sync_targets(&controller));
+    let mut auth_failure_syncs = std::collections::BTreeMap::<String, Instant>::new();
     let termination = hel::termination::Coordinator::install().token();
     let mut options = ServerOptions::new(bind, snapshot_rx, conversation_rx, action_tx)?;
     options.shutdown = termination.clone();
@@ -876,6 +967,11 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                     let Some(update) = update else { break };
                     if let WorkerPollPayload::Events { events, phase, transcript, queued_prompts: worker_queue, .. } = update.payload {
                         if let Some(session) = controller.state.sessions.get(&update.session_id).cloned() {
+                            if hel::hel_credentials::events_report_auth_failure(session.harness_kind, &events)
+                                && auth_failure_sync_is_due(&mut auth_failure_syncs, &update.session_id, Instant::now())
+                            {
+                                credential_sync_handle.sync_profile_now(&session.last_profile, Some(&update.session_id));
+                            }
                             recovery_observer
                                 .observe(hel::hel_recovery::RecoveryObservation {
                                     session,
@@ -905,6 +1001,11 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                     let mut changed = false;
                     while let Some(result) = recovery.try_result() {
                         changed |= merge_recovery_result(&mut controller, result);
+                    }
+                    while let Some(result) = credential_sync.try_result() {
+                        if let Some(notice) = credential_sync_notice(&result) {
+                            eprintln!("Hel: {notice}");
+                        }
                     }
                     if changed {
                         revision += 1;
@@ -949,6 +1050,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                         continue;
                     }
                     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                    credential_sync_handle.set_targets(credential_sync_targets(&controller));
                     conversations.retain(|id, _| {
                         controller.state.sessions.get(id).is_some_and(|session| session.state.is_active())
                     });
@@ -1223,6 +1325,92 @@ fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPollTarget> {
         .collect()
 }
 
+/// Sessions whose worker can answer credential requests right now. Sessions
+/// still provisioning or already disconnected would only produce connection
+/// errors, so they stay out.
+fn credential_sync_targets(controller: &Controller) -> Vec<CredentialSyncTarget> {
+    controller
+        .state
+        .sessions
+        .values()
+        .filter(|session| {
+            matches!(
+                session.state,
+                SessionState::Running | SessionState::Checkpointing
+            ) && session.target.is_some()
+        })
+        .filter_map(|session| {
+            let profile = controller.config.profiles.get(&session.last_profile)?;
+            let spec = controller.reconnect_command(&session.id).ok()?;
+            Some(CredentialSyncTarget {
+                session_id: session.id.clone(),
+                profile_id: session.last_profile.clone(),
+                harness: profile.kind,
+                profile_home: profile.home.clone(),
+                spec,
+            })
+        })
+        .collect()
+}
+
+/// One automatic sync and notice per session per cooldown, so a harness that
+/// fails authentication on every retry does not flood the UI.
+const AUTH_FAILURE_SYNC_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+fn auth_failure_sync_is_due(
+    last_attempts: &mut std::collections::BTreeMap<String, Instant>,
+    session_id: &str,
+    now: Instant,
+) -> bool {
+    if last_attempts
+        .get(session_id)
+        .is_some_and(|previous| now.duration_since(*previous) < AUTH_FAILURE_SYNC_COOLDOWN)
+    {
+        return false;
+    }
+    last_attempts.insert(session_id.to_owned(), now);
+    true
+}
+
+/// Healthy no-op cycles stay out of the UI; only actions, failures, and
+/// answers to an authentication failure are worth a notice.
+fn credential_sync_notice(result: &hel::hel_credentials::CredentialSyncResult) -> Option<String> {
+    if let Some(session_id) = &result.triggered_by {
+        return Some(if result.pushed_to(session_id) {
+            format!(
+                "Session {} hit an authentication failure; refreshed credentials were pushed. Retry the prompt, and if it repeats run `hel login --profile {}`.",
+                short_id(session_id),
+                result.profile_id
+            )
+        } else {
+            format!(
+                "Session {} hit an authentication failure and Hel has nothing fresher to push. Run `hel login --profile {}`.",
+                short_id(session_id),
+                result.profile_id
+            )
+        });
+    }
+    if let Some(detail) = &result.failure {
+        return Some(format!(
+            "Credential sync for profile {} failed: {detail}",
+            result.profile_id
+        ));
+    }
+    if let Some((session_id, detail)) = result.failures().next() {
+        return Some(format!(
+            "Credential sync for {} failed: {detail}",
+            short_id(session_id)
+        ));
+    }
+    let actions = result.actions();
+    (actions > 0).then(|| {
+        format!(
+            "Refreshed harness credentials for profile {} across {actions} session(s).",
+            result.profile_id
+        )
+    })
+}
+
 fn dashboard_resource_targets(controller: &Controller) -> Vec<ResourcePollTarget> {
     controller
         .state
@@ -1245,6 +1433,7 @@ fn refresh_dashboard_poll_targets(
     controller: &Controller,
     worker_targets_tx: &tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
     resource_targets_tx: &tokio::sync::watch::Sender<Vec<ResourcePollTarget>>,
+    credential_sync: &CredentialSyncHandle,
     excluded_sessions: &std::collections::BTreeSet<String>,
 ) {
     let mut worker_targets = dashboard_worker_targets(controller);
@@ -1253,6 +1442,9 @@ fn refresh_dashboard_poll_targets(
     let mut resource_targets = dashboard_resource_targets(controller);
     resource_targets.retain(|target| !excluded_sessions.contains(&target.session_id));
     resource_targets_tx.send_replace(resource_targets);
+    let mut credential_targets = credential_sync_targets(controller);
+    credential_targets.retain(|target| !excluded_sessions.contains(&target.session_id));
+    credential_sync.set_targets(credential_targets);
 }
 
 fn spawn_aws_resource_options_resolution(
@@ -2170,6 +2362,9 @@ async fn run_dashboard() -> Result<()> {
         spawn_dashboard_worker_poller();
     let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn();
     let recovery_observer = recovery.observer();
+    let mut credential_sync = CredentialSyncCoordinator::spawn();
+    let credential_sync_handle = credential_sync.handle();
+    let mut auth_failure_syncs = std::collections::BTreeMap::<String, Instant>::new();
     let (resource_targets_tx, resource_triggers_tx, mut resource_updates_rx) =
         spawn_dashboard_resource_poller();
     let (capacity_targets_tx, mut capacity_updates_rx) = spawn_dashboard_capacity_poller();
@@ -2183,6 +2378,7 @@ async fn run_dashboard() -> Result<()> {
         &controller,
         &worker_targets_tx,
         &resource_targets_tx,
+        &credential_sync_handle,
         &std::collections::BTreeSet::new(),
     );
     let capacity_targets = controller.deployment_capacity_targets();
@@ -2222,6 +2418,16 @@ async fn run_dashboard() -> Result<()> {
             if let WorkerPollPayload::Events { events, phase, .. } = &update.payload
                 && let Some(session) = controller.state.sessions.get(&session_id).cloned()
             {
+                if hel::hel_credentials::events_report_auth_failure(session.harness_kind, events)
+                    && auth_failure_sync_is_due(
+                        &mut auth_failure_syncs,
+                        &session_id,
+                        Instant::now(),
+                    )
+                {
+                    credential_sync_handle
+                        .sync_profile_now(&session.last_profile, Some(&session_id));
+                }
                 recovery_observer
                     .observe(hel::hel_recovery::RecoveryObservation {
                         session,
@@ -2243,6 +2449,11 @@ async fn run_dashboard() -> Result<()> {
         }
         while let Some(result) = recovery.try_result() {
             apply_recovery_result(&mut controller, &mut dashboard, result);
+        }
+        while let Some(result) = credential_sync.try_result() {
+            if let Some(notice) = credential_sync_notice(&result) {
+                dashboard.set_notice(notice);
+            }
         }
         while let Ok(update) = resource_updates_rx.try_recv() {
             dashboard.apply_resource_usage(&update.session_id, update.usage);
@@ -2339,6 +2550,7 @@ async fn run_dashboard() -> Result<()> {
                                         &controller,
                                         &worker_targets_tx,
                                         &resource_targets_tx,
+                                        &credential_sync_handle,
                                         &lifecycle_operations.keys().cloned().collect(),
                                     );
                                     dashboard.set_notice(format!(
@@ -2436,6 +2648,7 @@ async fn run_dashboard() -> Result<()> {
                 &controller,
                 &worker_targets_tx,
                 &resource_targets_tx,
+                &credential_sync_handle,
                 &lifecycle_operations.keys().cloned().collect(),
             );
         }
@@ -2504,6 +2717,7 @@ async fn run_dashboard() -> Result<()> {
                             &controller,
                             &worker_targets_tx,
                             &resource_targets_tx,
+                            &credential_sync_handle,
                             &lifecycle_operations.keys().cloned().collect(),
                         );
                         dashboard.set_notice(
@@ -3927,6 +4141,115 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_loop_triggers_at_most_one_credential_sync_per_cooldown() {
+        let mut attempts = std::collections::BTreeMap::new();
+        let started = Instant::now();
+        assert!(auth_failure_sync_is_due(&mut attempts, "session", started));
+        assert!(!auth_failure_sync_is_due(
+            &mut attempts,
+            "session",
+            started + Duration::from_secs(60)
+        ));
+        assert!(auth_failure_sync_is_due(
+            &mut attempts,
+            "other",
+            started + Duration::from_secs(60)
+        ));
+        assert!(auth_failure_sync_is_due(
+            &mut attempts,
+            "session",
+            started + AUTH_FAILURE_SYNC_COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn a_healthy_credential_cycle_stays_out_of_the_ui() {
+        let result = hel::hel_credentials::CredentialSyncResult {
+            profile_id: "work".into(),
+            triggered_by: None,
+            failure: None,
+            outcomes: Vec::new(),
+        };
+        assert_eq!(credential_sync_notice(&result), None);
+    }
+
+    #[test]
+    fn an_authentication_failure_notice_says_whether_anything_was_pushed() {
+        use hel::hel_credentials::{
+            CredentialSyncAction, CredentialSyncOutcome, CredentialSyncResult,
+        };
+
+        let pushed = CredentialSyncResult {
+            profile_id: "work".into(),
+            triggered_by: Some("018f9dd2-a3b4".into()),
+            failure: None,
+            outcomes: vec![CredentialSyncOutcome {
+                session_id: "018f9dd2-a3b4".into(),
+                outcome: Ok(CredentialSyncAction::Pushed),
+            }],
+        };
+        let notice = credential_sync_notice(&pushed).unwrap();
+        assert!(notice.contains("were pushed"), "{notice}");
+        assert!(notice.contains("hel login --profile work"), "{notice}");
+
+        let nothing_to_push = CredentialSyncResult {
+            triggered_by: Some("018f9dd2-a3b4".into()),
+            outcomes: Vec::new(),
+            ..pushed
+        };
+        let notice = credential_sync_notice(&nothing_to_push).unwrap();
+        assert!(notice.contains("nothing fresher"), "{notice}");
+        assert!(notice.contains("hel login --profile work"), "{notice}");
+    }
+
+    #[test]
+    fn a_failed_credential_sync_is_reported() {
+        use hel::hel_credentials::{CredentialSyncOutcome, CredentialSyncResult};
+
+        let result = CredentialSyncResult {
+            profile_id: "work".into(),
+            triggered_by: None,
+            failure: None,
+            outcomes: vec![CredentialSyncOutcome {
+                session_id: "018f9dd2-a3b4".into(),
+                outcome: Err("worker proxy disconnected".into()),
+            }],
+        };
+        let notice = credential_sync_notice(&result).unwrap();
+        assert!(notice.contains("worker proxy disconnected"), "{notice}");
+    }
+
+    #[test]
+    fn login_uses_the_sole_profile_and_otherwise_demands_a_choice() {
+        let mut config = HelConfig::default();
+        assert!(resolve_login_profile(&config, None).is_err());
+
+        config.profiles.insert(
+            "work".into(),
+            hel::hel_config::HarnessProfile {
+                kind: hel::hel_config::HarnessKind::Claude,
+                home: PathBuf::from("/home/user/.claude"),
+                executable: None,
+                environment: Default::default(),
+                context_window_bytes: None,
+            },
+        );
+        assert_eq!(resolve_login_profile(&config, None).unwrap(), "work");
+
+        config
+            .profiles
+            .insert("personal".into(), config.profiles["work"].clone());
+        let error = resolve_login_profile(&config, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("personal, work"), "{error}");
+        assert_eq!(
+            resolve_login_profile(&config, Some("personal")).unwrap(),
+            "personal"
+        );
+    }
+
+    #[test]
     fn aws_capacity_sums_live_instance_allocations() {
         let total = aggregate_aws_capacity(&[
             DeploymentCapacityUsage {
@@ -4007,6 +4330,11 @@ mod tests {
                 .get_subcommands()
                 .any(|sub| sub.get_name() == "setup")
         );
+        let login = command
+            .get_subcommands()
+            .find(|sub| sub.get_name() == "login")
+            .expect("hel login is a visible command");
+        assert!(!login.is_hide_set());
     }
 
     #[test]

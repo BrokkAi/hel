@@ -298,6 +298,21 @@ inside a GitHub checkout, one-repository bundle. Advanced configurations remain
 TOML-first: edit `config.toml` directly to add profiles, multi-repository virtual
 monorepos, SSH targets, or AWS targets.
 
+## Credentials
+
+Each profile keeps one canonical set of harness credentials on the controller,
+in the profile's configured home. Every isolated session gets its own copy, and
+because harness OAuth grants rotate their refresh token, those copies would
+otherwise drift apart until the older ones stop working. A background service
+reconciles the canonical copy with every live session in both directions, so a
+refresh anywhere reaches everywhere within about a minute while the Hel TUI or
+server is running. Credentials travel only between the controller and a
+session's worker; they are never written to the event stream or a recovery
+archive. When a session reports an authentication failure, Hel syncs that
+profile immediately and says so. When the grant itself is dead, run
+`hel login --profile <id>` to run the harness's own login against the profile
+home.
+
 ## Session recovery and archives
 
 After a completed turn, Hel automatically saves a recovery copy when the worker

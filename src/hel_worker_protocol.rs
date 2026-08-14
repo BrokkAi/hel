@@ -99,6 +99,27 @@ mod tests {
     }
 
     #[test]
+    fn credential_methods_decode_without_a_path_from_the_caller() {
+        let request =
+            br#"{"request_id":"r1","protocol_version":3,"request":{"method":"credential_state"}}"#;
+        let DecodedRequest::Known(envelope) = decode_request(request).unwrap() else {
+            panic!("credential_state should decode");
+        };
+        assert_eq!(envelope.request, WorkerRequest::CredentialState);
+
+        let request = br#"{"request_id":"r2","protocol_version":3,"request":{"method":"install_credentials","params":{"data":"e30="}}}"#;
+        let DecodedRequest::Known(envelope) = decode_request(request).unwrap() else {
+            panic!("install_credentials should decode");
+        };
+        assert_eq!(
+            envelope.request,
+            WorkerRequest::InstallCredentials {
+                data: "e30=".into()
+            }
+        );
+    }
+
+    #[test]
     fn malformed_known_method_is_an_invalid_request() {
         let request = br#"{"request_id":"r1","protocol_version":1,"request":{"method":"subscribe","params":{}}}"#;
         assert!(matches!(

@@ -115,6 +115,15 @@ pub enum WorkerRequest {
     CheckpointWhenQuiescent {
         reason: Option<String>,
     },
+    /// Report the fingerprint and freshness of this session's harness
+    /// credentials. The runtime answers these three without recording an
+    /// event, so credential bytes never reach the durable event stream.
+    CredentialState,
+    ReadCredentials,
+    InstallCredentials {
+        /// Base64 of the credential file to install.
+        data: String,
+    },
     Close,
 }
 
@@ -134,6 +143,9 @@ impl WorkerRequest {
             Self::SetConfig { .. } => "set_config",
             Self::Checkpoint { .. } => "checkpoint",
             Self::CheckpointWhenQuiescent { .. } => "checkpoint_when_quiescent",
+            Self::CredentialState => "credential_state",
+            Self::ReadCredentials => "read_credentials",
+            Self::InstallCredentials { .. } => "install_credentials",
             Self::Close => "close",
         }
     }
@@ -208,6 +220,18 @@ pub enum ResponsePayload {
     },
     Compacted {
         text: String,
+    },
+    /// Fingerprint and freshness of a session's harness credentials. Neither
+    /// value is secret.
+    CredentialState {
+        present: bool,
+        fingerprint: String,
+        freshness_epoch_ms: Option<i64>,
+    },
+    /// Base64 of a session's credential file. Sent only on the connection
+    /// socket, never recorded.
+    Credentials {
+        data: String,
     },
 }
 
@@ -907,6 +931,22 @@ impl DurableWorker {
                 )?;
                 ResponsePayload::Accepted { seq }
             }
+            // Credential requests are answered by the runtime layer so that no
+            // credential byte is ever recorded in the durable event stream or
+            // the idempotency ledger. Reaching the durable worker means the
+            // runtime forgot to intercept them.
+            WorkerRequest::CredentialState
+            | WorkerRequest::ReadCredentials
+            | WorkerRequest::InstallCredentials { .. } => {
+                return Ok(error(
+                    ErrorCode::Internal,
+                    format!(
+                        "{} is handled by the worker runtime, not durable state",
+                        envelope.request.method_name()
+                    ),
+                    false,
+                ));
+            }
             WorkerRequest::Close => {
                 if self.snapshot.phase == WorkerPhase::Closed {
                     return Ok(error(
@@ -1594,6 +1634,30 @@ mod tests {
             )]
         );
         assert!(worker.claim_pending_dispatches().unwrap().is_empty());
+    }
+
+    #[test]
+    fn credential_requests_leave_no_trace_in_durable_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+
+        let response = worker.handle(request(
+            "install-1",
+            WorkerRequest::InstallCredentials {
+                data: "e30=".into(),
+            },
+        ));
+
+        let ResponseBody::Error { error } = &response.body else {
+            panic!("durable state must refuse credential requests: {response:?}");
+        };
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(error.message.contains("install_credentials"), "{error:?}");
+        assert!(worker.events_after(0).unwrap().is_empty());
+        assert!(worker.snapshot().handled_requests.is_empty());
+        let persisted =
+            std::fs::read_to_string(temp.path().join("events.jsonl")).unwrap_or_default();
+        assert!(!persisted.contains("e30="), "{persisted}");
     }
 
     #[test]

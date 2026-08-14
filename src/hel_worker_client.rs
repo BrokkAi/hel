@@ -3,13 +3,17 @@
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+use crate::hel_credentials::CredentialSnapshot;
 use crate::hel_targets::CommandSpec;
 use crate::hel_worker::{
-    Attachment, MAX_FRAME_BYTES, PROTOCOL_VERSION, RequestEnvelope, ResponseBody, ResponseEnvelope,
-    ResponsePayload, SequencedEvent, VersionRange, WorkerRequest, WorkerSnapshot, WorkerStatus,
+    Attachment, MAX_FRAME_BYTES, PROTOCOL_VERSION, ProtocolError, ProtocolErrorDetail,
+    RequestEnvelope, ResponseBody, ResponseEnvelope, ResponsePayload, SequencedEvent, VersionRange,
+    WorkerRequest, WorkerSnapshot, WorkerStatus,
 };
 
 /// A live stdio connection to `hel worker proxy` on a session target.
@@ -235,6 +239,41 @@ impl WorkerClient {
         self.accepted(WorkerRequest::Cancel).await
     }
 
+    /// Fingerprint and freshness of the session's harness credentials.
+    /// `None` when the worker predates credential sync.
+    pub async fn credential_state(&mut self) -> Result<Option<CredentialSnapshot>> {
+        match self.call_supported(WorkerRequest::CredentialState).await? {
+            Some(payload) => credential_snapshot(payload).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the session's credential file. Callers must keep the bytes out of
+    /// events, logs, and archives.
+    pub async fn read_credentials(&mut self) -> Result<Vec<u8>> {
+        match self.call(WorkerRequest::ReadCredentials).await? {
+            ResponsePayload::Credentials { data } => BASE64
+                .decode(data.as_bytes())
+                .context("decode worker credential payload"),
+            _ => bail!("worker returned an unexpected credential response"),
+        }
+    }
+
+    /// Install credentials into the session's harness home. `None` when the
+    /// worker predates credential sync.
+    pub async fn install_credentials(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Option<CredentialSnapshot>> {
+        let request = WorkerRequest::InstallCredentials {
+            data: BASE64.encode(bytes),
+        };
+        match self.call_supported(request).await? {
+            Some(payload) => credential_snapshot(payload).map(Some),
+            None => Ok(None),
+        }
+    }
+
     pub async fn set_config(&mut self, key: String, value: String) -> Result<u64> {
         self.accepted(WorkerRequest::SetConfig {
             key,
@@ -275,6 +314,16 @@ impl WorkerClient {
         match self.call(request).await? {
             ResponsePayload::Accepted { seq } => Ok(seq),
             _ => bail!("worker returned an unexpected mutation response"),
+        }
+    }
+
+    /// Like `call`, but reports a worker that predates the method as `None`
+    /// instead of an error, so callers can skip it without noise.
+    async fn call_supported(&mut self, request: WorkerRequest) -> Result<Option<ResponsePayload>> {
+        match self.call(request).await {
+            Ok(payload) => Ok(Some(payload)),
+            Err(error) if is_unsupported_method(&error) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -350,6 +399,46 @@ impl crate::hel_compaction::CompactionBackend for WorkerClient {
     }
 }
 
+/// A worker built before this method existed answered the request. Callers
+/// that can degrade gracefully skip the worker; everyone else reports it.
+#[derive(Debug)]
+pub struct UnsupportedMethod {
+    pub method: String,
+}
+
+impl std::fmt::Display for UnsupportedMethod {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "worker does not support method {:?}",
+            self.method
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedMethod {}
+
+/// True when `error` came back as an unsupported-method rejection, including
+/// through the context layers `call` adds.
+pub fn is_unsupported_method(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<UnsupportedMethod>().is_some()
+}
+
+fn credential_snapshot(payload: ResponsePayload) -> Result<CredentialSnapshot> {
+    match payload {
+        ResponsePayload::CredentialState {
+            present,
+            fingerprint,
+            freshness_epoch_ms,
+        } => Ok(CredentialSnapshot {
+            present,
+            fingerprint,
+            freshness_epoch_ms,
+        }),
+        _ => bail!("worker returned an unexpected credential state response"),
+    }
+}
+
 fn decode_response(line: &str, request_id: &str, protocol: u32) -> Result<ResponsePayload> {
     let response: ResponseEnvelope =
         serde_json::from_str(line).context("decode worker response")?;
@@ -367,6 +456,13 @@ fn decode_response(line: &str, request_id: &str, protocol: u32) -> Result<Respon
     }
     match response.body {
         ResponseBody::Ok { payload } => Ok(payload),
+        ResponseBody::Error {
+            error:
+                ProtocolError {
+                    detail: Some(ProtocolErrorDetail::UnsupportedMethod { method }),
+                    ..
+                },
+        } => Err(anyhow::Error::new(UnsupportedMethod { method })),
         ResponseBody::Error { error } => Err(anyhow!(
             "worker rejected request ({:?}): {}",
             error.code,
@@ -408,7 +504,7 @@ fn decode_hello_response(line: &str, request_id: &str) -> Result<ResponsePayload
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hel_worker::{ErrorCode, ProtocolError};
+    use crate::hel_worker::ErrorCode;
 
     #[test]
     fn command_spec_preserves_argv_boundaries() {
@@ -457,6 +553,53 @@ mod tests {
         let encoded = serde_json::to_string(&response).unwrap();
         let error = decode_response(&encoded, "r1", PROTOCOL_VERSION).unwrap_err();
         assert!(error.to_string().contains("busy"));
+    }
+
+    #[test]
+    fn an_unsupported_method_rejection_stays_recognizable_through_context() {
+        let response = ResponseEnvelope {
+            request_id: "r1".into(),
+            protocol_version: PROTOCOL_VERSION,
+            body: ResponseBody::Error {
+                error: ProtocolError {
+                    code: ErrorCode::InvalidRequest,
+                    message: "worker does not support method \"credential_state\"".into(),
+                    retryable: false,
+                    detail: Some(ProtocolErrorDetail::UnsupportedMethod {
+                        method: "credential_state".into(),
+                    }),
+                },
+            },
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+
+        let error = decode_response(&encoded, "r1", PROTOCOL_VERSION)
+            .unwrap_err()
+            .context("worker 1.0.0 could not perform credential_state");
+
+        assert!(is_unsupported_method(&error));
+    }
+
+    #[test]
+    fn an_ordinary_rejection_is_not_reported_as_an_unsupported_method() {
+        let response = ResponseEnvelope {
+            request_id: "r1".into(),
+            protocol_version: PROTOCOL_VERSION,
+            body: ResponseBody::Error {
+                error: ProtocolError {
+                    code: ErrorCode::InvalidRequest,
+                    message: "credential payload is not JSON".into(),
+                    retryable: false,
+                    detail: None,
+                },
+            },
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+
+        let error = decode_response(&encoded, "r1", PROTOCOL_VERSION).unwrap_err();
+
+        assert!(!is_unsupported_method(&error));
+        assert!(error.to_string().contains("not JSON"));
     }
 
     #[test]
