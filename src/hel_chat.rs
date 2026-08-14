@@ -1579,7 +1579,9 @@ fn normalize_key(code: KeyCode, mut modifiers: KeyModifiers) -> (KeyCode, KeyMod
     }
     if character.is_ascii_uppercase() {
         modifiers.insert(KeyModifiers::SHIFT);
-        return (KeyCode::Char(character.to_ascii_lowercase()), modifiers);
+        if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) {
+            return (KeyCode::Char(character.to_ascii_lowercase()), modifiers);
+        }
     }
     (code, modifiers)
 }
@@ -3376,6 +3378,27 @@ mod tests {
         assert_eq!(chat.input, "remember me");
         chat.handle_key(key(KeyCode::Down));
         assert!(chat.input.is_empty());
+    }
+
+    #[test]
+    fn editor_preserves_uppercase_text_while_shortcuts_remain_case_insensitive() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+
+        chat.handle_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT));
+        // Some terminals report the uppercase character without a Shift modifier.
+        chat.handle_key(key(KeyCode::Char('I')));
+        assert_eq!(chat.input, "HI");
+
+        chat.handle_key(ctrl('r'));
+        chat.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+        assert_eq!(chat.history_search.as_ref().unwrap().query, "N");
+        chat.handle_key(key(KeyCode::Esc));
+
+        chat.handle_key(KeyEvent::new(
+            KeyCode::Char('T'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(chat.render_mode, TranscriptRenderMode::Raw);
     }
 
     #[test]
