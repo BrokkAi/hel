@@ -112,7 +112,7 @@ struct HistorySearch {
     unavailable: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChatRole {
     User,
     Agent,
@@ -125,8 +125,10 @@ pub enum ChatRole {
     System,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChatEntry {
+    #[serde(default)]
+    started_seq: u64,
     pub seq: u64,
     pub role: ChatRole,
     pub text: String,
@@ -138,11 +140,14 @@ pub struct ChatEntry {
     tool_diffstats: Vec<String>,
     tool_locations: Vec<String>,
     plan: Vec<PlanLine>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    leading_omitted: bool,
 }
 
 impl ChatEntry {
     fn plain(seq: u64, role: ChatRole, text: impl Into<String>) -> Self {
         Self {
+            started_seq: seq,
             seq,
             role,
             text: sanitize_terminal_text(&text.into()),
@@ -154,6 +159,7 @@ impl ChatEntry {
             tool_diffstats: Vec::new(),
             tool_locations: Vec::new(),
             plan: Vec::new(),
+            leading_omitted: false,
         }
     }
 
@@ -164,6 +170,7 @@ impl ChatEntry {
         tool_status: ToolStatus,
     ) -> Self {
         Self {
+            started_seq: seq,
             seq,
             role: ChatRole::Tool,
             text: sanitize_terminal_text(&title.into()),
@@ -175,11 +182,13 @@ impl ChatEntry {
             tool_diffstats: Vec::new(),
             tool_locations: Vec::new(),
             plan: Vec::new(),
+            leading_omitted: false,
         }
     }
 
     fn plan(seq: u64, plan: Vec<PlanLine>) -> Self {
         Self {
+            started_seq: seq,
             seq,
             role: ChatRole::Plan,
             text: String::new(),
@@ -191,6 +200,7 @@ impl ChatEntry {
             tool_diffstats: Vec::new(),
             tool_locations: Vec::new(),
             plan,
+            leading_omitted: false,
         }
     }
 
@@ -198,10 +208,53 @@ impl ChatEntry {
         self.seq = seq;
         self.revision = self.revision.wrapping_add(1);
     }
+
+    fn bounded_for_dashboard(mut self) -> Self {
+        self.bound_dashboard_content();
+        self
+    }
+
+    fn bound_dashboard_content(&mut self) {
+        const TEXT_BYTES: usize = 64 * 1024;
+        const DETAIL_BYTES: usize = 2 * 1024;
+        const DETAIL_COUNT: usize = 8;
+
+        self.leading_omitted |= truncate_string_start(&mut self.text, TEXT_BYTES);
+        for values in [
+            &mut self.tool_content,
+            &mut self.tool_diffstats,
+            &mut self.tool_locations,
+        ] {
+            values.truncate(DETAIL_COUNT);
+            for value in values {
+                truncate_string_start(value, DETAIL_BYTES);
+            }
+        }
+        self.plan.truncate(DETAIL_COUNT);
+        for line in &mut self.plan {
+            truncate_string_start(&mut line.text, DETAIL_BYTES);
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn truncate_string_start(value: &mut String, maximum_bytes: usize) -> bool {
+    if value.len() <= maximum_bytes {
+        return false;
+    }
+    let mut start = value.len() - maximum_bytes;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value.drain(..start);
+    true
 }
 
 /// The ACP tool states needed to keep a compact tool block visually useful.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ToolStatus {
     Pending,
     Running,
@@ -209,14 +262,14 @@ enum ToolStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum PlanStatus {
     Pending,
     Running,
     Completed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PlanLine {
     text: String,
     status: PlanStatus,
@@ -244,6 +297,13 @@ pub struct TranscriptSnapshot {
 }
 
 impl TranscriptSnapshot {
+    pub fn from_entries(entries: Vec<ChatEntry>) -> Self {
+        Self {
+            entries,
+            render_cache: TranscriptRenderCache::default(),
+        }
+    }
+
     pub(crate) fn has_assistant_messages(&self) -> bool {
         self.entries
             .iter()
@@ -358,6 +418,71 @@ impl ChatState {
         state.apply_events(events);
         state.latest_seq = state.latest_seq.max(snapshot.latest_seq);
         state
+    }
+
+    pub fn from_tail(
+        session_id: String,
+        phase: WorkerPhase,
+        latest_seq: u64,
+        entries: Vec<ChatEntry>,
+    ) -> Self {
+        let snapshot = WorkerSnapshot::summary(session_id, phase, latest_seq);
+        let mut state = Self::new(&snapshot, &[]);
+        state.entries = entries;
+        state
+    }
+
+    pub(crate) fn bounded_entries(
+        &self,
+        maximum_entries: usize,
+        maximum_bytes: usize,
+    ) -> Vec<ChatEntry> {
+        let start = self.entries.len().saturating_sub(maximum_entries);
+        let mut entries = self.entries[start..]
+            .iter()
+            .cloned()
+            .map(ChatEntry::bounded_for_dashboard)
+            .collect::<Vec<_>>();
+        while entries.len() > 1
+            && serde_json::to_vec(&entries).is_ok_and(|body| body.len() > maximum_bytes)
+        {
+            entries.remove(0);
+        }
+        entries
+    }
+
+    pub(crate) fn agent_message_start_sequences(&self) -> Vec<u64> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty())
+            .map(|entry| entry.started_seq)
+            .collect()
+    }
+
+    pub(crate) fn latest_agent_message_start_sequence(&self) -> Option<u64> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty())
+            .map(|entry| entry.started_seq)
+    }
+
+    pub(crate) fn trailing_agent_message_id(&self) -> Option<Option<String>> {
+        self.entries
+            .last()
+            .filter(|entry| entry.role == ChatRole::Agent)
+            .map(|entry| entry.message_id.clone())
+    }
+
+    pub(crate) fn retain_transcript_tail(&mut self, maximum_entries: usize) {
+        let remove = self.entries.len().saturating_sub(maximum_entries);
+        if remove > 0 {
+            self.entries.drain(..remove);
+            self.render_cache = TranscriptRenderCache::default();
+        }
+        for entry in &mut self.entries {
+            entry.bound_dashboard_content();
+        }
     }
 
     pub fn phase(&self) -> WorkerPhase {
@@ -2761,7 +2886,7 @@ fn entry_logical_lines(
         .take(8)
         .cloned()
         .collect::<Vec<_>>();
-    let source = match mode {
+    let mut source = match mode {
         TranscriptRenderMode::Raw if !details.is_empty() => {
             format!("{}\n{}", entry.text, details.join("\n"))
         }
@@ -2770,6 +2895,9 @@ fn entry_logical_lines(
         }
         _ => entry.text.clone(),
     };
+    if entry.leading_omitted {
+        source.insert_str(0, "[… earlier content omitted …]\n");
+    }
     match mode {
         TranscriptRenderMode::Rich => {
             markdown_lines(&source, visual.body_style, visual.header_style, width)
@@ -3590,6 +3718,49 @@ mod tests {
         assert_eq!(chat.entries.len(), 2);
         assert_eq!(chat.entries[0].role, ChatRole::User);
         assert_eq!(chat.entries[1].text, "done");
+    }
+
+    #[test]
+    fn hydrated_tail_continues_the_last_streamed_message() {
+        let first = RuntimeEvent::SessionUpdate {
+            update: serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "answer",
+                "content": {"type": "text", "text": "hello"}
+            }),
+        };
+        let event = SequencedEvent {
+            seq: 1,
+            request_id: None,
+            event: WorkerEvent::Adapter {
+                kind: "session_update".into(),
+                payload: serde_json::to_value(first).unwrap(),
+            },
+        };
+        let mut initial = snapshot();
+        initial.latest_seq = 1;
+        let full = ChatState::new(&initial, &[event]);
+        let entries = full.bounded_entries(10, 512 * 1024);
+        let mut tail =
+            ChatState::from_tail(initial.session_id.clone(), WorkerPhase::Running, 1, entries);
+        let second = RuntimeEvent::SessionUpdate {
+            update: serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "answer",
+                "content": {"type": "text", "text": " world"}
+            }),
+        };
+        tail.apply_events(&[SequencedEvent {
+            seq: 2,
+            request_id: None,
+            event: WorkerEvent::Adapter {
+                kind: "session_update".into(),
+                payload: serde_json::to_value(second).unwrap(),
+            },
+        }]);
+
+        assert_eq!(tail.entries.len(), 1);
+        assert_eq!(tail.entries[0].text, "hello world");
     }
 
     #[test]
