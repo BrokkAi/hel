@@ -314,6 +314,73 @@ pub enum TargetLocator {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ManagedWorktreeTarget {
+    Local,
+    Ssh {
+        destination: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ssh_args: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedWorktree {
+    pub source_project_directory: PathBuf,
+    pub source_repository: PathBuf,
+    pub worktree_root: PathBuf,
+    pub branch: String,
+    pub target: ManagedWorktreeTarget,
+}
+
+impl ManagedWorktree {
+    fn validate(&self, session_id: &str, project_directory: Option<&Path>) -> Result<()> {
+        for (label, path) in [
+            ("source project directory", &self.source_project_directory),
+            ("source repository", &self.source_repository),
+            ("worktree root", &self.worktree_root),
+        ] {
+            if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+                bail!("managed worktree {label} must be an absolute safe path");
+            }
+        }
+        if !self
+            .source_project_directory
+            .starts_with(&self.source_repository)
+        {
+            bail!("managed worktree source directory is outside its repository");
+        }
+        let expected_root = self
+            .source_repository
+            .join(".hel")
+            .join("worktrees")
+            .join(session_id);
+        if self.worktree_root != expected_root {
+            bail!("managed worktree root does not match the session-owned path");
+        }
+        if self.branch != format!("hel/{session_id}") {
+            bail!("managed worktree branch does not match the session id");
+        }
+        let relative = self
+            .source_project_directory
+            .strip_prefix(&self.source_repository)
+            .expect("source relationship checked above");
+        if project_directory != Some(self.worktree_root.join(relative).as_path()) {
+            bail!("session project directory does not match its managed worktree");
+        }
+        match &self.target {
+            ManagedWorktreeTarget::Local => {}
+            ManagedWorktreeTarget::Ssh { destination, .. } if destination.trim().is_empty() => {
+                bail!("managed SSH worktree has an empty destination")
+            }
+            ManagedWorktreeTarget::Ssh { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum SessionResourceAllocation {
     Container {
         cpus: u64,
@@ -434,6 +501,9 @@ pub struct SessionRecord {
     /// Existing project directory used directly by a local or SSH bare target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_directory: Option<PathBuf>,
+    /// Git worktree created and owned by Hel for this raw-project session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_worktree: Option<ManagedWorktree>,
     pub target_template_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_allocation: Option<SessionResourceAllocation>,
@@ -485,6 +555,9 @@ impl SessionRecord {
                     .any(|part| part == Component::ParentDir))
         {
             bail!("session {:?} has an unsafe project directory", self.id);
+        }
+        if let Some(managed_worktree) = &self.managed_worktree {
+            managed_worktree.validate(&self.id, self.project_directory.as_deref())?;
         }
         validate_id("target template", &self.target_template_id)?;
         if let Some(allocation) = &self.resource_allocation {
@@ -745,6 +818,7 @@ mod tests {
             last_profile: "codex-1".into(),
             bundle_id: "hel".into(),
             project_directory: None,
+            managed_worktree: None,
             target_template_id: "podman".into(),
             resource_allocation: None,
             additional_mounts: vec![AdditionalMount {

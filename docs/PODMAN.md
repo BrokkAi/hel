@@ -171,7 +171,7 @@ the following verbatim:
 ```console
 IMAGE=localhost/hel/agent-dev:latest
 CHECK_NAME="hel-podman-check-$$"
-podman run --detach --name "$CHECK_NAME" "$IMAGE" sleep infinity
+podman run --init --detach --name "$CHECK_NAME" "$IMAGE" sleep infinity
 podman exec "$CHECK_NAME" /bin/sh -c 'printf "Hel Podman exec works\n"'
 podman rm --force "$CHECK_NAME"
 ```

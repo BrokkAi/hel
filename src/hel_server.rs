@@ -1040,6 +1040,7 @@ mod tests {
                     last_profile: "codex-1".into(),
                     bundle_id: "hel".into(),
                     project_directory: None,
+                    managed_worktree: None,
                     target_template_id: "podman".into(),
                     resource_allocation: None,
                     additional_mounts: vec![],

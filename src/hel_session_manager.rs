@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::hel_archive::verify_archive_streaming;
+use crate::hel_credentials::relay_event_reports_auth_failure;
 use crate::hel_database::{
     ProjectionApplyOutcome, apply_projection_event, save_materialized_session,
 };
@@ -33,6 +34,10 @@ pub struct RelaySessionTarget {
 pub struct ManagedSessionSnapshot {
     pub materialized: MaterializedSession,
     pub operational: RelayOperationalState,
+    /// Newest relay event observed by this live actor that reports an
+    /// authentication failure. This is intentionally ephemeral: it avoids
+    /// retaining raw replay pages or rescanning projected history.
+    pub latest_auth_failure_ordinal: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -826,6 +831,7 @@ pub struct StandaloneSession {
     client: RelayClient,
     materialized: MaterializedSession,
     operational: RelayOperationalState,
+    latest_auth_failure_ordinal: Option<u64>,
 }
 
 impl StandaloneSession {
@@ -838,6 +844,7 @@ impl StandaloneSession {
             client,
             materialized,
             operational,
+            latest_auth_failure_ordinal: None,
         };
         connection.sync_in_place().await?;
         Ok(connection)
@@ -989,6 +996,7 @@ impl StandaloneSession {
         ManagedSessionSnapshot {
             materialized: self.materialized.clone(),
             operational: self.operational.clone(),
+            latest_auth_failure_ordinal: self.latest_auth_failure_ordinal,
         }
     }
 
@@ -1019,6 +1027,9 @@ impl StandaloneSession {
                         event,
                         &projected.mutation,
                     )?;
+                    if relay_event_reports_auth_failure(event) {
+                        self.latest_auth_failure_ordinal = Some(event.ordinal);
+                    }
                 }
                 ProjectionApplyOutcome::AlreadyApplied => {
                     bail!(

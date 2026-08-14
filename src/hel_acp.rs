@@ -260,7 +260,7 @@ async fn run_inner(
             String::new()
         }
     };
-    if !stderr_tail.trim().is_empty() {
+    if let Some(stderr_tail) = actionable_stderr_tail(&stderr_tail) {
         result =
             result.map_err(|error| error.context(format!("ACP bridge stderr:\n{stderr_tail}")));
     }
@@ -269,6 +269,23 @@ async fn run_inner(
 
 const ACP_STDERR_TAIL_BYTES: usize = 16 * 1024;
 const UNEXPECTED_PERMISSION_REQUEST_WARNING: &str = "The agent made a permission request, which means its permission policy is misconfigured. Hel is designed to run in either auto-review or YOLO mode.";
+/// Chatter the Claude bridge logs for SDK events it does not model, for example
+/// `Unexpected case: {"type":"vcs_state_changed"}`. It arrives often enough to
+/// fill the whole stderr tail and bury the real failure in worker exit records.
+const ADAPTER_CHATTER_PREFIX: &str = "Unexpected case: ";
+
+/// The part of a bridge stderr tail worth attaching to a failing result.
+/// Returns `None` when only adapter chatter was captured, so a failure keeps
+/// its own error text instead of gaining misleading context.
+fn actionable_stderr_tail(tail: &str) -> Option<String> {
+    let kept = tail
+        .lines()
+        .filter(|line| !line.trim_start().starts_with(ADAPTER_CHATTER_PREFIX))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let kept = kept.trim();
+    (!kept.is_empty()).then(|| kept.to_owned())
+}
 
 async fn emit_runtime_event(
     events: &mpsc::Sender<RuntimeEvent>,
@@ -419,6 +436,23 @@ where
         })
 }
 
+/// Stop reason reported for a turn the bridge rejected instead of finishing.
+const PROMPT_ERROR_STOP_REASON: &str = "error";
+
+/// Marker Hel adds to the warning for a prompt the bridge failed with ACP's
+/// `auth_required`. The wire message is a bare "Authentication required", too
+/// generic for `hel_credentials` to match on text alone, so the error code —
+/// not the bridge's wording — decides whether the credential heuristic fires.
+pub const PROMPT_AUTH_REQUIRED_MARKER: &str = "ACP auth_required";
+
+fn prompt_failure_warning(error: &agent_client_protocol::Error) -> String {
+    if error.code == agent_client_protocol::ErrorCode::AuthRequired {
+        format!("prompt failed ({PROMPT_AUTH_REQUIRED_MARKER}): {error}")
+    } else {
+        format!("prompt failed: {error}")
+    }
+}
+
 async fn drive_connection(
     connection: ConnectionTo<Agent>,
     spec: &LaunchSpec,
@@ -554,28 +588,30 @@ async fn drive_connection(
                 loop {
                     tokio::select! {
                         response = &mut prompt => {
-                            match response {
-                                Ok(response) => {
-                                    emit_runtime_event(
-                                        events,
-                                        RuntimeEvent::PromptFinished {
-                                            request_id,
-                                            stop_reason: format!("{:?}", response.stop_reason),
-                                        },
-                                    )
-                                    .await?;
-                                }
+                            // A rejected prompt fails the turn, not the worker: the
+                            // bridge can still serve later prompts, and a bridge that
+                            // really died is caught by the `child.wait()` arm in `run`.
+                            let stop_reason = match response {
+                                Ok(response) => format!("{:?}", response.stop_reason),
                                 Err(error) => {
                                     emit_runtime_event(
                                         events,
-                                        RuntimeEvent::CommandRejected {
-                                            request_id,
-                                            message: format!("send ACP prompt: {error}"),
+                                        RuntimeEvent::Warning {
+                                            message: prompt_failure_warning(&error),
                                         },
                                     )
                                     .await?;
+                                    PROMPT_ERROR_STOP_REASON.to_owned()
                                 }
-                            }
+                            };
+                            emit_runtime_event(
+                                events,
+                                RuntimeEvent::PromptFinished {
+                                    request_id,
+                                    stop_reason,
+                                },
+                            )
+                            .await?;
                             break;
                         }
                         command = requests.recv() => match command {
@@ -1155,6 +1191,171 @@ mod tests {
             events_rx.recv().await,
             Some(RuntimeEvent::Warning { message }) if message == "second"
         ));
+    }
+
+    #[test]
+    fn adapter_chatter_never_becomes_error_context() {
+        assert_eq!(
+            actionable_stderr_tail(
+                "Unexpected case: {\"type\":\"vcs_state_changed\"}\nUnexpected case: {\"type\":\"other\"}"
+            ),
+            None
+        );
+        assert_eq!(
+            actionable_stderr_tail(
+                "Unexpected case: {\"type\":\"vcs_state_changed\"}\nnode: out of memory\nUnexpected case: {\"type\":\"other\"}"
+            ),
+            Some("node: out of memory".to_owned())
+        );
+        assert_eq!(actionable_stderr_tail("   "), None);
+    }
+
+    #[test]
+    fn an_auth_required_prompt_failure_carries_the_credential_marker() {
+        let auth = prompt_failure_warning(&agent_client_protocol::Error::auth_required());
+        assert!(auth.contains("prompt failed"), "{auth}");
+        assert!(crate::hel_credentials::auth_failure_signature(
+            HarnessKind::Claude,
+            &auth
+        ));
+
+        let other = prompt_failure_warning(&agent_client_protocol::Error::internal_error());
+        assert!(other.contains("prompt failed"), "{other}");
+        assert!(!crate::hel_credentials::auth_failure_signature(
+            HarnessKind::Claude,
+            &other
+        ));
+    }
+
+    /// Answers `initialize` and `session/new`, then fails the first
+    /// `session/prompt` with a JSON-RPC error and completes the second.
+    async fn scripted_bridge(stream: tokio::io::DuplexStream) -> usize {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (read, mut write) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read).lines();
+        let mut prompts = 0_usize;
+        while let Some(line) = lines.next_line().await.expect("read scripted bridge input") {
+            let request: serde_json::Value =
+                serde_json::from_str(&line).expect("bridge input must be JSON-RPC");
+            let Some(method) = request.get("method").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let id = request
+                .get("id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let response = match method {
+                "initialize" => {
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": 1}})
+                }
+                "session/new" => {
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"sessionId": "scripted"}})
+                }
+                "session/prompt" => {
+                    prompts += 1;
+                    if prompts == 1 {
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {"code": -32000, "message": "Authentication required"},
+                        })
+                    } else {
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"stopReason": "end_turn"}})
+                    }
+                }
+                _ => continue,
+            };
+            if write
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        prompts
+    }
+
+    #[tokio::test]
+    async fn a_failed_prompt_fails_the_turn_and_the_runtime_keeps_serving() {
+        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+        let bridge = tokio::spawn(scripted_bridge(bridge_stream));
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
+
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let spec = LaunchSpec {
+            command: "scripted".into(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: std::env::current_dir().unwrap(),
+            additional_directories: Vec::new(),
+            resume_session: None,
+            harness: HarnessKind::Claude,
+            force_unrestricted_mode: false,
+        };
+        let driver = tokio::spawn(drive(transport, spec, request_rx, event_tx));
+
+        let next_event = async |events: &mut mpsc::Receiver<RuntimeEvent>| {
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("the runtime must keep emitting events after a failed prompt")
+                .expect("the runtime must not drop its event channel")
+        };
+
+        request_tx
+            .send(CommandRequest::Prompt {
+                request_id: "first".into(),
+                prompt: vec![ContentBlock::Text(TextContent::new("hello"))],
+            })
+            .await
+            .unwrap();
+        let mut warning = None;
+        let failed = loop {
+            match next_event(&mut event_rx).await {
+                RuntimeEvent::Warning { message } => warning = Some(message),
+                RuntimeEvent::PromptFinished {
+                    request_id,
+                    stop_reason,
+                } => break (request_id, stop_reason),
+                _ => {}
+            }
+        };
+        assert_eq!(failed, ("first".to_owned(), "error".to_owned()));
+        let warning = warning.expect("a failed prompt must warn before it finishes the turn");
+        assert!(warning.contains("Authentication required"), "{warning}");
+        assert!(crate::hel_credentials::auth_failure_signature(
+            HarnessKind::Claude,
+            &warning
+        ));
+
+        request_tx
+            .send(CommandRequest::Prompt {
+                request_id: "second".into(),
+                prompt: vec![ContentBlock::Text(TextContent::new("still there?"))],
+            })
+            .await
+            .unwrap();
+        let completed = loop {
+            if let RuntimeEvent::PromptFinished {
+                request_id,
+                stop_reason,
+            } = next_event(&mut event_rx).await
+            {
+                break (request_id, stop_reason);
+            }
+        };
+        assert_eq!(completed, ("second".to_owned(), "EndTurn".to_owned()));
+
+        drop(request_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), driver)
+            .await
+            .expect("closing the command channel must end the runtime")
+            .expect("the runtime task must not panic")
+            .expect("a failed prompt must not fail the runtime");
+        assert_eq!(bridge.await.unwrap(), 2);
     }
 
     #[cfg(unix)]

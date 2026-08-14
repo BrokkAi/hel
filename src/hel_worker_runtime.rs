@@ -100,7 +100,7 @@ mod unix {
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::mpsc;
 
-    use super::{AcpSupervisorSpec, WorkerLaunchConfig};
+    use super::{AcpSupervisorSpec, CredentialEndpoint, WorkerLaunchConfig};
     use crate::hel_acp::{self, CommandRequest, LaunchSpec, RuntimeEvent};
     use crate::hel_worker::{
         ClaimedRelayCommand, DurableRelay, RELAY_PROTOCOL_VERSION, RelayCommand,
@@ -122,6 +122,9 @@ mod unix {
         let startup_directory = std::env::current_dir()?;
         let root = super::resolve_relative_worker_root(root, &startup_directory);
         super::resolve_relative_harness_home(&mut config, &startup_directory);
+        // Resolve this before the launch config's environment is consumed by
+        // the ACP supervisor specification below.
+        let credentials = super::credential_endpoint(&config);
         std::fs::create_dir_all(&root)
             .with_context(|| format!("create worker root {}", root.display()))?;
         // Validate and recover durable state before publishing a socket. A
@@ -158,7 +161,7 @@ mod unix {
             // up and complete its checkpoint, but never reopen the ACP session.
             let (dispatch_wake_tx, dispatch_wake_rx) = mpsc::channel(1);
             drop(dispatch_wake_rx);
-            return serve_terminal_relay(listener, relay, dispatch_wake_tx).await;
+            return serve_terminal_relay(listener, relay, dispatch_wake_tx, credentials).await;
         }
 
         let resume_session =
@@ -205,11 +208,13 @@ mod unix {
                     let (stream, _) = accepted.context("accept worker proxy")?;
                     let client_relay = relay.clone();
                     let client_dispatch_wake = dispatch_wake_tx.clone();
+                    let client_credentials = credentials.clone();
                     tokio::spawn(async move {
                         if let Err(error) = serve_client(
                             stream,
                             client_relay,
                             client_dispatch_wake,
+                            client_credentials,
                         ).await {
                             tracing::warn!(%error, "relay proxy client disconnected");
                         }
@@ -267,7 +272,7 @@ mod unix {
         if let Err(error) = &acp_result {
             tracing::warn!(%error, "ACP runtime failed after the relay closed");
         }
-        serve_terminal_relay(listener, relay, dispatch_wake_tx).await
+        serve_terminal_relay(listener, relay, dispatch_wake_tx, credentials).await
     }
 
     pub(super) async fn abort_peer_and_return<T>(
@@ -284,6 +289,7 @@ mod unix {
         listener: UnixListener,
         relay: Arc<Mutex<DurableRelay>>,
         dispatch_wake: mpsc::Sender<()>,
+        credentials: std::result::Result<CredentialEndpoint, String>,
     ) -> Result<()> {
         loop {
             let (stream, _) = listener
@@ -292,8 +298,16 @@ mod unix {
                 .context("accept closed relay proxy")?;
             let client_relay = relay.clone();
             let client_dispatch_wake = dispatch_wake.clone();
+            let client_credentials = credentials.clone();
             tokio::spawn(async move {
-                if let Err(error) = serve_client(stream, client_relay, client_dispatch_wake).await {
+                if let Err(error) = serve_client(
+                    stream,
+                    client_relay,
+                    client_dispatch_wake,
+                    client_credentials,
+                )
+                .await
+                {
                     tracing::warn!(%error, "closed relay proxy client disconnected");
                 }
             });
@@ -692,6 +706,7 @@ mod unix {
         stream: UnixStream,
         relay: Arc<Mutex<DurableRelay>>,
         dispatch_wake: mpsc::Sender<()>,
+        credentials: std::result::Result<CredentialEndpoint, String>,
     ) -> Result<()> {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
@@ -708,6 +723,18 @@ mod unix {
                         continue;
                     }
                 };
+                if matches!(
+                    &envelope.request,
+                    RelayRequest::CredentialState
+                        | RelayRequest::ReadCredentials
+                        | RelayRequest::InstallCredentials { .. }
+                ) {
+                    // Credential bytes stay on this connection. They never
+                    // reach DurableRelay, its journal, or its command ledger.
+                    let response = credential_response(envelope, &credentials).await;
+                    write_response(&mut writer, &response).await?;
+                    continue;
+                }
                 let wakes_dispatch = matches!(&envelope.request, RelayRequest::Submit { .. });
                 let checkpoint_change = checkpoint_change(&envelope.request);
                 let response = relay
@@ -751,6 +778,125 @@ mod unix {
             (Err(error), Err(cleanup_error)) => Err(error.context(format!(
                 "also failed to release checkpoint barriers: {cleanup_error:#}"
             ))),
+        }
+    }
+
+    /// Serve a credential request against this relay's own harness home. File
+    /// work runs on a blocking thread so neither the socket task nor the ACP
+    /// coordinator is stalled by filesystem I/O.
+    async fn credential_response(
+        envelope: RelayRequestEnvelope,
+        credentials: &std::result::Result<CredentialEndpoint, String>,
+    ) -> RelayResponseEnvelope {
+        if envelope.protocol_version != RELAY_PROTOCOL_VERSION {
+            return RelayResponseEnvelope {
+                request_id: envelope.request_id,
+                protocol_version: envelope.protocol_version,
+                body: RelayResponseBody::Error {
+                    error: RelayProtocolError {
+                        code: RelayErrorCode::IncompatibleProtocol,
+                        message: format!(
+                            "request uses protocol {}, relay requires protocol {RELAY_PROTOCOL_VERSION}",
+                            envelope.protocol_version
+                        ),
+                        retryable: false,
+                        detail: None,
+                    },
+                },
+            };
+        }
+        let body = match credentials {
+            Err(message) => RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::InvalidState,
+                    message: message.clone(),
+                    retryable: false,
+                    detail: None,
+                },
+            },
+            Ok(endpoint) => {
+                let endpoint = endpoint.clone();
+                let request = envelope.request.clone();
+                match tokio::task::spawn_blocking(move || {
+                    apply_credential_request(&endpoint, &request)
+                })
+                .await
+                {
+                    Ok(Ok(payload)) => RelayResponseBody::Ok { payload },
+                    Ok(Err(error)) => RelayResponseBody::Error {
+                        error: RelayProtocolError {
+                            code: RelayErrorCode::InvalidRequest,
+                            message: format!("{error:#}"),
+                            retryable: false,
+                            detail: None,
+                        },
+                    },
+                    Err(error) => RelayResponseBody::Error {
+                        error: RelayProtocolError {
+                            code: RelayErrorCode::Internal,
+                            message: format!("credential task stopped: {error}"),
+                            retryable: true,
+                            detail: None,
+                        },
+                    },
+                }
+            }
+        };
+        RelayResponseEnvelope {
+            request_id: envelope.request_id,
+            protocol_version: envelope.protocol_version,
+            body,
+        }
+    }
+
+    pub(super) fn apply_credential_request(
+        endpoint: &CredentialEndpoint,
+        request: &RelayRequest,
+    ) -> Result<RelayResponsePayload> {
+        use crate::hel_credentials::{
+            CredentialSnapshot, MAX_CREDENTIAL_BYTES, read_credential_file, write_credential_file,
+        };
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        match request {
+            RelayRequest::CredentialState => {
+                let (snapshot, _) = read_credential_file(endpoint.harness, &endpoint.marker)?;
+                Ok(credential_state_payload(&snapshot))
+            }
+            RelayRequest::ReadCredentials => {
+                let (snapshot, bytes) = read_credential_file(endpoint.harness, &endpoint.marker)?;
+                if !snapshot.present {
+                    bail!("session has no {} credentials", endpoint.marker.display());
+                }
+                Ok(RelayResponsePayload::Credentials {
+                    data: BASE64.encode(&bytes),
+                })
+            }
+            RelayRequest::InstallCredentials { data } => {
+                if data.len() > MAX_CREDENTIAL_BYTES * 2 {
+                    bail!("credential payload is above the {MAX_CREDENTIAL_BYTES} byte limit");
+                }
+                let bytes = BASE64
+                    .decode(data.as_bytes())
+                    .context("decode credential payload")?;
+                write_credential_file(&endpoint.marker, &bytes)?;
+                Ok(credential_state_payload(&CredentialSnapshot::of(
+                    endpoint.harness,
+                    &bytes,
+                )))
+            }
+            other => bail!("{} is not a credential request", other.method_name()),
+        }
+    }
+
+    fn credential_state_payload(
+        snapshot: &crate::hel_credentials::CredentialSnapshot,
+    ) -> RelayResponsePayload {
+        RelayResponsePayload::CredentialState {
+            present: snapshot.present,
+            fingerprint: snapshot.fingerprint.clone(),
+            freshness_epoch_ms: snapshot.freshness_epoch_ms,
         }
     }
 
@@ -997,6 +1143,32 @@ mod unix {
     }
 }
 
+/// Where this relay's harness keeps its credentials, resolved solely from the
+/// launch config. Credential requests carry no path, so a caller cannot steer
+/// a read or write outside the session's harness home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialEndpoint {
+    pub harness: HarnessKind,
+    pub marker: PathBuf,
+}
+
+#[cfg(unix)]
+fn credential_endpoint(
+    config: &WorkerLaunchConfig,
+) -> std::result::Result<CredentialEndpoint, String> {
+    let key = config.harness.home_env();
+    let home = config.environment.get(key).ok_or_else(|| {
+        format!("worker launch config has no {key} entry, so it cannot locate harness credentials")
+    })?;
+    Ok(CredentialEndpoint {
+        harness: config.harness,
+        marker: crate::hel_setup::harness_authentication_marker(
+            config.harness,
+            Path::new(home.as_str()),
+        ),
+    })
+}
+
 #[cfg(unix)]
 fn resolve_relative_harness_home(config: &mut WorkerLaunchConfig, base: &Path) {
     let key = config.harness.home_env();
@@ -1087,6 +1259,260 @@ mod relay_tests {
             native_session_id: None,
             force_unrestricted_mode: true,
         }
+    }
+
+    fn test_credentials() -> std::result::Result<CredentialEndpoint, String> {
+        credential_endpoint(&launch_config("/profile"))
+    }
+
+    fn codex_credentials(last_refresh: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": { "access_token": "access", "refresh_token": "refresh" },
+            "last_refresh": last_refresh,
+        }))
+        .unwrap()
+    }
+
+    fn install_request(bytes: &[u8]) -> RelayRequest {
+        use base64::Engine as _;
+        RelayRequest::InstallCredentials {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_exchange_stays_on_the_connection_and_out_of_relay_state() {
+        use base64::Engine as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let relay_root = temp.path().join("relay");
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(&relay_root, SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let endpoint = credential_endpoint(&launch_config(&temp.path().to_string_lossy())).unwrap();
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(unix::serve_client(
+            server,
+            relay.clone(),
+            wake_tx,
+            Ok(endpoint),
+        ));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let bytes = codex_credentials("2026-08-05T02:51:00.864587231Z");
+        let request = RelayRequestEnvelope {
+            request_id: "install-credentials".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: install_request(&bytes),
+        };
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+
+        let response: RelayResponseEnvelope =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let RelayResponseBody::Ok {
+            payload:
+                RelayResponsePayload::CredentialState {
+                    present,
+                    fingerprint,
+                    freshness_epoch_ms,
+                },
+        } = response.body
+        else {
+            panic!("credential install failed: {:?}", response.body);
+        };
+        assert!(present);
+        assert_eq!(
+            fingerprint,
+            crate::hel_credentials::credential_fingerprint(&bytes)
+        );
+        assert_eq!(freshness_epoch_ms, Some(1_785_898_260_864));
+        assert_eq!(std::fs::read(temp.path().join("auth.json")).unwrap(), bytes);
+
+        let read = RelayRequestEnvelope {
+            request_id: "read-credentials".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::ReadCredentials,
+        };
+        let mut encoded = serde_json::to_vec(&read).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+        let response: RelayResponseEnvelope =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let RelayResponseBody::Ok {
+            payload: RelayResponsePayload::Credentials { data },
+        } = response.body
+        else {
+            panic!("credential read failed: {:?}", response.body);
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .unwrap(),
+            bytes
+        );
+
+        {
+            let relay = relay.lock().unwrap();
+            assert_eq!(relay.latest_ordinal(), 0);
+            assert!(
+                relay
+                    .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+                    .unwrap()
+                    .is_empty()
+            );
+            let persisted = std::fs::read_to_string(relay_root.join("relay-state.json")).unwrap();
+            assert!(!persisted.contains(&request.request_id));
+        }
+
+        drop(writer);
+        drop(lines);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn incompatible_protocol_cannot_read_or_mutate_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(home.path().join("relay"), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let endpoint = credential_endpoint(&launch_config(&home.path().to_string_lossy())).unwrap();
+        let original = codex_credentials("2026-08-05T02:51:00Z");
+        crate::hel_credentials::write_credential_file(&endpoint.marker, &original).unwrap();
+        let replacement = codex_credentials("2026-08-06T02:51:00Z");
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(unix::serve_client(server, relay, wake_tx, Ok(endpoint)));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        for (request_id, request) in [
+            ("read-with-v0", RelayRequest::ReadCredentials),
+            ("install-with-v0", install_request(&replacement)),
+        ] {
+            let envelope = RelayRequestEnvelope {
+                request_id: request_id.into(),
+                protocol_version: 0,
+                request,
+            };
+            let mut encoded = serde_json::to_vec(&envelope).unwrap();
+            encoded.push(b'\n');
+            writer.write_all(&encoded).await.unwrap();
+            let response: RelayResponseEnvelope =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(response.protocol_version, 0);
+            assert!(matches!(
+                response.body,
+                RelayResponseBody::Error {
+                    error: RelayProtocolError {
+                        code: RelayErrorCode::IncompatibleProtocol,
+                        retryable: false,
+                        ..
+                    }
+                }
+            ));
+        }
+
+        assert_eq!(
+            std::fs::read(home.path().join("auth.json")).unwrap(),
+            original
+        );
+        drop(writer);
+        drop(lines);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn installed_credentials_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let endpoint = credential_endpoint(&launch_config(&home.path().to_string_lossy())).unwrap();
+        unix::apply_credential_request(
+            &endpoint,
+            &install_request(&codex_credentials("2026-08-05T02:51:00Z")),
+        )
+        .unwrap();
+
+        let mode = std::fs::metadata(home.path().join("auth.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn installing_kimi_credentials_uses_its_fixed_nested_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = launch_config(&home.path().to_string_lossy());
+        config.harness = HarnessKind::Kimi;
+        config.environment = BTreeMap::from([(
+            "KIMI_CODE_HOME".to_owned(),
+            home.path().to_string_lossy().into_owned(),
+        )]);
+        let endpoint = credential_endpoint(&config).unwrap();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "access_token": "access",
+            "expires_at": 1_755_000_000,
+        }))
+        .unwrap();
+
+        unix::apply_credential_request(&endpoint, &install_request(&bytes)).unwrap();
+
+        assert_eq!(
+            std::fs::read(home.path().join("credentials/kimi-code.json")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn absent_reads_and_invalid_installs_are_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let endpoint = credential_endpoint(&launch_config(&home.path().to_string_lossy())).unwrap();
+
+        let error =
+            unix::apply_credential_request(&endpoint, &RelayRequest::ReadCredentials).unwrap_err();
+        assert!(format!("{error:#}").contains("no"), "{error:#}");
+
+        let error =
+            unix::apply_credential_request(&endpoint, &install_request(b"not json")).unwrap_err();
+        assert!(format!("{error:#}").contains("JSON"), "{error:#}");
+
+        let oversized = vec![b'a'; crate::hel_credentials::MAX_CREDENTIAL_BYTES + 1];
+        let error =
+            unix::apply_credential_request(&endpoint, &install_request(&oversized)).unwrap_err();
+        assert!(format!("{error:#}").contains("limit"), "{error:#}");
+    }
+
+    #[test]
+    fn installing_over_a_symlink_leaves_the_link_target_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = home.path().join("stolen.json");
+        std::fs::write(&elsewhere, b"{}").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.path().join("auth.json")).unwrap();
+        let endpoint = credential_endpoint(&launch_config(&home.path().to_string_lossy())).unwrap();
+
+        let error = unix::apply_credential_request(
+            &endpoint,
+            &install_request(&codex_credentials("2026-08-05T02:51:00Z")),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("symbolic link"), "{error:#}");
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn a_launch_config_without_a_harness_home_cannot_serve_credentials() {
+        let mut config = launch_config("/profile");
+        config.environment.clear();
+
+        let error = credential_endpoint(&config).unwrap_err();
+
+        assert!(error.contains("CODEX_HOME"), "{error}");
     }
 
     #[test]
@@ -2228,7 +2654,12 @@ mod relay_tests {
             })
             .unwrap();
         let (server, client) = tokio::net::UnixStream::pair().unwrap();
-        let server_task = tokio::spawn(unix::serve_client(server, relay.clone(), wake_tx.clone()));
+        let server_task = tokio::spawn(unix::serve_client(
+            server,
+            relay.clone(),
+            wake_tx.clone(),
+            test_credentials(),
+        ));
         let (reader, mut writer) = client.into_split();
         let mut lines = BufReader::new(reader).lines();
 
@@ -2337,7 +2768,12 @@ mod relay_tests {
         ));
         let (wake_tx, _wake_rx) = mpsc::channel(1);
         let (server, client) = tokio::net::UnixStream::pair().unwrap();
-        let server_task = tokio::spawn(unix::serve_client(server, relay, wake_tx));
+        let server_task = tokio::spawn(unix::serve_client(
+            server,
+            relay,
+            wake_tx,
+            test_credentials(),
+        ));
         let (reader, mut writer) = client.into_split();
         let mut lines = BufReader::new(reader).lines();
 
@@ -2403,7 +2839,12 @@ mod relay_tests {
             })
             .unwrap();
         let (server, client) = tokio::net::UnixStream::pair().unwrap();
-        let server_task = tokio::spawn(unix::serve_client(server, relay.clone(), wake_tx.clone()));
+        let server_task = tokio::spawn(unix::serve_client(
+            server,
+            relay.clone(),
+            wake_tx.clone(),
+            test_credentials(),
+        ));
         let (reader, mut writer) = client.into_split();
         let mut lines = BufReader::new(reader).lines();
 
@@ -2499,7 +2940,12 @@ mod relay_tests {
             })
             .unwrap();
         let (server, client) = tokio::net::UnixStream::pair().unwrap();
-        let server_task = tokio::spawn(unix::serve_client(server, relay, wake_tx.clone()));
+        let server_task = tokio::spawn(unix::serve_client(
+            server,
+            relay,
+            wake_tx.clone(),
+            test_credentials(),
+        ));
         let (reader, mut writer) = client.into_split();
         let request = RelayRequestEnvelope {
             request_id: "submit".into(),
@@ -2603,7 +3049,12 @@ mod relay_tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let (wake_tx, wake_rx) = mpsc::channel(1);
         drop(wake_rx);
-        let terminal = tokio::spawn(unix::serve_terminal_relay(listener, relay.clone(), wake_tx));
+        let terminal = tokio::spawn(unix::serve_terminal_relay(
+            listener,
+            relay.clone(),
+            wake_tx,
+            test_credentials(),
+        ));
         let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let request = RelayRequestEnvelope {

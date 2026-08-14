@@ -21,6 +21,7 @@ use hel::hel_config::{HelConfig, ProjectBundle, ProjectRepository, config_path, 
 use hel::hel_controller::{
     Controller, ControllerStoreGuard, SessionLaunchOptions, SessionResumeOptions,
 };
+use hel::hel_credentials::{CredentialSyncCoordinator, CredentialSyncHandle, CredentialSyncTarget};
 use hel::hel_greeting::{GreetingFacts, RepositoryGreetingFacts};
 use hel::hel_import::{
     BundleResolution, ClaudeImportRequest, ClaudeSessionSelection, CodexImportRequest,
@@ -91,12 +92,21 @@ enum Command {
     Recover(RecoverArgs),
     /// Create a verified recovery copy for an active session.
     Checkpoint(CheckpointArgs),
+    /// Run a harness login for a profile so live sessions pick up fresh credentials.
+    Login(LoginArgs),
 }
 
 #[derive(Debug, Args)]
 struct CheckpointArgs {
     #[arg(long)]
     session: String,
+}
+
+#[derive(Debug, Args)]
+struct LoginArgs {
+    /// Profile to authenticate. Optional when exactly one profile exists.
+    #[arg(long)]
+    profile: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -548,6 +558,83 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Some(Command::Login(args)) => login(args).await,
+    }
+}
+
+/// Run the harness's own interactive login against a profile's canonical home.
+/// Hel never sees the credential contents; it compares fingerprints before and
+/// after so it can tell the operator whether anything changed.
+async fn login(args: LoginArgs) -> Result<()> {
+    let controller = Controller::load()?;
+    let profile_id = resolve_login_profile(&controller.config, args.profile.as_deref())?;
+    let profile = controller
+        .config
+        .profiles
+        .get(&profile_id)
+        .with_context(|| {
+            format!(
+                "unknown profile {profile_id:?}; configured profiles: {}",
+                profile_ids(&controller.config)
+            )
+        })?;
+    let marker = hel::hel_setup::harness_authentication_marker(profile.kind, &profile.home);
+    let (before, _) = hel::hel_credentials::read_credential_file(profile.kind, &marker)?;
+    let (program, arguments) = hel::hel_credentials::login_command(profile);
+
+    println!(
+        "Running `{program} {}` against {}.",
+        arguments.join(" "),
+        profile.home.display()
+    );
+    let status = tokio::process::Command::new(&program)
+        .args(&arguments)
+        .envs(&profile.environment)
+        .env(profile.home_env(), &profile.home)
+        .status()
+        .await
+        .with_context(|| {
+            format!(
+                "run `{program} {}` for profile {profile_id}",
+                arguments.join(" ")
+            )
+        })?;
+
+    let (after, _) = hel::hel_credentials::read_credential_file(profile.kind, &marker)?;
+    if after.present && after.fingerprint != before.fingerprint {
+        println!(
+            "Credentials updated for profile {profile_id}. Live sessions pick them up within about a minute while the Hel TUI or server is running."
+        );
+    } else {
+        println!("Credentials for profile {profile_id} are unchanged.");
+    }
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+fn profile_ids(config: &HelConfig) -> String {
+    config
+        .profiles
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn resolve_login_profile(config: &HelConfig, requested: Option<&str>) -> Result<String> {
+    if let Some(profile) = requested {
+        return Ok(profile.to_owned());
+    }
+    let mut profiles = config.profiles.keys();
+    match (profiles.next(), profiles.next()) {
+        (Some(only), None) => Ok(only.clone()),
+        (Some(_), Some(_)) => bail!(
+            "several profiles are configured; pass --profile with one of: {}",
+            profile_ids(config)
+        ),
+        (None, _) => bail!("no harness profiles are configured; run `hel setup` first"),
     }
 }
 
@@ -907,6 +994,11 @@ async fn run_server(args: ServerArgs) -> Result<()> {
             interrupted_close_tx.clone(),
         );
     }
+    let mut credential_sync = CredentialSyncCoordinator::spawn();
+    let credential_sync_handle = credential_sync.handle();
+    credential_sync_handle.set_targets(credential_sync_targets(&controller));
+    let mut auth_failure_syncs = AuthFailureSyncTracker::default();
+    let mut credential_sync_notices = CredentialSyncNotices::default();
     let termination = hel::termination::Coordinator::install().token();
     let mut options = ServerOptions::new(bind, snapshot_rx, conversation_rx, action_tx)?;
     options.shutdown = termination.clone();
@@ -949,6 +1041,21 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                 },
                 update = worker_updates_rx.recv() => {
                     let Some(update) = update else { break };
+                    if let Some(snapshot) = update.view.snapshot.as_ref()
+                        && let Some(session) = controller.state.sessions.get(&update.session_id)
+                        && let Some(ordinal) = snapshot.latest_auth_failure_ordinal
+                    {
+                        auth_failure_syncs.observe(
+                            &update.session_id,
+                            &session.last_profile,
+                            ordinal,
+                        );
+                    }
+                    schedule_due_auth_failure_syncs(
+                        &mut auth_failure_syncs,
+                        &credential_sync_handle,
+                        Instant::now(),
+                    );
                     if let Err(error) = apply_worker_record_update(&mut controller, &update) {
                         tracing::warn!(session_id = %update.session_id, "could not persist relay session metadata: {error:#}");
                     }
@@ -989,9 +1096,19 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                     }
                 }
                 _ = recovery_tick.tick() => {
+                    schedule_due_auth_failure_syncs(
+                        &mut auth_failure_syncs,
+                        &credential_sync_handle,
+                        Instant::now(),
+                    );
                     let mut changed = false;
                     while let Some(result) = recovery.try_result() {
                         changed |= merge_recovery_result(&mut controller, result);
+                    }
+                    while let Some(result) = credential_sync.try_result() {
+                        if let Some(notice) = credential_sync_notices.notice(&result) {
+                            eprintln!("Hel: {notice}");
+                        }
                     }
                     if changed {
                         revision += 1;
@@ -1010,6 +1127,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                         continue;
                     }
                     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                    credential_sync_handle.set_targets(credential_sync_targets(&controller));
                     queued_prompts.retain(|session_id, _| {
                         controller.state.sessions.contains_key(session_id)
                     });
@@ -1098,6 +1216,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                         continue;
                     }
                     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                    credential_sync_handle.set_targets(credential_sync_targets(&controller));
                     conversations.retain(|id, _| {
                         controller.state.sessions.get(id).is_some_and(|session| session.state.is_active())
                     });
@@ -1414,6 +1533,193 @@ fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPollTarget> {
         .collect()
 }
 
+/// Sessions whose worker can answer credential requests right now. Sessions
+/// still provisioning or already disconnected would only produce connection
+/// errors, so they stay out.
+fn credential_sync_targets(controller: &Controller) -> Vec<CredentialSyncTarget> {
+    controller
+        .state
+        .sessions
+        .values()
+        .filter(|session| {
+            matches!(
+                session.state,
+                SessionState::Running | SessionState::Checkpointing
+            ) && session.target.is_some()
+        })
+        .filter_map(|session| {
+            let profile = controller.config.profiles.get(&session.last_profile)?;
+            let spec = controller.reconnect_command(&session.id).ok()?;
+            Some(CredentialSyncTarget {
+                session_id: session.id.clone(),
+                profile_id: session.last_profile.clone(),
+                harness: profile.kind,
+                profile_home: profile.home.clone(),
+                spec,
+            })
+        })
+        .collect()
+}
+
+/// One automatic sync and notice per session per cooldown, so a harness that
+/// fails authentication on every retry does not flood the UI.
+const AUTH_FAILURE_SYNC_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingAuthFailure {
+    ordinal: u64,
+    profile_id: String,
+}
+
+/// Deduplicates the actor's sticky failure marker while retaining a newer
+/// failure until its session cooldown expires.
+#[derive(Debug, Default)]
+struct AuthFailureSyncTracker {
+    handled_ordinals: std::collections::BTreeMap<String, u64>,
+    last_attempts: std::collections::BTreeMap<String, Instant>,
+    pending: std::collections::BTreeMap<String, PendingAuthFailure>,
+}
+
+impl AuthFailureSyncTracker {
+    fn observe(&mut self, session_id: &str, profile_id: &str, ordinal: u64) {
+        if self
+            .handled_ordinals
+            .get(session_id)
+            .is_some_and(|handled| *handled >= ordinal)
+        {
+            return;
+        }
+        let pending = PendingAuthFailure {
+            ordinal,
+            profile_id: profile_id.to_owned(),
+        };
+        match self.pending.entry(session_id.to_owned()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(pending);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry)
+                if entry.get().ordinal <= ordinal =>
+            {
+                entry.insert(pending);
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+
+    fn drain_due(&mut self, now: Instant) -> Vec<(String, String)> {
+        let due = self
+            .pending
+            .keys()
+            .filter(|session_id| {
+                self.last_attempts.get(*session_id).is_none_or(|previous| {
+                    now.saturating_duration_since(*previous) >= AUTH_FAILURE_SYNC_COOLDOWN
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        due.into_iter()
+            .map(|session_id| {
+                let pending = self
+                    .pending
+                    .remove(&session_id)
+                    .expect("due authentication failure disappeared");
+                self.handled_ordinals
+                    .insert(session_id.clone(), pending.ordinal);
+                self.last_attempts.insert(session_id.clone(), now);
+                (session_id, pending.profile_id)
+            })
+            .collect()
+    }
+}
+
+fn schedule_due_auth_failure_syncs(
+    tracker: &mut AuthFailureSyncTracker,
+    credential_sync: &CredentialSyncHandle,
+    now: Instant,
+) {
+    for (session_id, profile_id) in tracker.drain_due(now) {
+        credential_sync.sync_profile_now(&profile_id, Some(&session_id));
+    }
+}
+
+/// Turns finished credential syncs into UI notices.
+///
+/// The periodic cycle revisits every profile, so a session that keeps failing
+/// the same way would post the same notice forever. The last failure message
+/// per key is remembered and only a changed one speaks up again. Keys are the
+/// profile for a whole-sync failure and the profile plus session for a
+/// per-session failure.
+#[derive(Debug, Default)]
+struct CredentialSyncNotices {
+    last_failures: std::collections::BTreeMap<(String, Option<String>), String>,
+}
+
+impl CredentialSyncNotices {
+    /// Healthy no-op cycles stay out of the UI; only actions, new failures, and
+    /// answers to an authentication failure are worth a notice.
+    fn notice(&mut self, result: &hel::hel_credentials::CredentialSyncResult) -> Option<String> {
+        // Authentication-triggered syncs always speak: the upstream per-session
+        // cooldown, not this dedup, is what keeps them rare.
+        if let Some(session_id) = &result.triggered_by {
+            return Some(if result.pushed_to(session_id) {
+                format!(
+                    "Session {} hit an authentication failure; refreshed credentials were pushed. Retry the prompt, and if it repeats run `hel login --profile {}`.",
+                    short_id(session_id),
+                    result.profile_id
+                )
+            } else {
+                format!(
+                    "Session {} hit an authentication failure and Hel has nothing fresher to push. Run `hel login --profile {}`.",
+                    short_id(session_id),
+                    result.profile_id
+                )
+            });
+        }
+
+        let mut failures = std::collections::BTreeMap::new();
+        if let Some(detail) = &result.failure {
+            failures.insert(
+                (result.profile_id.clone(), None),
+                format!(
+                    "Credential sync for profile {} failed: {detail}",
+                    result.profile_id
+                ),
+            );
+        }
+        for (session_id, detail) in result.failures() {
+            failures.insert(
+                (result.profile_id.clone(), Some(session_id.to_owned())),
+                format!(
+                    "Credential sync for {} failed: {detail}",
+                    short_id(session_id)
+                ),
+            );
+        }
+        // A key that stopped failing is forgotten silently, so the same failure
+        // after a clean cycle is reported again.
+        self.last_failures
+            .retain(|key, _| key.0 != result.profile_id || failures.contains_key(key));
+        let mut notice = None;
+        for (key, message) in failures {
+            if self.last_failures.get(&key) != Some(&message) {
+                notice.get_or_insert_with(|| message.clone());
+            }
+            self.last_failures.insert(key, message);
+        }
+        if notice.is_some() {
+            return notice;
+        }
+
+        let actions = result.actions();
+        (actions > 0).then(|| {
+            format!(
+                "Refreshed harness credentials for profile {} across {actions} session(s).",
+                result.profile_id
+            )
+        })
+    }
+}
+
 fn dashboard_resource_targets(controller: &Controller) -> Vec<ResourcePollTarget> {
     controller
         .state
@@ -1436,6 +1742,7 @@ fn refresh_dashboard_poll_targets(
     controller: &Controller,
     worker_targets_tx: &tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
     resource_targets_tx: &tokio::sync::watch::Sender<Vec<ResourcePollTarget>>,
+    credential_sync: &CredentialSyncHandle,
     excluded_sessions: &std::collections::BTreeSet<String>,
 ) {
     let mut worker_targets = dashboard_worker_targets(controller);
@@ -1444,6 +1751,9 @@ fn refresh_dashboard_poll_targets(
     let mut resource_targets = dashboard_resource_targets(controller);
     resource_targets.retain(|target| !excluded_sessions.contains(&target.session_id));
     resource_targets_tx.send_replace(resource_targets);
+    let mut credential_targets = credential_sync_targets(controller);
+    credential_targets.retain(|target| !excluded_sessions.contains(&target.session_id));
+    credential_sync.set_targets(credential_targets);
 }
 
 fn spawn_aws_resource_options_resolution(
@@ -2254,6 +2564,10 @@ async fn run_dashboard() -> Result<()> {
             lifecycle_updates_tx.clone(),
         );
     }
+    let mut credential_sync = CredentialSyncCoordinator::spawn();
+    let credential_sync_handle = credential_sync.handle();
+    let mut auth_failure_syncs = AuthFailureSyncTracker::default();
+    let mut credential_sync_notices = CredentialSyncNotices::default();
     let (resource_targets_tx, resource_triggers_tx, mut resource_updates_rx) =
         spawn_dashboard_resource_poller();
     let (capacity_targets_tx, mut capacity_updates_rx) = spawn_dashboard_capacity_poller();
@@ -2267,7 +2581,8 @@ async fn run_dashboard() -> Result<()> {
         &controller,
         &worker_targets_tx,
         &resource_targets_tx,
-        &std::collections::BTreeSet::new(),
+        &credential_sync_handle,
+        &lifecycle_operations.keys().cloned().collect(),
     );
     let capacity_targets = controller.deployment_capacity_targets();
     capacity_targets_tx.send_replace(capacity_targets.clone());
@@ -2305,6 +2620,9 @@ async fn run_dashboard() -> Result<()> {
             if let Some(snapshot) = update.view.snapshot.as_ref()
                 && let Some(session) = controller.state.sessions.get(&session_id).cloned()
             {
+                if let Some(ordinal) = snapshot.latest_auth_failure_ordinal {
+                    auth_failure_syncs.observe(&session_id, &session.last_profile, ordinal);
+                }
                 recovery_observer
                     .observe(hel::hel_recovery::RecoveryObservation {
                         session,
@@ -2337,8 +2655,18 @@ async fn run_dashboard() -> Result<()> {
                 );
             }
         }
+        schedule_due_auth_failure_syncs(
+            &mut auth_failure_syncs,
+            &credential_sync_handle,
+            Instant::now(),
+        );
         while let Some(result) = recovery.try_result() {
             apply_recovery_result(&mut controller, &mut dashboard, result);
+        }
+        while let Some(result) = credential_sync.try_result() {
+            if let Some(notice) = credential_sync_notices.notice(&result) {
+                dashboard.set_notice(notice);
+            }
         }
         while let Ok(update) = resource_updates_rx.try_recv() {
             dashboard.apply_resource_usage(&update.session_id, update.usage);
@@ -2435,6 +2763,7 @@ async fn run_dashboard() -> Result<()> {
                                         &controller,
                                         &worker_targets_tx,
                                         &resource_targets_tx,
+                                        &credential_sync_handle,
                                         &lifecycle_operations.keys().cloned().collect(),
                                     );
                                     dashboard.set_notice(format!(
@@ -2530,6 +2859,7 @@ async fn run_dashboard() -> Result<()> {
                 &controller,
                 &worker_targets_tx,
                 &resource_targets_tx,
+                &credential_sync_handle,
                 &lifecycle_operations.keys().cloned().collect(),
             );
         }
@@ -2631,6 +2961,7 @@ async fn run_dashboard() -> Result<()> {
                             &controller,
                             &worker_targets_tx,
                             &resource_targets_tx,
+                            &credential_sync_handle,
                             &lifecycle_operations.keys().cloned().collect(),
                         );
                         dashboard.set_notice(
@@ -3187,7 +3518,7 @@ async fn run_dashboard() -> Result<()> {
                         let mut controller = Controller::load()?;
                         let executor = CancellableProcessExecutor::new(cancelled);
                         controller.force_destroy(&operation_session_id, &executor)?;
-                        delete_archived_session(&mut controller, &operation_session_id)
+                        controller.delete_session_controlled(&operation_session_id, &executor)
                     })()
                     .map(|()| LifecycleSuccess::DeletedActive)
                     .map_err(|error| format!("{error:#}"));
@@ -3219,7 +3550,8 @@ async fn run_dashboard() -> Result<()> {
                         if cancelled.load(Ordering::Acquire) {
                             bail!("operation cancelled");
                         }
-                        delete_archived_session(&mut controller, &operation_session_id)
+                        let executor = CancellableProcessExecutor::new(cancelled);
+                        controller.delete_session_controlled(&operation_session_id, &executor)
                     })()
                     .map(|()| LifecycleSuccess::DeletedArchived)
                     .map_err(|error| format!("{error:#}"));
@@ -3269,42 +3601,6 @@ fn reserve_recovery_or_cancel(
         std::thread::sleep(Duration::from_millis(25));
     }
     Ok(reservation)
-}
-
-fn delete_archived_session(controller: &mut Controller, session_id: &str) -> Result<()> {
-    let session = controller
-        .state
-        .sessions
-        .get(session_id)
-        .with_context(|| format!("unknown session {session_id}"))?
-        .clone();
-    if session.state.is_active() {
-        bail!("refusing to delete active session {session_id}");
-    }
-    let archive_path = session
-        .checkpoint
-        .as_ref()
-        .map(|checkpoint| checkpoint.archive_path.clone());
-    if let Some(archive_path) = &archive_path
-        && let Err(error) = std::fs::remove_file(archive_path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(error).with_context(|| {
-            format!(
-                "recovery archive could not be removed; session metadata was retained for retry: {}",
-                archive_path.display()
-            )
-        });
-    }
-    let session = controller.state.remove_archived_session(session_id)?;
-    if let Err(error) = hel::hel_database::delete_session(session_id) {
-        controller
-            .state
-            .sessions
-            .insert(session.id.clone(), session);
-        return Err(error).context("delete paused session from state");
-    }
-    Ok(())
 }
 
 fn discover_import_profile(
@@ -4017,6 +4313,201 @@ mod tests {
     }
 
     #[test]
+    fn a_new_auth_failure_waits_out_the_cooldown_without_being_lost() {
+        let mut tracker = AuthFailureSyncTracker::default();
+        let started = Instant::now();
+        tracker.observe("session", "work", 41);
+        assert_eq!(
+            tracker.drain_due(started),
+            vec![("session".into(), "work".into())]
+        );
+
+        tracker.observe("session", "work", 42);
+        assert!(
+            tracker
+                .drain_due(started + Duration::from_secs(60))
+                .is_empty()
+        );
+        tracker.observe("session", "new-profile", 43);
+        assert_eq!(tracker.pending["session"].ordinal, 43);
+
+        // No repeated observation is needed: the loop timer drains the sticky
+        // failure once its cooldown expires.
+        assert_eq!(
+            tracker.drain_due(started + AUTH_FAILURE_SYNC_COOLDOWN),
+            vec![("session".into(), "new-profile".into())]
+        );
+        tracker.observe("session", "new-profile", 43);
+        assert!(
+            tracker
+                .drain_due(started + (AUTH_FAILURE_SYNC_COOLDOWN * 2))
+                .is_empty()
+        );
+
+        tracker.observe("other", "personal", 1);
+        assert_eq!(
+            tracker.drain_due(started + Duration::from_secs(60)),
+            vec![("other".into(), "personal".into())]
+        );
+    }
+
+    #[test]
+    fn a_healthy_credential_cycle_stays_out_of_the_ui() {
+        let result = hel::hel_credentials::CredentialSyncResult {
+            profile_id: "work".into(),
+            triggered_by: None,
+            failure: None,
+            outcomes: Vec::new(),
+        };
+        assert_eq!(CredentialSyncNotices::default().notice(&result), None);
+    }
+
+    #[test]
+    fn an_authentication_failure_notice_says_whether_anything_was_pushed() {
+        use hel::hel_credentials::{
+            CredentialSyncAction, CredentialSyncOutcome, CredentialSyncResult,
+        };
+
+        let mut notices = CredentialSyncNotices::default();
+        let pushed = CredentialSyncResult {
+            profile_id: "work".into(),
+            triggered_by: Some("018f9dd2-a3b4".into()),
+            failure: None,
+            outcomes: vec![CredentialSyncOutcome {
+                session_id: "018f9dd2-a3b4".into(),
+                outcome: Ok(CredentialSyncAction::Pushed),
+            }],
+        };
+        let notice = notices.notice(&pushed).unwrap();
+        assert!(notice.contains("were pushed"), "{notice}");
+        assert!(notice.contains("hel login --profile work"), "{notice}");
+
+        let nothing_to_push = CredentialSyncResult {
+            triggered_by: Some("018f9dd2-a3b4".into()),
+            outcomes: Vec::new(),
+            ..pushed
+        };
+        let notice = notices.notice(&nothing_to_push).unwrap();
+        assert!(notice.contains("nothing fresher"), "{notice}");
+        assert!(notice.contains("hel login --profile work"), "{notice}");
+        // The per-session cooldown upstream limits these; the dedup must not.
+        assert_eq!(notices.notice(&nothing_to_push), Some(notice));
+    }
+
+    #[test]
+    fn a_failed_credential_sync_is_reported() {
+        use hel::hel_credentials::{CredentialSyncOutcome, CredentialSyncResult};
+
+        let result = CredentialSyncResult {
+            profile_id: "work".into(),
+            triggered_by: None,
+            failure: None,
+            outcomes: vec![CredentialSyncOutcome {
+                session_id: "018f9dd2-a3b4".into(),
+                outcome: Err("worker proxy disconnected".into()),
+            }],
+        };
+        let notice = CredentialSyncNotices::default().notice(&result).unwrap();
+        assert!(notice.contains("worker proxy disconnected"), "{notice}");
+    }
+
+    #[test]
+    fn a_repeated_credential_failure_is_reported_once_until_it_changes() {
+        use hel::hel_credentials::{
+            CredentialSyncAction, CredentialSyncOutcome, CredentialSyncResult,
+        };
+
+        let failed = |detail: &str| CredentialSyncResult {
+            profile_id: "work".into(),
+            triggered_by: None,
+            failure: None,
+            outcomes: vec![CredentialSyncOutcome {
+                session_id: "018f9dd2-a3b4".into(),
+                outcome: Err(detail.to_owned()),
+            }],
+        };
+        let mut notices = CredentialSyncNotices::default();
+
+        assert!(
+            notices
+                .notice(&failed("worker proxy disconnected"))
+                .is_some()
+        );
+        assert_eq!(notices.notice(&failed("worker proxy disconnected")), None);
+
+        let changed = notices.notice(&failed("container is gone")).unwrap();
+        assert!(changed.contains("container is gone"), "{changed}");
+        assert_eq!(notices.notice(&failed("container is gone")), None);
+
+        // A clean cycle forgets the failure, so a recurrence is reported again.
+        let healthy = CredentialSyncResult {
+            profile_id: "work".into(),
+            triggered_by: None,
+            failure: None,
+            outcomes: vec![CredentialSyncOutcome {
+                session_id: "018f9dd2-a3b4".into(),
+                outcome: Ok(CredentialSyncAction::Pushed),
+            }],
+        };
+        let refreshed = notices.notice(&healthy).unwrap();
+        assert!(
+            refreshed.contains("Refreshed harness credentials"),
+            "{refreshed}"
+        );
+        assert!(notices.notice(&failed("container is gone")).is_some());
+    }
+
+    #[test]
+    fn a_repeated_whole_sync_failure_is_reported_once_per_profile() {
+        use hel::hel_credentials::CredentialSyncResult;
+
+        let failed = |profile_id: &str| CredentialSyncResult {
+            profile_id: profile_id.to_owned(),
+            triggered_by: None,
+            failure: Some("controller home is unreadable".into()),
+            outcomes: Vec::new(),
+        };
+        let mut notices = CredentialSyncNotices::default();
+
+        let notice = notices.notice(&failed("work")).unwrap();
+        assert!(notice.contains("profile work"), "{notice}");
+        assert_eq!(notices.notice(&failed("work")), None);
+        // Another profile failing the same way is its own key.
+        assert!(notices.notice(&failed("personal")).is_some());
+        assert_eq!(notices.notice(&failed("work")), None);
+    }
+
+    #[test]
+    fn login_uses_the_sole_profile_and_otherwise_demands_a_choice() {
+        let mut config = HelConfig::default();
+        assert!(resolve_login_profile(&config, None).is_err());
+
+        config.profiles.insert(
+            "work".into(),
+            hel::hel_config::HarnessProfile {
+                kind: hel::hel_config::HarnessKind::Claude,
+                home: PathBuf::from("/home/user/.claude"),
+                executable: None,
+                environment: Default::default(),
+                context_window_bytes: None,
+            },
+        );
+        assert_eq!(resolve_login_profile(&config, None).unwrap(), "work");
+
+        config
+            .profiles
+            .insert("personal".into(), config.profiles["work"].clone());
+        let error = resolve_login_profile(&config, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("personal, work"), "{error}");
+        assert_eq!(
+            resolve_login_profile(&config, Some("personal")).unwrap(),
+            "personal"
+        );
+    }
+
+    #[test]
     fn aws_capacity_sums_live_instance_allocations() {
         let total = aggregate_aws_capacity(&[
             DeploymentCapacityUsage {
@@ -4097,6 +4588,11 @@ mod tests {
                 .get_subcommands()
                 .any(|sub| sub.get_name() == "setup")
         );
+        let login = command
+            .get_subcommands()
+            .find(|sub| sub.get_name() == "login")
+            .expect("hel login is a visible command");
+        assert!(!login.is_hide_set());
     }
 
     #[test]
@@ -4157,6 +4653,7 @@ mod tests {
                 last_profile: "codex".into(),
                 bundle_id: "project".into(),
                 project_directory: None,
+                managed_worktree: None,
                 target_template_id: "podman".into(),
                 resource_allocation: None,
                 additional_mounts: Vec::new(),
@@ -4183,7 +4680,11 @@ mod tests {
             state,
         };
 
-        assert!(delete_archived_session(&mut controller, session_id).is_err());
+        assert!(
+            controller
+                .delete_session_controlled(session_id, &ProcessExecutor)
+                .is_err()
+        );
         assert!(controller.state.sessions.contains_key(session_id));
     }
 }

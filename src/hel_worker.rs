@@ -101,6 +101,18 @@ pub enum RelayRequest {
         command: RelayCommand,
     },
     Status,
+    /// Report non-secret metadata for this session's harness credentials.
+    /// The runtime handles credential requests on the connection and never
+    /// passes them through the durable relay.
+    CredentialState,
+    /// Read this session's harness credential file as base64. The payload is
+    /// connection-only and must never enter relay state or observations.
+    ReadCredentials,
+    /// Install a base64-encoded credential file into this session's harness
+    /// home. The destination path is fixed by the worker launch config.
+    InstallCredentials {
+        data: String,
+    },
 }
 
 impl RelayRequest {
@@ -111,6 +123,9 @@ impl RelayRequest {
             Self::Acknowledge { .. } => "acknowledge",
             Self::Submit { .. } => "submit",
             Self::Status => "status",
+            Self::CredentialState => "credential_state",
+            Self::ReadCredentials => "read_credentials",
+            Self::InstallCredentials { .. } => "install_credentials",
         }
     }
 }
@@ -164,6 +179,18 @@ pub enum RelayResponsePayload {
         ordinal: u64,
     },
     Status(RelayOperationalState),
+    /// Fingerprint and freshness of a session's harness credentials. Neither
+    /// value is secret.
+    CredentialState {
+        present: bool,
+        fingerprint: String,
+        freshness_epoch_ms: Option<i64>,
+    },
+    /// Base64 of a session's credential file. Sent only on the connection
+    /// socket, never recorded.
+    Credentials {
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -851,6 +878,16 @@ impl DurableRelay {
                     "relay operational state",
                 )?;
                 RelayResponsePayload::Status(state)
+            }
+            RelayRequest::CredentialState
+            | RelayRequest::ReadCredentials
+            | RelayRequest::InstallCredentials { .. } => {
+                return Ok(relay_error(
+                    RelayErrorCode::InvalidState,
+                    "credential requests must be handled by the live relay transport",
+                    false,
+                    None,
+                ));
             }
         };
         Ok(RelayResponseBody::Ok { payload })
@@ -4530,6 +4567,46 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn credential_requests_cannot_enter_durable_relay_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+
+        for (request_id, request) in [
+            ("credential-state", RelayRequest::CredentialState),
+            ("read-credentials", RelayRequest::ReadCredentials),
+            (
+                "install-credentials",
+                RelayRequest::InstallCredentials {
+                    data: "e30=".into(),
+                },
+            ),
+        ] {
+            let response = relay.handle(relay_request(request_id, request));
+            assert!(matches!(
+                response.body,
+                RelayResponseBody::Error {
+                    error: RelayProtocolError {
+                        code: RelayErrorCode::InvalidState,
+                        retryable: false,
+                        ..
+                    }
+                }
+            ));
+        }
+
+        assert_eq!(relay.latest_ordinal(), 0);
+        assert!(
+            relay
+                .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+                .unwrap()
+                .is_empty()
+        );
+        let persisted = fs::read_to_string(temp.path().join(RELAY_STATE_FILE)).unwrap();
+        assert!(!persisted.contains("e30="));
+        assert!(relay.snapshot.handled_commands.is_empty());
     }
 
     #[test]

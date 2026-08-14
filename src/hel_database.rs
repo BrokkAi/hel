@@ -11,9 +11,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::hel_config::{HarnessKind, data_dir};
 use crate::hel_state::{
-    CheckpointMetadata, HelState, MaterializedExecutionState, MaterializedQueuedPrompt,
-    MaterializedSession, SessionRecord, SessionResourceAllocation, SessionState, TargetLocator,
-    TranscriptItem, validate_relay_event_digest, validate_relay_event_frontier,
+    CheckpointMetadata, HelState, ManagedWorktree, MaterializedExecutionState,
+    MaterializedQueuedPrompt, MaterializedSession, SessionRecord, SessionResourceAllocation,
+    SessionState, TargetLocator, TranscriptItem, validate_relay_event_digest,
+    validate_relay_event_frontier,
 };
 use crate::hel_targets::AdditionalMount;
 use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
@@ -252,6 +253,7 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
                  RENAME COLUMN event_sequence TO event_ordinal;
              ALTER TABLE sessions ADD COLUMN detached_after_event_ordinal INTEGER NOT NULL
                  DEFAULT 0 CHECK(detached_after_event_ordinal >= 0);
+             ALTER TABLE sessions ADD COLUMN managed_worktree TEXT;
              CREATE TABLE materialized_sessions (
                  session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
                  applied_event_ordinal INTEGER NOT NULL DEFAULT 0 CHECK(applied_event_ordinal >= 0),
@@ -301,7 +303,13 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
              COMMIT;",
         ))?;
     }
+    // Both development lines used schema version 6: durable relay projection
+    // on this branch and managed raw-session worktrees on master. Structural
+    // guards make either already-written v6 database converge before the v7
+    // sessions-table rebuild, without inventing a second version-6 ledger row.
+    ensure_managed_worktree_column(connection)?;
     if version < 7 {
+        ensure_relay_projection_schema(connection)?;
         migrate_destroying_session_state(connection)?;
     }
     ensure_projection_digest_column(connection)?;
@@ -316,6 +324,92 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
             SCHEMA_VERSION
         );
     }
+    Ok(())
+}
+
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info(?1)
+                 WHERE name = ?2
+             )",
+            params![table, column],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn ensure_managed_worktree_column(connection: &Connection) -> Result<()> {
+    if !table_has_column(connection, "sessions", "managed_worktree")? {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE sessions ADD COLUMN managed_worktree TEXT;
+             COMMIT;",
+        )?;
+    }
+    Ok(())
+}
+
+/// Complete the relay half of the colliding v6 migration for databases first
+/// opened by master, whose v6 contained only `managed_worktree`.
+fn ensure_relay_projection_schema(connection: &Connection) -> Result<()> {
+    if table_has_column(connection, "sessions", "detached_after_event_ordinal")? {
+        return Ok(());
+    }
+    connection.execute_batch(&format!(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE session_checkpoints
+             RENAME COLUMN event_sequence TO event_frontier;
+         ALTER TABLE prompt_history
+             RENAME COLUMN event_sequence TO event_ordinal;
+         ALTER TABLE sessions ADD COLUMN detached_after_event_ordinal INTEGER NOT NULL
+             DEFAULT 0 CHECK(detached_after_event_ordinal >= 0);
+         CREATE TABLE materialized_sessions (
+             session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+             applied_event_ordinal INTEGER NOT NULL DEFAULT 0 CHECK(applied_event_ordinal >= 0),
+             applied_event_digest TEXT NOT NULL
+                 DEFAULT '{RELAY_EVENT_GENESIS_DIGEST}'
+                 CHECK(length(applied_event_digest) = 64
+                       AND applied_event_digest NOT GLOB '*[^0-9a-f]*'),
+             last_activity_at_ms INTEGER,
+             execution_state TEXT NOT NULL DEFAULT 'idle'
+                 CHECK(execution_state IN ('idle','running','closing','closed')),
+             running_started_at_ms INTEGER,
+             session_title TEXT CHECK(session_title IS NULL OR length(trim(session_title)) > 0),
+             configuration_json TEXT NOT NULL DEFAULT '{{}}',
+             CHECK(
+                 (execution_state = 'running' AND running_started_at_ms IS NOT NULL)
+                 OR (execution_state != 'running' AND running_started_at_ms IS NULL)
+             )
+         ) STRICT;
+         CREATE TABLE materialized_transcript_items (
+             session_id TEXT NOT NULL REFERENCES materialized_sessions(session_id) ON DELETE CASCADE,
+             stable_id TEXT NOT NULL CHECK(length(trim(stable_id)) > 0),
+             position INTEGER NOT NULL CHECK(position > 0),
+             latest_content_event_ordinal INTEGER
+                 CHECK(latest_content_event_ordinal IS NULL
+                       OR latest_content_event_ordinal >= position),
+             created_at_ms INTEGER NOT NULL,
+             last_changed_at_ms INTEGER NOT NULL CHECK(last_changed_at_ms >= created_at_ms),
+             body_json TEXT NOT NULL,
+             PRIMARY KEY(session_id, stable_id)
+         ) STRICT;
+         CREATE INDEX materialized_transcript_position
+             ON materialized_transcript_items(session_id, position, stable_id);
+         CREATE TABLE materialized_queued_prompts (
+             session_id TEXT NOT NULL REFERENCES materialized_sessions(session_id) ON DELETE CASCADE,
+             ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+             command_id TEXT NOT NULL CHECK(length(trim(command_id)) > 0),
+             content_json TEXT NOT NULL,
+             queued_at_ms INTEGER NOT NULL,
+             PRIMARY KEY(session_id, ordinal),
+             UNIQUE(session_id, command_id)
+         ) STRICT;
+         INSERT INTO materialized_sessions(session_id)
+             SELECT session_id FROM sessions;
+         COMMIT;",
+    ))?;
     Ok(())
 }
 
@@ -345,19 +439,20 @@ fn migrate_destroying_session_state(connection: &Connection) -> Result<()> {
              last_error TEXT,
              resource_allocation TEXT,
              last_checkpoint_error TEXT,
-             project_directory BLOB
+             project_directory BLOB,
+             managed_worktree TEXT
          ) STRICT;
          INSERT INTO sessions_v7(
              session_id, title, harness_kind, last_profile, target_template_id, state,
              native_session_id, acp_session_title, session_title_override, updated_at,
              detached_after_event_ordinal, last_error, resource_allocation,
-             last_checkpoint_error, project_directory
+             last_checkpoint_error, project_directory, managed_worktree
          )
          SELECT
              session_id, title, harness_kind, last_profile, target_template_id, state,
              native_session_id, acp_session_title, session_title_override, updated_at,
              detached_after_event_ordinal, last_error, resource_allocation,
-             last_checkpoint_error, project_directory
+             last_checkpoint_error, project_directory, managed_worktree
          FROM sessions;
          DROP TABLE sessions;
          ALTER TABLE sessions_v7 RENAME TO sessions;
@@ -413,7 +508,7 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
                 s.target_template_id, s.state, s.native_session_id, s.acp_session_title,
                 s.session_title_override, c.created_at, s.updated_at,
                 s.detached_after_event_ordinal, s.last_error, s.resource_allocation,
-                s.last_checkpoint_error, s.project_directory
+                s.last_checkpoint_error, s.project_directory, s.managed_worktree
          FROM sessions s JOIN session_contexts c USING(session_id)
          ORDER BY s.session_id",
     )?;
@@ -425,6 +520,17 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
             last_profile: row.get(3)?,
             bundle_id: row.get(4)?,
             project_directory: row.get_ref(16)?.blob_or_null()?.map(blob_to_path),
+            managed_worktree: row
+                .get::<_, Option<String>>(17)?
+                .map(|json| serde_json::from_str::<ManagedWorktree>(&json))
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        17,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
             target_template_id: row.get(5)?,
             resource_allocation: row
                 .get::<_, Option<String>>(14)?
@@ -1448,7 +1554,8 @@ fn insert_session_scoped(
              last_error = excluded.last_error,
              resource_allocation = excluded.resource_allocation,
              last_checkpoint_error = excluded.last_checkpoint_error,
-             project_directory = excluded.project_directory"
+             project_directory = excluded.project_directory,
+             managed_worktree = excluded.managed_worktree"
         }
         SessionWriteScope::Lifecycle => {
             "title = excluded.title,
@@ -1464,7 +1571,8 @@ fn insert_session_scoped(
              last_error = excluded.last_error,
              resource_allocation = excluded.resource_allocation,
              last_checkpoint_error = excluded.last_checkpoint_error,
-             project_directory = excluded.project_directory"
+             project_directory = excluded.project_directory,
+             managed_worktree = excluded.managed_worktree"
         }
         SessionWriteScope::Checkpoint => {
             "title = excluded.title,
@@ -1481,7 +1589,8 @@ fn insert_session_scoped(
              last_error = excluded.last_error,
              resource_allocation = excluded.resource_allocation,
              last_checkpoint_error = excluded.last_checkpoint_error,
-             project_directory = excluded.project_directory"
+             project_directory = excluded.project_directory,
+             managed_worktree = excluded.managed_worktree"
         }
     };
     let upsert = format!(
@@ -1489,8 +1598,8 @@ fn insert_session_scoped(
              session_id, title, harness_kind, last_profile, target_template_id, state,
              native_session_id, acp_session_title, session_title_override, updated_at,
              detached_after_event_ordinal, last_error, resource_allocation,
-             last_checkpoint_error, project_directory
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             last_checkpoint_error, project_directory, managed_worktree
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
          ON CONFLICT(session_id) DO UPDATE SET {update_fields}"
     );
     tx.execute(
@@ -1518,6 +1627,11 @@ fn insert_session_scoped(
                 .project_directory
                 .as_ref()
                 .map(|path| path_to_blob(path)),
+            session
+                .managed_worktree
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
         ],
     )?;
     tx.execute(
@@ -1982,7 +2096,7 @@ impl<'a> ValueRefExt<'a> for rusqlite::types::ValueRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hel_state::TranscriptBody;
+    use crate::hel_state::{ManagedWorktreeTarget, TranscriptBody};
     use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
     use rusqlite::OptionalExtension;
 
@@ -1998,6 +2112,7 @@ mod tests {
             last_profile: "codex".into(),
             bundle_id: bundle.into(),
             project_directory: None,
+            managed_worktree: None,
             target_template_id: "local".into(),
             resource_allocation: Some(SessionResourceAllocation::Container {
                 cpus: 8,
@@ -2127,7 +2242,17 @@ mod tests {
         let database = directory.path().join("hel.sqlite3");
         let mut state = HelState::default();
         let mut record = session("session-1", "project-1");
-        record.project_directory = Some(PathBuf::from("/srv/project-1"));
+        record.project_directory = Some(PathBuf::from("/srv/project-1/.hel/worktrees/session-1"));
+        record.managed_worktree = Some(ManagedWorktree {
+            source_project_directory: PathBuf::from("/srv/project-1"),
+            source_repository: PathBuf::from("/srv/project-1"),
+            worktree_root: PathBuf::from("/srv/project-1/.hel/worktrees/session-1"),
+            branch: "hel/session-1".into(),
+            target: ManagedWorktreeTarget::Ssh {
+                destination: "builder".into(),
+                ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
+            },
+        });
         record.resource_allocation = None;
         record.target = Some(TargetLocator::LocalBare {
             worker_root: PathBuf::from("/var/lib/hel/workers/session-1"),
@@ -2142,6 +2267,12 @@ mod tests {
 
         assert_eq!(load_state_from(&database).unwrap(), state);
         let connection = open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
         assert_eq!(
             connection
                 .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
@@ -2390,6 +2521,21 @@ mod tests {
         let connection = open(&database).unwrap();
         assert_eq!(
             connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT managed_worktree IS NULL FROM sessions WHERE session_id = 'old-session'",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            connection
                 .query_row(
                     "SELECT resource_id FROM session_targets WHERE session_id = 'old-session'",
                     [],
@@ -2493,6 +2639,15 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT managed_worktree IS NULL FROM sessions WHERE session_id = 'session-1'",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
         assert_eq!(
             connection
                 .query_row(
@@ -2559,6 +2714,81 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn master_version_six_database_converges_to_the_relay_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE schema_migrations (
+                     version INTEGER PRIMARY KEY CHECK(version > 0),
+                     applied_at TEXT NOT NULL
+                 ) STRICT;
+                 CREATE TABLE session_contexts (
+                     session_id TEXT PRIMARY KEY,
+                     bundle_id TEXT NOT NULL,
+                     created_at TEXT NOT NULL
+                 ) STRICT;
+                 CREATE TABLE sessions (
+                     session_id TEXT PRIMARY KEY REFERENCES session_contexts(session_id),
+                     title TEXT,
+                     harness_kind TEXT,
+                     last_profile TEXT,
+                     target_template_id TEXT,
+                     state TEXT,
+                     native_session_id TEXT,
+                     acp_session_title TEXT,
+                     session_title_override TEXT,
+                     updated_at TEXT,
+                     last_viewed_event_sequence INTEGER NOT NULL DEFAULT 0,
+                     last_error TEXT,
+                     resource_allocation TEXT,
+                     last_checkpoint_error TEXT,
+                     project_directory BLOB,
+                     managed_worktree TEXT
+                 ) STRICT;
+                 CREATE TABLE session_checkpoints (
+                     session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+                     archive_path BLOB,
+                     sha256 TEXT,
+                     created_at TEXT,
+                     event_sequence INTEGER NOT NULL DEFAULT 0
+                 ) STRICT;
+                 CREATE TABLE prompt_history (
+                     history_id INTEGER PRIMARY KEY,
+                     session_id TEXT REFERENCES session_contexts(session_id),
+                     event_sequence INTEGER NOT NULL DEFAULT 0,
+                     submitted_at TEXT,
+                     text TEXT
+                 ) STRICT;
+                 INSERT INTO schema_migrations(version, applied_at)
+                     VALUES (1, 'now'), (2, 'now'), (3, 'now'), (4, 'now'), (5, 'now'), (6, 'now');
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let connection = open(&database).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        for (table, column) in [
+            ("sessions", "detached_after_event_ordinal"),
+            ("sessions", "managed_worktree"),
+            ("session_checkpoints", "event_frontier"),
+            ("prompt_history", "event_ordinal"),
+            ("materialized_sessions", "applied_event_digest"),
+        ] {
+            assert!(table_has_column(&connection, table, column).unwrap());
+        }
     }
 
     #[test]

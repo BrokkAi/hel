@@ -4,9 +4,12 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+use crate::hel_credentials::CredentialSnapshot;
 use crate::hel_targets::CommandSpec;
 use crate::hel_worker::{
     MAX_FRAME_BYTES, RELAY_EVENT_GENESIS_DIGEST, RELAY_PROTOCOL_VERSION, RelayCommand, RelayCursor,
@@ -292,6 +295,34 @@ impl RelayClient {
         }
     }
 
+    /// Return the fingerprint and freshness of this session's harness
+    /// credentials without exposing the credential bytes.
+    pub async fn credential_state(&mut self) -> Result<CredentialSnapshot> {
+        credential_snapshot(self.call(RelayRequest::CredentialState).await?)
+    }
+
+    /// Read this session's credential file. Callers must keep these bytes out
+    /// of durable relay observations, logs, and archives.
+    pub async fn read_credentials(&mut self) -> Result<Vec<u8>> {
+        match self.call(RelayRequest::ReadCredentials).await? {
+            RelayResponsePayload::Credentials { data } => BASE64
+                .decode(data.as_bytes())
+                .context("decode relay credential payload"),
+            _ => bail!("relay returned an unexpected credential response"),
+        }
+    }
+
+    /// Install credentials into the harness home fixed by this session's
+    /// launch config.
+    pub async fn install_credentials(&mut self, bytes: &[u8]) -> Result<CredentialSnapshot> {
+        credential_snapshot(
+            self.call(RelayRequest::InstallCredentials {
+                data: BASE64.encode(bytes),
+            })
+            .await?,
+        )
+    }
+
     pub async fn submit(
         &mut self,
         command_id: impl Into<String>,
@@ -409,6 +440,21 @@ impl RelayClient {
         let id = format!("relay-{:016x}-{}", self.connection_nonce, self.next_request);
         self.next_request = self.next_request.wrapping_add(1);
         id
+    }
+}
+
+fn credential_snapshot(payload: RelayResponsePayload) -> Result<CredentialSnapshot> {
+    match payload {
+        RelayResponsePayload::CredentialState {
+            present,
+            fingerprint,
+            freshness_epoch_ms,
+        } => Ok(CredentialSnapshot {
+            present,
+            fingerprint,
+            freshness_epoch_ms,
+        }),
+        _ => bail!("relay returned an unexpected credential state response"),
     }
 }
 

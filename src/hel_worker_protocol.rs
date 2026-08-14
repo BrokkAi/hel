@@ -78,7 +78,14 @@ pub fn decode_relay_request(bytes: &[u8]) -> Result<DecodedRelayRequest> {
 fn is_relay_v1_method(method: &str) -> bool {
     matches!(
         method,
-        "hello" | "attach" | "acknowledge" | "submit" | "status"
+        "hello"
+            | "attach"
+            | "acknowledge"
+            | "submit"
+            | "status"
+            | "credential_state"
+            | "read_credentials"
+            | "install_credentials"
     )
 }
 
@@ -126,6 +133,34 @@ mod tests {
         let request = br#"{"request_id":"r1","protocol_version":1,"request":{"method":"acknowledge","params":{}}}"#;
         assert!(matches!(
             decode_relay_request(request).unwrap(),
+            DecodedRelayRequest::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn credential_methods_decode_on_the_relay_v1_floor_without_a_path() {
+        let state =
+            br#"{"request_id":"r1","protocol_version":1,"request":{"method":"credential_state"}}"#;
+        let DecodedRelayRequest::Known(envelope) = decode_relay_request(state).unwrap() else {
+            panic!("credential_state should decode");
+        };
+        assert_eq!(envelope.protocol_version, 1);
+        assert_eq!(envelope.request, RelayRequest::CredentialState);
+
+        let install = br#"{"request_id":"r2","protocol_version":1,"request":{"method":"install_credentials","params":{"data":"e30="}}}"#;
+        let DecodedRelayRequest::Known(envelope) = decode_relay_request(install).unwrap() else {
+            panic!("install_credentials should decode");
+        };
+        assert_eq!(
+            envelope.request,
+            RelayRequest::InstallCredentials {
+                data: "e30=".into()
+            }
+        );
+
+        let caller_selected_path = br#"{"request_id":"r3","protocol_version":1,"request":{"method":"read_credentials","params":{"path":"/tmp/stolen"}}}"#;
+        assert!(matches!(
+            decode_relay_request(caller_selected_path).unwrap(),
             DecodedRelayRequest::Invalid { .. }
         ));
     }
