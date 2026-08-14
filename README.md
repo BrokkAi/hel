@@ -49,9 +49,9 @@ podman build --pull=always \
   containers
 ```
 
-The image includes Rust, Node 24, Git, the Codex ACP bridge, and the Claude ACP
-bridge. Hel copies its worker and the selected harness profile into each new
-container. Kimi Code uses Hel's official on-demand installer fallback.
+The image includes Rust, Node 24, Git, GitHub CLI, the Codex ACP bridge, and the
+Claude ACP bridge. Hel copies its worker and the selected harness profile into
+each new container. Kimi Code uses Hel's official on-demand installer fallback.
 
 Configure it as a target with:
 
@@ -227,7 +227,7 @@ effective global Git configuration: `user.name`, `user.email`,
 `diff.algorithm`. Hel applies these settings after cloning, so they do not
 provide repository credentials, and repository-local configuration still
 wins. Raw localhost and named `ssh-bare` machines keep their own Git
-configuration. Hel does not copy Git aliases, credentials, URL rewrites, includes, LFS filters, signing
+configuration. Hel does not copy Git aliases, stored Git credentials, URL rewrites, includes, LFS filters, signing
 settings, hooks, editor or pager commands, custom drivers, proxies,
 `safe.directory`, line-ending settings, or the controller's global excludes
 file.
@@ -235,9 +235,15 @@ file.
 For isolated and remote targets, harness homes are whitelists rather than
 complete dot-directory copies. For Claude, Hel copies `.credentials.json`, `settings.json`, `CLAUDE.md`,
 `skills/`, and `plugins/`; it does not copy transcripts, project history, or
-caches. SSH and GPG keys, GitHub CLI and package-registry credentials, cloud
-configuration, shell dotfiles, editor configuration, and toolchain state are
-not transferred automatically.
+caches. SSH and GPG keys, package-registry credentials, cloud configuration,
+shell dotfiles, editor configuration, and toolchain state are not transferred
+automatically. The standard container image includes GitHub CLI. When the
+controller's `gh` is authenticated, Hel passes its active GitHub token to each
+freshly provisioned managed container as `GH_TOKEN`; this supports `gh` and
+HTTPS Git pushes without copying SSH keys. The token is not added to recovery
+archives. Existing live containers are not mutated, while archived sessions
+receive current GitHub authentication when they provision a fresh target on
+resume.
 
 `local-bare` is intentionally different: it runs the ACP bridge in the chosen
 local Git worktree and points `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, or

@@ -614,8 +614,13 @@ impl Controller {
     }
 
     pub async fn provision_session(&mut self, session_id: &str) -> Result<()> {
-        self.provision_session_with(session_id, &ProcessExecutor)
-            .await?;
+        let github_token = controller_github_token();
+        self.provision_session_with_github_token(
+            session_id,
+            &ProcessExecutor,
+            github_token.as_deref(),
+        )
+        .await?;
         match self
             .install_and_connect_worker(session_id, &ProcessExecutor)
             .await
@@ -702,6 +707,16 @@ impl Controller {
         session_id: &str,
         executor: &(impl CommandExecutor + Sync),
     ) -> Result<()> {
+        self.provision_session_with_github_token(session_id, executor, None)
+            .await
+    }
+
+    async fn provision_session_with_github_token(
+        &mut self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+        github_token: Option<&str>,
+    ) -> Result<()> {
         let session = self
             .state
             .sessions
@@ -729,19 +744,25 @@ impl Controller {
                     );
                 }
             }
-            let target = backend_target(template, session.resource_allocation.as_ref())?;
+            let mut target = backend_target(template, session.resource_allocation.as_ref())?;
             let runtime_mounts = if matches!(target, hel_targets::TargetTemplate::AwsEc2(_)) {
                 &[][..]
             } else {
                 session.additional_mounts.as_slice()
             };
-            let bundle = session
+            let mut bundle = session
                 .project_directory
                 .is_none()
                 .then(|| self.config.bundles.get(&session.bundle_id))
                 .flatten()
                 .map(backend_bundle)
                 .transpose()?;
+            if let Some(token) = github_token
+                && inject_github_token(&mut target, token)
+                && let Some(bundle) = bundle.as_mut()
+            {
+                use_github_https_urls(bundle);
+            }
             let provision = if let Some(project_directory) = &session.project_directory {
                 hel_targets::provision_bare_project_plan(
                     &target,
@@ -1358,6 +1379,7 @@ impl Controller {
             .context_window_bytes
             .unwrap_or(crate::hel_compaction::DEFAULT_CONTEXT_BYTES);
         let portable_events = (!same_harness).then(|| canonical_events.to_vec());
+        let github_token = controller_github_token();
 
         let record = self.state.sessions.get_mut(session_id).unwrap();
         record.harness_kind = profile.kind;
@@ -1377,8 +1399,12 @@ impl Controller {
         self.state.save()?;
 
         let result = async {
-            self.provision_session_with(session_id, &ProcessExecutor)
-                .await?;
+            self.provision_session_with_github_token(
+                session_id,
+                &ProcessExecutor,
+                github_token.as_deref(),
+            )
+            .await?;
             let (backend, worker_root) =
                 self.prepare_worker_files(session_id, &ProcessExecutor, same_harness)?;
             let harness_home = target_profile_home(&backend, session_id, &profile);
@@ -2899,6 +2925,64 @@ fn backend_target(
             container: backend_container(container, allocation),
         },
     })
+}
+
+fn controller_github_token() -> Option<String> {
+    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(token) = std::env::var(name)
+            && let Some(token) = usable_github_token(&token)
+        {
+            return Some(token.to_owned());
+        }
+    }
+    let output = Command::new("gh")
+        .args(["auth", "token", "--hostname", "github.com"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then_some(())
+        .and_then(|()| std::str::from_utf8(&output.stdout).ok())
+        .and_then(usable_github_token)
+        .map(str::to_owned)
+}
+
+fn usable_github_token(token: &str) -> Option<&str> {
+    let token = token.trim();
+    (!token.is_empty() && !token.chars().any(char::is_whitespace)).then_some(token)
+}
+
+fn inject_github_token(target: &mut hel_targets::TargetTemplate, token: &str) -> bool {
+    let container = match target {
+        hel_targets::TargetTemplate::LocalPodman(container)
+        | hel_targets::TargetTemplate::AppleContainer(container)
+        | hel_targets::TargetTemplate::SshPodman { container, .. } => container,
+        hel_targets::TargetTemplate::LocalBare
+        | hel_targets::TargetTemplate::AwsEc2(_)
+        | hel_targets::TargetTemplate::SshBare { .. } => return false,
+    };
+    container
+        .extra_run_args
+        .extend(["--env".to_owned(), format!("GH_TOKEN={token}")]);
+    true
+}
+
+fn use_github_https_urls(bundle: &mut hel_targets::ProjectBundleSpec) {
+    for repository in &mut bundle.repositories {
+        let Some(source) = repository.url.as_deref() else {
+            continue;
+        };
+        let Some(github) = crate::hel_setup::github_repository_from_origin(source) else {
+            continue;
+        };
+        repository.url = Some(format!(
+            "https://github.com/{}/{}.git",
+            github.owner, github.repository
+        ));
+    }
 }
 
 fn mount_history_host(template: &TargetTemplate) -> Option<String> {
@@ -5005,6 +5089,44 @@ mod tests {
         };
         assert!(container.extra_run_args.contains(&"--cpus=4".into()));
         assert!(container.extra_run_args.contains(&"A=b c".into()));
+    }
+
+    #[test]
+    fn github_token_is_injected_only_into_managed_containers() {
+        let mut podman = hel_targets::TargetTemplate::LocalPodman(ContainerTemplate {
+            image: "dev:1".into(),
+            extra_run_args: vec![],
+        });
+        assert!(inject_github_token(&mut podman, "github-token"));
+        let hel_targets::TargetTemplate::LocalPodman(container) = podman else {
+            unreachable!()
+        };
+        assert!(
+            container
+                .extra_run_args
+                .windows(2)
+                .any(|arguments| arguments == ["--env", "GH_TOKEN=github-token"])
+        );
+
+        let mut bare = hel_targets::TargetTemplate::LocalBare;
+        assert!(!inject_github_token(&mut bare, "github-token"));
+        assert_eq!(bare, hel_targets::TargetTemplate::LocalBare);
+        assert_eq!(usable_github_token("  token-value\n"), Some("token-value"));
+        assert_eq!(usable_github_token("not a token"), None);
+
+        let mut bundle = hel_targets::ProjectBundleSpec {
+            primary: "app".into(),
+            repositories: vec![hel_targets::RepositorySpec {
+                url: Some("git@github.com:example/app.git".into()),
+                destination: "app".into(),
+                git_ref: None,
+            }],
+        };
+        use_github_https_urls(&mut bundle);
+        assert_eq!(
+            bundle.repositories[0].url.as_deref(),
+            Some("https://github.com/example/app.git")
+        );
     }
 
     #[test]
