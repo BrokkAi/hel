@@ -4192,7 +4192,9 @@ fn render_sessions(
         visible_sessions,
     );
 
-    let archived_rows = archived.iter().map(|session| archived_session_row(session));
+    let archived_rows = archived
+        .iter()
+        .map(|session| archived_session_row(session, &dashboard.config));
     let archived_focused = dashboard.focus == Focus::Archived;
     let archived_table = Table::new(archived_rows, archived_session_column_constraints())
         .header(archived_session_header())
@@ -4273,8 +4275,9 @@ fn session_column_constraints() -> [Constraint; 6] {
     ]
 }
 
-fn archived_session_column_constraints() -> [Constraint; 4] {
+fn archived_session_column_constraints() -> [Constraint; 5] {
     [
+        Constraint::Length(18),
         Constraint::Length(14),
         Constraint::Length(15),
         Constraint::Length(7),
@@ -4295,7 +4298,7 @@ fn session_header() -> Row<'static> {
 }
 
 fn archived_session_header() -> Row<'static> {
-    Row::new(["Profile", "Archived", "Archive", "Session name"])
+    Row::new(["Target", "Profile", "Archived", "Archive", "Session name"])
         .style(Style::default().add_modifier(Modifier::BOLD))
 }
 
@@ -4467,13 +4470,35 @@ fn active_session_row(
     .top_margin(top_margin)
 }
 
-fn archived_session_row(session: &SessionRecord) -> Row<'static> {
+fn paused_session_target(config: &HelConfig, session: &SessionRecord) -> String {
+    if let Some(project_directory) = &session.project_directory {
+        return project_directory
+            .file_name()
+            .unwrap_or(project_directory.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+    }
+    config.bundles.get(&session.bundle_id).map_or_else(
+        || session.bundle_id.clone(),
+        |bundle| {
+            bundle
+                .repositories
+                .iter()
+                .map(|repository| repository.destination.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    )
+}
+
+fn archived_session_row(session: &SessionRecord, config: &HelConfig) -> Row<'static> {
     let checkpoint = session
         .checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint_time_display(&checkpoint.created_at))
         .unwrap_or_else(|| "never".into());
     Row::new([
+        paused_session_target(config, session),
         session.last_profile.clone(),
         checkpoint,
         checkpoint_archive_size(session),
@@ -8510,7 +8535,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_sessions_omit_turn_clock_and_target_columns() {
+    fn archived_sessions_omit_turn_clock_and_target_infrastructure() {
         let mut dashboard = dashboard_with_session(archived_session());
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -8526,6 +8551,8 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(rendered.matches("Turn clock").count(), 1);
+        assert!(rendered.contains("Target"));
+        assert!(rendered.contains("hel"));
         assert!(!rendered.contains("podman: hel"));
         assert!(rendered.contains("26-08-09 01:00"));
         assert!(!rendered.contains("2026-08-09T01:00:00Z"));
@@ -8555,11 +8582,13 @@ mod tests {
         let header = lines
             .iter()
             .find(|line| {
-                line.contains("Profile")
+                line.contains("Target")
+                    && line.contains("Profile")
                     && line.contains("Archived")
                     && line.contains("Session name")
             })
             .expect("archived header");
+        let target = header.find("Target").unwrap();
         let profile = header.find("Profile").unwrap();
         let archived = header.find("Archived").unwrap();
         let archive = header[archived + "Archived".len()..]
@@ -8568,10 +8597,37 @@ mod tests {
             .unwrap();
         let session_name = header.find("Session name").unwrap();
 
+        assert_eq!(profile - target, 19);
         assert_eq!(archived - profile, 15);
         assert_eq!(archive - archived, 16);
         assert_eq!(session_name - archive, 8);
         assert!(lines.iter().any(|line| line.contains(long_name)));
+    }
+
+    #[test]
+    fn paused_target_lists_bundle_directories_and_uses_raw_directory_leaf() {
+        let mut config = config();
+        config
+            .bundles
+            .get_mut("hel")
+            .unwrap()
+            .repositories
+            .push(ProjectRepository {
+                id: "docs".into(),
+                github: Some("BrokkAi/docs".into()),
+                local: None,
+                destination: PathBuf::from("documentation"),
+                git_ref: None,
+            });
+        let mut session = archived_session();
+
+        assert_eq!(
+            paused_session_target(&config, &session),
+            "hel, documentation"
+        );
+
+        session.project_directory = Some(PathBuf::from("/home/user/Projects/raw-project"));
+        assert_eq!(paused_session_target(&config, &session), "raw-project");
     }
 
     #[test]
