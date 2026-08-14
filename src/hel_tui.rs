@@ -33,6 +33,7 @@ const BASELINE_MEMORY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const ACTIVE_MESSAGE_LINES: usize = 4;
 const SELECTED_TRANSCRIPT_LINES: usize = 10;
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
+const SUMMARY_RULE: &str = "─";
 const DASHBOARD_FIXED_HEIGHT: u16 = 3;
 const DASHBOARD_PANE_COUNT: usize = 4;
 const MOUSE_SCROLL_ROWS: isize = 3;
@@ -4128,6 +4129,7 @@ fn render_sessions(
                     &dashboard.config,
                     preview.len() as u16 + 1,
                     u16::from(index > 0),
+                    usize::from(active_area.width),
                 )
             });
     let active_focused = dashboard.focus == Focus::Active;
@@ -4168,7 +4170,8 @@ fn render_sessions(
                     active_area.width.saturating_sub(2),
                     1,
                 ),
-                Style::default().bg(Color::DarkGray).fg(Color::LightYellow),
+                // Background only: the summary keeps its own text and rule colors.
+                Style::default().bg(Color::DarkGray),
             );
         }
         let preview_height = active_area
@@ -4449,25 +4452,47 @@ fn active_session_row(
     config: &HelConfig,
     height: u16,
     top_margin: u16,
+    rule_width: usize,
 ) -> Row<'static> {
     let (clock, profile, target, resources, session_name) =
         session_values(session, detail, now_epoch_seconds, config);
     let unread_count = detail.map_or(0, |detail| detail.unread_agent_message_sequences.len());
     Row::new([
-        Cell::from(unread_line(unread_count)),
-        Cell::from(clock),
-        Cell::from(profile),
-        Cell::from(target),
-        Cell::from(resources),
-        Cell::from(recovery_warning_name(
-            session,
-            session_name,
-            now_epoch_seconds,
-        )),
+        summary_rule_cell(unread_line(unread_count), rule_width),
+        summary_rule_cell(Line::raw(clock), rule_width),
+        summary_rule_cell(Line::raw(profile), rule_width),
+        summary_rule_cell(Line::raw(target), rule_width),
+        summary_rule_cell(Line::raw(resources), rule_width),
+        summary_rule_cell(
+            Line::raw(recovery_warning_name(
+                session,
+                session_name,
+                now_epoch_seconds,
+            )),
+            rule_width,
+        ),
     ])
     .style(Style::default().fg(Color::LightYellow))
     .height(height)
     .top_margin(top_margin)
+}
+
+/// Trails each summary column with the block's rule glyph so every active
+/// session reads as its own band. Table cells clip the fill at the column edge,
+/// so one pane-wide run works for every column.
+fn summary_rule_cell(content: Line<'static>, rule_width: usize) -> Cell<'static> {
+    let mut spans = content.spans;
+    let gap = if spans.iter().all(|span| span.content.is_empty()) {
+        ""
+    } else {
+        " "
+    };
+    spans.push(Span::styled(
+        format!("{gap}{}", SUMMARY_RULE.repeat(rule_width)),
+        // Reset keeps the rule the same weight as the surrounding block border.
+        Style::default().fg(Color::Reset),
+    ));
+    Cell::from(Line::from(spans))
 }
 
 fn paused_session_target(config: &HelConfig, session: &SessionRecord) -> String {
@@ -5913,6 +5938,12 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// A drawn summary cell that holds session text rather than the rule fill.
+    fn summary_text_cell(cell: &ratatui::buffer::Cell) -> bool {
+        let symbol = cell.symbol();
+        !symbol.trim().is_empty() && symbol != SUMMARY_RULE
+    }
+
     fn ctrl_key(character: char) -> KeyEvent {
         KeyEvent::new(
             KeyCode::Char(character),
@@ -6617,8 +6648,14 @@ mod tests {
         let status_y = buffer.area.y + status_y as u16;
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
-                .filter(|x| !buffer[(*x, status_y)].symbol().trim().is_empty())
+                .filter(|x| summary_text_cell(&buffer[(*x, status_y)]))
                 .all(|x| buffer[(x, status_y)].fg == Color::LightYellow)
+        );
+        assert!(status.contains(SUMMARY_RULE));
+        assert!(
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .filter(|x| buffer[(*x, status_y)].symbol() == SUMMARY_RULE)
+                .all(|x| buffer[(x, status_y)].fg == Color::Reset)
         );
     }
 
@@ -8386,8 +8423,19 @@ mod tests {
         );
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
-                .filter(|x| !buffer[(*x, info_y)].symbol().trim().is_empty())
+                .filter(|x| summary_text_cell(&buffer[(*x, info_y)]))
                 .all(|x| buffer[(x, info_y)].fg == Color::LightYellow)
+        );
+        // The rule fills the gaps and stays the color of the block border.
+        assert!(
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .any(|x| buffer[(x, info_y)].symbol() == SUMMARY_RULE)
+        );
+        assert!(
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .filter(|x| buffer[(*x, info_y)].symbol() == SUMMARY_RULE)
+                .all(|x| buffer[(x, info_y)].fg == Color::Reset
+                    && buffer[(x, info_y)].bg == Color::DarkGray)
         );
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
