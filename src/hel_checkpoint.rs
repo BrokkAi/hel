@@ -19,7 +19,8 @@ use sha2::{Digest, Sha256};
 use crate::hel_archive::{
     ArchiveInput, BundleManifest, GitCollectionSpec, GitCommand, GitCommandRunner, NativeArtifact,
     PayloadRole, RepositorySnapshot, SessionManifest, SystemGit, TargetManifest,
-    collect_git_snapshot, read_archive_verified, restore_git_snapshot, write_archive_atomic,
+    collect_git_metadata_snapshot, collect_git_snapshot, read_archive_verified,
+    restore_git_snapshot, write_archive_atomic,
 };
 use crate::hel_config::HarnessKind;
 use crate::hel_targets::{
@@ -38,6 +39,10 @@ pub struct CheckpointRepositorySpec {
     pub base_commit: String,
     #[serde(default)]
     pub full_history: bool,
+    /// False for raw projects whose existing worktree remains the recovery
+    /// source and is deliberately never restored from the checkpoint.
+    #[serde(default = "default_true")]
+    pub capture_contents: bool,
     #[serde(default)]
     pub origin_override: Option<String>,
 }
@@ -89,6 +94,9 @@ pub struct TargetCheckpoint {
     pub path: PathBuf,
     pub sha256: String,
     pub event_sequence: u64,
+    /// Repositories that requested a delta but had no usable common base.
+    #[serde(default)]
+    pub full_history_fallbacks: Vec<String>,
 }
 
 /// Hidden target CLI entry point: `hel worker export-checkpoint --spec PATH`.
@@ -506,22 +514,32 @@ pub fn export_checkpoint_with_git(
         .map(|repository| {
             let path = spec.workspace_root.join(&repository.relative_destination);
             ensure!(path.is_dir(), "repository {} is missing", path.display());
-            reject_dirty_submodules(git, &path)
-                .with_context(|| format!("repository '{}'", repository.id))?;
-            collect_git_snapshot(
-                git,
-                &path,
-                &GitCollectionSpec {
-                    id: repository.id.clone(),
-                    relative_destination: repository.relative_destination.clone(),
-                    base_commit: repository.base_commit.clone(),
-                    full_history: repository.full_history,
-                    origin_override: repository.origin_override.clone(),
-                },
-            )
+            let collection = GitCollectionSpec {
+                id: repository.id.clone(),
+                relative_destination: repository.relative_destination.clone(),
+                base_commit: repository.base_commit.clone(),
+                full_history: repository.full_history,
+                origin_override: repository.origin_override.clone(),
+            };
+            if repository.capture_contents {
+                reject_dirty_submodules(git, &path)
+                    .with_context(|| format!("repository '{}'", repository.id))?;
+                collect_git_snapshot(git, &path, &collection)
+            } else {
+                collect_git_metadata_snapshot(git, &path, &collection)
+            }
             .with_context(|| format!("repository '{}'", repository.id))
         })
         .collect::<Result<Vec<_>>>()?;
+    let full_history_fallbacks = spec
+        .repositories
+        .iter()
+        .zip(&repositories)
+        .filter(|(requested, collected)| {
+            requested.capture_contents && !requested.full_history && collected.metadata.full_history
+        })
+        .map(|(requested, _)| requested.id.clone())
+        .collect();
     let verified = write_archive_atomic(
         &spec.output_path,
         &ArchiveInput {
@@ -538,6 +556,7 @@ pub fn export_checkpoint_with_git(
         path: spec.output_path.clone(),
         sha256: verified.archive_sha256,
         event_sequence,
+        full_history_fallbacks,
     })
 }
 
@@ -1784,6 +1803,7 @@ mod tests {
                     relative_destination: "app".into(),
                     base_commit: base,
                     full_history: false,
+                    capture_contents: true,
                     origin_override: None,
                 }],
                 event_sequence: 1,
@@ -1841,6 +1861,86 @@ mod tests {
     }
 
     #[test]
+    fn raw_project_export_keeps_git_metadata_without_git_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut spec, _) = fixture(temp.path());
+        spec.repositories[0].capture_contents = false;
+        let repository = spec.workspace_root.join("app");
+        fs::write(repository.join("README.md"), b"dirty").unwrap();
+        fs::write(repository.join("untracked.txt"), b"untracked").unwrap();
+
+        let target = export_checkpoint(&spec).unwrap();
+        assert!(target.full_history_fallbacks.is_empty());
+        let archive = read_archive_verified(&spec.output_path).unwrap();
+        let repository = &archive.manifest.repositories[0];
+        assert_eq!(
+            repository.metadata.base_commit,
+            repository.metadata.head_commit
+        );
+        assert!(!repository.metadata.full_history);
+        for role in [
+            PayloadRole::GitBundle {
+                repository_id: "app".into(),
+            },
+            PayloadRole::GitStagedPatch {
+                repository_id: "app".into(),
+            },
+            PayloadRole::GitUnstagedPatch {
+                repository_id: "app".into(),
+            },
+            PayloadRole::GitUntrackedTar {
+                repository_id: "app".into(),
+            },
+        ] {
+            assert!(archive.payload_by_role(&role).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_delta_base_is_reported_as_a_full_history_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut spec, _) = fixture(temp.path());
+        spec.repositories[0].base_commit = "refs/hel/missing".into();
+
+        let target = export_checkpoint(&spec).unwrap();
+
+        assert_eq!(target.full_history_fallbacks, ["app"]);
+        let archive = read_archive_verified(&spec.output_path).unwrap();
+        assert!(archive.manifest.repositories[0].metadata.full_history);
+    }
+
+    #[test]
+    fn raw_project_without_git_metadata_fails_checkpoint_export() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut spec, _) = fixture(temp.path());
+        spec.repositories[0].capture_contents = false;
+        fs::remove_dir_all(spec.workspace_root.join("app/.git")).unwrap();
+
+        let error = export_checkpoint(&spec).unwrap_err();
+
+        assert!(format!("{error:#}").contains("repository has no valid Git HEAD"));
+    }
+
+    #[test]
+    fn checkpoint_wire_defaults_preserve_legacy_capture_behavior() {
+        let repository: CheckpointRepositorySpec = serde_json::from_value(json!({
+            "id": "app",
+            "relative_destination": "app",
+            "base_commit": "HEAD"
+        }))
+        .unwrap();
+        assert!(repository.capture_contents);
+
+        let target: TargetCheckpoint = serde_json::from_value(json!({
+            "path": "/worker/checkpoint.hel.zip",
+            "sha256": "abc",
+            "event_sequence": 7
+        }))
+        .unwrap();
+        assert!(target.full_history_fallbacks.is_empty());
+    }
+
+    #[test]
     fn canonical_checkpoint_payload_stops_at_the_latched_frontier() {
         let temp = tempfile::tempdir().unwrap();
         let (spec, _) = fixture(temp.path());
@@ -1867,6 +1967,7 @@ mod tests {
             relative_destination: "worker".into(),
             base_commit: base,
             full_history: false,
+            capture_contents: true,
             origin_override: None,
         });
 

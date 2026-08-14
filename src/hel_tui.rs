@@ -174,6 +174,28 @@ enum Focus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionOrder {
+    Added,
+    RecentActivity,
+}
+
+impl SessionOrder {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::RecentActivity => "recent activity",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Added => Self::RecentActivity,
+            Self::RecentActivity => Self::Added,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WizardStep {
     Profile,
     Target,
@@ -543,7 +565,7 @@ struct SessionActivity {
 struct SessionDetail {
     last_event_sequence: u64,
     current_turn_started_at: Option<u64>,
-    last_agent_text_at: Option<u64>,
+    last_activity_at: Option<u64>,
     agent_text_stream_open: bool,
     last_agent_message_id: Option<String>,
     last_agent_message: Option<String>,
@@ -570,6 +592,7 @@ pub struct DashboardState {
     session_operations: BTreeMap<String, SessionOperationDisplay>,
     capacity_details: BTreeMap<String, CapacityDetail>,
     session_index: usize,
+    session_order: SessionOrder,
     capacity_index: usize,
     quota_index: usize,
     focus: Focus,
@@ -591,6 +614,7 @@ impl DashboardState {
             session_operations: BTreeMap::new(),
             capacity_details: BTreeMap::new(),
             session_index: 0,
+            session_order: SessionOrder::Added,
             capacity_index: 0,
             quota_index: 0,
             focus: Focus::Active,
@@ -694,7 +718,11 @@ impl DashboardState {
     }
 
     pub fn select_active_session(&mut self, session_id: &str) {
-        let (active, _) = partition_sessions(self.state.sessions.values(), &self.session_details);
+        let (active, _) = partition_sessions(
+            self.state.sessions.values(),
+            &self.session_details,
+            self.session_order,
+        );
         if let Some(index) = active.iter().position(|session| session.id == session_id) {
             self.focus = Focus::Active;
             self.session_index = index;
@@ -739,6 +767,7 @@ impl DashboardState {
                 continue;
             }
             detail.last_event_sequence = event.seq;
+            detail.last_activity_at = Some(observed_at_epoch_seconds);
             match &event.event {
                 WorkerEvent::PromptAccepted { .. } => {
                     detail.agent_text_stream_open = false;
@@ -771,7 +800,6 @@ impl DashboardState {
                             }
                             detail.last_agent_message_id = message_id;
                             detail.agent_text_stream_open = true;
-                            detail.last_agent_text_at = Some(observed_at_epoch_seconds);
                             updated_latest_message = true;
                         } else {
                             detail.agent_text_stream_open = false;
@@ -1242,6 +1270,10 @@ impl DashboardState {
             (KeyCode::End, _) => {
                 let len = self.focus_len();
                 self.set_selection(len.saturating_sub(1));
+                DashboardAction::None
+            }
+            (KeyCode::Char('s'), false) => {
+                self.cycle_session_order();
                 DashboardAction::None
             }
             (KeyCode::Char('n'), true) => self.begin_new(),
@@ -3141,9 +3173,25 @@ impl DashboardState {
     }
 
     fn ordered_sessions(&self) -> Vec<&SessionRecord> {
-        let (active, archived) =
-            partition_sessions(self.state.sessions.values(), &self.session_details);
+        let (active, archived) = partition_sessions(
+            self.state.sessions.values(),
+            &self.session_details,
+            self.session_order,
+        );
         active.into_iter().chain(archived).collect()
+    }
+
+    fn cycle_session_order(&mut self) {
+        let selected_id = self.selected_session().map(|session| session.id.clone());
+        self.session_order = self.session_order.next();
+        if let Some(selected_id) = selected_id
+            && let Some(index) = self
+                .ordered_sessions()
+                .iter()
+                .position(|session| session.id == selected_id)
+        {
+            self.session_index = index;
+        }
     }
 
     fn compatible_profiles(&self, session_id: &str) -> Vec<(&String, HarnessKind)> {
@@ -3187,8 +3235,11 @@ impl DashboardState {
     }
 
     fn focus_len_for(&self, focus: Focus) -> usize {
-        let (active, archived) =
-            partition_sessions(self.state.sessions.values(), &self.session_details);
+        let (active, archived) = partition_sessions(
+            self.state.sessions.values(),
+            &self.session_details,
+            self.session_order,
+        );
         match focus {
             Focus::Active => active.len(),
             Focus::Archived => archived.len(),
@@ -3202,9 +3253,13 @@ impl DashboardState {
     }
 
     fn set_selection_for(&mut self, focus: Focus, index: usize) {
-        let active_len = partition_sessions(self.state.sessions.values(), &self.session_details)
-            .0
-            .len();
+        let active_len = partition_sessions(
+            self.state.sessions.values(),
+            &self.session_details,
+            self.session_order,
+        )
+        .0
+        .len();
         match focus {
             Focus::Active => self.session_index = index,
             Focus::Archived => self.session_index = active_len + index,
@@ -3218,10 +3273,13 @@ impl DashboardState {
         match self.focus {
             Focus::Active => move_index(&mut self.session_index, len, delta),
             Focus::Archived => {
-                let active_len =
-                    partition_sessions(self.state.sessions.values(), &self.session_details)
-                        .0
-                        .len();
+                let active_len = partition_sessions(
+                    self.state.sessions.values(),
+                    &self.session_details,
+                    self.session_order,
+                )
+                .0
+                .len();
                 let mut index = self.session_index.saturating_sub(active_len);
                 move_index(&mut index, len, delta);
                 self.session_index = active_len + index;
@@ -3237,9 +3295,13 @@ impl DashboardState {
             self.set_selection_for(focus, 0);
             return;
         }
-        let active_len = partition_sessions(self.state.sessions.values(), &self.session_details)
-            .0
-            .len();
+        let active_len = partition_sessions(
+            self.state.sessions.values(),
+            &self.session_details,
+            self.session_order,
+        )
+        .0
+        .len();
         let current = match focus {
             Focus::Active => self.session_index,
             Focus::Archived => self.session_index.saturating_sub(active_len),
@@ -3263,9 +3325,13 @@ impl DashboardState {
             (Focus::Capacity, false) | (Focus::Active, true) => Focus::Quotas,
             (Focus::Quotas, false) | (Focus::Archived, true) => Focus::Active,
         };
-        let active_len = partition_sessions(self.state.sessions.values(), &self.session_details)
-            .0
-            .len();
+        let active_len = partition_sessions(
+            self.state.sessions.values(),
+            &self.session_details,
+            self.session_order,
+        )
+        .0
+        .len();
         match self.focus {
             Focus::Active => {
                 self.session_index = self.session_index.min(active_len.saturating_sub(1));
@@ -3277,8 +3343,11 @@ impl DashboardState {
     }
 
     fn clamp_selections(&mut self) {
-        let (active, archived) =
-            partition_sessions(self.state.sessions.values(), &self.session_details);
+        let (active, archived) = partition_sessions(
+            self.state.sessions.values(),
+            &self.session_details,
+            self.session_order,
+        );
         if self.focus == Focus::Active && active.is_empty() && !archived.is_empty() {
             self.focus = Focus::Archived;
         } else if self.focus == Focus::Archived && archived.is_empty() && !active.is_empty() {
@@ -3312,6 +3381,7 @@ impl DashboardState {
 fn partition_sessions<'a>(
     sessions: impl IntoIterator<Item = &'a SessionRecord>,
     session_details: &BTreeMap<String, SessionDetail>,
+    order: SessionOrder,
 ) -> (Vec<&'a SessionRecord>, Vec<&'a SessionRecord>) {
     let mut active = Vec::new();
     let mut archived = Vec::new();
@@ -3322,22 +3392,30 @@ fn partition_sessions<'a>(
             archived.push(session);
         }
     }
-    active.sort_by(|left, right| {
-        let last_agent_text_at = |session: &SessionRecord| {
-            session_details
-                .get(&session.id)
-                .and_then(|detail| detail.last_agent_text_at)
-        };
-        last_agent_text_at(right)
-            .cmp(&last_agent_text_at(left))
+    let timestamp = |session: &SessionRecord| match order {
+        SessionOrder::Added => session_timestamp(&session.created_at),
+        SessionOrder::RecentActivity => session_details
+            .get(&session.id)
+            .and_then(|detail| detail.last_activity_at)
+            .map(|timestamp| timestamp as i64)
+            .into_iter()
+            .chain(session_timestamp(&session.updated_at))
+            .max(),
+    };
+    let sort = |left: &&SessionRecord, right: &&SessionRecord| {
+        timestamp(right)
+            .cmp(&timestamp(left))
             .then_with(|| left.id.cmp(&right.id))
-    });
-    archived.sort_by(|left, right| {
-        checkpoint_time(right)
-            .cmp(&checkpoint_time(left))
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    };
+    active.sort_by(sort);
+    archived.sort_by(sort);
     (active, archived)
+}
+
+fn session_timestamp(timestamp: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|timestamp| timestamp.timestamp())
 }
 
 fn clamp_resources(cpus: u64, memory_bytes: u64, limits: Option<(u64, u64)>) -> (u64, u64) {
@@ -3467,13 +3545,6 @@ fn adjust_resources(
             }
         }
     }
-}
-
-fn checkpoint_time(session: &SessionRecord) -> Option<chrono::DateTime<chrono::FixedOffset>> {
-    session
-        .checkpoint
-        .as_ref()
-        .and_then(|checkpoint| chrono::DateTime::parse_from_rfc3339(&checkpoint.created_at).ok())
 }
 
 fn activity_from_adapter(payload: &serde_json::Value) -> Option<SessionActivity> {
@@ -3702,6 +3773,7 @@ fn render_adaptive_dashboard(
         let (active, archived) = partition_sessions(
             dashboard.state.sessions.values(),
             &dashboard.session_details,
+            dashboard.session_order,
         );
         (active.len(), archived.len())
     };
@@ -3828,6 +3900,7 @@ fn prepare_active_previews(
     let active_ids = partition_sessions(
         dashboard.state.sessions.values(),
         &dashboard.session_details,
+        dashboard.session_order,
     )
     .0
     .into_iter()
@@ -4208,6 +4281,7 @@ fn render_sessions(
     let (active, archived) = partition_sessions(
         dashboard.state.sessions.values(),
         &dashboard.session_details,
+        dashboard.session_order,
     );
     let now_epoch_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4268,7 +4342,7 @@ fn render_sessions(
                     active_area.width.saturating_sub(2),
                     1,
                 ),
-                Style::default().bg(Color::DarkGray).fg(Color::White),
+                Style::default().bg(Color::DarkGray).fg(Color::LightYellow),
             );
         }
         let preview_height = active_area
@@ -4293,7 +4367,11 @@ fn render_sessions(
     );
 
     let archived_rows = archived.iter().map(|session| {
-        archived_session_row(session, dashboard.session_operations.get(&session.id))
+        archived_session_row(
+            session,
+            &dashboard.config,
+            dashboard.session_operations.get(&session.id),
+        )
     });
     let archived_focused = dashboard.focus == Focus::Archived;
     let archived_table = Table::new(archived_rows, archived_session_column_constraints())
@@ -4375,8 +4453,9 @@ fn session_column_constraints() -> [Constraint; 6] {
     ]
 }
 
-fn archived_session_column_constraints() -> [Constraint; 4] {
+fn archived_session_column_constraints() -> [Constraint; 5] {
     [
+        Constraint::Length(18),
         Constraint::Length(14),
         Constraint::Length(15),
         Constraint::Length(7),
@@ -4390,14 +4469,14 @@ fn session_header() -> Row<'static> {
         "Turn clock",
         "Profile",
         "Target",
-        "Resources",
+        "Project",
         "Session name",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD))
 }
 
 fn archived_session_header() -> Row<'static> {
-    Row::new(["Profile", "Archived", "Archive", "Session name"])
+    Row::new(["Project", "Profile", "Archived", "Archive", "Session name"])
         .style(Style::default().add_modifier(Modifier::BOLD))
 }
 
@@ -4426,11 +4505,8 @@ fn session_values(
     (
         clock,
         session.last_profile.clone(),
-        session_target(config, session),
-        detail
-            .and_then(|detail| detail.resource_usage.as_ref())
-            .map(resource_summary)
-            .unwrap_or_else(|| "—".into()),
+        session.target_template_id.clone(),
+        session_project(config, session),
         session_name(session).to_string(),
     )
 }
@@ -4443,39 +4519,29 @@ fn session_updated_at_epoch_seconds(session: &SessionRecord) -> Option<u64> {
         .ok()
 }
 
-fn session_target(config: &HelConfig, session: &SessionRecord) -> String {
-    let Some(bundle) = config.bundles.get(&session.bundle_id) else {
-        return session.target_template_id.clone();
-    };
-    let project_dirs = bundle
-        .repositories
-        .iter()
-        .map(|repository| repository.destination.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{}: {project_dirs}", session.target_template_id)
+fn session_project(config: &HelConfig, session: &SessionRecord) -> String {
+    if let Some(project_directory) = &session.project_directory {
+        return path_leaf(project_directory);
+    }
+    config
+        .bundles
+        .get(&session.bundle_id)
+        .and_then(|bundle| {
+            bundle
+                .repositories
+                .iter()
+                .find(|repository| repository.id == bundle.primary_repo)
+                .or_else(|| bundle.repositories.first())
+        })
+        .map(|repository| path_leaf(&repository.destination))
+        .unwrap_or_else(|| path_leaf(std::path::Path::new(&session.bundle_id)))
 }
 
-fn resource_summary(usage: &SessionResourceUsage) -> String {
-    let memory = match usage.memory_limit_bytes {
-        Some(limit) if limit > 0 => format!(
-            "M {}%",
-            u128::from(usage.memory_current_bytes) * 100 / u128::from(limit)
-        ),
-        _ => format!("M {}", format_resource_bytes(usage.memory_current_bytes)),
-    };
-    let mut resources = Vec::new();
-    if let Some(cpu) = usage.cpu_percent {
-        resources.push(format!("C {cpu}%"));
-    }
-    resources.push(memory);
-    if let Some(swap) = usage.swap_current_bytes.filter(|swap| *swap > 0) {
-        resources.push(format!("S {}", format_resource_bytes(swap)));
-    }
-    if let Some(disk) = usage.writable_disk_bytes {
-        resources.push(format!("D {}", format_resource_bytes(disk)));
-    }
-    resources.join(" · ")
+fn path_leaf(path: &std::path::Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn checkpoint_archive_size(session: &SessionRecord) -> String {
@@ -4515,7 +4581,7 @@ fn unread_line(unread_count: usize) -> Line<'static> {
         Line::from(Span::styled(
             format!("{unread_count} unread"),
             Style::default()
-                .fg(Color::Blue)
+                .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
         ))
     } else {
@@ -4572,12 +4638,14 @@ fn active_session_row(
             now_epoch_seconds,
         )),
     ])
+    .style(Style::default().fg(Color::LightYellow))
     .height(height)
     .top_margin(top_margin)
 }
 
 fn archived_session_row(
     session: &SessionRecord,
+    config: &HelConfig,
     operation: Option<&SessionOperationDisplay>,
 ) -> Row<'static> {
     let checkpoint = session
@@ -4586,6 +4654,7 @@ fn archived_session_row(
         .map(|checkpoint| checkpoint_time_display(&checkpoint.created_at))
         .unwrap_or_else(|| "never".into());
     Row::new([
+        session_project(config, session),
         session.last_profile.clone(),
         checkpoint,
         checkpoint_archive_size(session),
@@ -4891,7 +4960,10 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
-                format!("{accelerator} for: {actions}"),
+                format!(
+                    "s sort: {} · {accelerator} for: {actions}",
+                    dashboard.session_order.label()
+                ),
                 Style::default().fg(Color::DarkGray),
             ),
             Line::styled(
@@ -6437,7 +6509,11 @@ mod tests {
             ]),
             mount_history: BTreeMap::new(),
         };
-        let (active, archived) = partition_sessions(state.sessions.values(), &BTreeMap::new());
+        let (active, archived) = partition_sessions(
+            state.sessions.values(),
+            &BTreeMap::new(),
+            SessionOrder::Added,
+        );
         assert_eq!(
             active
                 .iter()
@@ -6471,19 +6547,22 @@ mod tests {
     }
 
     #[test]
-    fn archived_sessions_are_ordered_by_checkpoint_time_descending() {
+    fn sessions_are_ordered_by_creation_time_descending_by_default() {
         let mut oldest = archived_session();
         oldest.id = "session-z".into();
-        oldest.checkpoint.as_mut().unwrap().created_at = "2026-08-09T01:00:00Z".into();
+        oldest.created_at = "2026-08-09T01:00:00Z".into();
         let mut newest = archived_session();
         newest.id = "session-y".into();
-        newest.checkpoint.as_mut().unwrap().created_at = "2026-08-09T00:30:00-02:00".into();
-        let mut without_checkpoint = archived_session();
-        without_checkpoint.id = "session-a".into();
-        without_checkpoint.checkpoint = None;
+        newest.created_at = "2026-08-09T00:30:00-02:00".into();
+        let mut invalid_timestamp = archived_session();
+        invalid_timestamp.id = "session-a".into();
+        invalid_timestamp.created_at = "unknown".into();
 
-        let (_, archived) =
-            partition_sessions([&without_checkpoint, &oldest, &newest], &BTreeMap::new());
+        let (_, archived) = partition_sessions(
+            [&invalid_timestamp, &oldest, &newest],
+            &BTreeMap::new(),
+            SessionOrder::Added,
+        );
 
         assert_eq!(
             archived
@@ -6495,7 +6574,7 @@ mod tests {
     }
 
     #[test]
-    fn active_sessions_are_sorted_by_most_recent_agent_text() {
+    fn sort_hotkey_toggles_recent_activity_and_preserves_selection() {
         let active_session = |id: &str| {
             let mut session = archived_session();
             session.id = id.into();
@@ -6524,16 +6603,27 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
+        assert_eq!(dashboard.session_order, SessionOrder::Added);
+        assert_eq!(
+            ordered_ids(&dashboard),
+            ["session-a", "session-b", "session-c"]
+        );
+        dashboard.handle_key(key(KeyCode::Down));
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-b");
+
         dashboard.apply_worker_events(
             "session-b",
             &[adapter_text_event(1, "agent_message_chunk", "second")],
-            100,
+            2_000_000_100,
             false,
         );
+        dashboard.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(dashboard.session_order, SessionOrder::RecentActivity);
         assert_eq!(
             ordered_ids(&dashboard),
             ["session-b", "session-a", "session-c"]
         );
+        assert_eq!(dashboard.selected_session().unwrap().id, "session-b");
 
         dashboard.apply_worker_events(
             "session-c",
@@ -6542,20 +6632,27 @@ mod tests {
                 "agent_thought_chunk",
                 "later thought",
             )],
-            200,
+            2_000_000_200,
             false,
         );
         assert_eq!(
             ordered_ids(&dashboard),
-            ["session-b", "session-a", "session-c"]
+            ["session-c", "session-b", "session-a"]
         );
 
         dashboard.apply_worker_events(
             "session-a",
             &[adapter_text_event(1, "agent_message_chunk", "newest")],
-            300,
+            2_000_000_300,
             false,
         );
+        assert_eq!(
+            ordered_ids(&dashboard),
+            ["session-a", "session-c", "session-b"]
+        );
+
+        dashboard.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(dashboard.session_order, SessionOrder::Added);
         assert_eq!(
             ordered_ids(&dashboard),
             ["session-a", "session-b", "session-c"]
@@ -6575,7 +6672,7 @@ mod tests {
                     }),
                 },
             }],
-            400,
+            2_000_000_400,
             false,
         );
         assert_eq!(
@@ -6609,7 +6706,7 @@ mod tests {
         assert_eq!(
             badge.spans[0].style,
             Style::default()
-                .fg(Color::Blue)
+                .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD)
         );
 
@@ -6714,11 +6811,19 @@ mod tests {
         let profile_start = header.find("Profile").unwrap();
         assert!(profile_start.saturating_sub(clock_end) >= 2);
 
-        let status = lines
+        let status_y = lines
             .iter()
-            .find(|line| line.contains("1 unread") && line.contains("codex-1"))
+            .position(|line| line.contains("1 unread") && line.contains("codex-1"))
             .expect("active status row");
+        let status = &lines[status_y];
         assert!(status.find("1 unread") < status.find("codex-1"));
+        let buffer = terminal.backend().buffer();
+        let status_y = buffer.area.y + status_y as u16;
+        assert!(
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .filter(|x| !buffer[(*x, status_y)].symbol().trim().is_empty())
+                .all(|x| buffer[(x, status_y)].fg == Color::LightYellow)
+        );
     }
 
     #[test]
@@ -8411,8 +8516,9 @@ mod tests {
         assert!(rendered.contains("Profile"));
         assert!(rendered.contains("Target"));
         assert!(!rendered.contains("Checkpoint"));
-        assert!(rendered.contains("Resources"));
-        assert!(rendered.contains("C 37% · M 50%"));
+        assert!(rendered.contains("Project"));
+        assert!(rendered.contains("hel"));
+        assert!(!rendered.contains("C 37% · M 50%"));
         assert!(!rendered.contains("S 4.0K · D 8.0K"));
         assert!(rendered.contains("Session name"));
         assert!(rendered.contains("ACP pretty name"));
@@ -8492,6 +8598,11 @@ mod tests {
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .all(|x| buffer[(x, info_y)].bg == Color::DarkGray)
+        );
+        assert!(
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .filter(|x| !buffer[(*x, info_y)].symbol().trim().is_empty())
+                .all(|x| buffer[(x, info_y)].fg == Color::LightYellow)
         );
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
@@ -8640,7 +8751,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_sessions_omit_turn_clock_and_target_columns() {
+    fn archived_sessions_omit_turn_clock_and_target_infrastructure() {
         let mut dashboard = dashboard_with_session(archived_session());
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -8656,6 +8767,8 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(rendered.matches("Turn clock").count(), 1);
+        assert!(rendered.contains("Project"));
+        assert!(rendered.contains("hel"));
         assert!(!rendered.contains("podman: hel"));
         assert!(rendered.contains("26-08-09 01:00"));
         assert!(!rendered.contains("2026-08-09T01:00:00Z"));
@@ -8685,11 +8798,13 @@ mod tests {
         let header = lines
             .iter()
             .find(|line| {
-                line.contains("Profile")
+                line.contains("Project")
+                    && line.contains("Profile")
                     && line.contains("Archived")
                     && line.contains("Session name")
             })
             .expect("archived header");
+        let project = header.find("Project").unwrap();
         let profile = header.find("Profile").unwrap();
         let archived = header.find("Archived").unwrap();
         let archive = header[archived + "Archived".len()..]
@@ -8698,10 +8813,34 @@ mod tests {
             .unwrap();
         let session_name = header.find("Session name").unwrap();
 
+        assert_eq!(profile - project, 19);
         assert_eq!(archived - profile, 15);
         assert_eq!(archive - archived, 16);
         assert_eq!(session_name - archive, 8);
         assert!(lines.iter().any(|line| line.contains(long_name)));
+    }
+
+    #[test]
+    fn project_uses_primary_bundle_leaf_or_raw_directory_leaf() {
+        let mut config = config();
+        config
+            .bundles
+            .get_mut("hel")
+            .unwrap()
+            .repositories
+            .push(ProjectRepository {
+                id: "docs".into(),
+                github: Some("BrokkAi/docs".into()),
+                local: None,
+                destination: PathBuf::from("documentation"),
+                git_ref: None,
+            });
+        let mut session = archived_session();
+
+        assert_eq!(session_project(&config, &session), "hel");
+
+        session.project_directory = Some(PathBuf::from("/home/user/Projects/raw-project"));
+        assert_eq!(session_project(&config, &session), "raw-project");
     }
 
     #[test]
@@ -8761,7 +8900,7 @@ mod tests {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let detail = SessionDetail {
-            last_agent_text_at: Some(1_000),
+            last_activity_at: Some(1_000),
             ..SessionDetail::default()
         };
 
@@ -8862,7 +9001,7 @@ mod tests {
     }
 
     #[test]
-    fn target_cell_combines_infrastructure_and_project_directories() {
+    fn active_target_and_project_are_separate_cells() {
         let mut config = config();
         config
             .bundles
@@ -8877,10 +9016,10 @@ mod tests {
                 git_ref: None,
             });
 
-        assert_eq!(
-            session_target(&config, &archived_session()),
-            "podman: hel, anvil"
-        );
+        let (_, _, target, project, _) =
+            session_values(&archived_session(), None, None, 0, &config);
+        assert_eq!(target, "podman");
+        assert_eq!(project, "hel");
     }
 
     #[test]

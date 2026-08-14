@@ -461,6 +461,7 @@ pub struct ChatState {
     history_search: Option<HistorySearch>,
     queued_prompts: VecDeque<QueuedPrompt>,
     recovery_busy: bool,
+    goal_prompt_active: bool,
     agent_commands: Vec<AvailableCommand>,
     command_choices: Vec<CommandChoice>,
     model_values: Vec<ConfigValueChoice>,
@@ -497,6 +498,10 @@ impl ChatState {
             history_search: None,
             queued_prompts: VecDeque::new(),
             recovery_busy: false,
+            goal_prompt_active: snapshot
+                .active_prompt
+                .as_ref()
+                .is_some_and(|prompt| is_goal_prompt(&prompt.text)),
             agent_commands: Vec::new(),
             command_choices: builtin_command_choices(),
             model_values: Vec::new(),
@@ -559,6 +564,19 @@ impl ChatState {
         self.latest_seq
     }
 
+    fn mark_prompt_submitted(&mut self, prompt: &str) {
+        self.phase = WorkerPhase::Running;
+        self.goal_prompt_active = is_goal_prompt(prompt);
+        self.notice = None;
+    }
+
+    fn pursuing_goal(&self) -> bool {
+        self.goal_prompt_active
+            && self
+                .agent_commands
+                .iter()
+                .any(|command| command.name == "goal")
+    }
     pub fn entries(&self) -> &[ChatEntry] {
         &self.entries
     }
@@ -599,8 +617,6 @@ impl ChatState {
     }
 
     fn reset_interaction(&mut self) {
-        self.input.clear();
-        self.input_cursor = 0;
         self.prompt_history.clear();
         self.history_index = None;
         self.history_draft.clear();
@@ -1539,7 +1555,7 @@ impl ChatState {
     fn apply_event(&mut self, event: &SequencedEvent) {
         match &event.event {
             WorkerEvent::PromptAccepted { text, .. } => {
-                self.phase = WorkerPhase::Running;
+                self.mark_prompt_submitted(text);
                 self.record_accepted_prompt(event.seq, text);
                 self.entries.push(
                     ChatEntry::plain(event.seq, ChatRole::User, text)
@@ -1548,6 +1564,7 @@ impl ChatState {
             }
             WorkerEvent::TurnCompleted => {
                 self.phase = WorkerPhase::Idle;
+                self.goal_prompt_active = false;
             }
             // The durable worker records cancellation acceptance before the
             // ACP prompt future resolves. Keep the chat busy until the later
@@ -1816,7 +1833,9 @@ fn normalize_key(code: KeyCode, mut modifiers: KeyModifiers) -> (KeyCode, KeyMod
     }
     if character.is_ascii_uppercase() {
         modifiers.insert(KeyModifiers::SHIFT);
-        return (KeyCode::Char(character.to_ascii_lowercase()), modifiers);
+        if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) {
+            return (KeyCode::Char(character.to_ascii_lowercase()), modifiers);
+        }
     }
     (code, modifiers)
 }
@@ -1891,6 +1910,12 @@ fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> {
         _ => return None,
     };
     Some((command, args))
+}
+
+fn is_goal_prompt(prompt: &str) -> bool {
+    prompt
+        .strip_prefix("/goal")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
 fn find_config_option<'a>(
@@ -2340,11 +2365,12 @@ fn prompt_title(chat: &ChatState, queued: usize) -> String {
     .map(str::to_owned)
     .collect::<Vec<_>>();
     if chat.recovery_busy {
-        parts.push("Saving recovery copy…".into());
+        parts.push("Saving checkpoint…".into());
         parts.push(format!("{queued} queued"));
     } else {
         match chat.phase {
             WorkerPhase::Idle => parts.push("Prompt".into()),
+            WorkerPhase::Running if chat.pursuing_goal() => parts.push("Pursuing goal".into()),
             WorkerPhase::Running => parts.push("Running".into()),
             WorkerPhase::Closing => parts.push("Closing".into()),
             WorkerPhase::Closed => parts.push("Closed".into()),
@@ -3175,7 +3201,8 @@ mod tests {
 
         assert_eq!(chat.entries.len(), 1);
         assert!(chat.render_cache.entries[0].is_some());
-        assert!(chat.input.is_empty());
+        assert_eq!(chat.input, "draft");
+        assert_eq!(chat.input_cursor, "draft".len());
         assert!(chat.prompt_history.is_empty());
         assert!(chat.queued_prompts.is_empty());
         assert_eq!(chat.scroll_top, 0);
@@ -3283,6 +3310,17 @@ mod tests {
             ChatAction::Prompt("first\nsecond\nthird".into())
         );
         assert!(chat.queued_prompts.is_empty());
+    }
+
+    #[test]
+    fn submitting_a_prompt_clears_a_stale_queue_notice() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_notice("Queued 1: next");
+
+        chat.mark_prompt_submitted("hello");
+
+        assert_eq!(chat.phase, WorkerPhase::Running);
+        assert!(chat.notice.is_none());
     }
 
     #[test]
@@ -3438,6 +3476,63 @@ mod tests {
         assert!(rendered.contains("gpt-5.6-sol · high · Running · Esc cancels"));
         assert!(!rendered.contains("HEL /"));
         assert_ne!(buffer[(buffer.area.x, buffer.area.y)].symbol(), "┌");
+    }
+
+    #[test]
+    fn composer_title_identifies_an_active_advertised_goal() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.apply_session_update(
+            1,
+            &serde_json::json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {"name": "goal", "description": "set a persistent goal"}
+                ]
+            }),
+        );
+        chat.apply_event(&SequencedEvent {
+            seq: 2,
+            recorded_at_ms: None,
+            request_id: Some("goal".into()),
+            event: WorkerEvent::PromptAccepted {
+                request_id: "goal".into(),
+                text: "/goal ship the release".into(),
+                attachments: Vec::new(),
+            },
+        });
+
+        assert!(prompt_title(&chat, 0).contains("Pursuing goal"));
+        assert!(!prompt_title(&chat, 0).contains("Running"));
+
+        chat.apply_event(&SequencedEvent {
+            seq: 3,
+            recorded_at_ms: None,
+            request_id: None,
+            event: WorkerEvent::TurnCompleted,
+        });
+        assert!(prompt_title(&chat, 0).contains("Prompt"));
+        assert!(!prompt_title(&chat, 0).contains("Pursuing goal"));
+    }
+
+    #[test]
+    fn composer_title_does_not_label_ordinary_or_unadvertised_prompts_as_goals() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.mark_prompt_submitted("/goal ship the release");
+        assert!(prompt_title(&chat, 0).contains("Running"));
+        assert!(!prompt_title(&chat, 0).contains("Pursuing goal"));
+
+        chat.apply_session_update(
+            1,
+            &serde_json::json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {"name": "goal", "description": "set a persistent goal"}
+                ]
+            }),
+        );
+        chat.mark_prompt_submitted("please ship the release");
+        assert!(prompt_title(&chat, 0).contains("Running"));
+        assert!(!prompt_title(&chat, 0).contains("Pursuing goal"));
     }
 
     #[test]
@@ -3642,6 +3737,27 @@ mod tests {
         assert_eq!(chat.input, "remember me");
         chat.handle_key(key(KeyCode::Down));
         assert!(chat.input.is_empty());
+    }
+
+    #[test]
+    fn editor_preserves_uppercase_text_while_shortcuts_remain_case_insensitive() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+
+        chat.handle_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT));
+        // Some terminals report the uppercase character without a Shift modifier.
+        chat.handle_key(key(KeyCode::Char('I')));
+        assert_eq!(chat.input, "HI");
+
+        chat.handle_key(ctrl('r'));
+        chat.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+        assert_eq!(chat.history_search.as_ref().unwrap().query, "N");
+        chat.handle_key(key(KeyCode::Esc));
+
+        chat.handle_key(KeyEvent::new(
+            KeyCode::Char('T'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(chat.render_mode, TranscriptRenderMode::Raw);
     }
 
     #[test]

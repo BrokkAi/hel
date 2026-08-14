@@ -65,7 +65,8 @@ Claude advertises both with a compatible recent adapter, and Kimi Code
 advertises `/plan` but not `/goal` in compatible releases. Older or custom
 adapter executables may expose fewer commands. The interactive autocomplete is
 the source of truth for the active session; Hel does not emulate a missing
-command or expose the adapters' general permission modes.
+command or expose the adapters' general permission modes. While an advertised
+`/goal` request is active, the prompt composer title shows `Pursuing goal`.
 
 ## Keyboard basics
 
