@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::hel_config::{HarnessKind, data_dir};
 use crate::hel_state::{
@@ -303,6 +303,106 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
 
 pub fn save_state(state: &HelState) -> Result<()> {
     save_state_to(&database_path(), state)
+}
+
+/// Persist one operational session without rewriting unrelated controller
+/// state. Dashboard lifecycle jobs use this path so independent jobs can
+/// commit concurrently without restoring stale copies of other sessions.
+pub fn save_session(session: &SessionRecord) -> Result<()> {
+    save_session_to(&database_path(), session)
+}
+
+fn save_session_to(path: &Path, session: &SessionRecord) -> Result<()> {
+    let mut validation = HelState::default();
+    validation
+        .sessions
+        .insert(session.id.clone(), session.clone());
+    validation.validate()?;
+
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(existing_bundle) = tx
+        .query_row(
+            "SELECT bundle_id FROM session_contexts WHERE session_id = ?1",
+            [session.id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        && existing_bundle != session.bundle_id
+    {
+        bail!(
+            "session {} was already associated with bundle {}, not {}",
+            session.id,
+            existing_bundle,
+            session.bundle_id
+        );
+    }
+    tx.execute(
+        "DELETE FROM sessions WHERE session_id = ?1",
+        [session.id.as_str()],
+    )?;
+    insert_session(&tx, session)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Remove one operational session while retaining its relational history
+/// context and prompt history.
+pub fn delete_session(session_id: &str) -> Result<()> {
+    let connection = open(&database_path())?;
+    connection.execute("DELETE FROM sessions WHERE session_id = ?1", [session_id])?;
+    Ok(())
+}
+
+/// Atomically apply the controller's MRU policy for newly used mount sources.
+pub fn remember_mount_sources(host: &str, mounts: &[AdditionalMount]) -> Result<()> {
+    if mounts.is_empty() {
+        return Ok(());
+    }
+    remember_sources(
+        &database_path(),
+        host,
+        mounts.iter().map(|mount| mount.source.clone()),
+    )
+}
+
+pub fn remember_project_directory(host: &str, directory: &Path) -> Result<()> {
+    remember_sources(
+        &database_path(),
+        &format!("project:{host}"),
+        std::iter::once(directory.to_path_buf()),
+    )
+}
+
+fn remember_sources(
+    path: &Path,
+    host: &str,
+    new_sources: impl IntoIterator<Item = PathBuf>,
+) -> Result<()> {
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut sources = {
+        let mut statement =
+            tx.prepare("SELECT source FROM mount_history WHERE host = ?1 ORDER BY ordinal")?;
+        statement
+            .query_map([host], |row| Ok(blob_to_path(row.get_ref(0)?.as_blob()?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let additions = new_sources.into_iter().collect::<Vec<_>>();
+    for source in additions.iter().rev() {
+        sources.retain(|existing| existing != source);
+        sources.insert(0, source.clone());
+    }
+    sources.truncate(20);
+    tx.execute("DELETE FROM mount_history WHERE host = ?1", [host])?;
+    for (ordinal, source) in sources.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO mount_history(host, source, ordinal) VALUES (?1, ?2, ?3)",
+            params![host, path_to_blob(source), ordinal as i64],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 pub fn record_recovery_success(
@@ -1115,6 +1215,43 @@ mod tests {
             .query_row("SELECT count(*) FROM prompt_history", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn independent_session_writes_preserve_both_updates() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        save_session_to(&database, &session("session-1", "project-1")).unwrap();
+        save_session_to(&database, &session("session-2", "project-2")).unwrap();
+
+        let first_database = database.clone();
+        let first = std::thread::spawn(move || {
+            let mut record = session("session-1", "project-1");
+            record.session_title_override = Some("first changed".into());
+            save_session_to(&first_database, &record).unwrap();
+        });
+        let second_database = database.clone();
+        let second = std::thread::spawn(move || {
+            let mut record = session("session-2", "project-2");
+            record.session_title_override = Some("second changed".into());
+            save_session_to(&second_database, &record).unwrap();
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let state = load_state_from(&database).unwrap();
+        assert_eq!(
+            state.sessions["session-1"]
+                .session_title_override
+                .as_deref(),
+            Some("first changed")
+        );
+        assert_eq!(
+            state.sessions["session-2"]
+                .session_title_override
+                .as_deref(),
+            Some("second changed")
+        );
     }
 
     #[test]

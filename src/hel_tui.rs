@@ -74,6 +74,9 @@ pub enum DashboardAction {
         resource_allocation: Option<SessionResourceAllocation>,
         discard_queue: bool,
     },
+    CancelOperation {
+        session_id: String,
+    },
     ResolveAwsResourceOptions {
         target_template_ids: Vec<String>,
     },
@@ -110,6 +113,38 @@ pub enum DashboardAction {
     },
     OpenConfig,
     QuitDetach,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOperationKind {
+    Launching,
+    Resuming,
+    Pausing,
+    Destroying,
+    Deleting,
+    Connecting,
+    Importing,
+}
+
+impl SessionOperationKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Launching => "Launching",
+            Self::Resuming => "Resuming",
+            Self::Pausing => "Pausing",
+            Self::Destroying => "Destroying",
+            Self::Deleting => "Deleting",
+            Self::Connecting => "Connecting",
+            Self::Importing => "Importing",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SessionOperationDisplay {
+    kind: SessionOperationKind,
+    started_at_epoch_seconds: u64,
+    placeholder: Option<SessionRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -532,6 +567,7 @@ pub struct DashboardState {
     quotas: BTreeMap<String, ProfileQuota>,
     quota_refreshing: BTreeSet<String>,
     session_details: BTreeMap<String, SessionDetail>,
+    session_operations: BTreeMap<String, SessionOperationDisplay>,
     capacity_details: BTreeMap<String, CapacityDetail>,
     session_index: usize,
     capacity_index: usize,
@@ -552,6 +588,7 @@ impl DashboardState {
             quotas,
             quota_refreshing: BTreeSet::new(),
             session_details: BTreeMap::new(),
+            session_operations: BTreeMap::new(),
             capacity_details: BTreeMap::new(),
             session_index: 0,
             capacity_index: 0,
@@ -579,6 +616,7 @@ impl DashboardState {
 
     pub fn set_state(&mut self, state: HelState) {
         self.state = state;
+        self.apply_operation_projection();
         for (session_id, detail) in &mut self.session_details {
             let viewed_through = self
                 .state
@@ -590,6 +628,69 @@ impl DashboardState {
                 .retain(|seq| *seq > viewed_through);
         }
         self.clamp_selections();
+    }
+
+    pub fn begin_session_operation(
+        &mut self,
+        session_id: String,
+        kind: SessionOperationKind,
+        placeholder: Option<SessionRecord>,
+    ) {
+        self.session_operations.insert(
+            session_id,
+            SessionOperationDisplay {
+                kind,
+                started_at_epoch_seconds: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                placeholder,
+            },
+        );
+        self.apply_operation_projection();
+        self.clamp_selections();
+    }
+
+    pub fn rekey_session_operation(&mut self, previous: &str, session_id: String) {
+        if let Some(mut operation) = self.session_operations.remove(previous) {
+            operation.placeholder = None;
+            self.session_operations.insert(session_id, operation);
+        }
+        self.apply_operation_projection();
+        self.clamp_selections();
+    }
+
+    pub fn finish_session_operation(&mut self, session_id: &str) {
+        self.session_operations.remove(session_id);
+        if self
+            .state
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.id.starts_with("pending-"))
+        {
+            self.state.sessions.remove(session_id);
+        }
+        self.clamp_selections();
+    }
+
+    fn apply_operation_projection(&mut self) {
+        for (session_id, operation) in &self.session_operations {
+            if let Some(placeholder) = &operation.placeholder {
+                self.state
+                    .sessions
+                    .entry(session_id.clone())
+                    .or_insert_with(|| placeholder.clone());
+            }
+            if matches!(
+                operation.kind,
+                SessionOperationKind::Launching
+                    | SessionOperationKind::Resuming
+                    | SessionOperationKind::Importing
+            ) && let Some(session) = self.state.sessions.get_mut(session_id)
+            {
+                session.state = SessionState::Provisioning;
+            }
+        }
     }
 
     pub fn select_active_session(&mut self, session_id: &str) {
@@ -1144,12 +1245,24 @@ impl DashboardState {
                 DashboardAction::None
             }
             (KeyCode::Char('n'), true) => self.begin_new(),
+            (KeyCode::Char('x'), true) => {
+                let session_id = self.selected_session().and_then(|session| {
+                    self.session_operations
+                        .contains_key(&session.id)
+                        .then(|| session.id.clone())
+                });
+                session_id.map_or(DashboardAction::None, |session_id| {
+                    DashboardAction::CancelOperation { session_id }
+                })
+            }
             (KeyCode::Char('i') | KeyCode::Char('t'), true) => DashboardAction::OpenImport,
             (KeyCode::Char('r'), true) => {
                 if self.focus == Focus::Quotas {
                     DashboardAction::RefreshQuotas
                 } else if matches!(self.focus, Focus::Active | Focus::Archived) {
-                    self.begin_rename();
+                    if !self.reject_selected_operation() {
+                        self.begin_rename();
+                    }
                     DashboardAction::None
                 } else {
                     DashboardAction::None
@@ -1158,6 +1271,9 @@ impl DashboardState {
             (KeyCode::Char('u'), true) => DashboardAction::RefreshQuotas,
             (KeyCode::Char('e'), true) if self.config_is_empty() => DashboardAction::OpenConfig,
             (KeyCode::Char('p'), true) if self.focus == Focus::Active => {
+                if self.reject_selected_operation() {
+                    return DashboardAction::None;
+                }
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(Confirmation::Close {
                         session_id: session.id.clone(),
@@ -1166,6 +1282,9 @@ impl DashboardState {
                 DashboardAction::None
             }
             (KeyCode::Char('d'), true) | (KeyCode::Delete, _) if self.focus == Focus::Archived => {
+                if self.reject_selected_operation() {
+                    return DashboardAction::None;
+                }
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(Confirmation::DeleteArchived {
                         session_id: session.id.clone(),
@@ -1174,6 +1293,9 @@ impl DashboardState {
                 DashboardAction::None
             }
             (KeyCode::Char('d'), true) | (KeyCode::Delete, _) if self.focus == Focus::Active => {
+                if self.reject_selected_operation() {
+                    return DashboardAction::None;
+                }
                 if let Some(session) = self.selected_session() {
                     let session_id = session.id.clone();
                     let has_assistant_messages =
@@ -1369,6 +1491,23 @@ impl DashboardState {
                 .cloned()
                 .unwrap_or_default(),
         });
+    }
+
+    fn reject_selected_operation(&mut self) -> bool {
+        let operation = self.selected_session().and_then(|session| {
+            self.session_operations
+                .get(&session.id)
+                .map(|operation| operation.kind)
+        });
+        if let Some(operation) = operation {
+            self.notice = Some(format!(
+                "{} is in progress; press Ctrl+X to cancel it.",
+                operation.label()
+            ));
+            true
+        } else {
+            false
+        }
     }
 
     fn handle_rename_key(&mut self, code: KeyCode, mut editor: RenameEditor) -> DashboardAction {
@@ -2963,6 +3102,13 @@ impl DashboardState {
         let Some(session) = self.selected_session() else {
             return DashboardAction::None;
         };
+        if let Some(operation) = self.session_operations.get(&session.id) {
+            self.notice = Some(format!(
+                "{} is in progress; press Ctrl+X to cancel it.",
+                operation.kind.label()
+            ));
+            return DashboardAction::None;
+        }
         if session.state == SessionState::Error {
             if session.checkpoint.is_some() {
                 return self.begin_resume();
@@ -4077,6 +4223,7 @@ fn render_sessions(
                 active_session_row(
                     session,
                     dashboard.session_details.get(&session.id),
+                    dashboard.session_operations.get(&session.id),
                     now_epoch_seconds,
                     &dashboard.config,
                     preview.len() as u16 + 1,
@@ -4145,7 +4292,9 @@ fn render_sessions(
         visible_sessions,
     );
 
-    let archived_rows = archived.iter().map(|session| archived_session_row(session));
+    let archived_rows = archived.iter().map(|session| {
+        archived_session_row(session, dashboard.session_operations.get(&session.id))
+    });
     let archived_focused = dashboard.focus == Focus::Archived;
     let archived_table = Table::new(archived_rows, archived_session_column_constraints())
         .header(archived_session_header())
@@ -4255,10 +4404,17 @@ fn archived_session_header() -> Row<'static> {
 fn session_values(
     session: &SessionRecord,
     detail: Option<&SessionDetail>,
+    operation: Option<&SessionOperationDisplay>,
     now_epoch_seconds: u64,
     config: &HelConfig,
 ) -> (String, String, String, String, String) {
-    let clock = if session.state == SessionState::Provisioning {
+    let clock = if let Some(operation) = operation {
+        format!(
+            "{} {}s",
+            operation.kind.label(),
+            now_epoch_seconds.saturating_sub(operation.started_at_epoch_seconds)
+        )
+    } else if session.state == SessionState::Provisioning {
         let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
         format!("Launch {}s", now_epoch_seconds.saturating_sub(started_at))
     } else {
@@ -4395,13 +4551,14 @@ fn active_transcript_tail(
 fn active_session_row(
     session: &SessionRecord,
     detail: Option<&SessionDetail>,
+    operation: Option<&SessionOperationDisplay>,
     now_epoch_seconds: u64,
     config: &HelConfig,
     height: u16,
     top_margin: u16,
 ) -> Row<'static> {
     let (clock, profile, target, resources, session_name) =
-        session_values(session, detail, now_epoch_seconds, config);
+        session_values(session, detail, operation, now_epoch_seconds, config);
     let unread_count = detail.map_or(0, |detail| detail.unread_agent_message_sequences.len());
     Row::new([
         Cell::from(unread_line(unread_count)),
@@ -4419,7 +4576,10 @@ fn active_session_row(
     .top_margin(top_margin)
 }
 
-fn archived_session_row(session: &SessionRecord) -> Row<'static> {
+fn archived_session_row(
+    session: &SessionRecord,
+    operation: Option<&SessionOperationDisplay>,
+) -> Row<'static> {
     let checkpoint = session
         .checkpoint
         .as_ref()
@@ -4429,7 +4589,10 @@ fn archived_session_row(session: &SessionRecord) -> Row<'static> {
         session.last_profile.clone(),
         checkpoint,
         checkpoint_archive_size(session),
-        session_name(session).to_string(),
+        operation.map_or_else(
+            || session_name(session).to_string(),
+            |operation| format!("{}… {}", operation.kind.label(), session_name(session)),
+        ),
     ])
 }
 
@@ -5980,6 +6143,21 @@ mod tests {
             },
             BTreeMap::new(),
         )
+    }
+
+    #[test]
+    fn resume_is_projected_into_active_while_background_work_runs() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Resuming, None);
+
+        assert_eq!(
+            dashboard.state.sessions["session-1"].state,
+            SessionState::Provisioning
+        );
+        assert_eq!(
+            dashboard.session_operations["session-1"].kind,
+            SessionOperationKind::Resuming
+        );
     }
 
     #[test]
@@ -8587,7 +8765,7 @@ mod tests {
             ..SessionDetail::default()
         };
 
-        let (clock, _, _, _, _) = session_values(&session, Some(&detail), 1_480, &config());
+        let (clock, _, _, _, _) = session_values(&session, Some(&detail), None, 1_480, &config());
         assert_eq!(clock, "");
     }
 
@@ -8679,7 +8857,7 @@ mod tests {
         session.state = SessionState::Provisioning;
         session.updated_at = "1970-01-01T00:16:40Z".into();
 
-        let (clock, _, _, _, _) = session_values(&session, None, 1_012, &config());
+        let (clock, _, _, _, _) = session_values(&session, None, None, 1_012, &config());
         assert_eq!(clock, "Launch 12s");
     }
 

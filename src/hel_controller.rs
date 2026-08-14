@@ -28,8 +28,8 @@ use crate::hel_state::{
     TargetLocator, new_session_id, normalize_session_title,
 };
 use crate::hel_targets::{
-    self, AdditionalMount, AwsTemplate, CommandExecutor, CommandOutput, CommandSpec,
-    ContainerTemplate, ProcessExecutor, ProjectBundleSpec, RepositorySpec, SshTarget,
+    self, AdditionalMount, AwsTemplate, CancellableProcessExecutor, CommandExecutor, CommandOutput,
+    CommandSpec, ContainerTemplate, ProcessExecutor, ProjectBundleSpec, RepositorySpec, SshTarget,
 };
 use crate::hel_worker::{
     PROTOCOL_VERSION, RequestEnvelope, ResponseBody, ResponsePayload, VersionRange, WorkerEvent,
@@ -85,6 +85,12 @@ pub struct SessionLaunchOptions {
     pub allow_dirty_local: bool,
     pub resource_allocation: Option<SessionResourceAllocation>,
     pub project_directory: Option<PathBuf>,
+}
+
+pub struct SessionResumeOptions {
+    pub additional_mounts: Option<Vec<AdditionalMount>>,
+    pub resource_allocation: Option<SessionResourceAllocation>,
+    pub discard_queue: bool,
 }
 
 impl Controller {
@@ -214,6 +220,13 @@ impl Controller {
         Ok(())
     }
 
+    fn persist_session_state(&self, session_id: &str) -> Result<()> {
+        match self.state.sessions.get(session_id) {
+            Some(session) => crate::hel_database::save_session(session),
+            None => crate::hel_database::delete_session(session_id),
+        }
+    }
+
     /// Find managed resources which are not represented by the controller's
     /// current state. Labels/tags establish Hel ownership; the worker marker
     /// supplies profile and bundle metadata when it is available.
@@ -330,7 +343,7 @@ impl Controller {
         record.native_session_id = crate::hel_worker::recover_native_session_id(&bootstrap.events);
         record.acp_session_title = crate::hel_state::harness_session_title(&bootstrap.events);
         self.state.sessions.insert(session_id.to_owned(), record);
-        self.state.save()
+        self.persist_session_state(session_id)
     }
 
     pub fn destroy_orphan_worker(
@@ -609,26 +622,29 @@ impl Controller {
         if let Some(host) = mount_history_host(template) {
             self.state.remember_mount_sources(&host, &additional_mounts);
         }
-        self.state.save()?;
+        self.persist_session_state(&id)?;
+        if let Some(host) = mount_history_host(template) {
+            crate::hel_database::remember_mount_sources(&host, &additional_mounts)?;
+        }
         Ok(id)
     }
 
     pub async fn provision_session(&mut self, session_id: &str) -> Result<()> {
-        let github_token = controller_github_token();
-        self.provision_session_with_github_token(
-            session_id,
-            &ProcessExecutor,
-            github_token.as_deref(),
-        )
-        .await?;
-        match self
-            .install_and_connect_worker(session_id, &ProcessExecutor)
+        self.provision_session_controlled(session_id, &ProcessExecutor)
             .await
-        {
+    }
+
+    pub async fn provision_session_controlled(
+        &mut self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+    ) -> Result<()> {
+        let github_token = controller_github_token();
+        self.provision_session_with_github_token(session_id, executor, github_token.as_deref())
+            .await?;
+        match self.install_and_connect_worker(session_id, executor).await {
             Ok(native_session_id) => self.mark_worker_connected(session_id, native_session_id),
-            Err(error) => {
-                Err(self.rollback_failed_new_session(session_id, error, &ProcessExecutor)?)
-            }
+            Err(error) => Err(self.rollback_failed_new_session(session_id, error, executor)?),
         }
     }
 
@@ -636,7 +652,7 @@ impl Controller {
         &mut self,
         session_id: &str,
         error: anyhow::Error,
-        executor: &impl CommandExecutor,
+        _executor: &impl CommandExecutor,
     ) -> Result<anyhow::Error> {
         let session = self
             .state
@@ -648,7 +664,11 @@ impl Controller {
             Some(locator) => (|| -> Result<()> {
                 let backend = backend_locator(locator, &session, &self.config)?;
                 hel_targets::close_plan(&backend, session_id)?
-                    .execute(executor)
+                    // Rollback must remain possible after the foreground
+                    // operation's cancellation token has been set.
+                    .execute(&CancellableProcessExecutor::with_timeout(
+                        Duration::from_secs(15),
+                    ))
                     .map(|_| ())
             })(),
             None => Ok(()),
@@ -668,7 +688,7 @@ impl Controller {
                 .err()
                 .map(|cleanup_error| format!("{cleanup_error:#}")),
         );
-        self.state.save()?;
+        self.persist_session_state(session_id)?;
         Ok(failure)
     }
 
@@ -681,7 +701,7 @@ impl Controller {
             .with_context(|| format!("unknown session {session_id}"))?;
         record.session_title_override = Some(title.clone());
         record.updated_at = now();
-        self.state.save()?;
+        self.persist_session_state(session_id)?;
         Ok(title)
     }
 
@@ -697,7 +717,7 @@ impl Controller {
             .with_context(|| format!("unknown session {session_id}"))?;
         if event_sequence > record.last_viewed_event_sequence {
             record.last_viewed_event_sequence = event_sequence;
-            self.state.save()?;
+            self.persist_session_state(session_id)?;
         }
         Ok(())
     }
@@ -810,9 +830,10 @@ impl Controller {
             };
             if let Some(host) = host {
                 self.state.remember_project_directory(host, &directory);
+                crate::hel_database::remember_project_directory(host, &directory)?;
             }
         }
-        self.state.save()?;
+        self.persist_session_state(session_id)?;
         result
     }
 
@@ -835,7 +856,7 @@ impl Controller {
         }
         session.updated_at = now();
         session.last_error = None;
-        self.state.save()
+        self.persist_session_state(session_id)
     }
 
     async fn install_and_connect_worker(
@@ -1305,6 +1326,33 @@ impl Controller {
         resource_allocation: Option<SessionResourceAllocation>,
         discard_queue: bool,
     ) -> Result<WorkerBootstrap> {
+        self.resume_session_controlled(
+            session_id,
+            profile_id,
+            target_id,
+            SessionResumeOptions {
+                additional_mounts,
+                resource_allocation,
+                discard_queue,
+            },
+            &ProcessExecutor,
+        )
+        .await
+    }
+
+    pub async fn resume_session_controlled(
+        &mut self,
+        session_id: &str,
+        profile_id: &str,
+        target_id: &str,
+        options: SessionResumeOptions,
+        executor: &(impl CommandExecutor + Sync),
+    ) -> Result<WorkerBootstrap> {
+        let SessionResumeOptions {
+            additional_mounts,
+            resource_allocation,
+            discard_queue,
+        } = options;
         let previous = self
             .state
             .sessions
@@ -1363,7 +1411,7 @@ impl Controller {
         {
             let backend = backend_locator(locator, &previous, &self.config)?;
             hel_targets::close_plan(&backend, session_id)?
-                .execute(&ProcessExecutor)
+                .execute(executor)
                 .context("clean up target from failed resume")?;
         }
         let same_harness = profile.kind == archive.manifest.session.harness_kind;
@@ -1395,18 +1443,19 @@ impl Controller {
         record.last_error = None;
         if let Some(host) = history_host {
             self.state.remember_mount_sources(&host, &history_mounts);
+            crate::hel_database::remember_mount_sources(&host, &history_mounts)?;
         }
-        self.state.save()?;
+        self.persist_session_state(session_id)?;
 
         let result = async {
             self.provision_session_with_github_token(
                 session_id,
-                &ProcessExecutor,
+                executor,
                 github_token.as_deref(),
             )
             .await?;
             let (backend, worker_root) =
-                self.prepare_worker_files(session_id, &ProcessExecutor, same_harness)?;
+                self.prepare_worker_files(session_id, executor, same_harness)?;
             let harness_home = target_profile_home(&backend, session_id, &profile);
             let workspace_root = if let Some(project_directory) = &previous.project_directory {
                 project_directory
@@ -1445,21 +1494,21 @@ impl Controller {
             let local_spec = staging.path().join("restore-spec.json");
             std::fs::write(&local_spec, serde_json::to_vec_pretty(&restore)?)?;
             upload_checkpoint_spec(
-                &ProcessExecutor,
+                executor,
                 &backend,
                 session_id,
                 &checkpoint.archive_path,
                 &remote_archive,
             )?;
             upload_checkpoint_spec(
-                &ProcessExecutor,
+                executor,
                 &backend,
                 session_id,
                 &local_spec,
                 &remote_spec,
             )?;
             execute_checked(
-                &ProcessExecutor,
+                executor,
                 restore_command(&backend, session_id, &remote_spec)?,
             )?;
             install_attached_resources(
@@ -1467,15 +1516,10 @@ impl Controller {
                 session_id,
                 &backend,
                 &worker_root,
-                &ProcessExecutor,
+                executor,
             )?;
-            self.connect_local_repositories(
-                session_id,
-                &backend,
-                &worker_root,
-                &ProcessExecutor,
-            )?;
-            start_worker(&ProcessExecutor, &backend, &worker_root)?;
+            self.connect_local_repositories(session_id, &backend, &worker_root, executor)?;
+            start_worker(executor, &backend, &worker_root)?;
             handshake_worker(&hel_targets::reconnect_plan(&backend, session_id)?.commands[0])
                 .await?;
             let spec = self.reconnect_command(session_id)?;
@@ -1531,9 +1575,7 @@ impl Controller {
         .await;
         match result {
             Ok(bootstrap) => Ok(bootstrap),
-            Err(error) => {
-                Err(self.rollback_failed_resume(session_id, &previous, error, &ProcessExecutor)?)
-            }
+            Err(error) => Err(self.rollback_failed_resume(session_id, &previous, error, executor)?),
         }
     }
 
@@ -1542,7 +1584,7 @@ impl Controller {
         session_id: &str,
         previous: &SessionRecord,
         error: anyhow::Error,
-        executor: &impl CommandExecutor,
+        _executor: &impl CommandExecutor,
     ) -> Result<anyhow::Error> {
         let current = self
             .state
@@ -1554,7 +1596,11 @@ impl Controller {
             Some(locator) => (|| -> Result<()> {
                 let backend = backend_locator(locator, &current, &self.config)?;
                 hel_targets::close_plan(&backend, session_id)?
-                    .execute(executor)
+                    // Use a fresh executor: cancellation applies to the
+                    // requested operation, not to its compensating cleanup.
+                    .execute(&CancellableProcessExecutor::with_timeout(
+                        Duration::from_secs(15),
+                    ))
                     .map(|_| ())
             })(),
             None => Ok(()),
@@ -1569,7 +1615,7 @@ impl Controller {
                 .err()
                 .map(|cleanup_error| format!("{cleanup_error:#}")),
         );
-        self.state.save()?;
+        self.persist_session_state(session_id)?;
         Ok(failure)
     }
 
@@ -1577,6 +1623,15 @@ impl Controller {
     /// target remains live. A failed export or transfer leaves the previous
     /// archive and target untouched.
     pub async fn checkpoint_session(&mut self, session_id: &str) -> Result<CheckpointMetadata> {
+        self.checkpoint_session_controlled(session_id, &ProcessExecutor)
+            .await
+    }
+
+    pub async fn checkpoint_session_controlled(
+        &mut self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+    ) -> Result<CheckpointMetadata> {
         let previous = self
             .state
             .sessions
@@ -1587,12 +1642,9 @@ impl Controller {
         record.state = SessionState::Checkpointing;
         record.updated_at = now();
         record.last_checkpoint_error = None;
-        self.state.save()?;
+        self.persist_session_state(session_id)?;
 
-        match self
-            .checkpoint_session_with(session_id, &ProcessExecutor)
-            .await
-        {
+        match self.checkpoint_session_with(session_id, executor).await {
             Ok(artifact) => {
                 let record = self.state.sessions.get_mut(session_id).unwrap();
                 record.state = SessionState::Running;
@@ -1601,7 +1653,7 @@ impl Controller {
                 record.updated_at = now();
                 record.last_error = None;
                 record.last_checkpoint_error = None;
-                self.state.save()?;
+                self.persist_session_state(session_id)?;
                 prune_replaced_checkpoint(previous.checkpoint.as_ref(), &artifact.metadata);
                 Ok(artifact.metadata)
             }
@@ -1614,7 +1666,7 @@ impl Controller {
                     };
                     record.updated_at = now();
                     record.last_checkpoint_error = Some(format!("{error:#}"));
-                    self.state.save()?;
+                    self.persist_session_state(session_id)?;
                 }
                 Err(error)
             }
@@ -1812,12 +1864,37 @@ impl Controller {
     /// Checkpoint, ask the harness to close, and only then tear down the exact
     /// provisioned target. Checkpoint failure is deliberately non-destructive.
     pub async fn close_session(&mut self, session_id: &str) -> Result<()> {
-        self.checkpoint_session(session_id).await?;
-        let spec = self.reconnect_command(session_id)?;
-        let mut client = WorkerClient::connect(&spec, session_id).await?;
-        client.close().await?;
-        client.detach().await?;
-        self.destroy_after_verified_checkpoint(session_id, &ProcessExecutor)
+        self.close_session_controlled(session_id, &ProcessExecutor)
+            .await
+    }
+
+    pub async fn close_session_controlled(
+        &mut self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+    ) -> Result<()> {
+        self.checkpoint_session_controlled(session_id, executor)
+            .await?;
+        let result = async {
+            let spec = self.reconnect_command(session_id)?;
+            let mut client = WorkerClient::connect(&spec, session_id).await?;
+            client.close().await?;
+            client.detach().await?;
+            self.destroy_after_verified_checkpoint(session_id, executor)
+        }
+        .await;
+        if let Err(error) = result {
+            if let Some(record) = self.state.sessions.get_mut(session_id) {
+                record.state = SessionState::Error;
+                record.updated_at = now();
+                record.last_error = Some(format!(
+                    "pause failed after recovery copy was saved: {error:#}"
+                ));
+                self.persist_session_state(session_id)?;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Execute cleanup only after the close state machine has installed a
@@ -1844,7 +1921,7 @@ impl Controller {
         record.target = None;
         record.updated_at = now();
         record.last_error = None;
-        self.state.save()
+        self.persist_session_state(session_id)
     }
 
     pub fn force_destroy(
@@ -1866,7 +1943,7 @@ impl Controller {
         record.state = SessionState::DestroyedWithDataLoss;
         record.target = None;
         record.updated_at = now();
-        self.state.save()
+        self.persist_session_state(session_id)
     }
 }
 

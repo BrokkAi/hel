@@ -9,6 +9,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -310,6 +313,187 @@ impl CommandExecutor for ProcessExecutor {
             copy.context("stream command input")?;
             flush.context("flush command input")?;
         }
+        Ok(CommandOutput {
+            status: status.code().unwrap_or(-1),
+            stdout,
+            stderr,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct CancellableProcessExecutor {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellableProcessExecutor {
+    pub fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self { cancelled }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn with_timeout(timeout: Duration) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let deadline = cancelled.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            deadline.store(true, Ordering::Release);
+        });
+        Self { cancelled }
+    }
+
+    fn check_cancelled(&self) -> Result<()> {
+        if self.is_cancelled() {
+            bail!("operation cancelled");
+        }
+        Ok(())
+    }
+}
+
+fn cancellable_command(command: &CommandSpec) -> Command {
+    let mut process = Command::new(&command.program);
+    process.args(&command.args).envs(&command.env);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        process.process_group(0);
+    }
+    process
+}
+
+fn terminate_cancellable_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // The child owns a fresh process group, so descendants such as an SSH or
+    // shell helper cannot keep its output pipes open after cancellation.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+impl CommandExecutor for CancellableProcessExecutor {
+    fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        self.check_cancelled()?;
+        let mut child = cancellable_command(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("run {} for {}", command.program, command.purpose))?;
+        let mut stdout = child.stdout.take().context("command stdout missing")?;
+        let mut stderr = child.stderr.take().context("command stderr missing")?;
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::io::copy(&mut stdout, &mut bytes).map(|_| bytes)
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::io::copy(&mut stderr, &mut bytes).map(|_| bytes)
+        });
+        let status = loop {
+            if self.is_cancelled() {
+                terminate_cancellable_child(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                bail!("operation cancelled while {}", command.purpose);
+            }
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("wait for {}", command.purpose))?
+            {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("command stdout reader panicked"))??;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("command stderr reader panicked"))??;
+        Ok(CommandOutput {
+            status: status.code().unwrap_or(-1),
+            stdout,
+            stderr,
+        })
+    }
+
+    fn execute_with_stdin(
+        &self,
+        command: &CommandSpec,
+        input: &mut dyn Read,
+    ) -> Result<CommandOutput> {
+        self.check_cancelled()?;
+        // Streamed transfers already isolate stdout/stderr reader threads.
+        // Checking before each input chunk makes large checkpoint copies
+        // cooperatively cancellable without changing the executor interface.
+        let mut child = cancellable_command(command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("run {} for {}", command.program, command.purpose))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("streamed command stdin missing")?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("streamed command stdout missing")?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .context("streamed command stderr missing")?;
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::io::copy(&mut stdout, &mut bytes).map(|_| bytes)
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::io::copy(&mut stderr, &mut bytes).map(|_| bytes)
+        });
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            self.check_cancelled().inspect_err(|_| {
+                terminate_cancellable_child(&mut child);
+            })?;
+            let count = input.read(&mut buffer).context("read command input")?;
+            if count == 0 {
+                break;
+            }
+            stdin
+                .write_all(&buffer[..count])
+                .context("stream command input")?;
+        }
+        stdin.flush().context("flush command input")?;
+        drop(stdin);
+        let status = loop {
+            if self.is_cancelled() {
+                terminate_cancellable_child(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                bail!("operation cancelled while {}", command.purpose);
+            }
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("wait for {}", command.purpose))?
+            {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("streamed command stdout reader panicked"))??;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("streamed command stderr reader panicked"))??;
         Ok(CommandOutput {
             status: status.code().unwrap_or(-1),
             stdout,
@@ -2584,6 +2768,25 @@ mod tests {
         };
         assert!(plan.execute(&executor).is_err());
         assert_eq!(executor.seen.borrow().len(), 2);
+    }
+
+    #[test]
+    fn cancellable_executor_terminates_a_running_process() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let executor = CancellableProcessExecutor::new(cancelled.clone());
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            cancelled.store(true, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        let error = executor
+            .execute(
+                &CommandSpec::new("sh", ["-c", "sleep 30"]).purpose("test cancellable process"),
+            )
+            .unwrap_err();
+        cancel.join().unwrap();
+        assert!(error.to_string().contains("operation cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

@@ -24,6 +24,14 @@ Stage and commit only the files that you changed. Do not run `git add -A`. Do no
 Continue when there is a clear next step toward the requested goal. Do not stop
 for unnecessary approval.
 
+The TUI and web control surfaces must never perform blocking I/O or long-running
+work on their event/render loops. Run filesystem scans, network calls, process
+execution, provisioning, checkpointing, imports, and similar work in supervised
+background tasks. Independent operations must be able to run concurrently.
+Represent in-flight work immediately in UI state, make it cancellable where the
+underlying operation permits rollback, and report background failures instead
+of dropping them. Quitting a UI must remain responsive while cleanup is bounded.
+
 Prefer behavior tests that prove the advertised interface. Do not add tests that
 only duplicate implementation lists or internal construction order.
 
