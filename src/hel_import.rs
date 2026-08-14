@@ -18,16 +18,18 @@ use crate::hel_archive::{
     ArchiveInput, BundleManifest, GitCollectionSpec, GitHistoryMode, GitSnapshotProgress,
     SystemGit, TargetManifest, collect_git_snapshot_with_progress, write_archive_atomic,
 };
+use crate::hel_chat::ChatState;
 use crate::hel_checkpoint::{collect_import_native_artifacts, collect_native_artifacts};
 use crate::hel_config::{
     HarnessKind, HelConfig, ProjectBundle, ProjectRepository, TargetTemplate, validate_id,
 };
+use crate::hel_projection::canonical_session_from_materialized;
 use crate::hel_setup::{GithubRepository, github_repository_from_origin};
 use crate::hel_state::{
     CheckpointMetadata, HelState, SessionRecord, SessionState, harness_session_title,
     new_session_id,
 };
-use crate::hel_worker::{SequencedEvent, WorkerEvent};
+use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeSessionSelection {
@@ -2154,8 +2156,8 @@ fn import_claude_session_inner(
         &source.native_session_id,
         false,
     )?;
-    let canonical_events = encode_events(&transcript.events)?;
     let session_id = new_session_id()?;
+    let canonical_session = canonical_import_session(&session_id, &transcript.events)?;
     let timestamp = timestamp();
     let profile_id = import_profile_id(config, profile_id, HarnessKind::Claude, claude_home)?;
     let target_id = default_import_target_id(config);
@@ -2175,7 +2177,7 @@ fn import_claude_session_inner(
                 created_at: timestamp.clone(),
                 checkpointed_at: timestamp.clone(),
                 hel_version: env!("CARGO_PKG_VERSION").into(),
-                worker_version: env!("CARGO_PKG_VERSION").into(),
+                relay_version: env!("CARGO_PKG_VERSION").into(),
                 adapter_version: "acp-v1".into(),
             },
             target: TargetManifest {
@@ -2187,7 +2189,7 @@ fn import_claude_session_inner(
                 id: bundle_id.to_owned(),
                 primary_repository: bundle.primary_repo.clone(),
             },
-            canonical_events,
+            canonical_session,
             native_artifacts,
             repositories,
         },
@@ -2202,7 +2204,7 @@ fn import_claude_session_inner(
         archive_path: archive_path.clone(),
         sha256: verified.archive_sha256,
         created_at: timestamp.clone(),
-        event_sequence: transcript.events.last().map_or(0, |event| event.seq),
+        event_frontier: transcript.events.last().map_or(0, |event| event.seq),
     };
     state.sessions.insert(
         session_id.clone(),
@@ -2223,7 +2225,7 @@ fn import_claude_session_inner(
             session_title_override,
             created_at: timestamp.clone(),
             updated_at: timestamp,
-            last_viewed_event_sequence: 0,
+            detached_after_event_ordinal: 0,
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: Some(checkpoint),
@@ -2387,8 +2389,8 @@ fn import_native_session(
     let repositories = collect_local_repositories(bundle, &targets.git_roots, control)?;
     let native_artifacts =
         collect_import_native_artifacts(harness, harness_home, native_session_id, source_path)?;
-    let canonical_events = encode_events(&transcript.events)?;
     let session_id = new_session_id()?;
+    let canonical_session = canonical_import_session(&session_id, &transcript.events)?;
     let timestamp = timestamp();
     let profile_id = import_profile_id(config, profile_id, harness, harness_home)?;
     let target_id = default_import_target_id(config);
@@ -2408,7 +2410,7 @@ fn import_native_session(
                 created_at: timestamp.clone(),
                 checkpointed_at: timestamp.clone(),
                 hel_version: env!("CARGO_PKG_VERSION").into(),
-                worker_version: env!("CARGO_PKG_VERSION").into(),
+                relay_version: env!("CARGO_PKG_VERSION").into(),
                 adapter_version: "acp-v1".into(),
             },
             target: TargetManifest {
@@ -2423,7 +2425,7 @@ fn import_native_session(
                 id: bundle_id.to_owned(),
                 primary_repository: bundle.primary_repo.clone(),
             },
-            canonical_events,
+            canonical_session,
             native_artifacts,
             repositories,
         },
@@ -2438,7 +2440,7 @@ fn import_native_session(
         archive_path: archive_path.clone(),
         sha256: verified.archive_sha256,
         created_at: timestamp.clone(),
-        event_sequence: transcript.events.last().map_or(0, |event| event.seq),
+        event_frontier: transcript.events.last().map_or(0, |event| event.seq),
     };
     state.sessions.insert(
         session_id.clone(),
@@ -2459,7 +2461,7 @@ fn import_native_session(
             session_title_override,
             created_at: timestamp.clone(),
             updated_at: timestamp,
-            last_viewed_event_sequence: 0,
+            detached_after_event_ordinal: 0,
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: Some(checkpoint),
@@ -2594,13 +2596,15 @@ fn collect_local_repositories(
         .collect()
 }
 
-fn encode_events(events: &[SequencedEvent]) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    for event in events {
-        serde_json::to_writer(&mut bytes, event)?;
-        bytes.push(b'\n');
-    }
-    Ok(bytes)
+fn canonical_import_session(
+    session_id: &str,
+    events: &[SequencedEvent],
+) -> Result<crate::hel_archive::CanonicalSessionSnapshot> {
+    let latest = events.last().map_or(0, |event| event.seq);
+    let snapshot = WorkerSnapshot::summary(session_id.to_owned(), WorkerPhase::Idle, latest);
+    let mut materialized = ChatState::new(&snapshot, events).materialized_session();
+    materialized.session_title = harness_session_title(events);
+    canonical_session_from_materialized(&materialized)
 }
 
 fn default_profile(config: &HelConfig, harness: HarnessKind, home: &Path) -> String {

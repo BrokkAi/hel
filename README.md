@@ -50,8 +50,9 @@ podman build --pull=always \
 ```
 
 The image includes Rust, Node 24, Git, GitHub CLI, the Codex ACP bridge, and the
-Claude ACP bridge. Hel copies its worker and the selected harness profile into
-each new container. Kimi Code uses Hel's official on-demand installer fallback.
+Claude ACP bridge. Hel copies its session relay and the selected harness profile
+into each new container. Kimi Code uses Hel's official on-demand installer
+fallback.
 
 Configure it as a target with:
 
@@ -75,7 +76,8 @@ local Codex, Claude Code, and Kimi Code homes, reports whether their credentials
 appear present, detects the current GitHub origin, recommends a usable local
 container runtime, writes the configuration after confirmation, and smoke-tests
 the selected image. `Ctrl+Q` or Esc detaches; it does not stop the target-side
-worker. `hel server` explicitly starts the authenticated phone controller. It
+session relay or ACP agent. `hel server` explicitly starts the authenticated
+phone controller. It
 binds only to loopback unless direct TLS is configured:
 
 ```console
@@ -87,9 +89,29 @@ The web dashboard lists every managed conversation and shows the latest four
 nonempty transcript lines for active sessions. Opening an active conversation
 shows a live feed (including thoughts, tools, and plans) and lets the viewer
 send prompts or remove queued prompts. Prompts are queued durably by the
-target-side worker, so they continue to run in order while the TUI is minimized,
+target-side relay, so they continue to run in order while the TUI is minimized,
 detached, or not running. Archiving preserves pending prompts in the recovery
 copy; resuming asks whether to start with that queue or discard it.
+
+Every session uses the same relay boundary, including raw localhost sessions.
+The relay owns the live ACP connection, unattended permission decisions, and a
+serial command queue; it does not own a dashboard database or rendered
+transcript. Controller processes may come and go. On attach they replay the
+durable ACP-domain event stream after their last committed ordinal and rolling
+digest, apply each event transactionally to the controller's SQLite projection,
+and only then acknowledge it. The target retains acknowledged events until a
+verified checkpoint covers them, making a detected projection desync repairable
+without retaining an infinite event history.
+
+One controller process owns a controller data store at a time, enforced by an
+OS-backed lock on that store. Restarting or moving the controller is supported;
+concurrent controllers sharing one projection database are not.
+
+Unread counts come from that logical projection: an agent message counts once
+when it receives content after the detach cursor, even if the stream began
+before detaching and regardless of how many chunks followed. Activity is a
+monotonic controller-side watermark derived while those same relay events are
+committed, not a separate relay-authored tag.
 
 The dashboard lists sessions in creation sequence. Press `s` to cycle through
 sequence, most-recent activity, and profile-then-sequence ordering; the current
@@ -257,7 +279,7 @@ unrestricted mode or auto-approve ACP permission requests there. Kimi's normal
 `auto` mode is its no-confirmation mode, so the dashboard displays a prominent
 warning before using Kimi on raw localhost.
 
-Raw-project checkpoints preserve Hel's event stream and native harness state,
+Raw-project checkpoints preserve Hel's materialized session and native harness state,
 but they do not back up the selected worktree. Resuming requires the same
 project path with a valid Git `HEAD`; Hel leaves that project untouched when
 closing the session.
@@ -300,15 +322,16 @@ monorepos, SSH targets, or AWS targets.
 
 ## Session recovery and archives
 
-After a completed turn, Hel automatically saves a recovery copy when the worker
+After a completed turn, Hel automatically saves a recovery copy when the relay
 is idle, the previous copy is at least ten minutes old, and the turn is not
 already covered. Reconnect replay is evaluated by the same policy; there is no
 separate startup checkpoint. Healthy recovery state stays out of the UI, while
 failures leave the session usable and surface a warning. Operators can force a
 copy with `hel checkpoint --session <id>`.
 
-Recovery archives are versioned ZIPs containing a manifest, a canonical event
-stream, allowlisted native harness artifacts, and the Git state needed to
+Recovery archives are versioned ZIPs containing a manifest, a canonical
+materialized session at an exact event frontier and digest, allowlisted native
+harness artifacts, and the Git state needed to
 rebuild disposable workspaces. Committed work is stored as the set of commits
 that no origin ref contains, where origin is either the configured remote or
 Hel's proxy to your local repository; staged, unstaged, and untracked changes
@@ -319,5 +342,9 @@ through the proxy, and a small bootstrap archive carries their uncommitted
 changes. Every payload is SHA-256 verified after the archive is atomically
 installed. Normal Pause refuses teardown if that verification fails; explicit
 force-destroy is the data-loss escape hatch.
+
+Relay protocol v1 and recovery-archive schema v2 are the compatibility floor
+for this design. Hel rejects the retired worker protocol and older checkpoint
+schemas instead of attempting a partial conversion.
 
 Hel is licensed under `GPL-3.0-only`.

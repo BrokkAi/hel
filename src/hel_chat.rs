@@ -2,14 +2,15 @@
 
 mod rendering;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    AvailableCommand, AvailableCommandInput, ContentBlock, EmbeddedResourceResource,
-    PlanEntryStatus, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOptions, SessionUpdate, ToolCallContent, ToolCallLocation, ToolCallStatus,
+    AvailableCommand, AvailableCommandInput, ContentBlock, ContentChunk, EmbeddedResourceResource,
+    Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionUpdate, TextContent, ToolCall,
+    ToolCallContent, ToolCallLocation, ToolCallStatus,
 };
 use anyhow::Result;
 use crossterm::event::{
@@ -23,14 +24,22 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::hel_acp::RuntimeEvent;
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
 use crate::hel_recovery::RecoveryContext;
-use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSnapshot};
-use crate::hel_worker_client::WorkerClient;
+use crate::hel_session_manager::{ManagedSessionHandle, new_command_id};
+use crate::hel_state::{
+    MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, TranscriptBody,
+    TranscriptItem,
+};
+use crate::hel_worker::{
+    RELAY_EVENT_GENESIS_DIGEST, RelayCommand, SequencedEvent, WorkerEvent, WorkerPhase,
+    WorkerSnapshot,
+};
 use rendering::{
     LogicalLine, TranscriptRenderMode, display_width, markdown_lines, raw_lines,
     sanitize_terminal_text, wrap_styled_line,
@@ -40,8 +49,8 @@ const MOUSE_SCROLL_ROWS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatExit {
-    Detached { last_seen_event_sequence: u64 },
-    QuitDetached { last_seen_event_sequence: u64 },
+    Detached { last_seen_event_ordinal: u64 },
+    QuitDetached { last_seen_event_ordinal: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,11 +225,13 @@ impl ChatEntry {
         self.revision = self.revision.wrapping_add(1);
     }
 
+    #[cfg(test)]
     fn bounded_for_dashboard(mut self) -> Self {
         self.bound_dashboard_content();
         self
     }
 
+    #[cfg(test)]
     fn bound_dashboard_content(&mut self) {
         const TEXT_BYTES: usize = 64 * 1024;
         const DETAIL_BYTES: usize = 2 * 1024;
@@ -253,6 +264,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+#[cfg(test)]
 fn truncate_string_start(value: &mut String, maximum_bytes: usize) -> bool {
     if value.len() <= maximum_bytes {
         return false;
@@ -346,6 +358,15 @@ impl TranscriptSnapshot {
         }
     }
 
+    /// Render the controller's durable logical-session projection. Relay
+    /// ordinals remain the public cursor: an item's first ordinal is its
+    /// stable browser identity, while the current projection frontier is a
+    /// conservative update cursor for rebuilt snapshots.
+    pub fn from_materialized(session: &MaterializedSession) -> Self {
+        let entries = materialized_chat_entries(session);
+        Self::from_entries_at(entries, session.applied_event_ordinal)
+    }
+
     pub(crate) fn has_assistant_messages(&self) -> bool {
         self.entries
             .iter()
@@ -399,8 +420,19 @@ impl TranscriptSnapshot {
         let mut remaining = BROWSER_TRANSCRIPT_LINES;
         for entry in entries.iter_mut().rev() {
             if entry.lines.len() > remaining {
-                let drop = entry.lines.len() - remaining;
-                entry.lines.drain(..drop);
+                let omitted = entry
+                    .lines
+                    .len()
+                    .saturating_sub(remaining.saturating_sub(1));
+                if remaining == 0 {
+                    entry.lines.clear();
+                } else {
+                    entry.lines.drain(..omitted);
+                    entry
+                        .lines
+                        .insert(0, format!("[… {omitted} earlier lines omitted …]"));
+                    entry.lines.truncate(remaining);
+                }
             }
             remaining = remaining.saturating_sub(entry.lines.len());
         }
@@ -451,6 +483,105 @@ impl TranscriptSnapshot {
     }
 }
 
+fn materialized_chat_entries(session: &MaterializedSession) -> Vec<ChatEntry> {
+    session
+        .transcript
+        .iter()
+        .map(|item| materialized_chat_entry(item, session.applied_event_ordinal))
+        .collect()
+}
+
+fn materialized_chat_entry(item: &TranscriptItem, frontier: u64) -> ChatEntry {
+    let mut entry = match &item.body {
+        TranscriptBody::User { content } => ChatEntry::plain(
+            item.position,
+            ChatRole::User,
+            materialized_content_text(content),
+        ),
+        TranscriptBody::Agent { chunks, .. } => ChatEntry::plain(
+            item.position,
+            ChatRole::Agent,
+            materialized_chunks_text(chunks),
+        ),
+        TranscriptBody::Thought { chunks, .. } => ChatEntry::plain(
+            item.position,
+            ChatRole::Thought,
+            materialized_chunks_text(chunks),
+        ),
+        TranscriptBody::Tool { call } => {
+            let call = serde_json::from_value::<ToolCall>(call.clone()).ok();
+            let mut entry = ChatEntry::tool(
+                item.position,
+                call.as_ref()
+                    .map_or("[invalid tool call]", |call| call.title.as_str()),
+                Some(item.stable_id.clone()),
+                call.as_ref()
+                    .map_or(ToolStatus::Pending, |call| tool_status(&call.status)),
+            );
+            if let Some(call) = call {
+                entry.tool_content = tool_content_details(&call.content);
+                entry.tool_diffstats = tool_diffstats(&call.content);
+                entry.tool_locations = tool_location_details(&call.locations);
+            }
+            entry
+        }
+        TranscriptBody::Plan { plan } => ChatEntry::plan(
+            item.position,
+            serde_json::from_value::<Plan>(plan.clone())
+                .map(|plan| plan.entries)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|line| PlanLine {
+                    text: sanitize_terminal_text(&line.content),
+                    status: plan_status(&line.status),
+                })
+                .collect(),
+        ),
+        TranscriptBody::System { text } => ChatEntry::plain(item.position, ChatRole::System, text),
+    };
+    entry.seq = frontier.max(item.position);
+    entry.recorded_at_ms = Some(item.created_at_ms);
+    entry.revision = u64::try_from(item.last_changed_at_ms).unwrap_or_default();
+    if matches!(
+        &item.body,
+        TranscriptBody::Agent { .. } | TranscriptBody::Thought { .. }
+    ) {
+        entry.message_id = Some(item.stable_id.clone());
+    }
+    entry
+}
+
+pub fn materialized_content_text(content: &[serde_json::Value]) -> String {
+    content
+        .iter()
+        .map(materialized_value_text)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn materialized_chunks_text(chunks: &[serde_json::Value]) -> String {
+    chunks
+        .iter()
+        .filter_map(|value| serde_json::from_value::<ContentChunk>(value.clone()).ok())
+        .filter_map(|chunk| content_block_text(&chunk.content))
+        .map(|text| sanitize_terminal_text(&text))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn materialized_value_text(value: &serde_json::Value) -> String {
+    if let Ok(block) = serde_json::from_value::<ContentBlock>(value.clone())
+        && let Some(text) = content_block_text(&block)
+    {
+        return sanitize_terminal_text(&text);
+    }
+    if let Some(text) = value.as_str() {
+        return sanitize_terminal_text(text);
+    }
+    sanitize_terminal_text(&serde_json::to_string(value).unwrap_or_else(|_| "[content]".into()))
+}
+
 fn browser_entry(entry: &ChatEntry) -> BrowserTranscriptEntry {
     let (role, label) = match entry.role {
         ChatRole::User => ("user", "You".to_owned()),
@@ -479,9 +610,10 @@ fn browser_entry(entry: &ChatEntry) -> BrowserTranscriptEntry {
                 format!("{marker} {}", line.text)
             })
             .collect::<Vec<_>>()
-    } else if entry.role == ChatRole::Tool && !entry.tool_diffstats.is_empty() {
+    } else if entry.role == ChatRole::Tool {
         std::iter::once(entry.text.clone())
-            .chain(entry.tool_diffstats.clone())
+            .chain(entry.tool_content.clone())
+            .chain(entry.tool_locations.clone())
             .collect()
     } else {
         entry.text.lines().map(str::to_owned).collect()
@@ -685,6 +817,68 @@ impl ChatState {
         state
     }
 
+    pub fn from_materialized(
+        session: &MaterializedSession,
+        config_options: &[SessionConfigOption],
+        available_commands: &[AvailableCommand],
+    ) -> Self {
+        let phase = match session.execution {
+            MaterializedExecutionState::Idle => WorkerPhase::Idle,
+            MaterializedExecutionState::Running { .. } => WorkerPhase::Running,
+            MaterializedExecutionState::Closing => WorkerPhase::Closing,
+            MaterializedExecutionState::Closed => WorkerPhase::Closed,
+        };
+        let snapshot = WorkerSnapshot::summary(
+            session.session_id.clone(),
+            phase,
+            session.applied_event_ordinal,
+        );
+        let mut state = Self::new(&snapshot, &[]);
+        state.apply_materialized(session, config_options, available_commands);
+        state
+    }
+
+    pub fn apply_materialized(
+        &mut self,
+        session: &MaterializedSession,
+        config_options: &[SessionConfigOption],
+        available_commands: &[AvailableCommand],
+    ) {
+        self.phase = match session.execution {
+            MaterializedExecutionState::Idle => WorkerPhase::Idle,
+            MaterializedExecutionState::Running { .. } => WorkerPhase::Running,
+            MaterializedExecutionState::Closing => WorkerPhase::Closing,
+            MaterializedExecutionState::Closed => WorkerPhase::Closed,
+        };
+        self.latest_seq = session.applied_event_ordinal;
+        self.entries = materialized_chat_entries(session);
+        self.queued_prompts = session
+            .queued_prompts
+            .iter()
+            .map(|prompt| QueuedPrompt {
+                id: prompt.command_id.clone(),
+                text: materialized_content_text(&prompt.content),
+            })
+            .collect();
+        self.set_config_options(config_options);
+        self.agent_commands = available_commands.to_vec();
+        self.rebuild_command_choices();
+        self.current_model = session
+            .configuration
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| config_current_value(config_options, "model"));
+        self.current_effort = session
+            .configuration
+            .get("effort")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| config_current_value(config_options, "effort"));
+        self.render_cache.entries.clear();
+    }
+
+    #[cfg(test)]
     pub(crate) fn bounded_entries(
         &self,
         maximum_entries: usize,
@@ -702,40 +896,6 @@ impl ChatState {
             entries.remove(0);
         }
         entries
-    }
-
-    pub(crate) fn agent_message_start_sequences(&self) -> Vec<u64> {
-        self.entries
-            .iter()
-            .filter(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty())
-            .map(|entry| entry.start_seq)
-            .collect()
-    }
-
-    pub(crate) fn latest_agent_message_start_sequence(&self) -> Option<u64> {
-        self.entries
-            .iter()
-            .rev()
-            .find(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty())
-            .map(|entry| entry.start_seq)
-    }
-
-    pub(crate) fn trailing_agent_message_id(&self) -> Option<Option<String>> {
-        self.entries
-            .last()
-            .filter(|entry| entry.role == ChatRole::Agent)
-            .map(|entry| entry.message_id.clone())
-    }
-
-    pub(crate) fn retain_transcript_tail(&mut self, maximum_entries: usize) {
-        let remove = self.entries.len().saturating_sub(maximum_entries);
-        if remove > 0 {
-            self.entries.drain(..remove);
-            self.render_cache = TranscriptRenderCache::default();
-        }
-        for entry in &mut self.entries {
-            entry.bound_dashboard_content();
-        }
     }
 
     pub fn phase(&self) -> WorkerPhase {
@@ -784,6 +944,192 @@ impl ChatState {
             latest_seq: self.latest_seq,
             last_compaction_seq: self.last_compaction_seq,
             render_cache: TranscriptRenderCache::default(),
+        }
+    }
+
+    /// Convert a legacy/import transcript projection into the controller's
+    /// canonical logical-session model. Native importers use this at their
+    /// boundary; live relay sessions are projected directly from relay events.
+    pub fn materialized_session(&self) -> MaterializedSession {
+        let mut stable_ids = BTreeSet::new();
+        let transcript = self
+            .entries
+            .iter()
+            .filter(|entry| entry.start_seq > 0)
+            .map(|entry| {
+                let base_id = match entry.role {
+                    ChatRole::User => format!("user:{}", entry.start_seq),
+                    ChatRole::Agent => entry.message_id.as_ref().map_or_else(
+                        || format!("agent:{}", entry.start_seq),
+                        |id| format!("agent:{id}"),
+                    ),
+                    ChatRole::Thought => entry.message_id.as_ref().map_or_else(
+                        || format!("thought:{}", entry.start_seq),
+                        |id| format!("thought:{id}"),
+                    ),
+                    ChatRole::Tool => entry.tool_call_id.as_ref().map_or_else(
+                        || format!("tool:{}", entry.start_seq),
+                        |id| format!("tool:{id}"),
+                    ),
+                    ChatRole::Plan => format!("plan:{}", entry.start_seq),
+                    ChatRole::System => format!("system:{}", entry.start_seq),
+                };
+                let stable_id = if stable_ids.insert(base_id.clone()) {
+                    base_id
+                } else {
+                    format!("{base_id}:{}", entry.start_seq)
+                };
+                let body = match entry.role {
+                    ChatRole::User => TranscriptBody::User {
+                        content: vec![serde_json::json!({
+                            "type": "text",
+                            "text": entry.text,
+                        })],
+                    },
+                    ChatRole::Agent | ChatRole::Thought => {
+                        let mut chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(
+                            entry.text.clone(),
+                        )));
+                        if let Some(message_id) = &entry.message_id {
+                            chunk = chunk.message_id(message_id.as_str());
+                        }
+                        let chunks = vec![
+                            serde_json::to_value(chunk)
+                                .expect("ACP content chunk serialization cannot fail"),
+                        ];
+                        if entry.role == ChatRole::Agent {
+                            TranscriptBody::Agent {
+                                chunks,
+                                streaming: false,
+                            }
+                        } else {
+                            TranscriptBody::Thought {
+                                chunks,
+                                streaming: false,
+                            }
+                        }
+                    }
+                    ChatRole::Tool => {
+                        let call_id = entry
+                            .tool_call_id
+                            .clone()
+                            .unwrap_or_else(|| stable_id.clone());
+                        let content = entry
+                            .tool_content
+                            .iter()
+                            .cloned()
+                            .map(|text| {
+                                ToolCallContent::from(ContentBlock::Text(TextContent::new(text)))
+                            })
+                            .collect();
+                        let mut call = ToolCall::new(call_id, entry.text.clone())
+                            .status(match entry.tool_status.unwrap_or(ToolStatus::Pending) {
+                                ToolStatus::Pending => ToolCallStatus::Pending,
+                                ToolStatus::Running => ToolCallStatus::InProgress,
+                                ToolStatus::Completed => ToolCallStatus::Completed,
+                                ToolStatus::Failed => ToolCallStatus::Failed,
+                            })
+                            .content(content);
+                        if !entry.tool_diffstats.is_empty() || !entry.tool_locations.is_empty() {
+                            call = call.raw_output(serde_json::json!({
+                                "legacyDiffstats": entry.tool_diffstats,
+                                "legacyLocations": entry.tool_locations,
+                            }));
+                        }
+                        TranscriptBody::Tool {
+                            call: serde_json::to_value(call)
+                                .expect("ACP tool call serialization cannot fail"),
+                        }
+                    }
+                    ChatRole::Plan => TranscriptBody::Plan {
+                        plan: serde_json::to_value(Plan::new(
+                            entry
+                                .plan
+                                .iter()
+                                .map(|line| {
+                                    PlanEntry::new(
+                                        line.text.clone(),
+                                        PlanEntryPriority::Medium,
+                                        match line.status {
+                                            PlanStatus::Pending => PlanEntryStatus::Pending,
+                                            PlanStatus::Running => PlanEntryStatus::InProgress,
+                                            PlanStatus::Completed => PlanEntryStatus::Completed,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        ))
+                        .expect("ACP plan serialization cannot fail"),
+                    },
+                    ChatRole::System => TranscriptBody::System {
+                        text: entry.text.clone(),
+                    },
+                };
+                let timestamp = entry.recorded_at_ms.unwrap_or_default();
+                TranscriptItem {
+                    stable_id,
+                    position: entry.start_seq,
+                    latest_content_event_ordinal: (entry.role == ChatRole::Agent)
+                        .then_some(entry.seq),
+                    created_at_ms: timestamp,
+                    last_changed_at_ms: timestamp,
+                    body,
+                }
+            })
+            .collect::<Vec<_>>();
+        let started_at_ms = self
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.role == ChatRole::User)
+            .and_then(|entry| entry.recorded_at_ms)
+            .unwrap_or_default();
+        let mut configuration = BTreeMap::new();
+        if let Some(model) = &self.current_model {
+            configuration.insert("model".into(), serde_json::Value::String(model.clone()));
+        }
+        if let Some(effort) = &self.current_effort {
+            configuration.insert("effort".into(), serde_json::Value::String(effort.clone()));
+        }
+        let applied_event_digest = if self.latest_seq == 0 {
+            RELAY_EVENT_GENESIS_DIGEST.to_owned()
+        } else {
+            let mut digest = Sha256::new();
+            digest.update(b"hel-imported-transcript-frontier-v1\0");
+            digest.update(self.session_id.as_bytes());
+            digest.update(self.latest_seq.to_le_bytes());
+            format!("{:x}", digest.finalize())
+        };
+        MaterializedSession {
+            session_id: self.session_id.clone(),
+            applied_event_ordinal: self.latest_seq,
+            applied_event_digest,
+            last_activity_at_ms: self
+                .entries
+                .iter()
+                .filter_map(|entry| entry.recorded_at_ms)
+                .max(),
+            execution: match self.phase {
+                WorkerPhase::Idle => MaterializedExecutionState::Idle,
+                WorkerPhase::Running => MaterializedExecutionState::Running { started_at_ms },
+                WorkerPhase::Closing => MaterializedExecutionState::Closing,
+                WorkerPhase::Closed => MaterializedExecutionState::Closed,
+            },
+            session_title: None,
+            configuration,
+            transcript,
+            queued_prompts: self
+                .queued_prompts
+                .iter()
+                .map(|prompt| MaterializedQueuedPrompt {
+                    command_id: prompt.id.clone(),
+                    content: vec![serde_json::json!({
+                        "type": "text",
+                        "text": prompt.text,
+                    })],
+                    queued_at_ms: 0,
+                })
+                .collect(),
         }
     }
 
@@ -2357,7 +2703,6 @@ fn content_block_text(content: &ContentBlock) -> Option<String> {
 }
 
 fn tool_content_details(content: &[ToolCallContent]) -> Vec<String> {
-    const MAX_DETAILS: usize = 8;
     let mut details = Vec::new();
     for item in content {
         let detail = match item {
@@ -2370,9 +2715,6 @@ fn tool_content_details(content: &[ToolCallContent]) -> Vec<String> {
         };
         if let Some(detail) = detail {
             details.push(sanitize_terminal_text(&detail));
-        }
-        if details.len() == MAX_DETAILS {
-            return details;
         }
     }
     details
@@ -2407,7 +2749,6 @@ fn format_diffstat(diff: &agent_client_protocol::schema::v1::Diff) -> String {
 fn tool_location_details(locations: &[ToolCallLocation]) -> Vec<String> {
     locations
         .iter()
-        .take(8)
         .map(|location| match location.line {
             Some(line) => format!("{}:{line}", location.path.display()),
             None => location.path.display().to_string(),
@@ -2415,26 +2756,541 @@ fn tool_location_details(locations: &[ToolCallLocation]) -> Vec<String> {
         .collect()
 }
 
+const CHAT_REMOTE_QUEUE_CAPACITY: usize = 32;
+
+#[derive(Debug)]
+enum ChatRemoteOperation {
+    Sync,
+    Prompt {
+        command_id: String,
+        text: String,
+        session_id: String,
+        bundle_id: String,
+    },
+    RemoveQueuedPrompt {
+        command_id: String,
+        id: String,
+        text: String,
+    },
+    SetConfig {
+        command_id: String,
+        key: String,
+        value: String,
+    },
+    Cancel {
+        command_id: String,
+    },
+}
+
+#[derive(Debug)]
+enum ChatRemoteResult {
+    Sync(std::result::Result<(), String>),
+    Prompt {
+        text: String,
+        result: std::result::Result<(u64, Option<String>), String>,
+    },
+    RemoveQueuedPrompt {
+        id: String,
+        text: String,
+        result: std::result::Result<(), String>,
+    },
+    SetConfig {
+        key: String,
+        value: String,
+        result: std::result::Result<(), String>,
+    },
+    Cancel(std::result::Result<(), String>),
+    WorkerFailed(String),
+}
+
+impl ChatRemoteResult {
+    fn failure_message(&self) -> Option<&str> {
+        match self {
+            Self::Sync(Err(error))
+            | Self::Prompt {
+                result: Err(error), ..
+            }
+            | Self::RemoveQueuedPrompt {
+                result: Err(error), ..
+            }
+            | Self::SetConfig {
+                result: Err(error), ..
+            }
+            | Self::Cancel(Err(error))
+            | Self::WorkerFailed(error) => Some(error),
+            Self::Prompt {
+                result: Ok((_, Some(error))),
+                ..
+            } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+fn publish_chat_remote_result(
+    results: &tokio::sync::mpsc::UnboundedSender<ChatRemoteResult>,
+    attached: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    result: ChatRemoteResult,
+) {
+    if !attached.load(std::sync::atomic::Ordering::Acquire) {
+        if let Some(error) = result.failure_message() {
+            tracing::error!(%error, "detached chat operation failed");
+        }
+        return;
+    }
+    if let Err(error) = results.send(result)
+        && let Some(error) = error.0.failure_message()
+    {
+        tracing::error!(%error, "chat operation failed after its UI closed");
+    }
+}
+
+struct ChatRemoteSupervisor {
+    operations: Option<tokio::sync::mpsc::Sender<ChatRemoteOperation>>,
+    results: tokio::sync::mpsc::UnboundedReceiver<ChatRemoteResult>,
+    attached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ChatRemoteSupervisor {
+    fn spawn(session: ManagedSessionHandle) -> Self {
+        let (operations_tx, operations_rx) = tokio::sync::mpsc::channel(CHAT_REMOTE_QUEUE_CAPACITY);
+        let (results_tx, results_rx) = tokio::sync::mpsc::unbounded_channel();
+        let attached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let worker_attached = attached.clone();
+        let worker = tokio::spawn(run_chat_remote_worker(
+            session,
+            operations_rx,
+            results_tx,
+            worker_attached,
+        ));
+        Self {
+            operations: Some(operations_tx),
+            results: results_rx,
+            attached,
+            worker: Some(worker),
+        }
+    }
+
+    fn operations(&self) -> &tokio::sync::mpsc::Sender<ChatRemoteOperation> {
+        self.operations
+            .as_ref()
+            .expect("chat remote supervisor is attached")
+    }
+
+    fn try_recv(
+        &mut self,
+    ) -> std::result::Result<ChatRemoteResult, tokio::sync::mpsc::error::TryRecvError> {
+        self.results.try_recv()
+    }
+
+    async fn take_finished(&mut self) -> Option<std::result::Result<(), tokio::task::JoinError>> {
+        if !self
+            .worker
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return None;
+        }
+        Some(
+            self.worker
+                .take()
+                .expect("finished chat worker exists")
+                .await,
+        )
+    }
+}
+
+impl Drop for ChatRemoteSupervisor {
+    fn drop(&mut self) {
+        self.attached
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.results.close();
+        while let Ok(result) = self.results.try_recv() {
+            if let Some(error) = result.failure_message() {
+                tracing::error!(%error, "chat operation failed while detaching");
+            }
+        }
+        drop(self.operations.take());
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(error) = worker.await {
+                        tracing::error!(%error, "detached chat background worker failed");
+                    }
+                });
+            }
+            Err(error) => {
+                worker.abort();
+                tracing::error!(%error, "could not supervise detached chat background worker");
+            }
+        }
+    }
+}
+
+async fn run_chat_remote_worker(
+    session: ManagedSessionHandle,
+    mut operations: tokio::sync::mpsc::Receiver<ChatRemoteOperation>,
+    results: tokio::sync::mpsc::UnboundedSender<ChatRemoteResult>,
+    attached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut pending = tokio::task::JoinSet::new();
+    let mut accepting = true;
+    loop {
+        if !accepting && pending.is_empty() {
+            break;
+        }
+        tokio::select! {
+            operation = operations.recv(), if accepting => {
+                let Some(operation) = operation else {
+                    accepting = false;
+                    continue;
+                };
+                enqueue_chat_remote_operation(
+                    &session,
+                    operation,
+                    &mut pending,
+                    &results,
+                    &attached,
+                ).await;
+            }
+            joined = pending.join_next(), if !pending.is_empty() => {
+                if let Some(Err(error)) = joined {
+                    publish_chat_remote_result(
+                        &results,
+                        &attached,
+                        ChatRemoteResult::WorkerFailed(format!(
+                            "chat background operation failed: {error}"
+                        )),
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn enqueue_chat_remote_operation(
+    session: &ManagedSessionHandle,
+    operation: ChatRemoteOperation,
+    pending: &mut tokio::task::JoinSet<()>,
+    results: &tokio::sync::mpsc::UnboundedSender<ChatRemoteResult>,
+    attached: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    match operation {
+        ChatRemoteOperation::Sync => match session.enqueue_sync().await {
+            Ok(response) => {
+                let results = results.clone();
+                let attached = attached.clone();
+                pending.spawn(async move {
+                    let result = response.wait().await.map_err(|error| format!("{error:#}"));
+                    publish_chat_remote_result(&results, &attached, ChatRemoteResult::Sync(result));
+                });
+            }
+            Err(error) => {
+                publish_chat_remote_result(
+                    results,
+                    attached,
+                    ChatRemoteResult::Sync(Err(format!("{error:#}"))),
+                );
+            }
+        },
+        ChatRemoteOperation::Prompt {
+            command_id,
+            text,
+            session_id,
+            bundle_id,
+        } => {
+            let response = session
+                .enqueue_submit(
+                    command_id,
+                    RelayCommand::Prompt {
+                        prompt: vec![ContentBlock::Text(TextContent::new(text.clone()))],
+                    },
+                )
+                .await;
+            match response {
+                Ok(response) => {
+                    let results = results.clone();
+                    let attached = attached.clone();
+                    pending.spawn(async move {
+                        let result = match response.wait().await {
+                            Ok(ordinal) => {
+                                let history_text = text.clone();
+                                let history = tokio::task::spawn_blocking(move || {
+                                    crate::hel_database::record_prompt(
+                                        &session_id,
+                                        &bundle_id,
+                                        ordinal,
+                                        None,
+                                        &history_text,
+                                    )
+                                })
+                                .await;
+                                let warning = match history {
+                                    Ok(Ok(())) => None,
+                                    Ok(Err(error)) => Some(format!("{error:#}")),
+                                    Err(error) => Some(format!("history task failed: {error}")),
+                                };
+                                Ok((ordinal, warning))
+                            }
+                            Err(error) => Err(format!("{error:#}")),
+                        };
+                        publish_chat_remote_result(
+                            &results,
+                            &attached,
+                            ChatRemoteResult::Prompt { text, result },
+                        );
+                    });
+                }
+                Err(error) => {
+                    publish_chat_remote_result(
+                        results,
+                        attached,
+                        ChatRemoteResult::Prompt {
+                            text,
+                            result: Err(format!("{error:#}")),
+                        },
+                    );
+                }
+            }
+        }
+        ChatRemoteOperation::RemoveQueuedPrompt {
+            command_id,
+            id,
+            text,
+        } => {
+            let response = session
+                .enqueue_submit(
+                    command_id,
+                    RelayCommand::RemoveQueuedPrompt {
+                        queued_command_id: id.clone(),
+                    },
+                )
+                .await;
+            match response {
+                Ok(response) => {
+                    let results = results.clone();
+                    let attached = attached.clone();
+                    pending.spawn(async move {
+                        let result = response
+                            .wait()
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| format!("{error:#}"));
+                        publish_chat_remote_result(
+                            &results,
+                            &attached,
+                            ChatRemoteResult::RemoveQueuedPrompt { id, text, result },
+                        );
+                    });
+                }
+                Err(error) => {
+                    publish_chat_remote_result(
+                        results,
+                        attached,
+                        ChatRemoteResult::RemoveQueuedPrompt {
+                            id,
+                            text,
+                            result: Err(format!("{error:#}")),
+                        },
+                    );
+                }
+            }
+        }
+        ChatRemoteOperation::SetConfig {
+            command_id,
+            key,
+            value,
+        } => {
+            let response = session
+                .enqueue_submit(
+                    command_id,
+                    RelayCommand::SetConfig {
+                        key: key.clone(),
+                        value: value.clone(),
+                    },
+                )
+                .await;
+            match response {
+                Ok(response) => {
+                    let results = results.clone();
+                    let attached = attached.clone();
+                    pending.spawn(async move {
+                        let result = response
+                            .wait()
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| format!("{error:#}"));
+                        publish_chat_remote_result(
+                            &results,
+                            &attached,
+                            ChatRemoteResult::SetConfig { key, value, result },
+                        );
+                    });
+                }
+                Err(error) => {
+                    publish_chat_remote_result(
+                        results,
+                        attached,
+                        ChatRemoteResult::SetConfig {
+                            key,
+                            value,
+                            result: Err(format!("{error:#}")),
+                        },
+                    );
+                }
+            }
+        }
+        ChatRemoteOperation::Cancel { command_id } => {
+            let response = session
+                .enqueue_submit(command_id, RelayCommand::Cancel)
+                .await;
+            match response {
+                Ok(response) => {
+                    let results = results.clone();
+                    let attached = attached.clone();
+                    pending.spawn(async move {
+                        let result = response
+                            .wait()
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| format!("{error:#}"));
+                        publish_chat_remote_result(
+                            &results,
+                            &attached,
+                            ChatRemoteResult::Cancel(result),
+                        );
+                    });
+                }
+                Err(error) => {
+                    publish_chat_remote_result(
+                        results,
+                        attached,
+                        ChatRemoteResult::Cancel(Err(format!("{error:#}"))),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn restore_unsent_input(chat: &mut ChatState, input: &str) {
+    if chat.input.is_empty() {
+        chat.set_input(input.to_owned());
+    } else if chat.input != input {
+        chat.set_input(format!("{input}\n\n{}", chat.input));
+    }
+}
+
+fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteResult) {
+    match result {
+        ChatRemoteResult::Sync(Ok(())) => chat.set_notice("Connected to session relay"),
+        ChatRemoteResult::Sync(Err(error)) => chat.set_notice(format!("Connection failed: {error}")),
+        ChatRemoteResult::Prompt {
+            text,
+            result: Ok((ordinal, None)),
+        } => chat.set_notice(format!(
+            "Prompt accepted by relay at {ordinal}: {}",
+            queued_prompt_preview(&text)
+        )),
+        ChatRemoteResult::Prompt {
+            text,
+            result: Ok((ordinal, Some(history_error))),
+        } => chat.set_notice(format!(
+            "Prompt accepted by relay at {ordinal} ({}), but history was not saved: {history_error}",
+            queued_prompt_preview(&text)
+        )),
+        ChatRemoteResult::Prompt {
+            text,
+            result: Err(error),
+        } => {
+            restore_unsent_input(chat, &text);
+            chat.set_notice(format!("Prompt was not sent: {error}"));
+        }
+        ChatRemoteResult::RemoveQueuedPrompt {
+            result: Ok(()), ..
+        } => chat.set_notice("Queued prompt removed"),
+        ChatRemoteResult::RemoveQueuedPrompt {
+            id,
+            text,
+            result: Err(error),
+        } => {
+            if !chat.queued_prompts.iter().any(|prompt| prompt.id == id) {
+                chat.queued_prompts.push_back(QueuedPrompt { id, text });
+            }
+            chat.set_notice(format!("Queued prompt was not removed: {error}"));
+        }
+        ChatRemoteResult::SetConfig {
+            result: Ok(()), ..
+        } => chat.set_notice("Configuration update accepted"),
+        ChatRemoteResult::SetConfig {
+            key,
+            value,
+            result: Err(error),
+        } => {
+            restore_unsent_input(chat, &format!("/{key} {value}"));
+            chat.set_notice(format!("Configuration was not changed: {error}"));
+        }
+        ChatRemoteResult::Cancel(Ok(())) => chat.set_notice("Cancellation requested"),
+        ChatRemoteResult::Cancel(Err(error)) => {
+            chat.set_notice(format!("Cancellation failed: {error}"))
+        }
+        ChatRemoteResult::WorkerFailed(error) => chat.set_notice(error),
+    }
+}
+
+fn queue_chat_remote_operation(
+    operations: &tokio::sync::mpsc::Sender<ChatRemoteOperation>,
+    operation: ChatRemoteOperation,
+    chat: &mut ChatState,
+) {
+    if let Err(error) = operations.try_send(operation) {
+        let operation = error.into_inner();
+        match operation {
+            ChatRemoteOperation::Prompt { text, .. } => restore_unsent_input(chat, &text),
+            ChatRemoteOperation::RemoveQueuedPrompt { id, text, .. } => {
+                if !chat.queued_prompts.iter().any(|prompt| prompt.id == id) {
+                    chat.queued_prompts.push_back(QueuedPrompt { id, text });
+                }
+            }
+            ChatRemoteOperation::SetConfig { key, value, .. } => {
+                restore_unsent_input(chat, &format!("/{key} {value}"));
+            }
+            ChatRemoteOperation::Sync | ChatRemoteOperation::Cancel { .. } => {}
+        }
+        chat.set_notice("The session command queue is full; the command was not sent");
+    }
+}
+
 /// Run chat until the user returns to the dashboard or quits Hel. Either exit
 /// detaches the proxy and leaves the target worker alive.
 pub async fn run_chat(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    mut client: WorkerClient,
-    chat: Option<ChatState>,
+    session: &mut ManagedSessionHandle,
     bundle_id: &str,
     recovery: Option<RecoveryContext>,
-) -> Result<(ChatExit, WorkerClient, ChatState)> {
-    let (mut chat, bootstrap_events) = match chat {
-        Some(chat) => (chat, Vec::new()),
-        None => {
-            let bootstrap = client.bootstrap().await?;
-            let events = bootstrap.events.clone();
-            (
-                ChatState::new(&bootstrap.snapshot, &bootstrap.events),
-                events,
+) -> Result<ChatExit> {
+    let view = session.view();
+    let needs_initial_sync = view.snapshot.is_none();
+    let mut chat = view.snapshot.map_or_else(
+        || {
+            ChatState::from_materialized(
+                &MaterializedSession::empty(session.session_id()),
+                &[],
+                &[],
             )
-        }
-    };
+        },
+        |snapshot| {
+            ChatState::from_materialized(
+                &snapshot.materialized,
+                &snapshot.operational.config_options,
+                &snapshot.operational.available_commands,
+            )
+        },
+    );
     chat.set_history_context(bundle_id);
     if let Some(detail) = recovery
         .as_ref()
@@ -2442,17 +3298,27 @@ pub async fn run_chat(
     {
         chat.set_notice(format!("Recovery copy failed: {detail}"));
     }
-    if !bootstrap_events.is_empty()
-        && let Some(recovery) = &recovery
-    {
-        recovery.observe(&bootstrap_events, chat.phase()).await;
-    }
     let (voice_updates_tx, mut voice_updates_rx) =
         tokio::sync::mpsc::unbounded_channel::<VoiceUpdate>();
+    let mut remote = ChatRemoteSupervisor::spawn(session.clone());
+    if needs_initial_sync {
+        chat.set_notice("Connecting to session relay…");
+        queue_chat_remote_operation(remote.operations(), ChatRemoteOperation::Sync, &mut chat);
+    }
     let mut voice_cancel: Option<std::sync::mpsc::Sender<()>> = None;
     let mut voice_prefix = String::new();
     loop {
         chat.recovery_busy = recovery.as_ref().is_some_and(RecoveryContext::is_busy);
+        while let Ok(result) = remote.try_recv() {
+            apply_chat_remote_result(&mut chat, result);
+        }
+        if let Some(result) = remote.take_finished().await {
+            if let Err(error) = result {
+                chat.set_notice(format!("Chat background worker failed: {error}"));
+            } else {
+                chat.set_notice("Chat background worker stopped unexpectedly");
+            }
+        }
         while let Ok(update) = voice_updates_rx.try_recv() {
             match update {
                 VoiceUpdate::Partial(text) => {
@@ -2493,46 +3359,63 @@ pub async fn run_chat(
                 _ => None,
             };
             if let Some(action) = action {
-                let result = match action {
-                    ChatAction::None => None,
+                match action {
+                    ChatAction::None => {}
                     ChatAction::Prompt(text) => {
-                        match client.enqueue_prompt(text.clone(), Vec::new()).await {
-                            Ok(_) => {
-                                chat.set_notice(format!(
-                                    "Prompt accepted by worker: {}",
-                                    queued_prompt_preview(&text)
-                                ));
-                                None
-                            }
-                            Err(error) => {
-                                chat.set_input(text);
-                                Some(error)
-                            }
-                        }
+                        chat.set_notice("Sending prompt…");
+                        queue_chat_remote_operation(
+                            remote.operations(),
+                            ChatRemoteOperation::Prompt {
+                                command_id: new_command_id("prompt")?,
+                                text,
+                                session_id: session.session_id().to_owned(),
+                                bundle_id: bundle_id.to_owned(),
+                            },
+                            &mut chat,
+                        );
                     }
                     ChatAction::RemoveQueuedPrompt { id, text } => {
-                        match client.remove_queued_prompt(id.clone()).await {
-                            Ok(_) => None,
-                            Err(error) => {
-                                chat.queued_prompts.push_back(QueuedPrompt { id, text });
-                                Some(error)
-                            }
-                        }
+                        chat.set_notice("Removing queued prompt…");
+                        queue_chat_remote_operation(
+                            remote.operations(),
+                            ChatRemoteOperation::RemoveQueuedPrompt {
+                                command_id: new_command_id("remove-prompt")?,
+                                id,
+                                text,
+                            },
+                            &mut chat,
+                        );
                     }
                     ChatAction::SetConfig { key, value } => {
-                        client.set_config(key, value).await.err()
+                        chat.set_notice("Sending configuration update…");
+                        queue_chat_remote_operation(
+                            remote.operations(),
+                            ChatRemoteOperation::SetConfig {
+                                command_id: new_command_id("set-config")?,
+                                key,
+                                value,
+                            },
+                            &mut chat,
+                        );
                     }
-                    ChatAction::Cancel => client.cancel().await.err(),
+                    ChatAction::Cancel => {
+                        chat.set_notice("Sending cancellation request…");
+                        queue_chat_remote_operation(
+                            remote.operations(),
+                            ChatRemoteOperation::Cancel {
+                                command_id: new_command_id("cancel")?,
+                            },
+                            &mut chat,
+                        );
+                    }
                     ChatAction::ToggleVoice => {
                         if let Some(cancel) = voice_cancel.as_ref() {
                             let _ = cancel.send(());
                             chat.set_notice("Stopping voice dictation…");
-                            None
                         } else if !crate::speech::voice_input_supported() {
                             chat.set_notice(
                             "Voice helper unavailable; install hel-voice-worker beside hel or set HEL_VOICE_WORKER",
                         );
-                            None
                         } else {
                             let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
                             voice_cancel = Some(cancel_tx);
@@ -2540,41 +3423,41 @@ pub async fn run_chat(
                             chat.voice_active = true;
                             chat.set_notice("Listening… press Alt-V again to stop");
                             spawn_dictation(voice_updates_tx.clone(), cancel_rx);
-                            None
                         }
                     }
                     action @ (ChatAction::Back | ChatAction::QuitDetach) => {
                         if let Some(cancel) = voice_cancel.take() {
                             let _ = cancel.send(());
                         }
-                        let last_seen_event_sequence = chat.latest_seq();
+                        let last_seen_event_ordinal = chat.latest_seq();
                         chat.reset_interaction();
                         let exit = if action == ChatAction::QuitDetach {
                             ChatExit::QuitDetached {
-                                last_seen_event_sequence,
+                                last_seen_event_ordinal,
                             }
                         } else {
                             ChatExit::Detached {
-                                last_seen_event_sequence,
+                                last_seen_event_ordinal,
                             }
                         };
-                        return Ok((exit, client, chat));
+                        return Ok(exit);
                     }
-                };
-                if let Some(error) = result {
-                    chat.set_notice(format!("{error:#}"));
                 }
             }
             pending = event::poll(Duration::from_millis(0))?;
         }
-        match client.sync().await {
-            Ok(events) => {
-                chat.apply_events(&events);
-                if let Some(recovery) = &recovery {
-                    recovery.observe(&events, chat.phase()).await;
-                }
+        while session.has_changed()? {
+            let view = session.changed().await?;
+            if let Some(snapshot) = view.snapshot {
+                chat.apply_materialized(
+                    &snapshot.materialized,
+                    &snapshot.operational.config_options,
+                    &snapshot.operational.available_commands,
+                );
             }
-            Err(error) => chat.set_notice(format!("connection lost: {error:#}")),
+            if let Some(error) = view.error {
+                chat.set_notice(format!("connection lost: {error}"));
+            }
         }
     }
 }
@@ -3297,7 +4180,6 @@ fn entry_logical_lines(
         .tool_content
         .iter()
         .chain(&entry.tool_locations)
-        .take(8)
         .cloned()
         .collect::<Vec<_>>();
     let mut source = match mode {
@@ -4233,6 +5115,13 @@ mod tests {
 
         assert_eq!(tail.entries.len(), 1);
         assert_eq!(tail.entries[0].text, "hello world");
+        let materialized = tail.materialized_session();
+        assert_eq!(materialized.transcript[0].position, 1);
+        assert_eq!(
+            materialized.transcript[0].latest_content_event_ordinal,
+            Some(2)
+        );
+        assert_eq!(materialized.unread_agent_messages_after(1), 1);
     }
 
     #[test]
@@ -4559,6 +5448,12 @@ mod tests {
             BROWSER_TRANSCRIPT_LINES
         );
         assert_eq!(full.entries.last().unwrap().role, "thought");
+        assert!(
+            full.entries[0]
+                .lines
+                .first()
+                .is_some_and(|line| line.contains("earlier lines omitted"))
+        );
         let truncated = &full.entries.last().unwrap().lines[0];
         assert!(truncated.ends_with("… [truncated]"));
         assert!(truncated.len() <= BROWSER_LINE_BYTES);
@@ -4814,6 +5709,117 @@ mod tests {
         assert_eq!(chat.entries.len(), 1);
         assert_eq!(chat.entries[0].role, ChatRole::Plan);
         assert_eq!(chat.entries[0].plan[0].status, PlanStatus::Completed);
+    }
+
+    #[test]
+    fn materialized_tool_and_plan_conversion_preserves_more_than_eight_details() {
+        let tool_content = (0..12)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "content",
+                    "content": {"type": "text", "text": format!("result-{index}")}
+                })
+            })
+            .collect::<Vec<_>>();
+        let locations = (0..12)
+            .map(|index| {
+                serde_json::json!({
+                    "path": format!("src/file-{index}.rs"),
+                    "line": index + 1
+                })
+            })
+            .collect::<Vec<_>>();
+        let plan = (0..12)
+            .map(|index| {
+                serde_json::json!({
+                    "content": format!("step-{index}"),
+                    "priority": "medium",
+                    "status": "pending"
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut session = MaterializedSession::empty("session-rich-details");
+        session.applied_event_ordinal = 2;
+        session.applied_event_digest = "a".repeat(64);
+        session.transcript = vec![
+            TranscriptItem {
+                stable_id: "tool:inspect".into(),
+                position: 1,
+                latest_content_event_ordinal: None,
+                created_at_ms: 1,
+                last_changed_at_ms: 1,
+                body: TranscriptBody::Tool {
+                    call: serde_json::json!({
+                        "toolCallId": "inspect",
+                        "title": "inspect",
+                        "status": "completed",
+                        "content": tool_content,
+                        "locations": locations
+                    }),
+                },
+            },
+            TranscriptItem {
+                stable_id: "plan:current".into(),
+                position: 2,
+                latest_content_event_ordinal: None,
+                created_at_ms: 2,
+                last_changed_at_ms: 2,
+                body: TranscriptBody::Plan {
+                    plan: serde_json::json!({"entries": plan}),
+                },
+            },
+        ];
+
+        let entries = materialized_chat_entries(&session);
+        assert_eq!(entries[0].tool_content.len(), 12);
+        assert_eq!(entries[0].tool_locations.len(), 12);
+        assert_eq!(entries[1].plan.len(), 12);
+
+        let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
+        assert!(
+            browser.entries[0]
+                .lines
+                .iter()
+                .any(|line| line == "result-11")
+        );
+        assert!(
+            browser.entries[0]
+                .lines
+                .iter()
+                .any(|line| line == "src/file-11.rs:12")
+        );
+        assert!(
+            browser.entries[1]
+                .lines
+                .iter()
+                .any(|line| line == "○ step-11")
+        );
+    }
+
+    #[test]
+    fn full_remote_queue_restores_unsent_input_without_blocking() {
+        let (operations, _receiver) = tokio::sync::mpsc::channel(1);
+        operations.try_send(ChatRemoteOperation::Sync).unwrap();
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("new draft".into());
+
+        queue_chat_remote_operation(
+            &operations,
+            ChatRemoteOperation::Prompt {
+                command_id: "prompt-1".into(),
+                text: "unsent prompt".into(),
+                session_id: "session-1".into(),
+                bundle_id: "bundle-1".into(),
+            },
+            &mut chat,
+        );
+
+        assert_eq!(chat.input, "unsent prompt\n\nnew draft");
+        assert!(
+            chat.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("queue is full"))
+        );
     }
 
     #[test]

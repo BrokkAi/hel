@@ -16,9 +16,11 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use hel::hel_archive::{PayloadRole, read_archive_verified};
+use hel::hel_archive::verify_archive_streaming;
 use hel::hel_config::{HelConfig, ProjectBundle, ProjectRepository, config_path, sessions_dir};
-use hel::hel_controller::{Controller, SessionLaunchOptions, SessionResumeOptions};
+use hel::hel_controller::{
+    Controller, ControllerStoreGuard, SessionLaunchOptions, SessionResumeOptions,
+};
 use hel::hel_greeting::{GreetingFacts, RepositoryGreetingFacts};
 use hel::hel_import::{
     BundleResolution, ClaudeImportRequest, ClaudeSessionSelection, CodexImportRequest,
@@ -31,26 +33,31 @@ use hel::hel_import::{
     read_codex_transcript, read_kimi_transcript, resolve_bundle, scan_claude_sessions,
     scan_codex_sessions, scan_kimi_sessions, session_edit_targets,
 };
+use hel::hel_projection::materialized_session_from_canonical;
 use hel::hel_quota::{ProfileQuota, QuotaManager, QuotaRefreshRequest};
 use hel::hel_server::{
     ControllerAction, ControllerRequest, ResumeQueueDisposition, ServerOptions, ViewerQueuedPrompt,
     ViewerQuota, ViewerSnapshot,
 };
+use hel::hel_session_manager::{
+    RelaySessionTarget, SessionManagerControl, SessionManagerUpdate, SessionManagerUpdates,
+    new_command_id, spawn_session_manager,
+};
 use hel::hel_setup::{SetupOutcome, github_repository_from_origin, run_setup_dialog};
 use hel::hel_state::{
-    HelState, SessionResourceAllocation, SessionState, TargetLocator, harness_session_title,
+    HelState, MaterializedSession, SessionRecord, SessionResourceAllocation, SessionState,
+    TargetLocator,
 };
 use hel::hel_targets::{
-    CancellableProcessExecutor, CommandOutput, CommandSpec, DeploymentCapacityKind,
-    DeploymentCapacityTarget, DeploymentCapacityUsage, ProcessExecutor, SessionResourceProbe,
-    SessionResourceUsage,
+    CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec,
+    DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage, ProcessExecutor,
+    SessionResourceProbe, SessionResourceUsage,
 };
 use hel::hel_tui::{
     DashboardAction, DashboardState, ImportProfileOption, ImportSessionOption,
     SessionOperationKind, render,
 };
-use hel::hel_worker::{SequencedEvent, WorkerPhase};
-use hel::hel_worker_client::{WorkerBootstrap, WorkerClient};
+use hel::hel_worker::RelayCommand;
 use hel::hel_worker_runtime::{
     AcpSupervisorSpec, WorkerLaunchConfig, proxy, run_acp_supervisor, run_daemon,
 };
@@ -283,13 +290,11 @@ struct WorkerArgs {
 }
 
 const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
-const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const WORKER_POLL_TIMEOUT: Duration = Duration::from_secs(3);
-const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const WORKER_REPLAY_PAGE_TIMEOUT: Duration = Duration::from_secs(15);
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const RESOURCE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const CAPACITY_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const WORKER_DIAGNOSIS_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_CONCURRENT_PHONE_ACTIONS: usize = 4;
 
 #[derive(Debug)]
 enum QuotaUpdate {
@@ -297,56 +302,78 @@ enum QuotaUpdate {
     Report(ProfileQuota),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WorkerPollTarget {
-    session_id: String,
-    spec: CommandSpec,
-    viewed_through: u64,
-}
+type WorkerPollTarget = RelaySessionTarget;
+type WorkerPollUpdate = SessionManagerUpdate;
 
 #[derive(Debug)]
-struct WorkerPollUpdate {
-    session_id: String,
-    payload: WorkerPollPayload,
+struct WorkerDiagnosisEpisode {
+    id: u64,
+    error: String,
+    diagnosed: bool,
 }
 
-#[derive(Debug)]
-enum WorkerPollPayload {
-    Connected,
-    Events {
-        events: Vec<SequencedEvent>,
-        phase: WorkerPhase,
-        transcript: hel::hel_chat::TranscriptSnapshot,
-        queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
-        /// These events predate the connection established by this poll.
-        received_while_detached: bool,
-    },
-    Hydrated(hel::hel_worker::WorkerSessionSummary),
-    /// The worker failed several consecutive polls; the session needs
-    /// attention and a diagnosis.
-    Unreachable {
-        detail: String,
-    },
+#[derive(Debug, Default)]
+struct WorkerDiagnosisTracker {
+    next_episode: u64,
+    current: std::collections::BTreeMap<String, WorkerDiagnosisEpisode>,
+    pending: std::collections::BTreeMap<String, u64>,
 }
 
-struct WarmWorker {
-    spec: CommandSpec,
-    client: WorkerClient,
-    chat: hel::hel_chat::ChatState,
-    queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
-    opening_events: Vec<SequencedEvent>,
-    full_history: bool,
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WorkerDiagnosisCompletion {
+    display_error: Option<String>,
+    restart_episode: Option<u64>,
 }
 
-enum WorkerPollCommand {
-    Checkout {
-        session_id: String,
-        reply: tokio::sync::oneshot::Sender<Option<WarmWorker>>,
-    },
-    Checkin {
-        session_id: String,
-        worker: Option<Box<WarmWorker>>,
-    },
+impl WorkerDiagnosisTracker {
+    fn observe(&mut self, session_id: &str, connected: bool, error: Option<String>) -> Option<u64> {
+        if connected {
+            self.current.remove(session_id);
+        }
+        let error = error?;
+        let episode = self
+            .current
+            .entry(session_id.to_owned())
+            .or_insert_with(|| {
+                self.next_episode = self.next_episode.wrapping_add(1).max(1);
+                WorkerDiagnosisEpisode {
+                    id: self.next_episode,
+                    error: error.clone(),
+                    diagnosed: false,
+                }
+            });
+        episode.error = error;
+        if episode.diagnosed || self.pending.contains_key(session_id) {
+            return None;
+        }
+        self.pending.insert(session_id.to_owned(), episode.id);
+        Some(episode.id)
+    }
+
+    fn finish(&mut self, session_id: &str, episode_id: u64) -> WorkerDiagnosisCompletion {
+        if self.pending.get(session_id) != Some(&episode_id) {
+            return WorkerDiagnosisCompletion::default();
+        }
+        self.pending.remove(session_id);
+        let Some(current) = self.current.get_mut(session_id) else {
+            return WorkerDiagnosisCompletion::default();
+        };
+        if current.id == episode_id {
+            current.diagnosed = true;
+            return WorkerDiagnosisCompletion {
+                display_error: Some(current.error.clone()),
+                restart_episode: None,
+            };
+        }
+        if !current.diagnosed {
+            self.pending.insert(session_id.to_owned(), current.id);
+            return WorkerDiagnosisCompletion {
+                display_error: None,
+                restart_episode: Some(current.id),
+            };
+        }
+        WorkerDiagnosisCompletion::default()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -367,10 +394,6 @@ struct CapacityPollUpdate {
     result: std::result::Result<Option<DeploymentCapacityUsage>, String>,
     sampled_at_epoch_seconds: u64,
 }
-
-/// Consecutive failed polls before a running session is declared unreachable.
-/// One failure is routinely a transient exec hiccup.
-const WORKER_POLL_FAILURE_THRESHOLD: u32 = 3;
 
 #[derive(Debug, Subcommand)]
 enum WorkerCommand {
@@ -455,6 +478,25 @@ fn install_worker_last_words(root: &std::path::Path) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let is_controller_process = matches!(
+        &cli.command,
+        None | Some(
+            Command::Server(_)
+                | Command::Setup(_)
+                | Command::Import(_)
+                | Command::Recover(_)
+                | Command::Checkpoint(_)
+        )
+    );
+    let _controller_guard = is_controller_process
+        .then(ControllerStoreGuard::acquire)
+        .transpose()?;
+    if is_controller_process {
+        hel::hel_database::recover_interrupted_checkpointing_sessions(
+            &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )?;
+        hel::hel_controller::reconcile_managed_checkpoint_archives()?;
+    }
     match cli.command {
         None => run_dashboard().await,
         Some(Command::Server(args)) => run_server(args).await,
@@ -502,7 +544,7 @@ async fn main() -> Result<()> {
             let checkpoint = controller.checkpoint_session(&args.session).await?;
             println!(
                 "saved recovery copy for {} at event {}",
-                args.session, checkpoint.event_sequence
+                args.session, checkpoint.event_frontier
             );
             Ok(())
         }
@@ -630,7 +672,7 @@ fn import_claude(args: ClaudeImportArgs) -> Result<()> {
     // `write_archive_atomic`; persist a synthesized config before the state
     // record that references it.
     config.save()?;
-    hel::hel_database::save_session(
+    persist_imported_session(
         state
             .sessions
             .get(&imported.session_id)
@@ -685,7 +727,7 @@ fn import_codex(args: CodexImportArgs) -> Result<()> {
         },
     )?;
     config.save()?;
-    hel::hel_database::save_session(
+    persist_imported_session(
         state
             .sessions
             .get(&imported.session_id)
@@ -740,7 +782,7 @@ fn import_kimi(args: KimiImportArgs) -> Result<()> {
         },
     )?;
     config.save()?;
-    hel::hel_database::save_session(
+    persist_imported_session(
         state
             .sessions
             .get(&imported.session_id)
@@ -835,7 +877,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     refresh_all_quotas(&controller, &mut quotas).await;
     let mut revision = 1;
     let mut conversations = std::collections::BTreeMap::new();
-    let mut queued_prompts = archived_queued_prompts(&controller);
+    let mut queued_prompts = projected_queued_prompts(&controller)?;
     let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(viewer_snapshot(
         &controller,
         &quotas,
@@ -845,11 +887,26 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     ));
     let (conversation_tx, conversation_rx) = tokio::sync::watch::channel(conversations.clone());
     let (action_tx, mut action_rx) = tokio::sync::mpsc::channel(32);
-    let (worker_targets_tx, mut worker_updates_rx, _worker_commands_tx) =
-        spawn_dashboard_worker_poller();
+    let (worker_targets_tx, mut worker_updates_rx, worker_commands_tx) =
+        spawn_dashboard_worker_poller()?;
     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
-    let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn();
+    let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn(worker_commands_tx.clone());
     let recovery_observer = recovery.observer();
+    let interrupted_close_ids = interrupted_close_session_ids(&controller);
+    let (interrupted_close_tx, mut interrupted_close_rx) =
+        tokio::sync::mpsc::unbounded_channel::<LifecycleUpdate>();
+    let mut interrupted_close_cancellations = std::collections::BTreeMap::new();
+    for session_id in &interrupted_close_ids {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        interrupted_close_cancellations.insert(session_id.clone(), cancelled.clone());
+        spawn_interrupted_close_recovery(
+            session_id.clone(),
+            worker_commands_tx.clone(),
+            recovery_observer.clone(),
+            cancelled,
+            interrupted_close_tx.clone(),
+        );
+    }
     let termination = hel::termination::Coordinator::install().token();
     let mut options = ServerOptions::new(bind, snapshot_rx, conversation_rx, action_tx)?;
     options.shutdown = termination.clone();
@@ -869,59 +926,57 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     let control = async {
         let mut recovery_tick = tokio::time::interval(Duration::from_millis(250));
         let (action_done_tx, mut action_done_rx) = tokio::sync::mpsc::unbounded_channel::<(
+            u64,
             Option<String>,
             tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
             std::result::Result<(), String>,
         )>();
-        let mut active_actions = std::collections::BTreeSet::new();
+        let mut active_actions = interrupted_close_ids
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut next_action_id = 0_u64;
+        let mut action_cancellations = std::collections::BTreeMap::<u64, Arc<AtomicBool>>::new();
         loop {
             tokio::select! {
-                _ = termination.cancelled() => break,
+                _ = termination.cancelled() => {
+                    for cancelled in interrupted_close_cancellations.values() {
+                        cancelled.store(true, Ordering::Release);
+                    }
+                    for cancelled in action_cancellations.values() {
+                        cancelled.store(true, Ordering::Release);
+                    }
+                    break;
+                },
                 update = worker_updates_rx.recv() => {
                     let Some(update) = update else { break };
-                    let mut browser_update = None;
-                    let mut queue_update = None;
-                    let progress = match update.payload {
-                        WorkerPollPayload::Events {
-                            events,
-                            phase,
-                            transcript,
-                            queued_prompts: worker_queue,
-                            ..
-                        } => {
-                            browser_update = Some(transcript.browser_transcript(None));
-                            queue_update = Some(worker_queue);
-                            Some((
-                                phase,
-                                hel::hel_recovery::latest_completed_turn_seq(&events),
-                            ))
-                        }
-                        WorkerPollPayload::Hydrated(summary) => {
-                            browser_update = Some(
-                                hel::hel_chat::TranscriptSnapshot::from_entries_at(
-                                    summary.transcript_tail.clone(),
-                                    summary.latest_seq,
-                                )
-                                .browser_transcript(None),
-                            );
-                            queue_update = Some(summary.queued_prompts.clone());
-                            Some((summary.phase, summary.latest_completed_turn_seq))
-                        }
-                        WorkerPollPayload::Connected | WorkerPollPayload::Unreachable { .. } => None,
-                    };
-                    if let Some((phase, latest_completed_turn_seq)) = progress {
+                    if let Err(error) = apply_worker_record_update(&mut controller, &update) {
+                        tracing::warn!(session_id = %update.session_id, "could not persist relay session metadata: {error:#}");
+                    }
+                    if let Some(snapshot) = update.view.snapshot {
                         if let Some(session) = controller.state.sessions.get(&update.session_id).cloned() {
                             recovery_observer
                                 .observe(hel::hel_recovery::RecoveryObservation {
                                     session,
                                     config: controller.config.clone(),
-                                    latest_completed_turn_seq,
-                                    phase,
+                                    latest_completed_turn_ordinal:
+                                        hel::hel_recovery::latest_completed_turn_ordinal(
+                                            &snapshot.materialized,
+                                        ),
+                                    execution: snapshot.materialized.execution,
                                 })
                                 .await;
                         }
-                        conversations.insert(update.session_id.clone(), browser_update.unwrap());
-                        queued_prompts.insert(update.session_id.clone(), queue_update.unwrap());
+                        conversations.insert(
+                            update.session_id.clone(),
+                            hel::hel_chat::TranscriptSnapshot::from_materialized(
+                                &snapshot.materialized,
+                            )
+                            .browser_transcript(None),
+                        );
+                        queued_prompts.insert(
+                            update.session_id.clone(),
+                            queued_prompt_projection(&snapshot.materialized),
+                        );
                         revision += 1;
                         conversation_tx.send_replace(conversations.clone());
                         let _ = snapshot_tx.send(viewer_snapshot(
@@ -943,8 +998,36 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                         let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, revision));
                     }
                 }
+                completed = interrupted_close_rx.recv() => {
+                    let Some(completed) = completed else { continue; };
+                    active_actions.remove(&completed.session_id);
+                    interrupted_close_cancellations.remove(&completed.session_id);
+                    if let Err(error) = &completed.result {
+                        tracing::warn!(session_id = %completed.session_id, "could not resume interrupted close: {error}");
+                    }
+                    if let Err(error) = controller.reload() {
+                        tracing::warn!(%error, "interrupted close completed but controller state could not be reloaded");
+                        continue;
+                    }
+                    worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                    queued_prompts.retain(|session_id, _| {
+                        controller.state.sessions.contains_key(session_id)
+                    });
+                    conversations.retain(|id, _| {
+                        controller.state.sessions.get(id).is_some_and(|session| session.state.is_active())
+                    });
+                    revision += 1;
+                    conversation_tx.send_replace(conversations.clone());
+                    let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, revision));
+                }
                 action = action_rx.recv() => {
                     let Some(request) = action else { break };
+                    if !phone_action_capacity_available(action_cancellations.len()) {
+                        let _ = request.reply.send(Err(
+                            "the controller is at its concurrent phone-action limit; retry shortly".into()
+                        ));
+                        continue;
+                    }
                     let session_id = controller_action_session_id(&request.action);
                     if session_id.as_ref().is_some_and(|id| !active_actions.insert(id.clone())) {
                         let _ = request.reply.send(Err("another operation is already running for this session".into()));
@@ -953,23 +1036,57 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                     let ControllerRequest { action, reply } = request;
                     let done = action_done_tx.clone();
                     let observer = recovery_observer.clone();
+                    let session_control = worker_commands_tx.clone();
+                    next_action_id = next_action_id.wrapping_add(1).max(1);
+                    let action_id = next_action_id;
+                    let cancelled = Arc::new(AtomicBool::new(false));
+                    action_cancellations.insert(action_id, cancelled.clone());
+                    let runtime = tokio::runtime::Handle::current();
                     tokio::spawn(async move {
-                        if let ControllerAction::Prompt { session_id, .. }
-                            | ControllerAction::Close { session_id } = &action
-                        {
-                            observer.wait_idle(session_id).await;
+                        let joined = tokio::task::spawn_blocking(move || {
+                            let result = (|| -> Result<()> {
+                                let _recovery_reservation = match &action {
+                                    ControllerAction::Prompt { session_id, .. }
+                                    | ControllerAction::Close { session_id }
+                                    | ControllerAction::Resume { session_id, .. }
+                                    | ControllerAction::RemoveQueuedPrompt { session_id, .. } => {
+                                        Some(reserve_recovery_or_cancel(
+                                            &observer,
+                                            session_id,
+                                            &cancelled,
+                                        )?)
+                                    }
+                                    ControllerAction::New { .. }
+                                    | ControllerAction::Open { .. }
+                                    | ControllerAction::Read { .. } => None,
+                                };
+                                if cancelled.load(Ordering::Acquire) {
+                                    bail!("phone action cancelled");
+                                }
+                                let mut operation_controller = Controller::load()?;
+                                let executor = CancellableProcessExecutor::new(cancelled);
+                                runtime.block_on(apply_phone_action(
+                                    &mut operation_controller,
+                                    &session_control,
+                                    action,
+                                    &executor,
+                                ))
+                            })();
+                            result.map_err(|error| format!("{error:#}"))
+                        })
+                        .await;
+                        let result = match joined {
+                            Ok(result) => result,
+                            Err(error) => Err(format!("phone action task failed: {error}")),
+                        };
+                        if done.send((action_id, session_id, reply, result)).is_err() {
+                            tracing::debug!(action_id, "phone action finished after the server stopped");
                         }
-                        let result = async {
-                            let mut operation_controller = Controller::load()?;
-                            apply_phone_action(&mut operation_controller, action).await
-                        }
-                        .await
-                        .map_err(|error| format!("{error:#}"));
-                        let _ = done.send((session_id, reply, result));
                     });
                 }
                 completed = action_done_rx.recv() => {
-                    let Some((session_id, reply, result)) = completed else { break };
+                    let Some((action_id, session_id, reply, result)) = completed else { break };
+                    action_cancellations.remove(&action_id);
                     if let Some(session_id) = session_id {
                         active_actions.remove(&session_id);
                     }
@@ -1008,11 +1125,21 @@ fn controller_action_session_id(action: &ControllerAction) -> Option<String> {
         | ControllerAction::Close { session_id }
         | ControllerAction::Resume { session_id, .. }
         | ControllerAction::Open { session_id }
+        | ControllerAction::Read { session_id, .. }
         | ControllerAction::RemoveQueuedPrompt { session_id, .. } => Some(session_id.clone()),
     }
 }
 
-async fn apply_phone_action(controller: &mut Controller, action: ControllerAction) -> Result<()> {
+fn phone_action_capacity_available(active_actions: usize) -> bool {
+    active_actions < MAX_CONCURRENT_PHONE_ACTIONS
+}
+
+async fn apply_phone_action(
+    controller: &mut Controller,
+    sessions: &SessionManagerControl,
+    action: ControllerAction,
+    executor: &(impl CommandExecutor + Sync),
+) -> Result<()> {
     match action {
         ControllerAction::New {
             profile_id,
@@ -1020,69 +1147,101 @@ async fn apply_phone_action(controller: &mut Controller, action: ControllerActio
             target_id,
             title,
         } => match controller.register_session(&profile_id, &bundle_id, &target_id, title) {
-            Ok(session_id) => controller.provision_session(&session_id).await,
+            Ok(session_id) => {
+                controller
+                    .provision_session_controlled(&session_id, executor)
+                    .await
+            }
             Err(error) => Err(error),
         },
         ControllerAction::Prompt { session_id, text } => {
-            let spec = controller.reconnect_command(&session_id)?;
-            let mut client = WorkerClient::connect(&spec, &session_id).await?;
-            client.enqueue_prompt(text, Vec::new()).await?;
-            client.detach().await
+            sessions
+                .session(&session_id)
+                .await?
+                .submit(
+                    new_command_id("phone-prompt")?,
+                    RelayCommand::Prompt {
+                        prompt: vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+                            agent_client_protocol::schema::v1::TextContent::new(text),
+                        )],
+                    },
+                )
+                .await?;
+            Ok(())
         }
-        ControllerAction::Close { session_id } => controller.close_session(&session_id).await,
+        ControllerAction::Close { session_id } => {
+            controller
+                .close_session_managed_controlled(&session_id, executor, sessions)
+                .await
+        }
         ControllerAction::Resume {
             session_id,
             profile_id,
             target_id,
             queue,
-        } => {
-            controller
-                .resume_session_with_queue_disposition(
-                    &session_id,
-                    &profile_id,
-                    &target_id,
-                    queue == ResumeQueueDisposition::Discard,
-                )
-                .await
-        }
+        } => controller
+            .resume_session_controlled(
+                &session_id,
+                &profile_id,
+                &target_id,
+                SessionResumeOptions {
+                    additional_mounts: None,
+                    resource_allocation: None,
+                    discard_queue: queue == ResumeQueueDisposition::Discard,
+                },
+                executor,
+            )
+            .await
+            .map(|_| ()),
         ControllerAction::Open { .. } => Ok(()),
+        ControllerAction::Read {
+            session_id,
+            through,
+        } => controller.mark_session_detached_after(&session_id, through),
         ControllerAction::RemoveQueuedPrompt {
             session_id,
             queue_id,
         } => {
-            let spec = controller.reconnect_command(&session_id)?;
-            let mut client = WorkerClient::connect(&spec, &session_id).await?;
-            client.remove_queued_prompt(queue_id).await?;
-            client.detach().await
+            sessions
+                .session(&session_id)
+                .await?
+                .submit(
+                    new_command_id("phone-remove-prompt")?,
+                    RelayCommand::RemoveQueuedPrompt {
+                        queued_command_id: queue_id,
+                    },
+                )
+                .await?;
+            Ok(())
         }
     }
 }
 
-fn archived_queued_prompts(
+fn persist_imported_session(session: &SessionRecord) -> Result<()> {
+    hel::hel_database::save_session(session)?;
+    let checkpoint = session
+        .checkpoint
+        .as_ref()
+        .context("imported session has no checkpoint")?;
+    let canonical = verify_archive_streaming(&checkpoint.archive_path)?.canonical_session;
+    let materialized = materialized_session_from_canonical(session.id.clone(), &canonical)?;
+    hel::hel_database::save_materialized_session(&materialized)
+}
+
+fn projected_queued_prompts(
     controller: &Controller,
-) -> std::collections::BTreeMap<String, Vec<hel::hel_worker::QueuedPrompt>> {
-    controller
+) -> Result<std::collections::BTreeMap<String, Vec<hel::hel_worker::QueuedPrompt>>> {
+    let queues = hel::hel_database::load_materialized_queued_prompts()?;
+    Ok(controller
         .state
         .sessions
-        .values()
-        .filter_map(|session| {
-            let checkpoint = session.checkpoint.as_ref()?;
-            let archive = read_archive_verified(&checkpoint.archive_path).ok()?;
-            let bytes = archive
-                .payload_by_role(&PayloadRole::CanonicalEvents)
-                .ok()?;
-            let events = bytes
-                .split(|byte| *byte == b'\n')
-                .filter(|line| !line.is_empty())
-                .map(serde_json::from_slice)
-                .collect::<serde_json::Result<Vec<SequencedEvent>>>()
-                .ok()?;
-            Some((
-                session.id.clone(),
-                hel::hel_worker::queued_prompts_from_events(&events),
-            ))
+        .keys()
+        .filter_map(|session_id| {
+            queues
+                .get(session_id)
+                .map(|queue| (session_id.clone(), queued_prompt_entries(queue)))
         })
-        .collect()
+        .collect())
 }
 
 fn viewer_snapshot(
@@ -1250,7 +1409,6 @@ fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPollTarget> {
                 .map(|spec| WorkerPollTarget {
                     session_id: session.id.clone(),
                     spec,
-                    viewed_through: session.last_viewed_event_sequence,
                 })
         })
         .collect()
@@ -1589,319 +1747,13 @@ async fn execute_resource_command(command: &CommandSpec) -> Result<CommandOutput
     Ok(command_output)
 }
 
-fn spawn_dashboard_worker_poller() -> (
+fn spawn_dashboard_worker_poller() -> Result<(
     tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
-    tokio::sync::mpsc::UnboundedReceiver<WorkerPollUpdate>,
-    tokio::sync::mpsc::Sender<WorkerPollCommand>,
-) {
-    spawn_dashboard_worker_poller_with_interval(WORKER_POLL_INTERVAL)
-}
-
-struct CompletedWorkerPoll {
-    worker: WarmWorker,
-    events: Vec<SequencedEvent>,
-    phase: WorkerPhase,
-    transcript: Option<hel::hel_chat::TranscriptSnapshot>,
-    connected: bool,
-    summary: Option<hel::hel_worker::WorkerSessionSummary>,
-}
-
-struct WorkerPollCompletion {
-    target: WorkerPollTarget,
-    result: std::result::Result<CompletedWorkerPoll, String>,
-}
-
-fn spawn_dashboard_worker_poller_with_interval(
-    poll_interval: Duration,
-) -> (
-    tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
-    tokio::sync::mpsc::UnboundedReceiver<WorkerPollUpdate>,
-    tokio::sync::mpsc::Sender<WorkerPollCommand>,
-) {
-    let (targets_tx, mut targets_rx) = tokio::sync::watch::channel(Vec::<WorkerPollTarget>::new());
-    let (updates_tx, updates_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (commands_tx, mut commands_rx) = tokio::sync::mpsc::channel(8);
-    let (completions_tx, mut completions_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        let mut targets: std::collections::BTreeMap<String, WorkerPollTarget> =
-            std::collections::BTreeMap::new();
-        let mut clients: std::collections::BTreeMap<String, WarmWorker> =
-            std::collections::BTreeMap::new();
-        let mut checked_out = std::collections::BTreeSet::new();
-        let mut polling = std::collections::BTreeMap::<String, CommandSpec>::new();
-        let mut pending_checkouts = std::collections::BTreeMap::new();
-        let mut failures: std::collections::BTreeMap<String, (u32, String)> =
-            std::collections::BTreeMap::new();
-        let mut interval = tokio::time::interval(poll_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    for target in targets.values() {
-                        if checked_out.contains(&target.session_id)
-                            || polling.contains_key(&target.session_id)
-                        {
-                            continue;
-                        }
-                        let worker = clients.remove(&target.session_id).filter(|worker| worker.spec == target.spec);
-                        polling.insert(target.session_id.clone(), target.spec.clone());
-                        let target = target.clone();
-                        let completions = completions_tx.clone();
-                        tokio::spawn(async move {
-                            let completion = poll_dashboard_worker(target, worker).await;
-                            let _ = completions.send(completion);
-                        });
-                    }
-                }
-                command = commands_rx.recv() => {
-                    match command {
-                        Some(WorkerPollCommand::Checkout { session_id, reply }) => {
-                            if polling.contains_key(&session_id) {
-                                if let Some(previous) = pending_checkouts.insert(session_id, reply) {
-                                    let _ = previous.send(None);
-                                }
-                            } else {
-                                checked_out.insert(session_id.clone());
-                                let _ = reply.send(clients.remove(&session_id));
-                            }
-                        }
-                        Some(WorkerPollCommand::Checkin { session_id, worker }) => {
-                            checked_out.remove(&session_id);
-                            if let Some(worker) = worker
-                                && targets.get(&session_id).is_some_and(|target| target.spec == worker.spec)
-                            {
-                                clients.insert(session_id, *worker);
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                completion = completions_rx.recv() => {
-                    let Some(completion) = completion else { break };
-                    let session_id = completion.target.session_id.clone();
-                    let current_poll = polling
-                        .get(&session_id)
-                        .is_some_and(|spec| spec == &completion.target.spec);
-                    if current_poll {
-                        polling.remove(&session_id);
-                    }
-                    let target_is_current = current_poll
-                        && targets
-                            .get(&session_id)
-                            .is_some_and(|target| target.spec == completion.target.spec);
-                    if !target_is_current {
-                        if let Some(reply) = pending_checkouts.remove(&session_id) {
-                            if targets.contains_key(&session_id) {
-                                checked_out.insert(session_id);
-                            }
-                            let _ = reply.send(None);
-                        }
-                        continue;
-                    }
-                    match completion.result {
-                        Ok(completed) => {
-                            let recovered = failures.remove(&session_id).is_some();
-                            if let Some(reply) = pending_checkouts.remove(&session_id) {
-                                checked_out.insert(session_id);
-                                let mut worker = completed.worker;
-                                worker.opening_events = completed.events;
-                                let _ = reply.send(Some(worker));
-                                continue;
-                            }
-                            if completed.connected || recovered {
-                                let _ = updates_tx.send(WorkerPollUpdate {
-                                    session_id: session_id.clone(),
-                                    payload: WorkerPollPayload::Connected,
-                                });
-                            }
-                            if let Some(summary) = completed.summary {
-                                let _ = updates_tx.send(WorkerPollUpdate {
-                                    session_id: session_id.clone(),
-                                    payload: WorkerPollPayload::Hydrated(summary),
-                                });
-                            } else if !completed.events.is_empty() || completed.connected {
-                                let _ = updates_tx.send(WorkerPollUpdate {
-                                    session_id: session_id.clone(),
-                                    payload: WorkerPollPayload::Events {
-                                        events: completed.events,
-                                        phase: completed.phase,
-                                        transcript: completed
-                                            .transcript
-                                            .expect("changed worker poll includes transcript"),
-                                        queued_prompts: completed.worker.queued_prompts.clone(),
-                                        received_while_detached: completed.connected,
-                                    },
-                                });
-                            }
-                            clients.insert(session_id, completed.worker);
-                        }
-                        Err(detail) => {
-                            if let Some(reply) = pending_checkouts.remove(&session_id) {
-                                checked_out.insert(session_id.clone());
-                                let _ = reply.send(None);
-                            }
-                            let entry = failures.entry(session_id.clone()).or_insert((0, String::new()));
-                            entry.0 += 1;
-                            entry.1 = detail;
-                            if entry.0 == WORKER_POLL_FAILURE_THRESHOLD {
-                                let _ = updates_tx.send(WorkerPollUpdate {
-                                    session_id,
-                                    payload: WorkerPollPayload::Unreachable {
-                                        detail: entry.1.clone(),
-                                    },
-                                });
-                            }
-                        }
-                    }
-                }
-                changed = targets_rx.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                    targets = targets_rx
-                        .borrow_and_update()
-                        .iter()
-                        .cloned()
-                        .map(|target| (target.session_id.clone(), target))
-                        .collect();
-                    clients.retain(|id, worker| {
-                        targets.get(id).is_some_and(|target| target.spec == worker.spec)
-                    });
-                    checked_out.retain(|id| targets.contains_key(id));
-                    failures.retain(|id, _| targets.contains_key(id));
-                    let stale_pending = pending_checkouts
-                        .keys()
-                        .filter(|id| {
-                            polling
-                                .get(*id)
-                                .zip(targets.get(*id))
-                                .is_none_or(|(polling, target)| polling != &target.spec)
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    for session_id in stale_pending {
-                        if targets.contains_key(&session_id) {
-                            checked_out.insert(session_id.clone());
-                        }
-                        if let Some(reply) = pending_checkouts.remove(&session_id) {
-                            let _ = reply.send(None);
-                        }
-                    }
-                }
-            }
-        }
-    });
-    (targets_tx, updates_rx, commands_tx)
-}
-
-async fn poll_dashboard_worker(
-    target: WorkerPollTarget,
-    worker: Option<WarmWorker>,
-) -> WorkerPollCompletion {
-    let connected = worker.is_none();
-    let result = async {
-        let (worker, events, summary) = match worker {
-            Some(mut worker) => {
-                let events = tokio::time::timeout(WORKER_POLL_TIMEOUT, worker.client.sync())
-                    .await
-                    .context("worker poll timed out")??;
-                worker.chat.apply_events(&events);
-                apply_queued_prompt_events(&mut worker.queued_prompts, &events);
-                (worker, events, None)
-            }
-            None => {
-                let mut client = tokio::time::timeout(
-                    WORKER_CONNECT_TIMEOUT,
-                    WorkerClient::connect(&target.spec, &target.session_id),
-                )
-                .await
-                .context("worker connect timed out")??;
-                if client.protocol_version() >= 3 {
-                    let summary = tokio::time::timeout(
-                        WORKER_CONNECT_TIMEOUT,
-                        client.session_summary(target.viewed_through, 10),
-                    )
-                    .await
-                    .context("worker session summary timed out")??;
-                    let chat = hel::hel_chat::ChatState::from_tail(
-                        target.session_id.clone(),
-                        summary.phase,
-                        summary.latest_seq,
-                        summary.transcript_tail.clone(),
-                    );
-                    (
-                        WarmWorker {
-                            spec: target.spec.clone(),
-                            client,
-                            chat,
-                            queued_prompts: summary.queued_prompts.clone(),
-                            opening_events: Vec::new(),
-                            full_history: false,
-                        },
-                        Vec::new(),
-                        Some(summary),
-                    )
-                } else {
-                    let bootstrap = client
-                        .bootstrap_with_timeout(WORKER_REPLAY_PAGE_TIMEOUT)
-                        .await?;
-                    let events = bootstrap.events.clone();
-                    let chat =
-                        hel::hel_chat::ChatState::new(&bootstrap.snapshot, &bootstrap.events);
-                    (
-                        WarmWorker {
-                            spec: target.spec.clone(),
-                            client,
-                            chat,
-                            queued_prompts: bootstrap.snapshot.queued_prompts.clone(),
-                            opening_events: Vec::new(),
-                            full_history: true,
-                        },
-                        events,
-                        None,
-                    )
-                }
-            }
-        };
-        let phase = worker.chat.phase();
-        let transcript = (summary.is_none() && (connected || !events.is_empty()))
-            .then(|| worker.chat.transcript_snapshot());
-        Ok::<_, anyhow::Error>(CompletedWorkerPoll {
-            worker,
-            events,
-            phase,
-            transcript,
-            connected,
-            summary,
-        })
-    }
-    .await;
-    let result = match result {
-        Ok(completed) => Ok(completed),
-        Err(error) => Err(format!("{error:#}")),
-    };
-    WorkerPollCompletion { target, result }
-}
-
-fn apply_queued_prompt_events(
-    queued: &mut Vec<hel::hel_worker::QueuedPrompt>,
-    events: &[SequencedEvent],
-) {
-    for event in events {
-        match &event.event {
-            hel::hel_worker::WorkerEvent::QueuedPromptAdded { prompt } => {
-                queued.push(prompt.clone());
-            }
-            hel::hel_worker::WorkerEvent::QueuedPromptRemoved { queue_id } => {
-                queued.retain(|prompt| prompt.id != *queue_id);
-            }
-            hel::hel_worker::WorkerEvent::QueuedPromptPromoted { prompt, .. } => {
-                queued.retain(|queued| queued.id != prompt.id);
-            }
-            hel::hel_worker::WorkerEvent::QueuedPromptsCleared => queued.clear(),
-            _ => {}
-        }
-    }
+    SessionManagerUpdates,
+    SessionManagerControl,
+)> {
+    let channels = spawn_session_manager()?;
+    Ok((channels.targets, channels.updates, channels.control))
 }
 
 fn current_epoch_seconds() -> u64 {
@@ -1926,73 +1778,112 @@ fn apply_worker_poll_update(
     dashboard: &mut DashboardState,
     update: WorkerPollUpdate,
 ) -> Result<bool> {
-    let mut latest_message_updated = false;
-    match update.payload {
-        WorkerPollPayload::Connected => {
-            if let Some(session) = controller.state.sessions.get_mut(&update.session_id)
-                && session.state == SessionState::Error
-                && session
-                    .last_error
-                    .as_deref()
-                    .is_some_and(|message| message.starts_with("worker unreachable:"))
-            {
-                session.state = SessionState::Running;
-                session.last_error = None;
-                hel::hel_database::save_session(session)?;
-                dashboard.set_state(controller.state.clone());
-            }
-        }
-        WorkerPollPayload::Events {
-            events,
-            phase,
-            transcript,
-            received_while_detached,
-            queued_prompts,
-        } => {
-            if let Some(title) = harness_session_title(&events)
-                && let Some(session) = controller.state.sessions.get_mut(&update.session_id)
-                && session.acp_session_title.as_deref() != Some(&title)
-            {
-                session.acp_session_title = Some(title);
-                hel::hel_database::save_session(session)?;
-                dashboard.set_state(controller.state.clone());
-            }
-            latest_message_updated = dashboard.apply_worker_update(
-                &update.session_id,
-                &events,
-                phase,
-                current_epoch_seconds(),
-                received_while_detached,
-            );
-            dashboard.apply_transcript(&update.session_id, transcript);
-            dashboard.apply_queued_prompts(&update.session_id, queued_prompts);
-        }
-        WorkerPollPayload::Hydrated(summary) => {
-            if let Some(title) = summary.session_title.as_ref()
-                && let Some(session) = controller.state.sessions.get_mut(&update.session_id)
-                && session.acp_session_title.as_deref() != Some(title)
-            {
-                session.acp_session_title = Some(title.clone());
-                controller.state.save()?;
-                dashboard.set_state(controller.state.clone());
-            }
-            dashboard.apply_worker_summary(&update.session_id, summary, current_epoch_seconds());
-        }
-        WorkerPollPayload::Unreachable { detail } => {
-            dashboard.mark_transcript_unavailable(&update.session_id);
-            let diagnosis = controller.diagnose_worker(&update.session_id);
-            let mut message = format!("worker unreachable: {detail}");
-            if let Some(diagnosis) = diagnosis {
-                message.push_str("; ");
-                message.push_str(&diagnosis);
-            }
-            dashboard.set_notice(format!(
-                "Session {}: {message}",
-                &update.session_id[..update.session_id.len().min(8)]
-            ));
-        }
+    if apply_worker_record_update(controller, &update)? {
+        dashboard.set_state(controller.state.clone());
     }
-    Ok(latest_message_updated)
+    if let Some(snapshot) = update.view.snapshot.as_ref() {
+        dashboard.apply_materialized_session(&snapshot.materialized);
+    }
+    if let Some(detail) = update.view.error {
+        dashboard.mark_transcript_unavailable(&update.session_id);
+        dashboard.set_notice(format!(
+            "Session {}: relay unreachable: {detail}; collecting worker diagnostics…",
+            &update.session_id[..update.session_id.len().min(8)]
+        ));
+    }
+    Ok(update.view.snapshot.is_some())
+}
+
+fn apply_worker_record_update(
+    controller: &mut Controller,
+    update: &WorkerPollUpdate,
+) -> Result<bool> {
+    let Some(snapshot) = update.view.snapshot.as_ref() else {
+        return Ok(false);
+    };
+    let Some(session) = controller.state.sessions.get(&update.session_id) else {
+        return Ok(false);
+    };
+    let changed_title = (session.acp_session_title != snapshot.materialized.session_title)
+        .then(|| snapshot.materialized.session_title.clone());
+    let reconnect_observed = update.view.connected
+        && session.state == SessionState::Error
+        && session
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.starts_with("relay unreachable:"));
+    let mut changed = false;
+    if let Some(title) = changed_title {
+        hel::hel_database::set_session_acp_title(&update.session_id, title.as_deref())?;
+        controller
+            .state
+            .sessions
+            .get_mut(&update.session_id)
+            .expect("session disappeared while updating its ACP title")
+            .acp_session_title = title;
+        changed = true;
+    }
+    if reconnect_observed && hel::hel_database::mark_session_relay_reconnected(&update.session_id)?
+    {
+        let session = controller
+            .state
+            .sessions
+            .get_mut(&update.session_id)
+            .expect("session disappeared while recording relay reconnection");
+        session.state = SessionState::Running;
+        session.last_error = None;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn spawn_worker_diagnosis(
+    controller: &Controller,
+    session_id: String,
+    episode_id: u64,
+    updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+) {
+    let diagnostic_controller = Controller {
+        config: controller.config.clone(),
+        state: controller.state.clone(),
+    };
+    tokio::spawn(async move {
+        let task_session_id = session_id.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let executor = CancellableProcessExecutor::with_timeout(WORKER_DIAGNOSIS_TIMEOUT);
+            diagnostic_controller.diagnose_worker_controlled(&task_session_id, &executor)
+        })
+        .await;
+        let result = joined.map_err(|error| format!("worker diagnosis task failed: {error}"));
+        if updates
+            .send(DashboardIoUpdate::WorkerDiagnosis {
+                session_id: session_id.clone(),
+                episode_id,
+                result,
+            })
+            .is_err()
+        {
+            tracing::debug!(%session_id, "worker diagnosis finished after the dashboard stopped");
+        }
+    });
+}
+
+fn queued_prompt_projection(session: &MaterializedSession) -> Vec<hel::hel_worker::QueuedPrompt> {
+    queued_prompt_entries(&session.queued_prompts)
+}
+
+fn queued_prompt_entries(
+    prompts: &[hel::hel_state::MaterializedQueuedPrompt],
+) -> Vec<hel::hel_worker::QueuedPrompt> {
+    prompts
+        .iter()
+        .map(|prompt| hel::hel_worker::QueuedPrompt {
+            id: prompt.command_id.clone(),
+            text: hel::hel_chat::materialized_content_text(&prompt.content),
+            attachments: Vec::new(),
+            created_at_ms: prompt.queued_at_ms,
+        })
+        .collect()
 }
 
 fn apply_recovery_result(
@@ -2017,27 +1908,37 @@ fn merge_recovery_result(
     controller: &mut Controller,
     result: hel::hel_recovery::RecoveryResult,
 ) -> bool {
-    let Some(session) = controller.state.sessions.get_mut(&result.session_id) else {
-        return false;
-    };
-    if session.target.as_ref() != Some(&result.expected_target) || !session.state.is_active() {
+    let hel::hel_recovery::RecoveryResult {
+        session_id,
+        expected_target,
+        outcome,
+    } = result;
+    if let Err(error) = controller.reload() {
+        tracing::warn!(%session_id, "could not reload a completed recovery checkpoint: {error:#}");
         return false;
     }
-    match result.outcome {
+    let Some(session) = controller.state.sessions.get_mut(&session_id) else {
+        return false;
+    };
+    if session.target.as_ref() != Some(&expected_target) || !session.state.is_active() {
+        return false;
+    }
+    match outcome {
         Ok(artifact) => {
-            session.native_session_id = Some(artifact.native_session_id);
-            session.checkpoint = Some(artifact.metadata.clone());
-            session.last_checkpoint_error = None;
-            if let Some(previous) = result
-                .previous_checkpoint
-                .filter(|previous| previous.archive_path != artifact.metadata.archive_path)
-                && let Err(error) = std::fs::remove_file(&previous.archive_path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(path = %previous.archive_path.display(), "could not remove superseded recovery copy: {error}");
+            if session.checkpoint.as_ref() != Some(&artifact.metadata) {
+                tracing::warn!(
+                    %session_id,
+                    "recovery checkpoint result no longer matches the durable session record; retaining both archives"
+                );
+                return false;
             }
         }
-        Err(detail) => session.last_checkpoint_error = Some(detail),
+        Err(detail) => {
+            // record_recovery_failure normally made this durable before the
+            // result was published. Preserve the diagnostic in this view if
+            // that write itself failed; later reloads remain authoritative.
+            session.last_checkpoint_error = Some(detail);
+        }
     }
     true
 }
@@ -2102,7 +2003,7 @@ enum LifecycleSuccess {
     Resumed {
         profile_id: String,
         target_id: String,
-        bootstrap: Box<WorkerBootstrap>,
+        materialized: Box<MaterializedSession>,
     },
     Closed,
     Destroyed,
@@ -2115,7 +2016,72 @@ struct LifecycleUpdate {
     result: std::result::Result<LifecycleSuccess, String>,
 }
 
+fn interrupted_close_session_ids(controller: &Controller) -> Vec<String> {
+    controller
+        .state
+        .sessions
+        .values()
+        .filter(|session| {
+            matches!(
+                session.state,
+                SessionState::Closing | SessionState::Destroying
+            ) && session.target.is_some()
+        })
+        .map(|session| session.id.clone())
+        .collect()
+}
+
+fn spawn_interrupted_close_recovery(
+    session_id: String,
+    session_manager: SessionManagerControl,
+    recovery_observer: hel::hel_recovery::RecoveryObserver,
+    cancelled: Arc<AtomicBool>,
+    updates: tokio::sync::mpsc::UnboundedSender<LifecycleUpdate>,
+) {
+    let runtime = tokio::runtime::Handle::current();
+    tokio::spawn(async move {
+        let operation_session_id = session_id.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            (|| -> Result<()> {
+                let _recovery_reservation = reserve_recovery_or_cancel(
+                    &recovery_observer,
+                    &operation_session_id,
+                    &cancelled,
+                )?;
+                let mut controller = Controller::load()?;
+                let executor = CancellableProcessExecutor::new(cancelled);
+                runtime.block_on(controller.recover_interrupted_close_managed(
+                    &operation_session_id,
+                    &executor,
+                    &session_manager,
+                ))
+            })()
+            .map(|()| LifecycleSuccess::Closed)
+            .map_err(|error| format!("{error:#}"))
+        })
+        .await;
+        let result = match joined {
+            Ok(result) => result,
+            Err(error) => Err(format!("interrupted close recovery task failed: {error}")),
+        };
+        if updates
+            .send(LifecycleUpdate {
+                session_id: session_id.clone(),
+                result,
+            })
+            .is_err()
+        {
+            tracing::debug!(%session_id, "interrupted close finished after its controller stopped");
+        }
+    });
+}
+
 enum DashboardIoUpdate {
+    WorkerDiagnosis {
+        session_id: String,
+        episode_id: u64,
+        result: std::result::Result<Option<String>, String>,
+    },
     MountCompletions {
         prefix: String,
         result: std::result::Result<Vec<String>, String>,
@@ -2234,7 +2200,7 @@ async fn run_dashboard() -> Result<()> {
         controller.state.clone(),
         std::collections::BTreeMap::new(),
     );
-    for (session_id, queued) in archived_queued_prompts(&controller) {
+    for (session_id, queued) in projected_queued_prompts(&controller)? {
         dashboard.apply_queued_prompts(&session_id, queued);
     }
     dashboard.set_greeting(greeting);
@@ -2256,9 +2222,38 @@ async fn run_dashboard() -> Result<()> {
     let (quota_profiles_tx, mut quota_updates_rx) = spawn_dashboard_quota_refresher();
     request_dashboard_quota_refresh(&controller, &mut dashboard, &quota_profiles_tx);
     let (worker_targets_tx, mut worker_updates_rx, worker_commands_tx) =
-        spawn_dashboard_worker_poller();
-    let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn();
+        spawn_dashboard_worker_poller()?;
+    worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+    let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn(worker_commands_tx.clone());
     let recovery_observer = recovery.observer();
+    let (lifecycle_updates_tx, mut lifecycle_updates_rx) =
+        tokio::sync::mpsc::unbounded_channel::<LifecycleUpdate>();
+    let mut lifecycle_operations =
+        std::collections::BTreeMap::<String, ActiveLifecycleOperation>::new();
+    for session_id in interrupted_close_session_ids(&controller) {
+        let state = controller.state.sessions[&session_id].state;
+        let kind = if state == SessionState::Destroying {
+            SessionOperationKind::Destroying
+        } else {
+            SessionOperationKind::Pausing
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        lifecycle_operations.insert(
+            session_id.clone(),
+            ActiveLifecycleOperation {
+                cancelled: cancelled.clone(),
+                kind,
+            },
+        );
+        dashboard.begin_session_operation(session_id.clone(), kind, None);
+        spawn_interrupted_close_recovery(
+            session_id,
+            worker_commands_tx.clone(),
+            recovery_observer.clone(),
+            cancelled,
+            lifecycle_updates_tx.clone(),
+        );
+    }
     let (resource_targets_tx, resource_triggers_tx, mut resource_updates_rx) =
         spawn_dashboard_resource_poller();
     let (capacity_targets_tx, mut capacity_updates_rx) = spawn_dashboard_capacity_poller();
@@ -2286,12 +2281,9 @@ async fn run_dashboard() -> Result<()> {
     let mut quit_detached = false;
     let mut next_import_task_id = 0_u64;
     let mut active_import: Option<ActiveDashboardImport> = None;
-    let (lifecycle_updates_tx, mut lifecycle_updates_rx) =
-        tokio::sync::mpsc::unbounded_channel::<LifecycleUpdate>();
     let (dashboard_io_tx, mut dashboard_io_rx) =
         tokio::sync::mpsc::unbounded_channel::<DashboardIoUpdate>();
-    let mut lifecycle_operations =
-        std::collections::BTreeMap::<String, ActiveLifecycleOperation>::new();
+    let mut worker_diagnoses = WorkerDiagnosisTracker::default();
     let termination = hel::termination::Coordinator::install().token();
 
     loop {
@@ -2308,40 +2300,41 @@ async fn run_dashboard() -> Result<()> {
         }
         while let Ok(update) = worker_updates_rx.try_recv() {
             let session_id = update.session_id.clone();
-            if let WorkerPollPayload::Events { events, phase, .. } = &update.payload
+            let connected = update.view.connected;
+            let connection_error = update.view.error.clone();
+            if let Some(snapshot) = update.view.snapshot.as_ref()
                 && let Some(session) = controller.state.sessions.get(&session_id).cloned()
             {
                 recovery_observer
                     .observe(hel::hel_recovery::RecoveryObservation {
                         session,
                         config: controller.config.clone(),
-                        latest_completed_turn_seq: hel::hel_recovery::latest_completed_turn_seq(
-                            events,
-                        ),
-                        phase: *phase,
-                    })
-                    .await;
-            } else if let WorkerPollPayload::Hydrated(summary) = &update.payload
-                && let Some(sequence) = summary.latest_completed_turn_seq
-                && let Some(session) = controller.state.sessions.get(&session_id).cloned()
-            {
-                recovery_observer
-                    .observe(hel::hel_recovery::RecoveryObservation {
-                        session,
-                        config: controller.config.clone(),
-                        latest_completed_turn_seq: Some(sequence),
-                        phase: summary.phase,
+                        latest_completed_turn_ordinal:
+                            hel::hel_recovery::latest_completed_turn_ordinal(
+                                &snapshot.materialized,
+                            ),
+                        execution: snapshot.materialized.execution,
                     })
                     .await;
             }
             match apply_worker_poll_update(&mut controller, &mut dashboard, update) {
                 Ok(true) => {
-                    let _ = resource_triggers_tx.try_send(session_id);
+                    let _ = resource_triggers_tx.try_send(session_id.clone());
                 }
                 Ok(false) => {}
                 Err(error) => {
                     dashboard.set_notice(format!("Could not save harness title: {error:#}"));
                 }
+            }
+            if let Some(episode_id) =
+                worker_diagnoses.observe(&session_id, connected, connection_error)
+            {
+                spawn_worker_diagnosis(
+                    &controller,
+                    session_id,
+                    episode_id,
+                    dashboard_io_tx.clone(),
+                );
             }
         }
         while let Some(result) = recovery.try_result() {
@@ -2424,7 +2417,7 @@ async fn run_dashboard() -> Result<()> {
                                     .sessions
                                     .insert(session.id.clone(), session);
                                 controller.config.save()?;
-                                hel::hel_database::save_session(
+                                persist_imported_session(
                                     controller
                                         .state
                                         .sessions
@@ -2491,11 +2484,9 @@ async fn run_dashboard() -> Result<()> {
                 Ok(LifecycleSuccess::Resumed {
                     profile_id,
                     target_id,
-                    bootstrap,
+                    materialized,
                 }) => {
-                    let chat =
-                        hel::hel_chat::ChatState::new(&bootstrap.snapshot, &bootstrap.events);
-                    dashboard.apply_transcript(&session_id, chat.transcript_snapshot());
+                    dashboard.apply_materialized_session(&materialized);
                     dashboard.select_active_session(&session_id);
                     dashboard.set_notice(format!(
                         "Resumed {} with {profile_id} on {target_id}",
@@ -2544,6 +2535,39 @@ async fn run_dashboard() -> Result<()> {
         }
         while let Ok(update) = dashboard_io_rx.try_recv() {
             match update {
+                DashboardIoUpdate::WorkerDiagnosis {
+                    session_id,
+                    episode_id,
+                    result,
+                } => {
+                    let completion = worker_diagnoses.finish(&session_id, episode_id);
+                    if let Some(error) = completion.display_error {
+                        let mut message = format!("relay unreachable: {error}");
+                        match &result {
+                            Ok(Some(diagnosis)) => {
+                                message.push_str("; ");
+                                message.push_str(diagnosis);
+                            }
+                            Ok(None) => {}
+                            Err(failure) => {
+                                message.push_str("; worker diagnostics failed: ");
+                                message.push_str(failure);
+                            }
+                        }
+                        dashboard
+                            .set_notice(format!("Session {}: {message}", short_id(&session_id)));
+                    } else if let Err(error) = &result {
+                        tracing::warn!(%session_id, "stale worker diagnosis task failed: {error}");
+                    }
+                    if let Some(restart_episode) = completion.restart_episode {
+                        spawn_worker_diagnosis(
+                            &controller,
+                            session_id,
+                            restart_episode,
+                            dashboard_io_tx.clone(),
+                        );
+                    }
+                }
                 DashboardIoUpdate::MountCompletions { prefix, result } => match result {
                     Ok(candidates) => dashboard.apply_mount_source_completions(&prefix, candidates),
                     Err(error) => dashboard.set_notice(format!("Path completion failed: {error}")),
@@ -2892,173 +2916,48 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
             DashboardAction::Open { session_id } => {
-                let session = controller
+                let session_record = controller
                     .state
                     .sessions
                     .get(&session_id)
                     .with_context(|| format!("unknown session {session_id}"))?
                     .clone();
-                let bundle_id = session.bundle_id.clone();
+                let bundle_id = session_record.bundle_id.clone();
                 let recovery_context = hel::hel_recovery::RecoveryContext {
                     observer: recovery_observer.clone(),
-                    session,
+                    session: session_record,
                     config: controller.config.clone(),
                 };
-                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                worker_commands_tx
-                    .send(WorkerPollCommand::Checkout {
-                        session_id: session_id.clone(),
-                        reply: reply_tx,
-                    })
-                    .await
-                    .context("dashboard worker poller stopped")?;
-                let warm = reply_rx.await.context("dashboard worker poller stopped")?;
-                let result = match warm {
-                    Some(mut worker) => {
-                        async {
-                            let spec = worker.spec.clone();
-                            if let Err(error) = apply_worker_poll_update(
-                                &mut controller,
-                                &mut dashboard,
-                                WorkerPollUpdate {
-                                    session_id: session_id.clone(),
-                                    payload: WorkerPollPayload::Connected,
-                                },
-                            ) {
-                                dashboard
-                                    .set_notice(format!("Could not save worker state: {error:#}"));
-                            }
-                            if !worker.opening_events.is_empty() {
-                                recovery_context
-                                    .observe(&worker.opening_events, worker.chat.phase())
-                                    .await;
-                                let update = WorkerPollUpdate {
-                                    session_id: session_id.clone(),
-                                    payload: WorkerPollPayload::Events {
-                                        events: worker.opening_events,
-                                        phase: worker.chat.phase(),
-                                        transcript: worker.chat.transcript_snapshot(),
-                                        queued_prompts: worker.queued_prompts.clone(),
-                                        received_while_detached: true,
-                                    },
-                                };
-                                if let Err(error) = apply_worker_poll_update(
-                                    &mut controller,
-                                    &mut dashboard,
-                                    update,
-                                ) {
-                                    dashboard.set_notice(format!(
-                                        "Could not save harness title: {error:#}"
-                                    ));
-                                }
-                            }
-                            if !worker.full_history {
-                                dashboard.set_notice(format!(
-                                    "Loading complete conversation for {}…",
-                                    short_id(&session_id)
-                                ));
-                                terminal
-                                    .terminal
-                                    .draw(|frame| render(frame, &mut dashboard))?;
-                                let bootstrap = worker
-                                    .client
-                                    .bootstrap_with_timeout(WORKER_REPLAY_PAGE_TIMEOUT)
-                                    .await?;
-                                worker.chat = hel::hel_chat::ChatState::new(
-                                    &bootstrap.snapshot,
-                                    &bootstrap.events,
-                                );
-                                worker.queued_prompts = bootstrap.snapshot.queued_prompts.clone();
-                                worker.full_history = true;
-                            }
-                            hel::hel_chat::run_chat(
-                                &mut terminal.terminal,
-                                worker.client,
-                                Some(worker.chat),
-                                &bundle_id,
-                                Some(recovery_context.clone()),
-                            )
-                            .await
-                            .map(|(exit, client, chat)| {
-                                let queued_prompts = chat.queued_prompt_snapshot();
-                                (
-                                    exit,
-                                    Some(WarmWorker {
-                                        spec,
-                                        client,
-                                        chat,
-                                        queued_prompts,
-                                        opening_events: Vec::new(),
-                                        full_history: true,
-                                    }),
-                                )
-                            })
-                        }
-                        .await
-                    }
-                    None => {
-                        async {
-                            let spec = controller.reconnect_command(&session_id)?;
-                            let client = WorkerClient::connect(&spec, &session_id).await?;
-                            let (exit, client, chat) = hel::hel_chat::run_chat(
-                                &mut terminal.terminal,
-                                client,
-                                None,
-                                &bundle_id,
-                                Some(recovery_context),
-                            )
-                            .await?;
-                            let queued_prompts = chat.queued_prompt_snapshot();
-                            Ok((
-                                exit,
-                                Some(WarmWorker {
-                                    spec,
-                                    client,
-                                    chat,
-                                    queued_prompts,
-                                    opening_events: Vec::new(),
-                                    full_history: true,
-                                }),
-                            ))
-                        }
-                        .await
-                    }
-                };
+                let result = async {
+                    let mut managed = worker_commands_tx.session(session_id.clone()).await?;
+                    let exit = hel::hel_chat::run_chat(
+                        &mut terminal.terminal,
+                        &mut managed,
+                        &bundle_id,
+                        Some(recovery_context),
+                    )
+                    .await?;
+                    Ok::<_, anyhow::Error>((exit, managed.view()))
+                }
+                .await;
                 match result {
-                    Ok((exit, worker)) => {
-                        let (last_seen_event_sequence, quit_after_detach) = match exit {
+                    Ok((exit, view)) => {
+                        let (detached_after_event_ordinal, quit_after_detach) = match exit {
                             hel::hel_chat::ChatExit::Detached {
-                                last_seen_event_sequence,
-                            } => (last_seen_event_sequence, false),
+                                last_seen_event_ordinal,
+                            } => (last_seen_event_ordinal, false),
                             hel::hel_chat::ChatExit::QuitDetached {
-                                last_seen_event_sequence,
-                            } => (last_seen_event_sequence, true),
+                                last_seen_event_ordinal,
+                            } => (last_seen_event_ordinal, true),
                         };
-                        if let Some(worker) = worker.as_ref() {
-                            dashboard.apply_worker_update(
-                                &session_id,
-                                &[],
-                                worker.chat.phase(),
-                                current_epoch_seconds(),
-                                false,
-                            );
-                            dashboard
-                                .apply_transcript(&session_id, worker.chat.transcript_snapshot());
-                            dashboard
-                                .apply_queued_prompts(&session_id, worker.queued_prompts.clone());
+                        if let Some(snapshot) = view.snapshot {
+                            dashboard.apply_materialized_session(&snapshot.materialized);
                         }
-                        worker_commands_tx
-                            .send(WorkerPollCommand::Checkin {
-                                session_id: session_id.clone(),
-                                worker: worker.map(Box::new),
-                            })
-                            .await
-                            .context("dashboard worker poller stopped")?;
                         while let Some(result) = recovery.try_result() {
                             apply_recovery_result(&mut controller, &mut dashboard, result);
                         }
                         let read_result = controller
-                            .mark_session_viewed_through(&session_id, last_seen_event_sequence);
+                            .mark_session_detached_after(&session_id, detached_after_event_ordinal);
                         dashboard.set_state(controller.state.clone());
                         match read_result {
                             Ok(()) => dashboard.clear_notice(),
@@ -3073,14 +2972,7 @@ async fn run_dashboard() -> Result<()> {
                         }
                     }
                     Err(error) => {
-                        worker_commands_tx
-                            .send(WorkerPollCommand::Checkin {
-                                session_id: session_id.clone(),
-                                worker: None,
-                            })
-                            .await
-                            .context("dashboard worker poller stopped")?;
-                        dashboard.set_notice(format!("Could not open session: {error:#}"))
+                        dashboard.set_notice(format!("Could not open session: {error:#}"));
                     }
                 }
             }
@@ -3111,12 +3003,18 @@ async fn run_dashboard() -> Result<()> {
                     },
                 );
                 let updates = lifecycle_updates_tx.clone();
+                let observer = recovery_observer.clone();
                 let operation_session_id = session_id.clone();
                 let operation_profile_id = profile_id.clone();
                 let operation_target_id = target_template_id.clone();
                 let runtime = tokio::runtime::Handle::current();
                 tokio::task::spawn_blocking(move || {
-                    let result = (|| -> Result<WorkerBootstrap> {
+                    let result = (|| -> Result<MaterializedSession> {
+                        let _recovery_reservation = reserve_recovery_or_cancel(
+                            &observer,
+                            &operation_session_id,
+                            &cancelled,
+                        )?;
                         let mut controller = Controller::load()?;
                         let executor = CancellableProcessExecutor::new(cancelled);
                         runtime.block_on(controller.resume_session_controlled(
@@ -3131,10 +3029,10 @@ async fn run_dashboard() -> Result<()> {
                             &executor,
                         ))
                     })()
-                    .map(|bootstrap| LifecycleSuccess::Resumed {
+                    .map(|materialized| LifecycleSuccess::Resumed {
                         profile_id: operation_profile_id,
                         target_id: operation_target_id,
-                        bootstrap: Box::new(bootstrap),
+                        materialized: Box::new(materialized),
                     })
                     .map_err(|error| format!("{error:#}"));
                     let _ = updates.send(LifecycleUpdate {
@@ -3160,21 +3058,23 @@ async fn run_dashboard() -> Result<()> {
                 );
                 let observer = recovery_observer.clone();
                 let updates = lifecycle_updates_tx.clone();
+                let session_manager = worker_commands_tx.clone();
                 let operation_session_id = session_id.clone();
                 let runtime = tokio::runtime::Handle::current();
                 tokio::task::spawn_blocking(move || {
                     let result = (|| -> Result<()> {
-                        while observer.is_busy(&operation_session_id) {
-                            if cancelled.load(Ordering::Acquire) {
-                                bail!("operation cancelled while waiting for recovery copy");
-                            }
-                            std::thread::sleep(Duration::from_millis(25));
-                        }
+                        let _recovery_reservation = reserve_recovery_or_cancel(
+                            &observer,
+                            &operation_session_id,
+                            &cancelled,
+                        )?;
                         let mut controller = Controller::load()?;
                         let executor = CancellableProcessExecutor::new(cancelled.clone());
-                        runtime.block_on(
-                            controller.close_session_controlled(&operation_session_id, &executor),
-                        )
+                        runtime.block_on(controller.close_session_managed_controlled(
+                            &operation_session_id,
+                            &executor,
+                            &session_manager,
+                        ))
                     })()
                     .map(|()| LifecycleSuccess::Closed)
                     .map_err(|error| format!("{error:#}"));
@@ -3238,10 +3138,16 @@ async fn run_dashboard() -> Result<()> {
                         kind: SessionOperationKind::Destroying,
                     },
                 );
+                let observer = recovery_observer.clone();
                 let updates = lifecycle_updates_tx.clone();
                 let operation_session_id = session_id.clone();
                 tokio::task::spawn_blocking(move || {
                     let result = (|| -> Result<()> {
+                        let _recovery_reservation = reserve_recovery_or_cancel(
+                            &observer,
+                            &operation_session_id,
+                            &cancelled,
+                        )?;
                         let mut controller = Controller::load()?;
                         let executor = CancellableProcessExecutor::new(cancelled);
                         controller.force_destroy(&operation_session_id, &executor)
@@ -3268,10 +3174,16 @@ async fn run_dashboard() -> Result<()> {
                         kind: SessionOperationKind::Deleting,
                     },
                 );
+                let observer = recovery_observer.clone();
                 let updates = lifecycle_updates_tx.clone();
                 let operation_session_id = session_id.clone();
                 tokio::task::spawn_blocking(move || {
                     let result = (|| -> Result<()> {
+                        let _recovery_reservation = reserve_recovery_or_cancel(
+                            &observer,
+                            &operation_session_id,
+                            &cancelled,
+                        )?;
                         let mut controller = Controller::load()?;
                         let executor = CancellableProcessExecutor::new(cancelled);
                         controller.force_destroy(&operation_session_id, &executor)?;
@@ -3344,29 +3256,53 @@ async fn run_dashboard() -> Result<()> {
     Ok(())
 }
 
+fn reserve_recovery_or_cancel(
+    observer: &hel::hel_recovery::RecoveryObserver,
+    session_id: &str,
+    cancelled: &AtomicBool,
+) -> Result<hel::hel_recovery::RecoveryReservation> {
+    let reservation = observer.reserve(session_id);
+    while observer.is_busy(session_id) {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("operation cancelled while waiting for recovery copy");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(reservation)
+}
+
 fn delete_archived_session(controller: &mut Controller, session_id: &str) -> Result<()> {
-    let session = controller.state.remove_archived_session(session_id)?;
+    let session = controller
+        .state
+        .sessions
+        .get(session_id)
+        .with_context(|| format!("unknown session {session_id}"))?
+        .clone();
+    if session.state.is_active() {
+        bail!("refusing to delete active session {session_id}");
+    }
     let archive_path = session
         .checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.archive_path.clone());
-    if let Err(error) = hel::hel_database::delete_session(session_id) {
-        controller
-            .state
-            .sessions
-            .insert(session.id.clone(), session);
-        return Err(error).context("delete paused session from state");
-    }
     if let Some(archive_path) = &archive_path
         && let Err(error) = std::fs::remove_file(archive_path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
         return Err(error).with_context(|| {
             format!(
-                "session was deleted, but its recovery archive could not be removed: {}",
+                "recovery archive could not be removed; session metadata was retained for retry: {}",
                 archive_path.display()
             )
         });
+    }
+    let session = controller.state.remove_archived_session(session_id)?;
+    if let Err(error) = hel::hel_database::delete_session(session_id) {
+        controller
+            .state
+            .sessions
+            .insert(session.id.clone(), session);
+        return Err(error).context("delete paused session from state");
     }
     Ok(())
 }
@@ -4007,38 +3943,59 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn slow_worker_poll_does_not_block_another_session_checkout() {
-        let (targets, _updates, commands) =
-            spawn_dashboard_worker_poller_with_interval(Duration::from_millis(10));
-        targets.send_replace(vec![
-            WorkerPollTarget {
-                session_id: "a-slow".into(),
-                spec: CommandSpec::new("sh", ["-c", "sleep 5"]),
-                viewed_through: 0,
-            },
-            WorkerPollTarget {
-                session_id: "b-fast".into(),
-                spec: CommandSpec::new("false", std::iter::empty::<&str>()),
-                viewed_through: 0,
-            },
-        ]);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let (reply, received) = tokio::sync::oneshot::channel();
-        commands
-            .send(WorkerPollCommand::Checkout {
-                session_id: "b-fast".into(),
-                reply,
-            })
-            .await
+    #[test]
+    fn worker_diagnosis_is_coalesced_for_one_unreachable_episode() {
+        let mut tracker = WorkerDiagnosisTracker::default();
+        let episode = tracker
+            .observe("session-1", false, Some("connection refused".into()))
             .unwrap();
 
-        let checked_out = tokio::time::timeout(Duration::from_millis(250), received)
-            .await
-            .expect("checkout should not wait for the unrelated slow worker")
-            .expect("worker poller should answer checkout");
-        assert!(checked_out.is_none());
+        assert_eq!(
+            tracker.observe("session-1", false, Some("still unreachable".into())),
+            None
+        );
+        assert_eq!(
+            tracker.finish("session-1", episode),
+            WorkerDiagnosisCompletion {
+                display_error: Some("still unreachable".into()),
+                restart_episode: None,
+            }
+        );
+        assert_eq!(
+            tracker.observe("session-1", false, Some("third poll".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_worker_diagnosis_is_not_published_after_reconnect() {
+        let mut tracker = WorkerDiagnosisTracker::default();
+        let first = tracker
+            .observe("session-1", false, Some("first outage".into()))
+            .unwrap();
+        assert_eq!(tracker.observe("session-1", true, None), None);
+        assert_eq!(
+            tracker.observe("session-1", false, Some("new outage".into())),
+            None
+        );
+
+        let completion = tracker.finish("session-1", first);
+        assert_eq!(completion.display_error, None);
+        let second = completion.restart_episode.unwrap();
+        assert_eq!(
+            tracker.finish("session-1", second).display_error.as_deref(),
+            Some("new outage")
+        );
+    }
+
+    #[test]
+    fn phone_action_capacity_is_bounded() {
+        assert!(phone_action_capacity_available(
+            MAX_CONCURRENT_PHONE_ACTIONS - 1
+        ));
+        assert!(!phone_action_capacity_available(
+            MAX_CONCURRENT_PHONE_ACTIONS
+        ));
     }
 
     #[test]
@@ -4182,5 +4139,51 @@ mod tests {
             },
         );
         assert!(!configuration_needs_setup(&config));
+    }
+
+    #[test]
+    fn failed_archive_removal_retains_session_metadata_for_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("checkpoint.hel.zip");
+        std::fs::create_dir(&archive_path).unwrap();
+        let session_id = "1123456789abcdef0123456789abcdef";
+        let mut state = HelState::default();
+        state.sessions.insert(
+            session_id.into(),
+            SessionRecord {
+                id: session_id.into(),
+                title: "paused".into(),
+                harness_kind: hel::hel_config::HarnessKind::Codex,
+                last_profile: "codex".into(),
+                bundle_id: "project".into(),
+                project_directory: None,
+                target_template_id: "podman".into(),
+                resource_allocation: None,
+                additional_mounts: Vec::new(),
+                state: SessionState::Archived,
+                target: None,
+                native_session_id: Some("native-session".into()),
+                acp_session_title: None,
+                session_title_override: None,
+                created_at: "2026-08-12T00:00:00Z".into(),
+                updated_at: "2026-08-12T00:00:00Z".into(),
+                detached_after_event_ordinal: 0,
+                last_error: None,
+                last_checkpoint_error: None,
+                checkpoint: Some(hel::hel_state::CheckpointMetadata {
+                    archive_path,
+                    sha256: "a".repeat(64),
+                    created_at: "2026-08-12T00:00:00Z".into(),
+                    event_frontier: 7,
+                }),
+            },
+        );
+        let mut controller = Controller {
+            config: HelConfig::default(),
+            state,
+        };
+
+        assert!(delete_archived_session(&mut controller, session_id).is_err());
+        assert!(controller.state.sessions.contains_key(session_id));
     }
 }

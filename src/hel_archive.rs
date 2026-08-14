@@ -4,6 +4,7 @@
 //! time.  Harness adapters must use a versioned allowlist; recursively copying
 //! a profile home would risk archiving credentials and configuration.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -19,16 +20,19 @@ use zip::write::SimpleFileOptions;
 
 use crate::hel_config::HarnessKind;
 
-pub const ARCHIVE_SCHEMA_VERSION: u32 = 1;
+pub const ARCHIVE_SCHEMA_VERSION: u32 = 2;
 pub const ARCHIVE_FORMAT: &str = "hel-session";
+pub const EVENT_FRONTIER_GENESIS_DIGEST: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 
 const MANIFEST_PATH: &str = "manifest.json";
-const CANONICAL_EVENTS_PATH: &str = "canonical/events.jsonl";
+const CANONICAL_SESSION_PATH: &str = "canonical/session.json";
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionManifest {
     pub id: String,
     pub title: String,
@@ -38,22 +42,23 @@ pub struct SessionManifest {
     pub created_at: String,
     pub checkpointed_at: String,
     pub hel_version: String,
-    pub worker_version: String,
+    pub relay_version: String,
     pub adapter_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BundleManifest {
     pub id: String,
     pub primary_repository: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TargetManifest {
     pub template_id: String,
     pub target_kind: String,
     /// Informational provenance only. It must not contain credentials.
-    #[serde(default)]
     pub details: BTreeMap<String, String>,
 }
 
@@ -64,7 +69,6 @@ pub struct RepositoryMetadata {
     pub origin: String,
     /// Informational provenance. Session deltas exclude every origin ref rather
     /// than a single base, so they record an empty string.
-    #[serde(default)]
     pub base_commit: String,
     pub head_commit: String,
     pub branch: Option<String>,
@@ -80,10 +84,106 @@ pub struct RepositoryManifest {
     pub untracked_tar_path: String,
 }
 
+/// Controller-owned, materialized state captured at a checkpoint barrier.
+///
+/// These types deliberately do not depend on the live ACP or relay types. ACP
+/// content blocks and evolving tool/plan details are stored as JSON values at
+/// the stable archive boundary, while the identity, ordering, and timestamps
+/// needed to rebuild controller state remain explicit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalSessionSnapshot {
+    /// Highest relay event ordinal incorporated into this projection.
+    pub event_frontier: u64,
+    /// Relay-authored rolling digest of the exact event prefix at the frontier.
+    pub event_frontier_digest: String,
+    pub session: CanonicalSessionState,
+    pub transcript: Vec<CanonicalTranscriptItem>,
+    pub queued_prompts: Vec<CanonicalQueuedPrompt>,
+}
+
+impl CanonicalSessionSnapshot {
+    pub fn validate(&self) -> Result<()> {
+        validate_canonical_session(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalSessionState {
+    pub execution: CanonicalExecutionState,
+    /// Monotonic controller projection watermark derived from relay events.
+    pub last_activity_at_ms: Option<i64>,
+    pub session_title: Option<String>,
+    pub configuration: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CanonicalExecutionState {
+    Idle,
+    Running { started_at_ms: i64 },
+    Closing,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalTranscriptItem {
+    pub stable_id: String,
+    /// Ordinal of the event that created this logical transcript item.
+    pub position: u64,
+    /// Ordinal of the most recent content chunk for an agent message. This is
+    /// `None` for every other logical item.
+    pub latest_content_event_ordinal: Option<u64>,
+    pub created_at_ms: i64,
+    pub last_changed_at_ms: i64,
+    pub body: CanonicalTranscriptBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CanonicalTranscriptBody {
+    User {
+        /// ACP content blocks in their JSON representation.
+        content: Vec<serde_json::Value>,
+    },
+    Agent {
+        /// Complete ACP `ContentChunk` values.
+        chunks: Vec<serde_json::Value>,
+        streaming: bool,
+    },
+    Thought {
+        /// Complete ACP `ContentChunk` values.
+        chunks: Vec<serde_json::Value>,
+        streaming: bool,
+    },
+    Tool {
+        /// Complete current ACP `ToolCall` value.
+        call: serde_json::Value,
+    },
+    Plan {
+        /// Complete current ACP `Plan` value.
+        plan: serde_json::Value,
+    },
+    System {
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalQueuedPrompt {
+    pub command_id: String,
+    /// ACP prompt content blocks in their JSON representation.
+    pub content: Vec<serde_json::Value>,
+    pub queued_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PayloadRole {
-    CanonicalEvents,
+    CanonicalSession,
     NativeArtifact { relative_path: PathBuf },
     GitBundle { repository_id: String },
     GitStagedPatch { repository_id: String },
@@ -92,6 +192,7 @@ pub enum PayloadRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PayloadDescriptor {
     pub path: String,
     pub sha256: String,
@@ -101,6 +202,7 @@ pub struct PayloadDescriptor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArchiveManifest {
     pub schema_version: u32,
     pub format: String,
@@ -132,7 +234,7 @@ pub struct ArchiveInput {
     pub session: SessionManifest,
     pub target: TargetManifest,
     pub bundle: BundleManifest,
-    pub canonical_events: Vec<u8>,
+    pub canonical_session: CanonicalSessionSnapshot,
     pub native_artifacts: Vec<NativeArtifact>,
     pub repositories: Vec<RepositorySnapshot>,
 }
@@ -162,6 +264,25 @@ impl VerifiedArchive {
             .ok_or_else(|| anyhow!("archive does not contain payload role {role:?}"))?;
         self.payload(descriptor)
     }
+
+    pub fn canonical_session(&self) -> Result<CanonicalSessionSnapshot> {
+        let snapshot: CanonicalSessionSnapshot =
+            serde_json::from_slice(self.payload_by_role(&PayloadRole::CanonicalSession)?)
+                .context("parse canonical session snapshot")?;
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+}
+
+/// Fully verified archive metadata for callers that do not need to restore
+/// payload bodies. Verification streams repository and native payloads instead
+/// of retaining them, so memory is bounded by the manifest, canonical session,
+/// and ZIP read buffers rather than the archive's expanded size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedArchiveMetadata {
+    pub manifest: ArchiveManifest,
+    pub canonical_session: CanonicalSessionSnapshot,
+    pub archive_sha256: String,
 }
 
 #[derive(Debug)]
@@ -181,9 +302,9 @@ impl CloseVerification {
 }
 
 #[derive(Debug)]
-struct PendingPayload {
+struct PendingPayload<'a> {
     descriptor: PayloadDescriptor,
-    data: Vec<u8>,
+    data: Cow<'a, [u8]>,
 }
 
 /// Writes, fsyncs, atomically replaces, reopens, and verifies an archive.
@@ -191,7 +312,7 @@ struct PendingPayload {
 /// Success means it is safe for the caller's close state machine to tear down
 /// the target. Failure leaves an existing destination untouched whenever the
 /// failure occurs before the final same-directory rename.
-pub fn write_archive_atomic(path: &Path, input: &ArchiveInput) -> Result<VerifiedArchive> {
+pub fn write_archive_atomic(path: &Path, input: &ArchiveInput) -> Result<VerifiedArchiveMetadata> {
     let (manifest, payloads) = prepare_archive(input)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
@@ -211,8 +332,10 @@ pub fn write_archive_atomic(path: &Path, input: &ArchiveInput) -> Result<Verifie
         .with_context(|| format!("atomically replace {}", path.display()))?;
     restrict_archive_permissions(path)?;
     sync_directory(parent)?;
+    drop(payloads);
+    drop(manifest);
 
-    read_archive_verified(path)
+    verify_archive_streaming(path)
         .with_context(|| format!("verify newly written archive {}", path.display()))
 }
 
@@ -228,23 +351,45 @@ pub fn checkpoint_for_close(path: &Path, input: &ArchiveInput) -> CloseVerificat
 
 pub fn read_archive_verified(path: &Path) -> Result<VerifiedArchive> {
     let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let archive_sha256 = digest_reader(&mut file)?;
+    let contents = read_verified_zip(&mut file, PayloadRetention::All)?;
     file.seek(SeekFrom::Start(0))?;
-    read_verified_zip(file, archive_sha256)
+    Ok(VerifiedArchive {
+        manifest: contents.manifest,
+        payloads: contents.payloads,
+        archive_sha256: digest_reader(&mut file)?,
+    })
 }
 
-fn prepare_archive(input: &ArchiveInput) -> Result<(ArchiveManifest, Vec<PendingPayload>)> {
+/// Verify an archive without materializing repository or native payloads.
+/// Every ZIP entry is still fully read, hashed, and checked; Git untracked
+/// payloads are parsed through the same path-safety validator while streaming.
+pub fn verify_archive_streaming(path: &Path) -> Result<VerifiedArchiveMetadata> {
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let contents = read_verified_zip(&mut file, PayloadRetention::CanonicalOnly)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(VerifiedArchiveMetadata {
+        manifest: contents.manifest,
+        canonical_session: contents.canonical_session,
+        archive_sha256: digest_reader(&mut file)?,
+    })
+}
+
+fn prepare_archive(input: &ArchiveInput) -> Result<(ArchiveManifest, Vec<PendingPayload<'_>>)> {
     ensure!(!input.session.id.trim().is_empty(), "session id is empty");
     ensure!(!input.bundle.id.trim().is_empty(), "bundle id is empty");
     validate_secret_free_map(&input.target.details)?;
+    input.canonical_session.validate()?;
 
     let mut payloads = Vec::new();
     push_payload(
         &mut payloads,
-        CANONICAL_EVENTS_PATH.to_string(),
-        input.canonical_events.clone(),
+        CANONICAL_SESSION_PATH.to_string(),
+        Cow::Owned(
+            serde_json::to_vec_pretty(&input.canonical_session)
+                .context("serialize canonical session snapshot")?,
+        ),
         0o600,
-        PayloadRole::CanonicalEvents,
+        PayloadRole::CanonicalSession,
     )?;
 
     for artifact in &input.native_artifacts {
@@ -254,7 +399,7 @@ fn prepare_archive(input: &ArchiveInput) -> Result<(ArchiveManifest, Vec<Pending
         push_payload(
             &mut payloads,
             archive_path,
-            artifact.data.clone(),
+            Cow::Borrowed(artifact.data.as_slice()),
             artifact.mode,
             PayloadRole::NativeArtifact {
                 relative_path: artifact.relative_path.clone(),
@@ -314,7 +459,13 @@ fn prepare_archive(input: &ArchiveInput) -> Result<(ArchiveManifest, Vec<Pending
                 },
             ),
         ] {
-            push_payload(&mut payloads, path.clone(), data.clone(), 0o600, role)?;
+            push_payload(
+                &mut payloads,
+                path.clone(),
+                Cow::Borrowed(data.as_slice()),
+                0o600,
+                role,
+            )?;
         }
         repositories.push(RepositoryManifest {
             metadata: repository.metadata.clone(),
@@ -353,10 +504,10 @@ fn prepare_archive(input: &ArchiveInput) -> Result<(ArchiveManifest, Vec<Pending
     Ok((manifest, payloads))
 }
 
-fn push_payload(
-    payloads: &mut Vec<PendingPayload>,
+fn push_payload<'a>(
+    payloads: &mut Vec<PendingPayload<'a>>,
     path: String,
-    data: Vec<u8>,
+    data: Cow<'a, [u8]>,
     mode: u32,
     role: PayloadRole,
 ) -> Result<()> {
@@ -379,7 +530,7 @@ fn push_payload(
 fn write_zip(
     output: &mut File,
     manifest: &ArchiveManifest,
-    payloads: &[PendingPayload],
+    payloads: &[PendingPayload<'_>],
 ) -> Result<()> {
     let mut writer = zip::ZipWriter::new(output);
     let manifest_bytes =
@@ -412,9 +563,59 @@ fn write_zip(
     Ok(())
 }
 
-fn read_verified_zip<R: Read + Seek>(reader: R, archive_sha256: String) -> Result<VerifiedArchive> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayloadRetention {
+    All,
+    CanonicalOnly,
+}
+
+struct VerifiedZipContents {
+    manifest: ArchiveManifest,
+    canonical_session: CanonicalSessionSnapshot,
+    payloads: BTreeMap<String, Vec<u8>>,
+}
+
+fn read_verified_zip<R: Read + Seek>(
+    reader: R,
+    retention: PayloadRetention,
+) -> Result<VerifiedZipContents> {
     let mut archive = zip::ZipArchive::new(reader).context("open Hel archive ZIP")?;
-    let mut raw_entries = BTreeMap::<String, (Vec<u8>, u32)>::new();
+    let manifest_count = (0..archive.len()).try_fold(0_usize, |count, index| {
+        let entry = archive
+            .by_index(index)
+            .with_context(|| format!("read ZIP entry metadata {index}"))?;
+        Ok::<_, anyhow::Error>(count + usize::from(entry.name() == MANIFEST_PATH))
+    })?;
+    ensure!(
+        manifest_count == 1,
+        "archive must contain exactly one {MANIFEST_PATH}"
+    );
+    let manifest_bytes = {
+        let mut entry = archive
+            .by_name(MANIFEST_PATH)
+            .with_context(|| format!("archive is missing {MANIFEST_PATH}"))?;
+        ensure!(!entry.is_dir(), "archive manifest is a directory entry");
+        ensure!(
+            entry.size() <= MAX_MANIFEST_BYTES,
+            "archive manifest is too large"
+        );
+        let mut bytes = Vec::with_capacity(entry.size().min(usize::MAX as u64) as usize);
+        entry
+            .read_to_end(&mut bytes)
+            .context("read archive manifest")?;
+        bytes
+    };
+    let manifest = parse_archive_manifest(&manifest_bytes)?;
+
+    let descriptors = manifest
+        .payloads
+        .iter()
+        .map(|descriptor| (descriptor.path.as_str(), descriptor))
+        .collect::<BTreeMap<_, _>>();
+    let expected_paths = descriptors.keys().copied().collect::<BTreeSet<_>>();
+    let mut actual_paths = BTreeSet::<String>::new();
+    let mut payloads = BTreeMap::new();
+    let mut canonical_session = None;
     let mut total_size = 0_u64;
     for index in 0..archive.len() {
         let mut entry = archive
@@ -442,52 +643,24 @@ fn read_verified_zip<R: Read + Seek>(reader: R, archive_sha256: String) -> Resul
             "archive expanded size exceeds limit"
         );
         let name = slash_path(&enclosed)?;
-        let mode = entry.unix_mode().unwrap_or(0o600) & 0o7777;
-        let mut bytes = Vec::with_capacity(entry.size().min(usize::MAX as u64) as usize);
-        entry
-            .read_to_end(&mut bytes)
-            .with_context(|| format!("read ZIP entry '{name}'"))?;
         ensure!(
-            raw_entries.insert(name.clone(), (bytes, mode)).is_none(),
+            actual_paths.insert(name.clone()),
             "duplicate ZIP entry '{name}'"
         );
-    }
-
-    let (manifest_bytes, _) = raw_entries
-        .remove(MANIFEST_PATH)
-        .ok_or_else(|| anyhow!("archive is missing {MANIFEST_PATH}"))?;
-    ensure!(
-        manifest_bytes.len() as u64 <= MAX_MANIFEST_BYTES,
-        "archive manifest is too large"
-    );
-    let manifest: ArchiveManifest =
-        serde_json::from_slice(&manifest_bytes).context("parse archive manifest")?;
-    validate_manifest(&manifest)?;
-
-    let expected_paths: BTreeSet<_> = manifest
-        .payloads
-        .iter()
-        .map(|descriptor| descriptor.path.as_str())
-        .collect();
-    let actual_paths: BTreeSet<_> = raw_entries.keys().map(String::as_str).collect();
-    ensure!(
-        expected_paths == actual_paths,
-        "archive payload list does not match manifest"
-    );
-
-    let mut payloads = BTreeMap::new();
-    for descriptor in &manifest.payloads {
-        let (bytes, mode) = raw_entries
-            .remove(&descriptor.path)
-            .ok_or_else(|| anyhow!("missing payload '{}'", descriptor.path))?;
+        if name == MANIFEST_PATH {
+            ensure!(
+                entry.size() == manifest_bytes.len() as u64,
+                "archive manifest size changed while it was read"
+            );
+            continue;
+        }
+        let descriptor = descriptors
+            .get(name.as_str())
+            .ok_or_else(|| anyhow!("archive contains unlisted payload '{name}'"))?;
+        let mode = entry.unix_mode().unwrap_or(0o600) & 0o7777;
         ensure!(
-            bytes.len() as u64 == descriptor.size,
+            entry.size() == descriptor.size,
             "size mismatch for payload '{}'",
-            descriptor.path
-        );
-        ensure!(
-            digest_bytes(&bytes) == descriptor.sha256,
-            "SHA-256 mismatch for payload '{}'",
             descriptor.path
         );
         ensure!(
@@ -495,24 +668,137 @@ fn read_verified_zip<R: Read + Seek>(reader: R, archive_sha256: String) -> Resul
             "mode mismatch for payload '{}'",
             descriptor.path
         );
-        if let PayloadRole::GitUntrackedTar { .. } = descriptor.role {
-            validate_untracked_tar(&bytes)
+
+        let retain =
+            retention == PayloadRetention::All || descriptor.role == PayloadRole::CanonicalSession;
+        let mut bytes =
+            retain.then(|| Vec::with_capacity(descriptor.size.min(usize::MAX as u64) as usize));
+        let mut digesting = DigestingReader::new(&mut entry);
+        if let Some(bytes) = bytes.as_mut() {
+            digesting
+                .read_to_end(bytes)
+                .with_context(|| format!("read ZIP entry '{name}'"))?;
+        } else if matches!(descriptor.role, PayloadRole::GitUntrackedTar { .. }) {
+            validate_untracked_tar_reader(&mut digesting)
+                .with_context(|| format!("validate payload '{}'", descriptor.path))?;
+            std::io::copy(&mut digesting, &mut std::io::sink())
+                .with_context(|| format!("finish reading ZIP entry '{name}'"))?;
+        } else {
+            std::io::copy(&mut digesting, &mut std::io::sink())
+                .with_context(|| format!("read ZIP entry '{name}'"))?;
+        }
+        let (actual_size, actual_digest) = digesting.finish();
+        ensure!(
+            actual_size == descriptor.size,
+            "size mismatch for payload '{}'",
+            descriptor.path
+        );
+        ensure!(
+            actual_digest == descriptor.sha256,
+            "SHA-256 mismatch for payload '{}'",
+            descriptor.path
+        );
+        if matches!(descriptor.role, PayloadRole::GitUntrackedTar { .. })
+            && let Some(bytes) = bytes.as_deref()
+        {
+            validate_untracked_tar(bytes)
                 .with_context(|| format!("validate payload '{}'", descriptor.path))?;
         }
-        payloads.insert(descriptor.path.clone(), bytes);
+        if descriptor.role == PayloadRole::CanonicalSession {
+            let bytes = bytes
+                .as_deref()
+                .expect("canonical session payload is always retained");
+            let snapshot: CanonicalSessionSnapshot =
+                serde_json::from_slice(bytes).context("parse canonical session snapshot")?;
+            snapshot.validate()?;
+            ensure!(
+                canonical_session.replace(snapshot).is_none(),
+                "archive contains duplicate canonical session payloads"
+            );
+        }
+        if retention == PayloadRetention::All {
+            payloads.insert(
+                descriptor.path.clone(),
+                bytes.expect("all payloads are retained by the full reader"),
+            );
+        }
     }
-    Ok(VerifiedArchive {
+    actual_paths.remove(MANIFEST_PATH);
+    let actual_payload_paths = actual_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        expected_paths == actual_payload_paths,
+        "archive payload list does not match manifest"
+    );
+    Ok(VerifiedZipContents {
         manifest,
+        canonical_session: canonical_session.context("archive canonical session is missing")?,
         payloads,
-        archive_sha256,
     })
+}
+
+struct DigestingReader<R> {
+    inner: R,
+    digest: Sha256,
+    bytes_read: u64,
+}
+
+impl<R> DigestingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            digest: Sha256::new(),
+            bytes_read: 0,
+        }
+    }
+
+    fn finish(self) -> (u64, String) {
+        (self.bytes_read, format!("{:x}", self.digest.finalize()))
+    }
+}
+
+impl<R: Read> Read for DigestingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.bytes_read = self.bytes_read.saturating_add(read as u64);
+        self.digest.update(&buffer[..read]);
+        Ok(read)
+    }
+}
+
+fn parse_archive_manifest(manifest_bytes: &[u8]) -> Result<ArchiveManifest> {
+    #[derive(Deserialize)]
+    struct ArchiveHeader {
+        schema_version: u32,
+        format: String,
+    }
+    let header: ArchiveHeader =
+        serde_json::from_slice(manifest_bytes).context("parse archive manifest header")?;
+    ensure!(
+        header.format == ARCHIVE_FORMAT,
+        "unsupported archive format '{}'",
+        header.format
+    );
+    ensure!(
+        header.schema_version == ARCHIVE_SCHEMA_VERSION,
+        "incompatible Hel archive schema {}; this build requires schema {}",
+        header.schema_version,
+        ARCHIVE_SCHEMA_VERSION
+    );
+    let manifest: ArchiveManifest =
+        serde_json::from_slice(manifest_bytes).context("parse schema-2 archive manifest")?;
+    validate_manifest(&manifest)?;
+    Ok(manifest)
 }
 
 fn validate_manifest(manifest: &ArchiveManifest) -> Result<()> {
     ensure!(
         manifest.schema_version == ARCHIVE_SCHEMA_VERSION,
-        "unsupported Hel archive schema {}",
-        manifest.schema_version
+        "incompatible Hel archive schema {}; this build requires schema {}",
+        manifest.schema_version,
+        ARCHIVE_SCHEMA_VERSION
     );
     ensure!(
         manifest.format == ARCHIVE_FORMAT,
@@ -559,11 +845,17 @@ fn validate_manifest(manifest: &ArchiveManifest) -> Result<()> {
     let canonical_count = manifest
         .payloads
         .iter()
-        .filter(|payload| payload.role == PayloadRole::CanonicalEvents)
+        .filter(|payload| payload.role == PayloadRole::CanonicalSession)
         .count();
     ensure!(
         canonical_count == 1,
-        "archive must contain exactly one canonical event payload"
+        "archive must contain exactly one canonical session payload"
+    );
+    ensure!(
+        manifest.payloads.iter().any(|payload| {
+            payload.role == PayloadRole::CanonicalSession && payload.path == CANONICAL_SESSION_PATH
+        }),
+        "canonical session payload must be stored at {CANONICAL_SESSION_PATH}"
     );
 
     let mut repository_ids = BTreeSet::new();
@@ -625,7 +917,7 @@ fn validate_manifest(manifest: &ArchiveManifest) -> Result<()> {
             | PayloadRole::GitStagedPatch { repository_id }
             | PayloadRole::GitUnstagedPatch { repository_id }
             | PayloadRole::GitUntrackedTar { repository_id } => Some(repository_id),
-            PayloadRole::CanonicalEvents | PayloadRole::NativeArtifact { .. } => None,
+            PayloadRole::CanonicalSession | PayloadRole::NativeArtifact { .. } => None,
         };
         if let Some(repository_id) = repository_id {
             ensure!(
@@ -634,6 +926,176 @@ fn validate_manifest(manifest: &ArchiveManifest) -> Result<()> {
                 payload.path,
                 repository_id
             );
+        }
+    }
+    Ok(())
+}
+
+fn validate_canonical_session(snapshot: &CanonicalSessionSnapshot) -> Result<()> {
+    ensure!(
+        is_lower_hex_sha256(&snapshot.event_frontier_digest),
+        "canonical event frontier digest must be 64 lowercase hexadecimal characters"
+    );
+    ensure!(
+        (snapshot.event_frontier == 0)
+            == (snapshot.event_frontier_digest == EVENT_FRONTIER_GENESIS_DIGEST),
+        "canonical event frontier and digest are inconsistent"
+    );
+    ensure!(
+        (snapshot.event_frontier == 0) == snapshot.session.last_activity_at_ms.is_none(),
+        "canonical event frontier and activity watermark are inconsistent"
+    );
+    ensure!(
+        snapshot.session.execution == CanonicalExecutionState::Idle,
+        "canonical session is not idle at the checkpoint barrier"
+    );
+    ensure!(
+        snapshot
+            .session
+            .session_title
+            .as_ref()
+            .is_none_or(|title| !title.trim().is_empty()),
+        "canonical session title is empty"
+    );
+    let mut item_ids = BTreeSet::new();
+    let mut previous_position = 0_u64;
+    for item in &snapshot.transcript {
+        ensure!(
+            !item.stable_id.trim().is_empty(),
+            "canonical transcript item id is empty"
+        );
+        ensure!(
+            item_ids.insert(item.stable_id.as_str()),
+            "duplicate canonical transcript item id '{}'",
+            item.stable_id
+        );
+        ensure!(
+            item.position > 0,
+            "canonical transcript item '{}' has zero position",
+            item.stable_id
+        );
+        ensure!(
+            item.position >= previous_position,
+            "canonical transcript items are out of position order"
+        );
+        ensure!(
+            item.position <= snapshot.event_frontier,
+            "canonical transcript item '{}' is beyond event frontier {}",
+            item.stable_id,
+            snapshot.event_frontier
+        );
+        match (&item.body, item.latest_content_event_ordinal) {
+            (CanonicalTranscriptBody::Agent { .. }, Some(ordinal)) => ensure!(
+                ordinal >= item.position && ordinal <= snapshot.event_frontier,
+                "canonical agent message '{}' has invalid latest content ordinal {ordinal}",
+                item.stable_id
+            ),
+            (CanonicalTranscriptBody::Agent { .. }, None) => bail!(
+                "canonical agent message '{}' has no latest content ordinal",
+                item.stable_id
+            ),
+            (_, Some(ordinal)) => bail!(
+                "canonical non-agent transcript item '{}' has latest content ordinal {ordinal}",
+                item.stable_id
+            ),
+            (_, None) => {}
+        }
+        ensure!(
+            item.last_changed_at_ms >= item.created_at_ms,
+            "canonical transcript item '{}' changed before it was created",
+            item.stable_id
+        );
+        ensure!(
+            !matches!(
+                &item.body,
+                CanonicalTranscriptBody::Agent {
+                    streaming: true,
+                    ..
+                } | CanonicalTranscriptBody::Thought {
+                    streaming: true,
+                    ..
+                }
+            ),
+            "canonical transcript item '{}' is still streaming at the checkpoint barrier",
+            item.stable_id
+        );
+        match &item.body {
+            CanonicalTranscriptBody::User { content } => {
+                for (index, block) in content.iter().enumerate() {
+                    serde_json::from_value::<agent_client_protocol::schema::v1::ContentBlock>(
+                        block.clone(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "canonical transcript item '{}' has invalid ACP content block {index}",
+                            item.stable_id
+                        )
+                    })?;
+                }
+            }
+            CanonicalTranscriptBody::Agent { chunks, .. }
+            | CanonicalTranscriptBody::Thought { chunks, .. } => {
+                for (index, chunk) in chunks.iter().enumerate() {
+                    serde_json::from_value::<agent_client_protocol::schema::v1::ContentChunk>(
+                        chunk.clone(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "canonical transcript item '{}' has invalid ACP content chunk {index}",
+                            item.stable_id
+                        )
+                    })?;
+                }
+            }
+            CanonicalTranscriptBody::Tool { call } => {
+                serde_json::from_value::<agent_client_protocol::schema::v1::ToolCall>(call.clone())
+                    .with_context(|| {
+                        format!(
+                            "canonical transcript item '{}' has invalid ACP tool call",
+                            item.stable_id
+                        )
+                    })?;
+            }
+            CanonicalTranscriptBody::Plan { plan } => {
+                serde_json::from_value::<agent_client_protocol::schema::v1::Plan>(plan.clone())
+                    .with_context(|| {
+                        format!(
+                            "canonical transcript item '{}' has invalid ACP plan",
+                            item.stable_id
+                        )
+                    })?;
+            }
+            CanonicalTranscriptBody::System { .. } => {}
+        }
+        previous_position = item.position;
+    }
+
+    let mut queue_ids = BTreeSet::new();
+    for prompt in &snapshot.queued_prompts {
+        ensure!(
+            !prompt.command_id.trim().is_empty(),
+            "canonical queued prompt id is empty"
+        );
+        ensure!(
+            queue_ids.insert(prompt.command_id.as_str()),
+            "duplicate canonical queued prompt id '{}'",
+            prompt.command_id
+        );
+        ensure!(
+            !prompt.content.is_empty(),
+            "canonical queued prompt '{}' has no content",
+            prompt.command_id
+        );
+        for (index, content) in prompt.content.iter().enumerate() {
+            serde_json::from_value::<agent_client_protocol::schema::v1::ContentBlock>(
+                content.clone(),
+            )
+            .with_context(|| {
+                format!(
+                    "canonical queued prompt '{}' has invalid ACP content block {index}",
+                    prompt.command_id
+                )
+            })?;
         }
     }
     Ok(())
@@ -1434,7 +1896,11 @@ fn path_from_git_bytes(bytes: &[u8]) -> Result<PathBuf> {
 }
 
 fn validate_untracked_tar(bytes: &[u8]) -> Result<()> {
-    let mut archive = tar::Archive::new(Cursor::new(bytes));
+    validate_untracked_tar_reader(Cursor::new(bytes))
+}
+
+fn validate_untracked_tar_reader(reader: impl Read) -> Result<()> {
+    let mut archive = tar::Archive::new(reader);
     for entry in archive.entries().context("read untracked-file tar")? {
         let entry = entry.context("read untracked-file tar entry")?;
         let relative = entry.path().context("read untracked-file tar path")?;
@@ -1765,7 +2231,7 @@ mod tests {
                 created_at: "2026-08-09T10:00:00Z".into(),
                 checkpointed_at: "2026-08-09T10:05:00Z".into(),
                 hel_version: "0.1.0".into(),
-                worker_version: "0.1.0".into(),
+                relay_version: "0.1.0".into(),
                 adapter_version: "0.1.0".into(),
             },
             target: TargetManifest {
@@ -1777,7 +2243,49 @@ mod tests {
                 id: "hel".into(),
                 primary_repository: "hel".into(),
             },
-            canonical_events: b"{\"seq\":1}\n".to_vec(),
+            canonical_session: CanonicalSessionSnapshot {
+                event_frontier: 4,
+                event_frontier_digest: "a".repeat(64),
+                session: CanonicalSessionState {
+                    execution: CanonicalExecutionState::Idle,
+                    last_activity_at_ms: Some(104),
+                    session_title: Some("Forge Hel".into()),
+                    configuration: BTreeMap::from([(
+                        "reasoning_effort".into(),
+                        serde_json::json!("high"),
+                    )]),
+                },
+                transcript: vec![
+                    CanonicalTranscriptItem {
+                        stable_id: "user-1".into(),
+                        position: 1,
+                        latest_content_event_ordinal: None,
+                        created_at_ms: 100,
+                        last_changed_at_ms: 100,
+                        body: CanonicalTranscriptBody::User {
+                            content: vec![serde_json::json!({"type": "text", "text": "hello"})],
+                        },
+                    },
+                    CanonicalTranscriptItem {
+                        stable_id: "agent-2".into(),
+                        position: 2,
+                        latest_content_event_ordinal: Some(2),
+                        created_at_ms: 101,
+                        last_changed_at_ms: 103,
+                        body: CanonicalTranscriptBody::Agent {
+                            chunks: vec![serde_json::json!({
+                                "content": {"type": "text", "text": "hi"}
+                            })],
+                            streaming: false,
+                        },
+                    },
+                ],
+                queued_prompts: vec![CanonicalQueuedPrompt {
+                    command_id: "prompt-4".into(),
+                    content: vec![serde_json::json!({"type": "text", "text": "next"})],
+                    queued_at_ms: 104,
+                }],
+            },
             native_artifacts: vec![NativeArtifact {
                 relative_path: PathBuf::from("sessions/native-1/rollout.jsonl"),
                 data: b"native transcript".to_vec(),
@@ -1793,12 +2301,8 @@ mod tests {
         let path = directory.path().join("session.hel.zip");
         let verified = write_archive_atomic(&path, &input()).unwrap();
         assert_eq!(verified.manifest.repositories.len(), 2);
-        assert_eq!(
-            verified
-                .payload_by_role(&PayloadRole::CanonicalEvents)
-                .unwrap(),
-            b"{\"seq\":1}\n"
-        );
+        assert_eq!(verified.canonical_session, input().canonical_session);
+        assert_eq!(verified.manifest.schema_version, ARCHIVE_SCHEMA_VERSION);
         assert_eq!(verified.archive_sha256.len(), 64);
         #[cfg(unix)]
         {
@@ -1808,6 +2312,169 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn archive_preparation_borrows_existing_payload_bodies() {
+        let archive_input = input();
+        let native = archive_input.native_artifacts[0].data.as_slice();
+        let bundle = archive_input.repositories[0].committed_bundle.as_slice();
+        let (_manifest, payloads) = prepare_archive(&archive_input).unwrap();
+
+        let canonical = payloads
+            .iter()
+            .find(|payload| payload.descriptor.role == PayloadRole::CanonicalSession)
+            .unwrap();
+        assert!(matches!(&canonical.data, Cow::Owned(_)));
+
+        let prepared_native = payloads
+            .iter()
+            .find(|payload| matches!(&payload.descriptor.role, PayloadRole::NativeArtifact { .. }))
+            .unwrap();
+        assert!(matches!(&prepared_native.data, Cow::Borrowed(_)));
+        assert_eq!(prepared_native.data.as_ptr(), native.as_ptr());
+
+        let prepared_bundle = payloads
+            .iter()
+            .find(|payload| {
+                matches!(
+                    &payload.descriptor.role,
+                    PayloadRole::GitBundle { repository_id } if repository_id == "hel"
+                )
+            })
+            .unwrap();
+        assert!(matches!(&prepared_bundle.data, Cow::Borrowed(_)));
+        assert_eq!(prepared_bundle.data.as_ptr(), bundle.as_ptr());
+    }
+
+    #[test]
+    fn streaming_verification_does_not_retain_large_noncanonical_payloads() {
+        const LARGE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.hel.zip");
+        let mut archive_input = input();
+        archive_input.repositories.clear();
+        archive_input.native_artifacts = vec![NativeArtifact {
+            relative_path: PathBuf::from("sessions/native-1/large-rollout.jsonl"),
+            data: vec![b'x'; LARGE_PAYLOAD_BYTES],
+            mode: 0o600,
+        }];
+
+        let verified = write_archive_atomic(&path, &archive_input).unwrap();
+        drop(archive_input);
+
+        let native = verified
+            .manifest
+            .payloads
+            .iter()
+            .find(|payload| matches!(payload.role, PayloadRole::NativeArtifact { .. }))
+            .unwrap();
+        assert_eq!(native.size, LARGE_PAYLOAD_BYTES as u64);
+        assert_eq!(verified.canonical_session, input().canonical_session);
+        let retained_metadata_bytes = serde_json::to_vec(&verified.manifest).unwrap().len()
+            + serde_json::to_vec(&verified.canonical_session)
+                .unwrap()
+                .len()
+            + verified.archive_sha256.len();
+        assert!(retained_metadata_bytes < LARGE_PAYLOAD_BYTES / 100);
+    }
+
+    #[test]
+    fn streaming_verification_rejects_noncanonical_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("corrupt-native.hel.zip");
+        let mut archive_input = input();
+        archive_input.repositories.clear();
+        archive_input.native_artifacts[0].data = b"native payload".to_vec();
+        write_archive_atomic(&path, &archive_input).unwrap();
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let entry = archive
+            .by_name("native/sessions/native-1/rollout.jsonl")
+            .unwrap();
+        let data_start = entry.data_start();
+        drop(entry);
+        let mut file = archive.into_inner();
+        file.seek(SeekFrom::Start(data_start)).unwrap();
+        file.write_all(b"X").unwrap();
+        drop(file);
+
+        assert!(verify_archive_streaming(&path).is_err());
+    }
+
+    #[test]
+    fn streaming_verification_rejects_unsafe_extra_zip_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unsafe-extra.hel.zip");
+        let archive_input = input();
+        let (manifest, payloads) = prepare_archive(&archive_input).unwrap();
+        let file = File::create(&path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file(
+                MANIFEST_PATH,
+                SimpleFileOptions::default().unix_permissions(0o600),
+            )
+            .unwrap();
+        writer
+            .write_all(&serde_json::to_vec_pretty(&manifest).unwrap())
+            .unwrap();
+        for payload in payloads {
+            writer
+                .start_file(
+                    payload.descriptor.path,
+                    SimpleFileOptions::default().unix_permissions(payload.descriptor.mode),
+                )
+                .unwrap();
+            writer.write_all(&payload.data).unwrap();
+        }
+        writer
+            .start_file("../escape", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"unsafe").unwrap();
+        writer.finish().unwrap();
+
+        let error = verify_archive_streaming(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("unsafe ZIP entry path"));
+    }
+
+    #[test]
+    fn streaming_verification_parses_untracked_tar_for_safety() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unsafe-untracked.hel.zip");
+        let archive_input = input();
+        let (mut manifest, mut payloads) = prepare_archive(&archive_input).unwrap();
+        let malicious = tar_with_file(".env", b"secret", 0o600);
+        let descriptor = manifest
+            .payloads
+            .iter_mut()
+            .find(|payload| {
+                matches!(
+                    payload.role,
+                    PayloadRole::GitUntrackedTar { ref repository_id }
+                        if repository_id == "hel"
+                )
+            })
+            .unwrap();
+        descriptor.size = malicious.len() as u64;
+        descriptor.sha256 = digest_bytes(&malicious);
+        let payload = payloads
+            .iter_mut()
+            .find(|payload| payload.descriptor.path == descriptor.path)
+            .unwrap();
+        payload.descriptor = descriptor.clone();
+        payload.data = Cow::Owned(malicious);
+        let mut file = File::create(&path).unwrap();
+        write_zip(&mut file, &manifest, &payloads).unwrap();
+        drop(file);
+
+        let error = verify_archive_streaming(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("credential/config path"));
     }
 
     #[test]
@@ -1822,7 +2489,7 @@ mod tests {
             .open(&path)
             .unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
-        let entry = archive.by_name(CANONICAL_EVENTS_PATH).unwrap();
+        let entry = archive.by_name(CANONICAL_SESSION_PATH).unwrap();
         let data_start = entry.data_start();
         drop(entry);
         let mut file = archive.into_inner();
@@ -1831,6 +2498,159 @@ mod tests {
         drop(file);
 
         assert!(read_archive_verified(&path).is_err());
+    }
+
+    #[test]
+    fn old_and_future_schemas_are_rejected_explicitly() {
+        for schema_version in [1, ARCHIVE_SCHEMA_VERSION + 1] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.hel.zip");
+            let archive_input = input();
+            let (mut manifest, payloads) = prepare_archive(&archive_input).unwrap();
+            manifest.schema_version = schema_version;
+            let mut file = File::create(&path).unwrap();
+            write_zip(&mut file, &manifest, &payloads).unwrap();
+            drop(file);
+
+            let error = read_archive_verified(&path).unwrap_err();
+            let error = format!("{error:#}");
+            assert!(
+                error.contains(&format!(
+                    "incompatible Hel archive schema {schema_version}; this build requires schema {ARCHIVE_SCHEMA_VERSION}"
+                )),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_two_wire_rejects_unknown_and_omitted_required_fields() {
+        let mut canonical = serde_json::to_value(input().canonical_session).unwrap();
+        canonical
+            .as_object_mut()
+            .unwrap()
+            .insert("revision".into(), serde_json::json!(4));
+        assert!(serde_json::from_value::<CanonicalSessionSnapshot>(canonical).is_err());
+
+        let mut canonical = serde_json::to_value(input().canonical_session).unwrap();
+        canonical["session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("configuration");
+        assert!(serde_json::from_value::<CanonicalSessionSnapshot>(canonical).is_err());
+
+        let mut target = serde_json::to_value(input().target).unwrap();
+        target.as_object_mut().unwrap().remove("details");
+        assert!(serde_json::from_value::<TargetManifest>(target).is_err());
+
+        let mut metadata = serde_json::to_value(repository("repo").metadata).unwrap();
+        metadata.as_object_mut().unwrap().remove("base_commit");
+        assert!(serde_json::from_value::<RepositoryMetadata>(metadata).is_err());
+    }
+
+    #[test]
+    fn canonical_session_rejects_duplicate_or_out_of_frontier_items() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.hel.zip");
+        let mut invalid = input();
+        invalid.canonical_session.transcript[1].stable_id = "user-1".into();
+        let error = write_archive_atomic(&path, &invalid).unwrap_err();
+        assert!(format!("{error:#}").contains("duplicate canonical transcript item id"));
+
+        invalid = input();
+        invalid.canonical_session.transcript[1].position = 5;
+        let error = write_archive_atomic(&path, &invalid).unwrap_err();
+        assert!(format!("{error:#}").contains("beyond event frontier"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn canonical_session_requires_a_valid_latest_agent_content_ordinal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.hel.zip");
+        let mut invalid = input();
+        invalid.canonical_session.transcript[1].latest_content_event_ordinal = None;
+        let error = write_archive_atomic(&path, &invalid).unwrap_err();
+        assert!(format!("{error:#}").contains("has no latest content ordinal"));
+
+        invalid = input();
+        invalid.canonical_session.transcript[1].latest_content_event_ordinal = Some(5);
+        let error = write_archive_atomic(&path, &invalid).unwrap_err();
+        assert!(format!("{error:#}").contains("invalid latest content ordinal"));
+
+        invalid = input();
+        invalid.canonical_session.transcript[0].latest_content_event_ordinal = Some(1);
+        let error = write_archive_atomic(&path, &invalid).unwrap_err();
+        assert!(format!("{error:#}").contains("non-agent transcript item"));
+    }
+
+    #[test]
+    fn canonical_session_rejects_a_stream_still_open_at_the_barrier() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.hel.zip");
+        let mut invalid = input();
+        invalid.canonical_session.transcript[1].body = CanonicalTranscriptBody::Agent {
+            chunks: vec![serde_json::json!({
+                "content": {"type": "text", "text": "partial"}
+            })],
+            streaming: true,
+        };
+
+        let error = write_archive_atomic(&path, &invalid).unwrap_err();
+
+        assert!(format!("{error:#}").contains("still streaming at the checkpoint barrier"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn canonical_session_rejects_non_idle_execution_at_the_barrier() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.hel.zip");
+        let mut invalid = input();
+        invalid.canonical_session.session.execution =
+            CanonicalExecutionState::Running { started_at_ms: 105 };
+
+        let error = write_archive_atomic(&path, &invalid).unwrap_err();
+
+        assert!(format!("{error:#}").contains("not idle at the checkpoint barrier"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn canonical_session_rejects_an_invalid_event_frontier_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.hel.zip");
+        let mut invalid = input();
+        invalid.canonical_session.event_frontier_digest = "A".repeat(64);
+
+        let error = write_archive_atomic(&path, &invalid).unwrap_err();
+
+        assert!(format!("{error:#}").contains("64 lowercase hexadecimal characters"));
+        assert!(!path.exists());
+
+        invalid = input();
+        invalid.canonical_session.event_frontier_digest = EVENT_FRONTIER_GENESIS_DIGEST.into();
+        let error = write_archive_atomic(&path, &invalid).unwrap_err();
+        assert!(format!("{error:#}").contains("frontier and digest are inconsistent"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn canonical_session_rejects_unrestorable_queued_prompts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.hel.zip");
+        let mut invalid = input();
+        invalid.canonical_session.queued_prompts[0].content.clear();
+
+        let error = write_archive_atomic(&path, &invalid).unwrap_err();
+        assert!(format!("{error:#}").contains("has no content"));
+        assert!(!path.exists());
+
+        invalid.canonical_session.queued_prompts[0].content =
+            vec![serde_json::json!({"type": "not_an_acp_content_block"})];
+        let error = write_archive_atomic(&path, &invalid).unwrap_err();
+        assert!(format!("{error:#}").contains("has invalid ACP content block 0"));
+        assert!(!path.exists());
     }
 
     #[test]

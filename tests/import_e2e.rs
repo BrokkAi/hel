@@ -10,16 +10,16 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use hel::hel_acp::RuntimeEvent;
-use hel::hel_archive::{PayloadRole, read_archive_verified};
+use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
+use hel::hel_archive::read_archive_verified;
 use hel::hel_config::{
     CONFIG_VERSION, ContainerTemplate, HarnessKind, HarnessProfile, HelConfig, ProjectBundle,
     ProjectRepository, TargetTemplate,
 };
 use hel::hel_controller::Controller;
-use hel::hel_state::{HelState, SessionState};
-use hel::hel_worker::WorkerEvent;
-use hel::hel_worker_client::WorkerClient;
+use hel::hel_session_manager::{StandaloneSession, new_command_id};
+use hel::hel_state::{HelState, MaterializedSession, SessionState, TranscriptBody};
+use hel::hel_worker::RelayCommand;
 
 #[test]
 #[ignore = "requires a signed-in Claude, Podman, and the Hel agent-development image"]
@@ -116,64 +116,27 @@ async fn imported_claude_session_resumes_natively_async() -> anyhow::Result<()> 
         archive.manifest.session.native_session_id,
         imported.native_session_id.clone().unwrap()
     );
-    assert!(
-        !archive
-            .payload_by_role(&PayloadRole::CanonicalEvents)?
-            .is_empty()
-    );
+    let canonical = archive.canonical_session()?;
+    assert!(!canonical.transcript.is_empty());
 
     let mut controller = Controller::load()?;
-    controller
-        .resume_session(session_id, "claude-e2e", "podman")
+    let materialized = controller
+        .resume_session_with_options(session_id, "claude-e2e", "podman", None, None)
         .await?;
-    let command = controller.reconnect_command(session_id)?;
-    let mut client = WorkerClient::connect(&command, session_id).await?;
-    let bootstrap = client.bootstrap().await?;
-    let mut events = bootstrap.events;
-    for _ in 0..30 {
-        if events.iter().any(|event| {
-            matches!(
-                runtime_event(event),
-                Some(RuntimeEvent::SessionStarted { .. })
-            )
-        }) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        events.extend(client.sync().await?);
-    }
-    assert!(events.iter().any(|event| {
-        matches!(
-            runtime_event(event),
-            Some(RuntimeEvent::SessionStarted { resumed: true, .. })
-        )
-    }));
-    assert!(
-        !events
-            .iter()
-            .any(|event| { matches!(runtime_event(event), Some(RuntimeEvent::Warning { .. })) })
-    );
-
-    client
-        .prompt("what word did I ask you to remember?".into(), Vec::new())
-        .await?;
-    let mut reply = String::new();
-    for _ in 0..60 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        for event in client.sync().await? {
-            if let Some(text) = agent_text(&event) {
-                reply.push_str(&text);
-            }
-        }
-        if reply.to_ascii_lowercase().contains("zanzibar") {
-            break;
-        }
-    }
-    assert!(
-        reply.to_ascii_lowercase().contains("zanzibar"),
-        "reply: {reply}"
-    );
-    client.detach().await?;
+    exercise_resumed_session(
+        &controller,
+        session_id,
+        &materialized,
+        ResumeExercise {
+            expected_native_session_id: &archive.manifest.session.native_session_id,
+            archived_frontier: canonical.event_frontier,
+            prompt: "what word did I ask you to remember?",
+            expected_reply: "zanzibar",
+            attempts: 60,
+            case_sensitive: false,
+        },
+    )
+    .await?;
     controller.close_session(session_id).await?;
     let final_state = HelState::load()?;
     let checkpoint = final_state.sessions[session_id]
@@ -265,56 +228,26 @@ async fn imported_kimi_session_resumes_natively_async() -> anyhow::Result<()> {
         archive.manifest.session.native_session_id,
         imported.native_session_id.clone().unwrap()
     );
+    let canonical = archive.canonical_session()?;
 
     let mut controller = Controller::load()?;
-    controller
-        .resume_session(session_id, "kimi-e2e", "podman")
+    let materialized = controller
+        .resume_session_with_options(session_id, "kimi-e2e", "podman", None, None)
         .await?;
-    let command = controller.reconnect_command(session_id)?;
-    let mut client = WorkerClient::connect(&command, session_id).await?;
-    let mut events = client.bootstrap().await?.events;
-    // The first container invocation downloads Kimi Code's official binary.
-    for _ in 0..300 {
-        if events.iter().any(|event| {
-            matches!(
-                runtime_event(event),
-                Some(RuntimeEvent::SessionStarted { .. })
-            )
-        }) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        events.extend(client.sync().await?);
-    }
-    assert!(events.iter().any(|event| {
-        matches!(
-            runtime_event(event),
-            Some(RuntimeEvent::SessionStarted { resumed: true, .. })
-        )
-    }));
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(runtime_event(event), Some(RuntimeEvent::Warning { .. })))
-    );
-
-    client
-        .prompt("Reply exactly KIMI_NATIVE_RESUME_OK.".into(), Vec::new())
-        .await?;
-    let mut reply = String::new();
-    for _ in 0..120 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        for event in client.sync().await? {
-            if let Some(text) = agent_text(&event) {
-                reply.push_str(&text);
-            }
-        }
-        if reply.contains("KIMI_NATIVE_RESUME_OK") {
-            break;
-        }
-    }
-    assert!(reply.contains("KIMI_NATIVE_RESUME_OK"), "reply: {reply}");
-    client.detach().await?;
+    exercise_resumed_session(
+        &controller,
+        session_id,
+        &materialized,
+        ResumeExercise {
+            expected_native_session_id: &archive.manifest.session.native_session_id,
+            archived_frontier: canonical.event_frontier,
+            prompt: "Reply exactly KIMI_NATIVE_RESUME_OK.",
+            expected_reply: "KIMI_NATIVE_RESUME_OK",
+            attempts: 120,
+            case_sensitive: true,
+        },
+    )
+    .await?;
     controller.close_session(session_id).await?;
     let final_state = HelState::load()?;
     read_archive_verified(
@@ -327,21 +260,96 @@ async fn imported_kimi_session_resumes_natively_async() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn runtime_event(event: &hel::hel_worker::SequencedEvent) -> Option<RuntimeEvent> {
-    let WorkerEvent::Adapter { payload, .. } = &event.event else {
-        return None;
-    };
-    serde_json::from_value(payload.clone()).ok()
+struct ResumeExercise<'a> {
+    expected_native_session_id: &'a str,
+    archived_frontier: u64,
+    prompt: &'a str,
+    expected_reply: &'a str,
+    attempts: usize,
+    case_sensitive: bool,
 }
 
-fn agent_text(event: &hel::hel_worker::SequencedEvent) -> Option<String> {
-    let WorkerEvent::Adapter { payload, .. } = &event.event else {
-        return None;
-    };
-    payload
-        .pointer("/update/content/text")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
+async fn exercise_resumed_session(
+    controller: &Controller,
+    session_id: &str,
+    materialized: &MaterializedSession,
+    exercise: ResumeExercise<'_>,
+) -> anyhow::Result<()> {
+    let new_system_messages = materialized.transcript.iter().filter_map(|item| {
+        if item.position <= exercise.archived_frontier {
+            return None;
+        }
+        let TranscriptBody::System { text } = &item.body else {
+            return None;
+        };
+        Some(text.as_str())
+    });
+    let messages = new_system_messages.collect::<Vec<_>>();
+    assert!(
+        messages.contains(&"harness session resumed"),
+        "resume messages: {messages:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.starts_with("warning:")),
+        "resume messages: {messages:?}"
+    );
+
+    let command = controller.reconnect_command(session_id)?;
+    let mut relay = StandaloneSession::connect_command(&command, session_id).await?;
+    let snapshot = relay.sync().await?;
+    assert_eq!(
+        snapshot.operational.native_session_id.as_deref(),
+        Some(exercise.expected_native_session_id)
+    );
+    let before_prompt = snapshot.materialized.applied_event_ordinal;
+    relay
+        .submit(
+            new_command_id("import-e2e-prompt")?,
+            RelayCommand::Prompt {
+                prompt: vec![ContentBlock::Text(TextContent::new(
+                    exercise.prompt.to_owned(),
+                ))],
+            },
+        )
+        .await?;
+
+    let mut reply = String::new();
+    for _ in 0..exercise.attempts {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let snapshot = relay.sync().await?;
+        reply = agent_text_after(&snapshot.materialized, before_prompt);
+        let found = if exercise.case_sensitive {
+            reply.contains(exercise.expected_reply)
+        } else {
+            reply
+                .to_ascii_lowercase()
+                .contains(&exercise.expected_reply.to_ascii_lowercase())
+        };
+        if found {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "reply did not contain {:?}: {reply}",
+        exercise.expected_reply
+    )
+}
+
+fn agent_text_after(materialized: &MaterializedSession, after_ordinal: u64) -> String {
+    materialized
+        .transcript
+        .iter()
+        .filter(|item| item.position > after_ordinal)
+        .filter_map(|item| match &item.body {
+            TranscriptBody::Agent { chunks, .. } => chunks
+                .iter()
+                .find_map(|chunk| chunk.pointer("/content/text")?.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn required_path(name: &str) -> PathBuf {
@@ -440,55 +448,26 @@ async fn imported_codex_session_resumes_natively_async() -> anyhow::Result<()> {
         archive.manifest.session.native_session_id,
         imported.native_session_id.clone().unwrap()
     );
+    let canonical = archive.canonical_session()?;
 
     let mut controller = Controller::load()?;
-    controller
-        .resume_session(session_id, "codex-e2e", "podman")
+    let materialized = controller
+        .resume_session_with_options(session_id, "codex-e2e", "podman", None, None)
         .await?;
-    let command = controller.reconnect_command(session_id)?;
-    let mut client = WorkerClient::connect(&command, session_id).await?;
-    let mut events = client.bootstrap().await?.events;
-    for _ in 0..90 {
-        if events.iter().any(|event| {
-            matches!(
-                runtime_event(event),
-                Some(RuntimeEvent::SessionStarted { .. })
-            )
-        }) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        events.extend(client.sync().await?);
-    }
-    assert!(events.iter().any(|event| {
-        matches!(
-            runtime_event(event),
-            Some(RuntimeEvent::SessionStarted { resumed: true, .. })
-        )
-    }));
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(runtime_event(event), Some(RuntimeEvent::Warning { .. })))
-    );
-
-    client
-        .prompt("Reply exactly CODEX_NATIVE_RESUME_OK.".into(), Vec::new())
-        .await?;
-    let mut reply = String::new();
-    for _ in 0..120 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        for event in client.sync().await? {
-            if let Some(text) = agent_text(&event) {
-                reply.push_str(&text);
-            }
-        }
-        if reply.contains("CODEX_NATIVE_RESUME_OK") {
-            break;
-        }
-    }
-    assert!(reply.contains("CODEX_NATIVE_RESUME_OK"), "reply: {reply}");
-    client.detach().await?;
+    exercise_resumed_session(
+        &controller,
+        session_id,
+        &materialized,
+        ResumeExercise {
+            expected_native_session_id: &archive.manifest.session.native_session_id,
+            archived_frontier: canonical.event_frontier,
+            prompt: "Reply exactly CODEX_NATIVE_RESUME_OK.",
+            expected_reply: "CODEX_NATIVE_RESUME_OK",
+            attempts: 120,
+            case_sensitive: true,
+        },
+    )
+    .await?;
     controller.close_session(session_id).await?;
     let final_state = HelState::load()?;
     read_archive_verified(

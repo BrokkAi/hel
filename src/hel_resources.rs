@@ -16,7 +16,7 @@ const MAX_EXPANDED_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 #[cfg(unix)]
 pub fn stream_resource(
     source: &Path,
-    consume: impl FnOnce(&mut dyn Read) -> Result<()>,
+    consume: impl FnOnce(&mut (dyn Read + Send)) -> Result<()>,
 ) -> Result<()> {
     use std::os::unix::net::UnixStream;
 
@@ -42,7 +42,7 @@ pub fn stream_resource(
 #[cfg(not(unix))]
 pub fn stream_resource(
     _source: &Path,
-    _consume: impl FnOnce(&mut dyn Read) -> Result<()>,
+    _consume: impl FnOnce(&mut (dyn Read + Send)) -> Result<()>,
 ) -> Result<()> {
     anyhow::bail!("streaming attached resources requires a Unix controller")
 }

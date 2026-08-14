@@ -1,1 +1,0 @@
-{"request_id":"hello-1","protocol_version":1,"request":{"method":"hello","params":{"client_version":"1.2.3","supported":{"min":1,"max":1}}}}

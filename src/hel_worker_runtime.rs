@@ -1,4 +1,4 @@
-//! Target-side daemon and stdio proxy for the durable worker protocol.
+//! Target-side daemon and stdio proxy for the durable ACP relay protocol.
 
 use std::path::{Path, PathBuf};
 
@@ -27,11 +27,10 @@ impl WorkerOwnership {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcpSupervisorSpec {
     pub command: PathBuf,
-    #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default)]
     pub environment: std::collections::BTreeMap<String, String>,
     pub cwd: PathBuf,
 }
@@ -52,35 +51,19 @@ impl AcpSupervisorSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerLaunchConfig {
     pub session_id: String,
     pub harness: HarnessKind,
     pub bridge_command: PathBuf,
-    #[serde(default)]
     pub bridge_args: Vec<String>,
-    #[serde(default)]
     pub environment: std::collections::BTreeMap<String, String>,
     pub cwd: PathBuf,
-    #[serde(default)]
     pub additional_directories: Vec<PathBuf>,
     pub native_session_id: Option<String>,
-    /// Recover a legacy native identity from canonical events when neither
-    /// the controller nor the worker has persisted one. Cross-harness resume
-    /// disables this because restored history belongs to the source harness.
-    #[serde(default = "default_recover_native_session")]
-    pub recover_native_session: bool,
     /// Isolated and remote targets deliberately run without harness approval
     /// prompts. Raw localhost instead honors the user's harness configuration.
-    #[serde(default = "default_force_unrestricted_mode")]
     pub force_unrestricted_mode: bool,
-}
-
-const fn default_recover_native_session() -> bool {
-    true
-}
-
-const fn default_force_unrestricted_mode() -> bool {
-    true
 }
 
 impl WorkerLaunchConfig {
@@ -107,69 +90,27 @@ impl WorkerLaunchConfig {
 
 #[cfg(unix)]
 mod unix {
-    use std::collections::{BTreeSet, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
-    use agent_client_protocol::schema::v1::{SessionUpdate, ToolCallStatus};
+    use agent_client_protocol::schema::v1::SessionUpdate;
     use anyhow::{Context, Result, bail};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::mpsc;
 
     use super::{AcpSupervisorSpec, WorkerLaunchConfig};
     use crate::hel_acp::{self, CommandRequest, LaunchSpec, RuntimeEvent};
     use crate::hel_worker::{
-        DurableWorker, ErrorCode, PROTOCOL_VERSION, ProtocolError, RequestEnvelope, ResponseBody,
-        ResponseEnvelope, ResponsePayload, WorkerRequest,
+        ClaimedRelayCommand, DurableRelay, RELAY_PROTOCOL_VERSION, RelayCommand,
+        RelayCommandOutcome, RelayErrorCode, RelayObservation, RelayProtocolError, RelayRequest,
+        RelayRequestEnvelope, RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload,
     };
-    use crate::hel_worker_protocol::DecodedRequest;
+
+    pub(super) const ACP_EVENT_CHANNEL_CAPACITY: usize = 256;
 
     struct SocketGuard(PathBuf);
-
-    pub(super) struct CheckpointBarrier {
-        pub(super) envelope: RequestEnvelope,
-        pub(super) response: oneshot::Sender<ResponseEnvelope>,
-    }
-
-    #[derive(Default)]
-    struct ToolActivity {
-        open: BTreeSet<String>,
-    }
-
-    impl ToolActivity {
-        fn observe(&mut self, event: &RuntimeEvent) {
-            let RuntimeEvent::SessionUpdate { update } = event else {
-                return;
-            };
-            let Ok(update) = serde_json::from_value::<SessionUpdate>(update.clone()) else {
-                return;
-            };
-            match update {
-                SessionUpdate::ToolCall(call) => {
-                    self.set_status(call.tool_call_id.to_string(), call.status);
-                }
-                SessionUpdate::ToolCallUpdate(update) => {
-                    if let Some(status) = update.fields.status {
-                        self.set_status(update.tool_call_id.to_string(), status);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        fn set_status(&mut self, id: String, status: ToolCallStatus) {
-            if matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
-                self.open.remove(&id);
-            } else {
-                self.open.insert(id);
-            }
-        }
-
-        fn is_quiescent(&self) -> bool {
-            self.open.is_empty()
-        }
-    }
 
     impl Drop for SocketGuard {
         fn drop(&mut self) {
@@ -185,8 +126,8 @@ mod unix {
             .with_context(|| format!("create worker root {}", root.display()))?;
         // Validate and recover durable state before publishing a socket. A
         // failed startup must never leave a fresh endpoint that looks live.
-        let durable_worker =
-            DurableWorker::open(&root, &config.session_id, env!("CARGO_PKG_VERSION"))?;
+        let durable_relay =
+            DurableRelay::open(&root, &config.session_id, env!("CARGO_PKG_VERSION"))?;
         let socket = root.join("control.sock");
         if socket.exists() {
             match UnixStream::connect(&socket).await {
@@ -204,11 +145,27 @@ mod unix {
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         }
 
-        let resume_session = select_resume_session(&config, &durable_worker);
-        let worker = Arc::new(Mutex::new(durable_worker));
+        let relay = Arc::new(Mutex::new(durable_relay));
+        if relay
+            .lock()
+            .expect("relay state lock poisoned")
+            .operational_state()
+            .execution
+            == crate::hel_worker::RelayExecutionState::Closed
+        {
+            // A durable close is a seal, including across target or daemon
+            // restarts. Keep the relay attachable so the controller can catch
+            // up and complete its checkpoint, but never reopen the ACP session.
+            let (dispatch_wake_tx, dispatch_wake_rx) = mpsc::channel(1);
+            drop(dispatch_wake_rx);
+            return serve_terminal_relay(listener, relay, dispatch_wake_tx).await;
+        }
+
+        let resume_session =
+            select_resume_session(&config, &relay.lock().expect("relay state lock poisoned"));
         let (acp_commands_tx, acp_commands_rx) = mpsc::channel(32);
-        let (acp_events_tx, acp_events_rx) = mpsc::unbounded_channel();
-        let (checkpoint_tx, checkpoint_rx) = mpsc::unbounded_channel();
+        let (acp_events_tx, acp_events_rx) = mpsc::channel(ACP_EVENT_CHANNEL_CAPACITY);
+        let (dispatch_wake_tx, dispatch_wake_rx) = mpsc::channel(1);
         let supervisor_path = root.join("acp-supervisor.json");
         AcpSupervisorSpec {
             command: config.bridge_command,
@@ -234,454 +191,740 @@ mod unix {
         };
         let mut acp_task = tokio::spawn(hel_acp::run(acp_spec, acp_commands_rx, acp_events_tx));
 
-        dispatch_pending(&worker, &acp_commands_tx).await?;
-
-        let event_worker = worker.clone();
-        let mut event_task = tokio::spawn(run_event_coordinator(
-            event_worker,
+        let event_relay = relay.clone();
+        let mut event_task = tokio::spawn(run_relay_coordinator(
+            event_relay,
             acp_events_rx,
-            checkpoint_rx,
+            dispatch_wake_rx,
             acp_commands_tx.clone(),
         ));
 
-        loop {
+        let acp_join = loop {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (stream, _) = accepted.context("accept worker proxy")?;
-                    let client_worker = worker.clone();
-                    let client_commands = acp_commands_tx.clone();
-                    let client_checkpoints = checkpoint_tx.clone();
+                    let client_relay = relay.clone();
+                    let client_dispatch_wake = dispatch_wake_tx.clone();
                     tokio::spawn(async move {
                         if let Err(error) = serve_client(
                             stream,
-                            client_worker,
-                            client_commands,
-                            client_checkpoints,
+                            client_relay,
+                            client_dispatch_wake,
                         ).await {
-                            tracing::warn!(%error, "worker proxy client disconnected");
+                            tracing::warn!(%error, "relay proxy client disconnected");
                         }
                     });
                 }
                 result = &mut event_task => {
-                    result.context("worker event task stopped")??;
-                    return acp_task.await.context("ACP runtime task stopped")?;
+                    match result {
+                        Ok(Ok(())) => break acp_task.await,
+                        Ok(Err(error)) => {
+                            drop(acp_commands_tx);
+                            return abort_peer_and_return(
+                                &mut acp_task,
+                                error,
+                                "relay coordinator failed",
+                            ).await;
+                        }
+                        Err(error) => {
+                            drop(acp_commands_tx);
+                            return abort_peer_and_return(
+                                &mut acp_task,
+                                anyhow::anyhow!(error),
+                                "relay coordinator task stopped",
+                            ).await;
+                        }
+                    }
                 }
                 result = &mut acp_task => {
-                    let acp_result = result.context("ACP runtime task stopped");
-                    event_task.await.context("worker event task stopped")??;
-                    return acp_result?;
+                    event_task.await.context("relay event task stopped")??;
+                    break result;
                 }
             }
+        };
+        let acp_result = match acp_join {
+            Ok(result) => result,
+            Err(error) => {
+                let error = anyhow::anyhow!("ACP runtime task stopped: {error}");
+                relay
+                    .lock()
+                    .expect("relay state lock poisoned")
+                    .record_observation(RelayObservation::Warning {
+                        message: format!("{error:#}"),
+                    })?;
+                Err(error)
+            }
+        };
+        let closed = relay
+            .lock()
+            .expect("relay state lock poisoned")
+            .operational_state()
+            .execution
+            == crate::hel_worker::RelayExecutionState::Closed;
+        if !closed {
+            return acp_result;
+        }
+        if let Err(error) = &acp_result {
+            tracing::warn!(%error, "ACP runtime failed after the relay closed");
+        }
+        serve_terminal_relay(listener, relay, dispatch_wake_tx).await
+    }
+
+    pub(super) async fn abort_peer_and_return<T>(
+        peer: &mut tokio::task::JoinHandle<T>,
+        error: anyhow::Error,
+        context: &'static str,
+    ) -> Result<()> {
+        peer.abort();
+        let _ = peer.await;
+        Err(error.context(context))
+    }
+
+    pub(super) async fn serve_terminal_relay(
+        listener: UnixListener,
+        relay: Arc<Mutex<DurableRelay>>,
+        dispatch_wake: mpsc::Sender<()>,
+    ) -> Result<()> {
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .context("accept closed relay proxy")?;
+            let client_relay = relay.clone();
+            let client_dispatch_wake = dispatch_wake.clone();
+            tokio::spawn(async move {
+                if let Err(error) = serve_client(stream, client_relay, client_dispatch_wake).await {
+                    tracing::warn!(%error, "closed relay proxy client disconnected");
+                }
+            });
         }
     }
 
-    pub(super) async fn run_event_coordinator(
-        worker: Arc<Mutex<DurableWorker>>,
-        mut events: mpsc::UnboundedReceiver<RuntimeEvent>,
-        mut checkpoints: mpsc::UnboundedReceiver<CheckpointBarrier>,
+    pub(super) async fn run_relay_coordinator(
+        relay: Arc<Mutex<DurableRelay>>,
+        mut events: mpsc::Receiver<RuntimeEvent>,
+        mut dispatch_wakes: mpsc::Receiver<()>,
         commands: mpsc::Sender<CommandRequest>,
     ) -> Result<()> {
-        const DRAIN_BATCH: usize = 256;
-
-        let mut activity = ToolActivity::default();
-        let mut pending = VecDeque::new();
-        let mut checkpoints_open = true;
+        let mut in_flight = BTreeMap::new();
+        let mut session_configured = false;
+        dispatch_pending(&relay, &commands, &mut in_flight, session_configured).await?;
+        let mut wakes_open = true;
         loop {
             tokio::select! {
+                biased;
+                wake = dispatch_wakes.recv(), if wakes_open => {
+                    if wake.is_none() {
+                        wakes_open = false;
+                    } else {
+                        // A wake only says durable work may now be available.
+                        // Runtime events already in the channel always belong
+                        // before any newly admitted checkpoint cut.
+                        let queued = events.len();
+                        if record_queued_runtime_events(
+                            &relay,
+                            &mut in_flight,
+                            &mut events,
+                            &mut session_configured,
+                            queued,
+                        ).await? {
+                            return Ok(());
+                        }
+                        dispatch_pending(
+                            &relay,
+                            &commands,
+                            &mut in_flight,
+                            session_configured,
+                        ).await?;
+                    }
+                }
                 event = events.recv() => {
-                    let Some(event) = event else { return Ok(()) };
-                    record_runtime_event(&worker, &mut activity, &event)?;
-                    if matches!(event, RuntimeEvent::PromptFinished { .. }) {
-                        dispatch_pending(&worker, &commands).await?;
+                    let Some(event) = event else {
+                        interrupt_in_flight(
+                            &relay,
+                            &mut in_flight,
+                            "ACP runtime stopped before the command completed",
+                        )?;
+                        return Ok(());
+                    };
+                    if record_runtime_event_batch(
+                        &relay,
+                        &mut in_flight,
+                        event,
+                        &mut events,
+                        &mut session_configured,
+                    ).await? {
+                        return Ok(());
                     }
-                }
-                checkpoint = checkpoints.recv(), if checkpoints_open => {
-                    match checkpoint {
-                        Some(checkpoint) => pending.push_back(checkpoint),
-                        None => checkpoints_open = false,
-                    }
-                }
-            }
-
-            let mut drained = 0;
-            loop {
-                match events.try_recv() {
-                    Ok(event) => {
-                        record_runtime_event(&worker, &mut activity, &event)?;
-                        if matches!(event, RuntimeEvent::PromptFinished { .. }) {
-                            dispatch_pending(&worker, &commands).await?;
-                        }
-                        drained += 1;
-                        if drained == DRAIN_BATCH {
-                            drained = 0;
-                            tokio::task::yield_now().await;
-                        }
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
-                }
-            }
-
-            if activity.is_quiescent() {
-                while let Some(checkpoint) = pending.pop_front() {
-                    if checkpoint.response.is_closed() {
-                        continue;
-                    }
-                    let response = worker
-                        .lock()
-                        .expect("worker state lock poisoned")
-                        .handle(checkpoint.envelope);
-                    let _ = checkpoint.response.send(response);
+                    dispatch_pending(
+                        &relay,
+                        &commands,
+                        &mut in_flight,
+                        session_configured,
+                    ).await?;
                 }
             }
         }
     }
 
-    fn record_runtime_event(
-        worker: &Arc<Mutex<DurableWorker>>,
-        activity: &mut ToolActivity,
-        event: &RuntimeEvent,
-    ) -> Result<()> {
-        activity.observe(event);
-        let value = serde_json::to_value(event)?;
-        let mut worker = worker.lock().expect("worker state lock poisoned");
-        if let RuntimeEvent::SessionStarted {
-            native_session_id, ..
-        } = event
-        {
-            worker.record_native_session_started(
-                runtime_event_kind(event),
-                value,
-                native_session_id,
-            )?;
-        } else {
-            worker.record_adapter_event(runtime_event_kind(event), value)?;
+    /// Record the complete batch already emitted by the ACP runtime before
+    /// admitting a checkpoint barrier. A command event may itself materialize
+    /// several durable observations, and queued notification events belong to
+    /// the cut ahead of any waiting barrier.
+    async fn record_runtime_event_batch(
+        relay: &Arc<Mutex<DurableRelay>>,
+        in_flight: &mut BTreeMap<String, RelayCommand>,
+        first: RuntimeEvent,
+        events: &mut mpsc::Receiver<RuntimeEvent>,
+        session_configured: &mut bool,
+    ) -> Result<bool> {
+        if record_runtime_event_and_track_configuration(
+            relay,
+            in_flight,
+            first,
+            session_configured,
+        )? {
+            return Ok(true);
         }
+        let queued = events.len();
+        record_queued_runtime_events(relay, in_flight, events, session_configured, queued).await
+    }
+
+    async fn record_queued_runtime_events(
+        relay: &Arc<Mutex<DurableRelay>>,
+        in_flight: &mut BTreeMap<String, RelayCommand>,
+        events: &mut mpsc::Receiver<RuntimeEvent>,
+        session_configured: &mut bool,
+        maximum: usize,
+    ) -> Result<bool> {
+        for recorded in 0..maximum {
+            match events.try_recv() {
+                Ok(event) => {
+                    if record_runtime_event_and_track_configuration(
+                        relay,
+                        in_flight,
+                        event,
+                        session_configured,
+                    )? {
+                        return Ok(true);
+                    }
+                    if (recorded + 1) % 256 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return Ok(false),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    interrupt_in_flight(
+                        relay,
+                        in_flight,
+                        "ACP runtime stopped before the command completed",
+                    )?;
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn record_runtime_event_and_track_configuration(
+        relay: &Arc<Mutex<DurableRelay>>,
+        in_flight: &mut BTreeMap<String, RelayCommand>,
+        event: RuntimeEvent,
+        session_configured: &mut bool,
+    ) -> Result<bool> {
+        *session_configured |= matches!(event, RuntimeEvent::SessionConfigured { .. });
+        record_runtime_event(relay, in_flight, event)
+    }
+
+    pub(super) fn record_runtime_event(
+        relay: &Arc<Mutex<DurableRelay>>,
+        in_flight: &mut BTreeMap<String, RelayCommand>,
+        event: RuntimeEvent,
+    ) -> Result<bool> {
+        let stopped = matches!(event, RuntimeEvent::Stopped);
+        let mut relay = relay.lock().expect("relay state lock poisoned");
         match event {
-            RuntimeEvent::PromptFinished { request_id, .. } => {
-                worker.record_turn_completed()?;
-                worker.complete_dispatch(request_id)?;
+            RuntimeEvent::Connected {
+                protocol_version: Some(protocol_version),
+                capabilities: Some(capabilities),
+                agent_info,
+                ..
+            } => {
+                relay.record_observation(RelayObservation::AgentInitialized {
+                    protocol_version,
+                    capabilities,
+                    agent_info,
+                })?;
             }
-            RuntimeEvent::ConfigApplied { request_id, .. } => {
-                worker.complete_dispatch(request_id)?;
+            RuntimeEvent::Connected { .. } => {
+                relay.record_observation(RelayObservation::Warning {
+                    message: "ACP initialized without capability metadata".into(),
+                })?;
             }
-            RuntimeEvent::Stopped
-                if worker.snapshot().phase == crate::hel_worker::WorkerPhase::Closing =>
-            {
-                worker.record_closed()?;
+            RuntimeEvent::SessionStarted {
+                native_session_id,
+                resumed,
+                ..
+            } => {
+                relay.record_observation(RelayObservation::SessionOpened {
+                    native_session_id,
+                    resumed,
+                })?;
             }
-            _ => {}
+            RuntimeEvent::SessionConfigured { config_options } => {
+                relay.record_observation(RelayObservation::SessionConfigured { config_options })?;
+            }
+            RuntimeEvent::SessionUpdate { update } => {
+                let typed = serde_json::from_value::<SessionUpdate>(update).map_err(|error| {
+                    anyhow::anyhow!("decode ACP session update for relay journal: {error}")
+                });
+                match typed {
+                    Ok(update) => {
+                        relay.record_session_update(update)?;
+                    }
+                    Err(error) => {
+                        relay.record_observation(RelayObservation::Warning {
+                            message: format!("{error:#}"),
+                        })?;
+                        return Err(error);
+                    }
+                }
+            }
+            RuntimeEvent::PermissionAutoApproved {
+                option_id,
+                option_name,
+            } => {
+                relay.record_observation(RelayObservation::PermissionAutoApproved {
+                    option_id,
+                    option_name,
+                })?;
+            }
+            RuntimeEvent::PromptFinished {
+                request_id,
+                stop_reason,
+            } => {
+                in_flight.remove(&request_id);
+                relay.record_command_completed(
+                    &request_id,
+                    RelayCommandOutcome::Prompt { stop_reason },
+                )?;
+            }
+            RuntimeEvent::ConfigApplied {
+                request_id,
+                key,
+                value,
+                config_options,
+            } => {
+                relay.record_observation(RelayObservation::ConfigurationUpdated { key, value })?;
+                relay.record_observation(RelayObservation::SessionConfigured { config_options })?;
+                relay.record_command_completed(&request_id, RelayCommandOutcome::Configured)?;
+                in_flight.remove(&request_id);
+            }
+            RuntimeEvent::CommandRejected {
+                request_id,
+                message,
+            } => {
+                in_flight.remove(&request_id);
+                relay.record_command_rejected(&request_id, message)?;
+            }
+            RuntimeEvent::CommandInterrupted {
+                request_id,
+                message,
+            } => {
+                in_flight.remove(&request_id);
+                relay.record_command_interrupted(&request_id, message)?;
+            }
+            RuntimeEvent::CancelApplied { request_id } => {
+                in_flight.remove(&request_id);
+                relay.record_command_completed(&request_id, RelayCommandOutcome::Cancelled)?;
+            }
+            RuntimeEvent::CloseApplied { request_id } => {
+                in_flight.remove(&request_id);
+                relay.record_command_completed(&request_id, RelayCommandOutcome::Closed)?;
+                relay.record_observation(RelayObservation::Closed)?;
+            }
+            RuntimeEvent::Warning { message } => {
+                relay.record_observation(RelayObservation::Warning { message })?;
+            }
+            RuntimeEvent::Stopped => {
+                if relay.operational_state().execution
+                    != crate::hel_worker::RelayExecutionState::Closed
+                {
+                    relay.record_observation(RelayObservation::Warning {
+                        message: "ACP runtime stopped".into(),
+                    })?;
+                }
+                for (command_id, _) in std::mem::take(in_flight) {
+                    relay.record_command_interrupted(
+                        &command_id,
+                        "ACP runtime stopped before the command completed",
+                    )?;
+                }
+            }
+        }
+        Ok(stopped)
+    }
+
+    fn interrupt_in_flight(
+        relay: &Arc<Mutex<DurableRelay>>,
+        in_flight: &mut BTreeMap<String, RelayCommand>,
+        message: &str,
+    ) -> Result<()> {
+        let mut relay = relay.lock().expect("relay state lock poisoned");
+        for (command_id, _) in std::mem::take(in_flight) {
+            relay.record_command_interrupted(&command_id, message)?;
         }
         Ok(())
+    }
+
+    async fn dispatch_pending(
+        relay: &Arc<Mutex<DurableRelay>>,
+        commands: &mpsc::Sender<CommandRequest>,
+        in_flight: &mut BTreeMap<String, RelayCommand>,
+        session_configured: bool,
+    ) -> Result<()> {
+        let available = commands.capacity();
+        let mut pending = relay
+            .lock()
+            .expect("relay state lock poisoned")
+            .claim_pending_commands_up_to(session_configured, available)?;
+        pending.sort_by_key(|claimed| claimed.accepted_ordinal);
+        for claimed in pending {
+            if matches!(&claimed.command, RelayCommand::BeginCheckpoint { .. }) {
+                relay
+                    .lock()
+                    .expect("relay state lock poisoned")
+                    .record_checkpoint_ready(&claimed.command_id)?;
+                continue;
+            }
+            let Some(command) = acp_command(&claimed) else {
+                relay
+                    .lock()
+                    .expect("relay state lock poisoned")
+                    .record_command_rejected(
+                        &claimed.command_id,
+                        "relay-local command was unexpectedly claimed for ACP dispatch",
+                    )?;
+                continue;
+            };
+            if let Err(error) = commands.send(command).await {
+                relay
+                    .lock()
+                    .expect("relay state lock poisoned")
+                    .record_command_interrupted(
+                        &claimed.command_id,
+                        "ACP runtime stopped before accepting the command",
+                    )?;
+                return Err(error).context("dispatch command to ACP runtime");
+            }
+            in_flight.insert(claimed.command_id, claimed.command);
+        }
+        Ok(())
+    }
+
+    fn acp_command(claimed: &ClaimedRelayCommand) -> Option<CommandRequest> {
+        let request_id = claimed.command_id.clone();
+        match &claimed.command {
+            RelayCommand::Prompt { prompt } => Some(CommandRequest::Prompt {
+                request_id,
+                prompt: prompt.clone(),
+            }),
+            RelayCommand::SetConfig { key, value } => Some(CommandRequest::SetConfig {
+                request_id,
+                key: key.clone(),
+                value: value.clone(),
+            }),
+            RelayCommand::Cancel => Some(CommandRequest::Cancel { request_id }),
+            RelayCommand::Close { .. } => Some(CommandRequest::Close { request_id }),
+            RelayCommand::BeginCheckpoint { .. }
+            | RelayCommand::RemoveQueuedPrompt { .. }
+            | RelayCommand::ClearQueuedPrompts
+            | RelayCommand::CompleteCheckpoint { .. } => None,
+        }
     }
 
     pub(super) fn select_resume_session(
         config: &WorkerLaunchConfig,
-        worker: &crate::hel_worker::DurableWorker,
+        relay: &DurableRelay,
     ) -> Option<String> {
-        if let Some(native_session_id) = &config.native_session_id {
-            return Some(native_session_id.clone());
-        }
-        if let Some(native_session_id) = worker.native_session_id() {
-            return Some(native_session_id.to_owned());
-        }
-        if !config.recover_native_session {
-            return None;
-        }
-        worker.recover_native_session_id_from_events()
+        config
+            .native_session_id
+            .clone()
+            .or_else(|| relay.operational_state().native_session_id)
     }
 
-    async fn serve_client(
+    pub(super) async fn read_bounded_line(
+        reader: &mut (impl AsyncBufRead + Unpin),
+        maximum_bytes: usize,
+    ) -> Result<Option<String>> {
+        let mut line = Vec::new();
+        loop {
+            let available = reader.fill_buf().await.context("read relay request")?;
+            if available.is_empty() {
+                if line.is_empty() {
+                    return Ok(None);
+                }
+                return String::from_utf8(line)
+                    .context("relay request is not UTF-8")
+                    .map(Some);
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let content_bytes = newline.unwrap_or(available.len());
+            let next_len = line
+                .len()
+                .checked_add(content_bytes)
+                .context("relay request frame length overflow")?;
+            if next_len > maximum_bytes {
+                bail!("relay request frame is too large");
+            }
+            line.extend_from_slice(&available[..content_bytes]);
+            let consumed = content_bytes + usize::from(newline.is_some());
+            reader.consume(consumed);
+            if newline.is_some() {
+                return String::from_utf8(line)
+                    .context("relay request is not UTF-8")
+                    .map(Some);
+            }
+        }
+    }
+
+    pub(super) async fn serve_client(
         stream: UnixStream,
-        worker: Arc<Mutex<DurableWorker>>,
-        commands: mpsc::Sender<CommandRequest>,
-        checkpoints: mpsc::UnboundedSender<CheckpointBarrier>,
+        relay: Arc<Mutex<DurableRelay>>,
+        dispatch_wake: mpsc::Sender<()>,
     ) -> Result<()> {
         let (reader, mut writer) = stream.into_split();
-        let mut lines = BufReader::new(reader).lines();
-        while let Some(line) = lines.next_line().await? {
-            if line.len() > crate::hel_worker::MAX_FRAME_BYTES {
-                bail!("worker request frame is too large");
-            }
-            let envelope = match crate::hel_worker_protocol::decode_request(line.as_bytes())? {
-                DecodedRequest::Known(envelope) => envelope,
-                DecodedRequest::Unknown {
-                    request_id,
-                    protocol_version,
-                    method,
-                } => {
-                    let response = crate::hel_worker::unsupported_method_response(
-                        request_id,
-                        protocol_version,
-                        method,
-                    );
-                    write_response(&mut writer, &response).await?;
-                    continue;
-                }
-                DecodedRequest::Invalid {
-                    request_id,
-                    protocol_version,
-                    message,
-                } => {
-                    let response = crate::hel_worker::invalid_request_response(
-                        request_id,
-                        protocol_version,
-                        message,
-                    );
-                    write_response(&mut writer, &response).await?;
-                    continue;
-                }
-            };
-            let request = envelope.request.clone();
-            if let WorkerRequest::Compact { text } = request {
-                let response = compact_response(envelope, text, &commands).await;
-                write_response(&mut writer, &response).await?;
-                continue;
-            }
-            if matches!(
-                request,
-                WorkerRequest::Checkpoint { .. } | WorkerRequest::CheckpointWhenQuiescent { .. }
-            ) {
-                let request_id = envelope.request_id.clone();
-                let protocol_version = envelope.protocol_version;
-                let (response_tx, response_rx) = oneshot::channel();
-                let response = if checkpoints
-                    .send(CheckpointBarrier {
-                        envelope,
-                        response: response_tx,
-                    })
-                    .is_ok()
-                {
-                    response_rx.await.unwrap_or_else(|_| {
-                        runtime_request_error(
-                            request_id,
-                            protocol_version,
-                            "worker event coordinator stopped",
-                        )
-                    })
-                } else {
-                    runtime_request_error(
-                        request_id,
-                        protocol_version,
-                        "worker event coordinator stopped",
-                    )
+        let mut reader = BufReader::new(reader);
+        let mut checkpoint_barriers = BTreeSet::new();
+        let serving_result = async {
+            while let Some(line) =
+                read_bounded_line(&mut reader, crate::hel_worker::MAX_FRAME_BYTES).await?
+            {
+                let envelope = match serde_json::from_str::<RelayRequestEnvelope>(&line) {
+                    Ok(envelope) => envelope,
+                    Err(error) => {
+                        let response = invalid_relay_request(&line, &error.to_string());
+                        write_response(&mut writer, &response).await?;
+                        continue;
+                    }
                 };
+                let wakes_dispatch = matches!(&envelope.request, RelayRequest::Submit { .. });
+                let checkpoint_change = checkpoint_change(&envelope.request);
+                let response = relay
+                    .lock()
+                    .expect("relay state lock poisoned")
+                    .handle(envelope);
+                let accepted = matches!(
+                    &response.body,
+                    RelayResponseBody::Ok {
+                        payload: RelayResponsePayload::Accepted { .. }
+                    }
+                );
+                if accepted {
+                    match checkpoint_change {
+                        Some(CheckpointChange::Begin(command_id)) => {
+                            checkpoint_barriers.insert(command_id);
+                        }
+                        Some(CheckpointChange::Complete(command_id)) => {
+                            checkpoint_barriers.remove(&command_id);
+                        }
+                        None => {}
+                    }
+                }
+                if wakes_dispatch && accepted {
+                    wake_dispatch(&relay, &dispatch_wake)?;
+                }
+                // Dispatch is driven from durable state, not from delivery of
+                // the acknowledgement. A controller can disappear after its
+                // request reaches the relay but before the response write.
                 write_response(&mut writer, &response).await?;
-                continue;
             }
-            let response = worker
-                .lock()
-                .expect("worker state lock poisoned")
-                .handle(envelope);
-            dispatch_pending(&worker, &commands).await?;
-            write_response(&mut writer, &response).await?;
+            Ok(())
+        }
+        .await;
+
+        let cleanup_result =
+            release_checkpoint_barriers(&relay, &dispatch_wake, checkpoint_barriers);
+        match (serving_result, cleanup_result) {
+            (Ok(()), cleanup_result) => cleanup_result,
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(cleanup_error)) => Err(error.context(format!(
+                "also failed to release checkpoint barriers: {cleanup_error:#}"
+            ))),
+        }
+    }
+
+    enum CheckpointChange {
+        Begin(String),
+        Complete(String),
+    }
+
+    fn checkpoint_change(request: &RelayRequest) -> Option<CheckpointChange> {
+        let RelayRequest::Submit {
+            command_id,
+            command,
+        } = request
+        else {
+            return None;
+        };
+        match command {
+            RelayCommand::BeginCheckpoint { .. } => {
+                Some(CheckpointChange::Begin(command_id.clone()))
+            }
+            RelayCommand::CompleteCheckpoint { barrier_command_id } => {
+                Some(CheckpointChange::Complete(barrier_command_id.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn release_checkpoint_barriers(
+        relay: &Arc<Mutex<DurableRelay>>,
+        dispatch_wake: &mpsc::Sender<()>,
+        checkpoint_barriers: BTreeSet<String>,
+    ) -> Result<()> {
+        let mut released = false;
+        {
+            let mut relay = relay.lock().expect("relay state lock poisoned");
+            for command_id in checkpoint_barriers {
+                released |= relay
+                    .cancel_checkpoint_barrier_on_disconnect(&command_id)
+                    .with_context(|| {
+                        format!("release disconnected checkpoint barrier {command_id}")
+                    })?
+                    .is_some();
+            }
+        }
+        if released {
+            wake_dispatch(relay, dispatch_wake)
+                .context("wake relay after releasing checkpoint barrier")?;
         }
         Ok(())
     }
 
-    fn runtime_request_error(
-        request_id: String,
-        protocol_version: u32,
-        message: &str,
-    ) -> ResponseEnvelope {
-        ResponseEnvelope {
+    pub(super) fn wake_dispatch(
+        relay: &Arc<Mutex<DurableRelay>>,
+        dispatch_wake: &mpsc::Sender<()>,
+    ) -> Result<()> {
+        match dispatch_wake.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(()))
+                if relay
+                    .lock()
+                    .expect("relay state lock poisoned")
+                    .operational_state()
+                    .execution
+                    == crate::hel_worker::RelayExecutionState::Closed =>
+            {
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => bail!("relay coordinator stopped"),
+        }
+    }
+
+    fn invalid_relay_request(line: &str, message: &str) -> RelayResponseEnvelope {
+        let value = serde_json::from_str::<serde_json::Value>(line).unwrap_or_default();
+        let request_id = value
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("invalid-request")
+            .to_owned();
+        let protocol_version = value
+            .get("protocol_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+            .unwrap_or(RELAY_PROTOCOL_VERSION);
+        RelayResponseEnvelope {
             request_id,
             protocol_version,
-            body: ResponseBody::Error {
-                error: ProtocolError {
-                    code: ErrorCode::Internal,
-                    message: message.into(),
-                    retryable: true,
+            body: RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::InvalidRequest,
+                    message: message.to_owned(),
+                    retryable: false,
                     detail: None,
                 },
             },
         }
     }
 
-    async fn write_response(
+    pub(super) async fn write_response(
         writer: &mut tokio::net::unix::OwnedWriteHalf,
-        response: &ResponseEnvelope,
+        response: &RelayResponseEnvelope,
     ) -> Result<()> {
         let mut encoded = serde_json::to_vec(response)?;
+        if encoded.len().saturating_add(1) > crate::hel_worker::MAX_FRAME_BYTES {
+            bail!("relay response frame is too large");
+        }
         encoded.push(b'\n');
         writer.write_all(&encoded).await?;
         writer.flush().await?;
         Ok(())
     }
 
-    async fn compact_response(
-        envelope: RequestEnvelope,
-        text: String,
-        commands: &mpsc::Sender<CommandRequest>,
-    ) -> ResponseEnvelope {
-        let body = if !(crate::hel_worker::MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION)
-            .contains(&envelope.protocol_version)
-        {
-            ResponseBody::Error {
-                error: ProtocolError {
-                    code: ErrorCode::IncompatibleProtocol,
-                    message: format!(
-                        "request uses protocol {}, worker supports {}-{}",
-                        envelope.protocol_version,
-                        crate::hel_worker::MIN_PROTOCOL_VERSION,
-                        PROTOCOL_VERSION
-                    ),
-                    retryable: false,
-                    detail: None,
-                },
-            }
-        } else if text.trim().is_empty() {
-            ResponseBody::Error {
-                error: ProtocolError {
-                    code: ErrorCode::InvalidRequest,
-                    message: "compaction prompt is empty".into(),
-                    retryable: false,
-                    detail: None,
-                },
-            }
-        } else {
-            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-            match commands
-                .send(CommandRequest::Compact {
-                    prompt: text,
-                    response: response_tx,
-                })
-                .await
-            {
-                Ok(()) => match response_rx.await {
-                    Ok(Ok(text)) => ResponseBody::Ok {
-                        payload: ResponsePayload::Compacted { text },
-                    },
-                    Ok(Err(message)) => runtime_compaction_error(&message),
-                    Err(_) => runtime_compaction_error("ACP runtime stopped"),
-                },
-                Err(_) => runtime_compaction_error("ACP runtime stopped"),
-            }
-        };
-        ResponseEnvelope {
-            request_id: envelope.request_id,
-            protocol_version: envelope.protocol_version,
-            body,
-        }
-    }
-
-    fn runtime_compaction_error(message: &str) -> ResponseBody {
-        ResponseBody::Error {
-            error: ProtocolError {
-                code: ErrorCode::Internal,
-                message: message.into(),
-                retryable: false,
-                detail: None,
-            },
-        }
-    }
-
-    async fn dispatch_pending(
-        worker: &Arc<Mutex<DurableWorker>>,
-        commands: &mpsc::Sender<CommandRequest>,
+    pub(super) async fn forward_proxy_streams(
+        mut client_read: impl tokio::io::AsyncRead + Unpin,
+        mut client_write: impl tokio::io::AsyncWrite + Unpin,
+        mut relay_read: impl tokio::io::AsyncRead + Unpin,
+        mut relay_write: impl tokio::io::AsyncWrite + Unpin,
     ) -> Result<()> {
-        let pending = worker
-            .lock()
-            .expect("worker state lock poisoned")
-            .claim_pending_dispatches()?;
-        for (request_id, request) in pending {
-            if let Some(command) = acp_command(request_id, request) {
-                commands
-                    .send(command)
-                    .await
-                    .context("ACP runtime stopped")?;
-            }
-        }
-        Ok(())
-    }
-
-    fn acp_command(request_id: String, request: WorkerRequest) -> Option<CommandRequest> {
-        match request {
-            WorkerRequest::Prompt { text, .. } => Some(CommandRequest::Prompt { request_id, text }),
-            WorkerRequest::SetConfig { key, value } => {
-                value.as_str().map(|value| CommandRequest::SetConfig {
-                    request_id,
-                    key,
-                    value: value.to_owned(),
-                })
-            }
-            WorkerRequest::Cancel => Some(CommandRequest::Cancel { request_id }),
-            WorkerRequest::Close => Some(CommandRequest::Close { request_id }),
-            _ => None,
-        }
-    }
-
-    fn runtime_event_kind(event: &RuntimeEvent) -> &'static str {
-        match event {
-            RuntimeEvent::Connected { .. } => "connected",
-            RuntimeEvent::SessionStarted { .. } => "session_started",
-            RuntimeEvent::SessionConfigured { .. } => "session_configured",
-            RuntimeEvent::SessionUpdate { .. } => "session_update",
-            RuntimeEvent::PermissionAutoApproved { .. } => "permission_auto_approved",
-            RuntimeEvent::PromptFinished { .. } => "prompt_finished",
-            RuntimeEvent::Warning { .. } => "warning",
-            RuntimeEvent::ConfigApplied { .. } => "config_applied",
-            RuntimeEvent::Stopped => "stopped",
-        }
-    }
-
-    pub async fn proxy(root: PathBuf) -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let stream = UnixStream::connect(root.join("control.sock"))
-            .await
-            .with_context(|| format!("connect worker at {}", root.display()))?;
-        let (mut socket_read, mut socket_write) = stream.into_split();
-        let mut stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
         // The proxy must die with its client. Joining both copy directions
         // left the process alive forever after stdin EOF (a killed `podman
         // exec` client), leaking one thread-heavy process per poll inside the
-        // container. Exit as soon as either side closes, with an idle
-        // watchdog for transports that never deliver EOF.
-        const IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-        let mut stdin_buf = [0_u8; 64 * 1024];
-        let mut socket_buf = [0_u8; 64 * 1024];
-        let idle = tokio::time::sleep(IDLE_LIMIT);
-        tokio::pin!(idle);
+        // container. Exit as soon as either side closes. An idle connection
+        // is intentional: it may own a checkpoint barrier while the
+        // controller transfers a large archive.
+        let mut client_buf = [0_u8; 64 * 1024];
+        let mut relay_buf = [0_u8; 64 * 1024];
         loop {
             tokio::select! {
-                read = stdin.read(&mut stdin_buf) => {
+                read = client_read.read(&mut client_buf) => {
                     let count = read.context("read proxy stdin")?;
                     if count == 0 {
                         // Client is gone; flush any final in-flight response
                         // briefly, then exit.
-                        let _ = socket_write.shutdown().await;
+                        let _ = relay_write.shutdown().await;
                         let _ = tokio::time::timeout(
                             std::time::Duration::from_millis(500),
-                            tokio::io::copy(&mut socket_read, &mut stdout),
+                            tokio::io::copy(&mut relay_read, &mut client_write),
                         )
                         .await;
                         return Ok(());
                     }
-                    socket_write
-                        .write_all(&stdin_buf[..count])
+                    relay_write
+                        .write_all(&client_buf[..count])
                         .await
                         .context("forward request to worker")?;
-                    idle.as_mut().reset(tokio::time::Instant::now() + IDLE_LIMIT);
                 }
-                read = socket_read.read(&mut socket_buf) => {
+                read = relay_read.read(&mut relay_buf) => {
                     let count = read.context("read worker socket")?;
                     if count == 0 {
                         return Ok(());
                     }
-                    stdout
-                        .write_all(&socket_buf[..count])
+                    client_write
+                        .write_all(&relay_buf[..count])
                         .await
                         .context("forward response to client")?;
-                    stdout.flush().await.context("flush proxy stdout")?;
-                    idle.as_mut().reset(tokio::time::Instant::now() + IDLE_LIMIT);
-                }
-                _ = &mut idle => {
-                    return Ok(());
+                    client_write.flush().await.context("flush proxy stdout")?;
                 }
             }
         }
+    }
+
+    pub async fn proxy(root: PathBuf) -> Result<()> {
+        let stream = UnixStream::connect(root.join("control.sock"))
+            .await
+            .with_context(|| format!("connect worker at {}", root.display()))?;
+        let (socket_read, socket_write) = stream.into_split();
+        forward_proxy_streams(
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+            socket_read,
+            socket_write,
+        )
+        .await
     }
 
     /// Own the ACP bridge's process group.  The daemon communicates only with
@@ -797,17 +1040,44 @@ pub async fn run_acp_supervisor(_spec: AcpSupervisorSpec) -> anyhow::Result<()> 
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
+mod relay_tests {
     use std::collections::BTreeMap;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
-    use crate::hel_acp::{self, CommandRequest, RuntimeEvent};
-    use tokio::sync::{mpsc, oneshot};
+    use agent_client_protocol::schema::ProtocolVersion;
+    use agent_client_protocol::schema::v1::{
+        AgentCapabilities, ContentBlock, ContentChunk, Implementation, SessionUpdate, TextContent,
+    };
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::hel_acp::{CommandRequest, RuntimeEvent};
+    use crate::hel_worker::{
+        DurableRelay, RELAY_EVENT_GENESIS_DIGEST, RELAY_PROTOCOL_VERSION, RelayCommand,
+        RelayErrorCode, RelayExecutionState, RelayObservation, RelayProtocolError, RelayRequest,
+        RelayRequestEnvelope, RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload,
+    };
+
+    const SESSION_ID: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
+
+    struct TestRuntimeEventSender(mpsc::Sender<RuntimeEvent>);
+
+    impl TestRuntimeEventSender {
+        fn send(&self, event: RuntimeEvent) -> std::result::Result<(), ()> {
+            self.0.try_send(event).map_err(|_| ())
+        }
+    }
+
+    fn runtime_event_channel() -> (TestRuntimeEventSender, mpsc::Receiver<RuntimeEvent>) {
+        let (sender, receiver) = mpsc::channel(unix::ACP_EVENT_CHANNEL_CAPACITY);
+        (TestRuntimeEventSender(sender), receiver)
+    }
 
     fn launch_config(profile_home: &str) -> WorkerLaunchConfig {
         WorkerLaunchConfig {
-            session_id: "session".into(),
+            session_id: SESSION_ID.into(),
             harness: HarnessKind::Codex,
             bridge_command: "codex-acp".into(),
             bridge_args: Vec::new(),
@@ -815,393 +1085,1779 @@ mod tests {
             cwd: ".local/share/hel/workspaces/session/repo".into(),
             additional_directories: Vec::new(),
             native_session_id: None,
-            recover_native_session: true,
             force_unrestricted_mode: true,
         }
     }
 
-    fn tool_event(id: &str, status: &str) -> hel_acp::RuntimeEvent {
-        hel_acp::RuntimeEvent::SessionUpdate {
-            update: serde_json::json!({
-                "sessionUpdate": "tool_call",
-                "toolCallId": id,
-                "title": id,
-                "status": status,
-            }),
+    #[test]
+    fn launch_wires_require_the_new_baseline_shape() {
+        let launch = launch_config("profile-home");
+        let mut retired = serde_json::to_value(&launch).unwrap();
+        retired
+            .as_object_mut()
+            .unwrap()
+            .insert("recover_native_session".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<WorkerLaunchConfig>(retired).is_err());
+
+        let mut incomplete = serde_json::to_value(&launch).unwrap();
+        incomplete.as_object_mut().unwrap().remove("bridge_args");
+        assert!(serde_json::from_value::<WorkerLaunchConfig>(incomplete).is_err());
+
+        let supervisor = AcpSupervisorSpec {
+            command: "codex-acp".into(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: ".".into(),
+        };
+        let mut incomplete = serde_json::to_value(&supervisor).unwrap();
+        incomplete.as_object_mut().unwrap().remove("environment");
+        assert!(serde_json::from_value::<AcpSupervisorSpec>(incomplete).is_err());
+    }
+
+    fn prompt(text: &str) -> RelayCommand {
+        RelayCommand::Prompt {
+            prompt: vec![ContentBlock::Text(TextContent::new(text))],
         }
     }
 
-    fn tool_update(id: &str, status: &str) -> hel_acp::RuntimeEvent {
-        hel_acp::RuntimeEvent::SessionUpdate {
-            update: serde_json::json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": id,
-                "status": status,
-            }),
-        }
+    fn submit(relay: &mut DurableRelay, command_id: &str, command: RelayCommand) {
+        let response = relay.handle(RelayRequestEnvelope {
+            request_id: format!("submit-{command_id}"),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Submit {
+                command_id: command_id.into(),
+                command,
+            },
+        });
+        assert!(
+            matches!(
+                &response.body,
+                RelayResponseBody::Ok {
+                    payload: RelayResponsePayload::Accepted { .. }
+                }
+            ),
+            "relay command was not accepted: {response:?}"
+        );
     }
 
-    #[tokio::test]
-    async fn missing_project_directory_fails_actual_acp_launch() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("worker");
-        let mut config = launch_config("profile");
-        config.session_id = "018f9dd2-a3b4-7c8d-9000-123456789abc".into();
-        config.cwd = temp.path().join("removed-project");
-
-        let error = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            unix::run_daemon(root.clone(), config),
-        )
-        .await
-        .expect("worker startup should not hang")
-        .unwrap_err();
-
-        let error = format!("{error:#}");
-        assert!(error.contains("launch ACP bridge"), "{error}");
-        assert!(!root.join("control.sock").exists());
-    }
-
-    #[tokio::test]
-    async fn checkpoint_waits_until_all_observed_tools_finish() {
-        let temp = tempfile::tempdir().unwrap();
-        let worker = Arc::new(Mutex::new(
-            crate::hel_worker::DurableWorker::open(
-                temp.path(),
-                "018f9dd2-a3b4-7c8d-9000-123456789abc",
-                "1.0.0",
-            )
-            .unwrap(),
+    fn assert_prompt(command: CommandRequest, expected_id: &str, expected_text: &str) {
+        let CommandRequest::Prompt { request_id, prompt } = command else {
+            panic!("expected ACP prompt command");
+        };
+        assert_eq!(request_id, expected_id);
+        assert!(matches!(
+            prompt.as_slice(),
+            [ContentBlock::Text(text)] if text.text == expected_text
         ));
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (checkpoint_tx, checkpoint_rx) = mpsc::unbounded_channel();
-        let (command_tx, _command_rx) = mpsc::channel(1);
-        let coordinator = tokio::spawn(unix::run_event_coordinator(
-            worker.clone(),
+    }
+
+    #[tokio::test]
+    async fn offline_prompt_queue_runs_serially_without_a_controller() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(&mut durable, "prompt-1", prompt("first"));
+        submit(&mut durable, "prompt-2", prompt("second"));
+        let relay = Arc::new(Mutex::new(durable));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay.clone(),
             event_rx,
-            checkpoint_rx,
+            wake_rx,
             command_tx,
         ));
-
-        event_tx.send(tool_event("one", "in_progress")).unwrap();
-        event_tx.send(tool_event("two", "pending")).unwrap();
-        let (response_tx, mut response_rx) = oneshot::channel();
-        checkpoint_tx
-            .send(unix::CheckpointBarrier {
-                envelope: crate::hel_worker::RequestEnvelope {
-                    request_id: "checkpoint-request".into(),
-                    protocol_version: crate::hel_worker::PROTOCOL_VERSION,
-                    request: crate::hel_worker::WorkerRequest::CheckpointWhenQuiescent {
-                        reason: Some("test".into()),
-                    },
-                },
-                response: response_tx,
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
             })
             .unwrap();
 
-        event_tx.send(tool_update("one", "completed")).unwrap();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(25), &mut response_rx)
-                .await
-                .is_err(),
-            "one remaining tool call must keep the checkpoint parked"
-        );
-
-        event_tx.send(tool_update("two", "failed")).unwrap();
-        let response = tokio::time::timeout(std::time::Duration::from_secs(1), response_rx)
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), command_rx.recv())
             .await
             .unwrap()
             .unwrap();
-        let crate::hel_worker::ResponseBody::Ok {
-            payload: crate::hel_worker::ResponsePayload::Accepted { seq },
-        } = &response.body
-        else {
-            panic!("checkpoint was not accepted: {response:?}");
-        };
-        assert_eq!(*seq, 5);
+        assert_prompt(first, "prompt-1", "first");
+        event_tx
+            .send(RuntimeEvent::PromptFinished {
+                request_id: "prompt-1".into(),
+                stop_reason: "end_turn".into(),
+            })
+            .unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), command_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_prompt(second, "prompt-2", "second");
         assert_eq!(
-            worker.lock().unwrap().snapshot().last_checkpoint_seq,
-            Some(5)
+            relay
+                .lock()
+                .unwrap()
+                .operational_state()
+                .active_prompt
+                .as_ref()
+                .map(|prompt| prompt.command_id.as_str()),
+            Some("prompt-2")
         );
 
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "prompt-2".into(),
+                message: "test shutdown".into(),
+            })
+            .unwrap();
         drop(event_tx);
-        drop(checkpoint_tx);
+        drop(wake_tx);
         coordinator.await.unwrap().unwrap();
     }
 
     #[tokio::test]
-    async fn checkpoint_does_not_wait_for_end_of_turn_without_open_tools() {
+    async fn config_during_a_prompt_waits_but_cancel_dispatches_immediately() {
         let temp = tempfile::tempdir().unwrap();
-        let mut durable = crate::hel_worker::DurableWorker::open(
-            temp.path(),
-            "018f9dd2-a3b4-7c8d-9000-123456789abc",
-            "1.0.0",
-        )
-        .unwrap();
-        let response = durable.handle(crate::hel_worker::RequestEnvelope {
-            request_id: "running-prompt".into(),
-            protocol_version: crate::hel_worker::PROTOCOL_VERSION,
-            request: crate::hel_worker::WorkerRequest::Prompt {
-                text: "running".into(),
-                attachments: vec![],
-            },
-        });
-        assert!(matches!(
-            response.body,
-            crate::hel_worker::ResponseBody::Ok {
-                payload: crate::hel_worker::ResponsePayload::Accepted { .. }
-            }
-        ));
-        let worker = Arc::new(Mutex::new(durable));
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (checkpoint_tx, checkpoint_rx) = mpsc::unbounded_channel();
-        let (command_tx, _command_rx) = mpsc::channel(1);
-        let coordinator = tokio::spawn(unix::run_event_coordinator(
-            worker.clone(),
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(&mut durable, "active-prompt", prompt("running"));
+        let relay = Arc::new(Mutex::new(durable));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay.clone(),
             event_rx,
-            checkpoint_rx,
+            wake_rx,
             command_tx,
         ));
-        let (response_tx, response_rx) = oneshot::channel();
-        checkpoint_tx
-            .send(unix::CheckpointBarrier {
-                envelope: crate::hel_worker::RequestEnvelope {
-                    request_id: "checkpoint-request".into(),
-                    protocol_version: crate::hel_worker::PROTOCOL_VERSION,
-                    request: crate::hel_worker::WorkerRequest::CheckpointWhenQuiescent {
-                        reason: Some("test".into()),
-                    },
-                },
-                response: response_tx,
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+        assert_prompt(command_rx.recv().await.unwrap(), "active-prompt", "running");
+
+        submit(
+            &mut relay.lock().unwrap(),
+            "config-while-running",
+            RelayCommand::SetConfig {
+                key: "model".into(),
+                value: "later".into(),
+            },
+        );
+        submit(
+            &mut relay.lock().unwrap(),
+            "cancel-while-running",
+            RelayCommand::Cancel,
+        );
+        wake_tx.try_send(()).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), command_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            CommandRequest::Cancel { request_id } if request_id == "cancel-while-running"
+        ));
+
+        event_tx
+            .send(RuntimeEvent::CancelApplied {
+                request_id: "cancel-while-running".into(),
+            })
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), command_rx.recv())
+                .await
+                .is_err(),
+            "configuration dispatched before the active prompt finished"
+        );
+
+        event_tx
+            .send(RuntimeEvent::PromptFinished {
+                request_id: "active-prompt".into(),
+                stop_reason: "cancelled".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), command_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            CommandRequest::SetConfig { request_id, .. } if request_id == "config-while-running"
+        ));
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "config-while-running".into(),
+                message: "test shutdown".into(),
+            })
+            .unwrap();
+        event_tx.send(RuntimeEvent::Stopped).unwrap();
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn proxy_transport_does_not_expire_an_idle_connection() {
+        let (mut controller, proxy_client) = tokio::io::duplex(1024);
+        let (proxy_relay, mut relay_peer) = tokio::io::duplex(1024);
+        let (client_read, client_write) = tokio::io::split(proxy_client);
+        let (relay_read, relay_write) = tokio::io::split(proxy_relay);
+        let proxy = tokio::spawn(unix::forward_proxy_streams(
+            client_read,
+            client_write,
+            relay_read,
+            relay_write,
+        ));
+
+        tokio::time::advance(std::time::Duration::from_secs(16 * 60)).await;
+        tokio::task::yield_now().await;
+        assert!(!proxy.is_finished(), "idle proxy connection expired");
+
+        controller.write_all(b"request").await.unwrap();
+        let mut request = [0_u8; 7];
+        relay_peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"request");
+        relay_peer.write_all(b"response").await.unwrap();
+        let mut response = [0_u8; 8];
+        controller.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"response");
+
+        drop(relay_peer);
+        drop(controller);
+        proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_dispatch_preserves_the_complete_acp_content_vector() {
+        let temp = tempfile::tempdir().unwrap();
+        let content = vec![
+            ContentBlock::Text(TextContent::new("first block")),
+            ContentBlock::Text(TextContent::new("second block")),
+        ];
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(
+            &mut durable,
+            "prompt-blocks",
+            RelayCommand::Prompt {
+                prompt: content.clone(),
+            },
+        );
+        let relay = Arc::new(Mutex::new(durable));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay, event_rx, wake_rx, command_tx,
+        ));
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
             })
             .unwrap();
 
-        let response = tokio::time::timeout(std::time::Duration::from_secs(1), response_rx)
-            .await
-            .expect("checkpoint should not wait for PromptFinished")
-            .unwrap();
-        assert!(matches!(
-            response.body,
-            crate::hel_worker::ResponseBody::Ok {
-                payload: crate::hel_worker::ResponsePayload::Accepted { .. }
-            }
-        ));
-        assert_eq!(
-            worker.lock().unwrap().snapshot().phase,
-            crate::hel_worker::WorkerPhase::Running
-        );
+        let CommandRequest::Prompt { request_id, prompt } = command_rx.recv().await.unwrap() else {
+            panic!("expected ACP prompt command");
+        };
+        assert_eq!(request_id, "prompt-blocks");
+        assert_eq!(prompt, content);
 
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "prompt-blocks".into(),
+                message: "test shutdown".into(),
+            })
+            .unwrap();
         drop(event_tx);
-        drop(checkpoint_tx);
+        drop(wake_tx);
         coordinator.await.unwrap().unwrap();
     }
 
     #[tokio::test]
-    async fn completed_turn_dispatches_worker_owned_queue_without_a_client() {
+    async fn same_priority_controls_dispatch_in_acceptance_order() {
         let temp = tempfile::tempdir().unwrap();
-        let mut durable = crate::hel_worker::DurableWorker::open(
-            temp.path(),
-            "018f9dd2-a3b4-7c8d-9000-123456789abc",
-            "1.0.0",
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(
+            &mut durable,
+            "z-accepted-first",
+            RelayCommand::SetConfig {
+                key: "model".into(),
+                value: "first".into(),
+            },
+        );
+        submit(
+            &mut durable,
+            "a-accepted-second",
+            RelayCommand::SetConfig {
+                key: "model".into(),
+                value: "second".into(),
+            },
+        );
+        let relay = Arc::new(Mutex::new(durable));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(2);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay, event_rx, wake_rx, command_tx,
+        ));
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+
+        let first = command_rx.recv().await.unwrap();
+        let second = command_rx.recv().await.unwrap();
+        assert!(matches!(
+            first,
+            CommandRequest::SetConfig { request_id, .. }
+                if request_id == "z-accepted-first"
+        ));
+        assert!(matches!(
+            second,
+            CommandRequest::SetConfig { request_id, .. }
+                if request_id == "a-accepted-second"
+        ));
+
+        for request_id in ["z-accepted-first", "a-accepted-second"] {
+            event_tx
+                .send(RuntimeEvent::CommandRejected {
+                    request_id: request_id.into(),
+                    message: "test shutdown".into(),
+                })
+                .unwrap();
+        }
+        event_tx.send(RuntimeEvent::Stopped).unwrap();
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_does_not_outgrow_the_bounded_acp_command_channel() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        for (command_id, value) in [("config-first", "first"), ("config-second", "second")] {
+            submit(
+                &mut durable,
+                command_id,
+                RelayCommand::SetConfig {
+                    key: "model".into(),
+                    value: value.into(),
+                },
+            );
+        }
+        let relay = Arc::new(Mutex::new(durable));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay, event_rx, wake_rx, command_tx,
+        ));
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            command_rx.recv().await.unwrap(),
+            CommandRequest::SetConfig { request_id, .. } if request_id == "config-first"
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), command_rx.recv(),)
+                .await
+                .is_err(),
+            "the second command was claimed beyond the channel's durable dispatch capacity"
+        );
+
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "config-first".into(),
+                message: "advance the bounded batch".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), command_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            CommandRequest::SetConfig { request_id, .. } if request_id == "config-second"
+        ));
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "config-second".into(),
+                message: "test shutdown".into(),
+            })
+            .unwrap();
+        event_tx.send(RuntimeEvent::Stopped).unwrap();
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn different_command_types_dispatch_in_acceptance_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(
+            &mut durable,
+            "config-first",
+            RelayCommand::SetConfig {
+                key: "model".into(),
+                value: "before-prompt".into(),
+            },
+        );
+        submit(&mut durable, "prompt-second", prompt("after config"));
+        let relay = Arc::new(Mutex::new(durable));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(2);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay, event_rx, wake_rx, command_tx,
+        ));
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            command_rx.recv().await.unwrap(),
+            CommandRequest::SetConfig { request_id, .. } if request_id == "config-first"
+        ));
+        assert_prompt(
+            command_rx.recv().await.unwrap(),
+            "prompt-second",
+            "after config",
+        );
+
+        for request_id in ["config-first", "prompt-second"] {
+            event_tx
+                .send(RuntimeEvent::CommandRejected {
+                    request_id: request_id.into(),
+                    message: "test shutdown".into(),
+                })
+                .unwrap();
+        }
+        event_tx.send(RuntimeEvent::Stopped).unwrap();
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_prompt_is_durable_and_does_not_stall_the_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(&mut durable, "prompt-1", prompt("first"));
+        submit(&mut durable, "prompt-2", prompt("second"));
+        let relay = Arc::new(Mutex::new(durable));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay.clone(),
+            event_rx,
+            wake_rx,
+            command_tx,
+        ));
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+
+        assert_prompt(command_rx.recv().await.unwrap(), "prompt-1", "first");
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "prompt-1".into(),
+                message: "agent rejected prompt".into(),
+            })
+            .unwrap();
+        assert_prompt(command_rx.recv().await.unwrap(), "prompt-2", "second");
+        let observations = relay
+            .lock()
+            .unwrap()
+            .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+            .unwrap();
+        assert!(observations.iter().any(|event| matches!(
+            &event.observation,
+            RelayObservation::CommandRejected {
+                command_id,
+                message,
+                ..
+            }
+                if command_id == "prompt-1" && message == "agent rejected prompt"
+        )));
+
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "prompt-2".into(),
+                message: "test shutdown".into(),
+            })
+            .unwrap();
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_cancel_and_close_commands_have_durable_terminal_outcomes() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay.clone(),
+            event_rx,
+            wake_rx,
+            command_tx,
+        ));
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+
+        submit(
+            &mut relay.lock().unwrap(),
+            "config-1",
+            RelayCommand::SetConfig {
+                key: "model".into(),
+                value: "test-model".into(),
+            },
+        );
+        wake_tx.try_send(()).unwrap();
+        assert!(matches!(
+            command_rx.recv().await.unwrap(),
+            CommandRequest::SetConfig { request_id, key, value }
+                if request_id == "config-1" && key == "model" && value == "test-model"
+        ));
+        event_tx
+            .send(RuntimeEvent::ConfigApplied {
+                request_id: "config-1".into(),
+                key: "model".into(),
+                value: "test-model".into(),
+                config_options: Vec::new(),
+            })
+            .unwrap();
+        wait_for_relay_state(&relay, |state| {
+            state.config.get("model").map(String::as_str) == Some("test-model")
+        })
+        .await;
+
+        submit(&mut relay.lock().unwrap(), "prompt-1", prompt("running"));
+        wake_tx.try_send(()).unwrap();
+        assert_prompt(command_rx.recv().await.unwrap(), "prompt-1", "running");
+        submit(&mut relay.lock().unwrap(), "cancel-1", RelayCommand::Cancel);
+        wake_tx.try_send(()).unwrap();
+        assert!(matches!(
+            command_rx.recv().await.unwrap(),
+            CommandRequest::Cancel { request_id } if request_id == "cancel-1"
+        ));
+        event_tx
+            .send(RuntimeEvent::CancelApplied {
+                request_id: "cancel-1".into(),
+            })
+            .unwrap();
+        event_tx
+            .send(RuntimeEvent::PromptFinished {
+                request_id: "prompt-1".into(),
+                stop_reason: "cancelled".into(),
+            })
+            .unwrap();
+        wait_for_relay_state(&relay, |state| {
+            state.execution == RelayExecutionState::Idle && state.active_prompt.is_none()
+        })
+        .await;
+
+        submit(
+            &mut relay.lock().unwrap(),
+            "barrier-before-close",
+            RelayCommand::BeginCheckpoint {
+                reason: Some("close test".into()),
+            },
+        );
+        wake_tx.try_send(()).unwrap();
+        wait_for_relay_state(&relay, |state| state.checkpoint_ready.is_some()).await;
+        let expected = relay
+            .lock()
+            .unwrap()
+            .operational_state()
+            .checkpoint_ready
+            .unwrap();
+        submit(
+            &mut relay.lock().unwrap(),
+            "close-01",
+            RelayCommand::Close {
+                barrier_command_id: "barrier-before-close".into(),
+                expected,
+            },
+        );
+        submit(
+            &mut relay.lock().unwrap(),
+            "complete-before-close",
+            RelayCommand::CompleteCheckpoint {
+                barrier_command_id: "barrier-before-close".into(),
+            },
+        );
+        wake_tx.try_send(()).unwrap();
+        assert!(matches!(
+            command_rx.recv().await.unwrap(),
+            CommandRequest::Close { request_id } if request_id == "close-01"
+        ));
+        event_tx
+            .send(RuntimeEvent::CloseApplied {
+                request_id: "close-01".into(),
+            })
+            .unwrap();
+        wait_for_relay_state(&relay, |state| {
+            state.execution == RelayExecutionState::Closed
+        })
+        .await;
+
+        event_tx.send(RuntimeEvent::Stopped).unwrap();
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+        let observations = relay
+            .lock()
+            .unwrap()
+            .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+            .unwrap();
+        assert!(observations.iter().any(|event| matches!(
+            &event.observation,
+            RelayObservation::CommandCompleted {
+                command_id,
+                outcome: crate::hel_worker::RelayCommandOutcome::Cancelled,
+            } if command_id == "cancel-1"
+        )));
+        assert!(
+            observations
+                .iter()
+                .any(|event| matches!(&event.observation, RelayObservation::Closed))
+        );
+    }
+
+    async fn wait_for_relay_state(
+        relay: &Arc<Mutex<DurableRelay>>,
+        predicate: impl Fn(&crate::hel_worker::RelayOperationalState) -> bool,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if predicate(&relay.lock().unwrap().operational_state()) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("relay state did not reach the expected condition");
+    }
+
+    #[test]
+    fn typed_acp_observations_and_permission_decisions_are_journaled() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let mut in_flight = BTreeMap::new();
+        unix::record_runtime_event(
+            &relay,
+            &mut in_flight,
+            RuntimeEvent::Connected {
+                agent_name: Some("test-agent".into()),
+                agent_version: Some("1".into()),
+                protocol_version: Some(ProtocolVersion::V1),
+                capabilities: Some(Box::new(AgentCapabilities::default())),
+                agent_info: Some(Implementation::new("test-agent", "1")),
+            },
         )
         .unwrap();
-        let accepted = |response: crate::hel_worker::ResponseEnvelope| {
-            assert!(matches!(
-                response.body,
-                crate::hel_worker::ResponseBody::Ok {
-                    payload: crate::hel_worker::ResponsePayload::Accepted { .. }
-                }
-            ));
-        };
-        accepted(durable.handle(crate::hel_worker::RequestEnvelope {
-            request_id: "running-prompt".into(),
-            protocol_version: crate::hel_worker::PROTOCOL_VERSION,
-            request: crate::hel_worker::WorkerRequest::Prompt {
-                text: "running".into(),
-                attachments: vec![],
+        unix::record_runtime_event(
+            &relay,
+            &mut in_flight,
+            RuntimeEvent::PermissionAutoApproved {
+                option_id: "allow-always".into(),
+                option_name: "Allow always".into(),
             },
-        }));
-        durable.claim_pending_dispatches().unwrap();
-        accepted(durable.handle(crate::hel_worker::RequestEnvelope {
-            request_id: "enqueue-prompt".into(),
-            protocol_version: crate::hel_worker::PROTOCOL_VERSION,
-            request: crate::hel_worker::WorkerRequest::EnqueuePrompt {
-                queue_id: "queued-0001".into(),
-                text: "next".into(),
-                attachments: vec![],
+        )
+        .unwrap();
+        let update = SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new("hello")))
+                .message_id("message-1"),
+        );
+        unix::record_runtime_event(
+            &relay,
+            &mut in_flight,
+            RuntimeEvent::SessionUpdate {
+                update: serde_json::to_value(update).unwrap(),
             },
-        }));
-        let worker = Arc::new(Mutex::new(durable));
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (_checkpoint_tx, checkpoint_rx) = mpsc::unbounded_channel();
+        )
+        .unwrap();
+
+        let events = relay
+            .lock()
+            .unwrap()
+            .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+            .unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                event.observation,
+                RelayObservation::AgentInitialized { .. }
+            ))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event.observation,
+            RelayObservation::PermissionAutoApproved { .. }
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.observation, RelayObservation::SessionUpdate { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_waits_for_current_session_configuration_then_stays_local() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(
+            &mut durable,
+            "checkpoint-1",
+            RelayCommand::BeginCheckpoint {
+                reason: Some("test".into()),
+            },
+        );
+        let relay = Arc::new(Mutex::new(durable));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
         let (command_tx, mut command_rx) = mpsc::channel(1);
-        let coordinator = tokio::spawn(unix::run_event_coordinator(
-            worker,
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay.clone(),
             event_rx,
-            checkpoint_rx,
+            wake_rx,
+            command_tx,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            relay
+                .lock()
+                .unwrap()
+                .operational_state()
+                .checkpoint_barrier
+                .is_none(),
+            "checkpoint became ready before the current ACP session was configured"
+        );
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if relay
+                    .lock()
+                    .unwrap()
+                    .operational_state()
+                    .checkpoint_barrier
+                    .as_deref()
+                    == Some("checkpoint-1")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), command_rx.recv())
+                .await
+                .is_err()
+        );
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_waits_for_an_in_flight_config_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(
+            &mut durable,
+            "config-before",
+            RelayCommand::SetConfig {
+                key: "model".into(),
+                value: "test-model".into(),
+            },
+        );
+        submit(
+            &mut durable,
+            "barrier-after-config",
+            RelayCommand::BeginCheckpoint {
+                reason: Some("after config".into()),
+            },
+        );
+        let relay = Arc::new(Mutex::new(durable));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(2);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay.clone(),
+            event_rx,
+            wake_rx,
             command_tx,
         ));
 
         event_tx
-            .send(RuntimeEvent::PromptFinished {
-                request_id: "running-prompt".into(),
-                stop_reason: "end_turn".into(),
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
             })
             .unwrap();
-        let command = command_rx.recv().await.unwrap();
         assert!(matches!(
-            command,
-            CommandRequest::Prompt { request_id, text }
-                if request_id == "queue-queued-0001" && text == "next"
+            command_rx.recv().await.unwrap(),
+            CommandRequest::SetConfig { request_id, .. } if request_id == "config-before"
         ));
+        assert!(
+            relay
+                .lock()
+                .unwrap()
+                .operational_state()
+                .checkpoint_barrier
+                .is_none(),
+            "checkpoint became ready before the ACP config command completed"
+        );
+        event_tx
+            .send(RuntimeEvent::ConfigApplied {
+                request_id: "config-before".into(),
+                key: "model".into(),
+                value: "test-model".into(),
+                config_options: Vec::new(),
+            })
+            .unwrap();
+        // ConfigApplied carries the ACP response's complete configuration.
+        // The coordinator must durably materialize its SessionConfigured
+        // observation before admitting the waiting checkpoint.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let (state, configured_events) = {
+                    let relay = relay.lock().unwrap();
+                    let state = relay.operational_state();
+                    let configured_events = relay
+                        .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+                        .unwrap()
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                event.observation,
+                                RelayObservation::SessionConfigured { .. }
+                            )
+                        })
+                        .count();
+                    (state, configured_events)
+                };
+                if state.checkpoint_barrier.as_deref() == Some("barrier-after-config")
+                    && configured_events == 2
+                {
+                    let ready = state.checkpoint_ready.expect("checkpoint is ready");
+                    assert_eq!(ready.ordinal, state.latest_ordinal);
+                    assert_eq!(ready.digest, state.latest_digest);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        relay
+            .lock()
+            .unwrap()
+            .cancel_checkpoint_barrier_on_disconnect("barrier-after-config")
+            .unwrap();
+        event_tx.send(RuntimeEvent::Stopped).unwrap();
         drop(event_tx);
+        drop(wake_tx);
         coordinator.await.unwrap().unwrap();
     }
 
-    #[test]
-    fn relative_harness_home_is_resolved_before_bridge_changes_directory() {
-        let mut config = launch_config(".local/share/hel/profiles/session");
+    #[tokio::test]
+    async fn checkpoint_wake_records_already_queued_runtime_events_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay.clone(),
+            event_rx,
+            wake_rx,
+            command_tx,
+        ));
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+        wait_for_relay_state(&relay, |state| state.latest_ordinal >= 1).await;
 
-        resolve_relative_harness_home(&mut config, Path::new("/home/ubuntu"));
+        event_tx
+            .send(RuntimeEvent::Warning {
+                message: "queued before checkpoint wake".into(),
+            })
+            .unwrap();
+        submit(
+            &mut relay.lock().unwrap(),
+            "checkpoint-after-queued-event",
+            RelayCommand::BeginCheckpoint {
+                reason: Some("ordering test".into()),
+            },
+        );
+        wake_tx.try_send(()).unwrap();
+        wait_for_relay_state(&relay, |state| state.checkpoint_ready.is_some()).await;
 
+        {
+            let relay_state = relay.lock().unwrap();
+            let state = relay_state.operational_state();
+            let ready = state.checkpoint_ready.expect("checkpoint is ready");
+            assert_eq!(ready.ordinal, state.latest_ordinal);
+            assert_eq!(ready.digest, state.latest_digest);
+            let events = relay_state
+                .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+                .unwrap();
+            let warning_ordinal = events
+                .iter()
+                .find_map(|event| match &event.observation {
+                    RelayObservation::Warning { message }
+                        if message == "queued before checkpoint wake" =>
+                    {
+                        Some(event.ordinal)
+                    }
+                    _ => None,
+                })
+                .expect("queued warning was recorded");
+            assert!(warning_ordinal < ready.ordinal);
+        }
+
+        relay
+            .lock()
+            .unwrap()
+            .cancel_checkpoint_barrier_on_disconnect("checkpoint-after-queued-event")
+            .unwrap();
+        event_tx.send(RuntimeEvent::Stopped).unwrap();
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_wake_is_not_starved_by_a_runtime_event_flood() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(
+            &mut durable,
+            "checkpoint-during-event-flood",
+            RelayCommand::BeginCheckpoint {
+                reason: Some("event flood fairness".into()),
+            },
+        );
+        let relay = Arc::new(Mutex::new(durable));
+        let (event_tx, event_rx) = mpsc::channel(8);
+        event_tx
+            .try_send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+        for sequence in 0..7 {
+            event_tx
+                .try_send(RuntimeEvent::Warning {
+                    message: format!("queued flood event {sequence}"),
+                })
+                .unwrap();
+        }
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        wake_tx.try_send(()).unwrap();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let flood_tx = event_tx.clone();
+        let flood = tokio::spawn(async move {
+            let mut sequence = 7_u64;
+            loop {
+                if flood_tx
+                    .send(RuntimeEvent::Warning {
+                        message: format!("live flood event {sequence}"),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                sequence += 1;
+            }
+        });
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay.clone(),
+            event_rx,
+            wake_rx,
+            command_tx,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if relay
+                    .lock()
+                    .unwrap()
+                    .operational_state()
+                    .checkpoint_ready
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime event flood starved the checkpoint wake");
+
+        flood.abort();
+        let _ = flood.await;
+        relay
+            .lock()
+            .unwrap()
+            .cancel_checkpoint_barrier_on_disconnect("checkpoint-during-event-flood")
+            .unwrap();
+        event_tx.send(RuntimeEvent::Stopped).await.unwrap();
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_freezes_effectful_commands_submitted_after_the_barrier() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(
+            &mut durable,
+            "barrier-before-config",
+            RelayCommand::BeginCheckpoint {
+                reason: Some("freeze later work".into()),
+            },
+        );
+        submit(
+            &mut durable,
+            "config-after",
+            RelayCommand::SetConfig {
+                key: "model".into(),
+                value: "later-model".into(),
+            },
+        );
+        let relay = Arc::new(Mutex::new(durable));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(2);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay.clone(),
+            event_rx,
+            wake_rx,
+            command_tx,
+        ));
+
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+        wait_for_relay_state(&relay, |state| {
+            state.checkpoint_barrier.as_deref() == Some("barrier-before-config")
+        })
+        .await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), command_rx.recv())
+                .await
+                .is_err(),
+            "a post-barrier ACP command was dispatched before checkpoint completion"
+        );
+
+        submit(
+            &mut relay.lock().unwrap(),
+            "complete-checkpoint",
+            RelayCommand::CompleteCheckpoint {
+                barrier_command_id: "barrier-before-config".into(),
+            },
+        );
+        wake_tx.try_send(()).unwrap();
+        assert!(matches!(
+            command_rx.recv().await.unwrap(),
+            CommandRequest::SetConfig { request_id, .. } if request_id == "config-after"
+        ));
+
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "config-after".into(),
+                message: "test shutdown".into(),
+            })
+            .unwrap();
+        event_tx.send(RuntimeEvent::Stopped).unwrap();
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_releases_checkpoint_and_runs_queued_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay.clone(),
+            event_rx,
+            wake_rx,
+            command_tx,
+        ));
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(unix::serve_client(server, relay.clone(), wake_tx.clone()));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        let begin = RelayRequestEnvelope {
+            request_id: "begin-checkpoint".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Submit {
+                command_id: "checkpoint-1".into(),
+                command: RelayCommand::BeginCheckpoint {
+                    reason: Some("test disconnect".into()),
+                },
+            },
+        };
+        let mut encoded = serde_json::to_vec(&begin).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+        let response = lines.next_line().await.unwrap().unwrap();
+        let response: crate::hel_worker::RelayResponseEnvelope =
+            serde_json::from_str(&response).unwrap();
+        assert!(matches!(response.body, RelayResponseBody::Ok { .. }));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if relay
+                    .lock()
+                    .unwrap()
+                    .operational_state()
+                    .checkpoint_barrier
+                    .as_deref()
+                    == Some("checkpoint-1")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let queued_prompt = RelayRequestEnvelope {
+            request_id: "queue-prompt".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Submit {
+                command_id: "prompt-1".into(),
+                command: prompt("runs after disconnect"),
+            },
+        };
+        let mut encoded = serde_json::to_vec(&queued_prompt).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+        let response = lines.next_line().await.unwrap().unwrap();
+        let response: crate::hel_worker::RelayResponseEnvelope =
+            serde_json::from_str(&response).unwrap();
+        assert!(matches!(response.body, RelayResponseBody::Ok { .. }));
+
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        drop(lines);
+        server_task.await.unwrap().unwrap();
+
+        assert!(
+            relay
+                .lock()
+                .unwrap()
+                .operational_state()
+                .checkpoint_barrier
+                .is_none()
+        );
+        assert_prompt(
+            tokio::time::timeout(std::time::Duration::from_secs(1), command_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            "prompt-1",
+            "runs after disconnect",
+        );
+        assert!(
+            relay
+                .lock()
+                .unwrap()
+                .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.observation,
+                    RelayObservation::CommandInterrupted { command_id, .. }
+                        if command_id == "checkpoint-1"
+                ))
+        );
+
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "prompt-1".into(),
+                message: "test shutdown".into(),
+            })
+            .unwrap();
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_client_rejects_unknown_envelope_fields_without_disconnect() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(unix::serve_client(server, relay, wake_tx));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        writer
+            .write_all(
+                b"{\"request_id\":\"retired\",\"protocol_version\":1,\"controller_store_id\":\"old\",\"request\":{\"method\":\"status\"}}\n",
+            )
+            .await
+            .unwrap();
+        let rejected: RelayResponseEnvelope =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(
+            rejected.body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::InvalidRequest,
+                    ..
+                }
+            }
+        ));
+
+        let status = RelayRequestEnvelope {
+            request_id: "valid-after-invalid".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Status,
+        };
+        let mut encoded = serde_json::to_vec(&status).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+        let accepted: RelayResponseEnvelope =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(
+            accepted.body,
+            RelayResponseBody::Ok {
+                payload: RelayResponsePayload::Status(_)
+            }
+        ));
+
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        drop(lines);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_between_close_and_checkpoint_completion_dispatches_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay.clone(),
+            event_rx,
+            wake_rx,
+            command_tx,
+        ));
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(unix::serve_client(server, relay.clone(), wake_tx.clone()));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        let begin = RelayRequestEnvelope {
+            request_id: "begin-close-checkpoint".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Submit {
+                command_id: "barrier-before-close".into(),
+                command: RelayCommand::BeginCheckpoint {
+                    reason: Some("disconnect race".into()),
+                },
+            },
+        };
+        let mut encoded = serde_json::to_vec(&begin).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+        let response = lines.next_line().await.unwrap().unwrap();
+        let response: crate::hel_worker::RelayResponseEnvelope =
+            serde_json::from_str(&response).unwrap();
+        assert!(matches!(response.body, RelayResponseBody::Ok { .. }));
+        wait_for_relay_state(&relay, |state| state.checkpoint_ready.is_some()).await;
+        let expected = relay
+            .lock()
+            .unwrap()
+            .operational_state()
+            .checkpoint_ready
+            .unwrap();
+
+        let close = RelayRequestEnvelope {
+            request_id: "queue-exact-close".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Submit {
+                command_id: "close-after-barrier".into(),
+                command: RelayCommand::Close {
+                    barrier_command_id: "barrier-before-close".into(),
+                    expected,
+                },
+            },
+        };
+        let mut encoded = serde_json::to_vec(&close).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+        let response = lines.next_line().await.unwrap().unwrap();
+        let response: crate::hel_worker::RelayResponseEnvelope =
+            serde_json::from_str(&response).unwrap();
+        assert!(matches!(response.body, RelayResponseBody::Ok { .. }));
+
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        drop(lines);
+        server_task.await.unwrap().unwrap();
+
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), command_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            CommandRequest::Close { request_id } if request_id == "close-after-barrier"
+        ));
+        event_tx
+            .send(RuntimeEvent::CloseApplied {
+                request_id: "close-after-barrier".into(),
+            })
+            .unwrap();
+        wait_for_relay_state(&relay, |state| {
+            state.execution == RelayExecutionState::Closed
+        })
+        .await;
+        event_tx.send(RuntimeEvent::Stopped).unwrap();
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_v1_client_disconnect_does_not_own_command_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay.clone(),
+            event_rx,
+            wake_rx,
+            command_tx,
+        ));
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(unix::serve_client(server, relay, wake_tx.clone()));
+        let (reader, mut writer) = client.into_split();
+        let request = RelayRequestEnvelope {
+            request_id: "submit".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Submit {
+                command_id: "prompt-1".into(),
+                command: prompt("continues offline"),
+            },
+        };
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+        drop(writer);
+        drop(reader);
+        // The response write may win or lose the close race; command
+        // execution must not depend on it.
+        let _ = server_task.await.unwrap();
+
+        assert_prompt(
+            tokio::time::timeout(std::time::Duration::from_secs(1), command_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            "prompt-1",
+            "continues offline",
+        );
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "prompt-1".into(),
+                message: "test shutdown".into(),
+            })
+            .unwrap();
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_relay_stays_attachable_after_the_acp_runtime_stops() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(
+            &mut durable,
+            "barrier-before-close",
+            RelayCommand::BeginCheckpoint {
+                reason: Some("close test".into()),
+            },
+        );
+        let claimed = durable.claim_pending_commands(true).unwrap();
+        assert!(matches!(
+            claimed.as_slice(),
+            [crate::hel_worker::ClaimedRelayCommand {
+                command_id,
+                command: RelayCommand::BeginCheckpoint { .. },
+                ..
+            }] if command_id == "barrier-before-close"
+        ));
+        durable
+            .record_checkpoint_ready("barrier-before-close")
+            .unwrap();
+        let expected = durable
+            .operational_state()
+            .checkpoint_ready
+            .expect("checkpoint is ready");
+        submit(
+            &mut durable,
+            "close-command",
+            RelayCommand::Close {
+                barrier_command_id: "barrier-before-close".into(),
+                expected,
+            },
+        );
+        submit(
+            &mut durable,
+            "complete-checkpoint",
+            RelayCommand::CompleteCheckpoint {
+                barrier_command_id: "barrier-before-close".into(),
+            },
+        );
+        let claimed = durable.claim_pending_commands(true).unwrap();
+        assert!(matches!(
+            claimed.as_slice(),
+            [crate::hel_worker::ClaimedRelayCommand {
+                command_id,
+                command: RelayCommand::Close { .. },
+                ..
+            }] if command_id == "close-command"
+        ));
+        durable
+            .record_command_completed(
+                "close-command",
+                crate::hel_worker::RelayCommandOutcome::Closed,
+            )
+            .unwrap();
+        durable
+            .record_observation(RelayObservation::Closed)
+            .unwrap();
+        let relay = Arc::new(Mutex::new(durable));
+
+        let socket = temp.path().join("closed-relay.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        drop(wake_rx);
+        let terminal = tokio::spawn(unix::serve_terminal_relay(listener, relay.clone(), wake_tx));
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let request = RelayRequestEnvelope {
+            request_id: "attach-closed-relay".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Attach {
+                after_ordinal: 0,
+                after_digest: RELAY_EVENT_GENESIS_DIGEST.into(),
+            },
+        };
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+        let response = BufReader::new(reader)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap();
+        let response: crate::hel_worker::RelayResponseEnvelope =
+            serde_json::from_str(&response).unwrap();
+        let state = match response.body {
+            RelayResponseBody::Ok {
+                payload: RelayResponsePayload::Attached { state, .. },
+            } => state,
+            body => panic!("closed relay did not accept attach: {body:?}"),
+        };
+        assert_eq!(state.execution, RelayExecutionState::Closed);
+
+        writer.shutdown().await.unwrap();
+        terminal.abort();
+        assert!(terminal.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn daemon_restart_serves_a_closed_relay_without_starting_acp() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(
+            &mut durable,
+            "barrier-before-restart-close",
+            RelayCommand::BeginCheckpoint {
+                reason: Some("closed restart test".into()),
+            },
+        );
+        let barrier = durable.claim_pending_commands(true).unwrap();
+        assert!(matches!(
+            barrier.as_slice(),
+            [crate::hel_worker::ClaimedRelayCommand {
+                command_id,
+                command: RelayCommand::BeginCheckpoint { .. },
+                ..
+            }] if command_id == "barrier-before-restart-close"
+        ));
+        durable
+            .record_checkpoint_ready("barrier-before-restart-close")
+            .unwrap();
+        let expected = durable
+            .operational_state()
+            .checkpoint_ready
+            .expect("checkpoint is ready");
+        submit(
+            &mut durable,
+            "close-before-daemon-restart",
+            RelayCommand::Close {
+                barrier_command_id: "barrier-before-restart-close".into(),
+                expected,
+            },
+        );
+        submit(
+            &mut durable,
+            "complete-before-daemon-restart",
+            RelayCommand::CompleteCheckpoint {
+                barrier_command_id: "barrier-before-restart-close".into(),
+            },
+        );
+        let close = durable.claim_pending_commands(true).unwrap();
+        assert!(matches!(
+            close.as_slice(),
+            [crate::hel_worker::ClaimedRelayCommand {
+                command_id,
+                command: RelayCommand::Close { .. },
+                ..
+            }] if command_id == "close-before-daemon-restart"
+        ));
+        durable
+            .record_command_completed(
+                "close-before-daemon-restart",
+                crate::hel_worker::RelayCommandOutcome::Closed,
+            )
+            .unwrap();
+        let closed_frontier = durable.latest_ordinal();
+        drop(durable);
+
+        let mut config = launch_config("profile-home-that-must-not-be-used");
+        config.bridge_command = temp.path().join("missing-acp-bridge");
+        config.cwd = temp.path().to_owned();
+        let root = temp.path().to_owned();
+        let daemon = tokio::spawn(unix::run_daemon(root.clone(), config));
+        let stream = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match tokio::net::UnixStream::connect(root.join("control.sock")).await {
+                    Ok(stream) => break stream,
+                    Err(_) if daemon.is_finished() => {
+                        panic!("closed relay daemon stopped during startup")
+                    }
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let request = RelayRequestEnvelope {
+            request_id: "status-after-closed-restart".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Status,
+        };
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+        let response = BufReader::new(reader)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap();
+        let response: RelayResponseEnvelope = serde_json::from_str(&response).unwrap();
+        let state = match response.body {
+            RelayResponseBody::Ok {
+                payload: RelayResponsePayload::Status(state),
+            } => state,
+            body => panic!("closed relay did not serve status after restart: {body:?}"),
+        };
+        assert_eq!(state.execution, RelayExecutionState::Closed);
+        assert_eq!(state.latest_ordinal, closed_frontier);
+        assert!(!root.join("acp-supervisor.json").exists());
+
+        writer.shutdown().await.unwrap();
+        daemon.abort();
+        assert!(daemon.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn oversized_response_is_rejected_before_writing() {
+        let (server, _client) = tokio::net::UnixStream::pair().unwrap();
+        let (_, mut writer) = server.into_split();
+        let response = RelayResponseEnvelope {
+            request_id: "oversized".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            body: RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::Internal,
+                    message: "x".repeat(crate::hel_worker::MAX_FRAME_BYTES),
+                    retryable: false,
+                    detail: None,
+                },
+            },
+        };
+
+        let error = unix::write_response(&mut writer, &response)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("response frame is too large"));
+    }
+
+    #[tokio::test]
+    async fn request_line_limit_is_enforced_while_the_line_is_read() {
+        let mut exact = BufReader::new(&b"12345678\nnext\n"[..]);
         assert_eq!(
-            config.environment["CODEX_HOME"],
-            "/home/ubuntu/.local/share/hel/profiles/session"
+            unix::read_bounded_line(&mut exact, 8).await.unwrap(),
+            Some("12345678".into())
+        );
+        assert_eq!(
+            unix::read_bounded_line(&mut exact, 8).await.unwrap(),
+            Some("next".into())
+        );
+
+        let mut oversized = BufReader::with_capacity(4, &b"123456789-without-a-newline"[..]);
+        let error = unix::read_bounded_line(&mut oversized, 8)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("request frame is too large"));
+    }
+
+    #[test]
+    fn repeated_dispatch_wakes_coalesce_to_one_pending_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (wake_tx, mut wake_rx) = mpsc::channel(1);
+
+        for _ in 0..10_000 {
+            unix::wake_dispatch(&relay, &wake_tx).unwrap();
+        }
+        assert_eq!(wake_rx.try_recv(), Ok(()));
+        assert!(matches!(
+            wake_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn coordinator_failure_aborts_peer_and_preserves_the_cause() {
+        let mut peer = tokio::spawn(std::future::pending::<()>());
+        let error = unix::abort_peer_and_return(
+            &mut peer,
+            anyhow::anyhow!("original coordinator failure"),
+            "relay coordinator failed",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(peer.is_finished());
+        assert!(format!("{error:#}").contains("original coordinator failure"));
+    }
+
+    #[test]
+    fn resume_prefers_explicit_identity_then_relay_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        relay
+            .record_observation(RelayObservation::SessionOpened {
+                native_session_id: "native-relay".into(),
+                resumed: false,
+            })
+            .unwrap();
+        let mut config = launch_config("/var/lib/hel/profiles/session");
+        assert_eq!(
+            unix::select_resume_session(&config, &relay).as_deref(),
+            Some("native-relay")
+        );
+        config.native_session_id = Some("native-explicit".into());
+        assert_eq!(
+            unix::select_resume_session(&config, &relay).as_deref(),
+            Some("native-explicit")
         );
     }
 
     #[test]
-    fn relative_worker_root_is_resolved_before_bridge_changes_directory() {
+    fn relative_paths_are_resolved_before_the_bridge_changes_directory() {
+        let mut config = launch_config(".local/share/hel/profiles/session");
+        resolve_relative_harness_home(&mut config, Path::new("/home/ubuntu"));
+        assert_eq!(
+            config.environment["CODEX_HOME"],
+            "/home/ubuntu/.local/share/hel/profiles/session"
+        );
         assert_eq!(
             resolve_relative_worker_root(
                 ".local/share/hel/workers/session".into(),
                 Path::new("/home/ubuntu"),
             ),
             Path::new("/home/ubuntu/.local/share/hel/workers/session")
-        );
-    }
-
-    #[test]
-    fn absolute_worker_root_is_preserved() {
-        assert_eq!(
-            resolve_relative_worker_root(
-                "/var/lib/hel/workers/session".into(),
-                Path::new("/home/ubuntu"),
-            ),
-            Path::new("/var/lib/hel/workers/session")
-        );
-    }
-
-    #[test]
-    fn absolute_harness_home_is_preserved() {
-        let mut config = launch_config("/var/lib/hel/profiles/session");
-
-        resolve_relative_harness_home(&mut config, Path::new("/home/ubuntu"));
-
-        assert_eq!(
-            config.environment["CODEX_HOME"],
-            "/var/lib/hel/profiles/session"
-        );
-    }
-
-    #[test]
-    fn legacy_launch_config_enables_event_identity_recovery() {
-        let mut value = serde_json::to_value(launch_config("/profile")).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("recover_native_session");
-
-        let config: WorkerLaunchConfig = serde_json::from_value(value).unwrap();
-        assert!(config.recover_native_session);
-    }
-
-    #[test]
-    fn persisted_native_identity_is_reused_for_every_harness() {
-        let native = "019feb39-865b-7392-b358-96932c672a42";
-        for harness in [HarnessKind::Codex, HarnessKind::Claude, HarnessKind::Kimi] {
-            let temp = tempfile::tempdir().unwrap();
-            let mut worker = crate::hel_worker::DurableWorker::open(
-                temp.path(),
-                "018f9dd2-a3b4-7c8d-9000-123456789abc",
-                "1.0.0",
-            )
-            .unwrap();
-            worker
-                .record_native_session_started(
-                    "session_started",
-                    serde_json::json!({
-                        "type": "session_started",
-                        "native_session_id": native,
-                        "resumed": false,
-                    }),
-                    native,
-                )
-                .unwrap();
-            let mut config = launch_config("/var/lib/hel/profiles/session");
-            config.harness = harness;
-
-            assert_eq!(
-                unix::select_resume_session(&config, &worker).as_deref(),
-                Some(native),
-                "{harness:?} must resume the worker-owned native identity"
-            );
-        }
-    }
-
-    #[test]
-    fn intentional_fresh_session_ignores_restored_native_history() {
-        let temp = tempfile::tempdir().unwrap();
-        let native = "019feb39-865b-7392-b358-96932c672a42";
-        let mut worker = crate::hel_worker::DurableWorker::open(
-            temp.path(),
-            "018f9dd2-a3b4-7c8d-9000-123456789abc",
-            "1.0.0",
-        )
-        .unwrap();
-        worker
-            .record_adapter_event(
-                "session_started",
-                serde_json::json!({
-                    "type": "session_started",
-                    "native_session_id": native,
-                    "resumed": false,
-                }),
-            )
-            .unwrap();
-        let mut config = launch_config("/var/lib/hel/profiles/session");
-        config.recover_native_session = false;
-
-        assert_eq!(unix::select_resume_session(&config, &worker), None);
-    }
-
-    #[test]
-    fn fresh_session_policy_reuses_identity_after_destination_starts() {
-        let temp = tempfile::tempdir().unwrap();
-        let native = "019feb39-865b-7392-b358-96932c672a42";
-        let mut worker = crate::hel_worker::DurableWorker::open(
-            temp.path(),
-            "018f9dd2-a3b4-7c8d-9000-123456789abc",
-            "1.0.0",
-        )
-        .unwrap();
-        worker
-            .record_native_session_started(
-                "session_started",
-                serde_json::json!({
-                    "type": "session_started",
-                    "native_session_id": native,
-                    "resumed": false,
-                }),
-                native,
-            )
-            .unwrap();
-        let mut config = launch_config("/var/lib/hel/profiles/session");
-        config.recover_native_session = false;
-
-        assert_eq!(
-            unix::select_resume_session(&config, &worker).as_deref(),
-            Some(native)
         );
     }
 }

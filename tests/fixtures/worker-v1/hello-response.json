@@ -1,1 +1,0 @@
-{"request_id":"hello-1","protocol_version":1,"result":"ok","payload":{"type":"hello","data":{"negotiated":1,"worker_version":"1.0.0","session_id":"018f9dd2-a3b4-7c8d-9000-123456789abc"}}}

@@ -17,15 +17,17 @@ use ratatui::widgets::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::hel_chat::{TranscriptSnapshot, render_agent_message_tail};
+use crate::hel_chat::{TranscriptSnapshot, materialized_content_text, render_agent_message_tail};
 use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use crate::hel_quota::{ProfileQuota, QuotaWindow};
-use crate::hel_state::{HelState, SessionRecord, SessionResourceAllocation, SessionState};
+use crate::hel_state::{
+    HelState, MaterializedExecutionState, MaterializedSession, SessionRecord,
+    SessionResourceAllocation, SessionState, TranscriptBody,
+};
 use crate::hel_targets::{
     AdditionalMount, DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage,
     SessionResourceUsage, default_mount_destination, path_completion,
 };
-use crate::hel_worker::{SequencedEvent, WorkerEvent, WorkerPhase, WorkerSessionSummary};
 
 const FORCE_CONFIRMATION: &str = "DESTROY";
 const BASELINE_CPUS: u64 = 8;
@@ -554,30 +556,15 @@ impl ImportDialog {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActivityKind {
-    Thinking,
-    AgentText,
-    ToolCall,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionActivity {
-    kind: ActivityKind,
-    text: String,
-}
-
 #[derive(Debug, Default)]
 struct SessionDetail {
-    last_event_sequence: u64,
     current_turn_started_at: Option<u64>,
-    last_activity_at: Option<u64>,
-    agent_text_stream_open: bool,
-    last_agent_message_id: Option<String>,
+    last_activity_at_ms: Option<u64>,
     last_agent_message: Option<String>,
-    unread_agent_message_sequences: Vec<u64>,
-    summarized_unread_agent_messages: usize,
-    summarized_unread_through: u64,
+    /// Latest agent-content ordinals retained so a state-only read-cursor
+    /// update can recompute the single unread count exactly.
+    agent_message_latest_content_ordinals: Vec<u64>,
+    unread_agent_messages: usize,
     resource_usage: Option<SessionResourceUsage>,
     transcript: Option<TranscriptSnapshot>,
     transcript_hydration: TranscriptHydration,
@@ -681,17 +668,16 @@ impl DashboardState {
         }
         self.apply_operation_projection();
         for (session_id, detail) in &mut self.session_details {
-            let viewed_through = self
+            let detached_after_event_ordinal = self
                 .state
                 .sessions
                 .get(session_id)
-                .map_or(0, |session| session.last_viewed_event_sequence);
-            detail
-                .unread_agent_message_sequences
-                .retain(|seq| *seq > viewed_through);
-            if viewed_through >= detail.summarized_unread_through {
-                detail.summarized_unread_agent_messages = 0;
-            }
+                .map_or(0, |session| session.detached_after_event_ordinal);
+            detail.unread_agent_messages = detail
+                .agent_message_latest_content_ordinals
+                .iter()
+                .filter(|ordinal| **ordinal > detached_after_event_ordinal)
+                .count();
         }
         self.clamp_selections();
     }
@@ -786,113 +772,6 @@ impl DashboardState {
         self.quotas.insert(quota.profile_id.clone(), quota);
     }
 
-    /// Incorporate the newly replayed worker events for one session.
-    pub fn apply_worker_events(
-        &mut self,
-        session_id: &str,
-        events: &[SequencedEvent],
-        observed_at_epoch_seconds: u64,
-        received_while_detached: bool,
-    ) -> bool {
-        let mut updated_latest_message = false;
-        let viewed_through = self
-            .state
-            .sessions
-            .get(session_id)
-            .map_or(0, |session| session.last_viewed_event_sequence);
-        let detail = self
-            .session_details
-            .entry(session_id.to_string())
-            .or_default();
-        for event in events {
-            if event.seq <= detail.last_event_sequence {
-                continue;
-            }
-            detail.last_event_sequence = event.seq;
-            detail.last_activity_at = Some(observed_at_epoch_seconds);
-            match &event.event {
-                WorkerEvent::PromptAccepted { .. } => {
-                    detail.agent_text_stream_open = false;
-                    detail.current_turn_started_at = Some(observed_at_epoch_seconds);
-                }
-                WorkerEvent::TurnCompleted => {
-                    detail.agent_text_stream_open = false;
-                    detail.current_turn_started_at = None;
-                }
-                WorkerEvent::Cancelled => detail.agent_text_stream_open = false,
-                WorkerEvent::Adapter { payload, .. } => {
-                    if let Some(activity) = activity_from_adapter(payload) {
-                        if activity.kind == ActivityKind::AgentText {
-                            let message_id = adapter_message_id(payload);
-                            let continues_message = detail.agent_text_stream_open
-                                && detail.last_agent_message_id == message_id;
-                            if !continues_message
-                                && event.seq > viewed_through
-                                && received_while_detached
-                            {
-                                detail.unread_agent_message_sequences.push(event.seq);
-                            }
-                            if continues_message {
-                                detail
-                                    .last_agent_message
-                                    .get_or_insert_default()
-                                    .push_str(&activity.text);
-                            } else {
-                                detail.last_agent_message = Some(activity.text);
-                            }
-                            detail.last_agent_message_id = message_id;
-                            detail.agent_text_stream_open = true;
-                            updated_latest_message = true;
-                        } else {
-                            detail.agent_text_stream_open = false;
-                        }
-                    }
-                }
-                WorkerEvent::ConfigChanged { .. }
-                | WorkerEvent::QueuedPromptAdded { .. }
-                | WorkerEvent::QueuedPromptRemoved { .. }
-                | WorkerEvent::QueuedPromptPromoted { .. }
-                | WorkerEvent::QueuedPromptsCleared
-                | WorkerEvent::Checkpointed { .. }
-                | WorkerEvent::Closing
-                | WorkerEvent::Closed => {
-                    detail.agent_text_stream_open = false;
-                }
-            }
-        }
-        updated_latest_message
-    }
-
-    /// Apply transcript changes and reconcile transient state with the
-    /// worker's authoritative snapshot-derived phase.
-    pub fn apply_worker_update(
-        &mut self,
-        session_id: &str,
-        events: &[SequencedEvent],
-        phase: WorkerPhase,
-        observed_at_epoch_seconds: u64,
-        received_while_detached: bool,
-    ) -> bool {
-        let updated = self.apply_worker_events(
-            session_id,
-            events,
-            observed_at_epoch_seconds,
-            received_while_detached,
-        );
-        let detail = self
-            .session_details
-            .entry(session_id.to_string())
-            .or_default();
-        if phase == WorkerPhase::Running {
-            detail
-                .current_turn_started_at
-                .get_or_insert(observed_at_epoch_seconds);
-        } else {
-            detail.current_turn_started_at = None;
-        }
-        updated
-    }
-
     pub fn apply_resource_usage(&mut self, session_id: &str, usage: SessionResourceUsage) {
         self.session_details
             .entry(session_id.to_string())
@@ -976,37 +855,64 @@ impl DashboardState {
         }
     }
 
-    pub fn apply_transcript(&mut self, session_id: &str, transcript: TranscriptSnapshot) {
+    /// Replace dashboard detail with the controller's durable logical-session
+    /// projection. Unread is a count of logical agent messages with content
+    /// added after the last detach cursor, never a count of stream chunks.
+    pub fn apply_materialized_session(&mut self, session: &MaterializedSession) {
+        let detached_after_event_ordinal = self
+            .state
+            .sessions
+            .get(&session.session_id)
+            .map_or(0, |record| record.detached_after_event_ordinal);
+        let last_agent_message = session.transcript.iter().rev().find_map(|item| {
+            let TranscriptBody::Agent { chunks, .. } = &item.body else {
+                return None;
+            };
+            let text = crate::hel_chat::materialized_chunks_text(chunks);
+            (!text.trim().is_empty()).then(|| text.clone())
+        });
         let detail = self
             .session_details
-            .entry(session_id.to_string())
+            .entry(session.session_id.clone())
             .or_default();
-        detail.transcript = Some(transcript);
+        detail.current_turn_started_at = match session.execution {
+            MaterializedExecutionState::Running { started_at_ms } => {
+                u64::try_from(started_at_ms).ok().map(|value| value / 1_000)
+            }
+            MaterializedExecutionState::Idle
+            | MaterializedExecutionState::Closing
+            | MaterializedExecutionState::Closed => None,
+        };
+        detail.last_activity_at_ms = session
+            .last_activity_at_ms()
+            .and_then(|value| u64::try_from(value).ok());
+        detail.last_agent_message = last_agent_message;
+        detail.agent_message_latest_content_ordinals = session
+            .transcript
+            .iter()
+            .filter(|item| item.is_nonempty_agent_message())
+            .filter_map(|item| item.latest_content_event_ordinal)
+            .collect();
+        detail.unread_agent_messages =
+            usize::try_from(session.unread_agent_messages_after(detached_after_event_ordinal))
+                .unwrap_or(usize::MAX);
+        detail.transcript = Some(TranscriptSnapshot::from_materialized(session));
         detail.transcript_hydration = TranscriptHydration::Ready;
-    }
-
-    pub fn apply_worker_summary(
-        &mut self,
-        session_id: &str,
-        summary: WorkerSessionSummary,
-        observed_at_epoch_seconds: u64,
-    ) {
-        let detail = self
-            .session_details
-            .entry(session_id.to_string())
-            .or_default();
-        detail.last_event_sequence = summary.latest_seq;
-        detail.last_activity_at = (summary.latest_seq > 0).then_some(observed_at_epoch_seconds);
-        detail.current_turn_started_at =
-            (summary.phase == WorkerPhase::Running).then_some(observed_at_epoch_seconds);
-        detail.summarized_unread_agent_messages =
-            usize::try_from(summary.unread_agent_messages).unwrap_or(usize::MAX);
-        detail.summarized_unread_through = summary.latest_seq;
-        detail.agent_text_stream_open = summary.agent_text_stream_open;
-        detail.last_agent_message_id = summary.last_agent_message_id;
-        detail.transcript = Some(TranscriptSnapshot::from_entries(summary.transcript_tail));
-        detail.queued_prompts = summary.queued_prompts;
-        detail.transcript_hydration = TranscriptHydration::Ready;
+        detail.queued_prompts = session
+            .queued_prompts
+            .iter()
+            .map(|prompt| crate::hel_worker::QueuedPrompt {
+                id: prompt.command_id.clone(),
+                text: materialized_content_text(&prompt.content),
+                attachments: Vec::new(),
+                created_at_ms: prompt.queued_at_ms,
+            })
+            .collect();
+        if let Some(title) = session.session_title.as_ref()
+            && let Some(record) = self.state.sessions.get_mut(&session.session_id)
+        {
+            record.acp_session_title = Some(title.clone());
+        }
     }
 
     pub fn mark_transcript_unavailable(&mut self, session_id: &str) {
@@ -3483,14 +3389,13 @@ fn partition_sessions<'a>(
             archived.push(session);
         }
     }
-    let activity_timestamp = |session: &SessionRecord| {
-        session_details
-            .get(&session.id)
-            .and_then(|detail| detail.last_activity_at)
-            .map(|timestamp| timestamp as i64)
-            .into_iter()
-            .chain(session_timestamp(&session.updated_at))
-            .max()
+    let activity_timestamp = |session: &SessionRecord| match session_details.get(&session.id) {
+        Some(detail) if detail.last_activity_at_ms.is_some() => detail
+            .last_activity_at_ms
+            .and_then(|timestamp| i64::try_from(timestamp).ok()),
+        Some(detail) if detail.transcript_hydration == TranscriptHydration::Ready => None,
+        Some(_) | None => session_timestamp(&session.updated_at)
+            .and_then(|timestamp| timestamp.checked_mul(1_000)),
     };
     let sequence = |left: &&SessionRecord, right: &&SessionRecord| {
         match (
@@ -3652,49 +3557,6 @@ fn adjust_resources(
             }
         }
     }
-}
-
-fn activity_from_adapter(payload: &serde_json::Value) -> Option<SessionActivity> {
-    let update = payload.get("update").filter(|_| {
-        payload.get("type").and_then(serde_json::Value::as_str) == Some("session_update")
-    })?;
-    let kind = update
-        .get("sessionUpdate")
-        .and_then(serde_json::Value::as_str)?;
-    let text = || {
-        update
-            .get("content")
-            .and_then(|content| content.get("text"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|text| !text.trim().is_empty())
-    };
-    match kind {
-        "agent_thought_chunk" => text().map(|text| SessionActivity {
-            kind: ActivityKind::Thinking,
-            text: text.to_string(),
-        }),
-        "agent_message_chunk" => text().map(|text| SessionActivity {
-            kind: ActivityKind::AgentText,
-            text: text.to_string(),
-        }),
-        "tool_call" => update
-            .get("title")
-            .and_then(serde_json::Value::as_str)
-            .filter(|title| !title.trim().is_empty())
-            .map(|text| SessionActivity {
-                kind: ActivityKind::ToolCall,
-                text: text.to_string(),
-            }),
-        _ => None,
-    }
-}
-
-fn adapter_message_id(payload: &serde_json::Value) -> Option<String> {
-    payload
-        .get("update")
-        .and_then(|update| update.get("messageId"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
 }
 
 fn truncate_text(text: &str, width: usize) -> String {
@@ -4808,11 +4670,7 @@ fn active_session_row(
 ) -> Row<'static> {
     let (clock, profile, target, project, session_name) =
         session_values(session, detail, operation, now_epoch_seconds, config);
-    let unread_count = detail.map_or(0, |detail| {
-        detail
-            .summarized_unread_agent_messages
-            .saturating_add(detail.unread_agent_message_sequences.len())
-    });
+    let unread_count = detail.map_or(0, |detail| detail.unread_agent_messages);
     Row::new([
         summary_rule_cell(Line::raw(project), layout.rule_width),
         summary_rule_cell(unread_line(unread_count), layout.rule_width),
@@ -6294,8 +6152,7 @@ mod tests {
         CONFIG_VERSION, ContainerTemplate, HarnessProfile, ProjectBundle, ProjectRepository,
         SshConnection,
     };
-    use crate::hel_state::{CheckpointMetadata, STATE_VERSION};
-    use crate::hel_worker::WorkerSnapshot;
+    use crate::hel_state::{CheckpointMetadata, STATE_VERSION, TranscriptItem};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -6408,14 +6265,14 @@ mod tests {
             session_title_override: None,
             created_at: "2026-08-09T00:00:00Z".into(),
             updated_at: "2026-08-09T01:00:00Z".into(),
-            last_viewed_event_sequence: 0,
+            detached_after_event_ordinal: 0,
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: Some(CheckpointMetadata {
                 archive_path: PathBuf::from("sessions/session-1.hel.zip"),
                 sha256: "a".repeat(64),
                 created_at: "2026-08-09T01:00:00Z".into(),
-                event_sequence: 2,
+                event_frontier: 2,
             }),
         }
     }
@@ -6673,70 +6530,102 @@ mod tests {
         }
     }
 
-    fn adapter_text_event(seq: u64, kind: &str, text: &str) -> SequencedEvent {
-        SequencedEvent {
-            seq,
-            recorded_at_ms: None,
-            request_id: None,
-            event: WorkerEvent::Adapter {
-                kind: "session_update".into(),
-                payload: serde_json::json!({
-                    "type": "session_update",
-                    "update": {
-                        "sessionUpdate": kind,
-                        "content": { "type": "text", "text": text }
-                    }
-                }),
-            },
+    fn transcript_item(position: u64, body: TranscriptBody) -> TranscriptItem {
+        let at_ms = i64::try_from(position).unwrap() * 1_000;
+        let latest_content_event_ordinal =
+            matches!(&body, TranscriptBody::Agent { .. }).then_some(position);
+        TranscriptItem {
+            stable_id: format!("item-{position}"),
+            position,
+            latest_content_event_ordinal,
+            created_at_ms: at_ms,
+            last_changed_at_ms: at_ms,
+            body,
         }
     }
 
-    fn apply_transcript(dashboard: &mut DashboardState, events: &[SequencedEvent]) {
-        apply_transcript_for(dashboard, "session-1", events);
+    fn agent_message(position: u64, text: impl Into<String>) -> TranscriptItem {
+        transcript_item(
+            position,
+            TranscriptBody::Agent {
+                chunks: vec![serde_json::json!({
+                    "content": {"type": "text", "text": text.into()}
+                })],
+                streaming: false,
+            },
+        )
     }
 
-    fn apply_transcript_for(
+    fn thought(position: u64, text: impl Into<String>) -> TranscriptItem {
+        transcript_item(
+            position,
+            TranscriptBody::Thought {
+                chunks: vec![serde_json::json!({
+                    "content": {"type": "text", "text": text.into()}
+                })],
+                streaming: false,
+            },
+        )
+    }
+
+    fn materialized_session_for(
+        session_id: &str,
+        transcript: Vec<TranscriptItem>,
+    ) -> MaterializedSession {
+        let frontier = transcript
+            .iter()
+            .map(|item| item.position)
+            .max()
+            .unwrap_or(0);
+        let mut session = MaterializedSession::empty(session_id);
+        session.applied_event_ordinal = frontier;
+        if frontier > 0 {
+            session.applied_event_digest = "a".repeat(64);
+        }
+        session.execution = MaterializedExecutionState::Running {
+            started_at_ms: 100_000,
+        };
+        session.last_activity_at_ms = transcript
+            .iter()
+            .map(|item| item.last_changed_at_ms)
+            .max()
+            .or(Some(100_000));
+        session.transcript = transcript;
+        session
+    }
+
+    fn apply_materialized_transcript(
+        dashboard: &mut DashboardState,
+        transcript: Vec<TranscriptItem>,
+    ) {
+        apply_materialized_transcript_for(dashboard, "session-1", transcript);
+    }
+
+    fn apply_materialized_transcript_for(
         dashboard: &mut DashboardState,
         session_id: &str,
-        events: &[SequencedEvent],
+        transcript: Vec<TranscriptItem>,
     ) {
-        let snapshot: WorkerSnapshot = serde_json::from_value(serde_json::json!({
-            "session_id": session_id,
-            "phase": "running",
-            "latest_seq": events.last().map_or(0, |event| event.seq),
-            "last_checkpoint_seq": null,
-            "active_prompt": null,
-            "config": {},
-            "handled_requests": {}
-        }))
-        .unwrap();
-        let chat = crate::hel_chat::ChatState::new(&snapshot, events);
-        dashboard.apply_worker_events(session_id, events, 100, false);
-        dashboard.apply_transcript(session_id, chat.transcript_snapshot());
+        dashboard.apply_materialized_session(&materialized_session_for(session_id, transcript));
     }
 
     /// A conversation of `count` numbered exchanges, so preview scroll
     /// assertions can name the message they expect to see. Agent chunks
     /// coalesce unless separated, so each pairs with its own prompt.
-    fn numbered_conversation(count: u64) -> Vec<SequencedEvent> {
+    fn numbered_conversation(count: u64) -> Vec<TranscriptItem> {
         (0..count)
             .flat_map(|index| {
                 [
-                    SequencedEvent {
-                        seq: index * 2 + 1,
-                        recorded_at_ms: None,
-                        request_id: None,
-                        event: WorkerEvent::PromptAccepted {
-                            request_id: format!("request-{index}"),
-                            text: format!("question {index}"),
-                            attachments: Vec::new(),
+                    transcript_item(
+                        index * 2 + 1,
+                        TranscriptBody::User {
+                            content: vec![serde_json::json!({
+                                "type": "text",
+                                "text": format!("question {index}"),
+                            })],
                         },
-                    },
-                    adapter_text_event(
-                        index * 2 + 2,
-                        "agent_message_chunk",
-                        &format!("answer {index}"),
                     ),
+                    agent_message(index * 2 + 2, format!("answer {index}")),
                 ]
             })
             .collect()
@@ -6847,6 +6736,115 @@ mod tests {
     }
 
     #[test]
+    fn recent_activity_uses_projection_milliseconds_without_metadata_override() {
+        let mut first = archived_session();
+        first.id = "first".into();
+        first.state = SessionState::Running;
+        first.updated_at = "2099-01-01T00:00:00Z".into();
+        let mut second = archived_session();
+        second.id = "second".into();
+        second.state = SessionState::Running;
+        second.updated_at = "1970-01-01T00:00:00Z".into();
+        let details = BTreeMap::from([
+            (
+                first.id.clone(),
+                SessionDetail {
+                    last_activity_at_ms: Some(10_001),
+                    transcript_hydration: TranscriptHydration::Ready,
+                    ..SessionDetail::default()
+                },
+            ),
+            (
+                second.id.clone(),
+                SessionDetail {
+                    last_activity_at_ms: Some(10_002),
+                    transcript_hydration: TranscriptHydration::Ready,
+                    ..SessionDetail::default()
+                },
+            ),
+        ]);
+
+        let (active, _) =
+            partition_sessions([&first, &second], &details, SessionOrder::RecentActivity);
+
+        assert_eq!(
+            active
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "first"]
+        );
+    }
+
+    #[test]
+    fn hydrated_session_without_activity_does_not_sort_by_lifecycle_timestamp() {
+        let mut hydrated = archived_session();
+        hydrated.id = "hydrated".into();
+        hydrated.state = SessionState::Running;
+        hydrated.updated_at = "2099-01-01T00:00:00Z".into();
+        let mut loading = archived_session();
+        loading.id = "loading".into();
+        loading.state = SessionState::Running;
+        loading.updated_at = "2026-01-01T00:00:00Z".into();
+        let details = BTreeMap::from([
+            (
+                hydrated.id.clone(),
+                SessionDetail {
+                    transcript_hydration: TranscriptHydration::Ready,
+                    ..SessionDetail::default()
+                },
+            ),
+            (loading.id.clone(), SessionDetail::default()),
+        ]);
+
+        let (active, _) = partition_sessions(
+            [&hydrated, &loading],
+            &details,
+            SessionOrder::RecentActivity,
+        );
+
+        assert_eq!(active[0].id, "loading");
+    }
+
+    #[test]
+    fn unavailable_session_keeps_its_committed_activity_watermark() {
+        let mut disconnected = archived_session();
+        disconnected.id = "disconnected".into();
+        disconnected.state = SessionState::Disconnected;
+        disconnected.updated_at = "2099-01-01T00:00:00Z".into();
+        let mut connected = archived_session();
+        connected.id = "connected".into();
+        connected.state = SessionState::Running;
+        connected.updated_at = "1970-01-01T00:00:00Z".into();
+        let details = BTreeMap::from([
+            (
+                disconnected.id.clone(),
+                SessionDetail {
+                    last_activity_at_ms: Some(10_001),
+                    transcript_hydration: TranscriptHydration::Unavailable,
+                    ..SessionDetail::default()
+                },
+            ),
+            (
+                connected.id.clone(),
+                SessionDetail {
+                    last_activity_at_ms: Some(10_002),
+                    transcript_hydration: TranscriptHydration::Ready,
+                    ..SessionDetail::default()
+                },
+            ),
+        ]);
+
+        let (active, _) = partition_sessions(
+            [&disconnected, &connected],
+            &details,
+            SessionOrder::RecentActivity,
+        );
+
+        assert_eq!(active[0].id, "connected");
+    }
+
+    #[test]
     fn sort_hotkey_round_robins_sequence_activity_and_profile() {
         let active_session = |id: &str| {
             let mut session = archived_session();
@@ -6887,12 +6885,9 @@ mod tests {
         dashboard.handle_key(key(KeyCode::Down));
         assert_eq!(dashboard.selected_session().unwrap().id, "session-b");
 
-        dashboard.apply_worker_events(
-            "session-b",
-            &[adapter_text_event(1, "agent_message_chunk", "second")],
-            2_000_000_100,
-            false,
-        );
+        let mut second = agent_message(1, "second");
+        second.last_changed_at_ms = 2_000_000_100_000;
+        apply_materialized_transcript_for(&mut dashboard, "session-b", vec![second]);
         dashboard.handle_key(key(KeyCode::Char('s')));
         assert_eq!(dashboard.session_order, SessionOrder::RecentActivity);
         assert_eq!(
@@ -6901,27 +6896,17 @@ mod tests {
         );
         assert_eq!(dashboard.selected_session().unwrap().id, "session-b");
 
-        dashboard.apply_worker_events(
-            "session-c",
-            &[adapter_text_event(
-                1,
-                "agent_thought_chunk",
-                "later thought",
-            )],
-            2_000_000_200,
-            false,
-        );
+        let mut later_thought = thought(1, "later thought");
+        later_thought.last_changed_at_ms = 2_000_000_200_000;
+        apply_materialized_transcript_for(&mut dashboard, "session-c", vec![later_thought]);
         assert_eq!(
             ordered_ids(&dashboard),
             ["session-c", "session-b", "session-a"]
         );
 
-        dashboard.apply_worker_events(
-            "session-a",
-            &[adapter_text_event(1, "agent_message_chunk", "newest")],
-            2_000_000_300,
-            false,
-        );
+        let mut newest = agent_message(1, "newest");
+        newest.last_changed_at_ms = 2_000_000_300_000;
+        apply_materialized_transcript_for(&mut dashboard, "session-a", vec![newest]);
         assert_eq!(
             ordered_ids(&dashboard),
             ["session-a", "session-c", "session-b"]
@@ -6943,23 +6928,18 @@ mod tests {
         );
         assert_eq!(dashboard.selected_session().unwrap().id, "session-a");
 
-        dashboard.apply_worker_events(
-            "session-b",
-            &[SequencedEvent {
-                seq: 2,
-                recorded_at_ms: None,
-                request_id: None,
-                event: WorkerEvent::Adapter {
-                    kind: "session_update".into(),
-                    payload: serde_json::json!({
-                        "type": "session_update",
-                        "update": { "sessionUpdate": "tool_call", "title": "later tool" }
-                    }),
-                },
-            }],
-            2_000_000_400,
-            false,
+        let mut later_tool = transcript_item(
+            2,
+            TranscriptBody::Tool {
+                call: serde_json::json!({
+                    "toolCallId": "later-tool",
+                    "title": "later tool",
+                    "status": "in_progress"
+                }),
+            },
         );
+        later_tool.last_changed_at_ms = 2_000_000_400_000;
+        apply_materialized_transcript_for(&mut dashboard, "session-b", vec![later_tool]);
         assert_eq!(
             ordered_ids(&dashboard),
             ["session-a", "session-b", "session-c"]
@@ -6967,25 +6947,21 @@ mod tests {
     }
 
     #[test]
-    fn messages_recovered_after_attach_are_unread_by_message_not_chunk() {
+    fn unread_count_uses_logical_agent_positions_after_the_detach_cursor() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
-        dashboard.focus = Focus::Quotas;
-        dashboard.apply_worker_events(
-            "session-1",
-            &[
-                adapter_text_event(1, "agent_message_chunk", "first "),
-                adapter_text_event(2, "agent_message_chunk", "message"),
-                adapter_text_event(3, "agent_thought_chunk", "thinking"),
-                adapter_text_event(4, "agent_message_chunk", "second message"),
+        apply_materialized_transcript(
+            &mut dashboard,
+            vec![
+                agent_message(1, "first message"),
+                thought(3, "thinking"),
+                agent_message(4, "second message"),
             ],
-            100,
-            true,
         );
 
         let detail = dashboard.session_details.get("session-1").unwrap();
-        assert_eq!(detail.unread_agent_message_sequences, [1, 4]);
+        assert_eq!(detail.unread_agent_messages, 2);
         let badge = unread_line(2);
         assert_eq!(badge.spans[0].content.as_ref(), "2 unread");
         assert_eq!(
@@ -7000,11 +6976,11 @@ mod tests {
             .sessions
             .get_mut("session-1")
             .unwrap()
-            .last_viewed_event_sequence = 1;
+            .detached_after_event_ordinal = 1;
         dashboard.set_state(state);
         assert_eq!(
-            dashboard.session_details["session-1"].unread_agent_message_sequences,
-            [4]
+            dashboard.session_details["session-1"].unread_agent_messages,
+            1
         );
 
         let mut state = dashboard.state.clone();
@@ -7012,137 +6988,66 @@ mod tests {
             .sessions
             .get_mut("session-1")
             .unwrap()
-            .last_viewed_event_sequence = 4;
+            .detached_after_event_ordinal = 4;
         dashboard.set_state(state);
-        assert!(
-            dashboard.session_details["session-1"]
-                .unread_agent_message_sequences
-                .is_empty()
+        assert_eq!(
+            dashboard.session_details["session-1"].unread_agent_messages,
+            0
         );
     }
 
     #[test]
-    fn hydrated_open_message_continuation_does_not_duplicate_unread_count() {
+    fn materialized_message_update_does_not_duplicate_unread_count() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
-        dashboard.focus = Focus::Quotas;
-        let first_chunk = SequencedEvent {
-            seq: 1,
-            recorded_at_ms: None,
-            request_id: None,
-            event: WorkerEvent::Adapter {
-                kind: "session_update".into(),
-                payload: serde_json::json!({
-                    "type": "session_update",
-                    "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "messageId": "answer-1",
-                        "content": { "type": "text", "text": "first " }
-                    }
-                }),
-            },
-        };
-        let snapshot: WorkerSnapshot = serde_json::from_value(serde_json::json!({
-            "session_id": "session-1",
-            "phase": "running",
-            "latest_seq": 1,
-            "last_checkpoint_seq": null,
-            "active_prompt": null,
-            "config": {},
-            "handled_requests": {}
-        }))
-        .unwrap();
-        let transcript_tail = crate::hel_chat::ChatState::new(&snapshot, &[first_chunk])
-            .bounded_entries(10, 512 * 1024);
-        dashboard.apply_worker_summary(
-            "session-1",
-            WorkerSessionSummary {
-                phase: WorkerPhase::Running,
-                latest_seq: 1,
-                latest_completed_turn_seq: None,
-                native_session_id: None,
-                session_title: None,
-                unread_agent_messages: 1,
-                agent_text_stream_open: true,
-                last_agent_message_id: Some("answer-1".into()),
-                transcript_tail,
-                queued_prompts: vec![crate::hel_worker::QueuedPrompt {
-                    id: "queued-1".into(),
-                    text: "next task".into(),
-                    attachments: vec![],
-                    created_at_ms: 0,
-                }],
-            },
-            100,
+        let mut initial = materialized_session_for("session-1", vec![agent_message(1, "first ")]);
+        initial
+            .queued_prompts
+            .push(crate::hel_state::MaterializedQueuedPrompt {
+                command_id: "queued-1".into(),
+                content: vec![serde_json::json!({ "type": "text", "text": "next task" })],
+                queued_at_ms: 0,
+            });
+        dashboard.apply_materialized_session(&initial);
+
+        let mut state = dashboard.state.clone();
+        state
+            .sessions
+            .get_mut("session-1")
+            .unwrap()
+            .detached_after_event_ordinal = 1;
+        dashboard.set_state(state);
+        assert_eq!(
+            dashboard.session_details["session-1"].unread_agent_messages,
+            0
         );
 
-        dashboard.apply_worker_events(
-            "session-1",
-            &[SequencedEvent {
-                seq: 2,
-                recorded_at_ms: None,
-                request_id: None,
-                event: WorkerEvent::Adapter {
-                    kind: "session_update".into(),
-                    payload: serde_json::json!({
-                        "type": "session_update",
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "messageId": "answer-1",
-                            "content": { "type": "text", "text": "continuation" }
-                        }
-                    }),
-                },
-            }],
-            101,
-            false,
-        );
+        let mut updated = agent_message(1, "first continuation");
+        updated.latest_content_event_ordinal = Some(2);
+        updated.last_changed_at_ms = 2_000;
+        let mut projection = materialized_session_for("session-1", vec![updated]);
+        projection.applied_event_ordinal = 2;
+        dashboard.apply_materialized_session(&projection);
 
         let detail = &dashboard.session_details["session-1"];
-        assert_eq!(detail.summarized_unread_agent_messages, 1);
-        assert!(detail.unread_agent_message_sequences.is_empty());
-        assert_eq!(detail.last_agent_message.as_deref(), Some("continuation"));
-        assert_eq!(detail.queued_prompts[0].text, "next task");
-    }
-
-    #[test]
-    fn messages_received_while_attached_are_read_regardless_of_dashboard_focus() {
-        let mut session = archived_session();
-        session.state = SessionState::Running;
-        let mut dashboard = dashboard_with_session(session);
-
-        dashboard.apply_worker_events(
-            "session-1",
-            &[adapter_text_event(
-                1,
-                "agent_message_chunk",
-                "visible response",
-            )],
-            100,
-            false,
+        assert_eq!(detail.unread_agent_messages, 1);
+        assert_eq!(
+            detail.last_agent_message.as_deref(),
+            Some("first continuation")
         );
+        assert!(detail.queued_prompts.is_empty());
 
-        assert!(
-            dashboard.session_details["session-1"]
-                .unread_agent_message_sequences
-                .is_empty()
-        );
-
-        dashboard.focus = Focus::Quotas;
-        dashboard.apply_worker_events(
-            "session-1",
-            &[
-                adapter_text_event(2, "agent_thought_chunk", "new turn"),
-                adapter_text_event(3, "agent_message_chunk", "hidden response"),
-            ],
-            101,
-            false,
-        );
-        assert!(
-            dashboard.session_details["session-1"]
-                .unread_agent_message_sequences
-                .is_empty()
+        let mut state = dashboard.state.clone();
+        state
+            .sessions
+            .get_mut("session-1")
+            .unwrap()
+            .detached_after_event_ordinal = 2;
+        dashboard.set_state(state);
+        assert_eq!(
+            dashboard.session_details["session-1"].unread_agent_messages,
+            0
         );
     }
 
@@ -7152,16 +7057,7 @@ mod tests {
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         dashboard.focus = Focus::Quotas;
-        dashboard.apply_worker_events(
-            "session-1",
-            &[adapter_text_event(
-                1,
-                "agent_message_chunk",
-                "hidden response",
-            )],
-            100,
-            true,
-        );
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "hidden response")]);
         let mut terminal = Terminal::new(TestBackend::new(140, 28)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
@@ -7209,33 +7105,19 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_adapter_updates_do_not_truncate_the_streamed_agent_response() {
+    fn later_non_agent_items_do_not_replace_the_last_agent_response() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
-        let unrelated = SequencedEvent {
-            seq: 2,
-            recorded_at_ms: None,
-            request_id: None,
-            event: WorkerEvent::Adapter {
-                kind: "usage_update".into(),
-                payload: serde_json::json!({
-                    "type": "usage_update",
-                    "used": 42
-                }),
-            },
-        };
-
-        dashboard.apply_worker_events(
-            "session-1",
-            &[
-                adapter_text_event(1, "agent_message_chunk", "The container lacked "),
-                unrelated,
-                adapter_text_event(3, "agent_message_chunk", "uv, so validation used Python "),
-                adapter_text_event(4, "agent_message_chunk", "3 directly."),
+        apply_materialized_transcript(
+            &mut dashboard,
+            vec![
+                agent_message(
+                    1,
+                    "The container lacked uv, so validation used Python 3 directly.",
+                ),
+                thought(2, "Checking the result"),
             ],
-            100,
-            false,
         );
 
         assert_eq!(
@@ -7575,12 +7457,7 @@ mod tests {
             }
         );
 
-        dashboard.apply_worker_events(
-            "session-1",
-            &[adapter_text_event(1, "agent_message_chunk", "hello")],
-            1,
-            false,
-        );
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "hello")]);
         assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
         assert!(matches!(
             dashboard.mode,
@@ -8185,9 +8062,13 @@ mod tests {
             },
             BTreeMap::new(),
         );
-        let events = numbered_conversation(14);
+        let transcript = numbered_conversation(14);
         for index in 0..count {
-            apply_transcript_for(&mut dashboard, &format!("session-{index}"), &events);
+            apply_materialized_transcript_for(
+                &mut dashboard,
+                &format!("session-{index}"),
+                transcript.clone(),
+            );
         }
         dashboard
     }
@@ -9000,34 +8881,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_message_update_requests_a_resource_refresh() {
-        let mut session = archived_session();
-        session.state = SessionState::Running;
-        let mut dashboard = dashboard_with_session(session);
-
-        assert!(dashboard.apply_worker_events(
-            "session-1",
-            &[adapter_text_event(1, "agent_message_chunk", "updated")],
-            100,
-            false,
-        ));
-        assert!(!dashboard.apply_worker_events(
-            "session-1",
-            &[adapter_text_event(
-                2,
-                "agent_thought_chunk",
-                "not a message"
-            )],
-            101,
-            false,
-        ));
-    }
-
-    #[test]
     fn active_session_renders_the_complete_last_agent_message() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
+        dashboard.focus = Focus::Quotas;
         dashboard.apply_resource_usage(
             "session-1",
             SessionResourceUsage {
@@ -9039,16 +8897,7 @@ mod tests {
                 writable_disk_bytes: Some(8_192),
             },
         );
-        dashboard.apply_worker_events(
-            "session-1",
-            &[
-                adapter_text_event(1, "agent_message_chunk", "**a b**\n"),
-                adapter_text_event(2, "agent_message_chunk", "c"),
-                adapter_text_event(3, "agent_thought_chunk", "later thought"),
-            ],
-            100,
-            false,
-        );
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "**a b**\nc")]);
         assert_eq!(
             dashboard.session_details["session-1"]
                 .last_agent_message
@@ -9070,7 +8919,6 @@ mod tests {
 
         assert!(rendered.contains("a b"));
         assert!(rendered.contains('c'));
-        assert!(!rendered.contains("later thought"));
         assert!(rendered.contains("Turn clock"));
         assert!(rendered.contains("Profile"));
         assert!(rendered.contains("Target"));
@@ -9090,40 +8938,29 @@ mod tests {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
-        let events = vec![
-            SequencedEvent {
-                seq: 1,
-                recorded_at_ms: None,
-                request_id: None,
-                event: WorkerEvent::PromptAccepted {
-                    request_id: "request-1".into(),
-                    text: "inspect the dashboard".into(),
-                    attachments: Vec::new(),
+        let transcript = vec![
+            transcript_item(
+                1,
+                TranscriptBody::User {
+                    content: vec![serde_json::json!({
+                        "type": "text",
+                        "text": "inspect the dashboard",
+                    })],
                 },
-            },
-            adapter_text_event(2, "agent_message_chunk", "**Rendered answer**"),
-            SequencedEvent {
-                seq: 3,
-                recorded_at_ms: None,
-                request_id: None,
-                event: WorkerEvent::Adapter {
-                    kind: "session_update".into(),
-                    payload: serde_json::json!({
-                        "type": "session_update",
-                        "update": {
-                            "sessionUpdate": "tool_call",
-                            "toolCallId": "tool-1",
-                            "title": "Run dashboard tests",
-                            "kind": "execute",
-                            "status": "completed",
-                            "content": [],
-                            "locations": []
-                        }
+            ),
+            agent_message(2, "**Rendered answer**"),
+            transcript_item(
+                3,
+                TranscriptBody::Tool {
+                    call: serde_json::json!({
+                        "toolCallId": "dashboard-tests",
+                        "title": "Run dashboard tests",
+                        "status": "completed"
                     }),
                 },
-            },
+            ),
         ];
-        apply_transcript(&mut dashboard, &events);
+        apply_materialized_transcript(&mut dashboard, transcript);
         let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
@@ -9207,10 +9044,11 @@ mod tests {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
-        let events = (1..=20)
-            .map(|seq| adapter_text_event(seq, "agent_message_chunk", &format!("line {seq}\n")))
-            .collect::<Vec<_>>();
-        apply_transcript(&mut dashboard, &events);
+        let message = (1..=20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, message)]);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
 
         terminal
@@ -9250,15 +9088,10 @@ mod tests {
         };
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         for index in 0..6 {
-            dashboard.apply_worker_events(
+            apply_materialized_transcript_for(
+                &mut dashboard,
                 &format!("active-{index:02}"),
-                &[adapter_text_event(
-                    1,
-                    "agent_message_chunk",
-                    "one\ntwo\nthree\nfour",
-                )],
-                100,
-                false,
+                vec![agent_message(1, "one\ntwo\nthree\nfour")],
             );
         }
         let backend = TestBackend::new(120, 36);
@@ -9477,7 +9310,7 @@ mod tests {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let detail = SessionDetail {
-            last_activity_at: Some(1_000),
+            last_activity_at_ms: Some(1_000_000),
             ..SessionDetail::default()
         };
 
@@ -9486,20 +9319,15 @@ mod tests {
     }
 
     #[test]
-    fn worker_phase_clears_a_stale_replayed_turn_clock() {
+    fn materialized_idle_state_clears_a_stale_turn_clock() {
         let mut dashboard = dashboard_with_session(archived_session());
-        let prompt = SequencedEvent {
-            seq: 1,
-            recorded_at_ms: None,
-            request_id: None,
-            event: WorkerEvent::PromptAccepted {
-                request_id: "request-1".into(),
-                text: "hello".into(),
-                attachments: Vec::new(),
-            },
+        let mut running = MaterializedSession::empty("session-1");
+        running.execution = MaterializedExecutionState::Running {
+            started_at_ms: 1_000_000,
         };
-
-        dashboard.apply_worker_update("session-1", &[prompt], WorkerPhase::Idle, 1_000, false);
+        dashboard.apply_materialized_session(&running);
+        let idle = MaterializedSession::empty("session-1");
+        dashboard.apply_materialized_session(&idle);
 
         assert_eq!(
             dashboard.session_details["session-1"].current_turn_started_at,
@@ -9508,10 +9336,13 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_running_worker_starts_clock_without_unseen_events() {
+    fn materialized_running_state_starts_clock_without_transcript_events() {
         let mut dashboard = dashboard_with_session(archived_session());
-
-        dashboard.apply_worker_update("session-1", &[], WorkerPhase::Running, 1_000, false);
+        let mut running = MaterializedSession::empty("session-1");
+        running.execution = MaterializedExecutionState::Running {
+            started_at_ms: 1_000_000,
+        };
+        dashboard.apply_materialized_session(&running);
 
         assert_eq!(
             dashboard.session_details["session-1"].current_turn_started_at,

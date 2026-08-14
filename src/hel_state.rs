@@ -1,6 +1,6 @@
 //! Durable controller-side state for Hel-managed sessions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hel_config::{HarnessKind, HelConfig, atomic_write, data_dir, validate_id};
 use crate::hel_targets::{AdditionalMount, validate_additional_mounts};
-use crate::hel_worker::{SequencedEvent, WorkerEvent};
+use crate::hel_worker::{RELAY_EVENT_GENESIS_DIGEST, SequencedEvent, WorkerEvent};
 
 pub const STATE_VERSION: u32 = 1;
 
@@ -21,10 +21,251 @@ pub enum SessionState {
     Disconnected,
     Checkpointing,
     Closing,
+    Destroying,
     Archived,
     Lost,
     Error,
     DestroyedWithDataLoss,
+}
+
+/// Controller-owned execution state derived from the relay event stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MaterializedExecutionState {
+    #[default]
+    Idle,
+    Running {
+        started_at_ms: i64,
+    },
+    Closing,
+    Closed,
+}
+
+/// The current value of one logical transcript item. ACP structures whose
+/// schemas can grow are kept as JSON values, while logical item identity and
+/// lifecycle remain controller-owned and stable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TranscriptBody {
+    User {
+        content: Vec<serde_json::Value>,
+    },
+    Agent {
+        /// Complete ACP `ContentChunk` values, including message IDs, content
+        /// metadata, and non-text content blocks.
+        chunks: Vec<serde_json::Value>,
+        streaming: bool,
+    },
+    Thought {
+        /// Complete ACP `ContentChunk` values, including message IDs, content
+        /// metadata, and non-text content blocks.
+        chunks: Vec<serde_json::Value>,
+        streaming: bool,
+    },
+    Tool {
+        /// Complete current ACP `ToolCall`, updated field-for-field as
+        /// `ToolCallUpdate` notifications arrive.
+        call: serde_json::Value,
+    },
+    Plan {
+        /// Complete current ACP `Plan`, including entry priorities and all
+        /// plan- and entry-level metadata.
+        plan: serde_json::Value,
+    },
+    System {
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptItem {
+    pub stable_id: String,
+    /// Ordinal of the relay event that first created this logical item.
+    pub position: u64,
+    /// Ordinal of the most recent content chunk for an agent message. This is
+    /// `None` for every other logical item.
+    pub latest_content_event_ordinal: Option<u64>,
+    pub created_at_ms: i64,
+    pub last_changed_at_ms: i64,
+    pub body: TranscriptBody,
+}
+
+impl TranscriptItem {
+    pub fn is_nonempty_agent_message(&self) -> bool {
+        let TranscriptBody::Agent { chunks, .. } = &self.body else {
+            return false;
+        };
+        chunks.iter().any(|chunk| {
+            let Some(content) = chunk.get("content") else {
+                return false;
+            };
+            match content.get("type").and_then(serde_json::Value::as_str) {
+                Some("text") => content
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty()),
+                Some(_) => true,
+                None => false,
+            }
+        })
+    }
+
+    pub(crate) fn validate(&self, through: u64) -> Result<()> {
+        if self.stable_id.trim().is_empty() {
+            bail!("materialized transcript item has an empty stable id");
+        }
+        if self.position == 0 || self.position > through {
+            bail!(
+                "materialized transcript item {:?} has invalid position {} at frontier {through}",
+                self.stable_id,
+                self.position
+            );
+        }
+        match (&self.body, self.latest_content_event_ordinal) {
+            (TranscriptBody::Agent { .. }, Some(ordinal))
+                if ordinal >= self.position && ordinal <= through => {}
+            (TranscriptBody::Agent { .. }, Some(ordinal)) => bail!(
+                "materialized agent message {:?} has invalid latest content ordinal {ordinal} at position {} and frontier {through}",
+                self.stable_id,
+                self.position
+            ),
+            (TranscriptBody::Agent { .. }, None) => bail!(
+                "materialized agent message {:?} has no latest content ordinal",
+                self.stable_id
+            ),
+            (_, Some(ordinal)) => bail!(
+                "non-agent transcript item {:?} has latest content ordinal {ordinal}",
+                self.stable_id
+            ),
+            (_, None) => {}
+        }
+        if self.last_changed_at_ms < self.created_at_ms {
+            bail!(
+                "materialized transcript item {:?} changed before it was created",
+                self.stable_id
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializedQueuedPrompt {
+    pub command_id: String,
+    pub content: Vec<serde_json::Value>,
+    pub queued_at_ms: i64,
+}
+
+/// Canonical controller projection for one logical ACP session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializedSession {
+    pub session_id: String,
+    pub applied_event_ordinal: u64,
+    pub applied_event_digest: String,
+    /// Monotonic controller projection watermark derived from relay event
+    /// receipt times. It is deliberately independent of retained rows.
+    pub last_activity_at_ms: Option<i64>,
+    pub execution: MaterializedExecutionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_title: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub configuration: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript: Vec<TranscriptItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_prompts: Vec<MaterializedQueuedPrompt>,
+}
+
+impl MaterializedSession {
+    pub fn empty(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            applied_event_ordinal: 0,
+            applied_event_digest: RELAY_EVENT_GENESIS_DIGEST.into(),
+            last_activity_at_ms: None,
+            execution: MaterializedExecutionState::Idle,
+            session_title: None,
+            configuration: BTreeMap::new(),
+            transcript: Vec::new(),
+            queued_prompts: Vec::new(),
+        }
+    }
+
+    pub fn last_activity_at_ms(&self) -> Option<i64> {
+        self.last_activity_at_ms
+    }
+
+    pub fn unread_agent_messages_after(&self, detached_after_event_ordinal: u64) -> u64 {
+        self.transcript
+            .iter()
+            .filter(|item| {
+                item.latest_content_event_ordinal
+                    .is_some_and(|ordinal| ordinal > detached_after_event_ordinal)
+                    && item.is_nonempty_agent_message()
+            })
+            .count() as u64
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_id("session", &self.session_id)?;
+        validate_relay_event_frontier(
+            self.applied_event_ordinal,
+            &self.applied_event_digest,
+            "materialized session event frontier",
+        )?;
+        if self
+            .session_title
+            .as_ref()
+            .is_some_and(|title| title.trim().is_empty())
+        {
+            bail!("materialized session has an empty title");
+        }
+        let mut item_ids = BTreeSet::new();
+        for item in &self.transcript {
+            item.validate(self.applied_event_ordinal)?;
+            if !item_ids.insert(item.stable_id.as_str()) {
+                bail!(
+                    "materialized transcript contains duplicate item {:?}",
+                    item.stable_id
+                );
+            }
+        }
+        let mut command_ids = BTreeSet::new();
+        for prompt in &self.queued_prompts {
+            if prompt.command_id.trim().is_empty() {
+                bail!("materialized prompt queue has an empty command id");
+            }
+            if !command_ids.insert(prompt.command_id.as_str()) {
+                bail!(
+                    "materialized prompt queue contains duplicate command {:?}",
+                    prompt.command_id
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_relay_event_digest(digest: &str, name: &str) -> Result<()> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("{name} must be a lowercase SHA-256 digest");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_relay_event_frontier(ordinal: u64, digest: &str, name: &str) -> Result<()> {
+    validate_relay_event_digest(digest, name)?;
+    if (ordinal == 0) != (digest == RELAY_EVENT_GENESIS_DIGEST) {
+        bail!("{name} has inconsistent ordinal {ordinal} and digest {digest}");
+    }
+    Ok(())
 }
 
 impl SessionState {
@@ -36,6 +277,7 @@ impl SessionState {
                 | Self::Disconnected
                 | Self::Checkpointing
                 | Self::Closing
+                | Self::Destroying
                 | Self::Error
         )
     }
@@ -158,8 +400,7 @@ pub struct CheckpointMetadata {
     /// Lowercase SHA-256 digest of the verified archive.
     pub sha256: String,
     pub created_at: String,
-    #[serde(default)]
-    pub event_sequence: u64,
+    pub event_frontier: u64,
 }
 
 impl CheckpointMetadata {
@@ -209,8 +450,7 @@ pub struct SessionRecord {
     pub session_title_override: Option<String>,
     pub created_at: String,
     pub updated_at: String,
-    #[serde(default)]
-    pub last_viewed_event_sequence: u64,
+    pub detached_after_event_ordinal: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -520,14 +760,14 @@ mod tests {
             session_title_override: None,
             created_at: "2026-08-09T12:00:00Z".into(),
             updated_at: "2026-08-09T12:01:00Z".into(),
-            last_viewed_event_sequence: 0,
+            detached_after_event_ordinal: 0,
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: Some(CheckpointMetadata {
                 archive_path: PathBuf::from("sessions/0123456789abcdef.hel.zip"),
                 sha256: "a".repeat(64),
                 created_at: "2026-08-09T12:01:00Z".into(),
-                event_sequence: 42,
+                event_frontier: 42,
             }),
         };
         HelState {
@@ -582,6 +822,27 @@ mod tests {
     }
 
     #[test]
+    fn retired_checkpoint_and_detach_cursor_names_are_rejected() {
+        let session_id = "0123456789abcdef";
+
+        let mut old_checkpoint = serde_json::to_value(sample_state()).unwrap();
+        let checkpoint = old_checkpoint["sessions"][session_id]["checkpoint"]
+            .as_object_mut()
+            .unwrap();
+        let frontier = checkpoint.remove("event_frontier").unwrap();
+        checkpoint.insert("event_sequence".into(), frontier);
+        assert!(serde_json::from_value::<HelState>(old_checkpoint).is_err());
+
+        let mut old_detach_cursor = serde_json::to_value(sample_state()).unwrap();
+        let session = old_detach_cursor["sessions"][session_id]
+            .as_object_mut()
+            .unwrap();
+        let ordinal = session.remove("detached_after_event_ordinal").unwrap();
+        session.insert("last_viewed_event_sequence".into(), ordinal);
+        assert!(serde_json::from_value::<HelState>(old_detach_cursor).is_err());
+    }
+
+    #[test]
     fn json_state_round_trip_is_atomic() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested/state.json");
@@ -628,6 +889,62 @@ mod tests {
         assert_eq!(
             state.mount_history["builder.example.test"],
             vec![PathBuf::from("/srv/first"), PathBuf::from("/srv/second")]
+        );
+    }
+
+    #[test]
+    fn materialized_activity_watermark_does_not_regress_when_detail_is_removed() {
+        let mut materialized = MaterializedSession::empty("session-1");
+        assert_eq!(materialized.last_activity_at_ms(), None);
+
+        materialized.execution = MaterializedExecutionState::Running { started_at_ms: 300 };
+        materialized.transcript.push(TranscriptItem {
+            stable_id: "system:1".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 350,
+            last_changed_at_ms: 400,
+            body: TranscriptBody::System {
+                text: "working".into(),
+            },
+        });
+        materialized.queued_prompts.push(MaterializedQueuedPrompt {
+            command_id: "prompt-2".into(),
+            content: Vec::new(),
+            queued_at_ms: 500,
+        });
+        materialized.last_activity_at_ms = Some(500);
+        assert_eq!(materialized.last_activity_at_ms(), Some(500));
+
+        materialized.queued_prompts.clear();
+        assert_eq!(materialized.last_activity_at_ms(), Some(500));
+        materialized.transcript.clear();
+        assert_eq!(materialized.last_activity_at_ms(), Some(500));
+        materialized.execution = MaterializedExecutionState::Idle;
+        assert_eq!(materialized.last_activity_at_ms(), Some(500));
+    }
+
+    #[test]
+    fn materialized_event_frontier_requires_the_matching_digest_kind() {
+        let mut materialized = MaterializedSession::empty("session-1");
+        materialized.validate().unwrap();
+
+        materialized.applied_event_ordinal = 1;
+        assert!(
+            materialized
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent ordinal")
+        );
+
+        materialized.applied_event_digest = "A".repeat(64);
+        assert!(
+            materialized
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("lowercase SHA-256")
         );
     }
 

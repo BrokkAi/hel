@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -240,7 +240,7 @@ pub trait CommandExecutor {
     fn execute_with_stdin(
         &self,
         _command: &CommandSpec,
-        _input: &mut dyn Read,
+        _input: &mut (dyn Read + Send),
     ) -> Result<CommandOutput> {
         bail!("this command executor does not support streamed stdin")
     }
@@ -267,7 +267,7 @@ impl CommandExecutor for ProcessExecutor {
     fn execute_with_stdin(
         &self,
         command: &CommandSpec,
-        input: &mut dyn Read,
+        input: &mut (dyn Read + Send),
     ) -> Result<CommandOutput> {
         let mut child = Command::new(&command.program)
             .args(&command.args)
@@ -324,25 +324,29 @@ impl CommandExecutor for ProcessExecutor {
 #[derive(Clone)]
 pub struct CancellableProcessExecutor {
     cancelled: Arc<AtomicBool>,
+    deadline: Option<Instant>,
 }
 
 impl CancellableProcessExecutor {
     pub fn new(cancelled: Arc<AtomicBool>) -> Self {
-        Self { cancelled }
+        Self {
+            cancelled,
+            deadline: None,
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let deadline = cancelled.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(timeout);
-            deadline.store(true, Ordering::Release);
-        });
-        Self { cancelled }
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            deadline: Some(Instant::now() + timeout),
+        }
     }
 
     fn check_cancelled(&self) -> Result<()> {
@@ -426,7 +430,7 @@ impl CommandExecutor for CancellableProcessExecutor {
     fn execute_with_stdin(
         &self,
         command: &CommandSpec,
-        input: &mut dyn Read,
+        input: &mut (dyn Read + Send),
     ) -> Result<CommandOutput> {
         self.check_cancelled()?;
         // Streamed transfers already isolate stdout/stderr reader threads.
@@ -458,42 +462,53 @@ impl CommandExecutor for CancellableProcessExecutor {
             let mut bytes = Vec::new();
             std::io::copy(&mut stderr, &mut bytes).map(|_| bytes)
         });
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            self.check_cancelled().inspect_err(|_| {
-                terminate_cancellable_child(&mut child);
-            })?;
-            let count = input.read(&mut buffer).context("read command input")?;
-            if count == 0 {
-                break;
-            }
-            stdin
-                .write_all(&buffer[..count])
-                .context("stream command input")?;
-        }
-        stdin.flush().context("flush command input")?;
-        drop(stdin);
-        let status = loop {
-            if self.is_cancelled() {
-                terminate_cancellable_child(&mut child);
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                bail!("operation cancelled while {}", command.purpose);
-            }
-            if let Some(status) = child
-                .try_wait()
-                .with_context(|| format!("wait for {}", command.purpose))?
-            {
-                break status;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        };
+        let process_result = std::thread::scope(|scope| -> Result<_> {
+            // Pipe writes can block forever when a remote helper stops reading.
+            // Keep the writer off the supervising thread so cancellation can
+            // kill the process group and thereby close the blocked pipe.
+            let input_writer = scope.spawn(|| -> Result<()> {
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    self.check_cancelled()?;
+                    let count = input.read(&mut buffer).context("read command input")?;
+                    if count == 0 {
+                        break;
+                    }
+                    stdin
+                        .write_all(&buffer[..count])
+                        .context("stream command input")?;
+                }
+                stdin.flush().context("flush command input")
+            });
+            let status = loop {
+                if self.is_cancelled() {
+                    terminate_cancellable_child(&mut child);
+                    let _ = input_writer.join();
+                    bail!("operation cancelled while {}", command.purpose);
+                }
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                    Err(error) => {
+                        terminate_cancellable_child(&mut child);
+                        let _ = input_writer.join();
+                        return Err(error).with_context(|| format!("wait for {}", command.purpose));
+                    }
+                }
+            };
+            let input_result = input_writer
+                .join()
+                .map_err(|_| anyhow::anyhow!("streamed command input writer panicked"))?;
+            Ok((status, input_result))
+        });
         let stdout = stdout_reader
             .join()
             .map_err(|_| anyhow::anyhow!("streamed command stdout reader panicked"))??;
         let stderr = stderr_reader
             .join()
             .map_err(|_| anyhow::anyhow!("streamed command stderr reader panicked"))??;
+        let (status, input_result) = process_result?;
+        input_result?;
         Ok(CommandOutput {
             status: status.code().unwrap_or(-1),
             stdout,
@@ -1462,7 +1477,7 @@ pub fn close_plan(locator: &TargetLocator, session_id: &str) -> Result<CommandPl
                 .purpose("remove exact local Hel worker state")
         }
         TargetLocator::LocalPodman { container_id } => {
-            CommandSpec::new("podman", ["rm", "--force", container_id])
+            CommandSpec::new("podman", ["rm", "--force", "--ignore", container_id])
                 .purpose("remove local Podman session container")
         }
         TargetLocator::AppleContainer { container_id } => {
@@ -1474,20 +1489,24 @@ pub fn close_plan(locator: &TargetLocator, session_id: &str) -> Result<CommandPl
             region,
             instance_id,
             ..
-        } => CommandSpec::new(
-            "aws",
-            [
-                "--profile",
-                profile,
-                "--region",
-                region,
-                "ec2",
-                "terminate-instances",
-                "--instance-ids",
-                instance_id,
-            ],
-        )
-        .purpose("terminate exact EC2 session instance"),
+        } => {
+            // EC2 TerminateInstances is explicitly idempotent, including a
+            // repeated request for an already-terminated instance.
+            CommandSpec::new(
+                "aws",
+                [
+                    "--profile",
+                    profile,
+                    "--region",
+                    region,
+                    "ec2",
+                    "terminate-instances",
+                    "--instance-ids",
+                    instance_id,
+                ],
+            )
+            .purpose("terminate exact EC2 session instance")
+        }
         TargetLocator::SshBare { ssh, workspace } => ssh_command(
             ssh,
             [
@@ -1501,7 +1520,7 @@ pub fn close_plan(locator: &TargetLocator, session_id: &str) -> Result<CommandPl
         )
         .purpose("remove exact SSH session workspace and runtime state"),
         TargetLocator::SshPodman { ssh, container_id } => {
-            ssh_command(ssh, ["podman", "rm", "--force", container_id])
+            ssh_command(ssh, ["podman", "rm", "--force", "--ignore", container_id])
                 .purpose("remove exact remote Podman session container")
         }
     };
@@ -1509,6 +1528,36 @@ pub fn close_plan(locator: &TargetLocator, session_id: &str) -> Result<CommandPl
         description: format!("close Hel session {session_id}"),
         commands: vec![command],
     })
+}
+
+/// Confirm that an Apple container is absent after its exact delete command
+/// failed. Other target deletion commands are already idempotent: filesystem
+/// removal uses `rm -rf`, Podman uses `--ignore`, and EC2 termination is an
+/// idempotent API operation. Apple defines the value passed to `run --name` as
+/// the container ID, and `list --quiet` emits those IDs, so this is an exact
+/// identity check rather than a display-name comparison.
+pub fn cleanup_target_is_confirmed_absent(
+    locator: &TargetLocator,
+    session_id: &str,
+    executor: &impl CommandExecutor,
+) -> Result<bool> {
+    verify_locator(locator, session_id)?;
+    let TargetLocator::AppleContainer { container_id } = locator else {
+        return Ok(false);
+    };
+    let command = CommandSpec::new("container", ["list", "--all", "--quiet"])
+        .purpose("confirm exact Apple session container is absent");
+    let output = executor.execute(&command)?;
+    if output.status != 0 {
+        bail!(
+            "{} failed with status {}: {}",
+            command.purpose,
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let listed = String::from_utf8(output.stdout).context("decode Apple container list")?;
+    Ok(!listed.lines().any(|id| id.trim() == container_id))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2309,9 +2358,43 @@ mod tests {
                 .purpose("check Apple container service")
         );
         assert_eq!(plan.commands[1].program, "container");
+        let name = resource_name(SESSION).unwrap();
+        assert!(
+            plan.commands[1]
+                .args
+                .windows(2)
+                .any(|args| args == ["--name", &name])
+        );
         assert!(plan.commands[1].args.windows(4).any(|args| {
             args == managed_resource_identity_args(ManagedResourceKind::Container, SESSION)
         }));
+    }
+
+    #[test]
+    fn apple_cleanup_confirms_absence_by_the_exact_provisioned_container_id() {
+        let container_id = resource_name(SESSION).unwrap();
+        let locator = TargetLocator::AppleContainer {
+            container_id: container_id.clone(),
+        };
+        let still_live = PodmanPreflightExecutor::with_outputs([podman_output(format!(
+            "unrelated-id\n{container_id}\n"
+        ))]);
+
+        assert!(!cleanup_target_is_confirmed_absent(&locator, SESSION, &still_live).unwrap());
+        assert_eq!(
+            still_live.seen.borrow()[0].args,
+            ["list", "--all", "--quiet"]
+        );
+
+        let absent = PodmanPreflightExecutor::with_outputs([podman_output("unrelated-id\n")]);
+        assert!(cleanup_target_is_confirmed_absent(&locator, SESSION, &absent).unwrap());
+
+        let failed = PodmanPreflightExecutor::with_outputs([CommandOutput {
+            status: 1,
+            stdout: Vec::new(),
+            stderr: b"service unavailable".to_vec(),
+        }]);
+        assert!(cleanup_target_is_confirmed_absent(&locator, SESSION, &failed).is_err());
     }
 
     #[test]
@@ -2709,6 +2792,38 @@ mod tests {
     }
 
     #[test]
+    fn podman_cleanup_ignores_an_already_absent_container() {
+        let name = resource_name(SESSION).unwrap();
+        let local = close_plan(
+            &TargetLocator::LocalPodman {
+                container_id: name.clone(),
+            },
+            SESSION,
+        )
+        .unwrap();
+        assert_eq!(
+            local.commands[0].args,
+            ["rm", "--force", "--ignore", name.as_str()]
+        );
+
+        let remote = close_plan(
+            &TargetLocator::SshPodman {
+                ssh: ssh(),
+                container_id: name,
+            },
+            SESSION,
+        )
+        .unwrap();
+        assert!(
+            remote.commands[0]
+                .args
+                .last()
+                .unwrap()
+                .contains("'podman' 'rm' '--force' '--ignore'")
+        );
+    }
+
+    #[test]
     fn close_rejects_broad_or_mismatched_targets() {
         let broad = TargetLocator::SshBare {
             ssh: ssh(),
@@ -2785,6 +2900,46 @@ mod tests {
                 &CommandSpec::new("sh", ["-c", "sleep 30"]).purpose("test cancellable process"),
             )
             .unwrap_err();
+        cancel.join().unwrap();
+        assert!(error.to_string().contains("operation cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn cancellable_executor_enforces_its_inline_deadline() {
+        let executor = CancellableProcessExecutor::with_timeout(Duration::from_millis(50));
+        let started = std::time::Instant::now();
+
+        let error = executor
+            .execute(
+                &CommandSpec::new("sh", ["-c", "sleep 30"])
+                    .purpose("test bounded process execution"),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("operation cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn cancellable_executor_interrupts_a_blocked_stdin_pipe() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let executor = CancellableProcessExecutor::new(cancelled.clone());
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            cancelled.store(true, Ordering::Release);
+        });
+        let mut input = std::io::Cursor::new(vec![0_u8; 16 * 1024 * 1024]);
+        let started = std::time::Instant::now();
+
+        let error = executor
+            .execute_with_stdin(
+                &CommandSpec::new("sh", ["-c", "sleep 30"])
+                    .purpose("test cancellation while streaming"),
+                &mut input,
+            )
+            .unwrap_err();
+
         cancel.join().unwrap();
         assert!(error.to_string().contains("operation cancelled"));
         assert!(started.elapsed() < Duration::from_secs(2));

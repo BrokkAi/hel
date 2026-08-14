@@ -1,41 +1,50 @@
 //! Controller-side lifecycle transitions and canonical-to-backend conversion.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use agent_client_protocol::schema::v1::{ContentBlock, Plan, TextContent, ToolCall};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
 use crate::hel_archive::{
-    ArchiveInput, BundleManifest, GitCollectionSpec, GitHistoryMode, PayloadRole, SessionManifest,
-    SystemGit, TargetManifest, collect_git_snapshot, read_archive_verified, write_archive_atomic,
+    ArchiveInput, BundleManifest, CanonicalSessionSnapshot, CanonicalTranscriptBody,
+    GitCollectionSpec, GitHistoryMode, SessionManifest, SystemGit, TargetManifest,
+    collect_git_snapshot, verify_archive_streaming, write_archive_atomic,
 };
 use crate::hel_checkpoint::{
-    CheckpointExportSpec, CheckpointRepositorySpec, CheckpointRestoreSpec, CheckpointTransfer,
-    RepositoryRestoreSpec, export_command, restore_command,
+    CheckpointExportSpec, CheckpointRepositoryCapture, CheckpointRepositorySpec,
+    CheckpointRestoreSpec, CheckpointTransfer, RepositoryRestoreSpec, export_command,
+    restore_command,
 };
 use crate::hel_config::{
     AwsAddressSource, HelConfig, ProjectBundle, SshConnection, TargetTemplate, atomic_write,
     data_dir, sessions_dir,
 };
+use crate::hel_database::advance_detached_after_event_ordinal;
 use crate::hel_git_proxy::{GitBrokerSpec, broker_is_alive};
 use crate::hel_local_git::{canonical_repository, dirty_local_repositories};
+use crate::hel_projection::{
+    canonical_session_from_materialized, materialized_session_from_canonical,
+};
+use crate::hel_session_manager::{
+    ManagedSessionLease, ManagedSessionSnapshot, SessionManagerControl, StandaloneSession,
+    new_command_id,
+};
 use crate::hel_state::{
-    CheckpointMetadata, HelState, SessionRecord, SessionResourceAllocation, SessionState,
-    TargetLocator, new_session_id, normalize_session_title,
+    CheckpointMetadata, HelState, MaterializedSession, SessionRecord, SessionResourceAllocation,
+    SessionState, TargetLocator, new_session_id, normalize_session_title,
 };
 use crate::hel_targets::{
     self, AdditionalMount, AwsTemplate, CancellableProcessExecutor, CommandExecutor, CommandOutput,
     CommandSpec, ContainerTemplate, ProcessExecutor, ProjectBundleSpec, RepositorySpec, SshTarget,
 };
-use crate::hel_worker::{
-    PROTOCOL_VERSION, RequestEnvelope, ResponseBody, ResponsePayload, VersionRange, WorkerEvent,
-    WorkerRequest,
-};
-use crate::hel_worker_client::{WorkerBootstrap, WorkerClient};
+use crate::hel_worker::{RelayCommand, RelayCursor, RelayExecutionState};
 use crate::hel_worker_runtime::{WorkerLaunchConfig, WorkerOwnership};
 
 const INHERITED_GIT_SETTINGS: &[&str] = &[
@@ -60,6 +69,121 @@ pub struct Controller {
     pub state: HelState,
 }
 
+/// Machine-wide advisory lock for one controller data store. This prevents a
+/// dashboard, server, or CLI lifecycle command from concurrently acting as a
+/// second controller against the same SQLite state and relay sessions.
+#[derive(Debug)]
+pub struct ControllerStoreGuard {
+    file: File,
+}
+
+impl ControllerStoreGuard {
+    pub fn acquire() -> Result<Self> {
+        let directory = data_dir();
+        Self::acquire_at(&directory)
+    }
+
+    fn acquire_at(directory: &Path) -> Result<Self> {
+        std::fs::create_dir_all(directory)
+            .with_context(|| format!("create controller data directory {}", directory.display()))?;
+        let path = directory.join("controller.lock");
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .with_context(|| format!("open controller lock {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => bail!(
+                "another Hel controller is already using {}; stop it before starting this command",
+                directory.display()
+            ),
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error)
+                    .with_context(|| format!("lock controller store {}", directory.display()));
+            }
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ControllerStoreGuard {
+    fn drop(&mut self) {
+        // Make release explicit. `File` also unlocks on close, but an explicit
+        // unlock keeps same-process handoff deterministic across platforms.
+        let _ = self.file.unlock();
+    }
+}
+
+/// Remove checkpoint archives installed by a process that exited before its
+/// database transaction committed. Call this only while holding the
+/// machine-wide controller-store guard and before starting background work.
+pub fn reconcile_managed_checkpoint_archives() -> Result<usize> {
+    let state = HelState::load()?;
+    reconcile_managed_checkpoint_archives_in(&sessions_dir(), &state)
+}
+
+fn reconcile_managed_checkpoint_archives_in(directory: &Path, state: &HelState) -> Result<usize> {
+    if !directory.exists() {
+        return Ok(0);
+    }
+    let referenced_names = state
+        .sessions
+        .values()
+        .filter_map(|session| session.checkpoint.as_ref())
+        .filter_map(|checkpoint| checkpoint.archive_path.file_name())
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    let mut removed = 0;
+    for entry in std::fs::read_dir(directory)
+        .with_context(|| format!("scan checkpoint directory {}", directory.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file()
+            || !is_managed_checkpoint_archive_name(&entry.file_name())
+            || referenced_names.contains(&entry.file_name())
+        {
+            continue;
+        }
+        std::fs::remove_file(entry.path()).with_context(|| {
+            format!(
+                "remove unreferenced managed checkpoint {}",
+                entry.path().display()
+            )
+        })?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn is_managed_checkpoint_archive_name(name: &OsStr) -> bool {
+    let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".hel.zip")) else {
+        return false;
+    };
+    let Some((frontier_prefix, nonce)) = stem.rsplit_once("-archive-") else {
+        return false;
+    };
+    if nonce.len() != 32
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return false;
+    }
+    let Some((session_id, frontier)) = frontier_prefix.rsplit_once('-') else {
+        return false;
+    };
+    !session_id.is_empty()
+        && frontier.parse::<u64>().is_ok()
+        && crate::hel_config::validate_id("session", session_id).is_ok()
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RecoveryCandidate {
     pub session_id: String,
@@ -78,6 +202,35 @@ pub struct RecoveryScan {
 pub struct CheckpointArtifact {
     pub metadata: CheckpointMetadata,
     pub native_session_id: String,
+    /// Digest paired with `metadata.event_frontier` at the relay barrier.
+    pub event_frontier_digest: String,
+}
+
+enum ControllerRelayLease {
+    Managed(ManagedSessionLease),
+    Standalone(StandaloneSession),
+}
+
+impl ControllerRelayLease {
+    fn connection_mut(&mut self) -> &mut StandaloneSession {
+        match self {
+            Self::Managed(lease) => lease.connection_mut(),
+            Self::Standalone(connection) => connection,
+        }
+    }
+
+    fn release(self) {
+        if let Self::Managed(lease) = self {
+            lease.release();
+        }
+    }
+}
+
+struct LatchedCheckpoint {
+    artifact: CheckpointArtifact,
+    relay: ControllerRelayLease,
+    barrier_command_id: String,
+    cursor: RelayCursor,
 }
 
 /// Whether connecting local repositories may also carry the user's current
@@ -234,9 +387,72 @@ impl Controller {
 
     fn persist_session_state(&self, session_id: &str) -> Result<()> {
         match self.state.sessions.get(session_id) {
-            Some(session) => crate::hel_database::save_session(session),
+            Some(session) => crate::hel_database::save_lifecycle_session(session),
             None => crate::hel_database::delete_session(session_id),
         }
+    }
+
+    fn persist_session_transition_or_restore(
+        &mut self,
+        session_id: &str,
+        previous: &SessionRecord,
+        context: &'static str,
+    ) -> Result<()> {
+        persist_session_record_transition_or_restore(
+            &mut self.state,
+            session_id,
+            previous,
+            context,
+            &crate::hel_database::save_lifecycle_session,
+        )
+    }
+
+    fn persist_checkpoint_transition_or_restore(
+        &mut self,
+        session_id: &str,
+        previous: &SessionRecord,
+        context: &'static str,
+    ) -> Result<()> {
+        persist_session_record_transition_or_restore(
+            &mut self.state,
+            session_id,
+            previous,
+            context,
+            &crate::hel_database::save_checkpointed_session,
+        )
+    }
+
+    fn persist_failed_checkpoint_state_or_restore(
+        &mut self,
+        session_id: &str,
+        previous: &SessionRecord,
+        primary: anyhow::Error,
+    ) -> anyhow::Error {
+        match self.persist_session_state(session_id) {
+            Ok(()) => primary,
+            Err(error) => self.restore_prior_session_after_persistence_failure(
+                session_id,
+                previous,
+                primary.context(format!(
+                    "failed to persist the checkpoint rollback state: {error:#}"
+                )),
+            ),
+        }
+    }
+
+    fn restore_prior_session_after_persistence_failure(
+        &mut self,
+        session_id: &str,
+        previous: &SessionRecord,
+        primary: anyhow::Error,
+    ) -> anyhow::Error {
+        restore_session_after_persistence_failure(
+            &mut self.state,
+            session_id,
+            previous,
+            primary,
+            crate::hel_database::save_lifecycle_session,
+        )
     }
 
     /// Find managed resources which are not represented by the controller's
@@ -332,7 +548,7 @@ impl Controller {
             session_title_override: None,
             created_at: now.clone(),
             updated_at: now,
-            last_viewed_event_sequence: 0,
+            detached_after_event_ordinal: 0,
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: None,
@@ -343,19 +559,25 @@ impl Controller {
             .into_iter()
             .next()
             .context("reconnect plan is empty")?;
-        let mut client = WorkerClient::connect(&spec, session_id)
+        self.state
+            .sessions
+            .insert(session_id.to_owned(), record.clone());
+        self.persist_session_state(session_id)?;
+        let mut relay = StandaloneSession::connect_command(&spec, session_id)
             .await
-            .context("orphan worker did not complete the v1 handshake")?;
-        let bootstrap = client
-            .bootstrap()
-            .await
-            .context("bootstrap orphan worker")?;
-        let mut record = record;
-        record.state = SessionState::Running;
-        record.native_session_id = crate::hel_worker::recover_native_session_id(&bootstrap.events);
-        record.acp_session_title = crate::hel_state::harness_session_title(&bootstrap.events);
+            .context("orphan relay did not complete the v1 handshake")?;
+        let native_session_id = wait_for_native_session(&mut relay).await?;
         self.state.sessions.insert(session_id.to_owned(), record);
-        self.persist_session_state(session_id)
+        self.mark_worker_connected(session_id, Some(native_session_id))?;
+        if let Some(title) = relay.snapshot().materialized.session_title {
+            crate::hel_database::set_session_acp_title(session_id, Some(&title))?;
+            self.state
+                .sessions
+                .get_mut(session_id)
+                .expect("adopted session disappeared while saving its ACP title")
+                .acp_session_title = Some(title);
+        }
+        Ok(())
     }
 
     pub fn destroy_orphan_worker(
@@ -627,7 +849,7 @@ impl Controller {
             session_title_override: None,
             created_at: now.clone(),
             updated_at: now,
-            last_viewed_event_sequence: 0,
+            detached_after_event_ordinal: 0,
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: None,
@@ -708,31 +930,38 @@ impl Controller {
 
     pub fn rename_session(&mut self, session_id: &str, title: &str) -> Result<String> {
         let title = normalize_session_title(title).context("session name cannot be empty")?;
+        ensure!(
+            self.state.sessions.contains_key(session_id),
+            "unknown session {session_id}"
+        );
+        let updated_at = now();
+        crate::hel_database::set_session_title_override(session_id, &title, &updated_at)?;
         let record = self
             .state
             .sessions
             .get_mut(session_id)
-            .with_context(|| format!("unknown session {session_id}"))?;
+            .expect("session was checked before updating its title");
         record.session_title_override = Some(title.clone());
-        record.updated_at = now();
-        self.persist_session_state(session_id)?;
+        record.updated_at = updated_at;
         Ok(title)
     }
 
-    pub fn mark_session_viewed_through(
+    pub fn mark_session_detached_after(
         &mut self,
         session_id: &str,
-        event_sequence: u64,
+        event_ordinal: u64,
     ) -> Result<()> {
+        ensure!(
+            self.state.sessions.contains_key(session_id),
+            "unknown session {session_id}"
+        );
+        let receipt = advance_detached_after_event_ordinal(session_id, event_ordinal)?;
         let record = self
             .state
             .sessions
             .get_mut(session_id)
-            .with_context(|| format!("unknown session {session_id}"))?;
-        if event_sequence > record.last_viewed_event_sequence {
-            record.last_viewed_event_sequence = event_sequence;
-            self.persist_session_state(session_id)?;
-        }
+            .expect("session was checked before advancing its read receipt");
+        record.detached_after_event_ordinal = receipt;
         Ok(())
     }
 
@@ -859,18 +1088,29 @@ impl Controller {
         let session = self
             .state
             .sessions
-            .get_mut(session_id)
+            .get(session_id)
             .with_context(|| format!("unknown session {session_id}"))?;
         if session.target.is_none() {
             bail!("session {session_id} has no provisioned target");
         }
+        let updated_at = now();
+        crate::hel_database::mark_session_worker_connected(
+            session_id,
+            native_session_id.as_deref(),
+            &updated_at,
+        )?;
+        let session = self
+            .state
+            .sessions
+            .get_mut(session_id)
+            .expect("session disappeared after its worker connection was saved");
         session.state = SessionState::Running;
         if native_session_id.is_some() {
             session.native_session_id = native_session_id;
         }
-        session.updated_at = now();
+        session.updated_at = updated_at;
         session.last_error = None;
-        self.persist_session_state(session_id)
+        Ok(())
     }
 
     async fn install_and_connect_worker(
@@ -878,7 +1118,7 @@ impl Controller {
         session_id: &str,
         executor: &impl CommandExecutor,
     ) -> Result<Option<String>> {
-        let (backend, worker_root) = self.prepare_worker_files(session_id, executor, true)?;
+        let (backend, worker_root) = self.prepare_worker_files(session_id, executor)?;
         install_attached_resources(&self.state, session_id, &backend, &worker_root, executor)?;
         self.connect_local_repositories(
             session_id,
@@ -890,9 +1130,8 @@ impl Controller {
         start_worker(executor, &backend, &worker_root)?;
         let reconnect = &hel_targets::reconnect_plan(&backend, session_id)?.commands[0];
         let readiness = async {
-            handshake_worker(reconnect).await?;
-            let mut client = WorkerClient::connect(reconnect, session_id).await?;
-            let (native_session_id, _) = wait_for_session_started(&mut client, 0).await?;
+            let mut relay = StandaloneSession::connect_command(reconnect, session_id).await?;
+            let native_session_id = wait_for_native_session(&mut relay).await?;
             Ok(Some(native_session_id))
         }
         .await;
@@ -911,7 +1150,6 @@ impl Controller {
         &self,
         session_id: &str,
         executor: &impl CommandExecutor,
-        recover_native_session: bool,
     ) -> Result<(hel_targets::TargetLocator, String)> {
         let session = self
             .state
@@ -968,7 +1206,6 @@ impl Controller {
             cwd: PathBuf::from(&workspace.0),
             additional_directories,
             native_session_id: session.native_session_id.clone(),
-            recover_native_session,
             force_unrestricted_mode: force_unrestricted_mode(&backend),
         };
 
@@ -1161,11 +1398,19 @@ impl Controller {
     /// worker has become unreachable. Best-effort; returns None when the
     /// target no longer exists or has no diagnostics.
     pub fn diagnose_worker(&self, session_id: &str) -> Option<String> {
+        self.diagnose_worker_controlled(session_id, &ProcessExecutor)
+    }
+
+    pub fn diagnose_worker_controlled(
+        &self,
+        session_id: &str,
+        executor: &impl CommandExecutor,
+    ) -> Option<String> {
         let session = self.state.sessions.get(session_id)?;
         let locator = session.target.as_ref()?;
         let backend = backend_locator(locator, session, &self.config).ok()?;
         let worker_root = hel_targets::worker_root(&backend, session_id).ok()?;
-        worker_last_words(&ProcessExecutor, &backend, &worker_root)
+        worker_last_words(executor, &backend, &worker_root)
     }
 
     pub fn reconnect_command(&self, session_id: &str) -> Result<CommandSpec> {
@@ -1313,7 +1558,7 @@ impl Controller {
         target_id: &str,
         additional_mounts: Option<Vec<AdditionalMount>>,
         resource_allocation: Option<SessionResourceAllocation>,
-    ) -> Result<WorkerBootstrap> {
+    ) -> Result<MaterializedSession> {
         self.resume_session_with_options_and_queue_disposition(
             session_id,
             profile_id,
@@ -1352,7 +1597,7 @@ impl Controller {
         additional_mounts: Option<Vec<AdditionalMount>>,
         resource_allocation: Option<SessionResourceAllocation>,
         discard_queue: bool,
-    ) -> Result<WorkerBootstrap> {
+    ) -> Result<MaterializedSession> {
         self.resume_session_controlled(
             session_id,
             profile_id,
@@ -1374,7 +1619,7 @@ impl Controller {
         target_id: &str,
         options: SessionResumeOptions,
         executor: &(impl CommandExecutor + Sync),
-    ) -> Result<WorkerBootstrap> {
+    ) -> Result<MaterializedSession> {
         let SessionResumeOptions {
             additional_mounts,
             resource_allocation,
@@ -1393,7 +1638,7 @@ impl Controller {
             .checkpoint
             .as_ref()
             .context("session has no checkpoint")?;
-        let archive = read_archive_verified(&checkpoint.archive_path)?;
+        let archive = verify_archive_streaming(&checkpoint.archive_path)?;
         if archive.archive_sha256 != checkpoint.sha256 || archive.manifest.session.id != session_id
         {
             bail!("persisted checkpoint verification failed");
@@ -1444,18 +1689,11 @@ impl Controller {
                 .context("clean up target from failed resume")?;
         }
         let same_harness = profile.kind == archive.manifest.session.harness_kind;
-        let canonical_events = archive.payload_by_role(&PayloadRole::CanonicalEvents)?;
-        let source_latest_seq = canonical_latest_sequence(canonical_events)?;
-        let archived_queue = canonical_events
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(serde_json::from_slice)
-            .collect::<serde_json::Result<Vec<crate::hel_worker::SequencedEvent>>>()
-            .map(|events| crate::hel_worker::queued_prompts_from_events(&events))?;
+        let canonical_session = archive.canonical_session.clone();
         let context_bytes = profile
             .context_window_bytes
             .unwrap_or(crate::hel_compaction::DEFAULT_CONTEXT_BYTES);
-        let portable_events = (!same_harness).then(|| canonical_events.to_vec());
+        let portable_session = (!same_harness).then(|| canonical_session.clone());
         let github_token = controller_github_token();
 
         let record = self.state.sessions.get_mut(session_id).unwrap();
@@ -1477,14 +1715,9 @@ impl Controller {
         self.persist_session_state(session_id)?;
 
         let result = async {
-            self.provision_session_with_github_token(
-                session_id,
-                executor,
-                github_token.as_deref(),
-            )
-            .await?;
-            let (backend, worker_root) =
-                self.prepare_worker_files(session_id, executor, same_harness)?;
+            self.provision_session_with_github_token(session_id, executor, github_token.as_deref())
+                .await?;
+            let (backend, worker_root) = self.prepare_worker_files(session_id, executor)?;
             let harness_home = target_profile_home(&backend, session_id, &profile);
             let workspace_root = if let Some(project_directory) = &previous.project_directory {
                 project_directory
@@ -1505,7 +1738,10 @@ impl Controller {
             let target_path = |path: &str| match &backend {
                 hel_targets::TargetLocator::AwsEc2 { .. }
                 | hel_targets::TargetLocator::SshBare { .. }
-                    if !path.starts_with('/') => PathBuf::from(format!("~/{path}")),
+                    if !path.starts_with('/') =>
+                {
+                    PathBuf::from(format!("~/{path}"))
+                }
                 _ => PathBuf::from(path),
             };
             // The restore needs the fetched objects: a committed delta bundle
@@ -1524,7 +1760,7 @@ impl Controller {
             let restore = CheckpointRestoreSpec {
                 archive_path: target_path(&remote_archive),
                 workspace_root: target_path(&workspace_root),
-                worker_root: target_path(&worker_root),
+                relay_root: target_path(&worker_root),
                 harness_home: target_path(&harness_home),
                 restore_repositories: previous.project_directory.is_none(),
                 restore_native: same_harness,
@@ -1540,24 +1776,12 @@ impl Controller {
                 &checkpoint.archive_path,
                 &remote_archive,
             )?;
-            upload_checkpoint_spec(
-                executor,
-                &backend,
-                session_id,
-                &local_spec,
-                &remote_spec,
-            )?;
+            upload_checkpoint_spec(executor, &backend, session_id, &local_spec, &remote_spec)?;
             execute_checked(
                 executor,
                 restore_command(&backend, session_id, &remote_spec)?,
             )?;
-            install_attached_resources(
-                &self.state,
-                session_id,
-                &backend,
-                &worker_root,
-                executor,
-            )?;
+            install_attached_resources(&self.state, session_id, &backend, &worker_root, executor)?;
             self.connect_local_repositories(
                 session_id,
                 &backend,
@@ -1565,17 +1789,17 @@ impl Controller {
                 executor,
                 LocalBootstrap::Seed,
             )?;
+            let mut restored_projection =
+                materialized_session_from_canonical(session_id, &canonical_session)?;
+            if discard_queue || !same_harness {
+                restored_projection.queued_prompts.clear();
+            }
+            crate::hel_database::save_materialized_session(&restored_projection)?;
             start_worker(executor, &backend, &worker_root)?;
-            handshake_worker(&hel_targets::reconnect_plan(&backend, session_id)?.commands[0])
-                .await?;
             let spec = self.reconnect_command(session_id)?;
-            let mut client = WorkerClient::connect(&spec, session_id).await?;
-            let (native_session_id, resumed) =
-                wait_for_session_started(&mut client, source_latest_seq).await?;
+            let mut relay = StandaloneSession::connect_command(&spec, session_id).await?;
+            let native_session_id = wait_for_native_session(&mut relay).await?;
             if same_harness {
-                if !resumed {
-                    bail!("same-harness resume started a fresh ACP session instead of loading the copied native session");
-                }
                 if native_session_id != archive.manifest.session.native_session_id {
                     bail!(
                         "ACP loaded native session {native_session_id}, expected {}",
@@ -1583,45 +1807,49 @@ impl Controller {
                     );
                 }
             } else {
-                if resumed {
-                    bail!("cross-harness resume unexpectedly loaded a native source session");
-                }
-                let events = portable_events
-                    .as_deref()
-                    .context("cross-harness resume is missing canonical events")?;
-                let context = crate::hel_compaction::compact_events(
-                    events,
-                    context_bytes,
-                    &mut client,
-                )
-                .await?;
-                client
-                    .prompt(
-                        context,
-                        vec![crate::hel_worker::Attachment {
-                            name: "cross-harness-handoff".into(),
-                            media_type: crate::hel_compaction::HANDOFF_MEDIA_TYPE.into(),
-                            reference: "synthetic".into(),
-                        }],
+                let portable = portable_session
+                    .as_ref()
+                    .context("cross-harness resume is missing canonical session")?;
+                let context = canonical_handoff_text(portable, context_bytes);
+                relay
+                    .submit(
+                        new_command_id("cross-harness-handoff")?,
+                        RelayCommand::Prompt {
+                            prompt: vec![ContentBlock::Text(TextContent::new(context))],
+                        },
                     )
                     .await?;
                 if !discard_queue {
-                    for prompt in &archived_queue {
-                        client
-                            .enqueue_prompt(prompt.text.clone(), prompt.attachments.clone())
+                    for prompt in &canonical_session.queued_prompts {
+                        let content = prompt
+                            .content
+                            .iter()
+                            .cloned()
+                            .map(serde_json::from_value)
+                            .collect::<serde_json::Result<Vec<ContentBlock>>>()?;
+                        relay
+                            .submit(
+                                prompt.command_id.clone(),
+                                RelayCommand::Prompt { prompt: content },
+                            )
                             .await?;
                     }
                 }
             }
             self.mark_worker_connected(session_id, Some(native_session_id))?;
-            let bootstrap = client.bootstrap().await?;
-            client.detach().await?;
-            Ok::<_, anyhow::Error>(bootstrap)
+            Ok::<_, anyhow::Error>(relay.sync().await?.materialized)
         }
         .await;
         match result {
-            Ok(bootstrap) => Ok(bootstrap),
-            Err(error) => Err(self.rollback_failed_resume(session_id, &previous, error, executor)?),
+            Ok(materialized) => Ok(materialized),
+            Err(error) => {
+                if let Ok(previous_projection) =
+                    materialized_session_from_canonical(session_id, &canonical_session)
+                {
+                    let _ = crate::hel_database::save_materialized_session(&previous_projection);
+                }
+                Err(self.rollback_failed_resume(session_id, &previous, error, executor)?)
+            }
         }
     }
 
@@ -1678,29 +1906,89 @@ impl Controller {
         session_id: &str,
         executor: &(impl CommandExecutor + Sync),
     ) -> Result<CheckpointMetadata> {
+        self.checkpoint_session_controlled_with_manager(session_id, executor, None)
+            .await
+    }
+
+    pub async fn checkpoint_session_managed_controlled(
+        &mut self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+        manager: &SessionManagerControl,
+    ) -> Result<CheckpointMetadata> {
+        self.checkpoint_session_controlled_with_manager(session_id, executor, Some(manager))
+            .await
+    }
+
+    async fn checkpoint_session_controlled_with_manager(
+        &mut self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+        manager: Option<&SessionManagerControl>,
+    ) -> Result<CheckpointMetadata> {
         let previous = self
             .state
             .sessions
             .get(session_id)
             .with_context(|| format!("unknown session {session_id}"))?
             .clone();
+        ensure!(
+            !matches!(
+                previous.state,
+                SessionState::Closing | SessionState::Destroying
+            ),
+            "session {session_id} is already closing; resume that close instead of starting an ordinary checkpoint"
+        );
         let record = self.state.sessions.get_mut(session_id).unwrap();
         record.state = SessionState::Checkpointing;
         record.updated_at = now();
         record.last_checkpoint_error = None;
-        self.persist_session_state(session_id)?;
+        self.persist_session_transition_or_restore(
+            session_id,
+            &previous,
+            "persist checkpointing state before creating a checkpoint",
+        )?;
 
-        match self.checkpoint_session_with(session_id, executor).await {
-            Ok(artifact) => {
-                let record = self.state.sessions.get_mut(session_id).unwrap();
-                record.state = SessionState::Running;
-                record.native_session_id = Some(artifact.native_session_id);
-                record.checkpoint = Some(artifact.metadata.clone());
-                record.updated_at = now();
-                record.last_error = None;
-                record.last_checkpoint_error = None;
-                self.persist_session_state(session_id)?;
+        match self
+            .checkpoint_session_latched(session_id, executor, manager)
+            .await
+        {
+            Ok(mut latched) => {
+                let artifact = latched.artifact.clone();
+                {
+                    let record = self.state.sessions.get_mut(session_id).unwrap();
+                    record.state = SessionState::Running;
+                    record.native_session_id = Some(artifact.native_session_id.clone());
+                    record.checkpoint = Some(artifact.metadata.clone());
+                    record.updated_at = now();
+                    record.last_error = None;
+                    record.last_checkpoint_error = None;
+                }
+                self.persist_checkpoint_transition_or_restore(
+                    session_id,
+                    &previous,
+                    "persist verified checkpoint before releasing relay history",
+                )?;
                 prune_replaced_checkpoint(previous.checkpoint.as_ref(), &artifact.metadata);
+                let completion = latched
+                    .relay
+                    .connection_mut()
+                    .submit(
+                        new_command_id("checkpoint-complete")?,
+                        RelayCommand::CompleteCheckpoint {
+                            barrier_command_id: latched.barrier_command_id.clone(),
+                        },
+                    )
+                    .await;
+                if let Err(error) = completion {
+                    tracing::warn!(
+                        session_id,
+                        "verified checkpoint was saved, but its relay barrier release could not be confirmed: {error:#}"
+                    );
+                    // Dropping the leased proxy releases an ordinary barrier.
+                } else {
+                    latched.relay.release();
+                }
                 Ok(artifact.metadata)
             }
             Err(error) => {
@@ -1712,25 +2000,95 @@ impl Controller {
                     };
                     record.updated_at = now();
                     record.last_checkpoint_error = Some(format!("{error:#}"));
-                    self.persist_session_state(session_id)?;
                 }
-                Err(error)
+                Err(self.persist_failed_checkpoint_state_or_restore(session_id, &previous, error))
             }
         }
     }
 
-    /// Create and verify a recovery archive without mutating controller state.
-    /// The caller is responsible for installing the returned metadata.
+    /// Create, verify, and durably install a recovery archive before allowing
+    /// the relay to garbage-collect through its event frontier.
     pub async fn create_recovery_checkpoint(&self, session_id: &str) -> Result<CheckpointArtifact> {
-        self.checkpoint_session_with(session_id, &ProcessExecutor)
+        self.create_recovery_checkpoint_with_manager(session_id, None, &ProcessExecutor)
             .await
     }
 
-    async fn checkpoint_session_with(
+    pub async fn create_recovery_checkpoint_managed(
+        &self,
+        session_id: &str,
+        manager: &SessionManagerControl,
+    ) -> Result<CheckpointArtifact> {
+        self.create_recovery_checkpoint_with_manager(session_id, Some(manager), &ProcessExecutor)
+            .await
+    }
+
+    pub async fn create_recovery_checkpoint_managed_controlled(
+        &self,
+        session_id: &str,
+        manager: &SessionManagerControl,
+        executor: &(impl CommandExecutor + Sync),
+    ) -> Result<CheckpointArtifact> {
+        self.create_recovery_checkpoint_with_manager(session_id, Some(manager), executor)
+            .await
+    }
+
+    async fn create_recovery_checkpoint_with_manager(
+        &self,
+        session_id: &str,
+        manager: Option<&SessionManagerControl>,
+        executor: &(impl CommandExecutor + Sync),
+    ) -> Result<CheckpointArtifact> {
+        let previous_checkpoint = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?
+            .checkpoint
+            .clone();
+        let mut latched = self
+            .checkpoint_session_latched(session_id, executor, manager)
+            .await?;
+        if let Err(error) = verify_checkpoint_artifact(session_id, &latched.artifact) {
+            return Err(remove_uninstalled_checkpoint(
+                &latched.artifact.metadata.archive_path,
+                error.context("final recovery checkpoint verification"),
+            ));
+        }
+        crate::hel_database::record_recovery_success(
+            session_id,
+            &latched.artifact.native_session_id,
+            &latched.artifact.metadata,
+        )
+        .context("persist verified recovery checkpoint before releasing relay history")?;
+        let artifact = latched.artifact.clone();
+        let completion = latched
+            .relay
+            .connection_mut()
+            .submit(
+                new_command_id("checkpoint-complete")?,
+                RelayCommand::CompleteCheckpoint {
+                    barrier_command_id: latched.barrier_command_id.clone(),
+                },
+            )
+            .await;
+        if let Err(error) = completion {
+            tracing::warn!(
+                session_id,
+                "recovery checkpoint was saved, but its relay barrier release could not be confirmed: {error:#}"
+            );
+        } else {
+            latched.relay.release();
+        }
+        prune_replaced_checkpoint(previous_checkpoint.as_ref(), &artifact.metadata);
+        Ok(artifact)
+    }
+
+    async fn checkpoint_session_latched(
         &self,
         session_id: &str,
         executor: &(impl CommandExecutor + Sync),
-    ) -> Result<CheckpointArtifact> {
+        manager: Option<&SessionManagerControl>,
+    ) -> Result<LatchedCheckpoint> {
         let session = self
             .state
             .sessions
@@ -1757,31 +2115,56 @@ impl Controller {
             .into_iter()
             .next()
             .context("reconnect plan is empty")?;
-        let mut client = WorkerClient::connect(&reconnect, session_id).await?;
-        let expected_sequence = client
-            .checkpoint(Some("controller archive checkpoint".into()))
-            .await?;
-        let native_session_id = if let Some(native_session_id) = session.native_session_id.clone() {
-            native_session_id
+        let mut relay = if let Some(manager) = manager {
+            let handle = manager
+                .wait_for_session(session_id, Duration::from_secs(5))
+                .await?;
+            ControllerRelayLease::Managed(handle.lease_connection().await?)
         } else {
-            let summary_identity = if client.protocol_version() >= 3 {
-                client
-                    .session_summary(expected_sequence, 1)
-                    .await?
-                    .native_session_id
-            } else {
-                None
-            };
-            match summary_identity {
-                Some(native_session_id) => native_session_id,
-                None => {
-                    let bootstrap = client.bootstrap().await?;
-                    native_session_id_from_events(&bootstrap.events)
-                        .context("harness did not report its native session ID")?
-                }
-            }
+            ControllerRelayLease::Standalone(
+                StandaloneSession::connect_command(&reconnect, session_id).await?,
+            )
         };
-        client.detach().await?;
+        let barrier_command_id = new_command_id("checkpoint")?;
+        let barrier = {
+            let connection = relay.connection_mut();
+            connection
+                .submit(
+                    barrier_command_id.clone(),
+                    RelayCommand::BeginCheckpoint {
+                        reason: Some("controller archive checkpoint".into()),
+                    },
+                )
+                .await?;
+            wait_for_checkpoint_barrier(connection, &barrier_command_id).await?
+        };
+        let cursor = barrier
+            .operational
+            .checkpoint_ready
+            .clone()
+            .context("relay reported a checkpoint barrier without its ready cursor")?;
+        let materialized = barrier.materialized;
+        let expected_ordinal = materialized.applied_event_ordinal;
+        let expected_digest = materialized.applied_event_digest.clone();
+        ensure!(
+            expected_ordinal == barrier.operational.latest_ordinal,
+            "checkpoint projection frontier {expected_ordinal} does not match relay frontier {}",
+            barrier.operational.latest_ordinal
+        );
+        ensure!(
+            expected_digest == barrier.operational.latest_digest,
+            "checkpoint projection digest does not match the relay frontier digest"
+        );
+        ensure!(
+            cursor.ordinal == expected_ordinal && cursor.digest == expected_digest,
+            "checkpoint-ready cursor does not match the latched controller projection"
+        );
+        let canonical_session = canonical_session_from_materialized(&materialized)?;
+        let native_session_id = barrier
+            .operational
+            .native_session_id
+            .or_else(|| session.native_session_id.clone())
+            .context("harness did not report its native session ID")?;
 
         let worker_root = hel_targets::worker_root(&backend, session_id)?;
         let harness_home = target_profile_home(&backend, session_id, profile);
@@ -1799,9 +2182,7 @@ impl Controller {
                     vec![CheckpointRepositorySpec {
                         id: "project".into(),
                         relative_destination: PathBuf::from(destination),
-                        base_commit: "HEAD".into(),
-                        session_delta: false,
-                        capture_contents: false,
+                        capture: CheckpointRepositoryCapture::MetadataOnly,
                         origin_override: None,
                     }],
                 )
@@ -1821,19 +2202,7 @@ impl Controller {
                     .map(|repository| CheckpointRepositorySpec {
                         id: repository.id.clone(),
                         relative_destination: repository.destination.clone(),
-                        // Legacy field: target binaries installed before
-                        // session deltas existed still delta from it.
-                        base_commit: if repository.is_local() {
-                            "refs/hel/base".into()
-                        } else {
-                            repository
-                                .git_ref
-                                .as_deref()
-                                .map(|git_ref| format!("origin/{git_ref}"))
-                                .unwrap_or_else(|| "origin/HEAD".into())
-                        },
-                        session_delta: true,
-                        capture_contents: true,
+                        capture: CheckpointRepositoryCapture::SessionDelta,
                         origin_override: repository
                             .is_local()
                             .then(|| format!("hel-local:{}", repository.id)),
@@ -1863,7 +2232,7 @@ impl Controller {
                 created_at: session.created_at.clone(),
                 checkpointed_at: checkpointed_at.clone(),
                 hel_version: env!("CARGO_PKG_VERSION").into(),
-                worker_version: env!("CARGO_PKG_VERSION").into(),
+                relay_version: env!("CARGO_PKG_VERSION").into(),
                 adapter_version: "acp-v1".into(),
             },
             target: TargetManifest {
@@ -1875,11 +2244,11 @@ impl Controller {
                 id: session.bundle_id.clone(),
                 primary_repository,
             },
-            worker_root: target_path(&worker_root),
+            relay_root: target_path(&worker_root),
             harness_home: target_path(&harness_home),
             workspace_root: target_path(&workspace_root),
             repositories,
-            event_sequence: expected_sequence,
+            canonical_session,
             output_path: target_path(&remote_archive),
         };
         let staging = tempfile::tempdir().context("create checkpoint staging")?;
@@ -1892,38 +2261,82 @@ impl Controller {
         )?;
         let target_checkpoint: crate::hel_checkpoint::TargetCheckpoint =
             serde_json::from_slice(&exported.stdout).context("decode target checkpoint result")?;
-        if target_checkpoint.event_sequence != expected_sequence {
+        if target_checkpoint.event_frontier != expected_ordinal {
             bail!(
-                "target checkpoint event frontier changed: expected {expected_sequence}, found {}",
-                target_checkpoint.event_sequence
+                "target checkpoint event frontier changed: expected {expected_ordinal}, found {}",
+                target_checkpoint.event_frontier
             );
         }
+        if target_checkpoint.event_frontier_digest != expected_digest {
+            bail!("target checkpoint event frontier digest changed");
+        }
 
+        // Checkpoint archives are immutable once controller metadata points at
+        // them. A repeated checkpoint may have the same event frontier, so a
+        // frontier-only name could overwrite the last known-good archive
+        // before the metadata swap commits.
+        let archive_id = new_command_id("archive")?;
         let destination = sessions_dir().join(format!(
-            "{session_id}-{}.hel.zip",
-            target_checkpoint.event_sequence
+            "{session_id}-{}-{archive_id}.hel.zip",
+            target_checkpoint.event_frontier
         ));
         let transfer = CheckpointTransfer {
             locator: &backend,
             session_id,
             remote_archive: &remote_archive,
             destination: &destination,
-            expected_event_sequence: Some(target_checkpoint.event_sequence),
+            expected_event_frontier: Some(target_checkpoint.event_frontier),
+            expected_event_frontier_digest: Some(&target_checkpoint.event_frontier_digest),
         };
         let verified = transfer.execute(executor)?;
-        if verified.sha256() != target_checkpoint.sha256 {
-            bail!("target and controller checkpoint checksums differ");
+        let installed_archive = verified.archive_path().to_path_buf();
+        let validate_transferred = || -> Result<()> {
+            ensure!(
+                verified.sha256() == target_checkpoint.sha256,
+                "target and controller checkpoint checksums differ"
+            );
+            ensure!(
+                verified.event_frontier_digest() == expected_digest,
+                "verified checkpoint event frontier digest changed"
+            );
+            Ok(())
+        };
+        if let Err(error) = validate_transferred() {
+            return Err(remove_uninstalled_checkpoint(&installed_archive, error));
         }
-        transfer.cleanup_plan(&verified)?.execute(executor)?;
+        let revalidated = relay.connection_mut().sync().await.and_then(|snapshot| {
+            validate_checkpoint_barrier_snapshot(&snapshot, &barrier_command_id, &cursor)
+        });
+        if let Err(error) = revalidated {
+            return Err(remove_uninstalled_checkpoint(
+                &installed_archive,
+                error.context("checkpoint barrier changed while transferring its archive"),
+            ));
+        }
+        if let Err(error) = transfer
+            .cleanup_plan(&verified)
+            .and_then(|plan| plan.execute(executor).map(|_| ()))
+        {
+            return Err(remove_uninstalled_checkpoint(
+                &installed_archive,
+                error.context("clean target checkpoint staging"),
+            ));
+        }
         let metadata = CheckpointMetadata {
             archive_path: verified.archive_path().to_path_buf(),
             sha256: verified.sha256().to_string(),
             created_at: checkpointed_at,
-            event_sequence: verified.event_sequence(),
+            event_frontier: verified.event_frontier(),
         };
-        Ok(CheckpointArtifact {
-            metadata,
-            native_session_id,
+        Ok(LatchedCheckpoint {
+            artifact: CheckpointArtifact {
+                metadata,
+                native_session_id,
+                event_frontier_digest: expected_digest,
+            },
+            relay,
+            barrier_command_id,
+            cursor,
         })
     }
 
@@ -1939,36 +2352,202 @@ impl Controller {
         session_id: &str,
         executor: &(impl CommandExecutor + Sync),
     ) -> Result<()> {
-        self.checkpoint_session_controlled(session_id, executor)
-            .await?;
-        let result = async {
-            let spec = self.reconnect_command(session_id)?;
-            let mut client = WorkerClient::connect(&spec, session_id).await?;
-            client.close().await?;
-            client.detach().await?;
-            self.destroy_after_verified_checkpoint(session_id, executor)
-        }
-        .await;
-        if let Err(error) = result {
-            if let Some(record) = self.state.sessions.get_mut(session_id) {
-                record.state = SessionState::Error;
+        self.close_session_controlled_with_manager(session_id, executor, None)
+            .await
+    }
+
+    pub async fn close_session_managed_controlled(
+        &mut self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+        manager: &SessionManagerControl,
+    ) -> Result<()> {
+        self.close_session_controlled_with_manager(session_id, executor, Some(manager))
+            .await
+    }
+
+    async fn close_session_controlled_with_manager(
+        &mut self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+        manager: Option<&SessionManagerControl>,
+    ) -> Result<()> {
+        let previous = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?
+            .clone();
+        let record = self.state.sessions.get_mut(session_id).unwrap();
+        // Persist the close intent before beginning its checkpoint. A process
+        // exit anywhere below must leave enough state for the next controller
+        // to retry the close, even when no checkpoint has been installed yet.
+        apply_close_checkpoint_started(record, now());
+        self.persist_session_transition_or_restore(
+            session_id,
+            &previous,
+            "persist closing state before checkpointing the session",
+        )?;
+
+        let mut latched = match self
+            .checkpoint_session_latched(session_id, executor, manager)
+            .await
+        {
+            Ok(latched) => latched,
+            Err(error) => {
+                let record = self.state.sessions.get_mut(session_id).unwrap();
+                record.state = previous.state;
                 record.updated_at = now();
-                record.last_error = Some(format!(
-                    "pause failed after recovery copy was saved: {error:#}"
-                ));
-                self.persist_session_state(session_id)?;
+                record.last_checkpoint_error = Some(format!("{error:#}"));
+                return Err(
+                    self.persist_failed_checkpoint_state_or_restore(session_id, &previous, error)
+                );
             }
+        };
+
+        let artifact = latched.artifact.clone();
+        let record = self.state.sessions.get_mut(session_id).unwrap();
+        record.state = SessionState::Closing;
+        record.native_session_id = Some(artifact.native_session_id.clone());
+        record.checkpoint = Some(artifact.metadata.clone());
+        record.updated_at = now();
+        record.last_error = None;
+        record.last_checkpoint_error = None;
+        self.persist_checkpoint_transition_or_restore(
+            session_id,
+            &previous,
+            "persist verified checkpoint and closing state before sealing the relay",
+        )?;
+        prune_replaced_checkpoint(previous.checkpoint.as_ref(), &artifact.metadata);
+
+        let close_command_id = new_command_id("close")?;
+        let barrier_command_id = latched.barrier_command_id.clone();
+        if let Err(error) = latched
+            .relay
+            .connection_mut()
+            .submit(
+                close_command_id,
+                RelayCommand::Close {
+                    barrier_command_id: barrier_command_id.clone(),
+                    expected: latched.cursor.clone(),
+                },
+            )
+            .await
+        {
+            self.record_interrupted_close(session_id, &error)?;
+            return Err(error.context("seal verified checkpoint for close"));
+        }
+        if let Err(error) = latched
+            .relay
+            .connection_mut()
+            .submit(
+                new_command_id("checkpoint-complete")?,
+                RelayCommand::CompleteCheckpoint { barrier_command_id },
+            )
+            .await
+        {
+            self.record_interrupted_close(session_id, &error)?;
+            return Err(error.context("release verified close checkpoint"));
+        }
+        if let Err(error) = wait_for_relay_closed(latched.relay.connection_mut()).await {
+            self.record_interrupted_close(session_id, &error)?;
+            return Err(error);
+        }
+        latched.relay.release();
+
+        if let Err(error) =
+            self.destroy_after_verified_checkpoint(session_id, &artifact.metadata, executor)
+        {
+            self.record_interrupted_close(session_id, &error)?;
             return Err(error);
         }
         Ok(())
     }
 
-    /// Execute cleanup only after the close state machine has installed a
-    /// verified checkpoint on the record.
-    pub fn destroy_after_verified_checkpoint(
+    /// Resume the durable closing state after a controller restart. If the
+    /// relay had accepted Close, wait for it and destroy through the exact
+    /// installed checkpoint gate. If it had not, take a fresh checkpoint;
+    /// the previously installed archive may have become stale after EOF
+    /// released its barrier.
+    pub async fn recover_interrupted_close_managed(
         &mut self,
         session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+        manager: &SessionManagerControl,
+    ) -> Result<()> {
+        let (state, verified) = {
+            let session = self
+                .state
+                .sessions
+                .get(session_id)
+                .with_context(|| format!("unknown session {session_id}"))?;
+            ensure!(
+                matches!(
+                    session.state,
+                    SessionState::Closing | SessionState::Destroying
+                ),
+                "session {session_id} has no interrupted close to recover"
+            );
+            (session.state, session.checkpoint.clone())
+        };
+        if state == SessionState::Destroying {
+            let verified = verified.context("destroying session has no verified checkpoint")?;
+            return self.destroy_after_verified_checkpoint(session_id, &verified, executor);
+        }
+        ensure!(
+            state == SessionState::Closing,
+            "session {session_id} has no relay close to recover"
+        );
+        let handle = manager
+            .wait_for_session(session_id, Duration::from_secs(5))
+            .await?;
+        let mut lease = handle.lease_connection().await?;
+        let execution = lease.connection_mut().sync().await?.operational.execution;
+        match execution {
+            RelayExecutionState::Closed => {}
+            RelayExecutionState::Closing => {
+                wait_for_relay_closed(lease.connection_mut()).await?;
+            }
+            RelayExecutionState::Idle | RelayExecutionState::Running => {
+                lease.release();
+                return self
+                    .close_session_controlled_with_manager(session_id, executor, Some(manager))
+                    .await;
+            }
+        }
+        lease.release();
+        let verified = verified.context("closed relay has no verified checkpoint")?;
+        self.destroy_after_verified_checkpoint(session_id, &verified, executor)
+    }
+
+    fn record_interrupted_close(&mut self, session_id: &str, error: &anyhow::Error) -> Result<()> {
+        let record = self.state.sessions.get_mut(session_id).unwrap();
+        apply_interrupted_close_error(record, error, &now());
+        self.persist_session_state(session_id)
+    }
+
+    /// Execute cleanup only after the close state machine has installed a
+    /// verified checkpoint on the record.
+    fn destroy_after_verified_checkpoint(
+        &mut self,
+        session_id: &str,
+        verified: &CheckpointMetadata,
         executor: &impl CommandExecutor,
+    ) -> Result<()> {
+        self.destroy_after_verified_checkpoint_with(
+            session_id,
+            verified,
+            executor,
+            crate::hel_database::save_lifecycle_session,
+        )
+    }
+
+    fn destroy_after_verified_checkpoint_with(
+        &mut self,
+        session_id: &str,
+        verified: &CheckpointMetadata,
+        executor: &impl CommandExecutor,
+        persist: impl Fn(&SessionRecord) -> Result<()>,
     ) -> Result<()> {
         let session = self
             .state
@@ -1976,18 +2555,67 @@ impl Controller {
             .get(session_id)
             .with_context(|| format!("unknown session {session_id}"))?
             .clone();
-        if session.checkpoint.is_none() {
-            bail!("refusing to destroy session {session_id}: no verified checkpoint");
+        ensure!(
+            matches!(
+                session.state,
+                SessionState::Closing | SessionState::Destroying
+            ),
+            "refusing to destroy session {session_id}: it is not closing or destroying"
+        );
+        ensure!(
+            session.checkpoint.as_ref() == Some(verified),
+            "refusing to destroy session {session_id}: verified checkpoint gate is stale"
+        );
+        if session.state == SessionState::Closing {
+            let record = self.state.sessions.get_mut(session_id).unwrap();
+            record.state = SessionState::Destroying;
+            record.updated_at = now();
+            record.last_error = None;
+            persist_session_record_transition_or_restore(
+                &mut self.state,
+                session_id,
+                &session,
+                "persist destroying state before target cleanup",
+                &persist,
+            )?;
         }
-        let locator = session.target.as_ref().context("session has no target")?;
-        let backend = backend_locator(locator, &session, &self.config)?;
-        hel_targets::close_plan(&backend, session_id)?.execute(executor)?;
+
+        let destroying = self
+            .state
+            .sessions
+            .get(session_id)
+            .expect("destroying session disappeared")
+            .clone();
+        verify_installed_checkpoint_gate(session_id, verified)?;
+        let locator = destroying
+            .target
+            .as_ref()
+            .context("session has no target")?;
+        let backend = backend_locator(locator, &destroying, &self.config)?;
+        if let Err(cleanup_error) = hel_targets::close_plan(&backend, session_id)?.execute(executor)
+        {
+            match hel_targets::cleanup_target_is_confirmed_absent(&backend, session_id, executor) {
+                Ok(true) => {}
+                Ok(false) => return Err(cleanup_error),
+                Err(probe_error) => {
+                    return Err(cleanup_error.context(format!(
+                        "target cleanup failed and exact absence could not be confirmed: {probe_error:#}"
+                    )));
+                }
+            }
+        }
         let record = self.state.sessions.get_mut(session_id).unwrap();
         record.state = SessionState::Archived;
         record.target = None;
         record.updated_at = now();
         record.last_error = None;
-        self.persist_session_state(session_id)
+        persist_session_record_transition_or_restore(
+            &mut self.state,
+            session_id,
+            &destroying,
+            "persist archived state after target cleanup",
+            &persist,
+        )
     }
 
     pub fn force_destroy(
@@ -2201,48 +2829,150 @@ fn preflight_target(template: &TargetTemplate, executor: &impl CommandExecutor) 
     }
 }
 
-fn native_session_id_from_events(events: &[crate::hel_worker::SequencedEvent]) -> Option<String> {
-    crate::hel_worker::recover_native_session_id(events)
-}
-
-fn canonical_latest_sequence(bytes: &[u8]) -> Result<u64> {
-    let mut latest = 0;
-    for line in bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        let event: crate::hel_worker::SequencedEvent = serde_json::from_slice(line)?;
-        latest = latest.max(event.seq);
+fn canonical_handoff_text(snapshot: &CanonicalSessionSnapshot, maximum_bytes: usize) -> String {
+    const PREFIX: &str = "Continue this coding session from the portable transcript below. Preserve the user's intent and the work already completed.\n\n";
+    let mut transcript = String::new();
+    for item in &snapshot.transcript {
+        let (label, body) = match &item.body {
+            CanonicalTranscriptBody::User { content } => {
+                ("User", crate::hel_chat::materialized_content_text(content))
+            }
+            CanonicalTranscriptBody::Agent { chunks, .. } => {
+                ("Agent", crate::hel_chat::materialized_chunks_text(chunks))
+            }
+            CanonicalTranscriptBody::Thought { chunks, .. } => (
+                "Agent reasoning",
+                crate::hel_chat::materialized_chunks_text(chunks),
+            ),
+            CanonicalTranscriptBody::Tool { call } => (
+                "Tool",
+                serde_json::from_value::<ToolCall>(call.clone())
+                    .map(|call| format!("{} [{:?}]", call.title, call.status))
+                    .unwrap_or_else(|_| "[invalid tool call]".into()),
+            ),
+            CanonicalTranscriptBody::Plan { plan } => (
+                "Plan",
+                serde_json::from_value::<Plan>(plan.clone())
+                    .map(|plan| plan.entries)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|entry| {
+                        format!(
+                            "- [{}] {}",
+                            format!("{:?}", entry.status).to_ascii_lowercase(),
+                            entry.content
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            CanonicalTranscriptBody::System { text } => ("System", text.clone()),
+        };
+        if !body.trim().is_empty() {
+            transcript.push_str(label);
+            transcript.push_str(":\n");
+            transcript.push_str(&body);
+            transcript.push_str("\n\n");
+        }
     }
-    Ok(latest)
+    let available = maximum_bytes.saturating_sub(PREFIX.len());
+    if transcript.len() > available {
+        let mut start = transcript.len() - available;
+        while !transcript.is_char_boundary(start) {
+            start += 1;
+        }
+        transcript.drain(..start);
+    }
+    format!("{PREFIX}{transcript}")
 }
 
-async fn wait_for_session_started(
-    client: &mut WorkerClient,
-    mut cursor: u64,
-) -> Result<(String, bool)> {
+async fn wait_for_native_session(relay: &mut StandaloneSession) -> Result<String> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let events = client.replay_after(cursor).await?;
-        for event in events {
-            cursor = cursor.max(event.seq);
-            let WorkerEvent::Adapter { payload, .. } = event.event else {
-                continue;
-            };
-            match serde_json::from_value::<crate::hel_acp::RuntimeEvent>(payload) {
-                Ok(crate::hel_acp::RuntimeEvent::SessionStarted {
-                    native_session_id,
-                    resumed,
-                    ..
-                }) => return Ok((native_session_id, resumed)),
-                Ok(crate::hel_acp::RuntimeEvent::Stopped) => {
-                    bail!("ACP runtime stopped before starting its session")
-                }
-                _ => {}
-            }
+        let snapshot = relay.sync().await?;
+        if let Some(native_session_id) = snapshot.operational.native_session_id {
+            return Ok(native_session_id);
+        }
+        if snapshot.operational.execution == RelayExecutionState::Closed {
+            bail!("ACP runtime stopped before starting its session");
         }
         if tokio::time::Instant::now() >= deadline {
             bail!("ACP runtime did not report session startup");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_checkpoint_barrier(
+    relay: &mut StandaloneSession,
+    command_id: &str,
+) -> Result<ManagedSessionSnapshot> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let snapshot = relay.sync().await?;
+        if checkpoint_barrier_is_ready(&snapshot, command_id) {
+            return Ok(snapshot);
+        }
+        if snapshot.operational.execution == RelayExecutionState::Closed {
+            bail!("ACP runtime stopped before reaching the checkpoint barrier");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("ACP relay did not reach checkpoint barrier {command_id}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+fn checkpoint_barrier_is_ready(snapshot: &ManagedSessionSnapshot, command_id: &str) -> bool {
+    snapshot.operational.checkpoint_barrier.as_deref() == Some(command_id)
+        && snapshot.operational.checkpoint_ready.is_some()
+}
+
+fn validate_checkpoint_barrier_snapshot(
+    snapshot: &ManagedSessionSnapshot,
+    command_id: &str,
+    expected: &RelayCursor,
+) -> Result<()> {
+    ensure!(
+        snapshot.operational.checkpoint_barrier.as_deref() == Some(command_id),
+        "checkpoint barrier {command_id} is no longer active"
+    );
+    ensure!(
+        snapshot.operational.checkpoint_ready.as_ref() == Some(expected),
+        "checkpoint barrier {command_id} has a different ready cursor"
+    );
+    ensure!(
+        snapshot.operational.latest_ordinal == expected.ordinal
+            && snapshot.operational.latest_digest == expected.digest,
+        "checkpoint barrier {command_id} no longer seals the expected relay frontier"
+    );
+    ensure!(
+        snapshot.materialized.applied_event_ordinal == expected.ordinal
+            && snapshot.materialized.applied_event_digest == expected.digest,
+        "controller projection does not match checkpoint barrier {command_id}"
+    );
+    Ok(())
+}
+
+fn remove_uninstalled_checkpoint(path: &Path, error: anyhow::Error) -> anyhow::Error {
+    match std::fs::remove_file(path) {
+        Ok(()) => error,
+        Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => error,
+        Err(remove_error) => error.context(format!(
+            "also failed to remove uninstalled checkpoint {}: {remove_error}",
+            path.display()
+        )),
+    }
+}
+
+async fn wait_for_relay_closed(relay: &mut StandaloneSession) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if relay.sync().await?.operational.execution == RelayExecutionState::Closed {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("ACP runtime did not close within 30 seconds");
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -3626,7 +4356,7 @@ fn bootstrap_local_repositories(
                 created_at: session.created_at.clone(),
                 checkpointed_at: now(),
                 hel_version: env!("CARGO_PKG_VERSION").into(),
-                worker_version: env!("CARGO_PKG_VERSION").into(),
+                relay_version: env!("CARGO_PKG_VERSION").into(),
                 adapter_version: "acp-v1".into(),
             },
             target: TargetManifest {
@@ -3638,7 +4368,9 @@ fn bootstrap_local_repositories(
                 id: session.bundle_id.clone(),
                 primary_repository: bundle.primary_repo.clone(),
             },
-            canonical_events: Vec::new(),
+            canonical_session: canonical_session_from_materialized(
+                &crate::hel_state::MaterializedSession::empty(session.id.clone()),
+            )?,
             native_artifacts: Vec::new(),
             repositories: snapshots,
         },
@@ -3775,7 +4507,7 @@ fn execute_checked(executor: &impl CommandExecutor, command: CommandSpec) -> Res
 fn execute_checked_with_stdin(
     executor: &impl CommandExecutor,
     command: &CommandSpec,
-    input: &mut dyn std::io::Read,
+    input: &mut (dyn std::io::Read + Send),
 ) -> Result<CommandOutput> {
     let output = executor.execute_with_stdin(command, input)?;
     if output.status != 0 {
@@ -4516,61 +5248,137 @@ fn worker_last_words(
     (!text.is_empty()).then(|| format!("worker diagnostics:\n{text}"))
 }
 
-async fn handshake_worker(command: &CommandSpec) -> Result<Option<String>> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    for _ in 0..40 {
-        let mut child = tokio::process::Command::new(&command.program)
-            .args(&command.args)
-            .envs(&command.env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn();
-        if let Ok(ref mut child) = child {
-            let request = RequestEnvelope {
-                request_id: "controller-hello".into(),
-                protocol_version: PROTOCOL_VERSION,
-                request: WorkerRequest::Hello {
-                    client_version: env!("CARGO_PKG_VERSION").into(),
-                    supported: VersionRange::CURRENT,
-                },
-            };
-            let mut stdin = child.stdin.take().context("worker proxy stdin missing")?;
-            let stdout = child.stdout.take().context("worker proxy stdout missing")?;
-            let mut encoded = serde_json::to_vec(&request)?;
-            encoded.push(b'\n');
-            if stdin.write_all(&encoded).await.is_ok() {
-                let mut line = String::new();
-                let read = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    tokio::io::BufReader::new(stdout).read_line(&mut line),
-                )
-                .await;
-                if matches!(read, Ok(Ok(value)) if value > 0) {
-                    let response: crate::hel_worker::ResponseEnvelope =
-                        serde_json::from_str(&line)?;
-                    let _ = child.kill().await;
-                    return match response.body {
-                        ResponseBody::Ok {
-                            payload: ResponsePayload::Hello { .. },
-                        } => Ok(None),
-                        ResponseBody::Error { error } => {
-                            bail!("worker handshake rejected: {}", error.message)
-                        }
-                        _ => bail!("worker handshake returned an unexpected response"),
-                    };
-                }
-            }
-            let _ = child.kill().await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-    bail!("target worker did not become reachable")
-}
-
 fn now() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn apply_close_checkpoint_started(record: &mut SessionRecord, updated_at: String) {
+    record.state = SessionState::Closing;
+    record.updated_at = updated_at;
+    record.last_checkpoint_error = None;
+}
+
+fn verify_installed_checkpoint_gate(
+    session_id: &str,
+    checkpoint: &CheckpointMetadata,
+) -> Result<()> {
+    let archive = verify_archive_streaming(&checkpoint.archive_path).with_context(|| {
+        format!(
+            "re-open installed checkpoint {} before target cleanup",
+            checkpoint.archive_path.display()
+        )
+    })?;
+    ensure!(
+        archive.archive_sha256 == checkpoint.sha256,
+        "refusing target cleanup for session {session_id}: installed checkpoint SHA changed"
+    );
+    ensure!(
+        archive.manifest.session.id == session_id,
+        "refusing target cleanup for session {session_id}: installed checkpoint belongs to session {}",
+        archive.manifest.session.id
+    );
+    let canonical = archive.canonical_session;
+    ensure!(
+        canonical.event_frontier == checkpoint.event_frontier,
+        "refusing target cleanup for session {session_id}: installed checkpoint frontier changed from {} to {}",
+        checkpoint.event_frontier,
+        canonical.event_frontier
+    );
+    Ok(())
+}
+
+fn verify_checkpoint_artifact(session_id: &str, artifact: &CheckpointArtifact) -> Result<()> {
+    let archive = verify_archive_streaming(&artifact.metadata.archive_path).with_context(|| {
+        format!(
+            "re-open completed checkpoint {}",
+            artifact.metadata.archive_path.display()
+        )
+    })?;
+    ensure!(
+        archive.archive_sha256 == artifact.metadata.sha256,
+        "completed checkpoint SHA changed before persistence"
+    );
+    ensure!(
+        archive.manifest.session.id == session_id,
+        "completed checkpoint belongs to session {} instead of {session_id}",
+        archive.manifest.session.id
+    );
+    let canonical = archive.canonical_session;
+    ensure!(
+        canonical.event_frontier == artifact.metadata.event_frontier,
+        "completed checkpoint frontier changed from {} to {}",
+        artifact.metadata.event_frontier,
+        canonical.event_frontier
+    );
+    ensure!(
+        canonical.event_frontier_digest == artifact.event_frontier_digest,
+        "completed checkpoint frontier digest changed before persistence"
+    );
+    Ok(())
+}
+
+fn apply_interrupted_close_error(
+    record: &mut SessionRecord,
+    error: &anyhow::Error,
+    updated_at: &str,
+) {
+    let destroying = record.state == SessionState::Destroying;
+    if !destroying {
+        record.state = SessionState::Closing;
+    }
+    record.updated_at = updated_at.to_owned();
+    record.last_error = Some(if destroying {
+        format!("target cleanup is safely retryable from its verified checkpoint: {error:#}")
+    } else {
+        format!("close is safely resumable from its verified checkpoint: {error:#}")
+    });
+}
+
+fn restore_session_after_persistence_failure(
+    state: &mut HelState,
+    session_id: &str,
+    previous: &SessionRecord,
+    primary: anyhow::Error,
+    persist: impl FnOnce(&SessionRecord) -> Result<()>,
+) -> anyhow::Error {
+    state
+        .sessions
+        .insert(session_id.to_owned(), previous.clone());
+    let restored = state
+        .sessions
+        .get(session_id)
+        .expect("restored session record disappeared");
+    match persist(restored) {
+        Ok(()) => primary,
+        Err(error) => primary.context(format!(
+            "restored prior session state in memory, but failed to persist the rollback: {error:#}"
+        )),
+    }
+}
+
+fn persist_session_record_transition_or_restore(
+    state: &mut HelState,
+    session_id: &str,
+    previous: &SessionRecord,
+    context: &'static str,
+    persist: &impl Fn(&SessionRecord) -> Result<()>,
+) -> Result<()> {
+    let result = persist(
+        state
+            .sessions
+            .get(session_id)
+            .expect("checkpoint session disappeared before persistence"),
+    );
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => Err(restore_session_after_persistence_failure(
+            state,
+            session_id,
+            previous,
+            error.context(context),
+            persist,
+        )),
+    }
 }
 
 fn prune_replaced_checkpoint(previous: Option<&CheckpointMetadata>, current: &CheckpointMetadata) {
@@ -4593,6 +5401,240 @@ mod tests {
 
     use super::*;
     use crate::hel_config::{ContainerTemplate as ConfigContainer, ProjectRepository};
+
+    fn checkpoint_test_session(session_id: &str) -> SessionRecord {
+        SessionRecord {
+            id: session_id.into(),
+            title: "checkpoint transition".into(),
+            harness_kind: crate::hel_config::HarnessKind::Codex,
+            last_profile: "codex".into(),
+            bundle_id: "project".into(),
+            project_directory: None,
+            target_template_id: "podman".into(),
+            resource_allocation: None,
+            additional_mounts: Vec::new(),
+            state: SessionState::Running,
+            target: None,
+            native_session_id: Some("native-session".into()),
+            acp_session_title: None,
+            session_title_override: None,
+            created_at: "2026-08-12T00:00:00Z".into(),
+            updated_at: "2026-08-12T00:00:00Z".into(),
+            detached_after_event_ordinal: 0,
+            last_error: None,
+            last_checkpoint_error: None,
+            checkpoint: None,
+        }
+    }
+
+    #[test]
+    fn startup_reconciliation_only_removes_unreferenced_controller_checkpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = "1123456789abcdef0123456789abcdef";
+        let referenced_name =
+            format!("{session_id}-7-archive-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.hel.zip");
+        let orphan_name =
+            format!("{session_id}-8-archive-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.hel.zip");
+        let imported_name = format!("{session_id}.hel.zip");
+        for name in [
+            &referenced_name,
+            &orphan_name,
+            &imported_name,
+            "notes.hel.zip",
+        ] {
+            std::fs::write(directory.path().join(name), b"test").unwrap();
+        }
+        let mut state = HelState::default();
+        let mut session = checkpoint_test_session(session_id);
+        session.checkpoint = Some(CheckpointMetadata {
+            archive_path: directory.path().join(&referenced_name),
+            sha256: "c".repeat(64),
+            created_at: "2026-08-12T00:00:00Z".into(),
+            event_frontier: 7,
+        });
+        state.sessions.insert(session_id.into(), session);
+
+        assert_eq!(
+            reconcile_managed_checkpoint_archives_in(directory.path(), &state).unwrap(),
+            1
+        );
+        assert!(directory.path().join(referenced_name).exists());
+        assert!(!directory.path().join(orphan_name).exists());
+        assert!(directory.path().join(imported_name).exists());
+        assert!(directory.path().join("notes.hel.zip").exists());
+    }
+
+    fn write_checkpoint_gate_archive(
+        directory: &Path,
+        session_id: &str,
+        event_frontier: u64,
+    ) -> CheckpointMetadata {
+        let archive_path = directory.join(format!("{session_id}.hel.zip"));
+        let verified = write_archive_atomic(
+            &archive_path,
+            &ArchiveInput {
+                session: SessionManifest {
+                    id: session_id.into(),
+                    title: "checkpoint gate".into(),
+                    harness_kind: crate::hel_config::HarnessKind::Codex,
+                    profile_id: "codex".into(),
+                    native_session_id: "native-session".into(),
+                    created_at: "2026-08-12T00:00:00Z".into(),
+                    checkpointed_at: "2026-08-14T12:00:00Z".into(),
+                    hel_version: "test".into(),
+                    relay_version: "test".into(),
+                    adapter_version: "test".into(),
+                },
+                target: TargetManifest {
+                    template_id: "local".into(),
+                    target_kind: "local-bare".into(),
+                    details: BTreeMap::new(),
+                },
+                bundle: BundleManifest {
+                    id: "project".into(),
+                    primary_repository: "project".into(),
+                },
+                canonical_session: crate::hel_archive::CanonicalSessionSnapshot {
+                    event_frontier,
+                    event_frontier_digest: if event_frontier == 0 {
+                        crate::hel_archive::EVENT_FRONTIER_GENESIS_DIGEST.into()
+                    } else {
+                        "a".repeat(64)
+                    },
+                    session: crate::hel_archive::CanonicalSessionState {
+                        execution: crate::hel_archive::CanonicalExecutionState::Idle,
+                        last_activity_at_ms: (event_frontier > 0).then_some(1_234),
+                        session_title: None,
+                        configuration: BTreeMap::new(),
+                    },
+                    transcript: Vec::new(),
+                    queued_prompts: Vec::new(),
+                },
+                native_artifacts: Vec::new(),
+                repositories: Vec::new(),
+            },
+        )
+        .unwrap();
+        CheckpointMetadata {
+            archive_path,
+            sha256: verified.archive_sha256,
+            created_at: "2026-08-14T12:00:00Z".into(),
+            event_frontier,
+        }
+    }
+
+    #[test]
+    fn recovery_artifact_final_verification_checks_the_latched_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = "1123456789abcdef0123456789abcdef";
+        let metadata = write_checkpoint_gate_archive(directory.path(), session_id, 7);
+        let mut artifact = CheckpointArtifact {
+            metadata,
+            native_session_id: "native-session".into(),
+            event_frontier_digest: "a".repeat(64),
+        };
+
+        verify_checkpoint_artifact(session_id, &artifact).unwrap();
+        artifact.event_frontier_digest = "b".repeat(64);
+        assert!(
+            verify_checkpoint_artifact(session_id, &artifact)
+                .unwrap_err()
+                .to_string()
+                .contains("frontier digest changed")
+        );
+    }
+
+    #[test]
+    fn checkpoint_barrier_is_not_reached_until_its_ready_cursor_is_projected() {
+        let cursor = RelayCursor {
+            ordinal: 7,
+            digest: "a".repeat(64),
+        };
+        let mut materialized = MaterializedSession::empty("session-1");
+        materialized.applied_event_ordinal = cursor.ordinal;
+        materialized.applied_event_digest = cursor.digest.clone();
+        let mut snapshot = ManagedSessionSnapshot {
+            materialized,
+            operational: crate::hel_worker::RelayOperationalState {
+                session_id: "session-1".into(),
+                execution: RelayExecutionState::Idle,
+                latest_ordinal: cursor.ordinal,
+                latest_digest: cursor.digest.clone(),
+                acknowledged_through: cursor.ordinal,
+                acknowledged_digest: cursor.digest.clone(),
+                recovery_floor_ordinal: 0,
+                recovery_floor_digest: crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST.into(),
+                native_session_id: Some("native-session".into()),
+                agent_capabilities: None,
+                agent_info: None,
+                config_options: Vec::new(),
+                available_commands: Vec::new(),
+                config: BTreeMap::new(),
+                active_prompt: None,
+                queued_prompts: Vec::new(),
+                checkpoint_barrier: Some("checkpoint-1".into()),
+                checkpoint_ready: None,
+            },
+        };
+
+        assert!(!checkpoint_barrier_is_ready(&snapshot, "checkpoint-1"));
+        snapshot.operational.checkpoint_ready = Some(cursor.clone());
+        assert!(checkpoint_barrier_is_ready(&snapshot, "checkpoint-1"));
+        validate_checkpoint_barrier_snapshot(&snapshot, "checkpoint-1", &cursor).unwrap();
+
+        snapshot.operational.latest_ordinal += 1;
+        assert!(validate_checkpoint_barrier_snapshot(&snapshot, "checkpoint-1", &cursor).is_err());
+    }
+
+    #[test]
+    fn controller_store_lock_excludes_a_second_process_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = ControllerStoreGuard::acquire_at(directory.path()).unwrap();
+        run_controller_lock_probe(directory.path(), true);
+        drop(first);
+        run_controller_lock_probe(directory.path(), false);
+    }
+
+    fn run_controller_lock_probe(directory: &Path, expect_locked: bool) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "hel_controller::tests::controller_store_lock_subprocess_probe",
+                "--nocapture",
+            ])
+            .env("HEL_CONTROLLER_LOCK_PROBE", directory)
+            .env(
+                "HEL_CONTROLLER_LOCK_EXPECTED",
+                if expect_locked { "locked" } else { "available" },
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "controller lock subprocess failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn controller_store_lock_subprocess_probe() {
+        let Some(directory) = std::env::var_os("HEL_CONTROLLER_LOCK_PROBE") else {
+            return;
+        };
+        let expected = std::env::var("HEL_CONTROLLER_LOCK_EXPECTED").unwrap();
+        let acquired = ControllerStoreGuard::acquire_at(Path::new(&directory));
+        match expected.as_str() {
+            "locked" => {
+                let error = acquired.expect_err("a second process acquired the controller store");
+                assert!(error.to_string().contains("another Hel controller"));
+            }
+            "available" => {
+                acquired.expect("released controller store stayed locked");
+            }
+            value => panic!("unexpected lock probe expectation {value:?}"),
+        }
+    }
 
     #[test]
     fn local_mount_source_must_be_an_existing_directory() {
@@ -4729,7 +5771,7 @@ mod tests {
             session_title_override: None,
             created_at: "2026-08-12T00:00:00Z".into(),
             updated_at: "2026-08-12T00:00:00Z".into(),
-            last_viewed_event_sequence: 0,
+            detached_after_event_ordinal: 0,
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: None,
@@ -4745,6 +5787,314 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!state.sessions.contains_key(session_id));
+    }
+
+    #[test]
+    fn checkpoint_persistence_rollback_restores_memory_and_reports_both_failures() {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let previous = checkpoint_test_session(session_id);
+        let mut changed = previous.clone();
+        changed.state = SessionState::Closing;
+        changed.last_checkpoint_error = Some("partially installed checkpoint".into());
+        let mut state = HelState::default();
+        state.sessions.insert(session_id.into(), changed);
+
+        let error = restore_session_after_persistence_failure(
+            &mut state,
+            session_id,
+            &previous,
+            anyhow::anyhow!("verified checkpoint persistence failed"),
+            |record| {
+                assert_eq!(record, &previous);
+                Err(anyhow::anyhow!("rollback database write failed"))
+            },
+        );
+
+        assert_eq!(state.sessions.get(session_id), Some(&previous));
+        let detail = format!("{error:#}");
+        assert!(detail.contains("verified checkpoint persistence failed"));
+        assert!(detail.contains("rollback database write failed"));
+    }
+
+    #[test]
+    fn starting_close_persists_its_intent_before_checkpointing() {
+        let mut session = checkpoint_test_session("0123456789abcdef0123456789abcdef");
+        session.state = SessionState::Running;
+        session.last_checkpoint_error = Some("old failure".into());
+
+        apply_close_checkpoint_started(&mut session, "2026-08-14T12:00:00Z".into());
+
+        assert_eq!(session.state, SessionState::Closing);
+        assert_eq!(session.updated_at, "2026-08-14T12:00:00Z");
+        assert!(session.last_checkpoint_error.is_none());
+    }
+
+    #[test]
+    fn target_cleanup_persists_destroying_and_rechecks_the_installed_archive() {
+        struct RecordingExecutor {
+            commands: RefCell<Vec<CommandSpec>>,
+        }
+
+        impl CommandExecutor for RecordingExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.commands.borrow_mut().push(command.clone());
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let checkpoint = write_checkpoint_gate_archive(directory.path(), session_id, 7);
+        let mut session = checkpoint_test_session(session_id);
+        session.target_template_id = "local".into();
+        session.state = SessionState::Closing;
+        session.target = Some(TargetLocator::LocalBare {
+            worker_root: directory.path().join(session_id),
+        });
+        session.checkpoint = Some(checkpoint.clone());
+        let mut config = HelConfig::default();
+        config
+            .targets
+            .insert("local".into(), TargetTemplate::LocalBare);
+        let mut controller = Controller {
+            config,
+            state: HelState {
+                sessions: BTreeMap::from([(session_id.into(), session)]),
+                ..HelState::default()
+            },
+        };
+        let executor = RecordingExecutor {
+            commands: RefCell::new(Vec::new()),
+        };
+        let persisted = RefCell::new(Vec::new());
+
+        controller
+            .destroy_after_verified_checkpoint_with(session_id, &checkpoint, &executor, |record| {
+                persisted.borrow_mut().push(record.state);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            persisted.into_inner(),
+            vec![SessionState::Destroying, SessionState::Archived]
+        );
+        assert_eq!(executor.commands.borrow().len(), 1);
+        let archived = &controller.state.sessions[session_id];
+        assert_eq!(archived.state, SessionState::Archived);
+        assert!(archived.target.is_none());
+    }
+
+    #[test]
+    fn destroying_retry_blocks_cleanup_when_the_archive_gate_changed() {
+        struct RecordingExecutor {
+            calls: RefCell<usize>,
+        }
+
+        impl CommandExecutor for RecordingExecutor {
+            fn execute(&self, _command: &CommandSpec) -> Result<CommandOutput> {
+                *self.calls.borrow_mut() += 1;
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let mut checkpoint = write_checkpoint_gate_archive(directory.path(), session_id, 7);
+        checkpoint.event_frontier = 8;
+        let mut session = checkpoint_test_session(session_id);
+        session.target_template_id = "local".into();
+        session.state = SessionState::Destroying;
+        session.target = Some(TargetLocator::LocalBare {
+            worker_root: directory.path().join(session_id),
+        });
+        session.checkpoint = Some(checkpoint.clone());
+        let mut config = HelConfig::default();
+        config
+            .targets
+            .insert("local".into(), TargetTemplate::LocalBare);
+        let mut controller = Controller {
+            config,
+            state: HelState {
+                sessions: BTreeMap::from([(session_id.into(), session)]),
+                ..HelState::default()
+            },
+        };
+        let executor = RecordingExecutor {
+            calls: RefCell::new(0),
+        };
+        let persisted = RefCell::new(Vec::new());
+
+        let error = controller
+            .destroy_after_verified_checkpoint_with(session_id, &checkpoint, &executor, |record| {
+                persisted.borrow_mut().push(record.state);
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("checkpoint frontier changed"));
+        assert_eq!(*executor.calls.borrow(), 0);
+        assert!(persisted.into_inner().is_empty());
+        assert_eq!(
+            controller.state.sessions[session_id].state,
+            SessionState::Destroying
+        );
+    }
+
+    #[test]
+    fn destroying_retry_finalizes_when_apple_container_is_confirmed_absent() {
+        struct AlreadyRemovedExecutor {
+            commands: RefCell<Vec<CommandSpec>>,
+        }
+
+        impl CommandExecutor for AlreadyRemovedExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.commands.borrow_mut().push(command.clone());
+                if command
+                    .args
+                    .first()
+                    .is_some_and(|argument| argument == "rm")
+                {
+                    Ok(CommandOutput {
+                        status: 1,
+                        stdout: Vec::new(),
+                        stderr: b"container not found".to_vec(),
+                    })
+                } else {
+                    Ok(CommandOutput {
+                        status: 0,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    })
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let checkpoint = write_checkpoint_gate_archive(directory.path(), session_id, 7);
+        let mut session = checkpoint_test_session(session_id);
+        session.target_template_id = "apple".into();
+        session.state = SessionState::Destroying;
+        session.target = Some(TargetLocator::AppleContainer {
+            container_id: hel_targets::resource_name(session_id).unwrap(),
+        });
+        session.checkpoint = Some(checkpoint.clone());
+        let mut config = HelConfig::default();
+        config.targets.insert(
+            "apple".into(),
+            TargetTemplate::AppleContainer {
+                container: ConfigContainer {
+                    image: "test:latest".into(),
+                    platform: None,
+                    cpus: None,
+                    memory: None,
+                    environment: BTreeMap::new(),
+                },
+            },
+        );
+        let mut controller = Controller {
+            config,
+            state: HelState {
+                sessions: BTreeMap::from([(session_id.into(), session)]),
+                ..HelState::default()
+            },
+        };
+        let executor = AlreadyRemovedExecutor {
+            commands: RefCell::new(Vec::new()),
+        };
+        let persisted = RefCell::new(Vec::new());
+
+        controller
+            .destroy_after_verified_checkpoint_with(session_id, &checkpoint, &executor, |record| {
+                persisted.borrow_mut().push(record.state);
+                Ok(())
+            })
+            .unwrap();
+
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].args[0], "rm");
+        assert_eq!(commands[1].args, ["list", "--all", "--quiet"]);
+        assert_eq!(persisted.into_inner(), vec![SessionState::Archived]);
+        assert_eq!(
+            controller.state.sessions[session_id].state,
+            SessionState::Archived
+        );
+    }
+
+    #[test]
+    fn installed_checkpoint_gate_reopens_and_checks_sha_session_and_frontier() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let checkpoint = write_checkpoint_gate_archive(directory.path(), session_id, 7);
+        verify_installed_checkpoint_gate(session_id, &checkpoint).unwrap();
+
+        let mut wrong_sha = checkpoint.clone();
+        wrong_sha.sha256 = "b".repeat(64);
+        assert!(
+            verify_installed_checkpoint_gate(session_id, &wrong_sha)
+                .unwrap_err()
+                .to_string()
+                .contains("SHA changed")
+        );
+        assert!(
+            verify_installed_checkpoint_gate("1123456789abcdef0123456789abcdef", &checkpoint)
+                .unwrap_err()
+                .to_string()
+                .contains("belongs to session")
+        );
+        let mut wrong_frontier = checkpoint.clone();
+        wrong_frontier.event_frontier += 1;
+        assert!(
+            verify_installed_checkpoint_gate(session_id, &wrong_frontier)
+                .unwrap_err()
+                .to_string()
+                .contains("frontier changed")
+        );
+
+        std::fs::write(
+            &checkpoint.archive_path,
+            b"changed after first verification",
+        )
+        .unwrap();
+        assert!(
+            format!(
+                "{:#}",
+                verify_installed_checkpoint_gate(session_id, &checkpoint).unwrap_err()
+            )
+            .contains("re-open installed checkpoint")
+        );
+    }
+
+    #[test]
+    fn interrupted_close_error_preserves_destroying_phase() {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let mut session = checkpoint_test_session(session_id);
+        session.state = SessionState::Destroying;
+
+        apply_interrupted_close_error(
+            &mut session,
+            &anyhow::anyhow!("podman unavailable"),
+            "2026-08-14T12:00:00Z",
+        );
+
+        assert_eq!(session.state, SessionState::Destroying);
+        assert_eq!(session.updated_at, "2026-08-14T12:00:00Z");
+        assert!(
+            session
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("cleanup is safely retryable"))
+        );
     }
 
     #[test]
@@ -4771,7 +6121,7 @@ mod tests {
             session_title_override: None,
             created_at: "2026-08-12T00:00:00Z".into(),
             updated_at: "2026-08-12T00:00:00Z".into(),
-            last_viewed_event_sequence: 0,
+            detached_after_event_ordinal: 0,
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: None,
@@ -4852,7 +6202,7 @@ mod tests {
             session_title_override: None,
             created_at: "2026-08-12T00:00:00Z".into(),
             updated_at: "2026-08-12T00:00:00Z".into(),
-            last_viewed_event_sequence: 0,
+            detached_after_event_ordinal: 0,
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: None,
@@ -4910,7 +6260,7 @@ mod tests {
             fn execute_with_stdin(
                 &self,
                 command: &CommandSpec,
-                input: &mut dyn std::io::Read,
+                input: &mut (dyn std::io::Read + Send),
             ) -> Result<CommandOutput> {
                 self.commands.borrow_mut().push(command.clone());
                 let mut stream = Vec::new();
@@ -4949,7 +6299,7 @@ mod tests {
             session_title_override: None,
             created_at: "2026-08-12T00:00:00Z".into(),
             updated_at: "2026-08-12T00:00:00Z".into(),
-            last_viewed_event_sequence: 0,
+            detached_after_event_ordinal: 0,
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: None,

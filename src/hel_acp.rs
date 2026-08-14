@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ClientCapabilities, CloseSessionRequest, ContentBlock, Implementation,
-    InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    AgentCapabilities, CancelNotification, ClientCapabilities, CloseSessionRequest, ContentBlock,
+    Implementation, InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOptionKind,
+    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionModeRequest, TextContent,
@@ -66,7 +66,7 @@ fn production_compaction_config(harness: HarnessKind) -> Option<ProductionCompac
 pub enum CommandRequest {
     Prompt {
         request_id: String,
-        text: String,
+        prompt: Vec<ContentBlock>,
     },
     SetConfig {
         request_id: String,
@@ -91,6 +91,12 @@ pub enum RuntimeEvent {
     Connected {
         agent_name: Option<String>,
         agent_version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<ProtocolVersion>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<Box<AgentCapabilities>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_info: Option<Implementation>,
     },
     SessionStarted {
         native_session_id: String,
@@ -121,6 +127,25 @@ pub enum RuntimeEvent {
         request_id: String,
         key: String,
         value: String,
+        /// The complete configuration returned by ACP for this change. Keep
+        /// it in the same runtime event as command completion so the relay
+        /// cannot publish a checkpoint between the two durable observations.
+        #[serde(default)]
+        config_options: Vec<SessionConfigOption>,
+    },
+    CommandRejected {
+        request_id: String,
+        message: String,
+    },
+    CommandInterrupted {
+        request_id: String,
+        message: String,
+    },
+    CancelApplied {
+        request_id: String,
+    },
+    CloseApplied {
+        request_id: String,
     },
     Stopped,
 }
@@ -128,7 +153,27 @@ pub enum RuntimeEvent {
 pub async fn run(
     spec: LaunchSpec,
     requests: mpsc::Receiver<CommandRequest>,
-    events: mpsc::UnboundedSender<RuntimeEvent>,
+    events: mpsc::Sender<RuntimeEvent>,
+) -> Result<()> {
+    let result = run_inner(spec, requests, events.clone()).await;
+    if let Err(error) = &result {
+        emit_runtime_event(
+            &events,
+            RuntimeEvent::Warning {
+                message: format!("ACP runtime failed: {error:#}"),
+            },
+        )
+        .await
+        .with_context(|| format!("report ACP runtime failure: {error:#}"))?;
+    }
+    emit_runtime_event(&events, RuntimeEvent::Stopped).await?;
+    result
+}
+
+async fn run_inner(
+    spec: LaunchSpec,
+    requests: mpsc::Receiver<CommandRequest>,
+    events: mpsc::Sender<RuntimeEvent>,
 ) -> Result<()> {
     let mut child = Command::new(&spec.command)
         .args(&spec.args)
@@ -174,36 +219,82 @@ pub async fn run(
     // terminate and reap the complete bridge process group before killing the
     // supervisor itself as a last resort.
     if !child_reaped {
-        match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
-            Ok(waited) => {
-                let _ = waited;
-            }
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-            }
+        let cleanup =
+            match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
+                Ok(Ok(status)) if status.success() => Ok(()),
+                Ok(Ok(status)) => Err(anyhow!(
+                    "ACP bridge exited with {status} after the protocol runtime completed"
+                )),
+                Ok(Err(error)) => Err(error).context("wait for ACP bridge shutdown"),
+                Err(_) => {
+                    let killed = child.kill().await.context("kill unresponsive ACP bridge");
+                    let waited = child
+                        .wait()
+                        .await
+                        .context("reap killed ACP bridge")
+                        .map(|_| ());
+                    match (killed, waited) {
+                        (Ok(()), Ok(())) => Ok(()),
+                        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                        (Err(error), Err(wait_error)) => Err(error.context(format!(
+                            "also failed to reap killed ACP bridge: {wait_error:#}"
+                        ))),
+                    }
+                }
+            };
+        if let Err(error) = cleanup {
+            merge_runtime_error(&mut result, error);
         }
     }
-    let stderr_tail = stderr_task
-        .await
-        .unwrap_or_else(|error| format!("failed to collect ACP bridge stderr: {error}"));
+    let stderr_tail = match stderr_task.await {
+        Ok(Ok(tail)) => tail,
+        Ok(Err(error)) => {
+            merge_runtime_error(&mut result, error);
+            String::new()
+        }
+        Err(error) => {
+            merge_runtime_error(
+                &mut result,
+                anyhow!("ACP stderr collector task failed: {error}"),
+            );
+            String::new()
+        }
+    };
     if !stderr_tail.trim().is_empty() {
         result =
             result.map_err(|error| error.context(format!("ACP bridge stderr:\n{stderr_tail}")));
     }
-    if let Err(error) = &result {
-        let _ = events.send(RuntimeEvent::Warning {
-            message: format!("ACP runtime failed: {error:#}"),
-        });
-    }
-    let _ = events.send(RuntimeEvent::Stopped);
     result
 }
 
 const ACP_STDERR_TAIL_BYTES: usize = 16 * 1024;
 const UNEXPECTED_PERMISSION_REQUEST_WARNING: &str = "The agent made a permission request, which means its permission policy is misconfigured. Hel is designed to run in either auto-review or YOLO mode.";
 
-async fn read_stderr_tail(mut stderr: tokio::process::ChildStderr) -> String {
+async fn emit_runtime_event(
+    events: &mpsc::Sender<RuntimeEvent>,
+    event: RuntimeEvent,
+) -> Result<()> {
+    events
+        .send(event)
+        .await
+        .map_err(|_| anyhow!("relay event coordinator stopped"))
+}
+
+fn relay_event_channel_error() -> agent_client_protocol::Error {
+    agent_client_protocol::Error::internal_error().data(serde_json::Value::String(
+        "relay event coordinator stopped".into(),
+    ))
+}
+
+fn merge_runtime_error(result: &mut Result<()>, additional: anyhow::Error) {
+    let previous = std::mem::replace(result, Ok(()));
+    *result = match previous {
+        Ok(()) => Err(additional),
+        Err(error) => Err(error.context(format!("additional ACP runtime error: {additional:#}"))),
+    };
+}
+
+async fn read_stderr_tail(mut stderr: tokio::process::ChildStderr) -> Result<String> {
     let mut tail = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
@@ -216,18 +307,18 @@ async fn read_stderr_tail(mut stderr: tokio::process::ChildStderr) -> String {
                 }
             }
             Err(error) => {
-                return format!("failed to read ACP bridge stderr: {error}");
+                return Err(error).context("read ACP bridge stderr");
             }
         }
     }
-    String::from_utf8_lossy(&tail).trim().to_owned()
+    Ok(String::from_utf8_lossy(&tail).trim().to_owned())
 }
 
 async fn drive<T>(
     transport: T,
     spec: LaunchSpec,
     mut requests: mpsc::Receiver<CommandRequest>,
-    events: mpsc::UnboundedSender<RuntimeEvent>,
+    events: mpsc::Sender<RuntimeEvent>,
 ) -> Result<()>
 where
     T: ConnectTo<Client>,
@@ -242,31 +333,40 @@ where
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
                 let scratch_id = notification.session_id.to_string();
-                let mut scratch = notification_scratch_outputs
-                    .lock()
-                    .expect("scratch output lock poisoned");
-                if let Some(output) = scratch.get_mut(&scratch_id) {
-                    if let SessionUpdate::AgentMessageChunk(chunk) = &notification.update
-                        && let ContentBlock::Text(text) = &chunk.content
-                    {
-                        output.push_str(&text.text);
+                {
+                    let mut scratch = notification_scratch_outputs
+                        .lock()
+                        .expect("scratch output lock poisoned");
+                    if let Some(output) = scratch.get_mut(&scratch_id) {
+                        if let SessionUpdate::AgentMessageChunk(chunk) = &notification.update
+                            && let ContentBlock::Text(text) = &chunk.content
+                        {
+                            output.push_str(&text.text);
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
                 }
-                drop(scratch);
-                let update = serde_json::to_value(notification.update).unwrap_or_else(
-                    |error| serde_json::json!({"serialization_error": error.to_string()}),
-                );
-                let _ = notification_events.send(RuntimeEvent::SessionUpdate { update });
+                let update = serde_json::to_value(notification.update).map_err(|error| {
+                    agent_client_protocol::Error::internal_error().data(serde_json::Value::String(
+                        format!("serialize ACP session update for relay: {error}"),
+                    ))
+                })?;
+                notification_events
+                    .send(RuntimeEvent::SessionUpdate { update })
+                    .await
+                    .map_err(|_| relay_event_channel_error())?;
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_request(
             async move |request: RequestPermissionRequest, responder, _cx| {
-                let _ = permission_events.send(RuntimeEvent::Warning {
-                    message: UNEXPECTED_PERMISSION_REQUEST_WARNING.to_owned(),
-                });
+                permission_events
+                    .send(RuntimeEvent::Warning {
+                        message: UNEXPECTED_PERMISSION_REQUEST_WARNING.to_owned(),
+                    })
+                    .await
+                    .map_err(|_| relay_event_channel_error())?;
                 if !auto_approve_permissions {
                     return responder.respond(RequestPermissionResponse::new(
                         RequestPermissionOutcome::Cancelled,
@@ -287,10 +387,13 @@ where
                         RequestPermissionOutcome::Cancelled,
                     ));
                 };
-                let _ = permission_events.send(RuntimeEvent::PermissionAutoApproved {
-                    option_id: selected.option_id.to_string(),
-                    option_name: selected.name.clone(),
-                });
+                permission_events
+                    .send(RuntimeEvent::PermissionAutoApproved {
+                        option_id: selected.option_id.to_string(),
+                        option_name: selected.name.clone(),
+                    })
+                    .await
+                    .map_err(|_| relay_event_channel_error())?;
                 responder.respond(RequestPermissionResponse::new(
                     RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                         selected.option_id.clone(),
@@ -320,7 +423,7 @@ async fn drive_connection(
     connection: ConnectionTo<Agent>,
     spec: &LaunchSpec,
     requests: &mut mpsc::Receiver<CommandRequest>,
-    events: &mpsc::UnboundedSender<RuntimeEvent>,
+    events: &mpsc::Sender<RuntimeEvent>,
     scratch_outputs: Arc<Mutex<BTreeMap<String, String>>>,
 ) -> Result<()> {
     let mut meta = serde_json::Map::new();
@@ -344,16 +447,23 @@ async fn drive_connection(
             initialized.protocol_version
         );
     }
-    let _ = events.send(RuntimeEvent::Connected {
-        agent_name: initialized
-            .agent_info
-            .as_ref()
-            .map(|info| info.name.clone()),
-        agent_version: initialized
-            .agent_info
-            .as_ref()
-            .map(|info| info.version.clone()),
-    });
+    emit_runtime_event(
+        events,
+        RuntimeEvent::Connected {
+            agent_name: initialized
+                .agent_info
+                .as_ref()
+                .map(|info| info.name.clone()),
+            agent_version: initialized
+                .agent_info
+                .as_ref()
+                .map(|info| info.version.clone()),
+            protocol_version: Some(initialized.protocol_version),
+            capabilities: Some(Box::new(initialized.agent_capabilities.clone())),
+            agent_info: initialized.agent_info.clone(),
+        },
+    )
+    .await?;
 
     let loaded_session = if let Some(existing) = &spec.resume_session {
         let loaded = connection
@@ -406,59 +516,170 @@ async fn drive_connection(
         .await?;
     }
     let mut config_options = config_options.unwrap_or_default();
-    let _ = events.send(RuntimeEvent::SessionStarted {
-        native_session_id: session_id.to_string(),
-        resumed,
-        unrestricted_mode: desired_mode.map(str::to_owned),
-    });
-    let _ = events.send(RuntimeEvent::SessionConfigured {
-        config_options: config_options.clone(),
-    });
+    emit_runtime_event(
+        events,
+        RuntimeEvent::SessionStarted {
+            native_session_id: session_id.to_string(),
+            resumed,
+            unrestricted_mode: desired_mode.map(str::to_owned),
+        },
+    )
+    .await?;
+    emit_runtime_event(
+        events,
+        RuntimeEvent::SessionConfigured {
+            config_options: config_options.clone(),
+        },
+    )
+    .await?;
 
     while let Some(request) = requests.recv().await {
         match request {
-            CommandRequest::Prompt { request_id, text } => {
-                if text.trim().is_empty() {
+            CommandRequest::Prompt { request_id, prompt } => {
+                if prompt.is_empty() {
+                    emit_runtime_event(
+                        events,
+                        RuntimeEvent::CommandRejected {
+                            request_id,
+                            message: "ACP prompt has no content blocks".into(),
+                        },
+                    )
+                    .await?;
                     continue;
                 }
                 let prompt = connection
-                    .send_request(PromptRequest::new(
-                        session_id.clone(),
-                        vec![ContentBlock::Text(TextContent::new(text))],
-                    ))
+                    .send_request(PromptRequest::new(session_id.clone(), prompt))
                     .block_task();
                 tokio::pin!(prompt);
                 loop {
                     tokio::select! {
                         response = &mut prompt => {
-                            let response = response.context("send ACP prompt")?;
-                            let _ = events.send(RuntimeEvent::PromptFinished {
-                                request_id,
-                                stop_reason: format!("{:?}", response.stop_reason),
-                            });
+                            match response {
+                                Ok(response) => {
+                                    emit_runtime_event(
+                                        events,
+                                        RuntimeEvent::PromptFinished {
+                                            request_id,
+                                            stop_reason: format!("{:?}", response.stop_reason),
+                                        },
+                                    )
+                                    .await?;
+                                }
+                                Err(error) => {
+                                    emit_runtime_event(
+                                        events,
+                                        RuntimeEvent::CommandRejected {
+                                            request_id,
+                                            message: format!("send ACP prompt: {error}"),
+                                        },
+                                    )
+                                    .await?;
+                                }
+                            }
                             break;
                         }
                         command = requests.recv() => match command {
-                            Some(CommandRequest::Cancel { .. }) => {
-                                connection.send_notification(CancelNotification::new(session_id.clone()))?;
+                            Some(CommandRequest::Cancel { request_id: cancel_id }) => {
+                                match connection.send_notification(CancelNotification::new(session_id.clone())) {
+                                    Ok(()) => {
+                                        emit_runtime_event(
+                                            events,
+                                            RuntimeEvent::CancelApplied {
+                                                request_id: cancel_id,
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                    Err(error) => {
+                                        emit_runtime_event(
+                                            events,
+                                            RuntimeEvent::CommandRejected {
+                                                request_id: cancel_id,
+                                                message: format!("cancel ACP prompt: {error}"),
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                }
                             }
-                            Some(CommandRequest::Close { .. }) | None => {
-                                connection.send_notification(CancelNotification::new(session_id.clone()))?;
-                                let _ = connection
+                            Some(CommandRequest::Close { request_id: close_id }) => {
+                                if let Err(error) = connection.send_notification(CancelNotification::new(session_id.clone())) {
+                                    emit_runtime_event(
+                                        events,
+                                        RuntimeEvent::Warning {
+                                            message: format!("cancel ACP prompt before close: {error}"),
+                                        },
+                                    )
+                                    .await?;
+                                }
+                                emit_runtime_event(
+                                    events,
+                                    RuntimeEvent::CommandInterrupted {
+                                        request_id: request_id.clone(),
+                                        message: "prompt interrupted because the session was closed".into(),
+                                    },
+                                )
+                                .await?;
+                                match connection
                                     .send_request(CloseSessionRequest::new(session_id.clone()))
                                     .block_task()
-                                    .await;
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        emit_runtime_event(
+                                            events,
+                                            RuntimeEvent::CloseApplied {
+                                                request_id: close_id,
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                    Err(error) => {
+                                        emit_runtime_event(
+                                            events,
+                                            RuntimeEvent::CommandRejected {
+                                                request_id: close_id,
+                                                message: format!("close ACP session: {error}"),
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                }
                                 return Ok(());
                             }
-                            Some(CommandRequest::Prompt { .. }) => {
-                                let _ = events.send(RuntimeEvent::Warning {
-                                    message: "a prompt is already running".into(),
-                                });
+                            None => {
+                                let cancellation = connection
+                                    .send_notification(CancelNotification::new(session_id.clone()));
+                                emit_runtime_event(
+                                    events,
+                                    RuntimeEvent::CommandInterrupted {
+                                        request_id: request_id.clone(),
+                                        message: "ACP command channel closed while the prompt was running".into(),
+                                    },
+                                )
+                                .await?;
+                                cancellation.context("cancel ACP prompt during runtime shutdown")?;
+                                return Ok(());
                             }
-                            Some(CommandRequest::SetConfig { .. }) => {
-                                let _ = events.send(RuntimeEvent::Warning {
-                                    message: "model and effort can only be changed while the agent is idle".into(),
-                                });
+                            Some(CommandRequest::Prompt { request_id, .. }) => {
+                                emit_runtime_event(
+                                    events,
+                                    RuntimeEvent::CommandRejected {
+                                        request_id,
+                                        message: "a prompt is already running".into(),
+                                    },
+                                )
+                                .await?;
+                            }
+                            Some(CommandRequest::SetConfig { request_id, .. }) => {
+                                emit_runtime_event(
+                                    events,
+                                    RuntimeEvent::CommandRejected {
+                                        request_id,
+                                        message: "configuration can only be changed while the agent is idle".into(),
+                                    },
+                                )
+                                .await?;
                             }
                             Some(CommandRequest::Compact { response, .. }) => {
                                 let _ = response.send(Err(
@@ -484,19 +705,26 @@ async fn drive_connection(
                 .await
                 {
                     Ok(()) => {
-                        let _ = events.send(RuntimeEvent::ConfigApplied {
-                            request_id,
-                            key,
-                            value,
-                        });
-                        let _ = events.send(RuntimeEvent::SessionConfigured {
-                            config_options: config_options.clone(),
-                        });
+                        emit_runtime_event(
+                            events,
+                            RuntimeEvent::ConfigApplied {
+                                request_id,
+                                key,
+                                value,
+                                config_options: config_options.clone(),
+                            },
+                        )
+                        .await?;
                     }
                     Err(error) => {
-                        let _ = events.send(RuntimeEvent::Warning {
-                            message: format!("{error:#}"),
-                        });
+                        emit_runtime_event(
+                            events,
+                            RuntimeEvent::CommandRejected {
+                                request_id,
+                                message: format!("{error:#}"),
+                            },
+                        )
+                        .await?;
                     }
                 }
             }
@@ -507,14 +735,45 @@ async fn drive_connection(
                         .map_err(|error| format!("{error:#}"));
                 let _ = response.send(result);
             }
-            CommandRequest::Cancel { .. } => {
-                connection.send_notification(CancelNotification::new(session_id.clone()))?;
+            CommandRequest::Cancel { request_id } => {
+                match connection.send_notification(CancelNotification::new(session_id.clone())) {
+                    Ok(()) => {
+                        emit_runtime_event(events, RuntimeEvent::CancelApplied { request_id })
+                            .await?;
+                    }
+                    Err(error) => {
+                        emit_runtime_event(
+                            events,
+                            RuntimeEvent::CommandRejected {
+                                request_id,
+                                message: format!("cancel ACP prompt: {error}"),
+                            },
+                        )
+                        .await?;
+                    }
+                }
             }
-            CommandRequest::Close { .. } => {
-                let _ = connection
+            CommandRequest::Close { request_id } => {
+                match connection
                     .send_request(CloseSessionRequest::new(session_id.clone()))
                     .block_task()
-                    .await;
+                    .await
+                {
+                    Ok(_) => {
+                        emit_runtime_event(events, RuntimeEvent::CloseApplied { request_id })
+                            .await?;
+                    }
+                    Err(error) => {
+                        emit_runtime_event(
+                            events,
+                            RuntimeEvent::CommandRejected {
+                                request_id,
+                                message: format!("close ACP session: {error}"),
+                            },
+                        )
+                        .await?;
+                    }
+                }
                 break;
             }
         }
@@ -623,16 +882,26 @@ async fn compact_in_scratch_session(
         ))
         .block_task()
         .await;
-    let _ = connection
+    let close_result = connection
         .send_request(CloseSessionRequest::new(session_id.clone()))
         .block_task()
-        .await;
+        .await
+        .context("close scratch ACP compaction session");
     let output = scratch_outputs
         .lock()
         .expect("scratch output lock poisoned")
         .remove(&session_id.to_string())
         .unwrap_or_default();
-    prompt_result.context("run scratch ACP compaction prompt")?;
+    let prompt_result = prompt_result.context("run scratch ACP compaction prompt");
+    match (prompt_result, close_result) {
+        (Ok(_), Ok(_)) => {}
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => return Err(error),
+        (Err(error), Err(close_error)) => {
+            return Err(error.context(format!(
+                "also failed to close scratch ACP compaction session: {close_error:#}"
+            )));
+        }
+    }
     if output.trim().is_empty() {
         bail!("scratch ACP compaction returned no agent text");
     }
@@ -849,11 +1118,50 @@ mod tests {
         assert!(UNEXPECTED_PERMISSION_REQUEST_WARNING.contains("YOLO"));
     }
 
+    #[tokio::test]
+    async fn runtime_event_delivery_waits_for_bounded_channel_capacity() {
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        emit_runtime_event(
+            &events_tx,
+            RuntimeEvent::Warning {
+                message: "first".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let blocked_tx = events_tx.clone();
+        let blocked = tokio::spawn(async move {
+            emit_runtime_event(
+                &blocked_tx,
+                RuntimeEvent::Warning {
+                    message: "second".into(),
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked.is_finished(),
+            "event producer bypassed bounded-channel backpressure"
+        );
+
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(RuntimeEvent::Warning { message }) if message == "first"
+        ));
+        blocked.await.unwrap().unwrap();
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(RuntimeEvent::Warning { message }) if message == "second"
+        ));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn bridge_exit_during_initialize_returns_an_actionable_error() {
         let (_request_tx, request_rx) = mpsc::channel(1);
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
         let spec = LaunchSpec {
             command: "sh".into(),
             args: vec![
@@ -894,5 +1202,35 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, RuntimeEvent::Stopped))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bridge_launch_failure_is_reported_before_the_runtime_stops() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let missing_bridge = temp.path().join("missing-acp-bridge");
+        let spec = LaunchSpec {
+            command: missing_bridge.clone(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: temp.path().to_path_buf(),
+            additional_directories: Vec::new(),
+            resume_session: None,
+            harness: HarnessKind::Kimi,
+            force_unrestricted_mode: true,
+        };
+
+        let error = run(spec, request_rx, event_tx).await.unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains(&format!("launch ACP bridge {}", missing_bridge.display()))
+        );
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(RuntimeEvent::Warning { message }) if message.contains("ACP runtime failed")
+        ));
+        assert!(matches!(event_rx.recv().await, Some(RuntimeEvent::Stopped)));
     }
 }

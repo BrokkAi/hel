@@ -330,6 +330,10 @@ pub enum ControllerAction {
     Open {
         session_id: String,
     },
+    Read {
+        session_id: String,
+        through: u64,
+    },
     Prompt {
         session_id: String,
         text: String,
@@ -388,6 +392,10 @@ fn router(options: ServerOptions) -> Router {
     let protected = Router::new()
         .route("/api/snapshot", get(snapshot))
         .route("/api/conversations/{session_id}", get(conversation))
+        .route(
+            "/api/conversations/{session_id}/read",
+            post(mark_conversation_read),
+        )
         .route("/api/events", get(events))
         .route("/api/actions", post(action))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -523,6 +531,38 @@ async fn conversation(
     Ok(Json(response))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadRequest {
+    through: u64,
+}
+
+async fn mark_conversation_read(
+    State(state): State<ServerState>,
+    Path(session_id): Path<String>,
+    Json(request): Json<ReadRequest>,
+) -> Result<StatusCode, ApiError> {
+    validate_public_id(&session_id)?;
+    require_session_record(&state.snapshot_rx.borrow(), &session_id)?;
+    let (reply, result) = tokio::sync::oneshot::channel();
+    state
+        .action_tx
+        .send(ControllerRequest {
+            action: ControllerAction::Read {
+                session_id,
+                through: request.through,
+            },
+            reply,
+        })
+        .await
+        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "controller unavailable"))?;
+    result
+        .await
+        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "controller unavailable"))?
+        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "read receipt failed"))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn events(State(state): State<ServerState>) -> impl IntoResponse {
     let mut snapshots = state.snapshot_rx.clone();
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(8);
@@ -582,7 +622,9 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
             require_profile(snapshot, profile_id)?;
             require_target(snapshot, target_id)?;
         }
-        ControllerAction::Open { session_id } | ControllerAction::Close { session_id } => {
+        ControllerAction::Open { session_id }
+        | ControllerAction::Close { session_id }
+        | ControllerAction::Read { session_id, .. } => {
             validate_public_id(session_id)?;
             require_session_record(snapshot, session_id)?;
         }
@@ -837,6 +879,7 @@ const fn session_state_name(state: SessionState) -> &'static str {
         SessionState::Disconnected => "disconnected",
         SessionState::Checkpointing => "checkpointing",
         SessionState::Closing => "closing",
+        SessionState::Destroying => "destroying",
         SessionState::Archived => "archived",
         SessionState::Lost => "lost",
         SessionState::Error => "error",
@@ -919,7 +962,7 @@ function options(items,selected){return items.map(x=>`<option value="${escapeAtt
 async function refresh(){try{snapshot=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);sessions.innerHTML=snapshot.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span> ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available?'':'disabled'}>Open</button><button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Archive</button></div></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);document.querySelector('#conversation-state').textContent=session.state}}if(!eventsStarted){eventsStarted=true;const source=new EventSource('/api/events');source.addEventListener('revision',()=>{refresh();if(currentSession)loadConversation(true)})}}catch(e){if(e.message==='unauthorized'){login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}}}
 function renderQueue(session){queue.innerHTML=(session.queued_prompts||[]).map((x,i)=>`<div class="queue-item"><span>${i+1}. ${escapeHtml(x.text)}</span><button class="danger" data-queue-id="${escapeAttr(x.id)}">Remove</button></div>`).join('')||'<p class="dim">No queued prompts.</p>'}
 function renderEntries(entries,replace){if(replace)feed.innerHTML='';for(const entry of entries){let node=document.querySelector(`[data-entry-id="${entry.id}"]`);if(!node){node=document.createElement('article');node.dataset.entryId=entry.id;feed.append(node)}node.className=`entry ${entry.role}`;const title=document.createElement('strong');title.textContent=entry.label;const body=document.createElement('pre');body.textContent=entry.lines.join('\n');node.replaceChildren(title,body)}window.scrollTo(0,document.body.scrollHeight)}
-async function loadConversation(delta=false){if(!currentSession)return;try{const result=await request(`/api/conversations/${encodeURIComponent(currentSession)}${delta&&cursor?`?after_seq=${cursor}`:''}`);renderEntries(result.entries,!delta||result.reset);cursor=result.latest_seq}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
+async function loadConversation(delta=false){if(!currentSession)return;try{const result=await request(`/api/conversations/${encodeURIComponent(currentSession)}${delta&&cursor?`?after_seq=${cursor}`:''}`);renderEntries(result.entries,!delta||result.reset);cursor=result.latest_seq;await request(`/api/conversations/${encodeURIComponent(currentSession)}/read`,{method:'POST',body:JSON.stringify({through:cursor})})}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
 async function openConversation(id){currentSession=id;cursor=0;location.hash=`conversation/${id}`;dashboard.classList.add('hidden');conversation.classList.remove('hidden');const session=snapshot.sessions.find(x=>x.id===id);document.querySelector('#conversation-title').textContent=session?.title||'Conversation';document.querySelector('#conversation-state').textContent=session?.state||'';renderQueue(session||{});await loadConversation(false)}
 function showDashboard(){currentSession=null;cursor=0;location.hash='';conversation.classList.add('hidden');dashboard.classList.remove('hidden')}
 document.querySelector('#login-form').onsubmit=async e=>{e.preventDefault();try{await request('/auth/session',{method:'POST',body:JSON.stringify({code:document.querySelector('#code').value})});document.querySelector('#login-error').textContent='';refresh()}catch(err){document.querySelector('#login-error').textContent=err.message}};
@@ -1007,7 +1050,7 @@ mod tests {
                     session_title_override: None,
                     created_at: "now".into(),
                     updated_at: "now".into(),
-                    last_viewed_event_sequence: 0,
+                    detached_after_event_ordinal: 0,
                     last_error: Some("secret-token at /highly/secret/codex".into()),
                     last_checkpoint_error: None,
                     checkpoint: None,
@@ -1253,5 +1296,33 @@ mod tests {
         assert_eq!(body["reset"], false);
         assert_eq!(body["entries"].as_array().unwrap().len(), 1);
         assert_eq!(body["entries"][0]["lines"][0], "live");
+    }
+
+    #[tokio::test]
+    async fn conversation_read_receipt_is_typed_and_forwarded() {
+        let (app, mut actions) = app();
+        let cookie = login_cookie(&app).await;
+        let response = tokio::spawn(
+            app.oneshot(
+                Request::post("/api/conversations/session-1/read")
+                    .header(COOKIE, cookie)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"through":42}"#))
+                    .unwrap(),
+            ),
+        );
+        let action = actions.recv().await.unwrap();
+        assert_eq!(
+            action.action,
+            ControllerAction::Read {
+                session_id: "session-1".into(),
+                through: 42,
+            }
+        );
+        action.reply.send(Ok(())).unwrap();
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
     }
 }

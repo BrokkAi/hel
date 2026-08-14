@@ -17,53 +17,55 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::hel_archive::{
-    ArchiveInput, BundleManifest, GitCollectionSpec, GitCommand, GitCommandRunner, GitHistoryMode,
-    NativeArtifact, PayloadRole, RepositorySnapshot, SessionManifest, SystemGit, TargetManifest,
-    collect_git_metadata_snapshot, collect_git_snapshot, has_origin_refs, read_archive_verified,
-    restore_git_snapshot, write_archive_atomic,
+    ArchiveInput, BundleManifest, CanonicalSessionSnapshot, CanonicalTranscriptBody,
+    GitCollectionSpec, GitCommand, GitCommandRunner, GitHistoryMode, NativeArtifact, PayloadRole,
+    RepositorySnapshot, SessionManifest, SystemGit, TargetManifest, collect_git_metadata_snapshot,
+    collect_git_snapshot, has_origin_refs, read_archive_verified, restore_git_snapshot,
+    verify_archive_streaming, write_archive_atomic,
 };
 use crate::hel_config::HarnessKind;
 use crate::hel_targets::{
     CommandExecutor, CommandPlan, CommandSpec, SshTarget, TargetLocator, join_remote_command,
     worker_root,
 };
-use crate::hel_worker::SequencedEvent;
-
 const MAX_NATIVE_FILE: u64 = 1024 * 1024 * 1024;
 const MAX_NATIVE_TOTAL: u64 = 8 * 1024 * 1024 * 1024;
+pub const RESTORED_CANONICAL_SESSION_FILE: &str = "canonical-session.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointRepositorySpec {
     pub id: String,
     pub relative_destination: PathBuf,
-    /// Legacy wire field. Target binaries installed before session deltas
-    /// existed require it and use it as the delta base; newer targets read it
-    /// only when `session_delta` is false.
-    pub base_commit: String,
-    /// Bundle the commits reachable from HEAD but from no origin ref instead
-    /// of deltaing from `base_commit`.
-    #[serde(default)]
-    pub session_delta: bool,
-    /// False for raw projects whose existing worktree remains the recovery
-    /// source and is deliberately never restored from the checkpoint.
-    #[serde(default = "default_true")]
-    pub capture_contents: bool,
-    #[serde(default)]
+    pub capture: CheckpointRepositoryCapture,
     pub origin_override: Option<String>,
+}
+
+/// Required repository capture semantics for the checkpoint protocol floor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CheckpointRepositoryCapture {
+    /// Bundle commits reachable from HEAD but from no origin ref.
+    SessionDelta,
+    /// Bundle the repository relative to an explicit commit.
+    DeltaFrom { base_commit: String },
+    /// Preserve Git provenance only. The existing worktree remains the source.
+    MetadataOnly,
 }
 
 /// Uploaded target-side input. It contains provenance and paths, never secrets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointExportSpec {
     pub session: SessionManifest,
     pub target: TargetManifest,
     pub bundle: BundleManifest,
-    pub worker_root: PathBuf,
+    pub relay_root: PathBuf,
     pub harness_home: PathBuf,
     pub workspace_root: PathBuf,
     pub repositories: Vec<CheckpointRepositorySpec>,
-    /// Inclusive canonical event frontier established by the live worker.
-    pub event_sequence: u64,
+    /// Controller projection latched at the relay's checkpoint barrier.
+    pub canonical_session: CanonicalSessionSnapshot,
     pub output_path: PathBuf,
 }
 
@@ -95,10 +97,12 @@ impl CheckpointExportSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TargetCheckpoint {
     pub path: PathBuf,
     pub sha256: String,
-    pub event_sequence: u64,
+    pub event_frontier: u64,
+    pub event_frontier_digest: String,
 }
 
 /// Hidden target CLI entry point: `hel worker export-checkpoint --spec PATH`.
@@ -107,23 +111,19 @@ pub fn export_from_spec_file(path: &Path) -> Result<TargetCheckpoint> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointRestoreSpec {
     pub archive_path: PathBuf,
     pub workspace_root: PathBuf,
-    pub worker_root: PathBuf,
+    pub relay_root: PathBuf,
     pub harness_home: PathBuf,
-    #[serde(default = "default_true")]
     pub restore_repositories: bool,
     pub restore_native: bool,
-    #[serde(default)]
     pub discard_queued_prompts: bool,
 }
 
-const fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryRestoreSpec {
     pub archive_path: PathBuf,
     pub workspace_root: PathBuf,
@@ -146,7 +146,7 @@ pub fn restore_from_spec_file(path: &Path) -> Result<()> {
         .with_context(|| format!("parse checkpoint restore spec {}", path.display()))?;
     spec.archive_path = resolve_target_path(&spec.archive_path)?;
     spec.workspace_root = resolve_target_path(&spec.workspace_root)?;
-    spec.worker_root = resolve_target_path(&spec.worker_root)?;
+    spec.relay_root = resolve_target_path(&spec.relay_root)?;
     spec.harness_home = resolve_target_path(&spec.harness_home)?;
     restore_checkpoint(&spec, &SystemGit)
 }
@@ -154,29 +154,23 @@ pub fn restore_from_spec_file(path: &Path) -> Result<()> {
 pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunner) -> Result<()> {
     ensure!(spec.workspace_root.is_dir(), "restore workspace is missing");
     let archive = read_archive_verified(&spec.archive_path)?;
+    // Deserialize and validate the schema-2 canonical projection before any
+    // repository, relay, or native-session state can be mutated.
+    let mut canonical_session = archive.canonical_session()?;
+    if spec.discard_queued_prompts {
+        canonical_session.queued_prompts.clear();
+    }
     if spec.restore_repositories {
         restore_repositories_from_archive(&archive, &spec.workspace_root, git)?;
     }
 
-    fs::create_dir_all(&spec.worker_root)?;
-    crate::hel_worker::clear_native_session_identity(&spec.worker_root)?;
-    let mut events = archive
-        .payload_by_role(&PayloadRole::CanonicalEvents)?
-        .to_vec();
-    let latest_seq = verify_canonical_payload(&events)?;
-    if spec.discard_queued_prompts {
-        let event = SequencedEvent {
-            seq: latest_seq
-                .checked_add(1)
-                .context("canonical event sequence exhausted while discarding queued prompts")?,
-            recorded_at_ms: None,
-            request_id: None,
-            event: crate::hel_worker::WorkerEvent::QueuedPromptsCleared,
-        };
-        serde_json::to_writer(&mut events, &event)?;
-        events.push(b'\n');
-    }
-    write_private_file(&spec.worker_root.join("events.jsonl"), &events, 0o600)?;
+    fs::create_dir_all(&spec.relay_root)?;
+    crate::hel_worker::clear_native_session_identity(&spec.relay_root)?;
+    write_private_file(
+        &restored_canonical_session_path(&spec.relay_root),
+        &serde_json::to_vec_pretty(&canonical_session)?,
+        0o600,
+    )?;
 
     if spec.restore_native {
         for descriptor in &archive.manifest.payloads {
@@ -210,6 +204,15 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
         }
     }
     Ok(())
+}
+
+pub fn restored_canonical_session_path(relay_root: &Path) -> PathBuf {
+    relay_root.join(RESTORED_CANONICAL_SESSION_FILE)
+}
+
+/// Reads the controller-owned projection without restoring target artifacts.
+pub fn read_checkpoint_session(path: &Path) -> Result<CanonicalSessionSnapshot> {
+    Ok(verify_archive_streaming(path)?.canonical_session)
 }
 
 pub fn restore_repositories(
@@ -490,18 +493,18 @@ pub fn export_checkpoint_with_git(
     git: &dyn GitCommandRunner,
 ) -> Result<TargetCheckpoint> {
     let mut resolved = spec.clone();
-    resolved.worker_root = resolve_target_path(&resolved.worker_root)?;
+    resolved.relay_root = resolve_target_path(&resolved.relay_root)?;
     resolved.harness_home = resolve_target_path(&resolved.harness_home)?;
     resolved.workspace_root = resolve_target_path(&resolved.workspace_root)?;
     resolved.output_path = resolve_target_path(&resolved.output_path)?;
     let spec = &resolved;
     validate_export_spec(spec)?;
-    let canonical_events = collect_canonical_events(&spec.worker_root, spec.event_sequence)?;
-    let event_sequence = spec.event_sequence;
+    let event_frontier = spec.canonical_session.event_frontier;
+    let event_frontier_digest = spec.canonical_session.event_frontier_digest.clone();
     // A session that never accepted a prompt legitimately has no native
     // harness artifacts yet; requiring them would make an unused session
     // impossible to close cleanly.
-    let prompted = events_contain_prompt(&canonical_events);
+    let prompted = canonical_session_contains_prompt(&spec.canonical_session);
     let native_artifacts = collect_native_artifacts(
         spec.session.harness_kind,
         &spec.harness_home,
@@ -516,24 +519,27 @@ pub fn export_checkpoint_with_git(
         .map(|repository| {
             let path = spec.workspace_root.join(&repository.relative_destination);
             ensure!(path.is_dir(), "repository {} is missing", path.display());
-            if !repository.capture_contents {
-                return collect_git_metadata_snapshot(
-                    git,
-                    &path,
-                    &GitCollectionSpec {
-                        id: repository.id.clone(),
-                        relative_destination: repository.relative_destination.clone(),
-                        history: GitHistoryMode::NoBundle,
-                        origin_override: repository.origin_override.clone(),
-                    },
-                )
-                .with_context(|| format!("repository '{}'", repository.id));
-            }
-            let history = if repository.session_delta {
-                repair_origin_refs(git, &path, &repository.id)?;
-                GitHistoryMode::SessionDelta
-            } else {
-                GitHistoryMode::DeltaFrom(repository.base_commit.clone())
+            let history = match &repository.capture {
+                CheckpointRepositoryCapture::MetadataOnly => {
+                    return collect_git_metadata_snapshot(
+                        git,
+                        &path,
+                        &GitCollectionSpec {
+                            id: repository.id.clone(),
+                            relative_destination: repository.relative_destination.clone(),
+                            history: GitHistoryMode::NoBundle,
+                            origin_override: repository.origin_override.clone(),
+                        },
+                    )
+                    .with_context(|| format!("repository '{}'", repository.id));
+                }
+                CheckpointRepositoryCapture::SessionDelta => {
+                    repair_origin_refs(git, &path, &repository.id)?;
+                    GitHistoryMode::SessionDelta
+                }
+                CheckpointRepositoryCapture::DeltaFrom { base_commit } => {
+                    GitHistoryMode::DeltaFrom(base_commit.clone())
+                }
             };
             reject_dirty_submodules(git, &path)
                 .with_context(|| format!("repository '{}'", repository.id))?;
@@ -556,7 +562,7 @@ pub fn export_checkpoint_with_git(
             session: spec.session.clone(),
             target: spec.target.clone(),
             bundle: spec.bundle.clone(),
-            canonical_events,
+            canonical_session: spec.canonical_session.clone(),
             native_artifacts,
             repositories,
         },
@@ -565,7 +571,8 @@ pub fn export_checkpoint_with_git(
     Ok(TargetCheckpoint {
         path: spec.output_path.clone(),
         sha256: verified.archive_sha256,
-        event_sequence,
+        event_frontier,
+        event_frontier_digest,
     })
 }
 
@@ -602,9 +609,10 @@ fn repair_origin_refs(git: &dyn GitCommandRunner, path: &Path, id: &str) -> Resu
 }
 
 fn validate_export_spec(spec: &CheckpointExportSpec) -> Result<()> {
+    spec.canonical_session.validate()?;
     validate_component(&spec.session.id, "session ID")?;
     validate_component(&spec.session.native_session_id, "native session ID")?;
-    ensure!(spec.worker_root.is_dir(), "worker root is missing");
+    ensure!(spec.relay_root.is_dir(), "relay root is missing");
     ensure!(spec.harness_home.is_dir(), "harness home is missing");
     ensure!(spec.workspace_root.is_dir(), "workspace root is missing");
     ensure!(
@@ -616,10 +624,9 @@ fn validate_export_spec(spec: &CheckpointExportSpec) -> Result<()> {
     for repository in &spec.repositories {
         validate_component(&repository.id, "repository ID")?;
         validate_relative_path(&repository.relative_destination)?;
-        ensure!(
-            !repository.base_commit.trim().is_empty(),
-            "base commit is empty"
-        );
+        if let CheckpointRepositoryCapture::DeltaFrom { base_commit } = &repository.capture {
+            ensure!(!base_commit.trim().is_empty(), "base commit is empty");
+        }
         ensure!(ids.insert(&repository.id), "duplicate repository ID");
         ensure!(
             destinations.insert(&repository.relative_destination),
@@ -628,44 +635,17 @@ fn validate_export_spec(spec: &CheckpointExportSpec) -> Result<()> {
     }
     let parent = spec.output_path.parent().unwrap_or_else(|| Path::new("."));
     ensure!(
-        parent.starts_with(&spec.worker_root),
-        "archive must be beneath worker root"
+        parent.starts_with(&spec.relay_root),
+        "archive must be beneath relay root"
     );
     Ok(())
 }
 
-fn events_contain_prompt(canonical_events: &[u8]) -> bool {
-    canonical_events.split(|byte| *byte == b'\n').any(|line| {
-        serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|event| {
-            matches!(
-                event
-                    .pointer("/event/type")
-                    .and_then(serde_json::Value::as_str),
-                Some("prompt_accepted" | "queued_prompt_promoted")
-            )
-        })
-    })
-}
-
-fn collect_canonical_events(worker_root: &Path, through_sequence: u64) -> Result<Vec<u8>> {
-    let path = worker_root.join("events.jsonl");
-    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    let mut expected = 1_u64;
-    let mut end = 0;
-    for frame in bytes.split_inclusive(|byte| *byte == b'\n') {
-        ensure!(frame.ends_with(b"\n"), "incomplete canonical event frame");
-        let event: SequencedEvent = serde_json::from_slice(&frame[..frame.len() - 1])?;
-        ensure!(event.seq == expected, "canonical event sequence gap");
-        end += frame.len();
-        if event.seq == through_sequence {
-            return Ok(bytes[..end].to_vec());
-        }
-        expected += 1;
-    }
-    bail!(
-        "canonical event frontier {through_sequence} is unavailable; event log ended at {}",
-        expected.saturating_sub(1)
-    )
+fn canonical_session_contains_prompt(snapshot: &CanonicalSessionSnapshot) -> bool {
+    snapshot
+        .transcript
+        .iter()
+        .any(|item| matches!(&item.body, CanonicalTranscriptBody::User { .. }))
 }
 
 pub fn collect_native_artifacts(
@@ -1070,7 +1050,8 @@ pub struct CheckpointTransfer<'a> {
     pub session_id: &'a str,
     pub remote_archive: &'a str,
     pub destination: &'a Path,
-    pub expected_event_sequence: Option<u64>,
+    pub expected_event_frontier: Option<u64>,
+    pub expected_event_frontier_digest: Option<&'a str>,
 }
 
 /// Unforgeable outside this module: proof that a controller-local archive was
@@ -1080,7 +1061,8 @@ pub struct VerifiedCheckpoint {
     session_id: String,
     archive_path: PathBuf,
     sha256: String,
-    event_sequence: u64,
+    event_frontier: u64,
+    event_frontier_digest: String,
 }
 
 impl VerifiedCheckpoint {
@@ -1090,8 +1072,11 @@ impl VerifiedCheckpoint {
     pub fn sha256(&self) -> &str {
         &self.sha256
     }
-    pub fn event_sequence(&self) -> u64 {
-        self.event_sequence
+    pub fn event_frontier(&self) -> u64 {
+        self.event_frontier
+    }
+    pub fn event_frontier_digest(&self) -> &str {
+        &self.event_frontier_digest
     }
     pub const fn teardown_allowed(&self) -> bool {
         true
@@ -1110,32 +1095,49 @@ impl CheckpointTransfer<'_> {
         transfer_plan(self.locator, self.session_id, self.remote_archive, &path)?
             .execute(executor)
             .context("download target checkpoint")?;
-        let verified = read_archive_verified(&path).context("verify downloaded checkpoint")?;
+        let verified = verify_archive_streaming(&path).context("verify downloaded checkpoint")?;
         ensure!(
             verified.manifest.session.id == self.session_id,
             "checkpoint session mismatch"
         );
-        let sequence =
-            verify_canonical_payload(verified.payload_by_role(&PayloadRole::CanonicalEvents)?)?;
-        if let Some(expected) = self.expected_event_sequence {
-            ensure!(sequence == expected, "checkpoint event sequence mismatch");
+        let canonical_session = verified.canonical_session;
+        let event_frontier = canonical_session.event_frontier;
+        let event_frontier_digest = canonical_session.event_frontier_digest;
+        if let Some(expected) = self.expected_event_frontier {
+            ensure!(
+                event_frontier == expected,
+                "checkpoint event frontier mismatch"
+            );
+        }
+        if let Some(expected) = self.expected_event_frontier_digest {
+            ensure!(
+                event_frontier_digest == expected,
+                "checkpoint event frontier digest mismatch"
+            );
         }
         let sha256 = verified.archive_sha256;
         temporary
             .persist(self.destination)
             .map_err(|error| error.error)?;
-        restrict_permissions(self.destination)?;
-        sync_directory(parent)?;
-        let installed = read_archive_verified(self.destination)?;
-        ensure!(
-            installed.archive_sha256 == sha256,
-            "installed archive checksum changed"
-        );
+        let post_install = (|| -> Result<()> {
+            restrict_permissions(self.destination)?;
+            sync_directory(parent)?;
+            let installed = verify_archive_streaming(self.destination)?;
+            ensure!(
+                installed.archive_sha256 == sha256,
+                "installed archive checksum changed"
+            );
+            Ok(())
+        })();
+        if let Err(error) = post_install {
+            return Err(remove_failed_checkpoint_install(self.destination, error));
+        }
         Ok(VerifiedCheckpoint {
             session_id: self.session_id.to_owned(),
             archive_path: self.destination.to_path_buf(),
             sha256,
-            event_sequence: sequence,
+            event_frontier,
+            event_frontier_digest,
         })
     }
 
@@ -1246,23 +1248,6 @@ fn cleanup_plan(locator: &TargetLocator, session_id: &str, remote: &str) -> Resu
         description: format!("clean checkpoint for {session_id}"),
         commands,
     })
-}
-
-fn verify_canonical_payload(bytes: &[u8]) -> Result<u64> {
-    ensure!(
-        bytes.is_empty() || bytes.ends_with(b"\n"),
-        "incomplete canonical event frame"
-    );
-    let mut expected = 1_u64;
-    for line in bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        let event: SequencedEvent = serde_json::from_slice(line)?;
-        ensure!(event.seq == expected, "canonical event sequence gap");
-        expected += 1;
-    }
-    Ok(expected - 1)
 }
 
 fn remote_staging_path(session_id: &str) -> Result<String> {
@@ -1421,16 +1406,30 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn remove_failed_checkpoint_install(path: &Path, error: anyhow::Error) -> anyhow::Error {
+    match fs::remove_file(path) {
+        Ok(()) => error,
+        Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => error,
+        Err(remove_error) => error.context(format!(
+            "also failed to remove incomplete checkpoint install {}: {remove_error}",
+            path.display()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::io::{Read, Write};
     use std::process::Command;
     use std::sync::Mutex;
 
-    use crate::hel_archive::GitOutput;
+    use crate::hel_archive::{
+        CanonicalExecutionState, CanonicalQueuedPrompt, CanonicalSessionState,
+        CanonicalTranscriptItem, GitOutput,
+    };
     use crate::hel_targets::CommandOutput;
-    use crate::hel_worker::DurableWorker;
 
     const SESSION: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
     const NATIVE: &str = "0190aabb-ccdd-7eef-9000-abcdef012345";
@@ -1591,13 +1590,31 @@ mod tests {
     }
 
     #[test]
-    fn prompt_detection_reads_canonical_event_type() {
-        let prompted = br#"{"seq":1,"event":{"type":"adapter","data":{"kind":"x","payload":{}}}}
-{"seq":2,"event":{"type":"prompt_accepted","data":{"request_id":"p","text":"hi","attachments":[]}}}"#;
-        assert!(events_contain_prompt(prompted));
-        let unprompted =
-            br#"{"seq":1,"event":{"type":"adapter","data":{"kind":"x","payload":{}}}}"#;
-        assert!(!events_contain_prompt(unprompted));
+    fn prompt_detection_reads_the_materialized_transcript() {
+        let mut snapshot = CanonicalSessionSnapshot {
+            event_frontier: 1,
+            event_frontier_digest: "a".repeat(64),
+            session: CanonicalSessionState {
+                execution: CanonicalExecutionState::Idle,
+                last_activity_at_ms: Some(1),
+                session_title: None,
+                configuration: Default::default(),
+            },
+            transcript: Vec::new(),
+            queued_prompts: Vec::new(),
+        };
+        assert!(!canonical_session_contains_prompt(&snapshot));
+        snapshot.transcript.push(CanonicalTranscriptItem {
+            stable_id: "user-1".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 1,
+            last_changed_at_ms: 1,
+            body: CanonicalTranscriptBody::User {
+                content: vec![json!({"type": "text", "text": "hi"})],
+            },
+        });
+        assert!(canonical_session_contains_prompt(&snapshot));
     }
 
     #[test]
@@ -1832,10 +1849,7 @@ mod tests {
 
     fn fixture(temp: &Path) -> (CheckpointExportSpec, PathBuf) {
         let worker_root = temp.join("worker");
-        let mut worker = DurableWorker::open(&worker_root, SESSION, "0.1.0").unwrap();
-        worker
-            .record_adapter_event("notice", serde_json::json!({}))
-            .unwrap();
+        fs::create_dir_all(&worker_root).unwrap();
         let harness_home = temp.join("codex");
         let native = harness_home.join("sessions/2026/08/09");
         fs::create_dir_all(&native).unwrap();
@@ -1871,7 +1885,7 @@ mod tests {
                     created_at: "2026-08-09T00:00:00Z".into(),
                     checkpointed_at: "2026-08-09T00:01:00Z".into(),
                     hel_version: "0.1.0".into(),
-                    worker_version: "0.1.0".into(),
+                    relay_version: "0.1.0".into(),
                     adapter_version: "test".into(),
                 },
                 target: TargetManifest {
@@ -1883,22 +1897,161 @@ mod tests {
                     id: "bundle".into(),
                     primary_repository: "app".into(),
                 },
-                worker_root,
+                relay_root: worker_root,
                 harness_home,
                 workspace_root: workspace,
                 repositories: vec![CheckpointRepositorySpec {
                     id: "app".into(),
                     relative_destination: "app".into(),
-                    base_commit: base,
-                    session_delta: false,
-                    capture_contents: true,
+                    capture: CheckpointRepositoryCapture::DeltaFrom { base_commit: base },
                     origin_override: None,
                 }],
-                event_sequence: 1,
+                canonical_session: CanonicalSessionSnapshot {
+                    event_frontier: 1,
+                    event_frontier_digest: "a".repeat(64),
+                    session: CanonicalSessionState {
+                        execution: CanonicalExecutionState::Idle,
+                        last_activity_at_ms: Some(1),
+                        session_title: Some("test".into()),
+                        configuration: Default::default(),
+                    },
+                    transcript: vec![CanonicalTranscriptItem {
+                        stable_id: "user-1".into(),
+                        position: 1,
+                        latest_content_event_ordinal: None,
+                        created_at_ms: 1,
+                        last_changed_at_ms: 1,
+                        body: CanonicalTranscriptBody::User {
+                            content: vec![json!({"type": "text", "text": "hello"})],
+                        },
+                    }],
+                    queued_prompts: vec![CanonicalQueuedPrompt {
+                        command_id: "queued-1".into(),
+                        content: vec![json!({"type": "text", "text": "next"})],
+                        queued_at_ms: 2,
+                    }],
+                },
                 output_path: output.clone(),
             },
             output,
         )
+    }
+
+    fn copy_archive_with_schema(source: &Path, destination: &Path, schema_version: u32) {
+        let source = File::open(source).unwrap();
+        let mut archive = zip::ZipArchive::new(source).unwrap();
+        let mut entries = Vec::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let name = entry.name().to_owned();
+            let mode = entry.unix_mode().unwrap_or(0o600);
+            let mut body = Vec::new();
+            entry.read_to_end(&mut body).unwrap();
+            if name == "manifest.json" {
+                let mut manifest: Value = serde_json::from_slice(&body).unwrap();
+                manifest["schema_version"] = json!(schema_version);
+                body = serde_json::to_vec_pretty(&manifest).unwrap();
+            }
+            entries.push((name, mode, body));
+        }
+        let output = File::create(destination).unwrap();
+        let mut writer = zip::ZipWriter::new(output);
+        for (name, mode, body) in entries {
+            writer
+                .start_file(
+                    name,
+                    zip::write::SimpleFileOptions::default().unix_permissions(mode),
+                )
+                .unwrap();
+            writer.write_all(&body).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    fn copy_archive_with_canonical_session(
+        source: &Path,
+        destination: &Path,
+        canonical_session: &CanonicalSessionSnapshot,
+    ) {
+        let source = File::open(source).unwrap();
+        let mut archive = zip::ZipArchive::new(source).unwrap();
+        let mut entries = Vec::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let name = entry.name().to_owned();
+            let mode = entry.unix_mode().unwrap_or(0o600);
+            let mut body = Vec::new();
+            entry.read_to_end(&mut body).unwrap();
+            entries.push((name, mode, body));
+        }
+
+        let canonical_body = serde_json::to_vec_pretty(canonical_session).unwrap();
+        let canonical_sha256 = format!("{:x}", Sha256::digest(&canonical_body));
+        entries
+            .iter_mut()
+            .find(|(name, _, _)| name == "canonical/session.json")
+            .unwrap()
+            .2 = canonical_body.clone();
+        let manifest_body = &mut entries
+            .iter_mut()
+            .find(|(name, _, _)| name == "manifest.json")
+            .unwrap()
+            .2;
+        let mut manifest: Value = serde_json::from_slice(manifest_body).unwrap();
+        let descriptor = manifest["payloads"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|payload| payload["path"] == "canonical/session.json")
+            .unwrap();
+        descriptor["size"] = json!(canonical_body.len());
+        descriptor["sha256"] = json!(canonical_sha256);
+        *manifest_body = serde_json::to_vec_pretty(&manifest).unwrap();
+
+        let output = File::create(destination).unwrap();
+        let mut writer = zip::ZipWriter::new(output);
+        for (name, mode, body) in entries {
+            writer
+                .start_file(
+                    name,
+                    zip::write::SimpleFileOptions::default().unix_permissions(mode),
+                )
+                .unwrap();
+            writer.write_all(&body).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    fn assert_canonical_restore_rejected_before_mutation(
+        spec: &CheckpointExportSpec,
+        invalid_archive: &Path,
+        canonical_session: &CanonicalSessionSnapshot,
+        expected_error: &str,
+    ) {
+        copy_archive_with_canonical_session(&spec.output_path, invalid_archive, canonical_session);
+        let readme = spec.workspace_root.join("app/README.md");
+        let before = fs::read(&readme).unwrap();
+        let relay_root = invalid_archive.with_extension("relay");
+        let harness_home = invalid_archive.with_extension("harness");
+
+        let error = restore_checkpoint(
+            &CheckpointRestoreSpec {
+                archive_path: invalid_archive.to_path_buf(),
+                workspace_root: spec.workspace_root.clone(),
+                relay_root: relay_root.clone(),
+                harness_home: harness_home.clone(),
+                restore_repositories: true,
+                restore_native: true,
+                discard_queued_prompts: false,
+            },
+            &SystemGit,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains(expected_error), "{error:#}");
+        assert_eq!(fs::read(&readme).unwrap(), before);
+        assert!(!relay_root.exists());
+        assert!(!harness_home.exists());
     }
 
     struct CopyExecutor {
@@ -1925,7 +2078,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (spec, source) = fixture(temp.path());
         let target = export_checkpoint(&spec).unwrap();
-        assert_eq!(target.event_sequence, 1);
+        assert_eq!(target.event_frontier, 1);
+        assert_eq!(
+            target.event_frontier_digest,
+            spec.canonical_session.event_frontier_digest
+        );
         let destination = temp.path().join("controller/session.hel.zip");
         let locator = &locators()[0];
         let gate = CheckpointTransfer {
@@ -1933,7 +2090,8 @@ mod tests {
             session_id: SESSION,
             remote_archive: "/var/lib/hel/workers/source.hel.zip",
             destination: &destination,
-            expected_event_sequence: Some(1),
+            expected_event_frontier: Some(1),
+            expected_event_frontier_digest: Some(&spec.canonical_session.event_frontier_digest),
         }
         .execute(&CopyExecutor {
             source,
@@ -1941,7 +2099,11 @@ mod tests {
         })
         .unwrap();
         assert!(gate.teardown_allowed());
-        assert_eq!(gate.event_sequence(), 1);
+        assert_eq!(gate.event_frontier(), 1);
+        assert_eq!(
+            gate.event_frontier_digest(),
+            spec.canonical_session.event_frontier_digest
+        );
         assert_eq!(
             read_archive_verified(&destination).unwrap().archive_sha256,
             gate.sha256()
@@ -1949,10 +2111,36 @@ mod tests {
     }
 
     #[test]
+    fn transfer_rejects_a_same_ordinal_frontier_digest_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, source) = fixture(temp.path());
+        export_checkpoint(&spec).unwrap();
+        let destination = temp.path().join("controller/session.hel.zip");
+        let unexpected_digest = "b".repeat(64);
+
+        let error = CheckpointTransfer {
+            locator: &locators()[0],
+            session_id: SESSION,
+            remote_archive: "/var/lib/hel/workers/source.hel.zip",
+            destination: &destination,
+            expected_event_frontier: Some(1),
+            expected_event_frontier_digest: Some(&unexpected_digest),
+        }
+        .execute(&CopyExecutor {
+            source,
+            calls: RefCell::new(0),
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("event frontier digest mismatch"));
+        assert!(!destination.exists());
+    }
+
+    #[test]
     fn raw_project_export_keeps_git_metadata_without_git_contents() {
         let temp = tempfile::tempdir().unwrap();
         let (mut spec, _) = fixture(temp.path());
-        spec.repositories[0].capture_contents = false;
+        spec.repositories[0].capture = CheckpointRepositoryCapture::MetadataOnly;
         let repository = spec.workspace_root.join("app");
         fs::write(repository.join("README.md"), b"dirty").unwrap();
         fs::write(repository.join("untracked.txt"), b"untracked").unwrap();
@@ -1986,7 +2174,7 @@ mod tests {
     fn session_delta_without_origin_refs_repairs_once_then_fails() {
         let temp = tempfile::tempdir().unwrap();
         let (mut spec, _) = fixture(temp.path());
-        spec.repositories[0].session_delta = true;
+        spec.repositories[0].capture = CheckpointRepositoryCapture::SessionDelta;
         let git = RecordingGit::with_fetch_failure();
 
         let error = export_checkpoint_with_git(&spec, &git).unwrap_err();
@@ -2002,10 +2190,26 @@ mod tests {
     }
 
     #[test]
+    fn invalid_canonical_session_is_rejected_before_repository_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut spec, _) = fixture(temp.path());
+        spec.repositories[0].capture = CheckpointRepositoryCapture::SessionDelta;
+        spec.canonical_session.session.execution =
+            CanonicalExecutionState::Running { started_at_ms: 3 };
+        let git = RecordingGit::with_fetch_failure();
+
+        let error = export_checkpoint_with_git(&spec, &git).unwrap_err();
+
+        assert!(format!("{error:#}").contains("not idle at the checkpoint barrier"));
+        assert_eq!(git.fetches(), 0);
+        assert!(!spec.output_path.exists());
+    }
+
+    #[test]
     fn session_delta_export_succeeds_when_the_repair_fetch_restores_origin_refs() {
         let temp = tempfile::tempdir().unwrap();
         let (mut spec, _) = fixture(temp.path());
-        spec.repositories[0].session_delta = true;
+        spec.repositories[0].capture = CheckpointRepositoryCapture::SessionDelta;
         let repository = spec.workspace_root.join("app");
         let origin = temp.path().join("origin.git");
         git(
@@ -2040,7 +2244,7 @@ mod tests {
     fn raw_project_without_git_metadata_fails_checkpoint_export() {
         let temp = tempfile::tempdir().unwrap();
         let (mut spec, _) = fixture(temp.path());
-        spec.repositories[0].capture_contents = false;
+        spec.repositories[0].capture = CheckpointRepositoryCapture::MetadataOnly;
         fs::remove_dir_all(spec.workspace_root.join("app/.git")).unwrap();
 
         let error = export_checkpoint(&spec).unwrap_err();
@@ -2049,40 +2253,232 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_wire_defaults_preserve_legacy_capture_behavior() {
-        let repository: CheckpointRepositorySpec = serde_json::from_value(json!({
+    fn checkpoint_wire_requires_the_new_capture_mode_and_rejects_legacy_fields() {
+        let legacy = serde_json::from_value::<CheckpointRepositorySpec>(json!({
             "id": "app",
             "relative_destination": "app",
             "base_commit": "HEAD"
+        }));
+        assert!(legacy.is_err());
+
+        let repository: CheckpointRepositorySpec = serde_json::from_value(json!({
+            "id": "app",
+            "relative_destination": "app",
+            "capture": { "mode": "delta_from", "base_commit": "HEAD" },
+            "origin_override": null
         }))
         .unwrap();
-        assert!(repository.capture_contents);
-        assert!(!repository.session_delta);
+        assert_eq!(
+            repository.capture,
+            CheckpointRepositoryCapture::DeltaFrom {
+                base_commit: "HEAD".into()
+            }
+        );
 
-        // Targets running an older worker still report the removed field.
-        let target: TargetCheckpoint = serde_json::from_value(json!({
+        let mixed = serde_json::from_value::<CheckpointRepositorySpec>(json!({
+            "id": "app",
+            "relative_destination": "app",
+            "capture": { "mode": "session_delta" },
+            "origin_override": null,
+            "session_delta": true
+        }));
+        assert!(mixed.is_err());
+
+        // The compatibility reset does not reinterpret the old event frontier.
+        let target = serde_json::from_value::<TargetCheckpoint>(json!({
             "path": "/worker/checkpoint.hel.zip",
             "sha256": "abc",
             "event_sequence": 7,
             "full_history_fallbacks": ["app"]
-        }))
-        .unwrap();
-        assert_eq!(target.event_sequence, 7);
+        }));
+        assert!(target.is_err());
+
+        let restore = json!({
+            "archive_path": "/relay/checkpoint.hel.zip",
+            "workspace_root": "/workspace",
+            "relay_root": "/relay",
+            "harness_home": "/harness",
+            "restore_repositories": true,
+            "restore_native": true,
+            "discard_queued_prompts": false
+        });
+        assert!(serde_json::from_value::<CheckpointRestoreSpec>(restore.clone()).is_ok());
+        let mut missing_flag = restore.clone();
+        missing_flag
+            .as_object_mut()
+            .unwrap()
+            .remove("discard_queued_prompts");
+        assert!(serde_json::from_value::<CheckpointRestoreSpec>(missing_flag).is_err());
+        let mut retired_root = restore;
+        retired_root
+            .as_object_mut()
+            .unwrap()
+            .insert("worker_root".into(), json!("/legacy"));
+        assert!(serde_json::from_value::<CheckpointRestoreSpec>(retired_root).is_err());
+
+        let repository_restore = serde_json::from_value::<RepositoryRestoreSpec>(json!({
+            "archive_path": "/relay/checkpoint.hel.zip",
+            "workspace_root": "/workspace",
+            "legacy": true
+        }));
+        assert!(repository_restore.is_err());
     }
 
     #[test]
-    fn canonical_checkpoint_payload_stops_at_the_latched_frontier() {
+    fn checkpoint_export_wire_uses_relay_root_and_rejects_retired_worker_root() {
         let temp = tempfile::tempdir().unwrap();
         let (spec, _) = fixture(temp.path());
-        let mut worker = DurableWorker::open(&spec.worker_root, SESSION, "0.1.0").unwrap();
-        worker
-            .record_adapter_event("later", serde_json::json!({"text": "excluded"}))
-            .unwrap();
+        let mut value = serde_json::to_value(&spec).unwrap();
+        assert!(value.get("relay_root").is_some());
+        assert!(value.get("worker_root").is_none());
 
-        let payload = collect_canonical_events(&spec.worker_root, spec.event_sequence).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("worker_root".into(), json!("/legacy"));
+        assert!(serde_json::from_value::<CheckpointExportSpec>(value).is_err());
+    }
 
-        assert_eq!(verify_canonical_payload(&payload).unwrap(), 1);
-        assert!(!String::from_utf8(payload).unwrap().contains("excluded"));
+    #[test]
+    fn checkpoint_round_trips_the_latched_materialized_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut spec, _) = fixture(temp.path());
+        spec.canonical_session.event_frontier = 9;
+        spec.canonical_session.transcript[0].position = 7;
+
+        let target = export_checkpoint(&spec).unwrap();
+        assert_eq!(target.event_frontier, 9);
+        assert_eq!(
+            read_checkpoint_session(&spec.output_path).unwrap(),
+            spec.canonical_session
+        );
+    }
+
+    #[test]
+    fn restore_seeds_materialized_session_and_can_discard_queued_prompts() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        export_checkpoint(&spec).unwrap();
+        let relay_root = temp.path().join("restored-relay");
+        restore_checkpoint(
+            &CheckpointRestoreSpec {
+                archive_path: spec.output_path.clone(),
+                workspace_root: spec.workspace_root.clone(),
+                relay_root: relay_root.clone(),
+                harness_home: temp.path().join("restored-harness"),
+                restore_repositories: false,
+                restore_native: false,
+                discard_queued_prompts: true,
+            },
+            &SystemGit,
+        )
+        .unwrap();
+
+        let restored: CanonicalSessionSnapshot = serde_json::from_slice(
+            &fs::read(restored_canonical_session_path(&relay_root)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.event_frontier,
+            spec.canonical_session.event_frontier
+        );
+        assert_eq!(restored.transcript, spec.canonical_session.transcript);
+        assert!(restored.queued_prompts.is_empty());
+        assert!(!relay_root.join("events.jsonl").exists());
+    }
+
+    #[test]
+    fn incompatible_schema_is_rejected_before_restore_mutates_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        export_checkpoint(&spec).unwrap();
+        let readme = spec.workspace_root.join("app/README.md");
+        let before = fs::read(&readme).unwrap();
+
+        for schema_version in [1, crate::hel_archive::ARCHIVE_SCHEMA_VERSION + 1] {
+            let incompatible = temp
+                .path()
+                .join(format!("incompatible-{schema_version}.hel.zip"));
+            copy_archive_with_schema(&spec.output_path, &incompatible, schema_version);
+            let relay_root = temp.path().join(format!("relay-{schema_version}"));
+            let error = restore_checkpoint(
+                &CheckpointRestoreSpec {
+                    archive_path: incompatible,
+                    workspace_root: spec.workspace_root.clone(),
+                    relay_root: relay_root.clone(),
+                    harness_home: temp.path().join("restored-harness"),
+                    restore_repositories: true,
+                    restore_native: true,
+                    discard_queued_prompts: false,
+                },
+                &SystemGit,
+            )
+            .unwrap_err();
+
+            assert!(
+                format!("{error:#}").contains("incompatible Hel archive schema"),
+                "{error:#}"
+            );
+            assert_eq!(fs::read(&readme).unwrap(), before);
+            assert!(!relay_root.exists());
+        }
+    }
+
+    #[test]
+    fn non_idle_canonical_session_is_rejected_before_restore_mutates_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        export_checkpoint(&spec).unwrap();
+        let mut invalid = spec.canonical_session.clone();
+        invalid.session.execution = CanonicalExecutionState::Running { started_at_ms: 3 };
+
+        assert_canonical_restore_rejected_before_mutation(
+            &spec,
+            &temp.path().join("non-idle.hel.zip"),
+            &invalid,
+            "not idle at the checkpoint barrier",
+        );
+    }
+
+    #[test]
+    fn invalid_frontier_digest_is_rejected_before_restore_mutates_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        export_checkpoint(&spec).unwrap();
+        let mut invalid = spec.canonical_session.clone();
+        invalid.event_frontier_digest = "A".repeat(64);
+
+        assert_canonical_restore_rejected_before_mutation(
+            &spec,
+            &temp.path().join("invalid-digest.hel.zip"),
+            &invalid,
+            "64 lowercase hexadecimal characters",
+        );
+    }
+
+    #[test]
+    fn unrestorable_queue_is_rejected_before_restore_mutates_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        export_checkpoint(&spec).unwrap();
+
+        let mut empty = spec.canonical_session.clone();
+        empty.queued_prompts[0].content.clear();
+        assert_canonical_restore_rejected_before_mutation(
+            &spec,
+            &temp.path().join("empty-prompt.hel.zip"),
+            &empty,
+            "has no content",
+        );
+
+        let mut malformed = spec.canonical_session.clone();
+        malformed.queued_prompts[0].content = vec![json!({"type": "not_an_acp_block"})];
+        assert_canonical_restore_rejected_before_mutation(
+            &spec,
+            &temp.path().join("malformed-prompt.hel.zip"),
+            &malformed,
+            "has invalid ACP content block 0",
+        );
     }
 
     #[test]
@@ -2095,9 +2491,7 @@ mod tests {
         spec.repositories.push(CheckpointRepositorySpec {
             id: "worker".into(),
             relative_destination: "worker".into(),
-            base_commit: base,
-            session_delta: false,
-            capture_contents: true,
+            capture: CheckpointRepositoryCapture::DeltaFrom { base_commit: base },
             origin_override: None,
         });
 
@@ -2125,7 +2519,8 @@ mod tests {
             session_id: SESSION,
             remote_archive: "/var/lib/hel/workers/source.hel.zip",
             destination: &destination,
-            expected_event_sequence: None,
+            expected_event_frontier: None,
+            expected_event_frontier_digest: None,
         }
         .execute(&CopyExecutor {
             source: corrupt,
