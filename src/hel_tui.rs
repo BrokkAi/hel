@@ -4355,8 +4355,9 @@ fn render_sessions(
             break;
         }
         visible_sessions += 1;
+        let selected = dashboard.focus == Focus::Active && index == dashboard.session_index;
         let info_y = detail_y.saturating_sub(1);
-        if info_y < active_area.bottom().saturating_sub(1) {
+        if selected && info_y < active_area.bottom().saturating_sub(1) {
             let summary_area = Rect::new(
                 active_area.x.saturating_add(1),
                 info_y,
@@ -4685,6 +4686,9 @@ fn active_session_row(
 /// so one pane-wide run works for every column.
 fn summary_rule_cell(content: Line<'static>, rule_width: usize) -> Cell<'static> {
     let mut spans = content.spans;
+    for span in &mut spans {
+        span.style = span.style.fg(Color::LightYellow);
+    }
     let gap = if spans.iter().all(|span| span.content.is_empty()) {
         ""
     } else {
@@ -6901,7 +6905,7 @@ mod tests {
         );
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
-                .all(|x| buffer[(x, status_y)].bg == Color::DarkGray)
+                .all(|x| buffer[(x, status_y)].bg != Color::DarkGray)
         );
         assert!(status.contains(SUMMARY_RULE));
         assert!(
