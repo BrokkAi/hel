@@ -1245,6 +1245,45 @@ impl Controller {
         additional_mounts: Option<Vec<AdditionalMount>>,
         resource_allocation: Option<SessionResourceAllocation>,
     ) -> Result<WorkerBootstrap> {
+        self.resume_session_with_options_and_queue_disposition(
+            session_id,
+            profile_id,
+            target_id,
+            additional_mounts,
+            resource_allocation,
+            false,
+        )
+        .await
+    }
+
+    pub async fn resume_session_with_queue_disposition(
+        &mut self,
+        session_id: &str,
+        profile_id: &str,
+        target_id: &str,
+        discard_queue: bool,
+    ) -> Result<()> {
+        self.resume_session_with_options_and_queue_disposition(
+            session_id,
+            profile_id,
+            target_id,
+            None,
+            None,
+            discard_queue,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn resume_session_with_options_and_queue_disposition(
+        &mut self,
+        session_id: &str,
+        profile_id: &str,
+        target_id: &str,
+        additional_mounts: Option<Vec<AdditionalMount>>,
+        resource_allocation: Option<SessionResourceAllocation>,
+        discard_queue: bool,
+    ) -> Result<WorkerBootstrap> {
         let previous = self
             .state
             .sessions
@@ -1309,6 +1348,12 @@ impl Controller {
         let same_harness = profile.kind == archive.manifest.session.harness_kind;
         let canonical_events = archive.payload_by_role(&PayloadRole::CanonicalEvents)?;
         let source_latest_seq = canonical_latest_sequence(canonical_events)?;
+        let archived_queue = canonical_events
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_slice)
+            .collect::<serde_json::Result<Vec<crate::hel_worker::SequencedEvent>>>()
+            .map(|events| crate::hel_worker::queued_prompts_from_events(&events))?;
         let context_bytes = profile
             .context_window_bytes
             .unwrap_or(crate::hel_compaction::DEFAULT_CONTEXT_BYTES);
@@ -1368,6 +1413,7 @@ impl Controller {
                 harness_home: target_path(&harness_home),
                 restore_repositories: previous.project_directory.is_none(),
                 restore_native: same_harness,
+                discard_queued_prompts: discard_queue || !same_harness,
             };
             let staging = tempfile::tempdir().context("create restore staging")?;
             let local_spec = staging.path().join("restore-spec.json");
@@ -1443,6 +1489,13 @@ impl Controller {
                         }],
                     )
                     .await?;
+                if !discard_queue {
+                    for prompt in &archived_queue {
+                        client
+                            .enqueue_prompt(prompt.text.clone(), prompt.attachments.clone())
+                            .await?;
+                    }
+                }
             }
             self.mark_worker_connected(session_id, Some(native_session_id))?;
             let bootstrap = client.bootstrap().await?;

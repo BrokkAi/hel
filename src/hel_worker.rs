@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Serialized bytes of events allowed in one replay response, well under
@@ -89,6 +89,16 @@ pub enum WorkerRequest {
         #[serde(default)]
         attachments: Vec<Attachment>,
     },
+    EnqueuePrompt {
+        queue_id: String,
+        text: String,
+        #[serde(default)]
+        attachments: Vec<Attachment>,
+    },
+    RemoveQueuedPrompt {
+        queue_id: String,
+    },
+    ClearQueuedPrompts,
     /// Run a prompt in a disposable ACP session. This does not enter the
     /// destination session's canonical history.
     Compact {
@@ -116,6 +126,9 @@ impl WorkerRequest {
             Self::Snapshot => "snapshot",
             Self::Subscribe { .. } => "subscribe",
             Self::Prompt { .. } => "prompt",
+            Self::EnqueuePrompt { .. } => "enqueue_prompt",
+            Self::RemoveQueuedPrompt { .. } => "remove_queued_prompt",
+            Self::ClearQueuedPrompts => "clear_queued_prompts",
             Self::Compact { .. } => "compact",
             Self::Cancel => "cancel",
             Self::SetConfig { .. } => "set_config",
@@ -128,6 +141,9 @@ impl WorkerRequest {
     const fn minimum_protocol(&self) -> u32 {
         match self {
             Self::CheckpointWhenQuiescent { .. } => 2,
+            Self::EnqueuePrompt { .. }
+            | Self::RemoveQueuedPrompt { .. }
+            | Self::ClearQueuedPrompts => 3,
             _ => 1,
         }
     }
@@ -136,6 +152,9 @@ impl WorkerRequest {
         matches!(
             self,
             Self::Prompt { .. }
+                | Self::EnqueuePrompt { .. }
+                | Self::RemoveQueuedPrompt { .. }
+                | Self::ClearQueuedPrompts
                 | Self::Compact { .. }
                 | Self::Cancel
                 | Self::SetConfig { .. }
@@ -242,6 +261,33 @@ pub struct ActivePrompt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueuedPrompt {
+    pub id: String,
+    pub text: String,
+    pub attachments: Vec<Attachment>,
+    pub created_at_ms: i64,
+}
+
+pub fn queued_prompts_from_events(events: &[SequencedEvent]) -> Vec<QueuedPrompt> {
+    let mut queued = Vec::new();
+    for event in events {
+        match &event.event {
+            WorkerEvent::QueuedPromptAdded { prompt } => queued.push(prompt.clone()),
+            WorkerEvent::QueuedPromptRemoved { queue_id } => {
+                queued.retain(|prompt: &QueuedPrompt| prompt.id != *queue_id);
+            }
+            WorkerEvent::QueuedPromptPromoted { prompt, .. } => {
+                queued.retain(|queued: &QueuedPrompt| queued.id != prompt.id);
+            }
+            WorkerEvent::QueuedPromptsCleared => queued.clear(),
+            _ => {}
+        }
+    }
+    queued
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSnapshot {
     pub session_id: String,
     pub phase: WorkerPhase,
@@ -249,6 +295,8 @@ pub struct WorkerSnapshot {
     pub last_checkpoint_seq: Option<u64>,
     pub active_prompt: Option<ActivePrompt>,
     pub config: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_prompts: Vec<QueuedPrompt>,
     #[serde(default)]
     handled_requests: BTreeMap<String, HandledRequest>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -285,6 +333,7 @@ impl WorkerSnapshot {
             last_checkpoint_seq: None,
             active_prompt: None,
             config: BTreeMap::new(),
+            queued_prompts: Vec::new(),
             handled_requests: BTreeMap::new(),
             dispatches: BTreeMap::new(),
         }
@@ -330,6 +379,17 @@ pub enum WorkerEvent {
         text: String,
         attachments: Vec<Attachment>,
     },
+    QueuedPromptAdded {
+        prompt: QueuedPrompt,
+    },
+    QueuedPromptRemoved {
+        queue_id: String,
+    },
+    QueuedPromptPromoted {
+        prompt: QueuedPrompt,
+        request_id: String,
+    },
+    QueuedPromptsCleared,
     TurnCompleted,
     Cancelled,
     ConfigChanged {
@@ -351,6 +411,13 @@ pub enum WorkerEvent {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
 }
 
 pub struct DurableWorker {
@@ -413,6 +480,9 @@ impl DurableWorker {
             worker.persist_snapshot()?;
         }
         worker.recover_dispatches()?;
+        if worker.snapshot.phase == WorkerPhase::Idle {
+            worker.promote_next_queued_prompt()?;
+        }
         Ok(worker)
     }
 
@@ -493,7 +563,37 @@ impl DurableWorker {
         }
         let seq = self.append_event(None, WorkerEvent::TurnCompleted)?;
         self.complete_prompt_dispatches()?;
+        self.promote_next_queued_prompt()?;
         Ok(seq)
+    }
+
+    fn promote_next_queued_prompt(&mut self) -> Result<Option<u64>> {
+        if self.snapshot.phase != WorkerPhase::Idle {
+            return Ok(None);
+        }
+        let Some(prompt) = self.snapshot.queued_prompts.first().cloned() else {
+            return Ok(None);
+        };
+        let request_id = format!("queue-{}", prompt.id);
+        let seq = self.append_event(
+            Some(&request_id),
+            WorkerEvent::QueuedPromptPromoted {
+                prompt: prompt.clone(),
+                request_id: request_id.clone(),
+            },
+        )?;
+        self.snapshot.dispatches.insert(
+            request_id,
+            DispatchRecord {
+                request: WorkerRequest::Prompt {
+                    text: prompt.text,
+                    attachments: prompt.attachments,
+                },
+                state: DispatchState::Pending,
+            },
+        );
+        self.persist_snapshot()?;
+        Ok(Some(seq))
     }
 
     pub fn record_closed(&mut self) -> Result<u64> {
@@ -661,6 +761,82 @@ impl DurableWorker {
                         text: text.clone(),
                         attachments: attachments.clone(),
                     },
+                )?;
+                ResponsePayload::Accepted { seq }
+            }
+            WorkerRequest::EnqueuePrompt {
+                queue_id,
+                text,
+                attachments,
+            } => {
+                if matches!(
+                    self.snapshot.phase,
+                    WorkerPhase::Closing | WorkerPhase::Closed
+                ) {
+                    return Ok(error(ErrorCode::InvalidState, "worker is closing", false));
+                }
+                if text.is_empty() && attachments.is_empty() {
+                    return Ok(error(ErrorCode::InvalidRequest, "prompt is empty", false));
+                }
+                if self.snapshot.queued_prompts.len() >= 20 {
+                    return Ok(error(
+                        ErrorCode::InvalidState,
+                        "worker already has 20 queued prompts",
+                        false,
+                    ));
+                }
+                if validate_identifier(queue_id, "queued prompt ID").is_err()
+                    || self
+                        .snapshot
+                        .queued_prompts
+                        .iter()
+                        .any(|prompt| prompt.id == *queue_id)
+                {
+                    return Ok(error(
+                        ErrorCode::InvalidRequest,
+                        "invalid queued prompt ID",
+                        false,
+                    ));
+                }
+                let seq = self.append_event(
+                    Some(&envelope.request_id),
+                    WorkerEvent::QueuedPromptAdded {
+                        prompt: QueuedPrompt {
+                            id: queue_id.clone(),
+                            text: text.clone(),
+                            attachments: attachments.clone(),
+                            created_at_ms: now_unix_millis(),
+                        },
+                    },
+                )?;
+                self.promote_next_queued_prompt()?;
+                ResponsePayload::Accepted { seq }
+            }
+            WorkerRequest::RemoveQueuedPrompt { queue_id } => {
+                if !self
+                    .snapshot
+                    .queued_prompts
+                    .iter()
+                    .any(|prompt| prompt.id == *queue_id)
+                {
+                    return Ok(error(
+                        ErrorCode::InvalidRequest,
+                        "unknown queued prompt",
+                        false,
+                    ));
+                }
+                let seq = self.append_event(
+                    Some(&envelope.request_id),
+                    WorkerEvent::QueuedPromptRemoved {
+                        queue_id: queue_id.clone(),
+                    },
+                )?;
+                ResponsePayload::Accepted { seq }
+            }
+            WorkerRequest::ClearQueuedPrompts => {
+                let seq = self.append_event(
+                    Some(&envelope.request_id),
+                    WorkerEvent::QueuedPromptsCleared,
                 )?;
                 ResponsePayload::Accepted { seq }
             }
@@ -932,7 +1108,7 @@ pub(crate) fn recover_native_session_id(events: &[SequencedEvent]) -> Option<Str
                     candidates.push((id.to_owned(), false));
                 }
             }
-            WorkerEvent::PromptAccepted { .. } => {
+            WorkerEvent::PromptAccepted { .. } | WorkerEvent::QueuedPromptPromoted { .. } => {
                 if let Some((_, prompted)) = candidates.last_mut() {
                     *prompted = true;
                 }
@@ -968,6 +1144,26 @@ fn apply_event(snapshot: &mut WorkerSnapshot, event: &SequencedEvent) -> Result<
                 attachments: attachments.clone(),
             });
         }
+        WorkerEvent::QueuedPromptAdded { prompt } => {
+            snapshot.queued_prompts.push(prompt.clone());
+        }
+        WorkerEvent::QueuedPromptRemoved { queue_id } => {
+            snapshot
+                .queued_prompts
+                .retain(|prompt| prompt.id != *queue_id);
+        }
+        WorkerEvent::QueuedPromptPromoted { prompt, request_id } => {
+            snapshot
+                .queued_prompts
+                .retain(|queued| queued.id != prompt.id);
+            snapshot.phase = WorkerPhase::Running;
+            snapshot.active_prompt = Some(ActivePrompt {
+                request_id: request_id.clone(),
+                text: prompt.text.clone(),
+                attachments: prompt.attachments.clone(),
+            });
+        }
+        WorkerEvent::QueuedPromptsCleared => snapshot.queued_prompts.clear(),
         WorkerEvent::TurnCompleted => {
             snapshot.phase = WorkerPhase::Idle;
             snapshot.active_prompt = None;
@@ -995,6 +1191,19 @@ fn apply_event(snapshot: &mut WorkerSnapshot, event: &SequencedEvent) -> Result<
                 text: text.clone(),
                 attachments: attachments.clone(),
             },
+            WorkerEvent::QueuedPromptAdded { prompt } => WorkerRequest::EnqueuePrompt {
+                queue_id: prompt.id.clone(),
+                text: prompt.text.clone(),
+                attachments: prompt.attachments.clone(),
+            },
+            WorkerEvent::QueuedPromptRemoved { queue_id } => WorkerRequest::RemoveQueuedPrompt {
+                queue_id: queue_id.clone(),
+            },
+            WorkerEvent::QueuedPromptPromoted { prompt, .. } => WorkerRequest::Prompt {
+                text: prompt.text.clone(),
+                attachments: prompt.attachments.clone(),
+            },
+            WorkerEvent::QueuedPromptsCleared => WorkerRequest::ClearQueuedPrompts,
             WorkerEvent::Cancelled => WorkerRequest::Cancel,
             WorkerEvent::ConfigChanged { key, value } => WorkerRequest::SetConfig {
                 key: key.clone(),
@@ -1648,6 +1857,107 @@ mod tests {
         };
         assert_eq!(latest_seq, 2);
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn durable_queue_promotes_prompts_without_an_attached_client() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        accepted(&worker.handle(request(
+            "running-prompt",
+            WorkerRequest::Prompt {
+                text: "running".into(),
+                attachments: vec![],
+            },
+        )));
+        accepted(&worker.handle(request(
+            "enqueue-first",
+            WorkerRequest::EnqueuePrompt {
+                queue_id: "queued-first".into(),
+                text: "first".into(),
+                attachments: vec![],
+            },
+        )));
+        accepted(&worker.handle(request(
+            "enqueue-second",
+            WorkerRequest::EnqueuePrompt {
+                queue_id: "queued-second".into(),
+                text: "second".into(),
+                attachments: vec![],
+            },
+        )));
+        assert_eq!(
+            worker
+                .snapshot()
+                .queued_prompts
+                .iter()
+                .map(|prompt| prompt.text.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+
+        worker.record_turn_completed().unwrap();
+
+        assert_eq!(worker.snapshot().phase, WorkerPhase::Running);
+        assert_eq!(
+            worker.snapshot().active_prompt.as_ref().unwrap().text,
+            "first"
+        );
+        assert_eq!(worker.snapshot().queued_prompts[0].text, "second");
+        assert!(
+            worker
+                .claim_pending_dispatches()
+                .unwrap()
+                .iter()
+                .any(|(request_id, request)| request_id == "queue-queued-first"
+                    && matches!(request, WorkerRequest::Prompt { text, .. } if text == "first"))
+        );
+
+        drop(worker);
+        let worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(
+            worker.snapshot().active_prompt.as_ref().unwrap().text,
+            "second"
+        );
+        assert!(worker.snapshot().queued_prompts.is_empty());
+    }
+
+    #[test]
+    fn queued_prompts_can_be_removed_or_cleared_durably() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        accepted(&worker.handle(request(
+            "running-prompt",
+            WorkerRequest::Prompt {
+                text: "running".into(),
+                attachments: vec![],
+            },
+        )));
+        for (index, text) in ["keep", "remove"].into_iter().enumerate() {
+            accepted(&worker.handle(request(
+                &format!("enqueue-{index}"),
+                WorkerRequest::EnqueuePrompt {
+                    queue_id: format!("queued-{index:08}"),
+                    text: text.into(),
+                    attachments: vec![],
+                },
+            )));
+        }
+        accepted(&worker.handle(request(
+            "remove-request",
+            WorkerRequest::RemoveQueuedPrompt {
+                queue_id: "queued-00000001".into(),
+            },
+        )));
+        assert_eq!(worker.snapshot().queued_prompts.len(), 1);
+
+        accepted(&worker.handle(request("clear-request", WorkerRequest::ClearQueuedPrompts)));
+        assert!(worker.snapshot().queued_prompts.is_empty());
+        drop(worker);
+
+        let worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert!(worker.snapshot().queued_prompts.is_empty());
+        assert!(queued_prompts_from_events(&worker.events_after(0).unwrap()).is_empty());
     }
 
     #[test]

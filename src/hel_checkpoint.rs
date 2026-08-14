@@ -105,6 +105,8 @@ pub struct CheckpointRestoreSpec {
     #[serde(default = "default_true")]
     pub restore_repositories: bool,
     pub restore_native: bool,
+    #[serde(default)]
+    pub discard_queued_prompts: bool,
 }
 
 const fn default_true() -> bool {
@@ -148,9 +150,23 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
 
     fs::create_dir_all(&spec.worker_root)?;
     crate::hel_worker::clear_native_session_identity(&spec.worker_root)?;
-    let events = archive.payload_by_role(&PayloadRole::CanonicalEvents)?;
-    let _ = verify_canonical_payload(events)?;
-    write_private_file(&spec.worker_root.join("events.jsonl"), events, 0o600)?;
+    let mut events = archive
+        .payload_by_role(&PayloadRole::CanonicalEvents)?
+        .to_vec();
+    let latest_seq = verify_canonical_payload(&events)?;
+    if spec.discard_queued_prompts {
+        let event = SequencedEvent {
+            seq: latest_seq
+                .checked_add(1)
+                .context("canonical event sequence exhausted while discarding queued prompts")?,
+            recorded_at_ms: None,
+            request_id: None,
+            event: crate::hel_worker::WorkerEvent::QueuedPromptsCleared,
+        };
+        serde_json::to_writer(&mut events, &event)?;
+        events.push(b'\n');
+    }
+    write_private_file(&spec.worker_root.join("events.jsonl"), &events, 0o600)?;
 
     if spec.restore_native {
         for descriptor in &archive.manifest.payloads {
@@ -561,10 +577,12 @@ fn validate_export_spec(spec: &CheckpointExportSpec) -> Result<()> {
 fn events_contain_prompt(canonical_events: &[u8]) -> bool {
     canonical_events.split(|byte| *byte == b'\n').any(|line| {
         serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|event| {
-            event
-                .pointer("/event/type")
-                .and_then(serde_json::Value::as_str)
-                == Some("prompt_accepted")
+            matches!(
+                event
+                    .pointer("/event/type")
+                    .and_then(serde_json::Value::as_str),
+                Some("prompt_accepted" | "queued_prompt_promoted")
+            )
         })
     })
 }

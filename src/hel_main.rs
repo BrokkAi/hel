@@ -16,6 +16,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use hel::hel_archive::{PayloadRole, read_archive_verified};
 use hel::hel_config::{HelConfig, ProjectBundle, ProjectRepository, config_path, sessions_dir};
 use hel::hel_controller::{Controller, SessionLaunchOptions};
 use hel::hel_greeting::{GreetingFacts, RepositoryGreetingFacts};
@@ -31,7 +32,10 @@ use hel::hel_import::{
     scan_codex_sessions, scan_kimi_sessions, session_edit_targets,
 };
 use hel::hel_quota::{ProfileQuota, QuotaManager, QuotaRefreshRequest};
-use hel::hel_server::{ControllerAction, ServerOptions, ViewerQuota, ViewerSnapshot};
+use hel::hel_server::{
+    ControllerAction, ResumeQueueDisposition, ServerOptions, ViewerQueuedPrompt, ViewerQuota,
+    ViewerSnapshot,
+};
 use hel::hel_setup::{SetupOutcome, github_repository_from_origin, run_setup_dialog};
 use hel::hel_state::{
     HelState, SessionResourceAllocation, SessionState, TargetLocator, harness_session_title,
@@ -308,6 +312,7 @@ enum WorkerPollPayload {
         events: Vec<SequencedEvent>,
         phase: WorkerPhase,
         transcript: hel::hel_chat::TranscriptSnapshot,
+        queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
         /// These events predate the connection established by this poll.
         received_while_detached: bool,
     },
@@ -322,6 +327,7 @@ struct WarmWorker {
     spec: CommandSpec,
     client: WorkerClient,
     chat: hel::hel_chat::ChatState,
+    queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
 }
 
 enum WorkerPollCommand {
@@ -805,8 +811,16 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     let mut quotas = QuotaManager::default();
     refresh_all_quotas(&controller, &mut quotas).await;
     let mut revision = 1;
-    let (snapshot_tx, snapshot_rx) =
-        tokio::sync::watch::channel(viewer_snapshot(&controller, &quotas, revision));
+    let mut conversations = std::collections::BTreeMap::new();
+    let mut queued_prompts = archived_queued_prompts(&controller);
+    let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(viewer_snapshot(
+        &controller,
+        &quotas,
+        &conversations,
+        &queued_prompts,
+        revision,
+    ));
+    let (conversation_tx, conversation_rx) = tokio::sync::watch::channel(conversations.clone());
     let (action_tx, mut action_rx) = tokio::sync::mpsc::channel(32);
     let (worker_targets_tx, mut worker_updates_rx, _worker_commands_tx) =
         spawn_dashboard_worker_poller();
@@ -814,7 +828,7 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     let mut recovery = hel::hel_recovery::RecoveryCoordinator::spawn();
     let recovery_observer = recovery.observer();
     let termination = hel::termination::Coordinator::install().token();
-    let mut options = ServerOptions::new(bind, snapshot_rx, action_tx)?;
+    let mut options = ServerOptions::new(bind, snapshot_rx, conversation_rx, action_tx)?;
     options.shutdown = termination.clone();
     if let (Some(cert), Some(key)) = (args.tls_cert, args.tls_key) {
         options.set_tls_config(
@@ -836,17 +850,31 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                 _ = termination.cancelled() => break,
                 update = worker_updates_rx.recv() => {
                     let Some(update) = update else { break };
-                    if let WorkerPollPayload::Events { events, phase, .. } = update.payload
-                        && let Some(session) = controller.state.sessions.get(&update.session_id).cloned()
-                    {
-                        recovery_observer
-                            .observe(hel::hel_recovery::RecoveryObservation {
-                                session,
-                                config: controller.config.clone(),
-                                events,
-                                phase,
-                            })
-                            .await;
+                    if let WorkerPollPayload::Events { events, phase, transcript, queued_prompts: worker_queue, .. } = update.payload {
+                        if let Some(session) = controller.state.sessions.get(&update.session_id).cloned() {
+                            recovery_observer
+                                .observe(hel::hel_recovery::RecoveryObservation {
+                                    session,
+                                    config: controller.config.clone(),
+                                    events,
+                                    phase,
+                                })
+                                .await;
+                        }
+                        conversations.insert(
+                            update.session_id.clone(),
+                            transcript.browser_transcript(None),
+                        );
+                        queued_prompts.insert(update.session_id.clone(), worker_queue);
+                        revision += 1;
+                        conversation_tx.send_replace(conversations.clone());
+                        let _ = snapshot_tx.send(viewer_snapshot(
+                            &controller,
+                            &quotas,
+                            &conversations,
+                            &queued_prompts,
+                            revision,
+                        ));
                     }
                 }
                 _ = recovery_tick.tick() => {
@@ -856,23 +884,31 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                     }
                     if changed {
                         revision += 1;
-                        let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, revision));
+                        let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, revision));
                     }
                 }
                 action = action_rx.recv() => {
-                    let Some(action) = action else { break };
+                    let Some(request) = action else { break };
                     if let ControllerAction::Prompt { session_id, .. }
-                        | ControllerAction::Close { session_id } = &action
+                        | ControllerAction::Close { session_id } = &request.action
                     {
                         recovery_observer.wait_idle(session_id).await;
                         while let Some(result) = recovery.try_result() {
                             merge_recovery_result(&mut controller, result);
                         }
                     }
-                    apply_phone_action(&mut controller, action).await;
+                    let result = apply_phone_action(&mut controller, request.action).await;
+                    if let Err(error) = &result {
+                        eprintln!("Hel phone action failed: {error:#}");
+                    }
                     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
+                    conversations.retain(|id, _| {
+                        controller.state.sessions.get(id).is_some_and(|session| session.state.is_active())
+                    });
                     revision += 1;
-                    let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, revision));
+                    conversation_tx.send_replace(conversations.clone());
+                    let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, revision));
+                    let _ = request.reply.send(result.map_err(|error| format!("{error:#}")));
                 }
             }
         }
@@ -886,8 +922,8 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     Ok(())
 }
 
-async fn apply_phone_action(controller: &mut Controller, action: ControllerAction) {
-    let result = match action {
+async fn apply_phone_action(controller: &mut Controller, action: ControllerAction) -> Result<()> {
+    match action {
         ControllerAction::New {
             profile_id,
             bundle_id,
@@ -898,28 +934,72 @@ async fn apply_phone_action(controller: &mut Controller, action: ControllerActio
             Err(error) => Err(error),
         },
         ControllerAction::Prompt { session_id, text } => {
-            worker_prompt(controller, &session_id, text).await
+            let spec = controller.reconnect_command(&session_id)?;
+            let mut client = WorkerClient::connect(&spec, &session_id).await?;
+            client.enqueue_prompt(text, Vec::new()).await?;
+            client.detach().await
         }
         ControllerAction::Close { session_id } => controller.close_session(&session_id).await,
         ControllerAction::Resume {
             session_id,
             profile_id,
             target_id,
+            queue,
         } => {
             controller
-                .resume_session(&session_id, &profile_id, &target_id)
+                .resume_session_with_queue_disposition(
+                    &session_id,
+                    &profile_id,
+                    &target_id,
+                    queue == ResumeQueueDisposition::Discard,
+                )
                 .await
         }
         ControllerAction::Open { .. } => Ok(()),
-    };
-    if let Err(error) = result {
-        eprintln!("Hel phone action failed: {error:#}");
+        ControllerAction::RemoveQueuedPrompt {
+            session_id,
+            queue_id,
+        } => {
+            let spec = controller.reconnect_command(&session_id)?;
+            let mut client = WorkerClient::connect(&spec, &session_id).await?;
+            client.remove_queued_prompt(queue_id).await?;
+            client.detach().await
+        }
     }
+}
+
+fn archived_queued_prompts(
+    controller: &Controller,
+) -> std::collections::BTreeMap<String, Vec<hel::hel_worker::QueuedPrompt>> {
+    controller
+        .state
+        .sessions
+        .values()
+        .filter_map(|session| {
+            let checkpoint = session.checkpoint.as_ref()?;
+            let archive = read_archive_verified(&checkpoint.archive_path).ok()?;
+            let bytes = archive
+                .payload_by_role(&PayloadRole::CanonicalEvents)
+                .ok()?;
+            let events = bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(serde_json::from_slice)
+                .collect::<serde_json::Result<Vec<SequencedEvent>>>()
+                .ok()?;
+            Some((
+                session.id.clone(),
+                hel::hel_worker::queued_prompts_from_events(&events),
+            ))
+        })
+        .collect()
 }
 
 fn viewer_snapshot(
     controller: &Controller,
     quotas: &QuotaManager,
+    conversations: &std::collections::BTreeMap<String, hel::hel_chat::BrowserTranscript>,
+    queued_prompts: &std::collections::BTreeMap<String, Vec<hel::hel_worker::QueuedPrompt>>,
     revision: u64,
 ) -> ViewerSnapshot {
     let mut snapshot =
@@ -942,6 +1022,42 @@ fn viewer_snapshot(
             has_error: quota.error.is_some(),
         });
     }
+    for session in &mut snapshot.sessions {
+        session.queued_prompts = queued_prompts
+            .get(&session.id)
+            .into_iter()
+            .flatten()
+            .map(|prompt| ViewerQueuedPrompt {
+                id: prompt.id.clone(),
+                text: prompt.text.clone(),
+                created_at: prompt.created_at_ms.to_string(),
+            })
+            .collect();
+        if let Some(transcript) = conversations.get(&session.id) {
+            session.conversation_available = true;
+            let mut lines = transcript
+                .entries
+                .iter()
+                .flat_map(|entry| {
+                    entry
+                        .lines
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(index, line)| {
+                            let line = line.trim();
+                            (!line.is_empty()).then(|| {
+                                if index == 0 {
+                                    format!("{}: {line}", entry.label)
+                                } else {
+                                    line.to_owned()
+                                }
+                            })
+                        })
+                })
+                .collect::<Vec<_>>();
+            session.preview = lines.split_off(lines.len().saturating_sub(4));
+        }
+    }
     snapshot
 }
 
@@ -949,28 +1065,6 @@ async fn refresh_all_quotas(controller: &Controller, quotas: &mut QuotaManager) 
     quotas
         .refresh_profiles(quota_refresh_profiles(controller))
         .await;
-}
-
-async fn worker_prompt(controller: &Controller, session_id: &str, text: String) -> Result<()> {
-    let bundle_id = controller
-        .state
-        .sessions
-        .get(session_id)
-        .with_context(|| format!("unknown session {session_id}"))?
-        .bundle_id
-        .clone();
-    let spec = controller.reconnect_command(session_id)?;
-    let mut client = WorkerClient::connect(&spec, session_id).await?;
-    let sequence = client.prompt(text.clone(), Vec::new()).await?;
-    if let Err(error) =
-        hel::hel_database::record_prompt(session_id, &bundle_id, sequence, None, &text)
-    {
-        tracing::warn!(
-            session_id,
-            "prompt sent but history was not saved: {error:#}"
-        );
-    }
-    client.detach().await
 }
 
 fn quota_refresh_profiles(controller: &Controller) -> Vec<QuotaRefreshRequest> {
@@ -1486,8 +1580,10 @@ async fn poll_dashboard_workers(
                     .get_mut(&target.session_id)
                     .expect("a successfully synced worker remains cached");
                 worker.chat.apply_events(&events);
+                apply_queued_prompt_events(&mut worker.queued_prompts, &events);
                 let phase = worker.chat.phase();
                 let transcript = worker.chat.transcript_snapshot();
+                let queued_prompts = worker.queued_prompts.clone();
                 if recovered
                     && updates
                         .send(WorkerPollUpdate {
@@ -1507,6 +1603,7 @@ async fn poll_dashboard_workers(
                                 events,
                                 phase,
                                 transcript,
+                                queued_prompts,
                                 received_while_detached: false,
                             },
                         })
@@ -1541,12 +1638,14 @@ async fn poll_dashboard_workers(
                             hel::hel_chat::ChatState::new(&bootstrap.snapshot, &bootstrap.events);
                         let phase = chat.phase();
                         let transcript = chat.transcript_snapshot();
+                        let queued_prompts = bootstrap.snapshot.queued_prompts.clone();
                         clients.insert(
                             target.session_id.clone(),
                             WarmWorker {
                                 spec: target.spec.clone(),
                                 client,
                                 chat,
+                                queued_prompts: queued_prompts.clone(),
                             },
                         );
                         if updates
@@ -1566,6 +1665,7 @@ async fn poll_dashboard_workers(
                                     events,
                                     phase,
                                     transcript,
+                                    queued_prompts,
                                     received_while_detached: true,
                                 },
                             })
@@ -1603,6 +1703,27 @@ async fn poll_dashboard_workers(
         }
     }
     true
+}
+
+fn apply_queued_prompt_events(
+    queued: &mut Vec<hel::hel_worker::QueuedPrompt>,
+    events: &[SequencedEvent],
+) {
+    for event in events {
+        match &event.event {
+            hel::hel_worker::WorkerEvent::QueuedPromptAdded { prompt } => {
+                queued.push(prompt.clone());
+            }
+            hel::hel_worker::WorkerEvent::QueuedPromptRemoved { queue_id } => {
+                queued.retain(|prompt| prompt.id != *queue_id);
+            }
+            hel::hel_worker::WorkerEvent::QueuedPromptPromoted { prompt, .. } => {
+                queued.retain(|queued| queued.id != prompt.id);
+            }
+            hel::hel_worker::WorkerEvent::QueuedPromptsCleared => queued.clear(),
+            _ => {}
+        }
+    }
 }
 
 fn current_epoch_seconds() -> u64 {
@@ -1648,6 +1769,7 @@ fn apply_worker_poll_update(
             phase,
             transcript,
             received_while_detached,
+            queued_prompts,
         } => {
             if let Some(title) = harness_session_title(&events)
                 && let Some(session) = controller.state.sessions.get_mut(&update.session_id)
@@ -1665,6 +1787,7 @@ fn apply_worker_poll_update(
                 received_while_detached,
             );
             dashboard.apply_transcript(&update.session_id, transcript);
+            dashboard.apply_queued_prompts(&update.session_id, queued_prompts);
         }
         WorkerPollPayload::Unreachable { detail } => {
             let diagnosis = controller.diagnose_worker(&update.session_id);
@@ -1883,6 +2006,9 @@ async fn run_dashboard() -> Result<()> {
         controller.state.clone(),
         std::collections::BTreeMap::new(),
     );
+    for (session_id, queued) in archived_queued_prompts(&controller) {
+        dashboard.apply_queued_prompts(&session_id, queued);
+    }
     dashboard.set_greeting(greeting);
     let mut terminal = TerminalGuard::enter()?;
     if configuration_needs_setup(&controller.config) {
@@ -2435,7 +2561,18 @@ async fn run_dashboard() -> Result<()> {
                             Some(recovery_context.clone()),
                         )
                         .await
-                        .map(|(exit, client, chat)| (exit, Some(WarmWorker { spec, client, chat })))
+                        .map(|(exit, client, chat)| {
+                            let queued_prompts = chat.queued_prompt_snapshot();
+                            (
+                                exit,
+                                Some(WarmWorker {
+                                    spec,
+                                    client,
+                                    chat,
+                                    queued_prompts,
+                                }),
+                            )
+                        })
                     }
                     None => {
                         async {
@@ -2449,7 +2586,16 @@ async fn run_dashboard() -> Result<()> {
                                 Some(recovery_context),
                             )
                             .await?;
-                            Ok((exit, Some(WarmWorker { spec, client, chat })))
+                            let queued_prompts = chat.queued_prompt_snapshot();
+                            Ok((
+                                exit,
+                                Some(WarmWorker {
+                                    spec,
+                                    client,
+                                    chat,
+                                    queued_prompts,
+                                }),
+                            ))
                         }
                         .await
                     }
@@ -2474,6 +2620,8 @@ async fn run_dashboard() -> Result<()> {
                             );
                             dashboard
                                 .apply_transcript(&session_id, worker.chat.transcript_snapshot());
+                            dashboard
+                                .apply_queued_prompts(&session_id, worker.queued_prompts.clone());
                         }
                         worker_commands_tx
                             .send(WorkerPollCommand::Checkin {
@@ -2518,6 +2666,7 @@ async fn run_dashboard() -> Result<()> {
                 target_template_id,
                 additional_mounts,
                 resource_allocation,
+                discard_queue,
             } => {
                 dashboard.set_notice(resume_progress_notice(
                     &session_id,
@@ -2528,12 +2677,13 @@ async fn run_dashboard() -> Result<()> {
                     .terminal
                     .draw(|frame| render(frame, &mut dashboard))?;
                 let resumed_chat = match controller
-                    .resume_session_with_options(
+                    .resume_session_with_options_and_queue_disposition(
                         &session_id,
                         &profile_id,
                         &target_template_id,
                         Some(additional_mounts),
                         resource_allocation,
+                        discard_queue,
                     )
                     .await
                 {

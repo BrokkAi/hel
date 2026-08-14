@@ -83,6 +83,14 @@ hel server
 hel server --bind 0.0.0.0:3765 --tls-cert ./hel.crt --tls-key ./hel.key
 ```
 
+The web dashboard lists every managed conversation and shows the latest four
+nonempty transcript lines for active sessions. Opening an active conversation
+shows a live feed (including thoughts, tools, and plans) and lets the viewer
+send prompts or remove queued prompts. Prompts are queued durably by the
+target-side worker, so they continue to run in order while the TUI is minimized,
+detached, or not running. Archiving preserves pending prompts in the recovery
+copy; resuming asks whether to start with that queue or discard it.
+
 ## Configuration
 
 Hel reads `~/.config/hel/config.toml` on Linux (the platform-equivalent config

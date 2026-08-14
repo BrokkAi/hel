@@ -22,6 +22,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use serde::Serialize;
 use similar::{ChangeTag, TextDiff};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -47,6 +48,7 @@ pub enum ChatExit {
 pub enum ChatAction {
     None,
     Prompt(String),
+    RemoveQueuedPrompt { id: String, text: String },
     SetConfig { key: String, value: String },
     Cancel,
     ToggleVoice,
@@ -98,6 +100,7 @@ struct Autocomplete {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QueuedPrompt {
+    id: String,
     text: String,
 }
 
@@ -127,6 +130,7 @@ pub enum ChatRole {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatEntry {
+    start_seq: u64,
     pub seq: u64,
     pub role: ChatRole,
     pub text: String,
@@ -144,6 +148,7 @@ pub struct ChatEntry {
 impl ChatEntry {
     fn plain(seq: u64, role: ChatRole, text: impl Into<String>) -> Self {
         Self {
+            start_seq: seq,
             seq,
             role,
             text: sanitize_terminal_text(&text.into()),
@@ -166,6 +171,7 @@ impl ChatEntry {
         tool_status: ToolStatus,
     ) -> Self {
         Self {
+            start_seq: seq,
             seq,
             role: ChatRole::Tool,
             text: sanitize_terminal_text(&title.into()),
@@ -183,6 +189,7 @@ impl ChatEntry {
 
     fn plan(seq: u64, plan: Vec<PlanLine>) -> Self {
         Self {
+            start_seq: seq,
             seq,
             role: ChatRole::Plan,
             text: String::new(),
@@ -249,7 +256,30 @@ struct TranscriptRenderCache {
 #[derive(Debug)]
 pub struct TranscriptSnapshot {
     entries: Vec<ChatEntry>,
+    latest_seq: u64,
+    last_compaction_seq: u64,
     render_cache: TranscriptRenderCache,
+}
+
+const BROWSER_TRANSCRIPT_LINES: usize = 1_000;
+const BROWSER_LINE_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowserTranscript {
+    pub latest_seq: u64,
+    pub window_start_seq: u64,
+    pub reset: bool,
+    pub entries: Vec<BrowserTranscriptEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowserTranscriptEntry {
+    pub id: u64,
+    pub updated_seq: u64,
+    pub role: &'static str,
+    pub label: String,
+    pub recorded_at_ms: Option<i64>,
+    pub lines: Vec<String>,
 }
 
 impl TranscriptSnapshot {
@@ -272,6 +302,136 @@ impl TranscriptSnapshot {
         let start = lines.len().saturating_sub(maximum_lines);
         lines.into_iter().skip(start).collect()
     }
+
+    pub fn browser_transcript(&self, after_seq: Option<u64>) -> BrowserTranscript {
+        let mut entries = self
+            .entries
+            .iter()
+            .filter(|entry| entry.start_seq > self.last_compaction_seq)
+            .map(browser_entry)
+            .collect::<Vec<_>>();
+        let mut remaining = BROWSER_TRANSCRIPT_LINES;
+        for entry in entries.iter_mut().rev() {
+            if entry.lines.len() > remaining {
+                let drop = entry.lines.len() - remaining;
+                entry.lines.drain(..drop);
+            }
+            remaining = remaining.saturating_sub(entry.lines.len());
+        }
+        entries.retain(|entry| !entry.lines.is_empty());
+        if remaining == 0 {
+            while entries.first().is_some_and(|entry| entry.lines.is_empty()) {
+                entries.remove(0);
+            }
+        }
+        let window_start_seq = entries.first().map_or(self.latest_seq, |entry| entry.id);
+        let reset = after_seq.is_some_and(|after| after < window_start_seq);
+        if let Some(after) = after_seq.filter(|_| !reset) {
+            entries.retain(|entry| entry.updated_seq > after);
+        }
+        BrowserTranscript {
+            latest_seq: self.latest_seq,
+            window_start_seq,
+            reset,
+            entries,
+        }
+    }
+
+    pub fn browser_tail(&self, maximum_lines: usize) -> Vec<String> {
+        let mut lines = self
+            .browser_transcript(None)
+            .entries
+            .into_iter()
+            .flat_map(|entry| {
+                entry
+                    .lines
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(move |(index, line)| {
+                        let line = line.trim().to_owned();
+                        (!line.is_empty()).then(|| {
+                            if index == 0 {
+                                format!("{}: {line}", entry.label)
+                            } else {
+                                line
+                            }
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        let start = lines.len().saturating_sub(maximum_lines);
+        lines.drain(..start);
+        lines
+    }
+}
+
+fn browser_entry(entry: &ChatEntry) -> BrowserTranscriptEntry {
+    let (role, label) = match entry.role {
+        ChatRole::User => ("user", "You".to_owned()),
+        ChatRole::Agent => ("agent", "Agent".to_owned()),
+        ChatRole::Thought => ("thought", "Thinking".to_owned()),
+        ChatRole::Tool => (
+            "tool",
+            format!(
+                "Tool · {}",
+                tool_status_name(entry.tool_status.unwrap_or(ToolStatus::Pending))
+            ),
+        ),
+        ChatRole::Plan => ("plan", "Plan".to_owned()),
+        ChatRole::System => ("system", "Hel".to_owned()),
+    };
+    let source = if entry.role == ChatRole::Plan {
+        entry
+            .plan
+            .iter()
+            .map(|line| {
+                let marker = match line.status {
+                    PlanStatus::Pending => "○",
+                    PlanStatus::Running => "●",
+                    PlanStatus::Completed => "✓",
+                };
+                format!("{marker} {}", line.text)
+            })
+            .collect::<Vec<_>>()
+    } else if entry.role == ChatRole::Tool && !entry.tool_diffstats.is_empty() {
+        std::iter::once(entry.text.clone())
+            .chain(entry.tool_diffstats.clone())
+            .collect()
+    } else {
+        entry.text.lines().map(str::to_owned).collect()
+    };
+    BrowserTranscriptEntry {
+        id: entry.start_seq,
+        updated_seq: entry.seq,
+        role,
+        label,
+        recorded_at_ms: entry.recorded_at_ms,
+        lines: source
+            .into_iter()
+            .map(|line| truncate_browser_line(&line))
+            .collect(),
+    }
+}
+
+fn truncate_browser_line(line: &str) -> String {
+    if line.len() <= BROWSER_LINE_BYTES {
+        return line.to_owned();
+    }
+    const SUFFIX: &str = "… [truncated]";
+    let mut end = BROWSER_LINE_BYTES - SUFFIX.len();
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{SUFFIX}", &line[..end])
+}
+
+const fn tool_status_name(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Pending => "waiting",
+        ToolStatus::Running => "running",
+        ToolStatus::Completed => "done",
+        ToolStatus::Failed => "failed",
+    }
 }
 
 impl Default for TranscriptRenderCache {
@@ -289,6 +449,7 @@ pub struct ChatState {
     bundle_id: Option<String>,
     phase: WorkerPhase,
     latest_seq: u64,
+    last_compaction_seq: u64,
     entries: Vec<ChatEntry>,
     input: String,
     input_cursor: usize,
@@ -324,6 +485,7 @@ impl ChatState {
             bundle_id: None,
             phase: snapshot.phase,
             latest_seq: 0,
+            last_compaction_seq: 0,
             entries: Vec::new(),
             input: String::new(),
             input_cursor: 0,
@@ -360,6 +522,16 @@ impl ChatState {
             voice_active: false,
         };
         state.apply_events(events);
+        // Bootstrap replays the full canonical log for transcript projection,
+        // while the snapshot is authoritative for the queue at that frontier.
+        state.queued_prompts = snapshot
+            .queued_prompts
+            .iter()
+            .map(|prompt| QueuedPrompt {
+                id: prompt.id.clone(),
+                text: prompt.text.clone(),
+            })
+            .collect();
         state.latest_seq = state.latest_seq.max(snapshot.latest_seq);
         state
     }
@@ -387,11 +559,6 @@ impl ChatState {
         self.latest_seq
     }
 
-    fn mark_prompt_submitted(&mut self) {
-        self.phase = WorkerPhase::Running;
-        self.notice = None;
-    }
-
     pub fn entries(&self) -> &[ChatEntry] {
         &self.entries
     }
@@ -399,8 +566,22 @@ impl ChatState {
     pub fn transcript_snapshot(&self) -> TranscriptSnapshot {
         TranscriptSnapshot {
             entries: self.entries.clone(),
+            latest_seq: self.latest_seq,
+            last_compaction_seq: self.last_compaction_seq,
             render_cache: TranscriptRenderCache::default(),
         }
+    }
+
+    pub fn queued_prompt_snapshot(&self) -> Vec<crate::hel_worker::QueuedPrompt> {
+        self.queued_prompts
+            .iter()
+            .map(|prompt| crate::hel_worker::QueuedPrompt {
+                id: prompt.id.clone(),
+                text: prompt.text.clone(),
+                attachments: Vec::new(),
+                created_at_ms: 0,
+            })
+            .collect()
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
@@ -970,22 +1151,16 @@ impl ChatState {
         self.update_autocomplete();
     }
 
-    fn edit_latest_queued_prompt(&mut self) {
+    fn edit_latest_queued_prompt(&mut self) -> ChatAction {
         let Some(queued) = self.queued_prompts.pop_back() else {
-            return;
+            return ChatAction::None;
         };
-        self.set_input(queued.text);
+        self.set_input(queued.text.clone());
         self.set_notice("Editing the most recently queued prompt");
-    }
-
-    fn queue_prompt(&mut self, text: String) {
-        self.queued_prompts
-            .push_back(QueuedPrompt { text: text.clone() });
-        self.set_notice(format!(
-            "Queued {}: {}",
-            self.queued_prompts.len(),
-            queued_prompt_preview(&text)
-        ));
+        ChatAction::RemoveQueuedPrompt {
+            id: queued.id,
+            text: queued.text,
+        }
     }
 
     fn show_help(&mut self) {
@@ -1063,19 +1238,7 @@ impl ChatState {
         }
         self.record_prompt_history(&prompt);
         self.clear_input();
-        if self.phase == WorkerPhase::Running {
-            self.queued_prompts.push_back(QueuedPrompt {
-                text: prompt.clone(),
-            });
-            self.set_notice(format!(
-                "Queued {}: {}",
-                self.queued_prompts.len(),
-                queued_prompt_preview(&prompt)
-            ));
-            ChatAction::None
-        } else {
-            ChatAction::Prompt(prompt)
-        }
+        ChatAction::Prompt(prompt)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ChatAction {
@@ -1202,7 +1365,7 @@ impl ChatState {
                 KeyCode::Char('j') | KeyCode::Char('m') => self.insert_character('\n'),
                 KeyCode::Char('p') => {
                     if self.input.is_empty() && !self.queued_prompts.is_empty() {
-                        self.edit_latest_queued_prompt();
+                        return self.edit_latest_queued_prompt();
                     } else if self.input.is_empty() || self.history_index.is_some() {
                         self.move_history(-1);
                     } else {
@@ -1248,7 +1411,9 @@ impl ChatState {
                     self.kill_range(start..self.input_cursor);
                 }
                 KeyCode::Enter => self.insert_character('\n'),
-                KeyCode::Up if !self.queued_prompts.is_empty() => self.edit_latest_queued_prompt(),
+                KeyCode::Up if !self.queued_prompts.is_empty() => {
+                    return self.edit_latest_queued_prompt();
+                }
                 _ => {}
             }
             return ChatAction::None;
@@ -1293,7 +1458,7 @@ impl ChatState {
             }
             KeyCode::Up => {
                 if self.input.is_empty() && !self.queued_prompts.is_empty() {
-                    self.edit_latest_queued_prompt();
+                    return self.edit_latest_queued_prompt();
                 } else if self.input.is_empty() || self.history_index.is_some() {
                     self.move_history(-1);
                 } else {
@@ -1312,8 +1477,7 @@ impl ChatState {
             KeyCode::Left
                 if modifiers.contains(KeyModifiers::SHIFT) && !self.queued_prompts.is_empty() =>
             {
-                self.edit_latest_queued_prompt();
-                ChatAction::None
+                self.edit_latest_queued_prompt()
             }
             KeyCode::Left => {
                 self.move_input_cursor(-1);
@@ -1376,6 +1540,7 @@ impl ChatState {
         match &event.event {
             WorkerEvent::PromptAccepted { text, .. } => {
                 self.phase = WorkerPhase::Running;
+                self.record_accepted_prompt(event.seq, text);
                 self.entries.push(
                     ChatEntry::plain(event.seq, ChatRole::User, text)
                         .with_recorded_at(event.recorded_at_ms),
@@ -1394,8 +1559,30 @@ impl ChatState {
             WorkerEvent::Closed => self.phase = WorkerPhase::Closed,
             WorkerEvent::Checkpointed { .. } => {}
             WorkerEvent::Adapter { payload, .. } => {
+                if is_compaction_artifact(payload) {
+                    self.last_compaction_seq = event.seq;
+                }
                 self.apply_adapter(event.seq, event.recorded_at_ms, payload)
             }
+            WorkerEvent::QueuedPromptAdded { prompt } => {
+                self.queued_prompts.push_back(QueuedPrompt {
+                    id: prompt.id.clone(),
+                    text: prompt.text.clone(),
+                });
+            }
+            WorkerEvent::QueuedPromptRemoved { queue_id } => {
+                self.queued_prompts.retain(|prompt| prompt.id != *queue_id);
+            }
+            WorkerEvent::QueuedPromptPromoted { prompt, .. } => {
+                self.queued_prompts.retain(|queued| queued.id != prompt.id);
+                self.phase = WorkerPhase::Running;
+                self.record_accepted_prompt(event.seq, &prompt.text);
+                self.entries.push(
+                    ChatEntry::plain(event.seq, ChatRole::User, &prompt.text)
+                        .with_recorded_at(event.recorded_at_ms),
+                );
+            }
+            WorkerEvent::QueuedPromptsCleared => self.queued_prompts.clear(),
             WorkerEvent::ConfigChanged { .. } => {}
         }
     }
@@ -1582,6 +1769,17 @@ impl ChatState {
         entry.message_id = message_id;
         self.entries.push(entry);
     }
+}
+
+fn is_compaction_artifact(payload: &serde_json::Value) -> bool {
+    let update = payload.get("update").unwrap_or(payload);
+    matches!(
+        update
+            .get("sessionUpdate")
+            .and_then(serde_json::Value::as_str),
+        Some("compaction" | "context_compaction" | "compaction_summary")
+    ) || update.get("encrypted_content").is_some()
+        || update.get("encryptedContent").is_some()
 }
 
 fn previous_grapheme_boundary(input: &str, cursor: usize) -> usize {
@@ -1923,29 +2121,6 @@ pub async fn run_chat(
                 }
             }
         }
-        if chat.phase == WorkerPhase::Idle
-            && !chat.recovery_busy
-            && let Some(queued) = chat.queued_prompts.pop_front()
-        {
-            match client.prompt(queued.text.clone(), Vec::new()).await {
-                Ok(sequence) => {
-                    chat.record_accepted_prompt(sequence, &queued.text);
-                    chat.mark_prompt_submitted();
-                }
-                Err(error) => {
-                    let dropped = chat.queued_prompts.len();
-                    chat.queued_prompts.clear();
-                    chat.set_input(queued.text);
-                    chat.set_notice(if dropped == 0 {
-                        format!("Queued prompt failed: {error:#}")
-                    } else {
-                        format!(
-                            "Queued prompt failed: {error:#}; dropped {dropped} later prompt(s)"
-                        )
-                    });
-                }
-            }
-        }
         terminal.draw(|frame| render(frame, &mut chat))?;
         // Drain every queued input event before redrawing or syncing: a paste
         // delivers thousands of key events, and one draw + worker sync per
@@ -1967,22 +2142,30 @@ pub async fn run_chat(
             if let Some(action) = action {
                 let result = match action {
                     ChatAction::None => None,
-                    ChatAction::Prompt(text) if chat.recovery_busy => {
-                        chat.queue_prompt(text);
-                        None
+                    ChatAction::Prompt(text) => {
+                        match client.enqueue_prompt(text.clone(), Vec::new()).await {
+                            Ok(_) => {
+                                chat.set_notice(format!(
+                                    "Prompt accepted by worker: {}",
+                                    queued_prompt_preview(&text)
+                                ));
+                                None
+                            }
+                            Err(error) => {
+                                chat.set_input(text);
+                                Some(error)
+                            }
+                        }
                     }
-                    ChatAction::Prompt(text) => match client.prompt(text.clone(), Vec::new()).await
-                    {
-                        Ok(sequence) => {
-                            chat.record_accepted_prompt(sequence, &text);
-                            chat.mark_prompt_submitted();
-                            None
+                    ChatAction::RemoveQueuedPrompt { id, text } => {
+                        match client.remove_queued_prompt(id.clone()).await {
+                            Ok(_) => None,
+                            Err(error) => {
+                                chat.queued_prompts.push_back(QueuedPrompt { id, text });
+                                Some(error)
+                            }
                         }
-                        Err(error) => {
-                            chat.set_input(text);
-                            Some(error)
-                        }
-                    },
+                    }
                     ChatAction::SetConfig { key, value } => {
                         client.set_config(key, value).await.err()
                     }
@@ -2928,6 +3111,13 @@ mod tests {
         KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
     }
 
+    fn queued(id: &str, text: &str) -> QueuedPrompt {
+        QueuedPrompt {
+            id: id.into(),
+            text: text.into(),
+        }
+    }
+
     fn transcript_text(chat: &mut ChatState, width: u16) -> Vec<String> {
         transcript_lines(chat, width)
             .into_iter()
@@ -2975,9 +3165,7 @@ mod tests {
         let _ = transcript_text(&mut chat, 80);
         chat.set_input("draft".into());
         chat.prompt_history.push("previous".into());
-        chat.queued_prompts.push_back(QueuedPrompt {
-            text: "queued".into(),
-        });
+        chat.queued_prompts.push_back(queued("queued-1", "queued"));
         chat.scroll_top = 4;
         chat.follow_bottom = false;
         chat.notice = Some("temporary".into());
@@ -3011,7 +3199,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_sends_while_idle_and_queues_while_running() {
+    fn enter_submits_to_the_worker_while_idle_or_running() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.handle_key(key(KeyCode::Char('h')));
         chat.handle_key(key(KeyCode::Char('i')));
@@ -3029,10 +3217,50 @@ mod tests {
         });
         let mut chat = ChatState::new(&running, &[]);
         chat.handle_key(key(KeyCode::Char('x')));
-        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
-        assert_eq!(chat.queued_prompts.len(), 1);
-        assert_eq!(chat.queued_prompts[0].text, "x");
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::Prompt("x".into())
+        );
+        assert!(chat.queued_prompts.is_empty());
         assert!(chat.entries.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_uses_snapshot_queue_without_duplicating_replayed_additions() {
+        let worker: WorkerSnapshot = serde_json::from_value(serde_json::json!({
+            "session_id": "1234567890",
+            "phase": "running",
+            "latest_seq": 1,
+            "last_checkpoint_seq": null,
+            "active_prompt": null,
+            "config": {},
+            "queued_prompts": [{
+                "id": "queued-0001",
+                "text": "next",
+                "attachments": [],
+                "created_at_ms": 1
+            }],
+            "handled_requests": {}
+        }))
+        .unwrap();
+        let events = [SequencedEvent {
+            seq: 1,
+            recorded_at_ms: Some(1),
+            request_id: Some("enqueue-1".into()),
+            event: WorkerEvent::QueuedPromptAdded {
+                prompt: crate::hel_worker::QueuedPrompt {
+                    id: "queued-0001".into(),
+                    text: "next".into(),
+                    attachments: vec![],
+                    created_at_ms: 1,
+                },
+            },
+        }];
+
+        let chat = ChatState::new(&worker, &events);
+
+        assert_eq!(chat.queued_prompts.len(), 1);
+        assert_eq!(chat.queued_prompts[0].id, "queued-0001");
     }
 
     #[test]
@@ -3050,20 +3278,11 @@ mod tests {
 
         assert_eq!(chat.input, "first\nsecond\nthird");
         assert!(chat.queued_prompts.is_empty());
-        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
-        assert_eq!(chat.queued_prompts.len(), 1);
-        assert_eq!(chat.queued_prompts[0].text, "first\nsecond\nthird");
-    }
-
-    #[test]
-    fn submitting_a_prompt_clears_a_stale_queue_notice() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.set_notice("Queued 1: next");
-
-        chat.mark_prompt_submitted();
-
-        assert_eq!(chat.phase, WorkerPhase::Running);
-        assert!(chat.notice.is_none());
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::Prompt("first\nsecond\nthird".into())
+        );
+        assert!(chat.queued_prompts.is_empty());
     }
 
     #[test]
@@ -3084,9 +3303,7 @@ mod tests {
     fn cancellation_waits_for_turn_completion_before_queue_can_drain() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.phase = WorkerPhase::Running;
-        chat.queued_prompts.push_back(QueuedPrompt {
-            text: "next".into(),
-        });
+        chat.queued_prompts.push_back(queued("queued-1", "next"));
         chat.apply_event(&SequencedEvent {
             seq: 1,
             recorded_at_ms: None,
@@ -3108,14 +3325,16 @@ mod tests {
     #[test]
     fn alt_up_recovers_the_latest_queued_prompt_for_editing() {
         let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.queued_prompts.push_back(QueuedPrompt {
-            text: "first".into(),
-        });
-        chat.queued_prompts.push_back(QueuedPrompt {
-            text: "second".into(),
-        });
+        chat.queued_prompts.push_back(queued("queued-1", "first"));
+        chat.queued_prompts.push_back(queued("queued-2", "second"));
 
-        chat.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(
+            chat.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+            ChatAction::RemoveQueuedPrompt {
+                id: "queued-2".into(),
+                text: "second".into(),
+            }
+        );
 
         assert_eq!(chat.input, "second");
         assert_eq!(chat.queued_prompts.len(), 1);
@@ -3125,9 +3344,12 @@ mod tests {
     #[test]
     fn up_and_control_p_peel_queued_prompts_back_into_the_editor() {
         let mut chat = ChatState::new(&snapshot(), &[]);
-        for text in ["first", "second", "third"] {
-            chat.queued_prompts
-                .push_back(QueuedPrompt { text: text.into() });
+        for (id, text) in [
+            ("queued-1", "first"),
+            ("queued-2", "second"),
+            ("queued-3", "third"),
+        ] {
+            chat.queued_prompts.push_back(queued(id, text));
         }
 
         chat.handle_key(key(KeyCode::Up));
@@ -3832,6 +4054,65 @@ mod tests {
         assert_eq!(tail.len(), 4);
         assert!(tail.iter().all(|line| !line.trim().is_empty()));
         assert_eq!(tail, ["│ two", "│ three", "│ four", "│ five"]);
+    }
+
+    #[test]
+    fn browser_transcript_is_bounded_utf8_safe_and_supports_deltas() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(ChatEntry::plain(
+            1,
+            ChatRole::Agent,
+            (0..1_005)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        chat.entries.push(ChatEntry::plain(
+            2,
+            ChatRole::Thought,
+            "🦀".repeat(BROWSER_LINE_BYTES),
+        ));
+        chat.latest_seq = 2;
+
+        let full = chat.transcript_snapshot().browser_transcript(None);
+        assert_eq!(
+            full.entries
+                .iter()
+                .map(|entry| entry.lines.len())
+                .sum::<usize>(),
+            BROWSER_TRANSCRIPT_LINES
+        );
+        assert_eq!(full.entries.last().unwrap().role, "thought");
+        let truncated = &full.entries.last().unwrap().lines[0];
+        assert!(truncated.ends_with("… [truncated]"));
+        assert!(truncated.len() <= BROWSER_LINE_BYTES);
+        assert!(!full.reset);
+
+        let delta = chat.transcript_snapshot().browser_transcript(Some(1));
+        assert!(!delta.reset);
+        assert_eq!(delta.entries.len(), 1);
+        assert_eq!(delta.entries[0].updated_seq, 2);
+        assert!(chat.transcript_snapshot().browser_transcript(Some(0)).reset);
+    }
+
+    #[test]
+    fn browser_transcript_excludes_entries_before_provider_compaction() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries
+            .push(ChatEntry::plain(1, ChatRole::User, "old"));
+        chat.entries
+            .push(ChatEntry::plain(3, ChatRole::Agent, "current"));
+        chat.latest_seq = 3;
+        chat.last_compaction_seq = 2;
+
+        let browser = chat.transcript_snapshot().browser_transcript(None);
+        assert_eq!(browser.entries.len(), 1);
+        assert_eq!(browser.entries[0].lines, ["current"]);
+        assert_eq!(browser_tail_label(&browser.entries[0]), "Agent: current");
+    }
+
+    fn browser_tail_label(entry: &BrowserTranscriptEntry) -> String {
+        format!("{}: {}", entry.label, entry.lines[0])
     }
 
     #[test]

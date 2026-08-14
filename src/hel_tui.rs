@@ -72,6 +72,7 @@ pub enum DashboardAction {
         target_template_id: String,
         additional_mounts: Vec<AdditionalMount>,
         resource_allocation: Option<SessionResourceAllocation>,
+        discard_queue: bool,
     },
     ResolveAwsResourceOptions {
         target_template_ids: Vec<String>,
@@ -261,6 +262,7 @@ struct ResumeWizard {
     resource_allocation: Option<SessionResourceAllocation>,
     aws_options: BTreeMap<String, Vec<SessionResourceAllocation>>,
     sizing_error: Option<String>,
+    discard_queue: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,6 +515,7 @@ struct SessionDetail {
     unread_agent_message_sequences: Vec<u64>,
     resource_usage: Option<SessionResourceUsage>,
     transcript: Option<TranscriptSnapshot>,
+    queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -675,6 +678,10 @@ impl DashboardState {
                     }
                 }
                 WorkerEvent::ConfigChanged { .. }
+                | WorkerEvent::QueuedPromptAdded { .. }
+                | WorkerEvent::QueuedPromptRemoved { .. }
+                | WorkerEvent::QueuedPromptPromoted { .. }
+                | WorkerEvent::QueuedPromptsCleared
                 | WorkerEvent::Checkpointed { .. }
                 | WorkerEvent::Closing
                 | WorkerEvent::Closed => {
@@ -803,6 +810,17 @@ impl DashboardState {
             .entry(session_id.to_string())
             .or_default()
             .transcript = Some(transcript);
+    }
+
+    pub fn apply_queued_prompts(
+        &mut self,
+        session_id: &str,
+        queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
+    ) {
+        self.session_details
+            .entry(session_id.to_owned())
+            .or_default()
+            .queued_prompts = queued_prompts;
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
@@ -2408,6 +2426,16 @@ impl DashboardState {
             mount_history_host(&self.config.targets[&nth_key(&self.config.targets, wizard.target)])
                 .is_some();
         let order = review_focus_order(can_attach, !wizard.mounts.mounts.is_empty());
+        if code == KeyCode::Char('q')
+            && self
+                .session_details
+                .get(&wizard.session_id)
+                .is_some_and(|detail| !detail.queued_prompts.is_empty())
+        {
+            wizard.discard_queue = !wizard.discard_queue;
+            self.mode = Mode::Resume(wizard);
+            return DashboardAction::None;
+        }
         match code {
             KeyCode::Tab | KeyCode::BackTab => {
                 wizard.review_focus =
@@ -2679,6 +2707,7 @@ impl DashboardState {
             target_template_id: nth_key(&self.config.targets, wizard.target),
             additional_mounts: wizard.mounts.mounts,
             resource_allocation: wizard.resource_allocation,
+            discard_queue: wizard.discard_queue,
         };
         self.cancel_modal();
         action
@@ -2907,6 +2936,7 @@ impl DashboardState {
             resource_allocation: None,
             aws_options: BTreeMap::new(),
             sizing_error: None,
+            discard_queue: false,
         });
         self.resolve_all_aws_resource_options_action()
     }
@@ -4772,6 +4802,7 @@ fn render_new_wizard(
                 focus: wizard.review_focus,
                 title: " New session · 4/4 review ",
                 submit_label: "Create",
+                queue: None,
             },
         );
         return;
@@ -4969,6 +5000,7 @@ struct ReviewWizardView<'a> {
     focus: ReviewFocus,
     title: &'a str,
     submit_label: &'a str,
+    queue: Option<(usize, bool)>,
 }
 
 fn render_review_wizard(
@@ -4986,6 +5018,7 @@ fn render_review_wizard(
         focus,
         title,
         submit_label,
+        queue,
     } = view;
     let target = &dashboard.config.targets[target_id];
     let can_attach = mount_history_host(target).is_some();
@@ -4998,6 +5031,16 @@ fn render_review_wizard(
             resource_allocation_label(allocation, None)
         )),
     ];
+    if let Some((count, discard)) = queue {
+        lines.push(Line::raw(format!(
+            "Queued prompts: {count} · {} (q toggles)",
+            if discard {
+                "discard on resume"
+            } else {
+                "start after resume"
+            }
+        )));
+    }
     if matches!(target, TargetTemplate::LocalBare)
         && dashboard
             .config
@@ -5259,6 +5302,12 @@ fn render_resume_wizard(
                 focus: wizard.review_focus,
                 title: " Resume · 3/3 review ",
                 submit_label: "Resume",
+                queue: dashboard
+                    .session_details
+                    .get(&wizard.session_id)
+                    .map(|detail| detail.queued_prompts.len())
+                    .filter(|count| *count > 0)
+                    .map(|count| (count, wizard.discard_queue)),
             },
         );
         return;
@@ -7137,6 +7186,7 @@ mod tests {
                     cpus: BASELINE_CPUS,
                     memory_bytes: BASELINE_MEMORY_BYTES,
                 }),
+                discard_queue: false,
             }
         );
     }
@@ -7203,6 +7253,7 @@ mod tests {
                     cpus: BASELINE_CPUS,
                     memory_bytes: BASELINE_MEMORY_BYTES,
                 }),
+                discard_queue: false,
             }
         );
     }

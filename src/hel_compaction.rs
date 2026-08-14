@@ -288,6 +288,13 @@ fn parse_complete_raw_history(bytes: &[u8]) -> Result<Vec<Turn>> {
                     });
                 }
             }
+            WorkerEvent::QueuedPromptPromoted { prompt, .. } => {
+                skip_synthetic_turn = false;
+                turns.push(Turn {
+                    user: prompt.text,
+                    events: Vec::new(),
+                });
+            }
             WorkerEvent::Adapter { payload, .. } => {
                 if is_provider_compaction_artifact(&payload) {
                     saw_compaction_artifact = true;

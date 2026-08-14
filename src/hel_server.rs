@@ -4,17 +4,20 @@
 //! redacted projection of controller state and forwards validated, typed
 //! actions through a channel supplied by the controller.
 
+use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result as AnyResult};
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, HeaderValue, SET_COOKIE};
 use axum::http::{Response, StatusCode};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -22,8 +25,10 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::sync::{mpsc, watch};
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::hel_chat::BrowserTranscript;
 use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate, validate_id};
 use crate::hel_state::{HelState, SessionState};
 
@@ -46,7 +51,8 @@ const MAX_PROMPT_CHARS: usize = 64 * 1024;
 pub struct ServerOptions {
     pub bind: SocketAddr,
     pub snapshot_rx: watch::Receiver<ViewerSnapshot>,
-    pub action_tx: mpsc::Sender<ControllerAction>,
+    pub conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
+    pub action_tx: mpsc::Sender<ControllerRequest>,
     pub shutdown: CancellationToken,
     pub session_ttl: Duration,
     /// Keep this enabled for direct HTTPS or an HTTPS reverse proxy. It may be
@@ -61,11 +67,13 @@ impl ServerOptions {
     pub fn new(
         bind: SocketAddr,
         snapshot_rx: watch::Receiver<ViewerSnapshot>,
-        action_tx: mpsc::Sender<ControllerAction>,
+        conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
+        action_tx: mpsc::Sender<ControllerRequest>,
     ) -> AnyResult<Self> {
         Ok(Self {
             bind,
             snapshot_rx,
+            conversation_rx,
             action_tx,
             shutdown: CancellationToken::new(),
             session_ttl: DEFAULT_SESSION_TTL,
@@ -174,6 +182,9 @@ impl ViewerSnapshot {
                 created_at: session.created_at.clone(),
                 updated_at: session.updated_at.clone(),
                 has_error: session.last_error.is_some(),
+                preview: Vec::new(),
+                queued_prompts: Vec::new(),
+                conversation_available: false,
             })
             .collect();
         let profiles = config
@@ -238,6 +249,19 @@ pub struct ViewerSession {
     pub created_at: String,
     pub updated_at: String,
     pub has_error: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_prompts: Vec<ViewerQueuedPrompt>,
+    pub conversation_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerQueuedPrompt {
+    pub id: String,
+    pub text: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +325,7 @@ pub enum ControllerAction {
         session_id: String,
         profile_id: String,
         target_id: String,
+        queue: ResumeQueueDisposition,
     },
     Open {
         session_id: String,
@@ -312,12 +337,30 @@ pub enum ControllerAction {
     Close {
         session_id: String,
     },
+    RemoveQueuedPrompt {
+        session_id: String,
+        queue_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResumeQueueDisposition {
+    Start,
+    Discard,
+}
+
+#[derive(Debug)]
+pub struct ControllerRequest {
+    pub action: ControllerAction,
+    pub reply: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
 #[derive(Clone)]
 struct ServerState {
     snapshot_rx: watch::Receiver<ViewerSnapshot>,
-    action_tx: mpsc::Sender<ControllerAction>,
+    conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
+    action_tx: mpsc::Sender<ControllerRequest>,
     viewer_code: Arc<str>,
     cookie_key: Arc<[u8]>,
     session_ttl: Duration,
@@ -334,6 +377,7 @@ struct CodeGuard {
 fn router(options: ServerOptions) -> Router {
     let state = ServerState {
         snapshot_rx: options.snapshot_rx,
+        conversation_rx: options.conversation_rx,
         action_tx: options.action_tx,
         viewer_code: options.viewer_code.into(),
         cookie_key: options.cookie_key.into(),
@@ -343,6 +387,8 @@ fn router(options: ServerOptions) -> Router {
     };
     let protected = Router::new()
         .route("/api/snapshot", get(snapshot))
+        .route("/api/conversations/{session_id}", get(conversation))
+        .route("/api/events", get(events))
         .route("/api/actions", post(action))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -439,12 +485,72 @@ async fn action(
     Json(action): Json<ControllerAction>,
 ) -> Result<StatusCode, ApiError> {
     validate_action(&action, &state.snapshot_rx.borrow())?;
+    let (reply, result) = tokio::sync::oneshot::channel();
     state
         .action_tx
-        .send(action)
+        .send(ControllerRequest { action, reply })
         .await
         .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "controller unavailable"))?;
+    result
+        .await
+        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "controller unavailable"))?
+        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "action failed"))?;
     Ok(StatusCode::ACCEPTED)
+}
+
+#[derive(Debug, Deserialize)]
+struct ConversationQuery {
+    after_seq: Option<u64>,
+}
+
+async fn conversation(
+    State(state): State<ServerState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<ConversationQuery>,
+) -> Result<Json<BrowserTranscript>, ApiError> {
+    validate_public_id(&session_id)?;
+    let conversations = state.conversation_rx.borrow();
+    let transcript = conversations
+        .get(&session_id)
+        .ok_or_else(|| ApiError::not_found("conversation unavailable"))?;
+    let mut response = transcript.clone();
+    if let Some(after) = query.after_seq {
+        response.reset = after < response.window_start_seq;
+        if !response.reset {
+            response.entries.retain(|entry| entry.updated_seq > after);
+        }
+    }
+    Ok(Json(response))
+}
+
+async fn events(State(state): State<ServerState>) -> impl IntoResponse {
+    let mut snapshots = state.snapshot_rx.clone();
+    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(8);
+    tokio::spawn(async move {
+        let initial = snapshots.borrow().revision;
+        if tx
+            .send(Ok(Event::default()
+                .event("revision")
+                .data(initial.to_string())))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        while snapshots.changed().await.is_ok() {
+            let revision = snapshots.borrow_and_update().revision;
+            if tx
+                .send(Ok(Event::default()
+                    .event("revision")
+                    .data(revision.to_string())))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
 
 fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Result<(), ApiError> {
@@ -467,6 +573,7 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
             session_id,
             profile_id,
             target_id,
+            ..
         } => {
             validate_public_id(session_id)?;
             validate_public_id(profile_id)?;
@@ -487,6 +594,14 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
                     "prompt must contain 1-65536 characters",
                 ));
             }
+        }
+        ControllerAction::RemoveQueuedPrompt {
+            session_id,
+            queue_id,
+        } => {
+            validate_public_id(session_id)?;
+            validate_public_id(queue_id)?;
+            require_session_record(snapshot, session_id)?;
         }
     }
     Ok(())
@@ -793,22 +908,29 @@ const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 
 
 const VIEWER_HTML: &str = r##"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#08090d"><link rel="manifest" href="/manifest.webmanifest"><title>Hel</title>
-<style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}.danger{background:#ff786f}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.session h3{margin:0 0 8px}.session p{margin:5px 0}textarea{width:100%;box-sizing:border-box;min-height:76px}</style></head>
+<style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}textarea{width:100%;box-sizing:border-box;min-height:76px}#conversation-feed{min-height:30vh}</style></head>
 <body><header><div><h1>HEL</h1><div class="dim">Welcome to Hel.</div></div><button id="logout" class="hidden">Sign out</button></header>
 <main id="login" class="card"><h2>Unlock viewer</h2><p class="dim">Enter the six-digit code shown by <code>hel server</code>.</p><form id="login-form" class="row"><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required><button>Enter</button></form><p id="login-error"></p></main>
-<main id="app" class="hidden"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><button>Start</button></form><p id="action-error"></p></section><section><h2>Sessions</h2><div id="sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></main>
+<main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><button>Start</button></form><p id="action-error"></p></section><section><h2>Sessions</h2><div id="sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div></section><form id="prompt-form" class="card"><textarea id="prompt-text" maxlength="65536" placeholder="Message the agent" required></textarea><button>Send or queue</button><p id="conversation-error"></p></form></section></main>
 <script>
-const login=document.querySelector('#login'),app=document.querySelector('#app'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),actionError=document.querySelector('#action-error');
+const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue');let snapshot,currentSession,cursor=0,eventsStarted=false;
 async function request(url,options={}){const response=await fetch(url,{...options,headers:{'content-type':'application/json',...(options.headers||{})}});if(response.status===401)throw new Error('unauthorized');if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||response.statusText)}return response.status===204?null:response.json()}
 function options(items,selected){return items.map(x=>`<option value="${escapeAttr(x.id)}" ${x.id===selected?'selected':''}>${escapeHtml(x.id)}</option>`).join('')}
-async function refresh(){try{const s=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(s.profiles);if(!newBundle.value)newBundle.innerHTML=options(s.bundles);if(!newTarget.value)newTarget.innerHTML=options(s.targets);sessions.innerHTML=s.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span> ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)}</p><div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}">Open</button><button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Archive</button></div><form class="prompt row" data-id="${escapeAttr(x.id)}"><textarea placeholder="Message the agent"></textarea><button>Send</button></form></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=s.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${s.targets.length} targets · ${s.bundles.length} bundles</p>`}catch(e){if(e.message==='unauthorized'){login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}}}
+async function refresh(){try{snapshot=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);sessions.innerHTML=snapshot.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span> ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available?'':'disabled'}>Open</button><button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Archive</button></div></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);document.querySelector('#conversation-state').textContent=session.state}}if(!eventsStarted){eventsStarted=true;const source=new EventSource('/api/events');source.addEventListener('revision',()=>{refresh();if(currentSession)loadConversation(true)})}}catch(e){if(e.message==='unauthorized'){login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}}}
+function renderQueue(session){queue.innerHTML=(session.queued_prompts||[]).map((x,i)=>`<div class="queue-item"><span>${i+1}. ${escapeHtml(x.text)}</span><button class="danger" data-queue-id="${escapeAttr(x.id)}">Remove</button></div>`).join('')||'<p class="dim">No queued prompts.</p>'}
+function renderEntries(entries,replace){if(replace)feed.innerHTML='';for(const entry of entries){let node=document.querySelector(`[data-entry-id="${entry.id}"]`);if(!node){node=document.createElement('article');node.dataset.entryId=entry.id;feed.append(node)}node.className=`entry ${entry.role}`;const title=document.createElement('strong');title.textContent=entry.label;const body=document.createElement('pre');body.textContent=entry.lines.join('\n');node.replaceChildren(title,body)}window.scrollTo(0,document.body.scrollHeight)}
+async function loadConversation(delta=false){if(!currentSession)return;try{const result=await request(`/api/conversations/${encodeURIComponent(currentSession)}${delta&&cursor?`?after_seq=${cursor}`:''}`);renderEntries(result.entries,!delta||result.reset);cursor=result.latest_seq}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
+async function openConversation(id){currentSession=id;cursor=0;location.hash=`conversation/${id}`;dashboard.classList.add('hidden');conversation.classList.remove('hidden');const session=snapshot.sessions.find(x=>x.id===id);document.querySelector('#conversation-title').textContent=session?.title||'Conversation';document.querySelector('#conversation-state').textContent=session?.state||'';renderQueue(session||{});await loadConversation(false)}
+function showDashboard(){currentSession=null;cursor=0;location.hash='';conversation.classList.add('hidden');dashboard.classList.remove('hidden')}
 document.querySelector('#login-form').onsubmit=async e=>{e.preventDefault();try{await request('/auth/session',{method:'POST',body:JSON.stringify({code:document.querySelector('#code').value})});document.querySelector('#login-error').textContent='';refresh()}catch(err){document.querySelector('#login-error').textContent=err.message}};
 logout.onclick=async()=>{await request('/auth/session',{method:'DELETE'});location.reload()};
 newForm.onsubmit=async e=>{e.preventDefault();try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'new',title:document.querySelector('#new-title').value,profile_id:newProfile.value,bundle_id:newBundle.value,target_id:newTarget.value})});document.querySelector('#new-title').value='';actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
-sessions.onclick=async e=>{const button=e.target.closest('button[data-action]');if(!button)return;if(button.dataset.action==='close'&&!confirm('Save a recovery copy, archive, and destroy this session target?'))return;const body={action:button.dataset.action,session_id:button.dataset.id};if(button.dataset.action==='resume'){body.profile_id=button.dataset.profile;body.target_id=button.dataset.target}try{await request('/api/actions',{method:'POST',body:JSON.stringify(body)});actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
-sessions.onsubmit=async e=>{if(!e.target.matches('.prompt'))return;e.preventDefault();const text=e.target.querySelector('textarea');await request('/api/actions',{method:'POST',body:JSON.stringify({action:'prompt',session_id:e.target.dataset.id,text:text.value})});text.value=''};
+sessions.onclick=async e=>{const button=e.target.closest('button[data-action]');if(!button)return;if(button.dataset.action==='open')return openConversation(button.dataset.id);if(button.dataset.action==='close'&&!confirm('Save a recovery copy, archive, and destroy this session target? Queued prompts will be preserved.'))return;const body={action:button.dataset.action,session_id:button.dataset.id};if(button.dataset.action==='resume'){body.profile_id=button.dataset.profile;body.target_id=button.dataset.target;const session=snapshot.sessions.find(x=>x.id===button.dataset.id);body.queue='start';if(session?.queued_prompts?.length){const choice=prompt(`This session has ${session.queued_prompts.length} queued prompt(s). Type start to run them after resume, or discard to remove them.`,'start');if(choice===null)return;if(!['start','discard'].includes(choice.toLowerCase()))return alert('Enter start or discard.');body.queue=choice.toLowerCase()}}try{await request('/api/actions',{method:'POST',body:JSON.stringify(body)});actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
+document.querySelector('#back').onclick=showDashboard;
+document.querySelector('#prompt-form').onsubmit=async e=>{e.preventDefault();const text=document.querySelector('#prompt-text');try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'prompt',session_id:currentSession,text:text.value})});text.value='';document.querySelector('#conversation-error').textContent='';await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
+queue.onclick=async e=>{const button=e.target.closest('button[data-queue-id]');if(!button)return;try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'remove-queued-prompt',session_id:currentSession,queue_id:button.dataset.queueId})});await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
 function escapeHtml(value){const e=document.createElement('span');e.textContent=value;return e.innerHTML}function escapeAttr(value){return escapeHtml(value).replaceAll('"','&quot;')}
-if('serviceWorker'in navigator)navigator.serviceWorker.register('/service-worker.js');refresh();setInterval(refresh,5000);
+if('serviceWorker'in navigator)navigator.serviceWorker.register('/service-worker.js');refresh().then(()=>{const match=location.hash.match(/^#conversation\/([A-Za-z0-9_-]+)$/);if(match)openConversation(match[1])});
 </script></body></html>"##;
 
 #[cfg(test)]
@@ -896,14 +1018,26 @@ mod tests {
         (config, state)
     }
 
-    fn app() -> (Router, mpsc::Receiver<ControllerAction>) {
+    fn app() -> (Router, mpsc::Receiver<ControllerRequest>) {
+        app_with_conversations(BTreeMap::new())
+    }
+
+    fn app_with_conversations(
+        conversations: BTreeMap<String, BrowserTranscript>,
+    ) -> (Router, mpsc::Receiver<ControllerRequest>) {
         let (config, state) = sample_config_state();
         let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
         let (_snapshot_tx, snapshot_rx) = watch::channel(snapshot);
+        let (_conversation_tx, conversation_rx) = watch::channel(conversations);
         let (action_tx, action_rx) = mpsc::channel(8);
-        let options = ServerOptions::new("127.0.0.1:0".parse().unwrap(), snapshot_rx, action_tx)
-            .unwrap()
-            .with_test_credentials("123456", b"01234567890123456789012345678901");
+        let options = ServerOptions::new(
+            "127.0.0.1:0".parse().unwrap(),
+            snapshot_rx,
+            conversation_rx,
+            action_tx,
+        )
+        .unwrap()
+        .with_test_credentials("123456", b"01234567890123456789012345678901");
         (router(options), action_rx)
     }
 
@@ -997,8 +1131,8 @@ mod tests {
     async fn valid_action_is_typed_and_forwarded() {
         let (app, mut actions) = app();
         let cookie = login_cookie(&app).await;
-        let response = app
-            .oneshot(
+        let response = tokio::spawn(
+            app.oneshot(
                 Request::post("/api/actions")
                     .header(COOKIE, cookie)
                     .header(CONTENT_TYPE, "application/json")
@@ -1006,17 +1140,19 @@ mod tests {
                         r#"{"action":"prompt","session_id":"session-1","text":"ship it"}"#,
                     ))
                     .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
+            ),
+        );
+        let action = actions.recv().await.unwrap();
         assert_eq!(
-            actions.recv().await,
-            Some(ControllerAction::Prompt {
+            action.action,
+            ControllerAction::Prompt {
                 session_id: "session-1".into(),
                 text: "ship it".into(),
-            })
+            }
         );
+        action.reply.send(Ok(())).unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
@@ -1038,6 +1174,7 @@ mod tests {
                 session_id: "session-1".into(),
                 profile_id: "claude-1".into(),
                 target_id: "podman".into(),
+                queue: ResumeQueueDisposition::Start,
             },
             &snapshot,
         )
@@ -1071,5 +1208,50 @@ mod tests {
         assert!(body.contains("session-1"));
         assert!(!body.contains("secret-token"));
         assert!(!body.contains("native-secret-id"));
+    }
+
+    #[tokio::test]
+    async fn conversation_endpoint_returns_authenticated_bounded_deltas() {
+        let transcript = BrowserTranscript {
+            latest_seq: 8,
+            window_start_seq: 3,
+            reset: false,
+            entries: vec![
+                crate::hel_chat::BrowserTranscriptEntry {
+                    id: 3,
+                    updated_seq: 3,
+                    role: "user",
+                    label: "You".into(),
+                    recorded_at_ms: None,
+                    lines: vec!["begin".into()],
+                },
+                crate::hel_chat::BrowserTranscriptEntry {
+                    id: 7,
+                    updated_seq: 8,
+                    role: "agent",
+                    label: "Agent".into(),
+                    recorded_at_ms: None,
+                    lines: vec!["live".into()],
+                },
+            ],
+        };
+        let (app, _) = app_with_conversations(BTreeMap::from([("session-1".into(), transcript)]));
+        let cookie = login_cookie(&app).await;
+        let response = app
+            .oneshot(
+                Request::get("/api/conversations/session-1?after_seq=3")
+                    .header(COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["latest_seq"], 8);
+        assert_eq!(body["reset"], false);
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body["entries"][0]["lines"][0], "live");
     }
 }
