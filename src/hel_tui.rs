@@ -7061,6 +7061,7 @@ mod tests {
                 phase: WorkerPhase::Running,
                 latest_seq: 1,
                 latest_completed_turn_seq: None,
+                native_session_id: None,
                 session_title: None,
                 unread_agent_messages: 1,
                 agent_text_stream_open: true,

@@ -267,6 +267,8 @@ pub struct WorkerSessionSummary {
     pub phase: WorkerPhase,
     pub latest_seq: u64,
     pub latest_completed_turn_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
     pub session_title: Option<String>,
     pub unread_agent_messages: u64,
     pub agent_text_stream_open: bool,
@@ -820,6 +822,7 @@ impl DurableWorker {
                     latest_completed_turn_seq: crate::hel_recovery::latest_completed_turn_seq(
                         &self.events,
                     ),
+                    native_session_id: self.native_session_id.clone(),
                     session_title: crate::hel_state::harness_session_title(&self.events),
                     unread_agent_messages: u64::try_from(
                         self.agent_message_start_sequences.len().saturating_sub(
@@ -1570,6 +1573,17 @@ mod tests {
     fn session_summary_hydrates_without_waiting_for_a_new_event_and_is_bounded() {
         let temp = tempfile::tempdir().unwrap();
         let mut worker = DurableWorker::open(temp.path(), SESSION, "1.0.0").unwrap();
+        worker
+            .record_native_session_started(
+                "session_started",
+                serde_json::json!({
+                    "type": "session_started",
+                    "native_session_id": "native-session",
+                    "resumed": false
+                }),
+                "native-session",
+            )
+            .unwrap();
         accepted(&worker.handle(request(
             "prompt",
             WorkerRequest::Prompt {
@@ -1595,6 +1609,10 @@ mod tests {
             running_summary.last_agent_message_id.as_deref(),
             Some("answer")
         );
+        assert_eq!(
+            running_summary.native_session_id.as_deref(),
+            Some("native-session")
+        );
         worker.record_turn_completed().unwrap();
 
         let response = worker.handle(request(
@@ -1606,8 +1624,8 @@ mod tests {
         ));
         assert!(serde_json::to_vec(&response).unwrap().len() < TRANSCRIPT_TAIL_BYTE_BUDGET);
         let summary = session_summary(response);
-        assert_eq!(summary.latest_seq, 3);
-        assert_eq!(summary.latest_completed_turn_seq, Some(3));
+        assert_eq!(summary.latest_seq, 4);
+        assert_eq!(summary.latest_completed_turn_seq, Some(4));
         assert_eq!(summary.unread_agent_messages, 1);
         assert!(!summary.agent_text_stream_open);
         assert!(!summary.transcript_tail.is_empty());
@@ -1621,9 +1639,28 @@ mod tests {
                 transcript_entry_limit: 10,
             },
         )));
-        assert_eq!(summary.latest_seq, 3);
+        assert_eq!(summary.latest_seq, 4);
+        assert_eq!(summary.native_session_id.as_deref(), Some("native-session"));
         assert_eq!(summary.unread_agent_messages, 1);
         assert!(!summary.transcript_tail.is_empty());
+    }
+
+    #[test]
+    fn legacy_session_summary_without_native_identity_remains_compatible() {
+        let summary: WorkerSessionSummary = serde_json::from_value(serde_json::json!({
+            "phase": "idle",
+            "latest_seq": 0,
+            "latest_completed_turn_seq": null,
+            "session_title": null,
+            "unread_agent_messages": 0,
+            "agent_text_stream_open": false,
+            "last_agent_message_id": null,
+            "transcript_tail": [],
+            "queued_prompts": []
+        }))
+        .unwrap();
+
+        assert_eq!(summary.native_session_id, None);
     }
 
     #[test]

@@ -863,7 +863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_waits_for_the_observed_tool_cohort_to_finish() {
+    async fn checkpoint_waits_until_all_observed_tools_finish() {
         let temp = tempfile::tempdir().unwrap();
         let worker = Arc::new(Mutex::new(
             crate::hel_worker::DurableWorker::open(
@@ -922,6 +922,73 @@ mod tests {
         assert_eq!(
             worker.lock().unwrap().snapshot().last_checkpoint_seq,
             Some(5)
+        );
+
+        drop(event_tx);
+        drop(checkpoint_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_does_not_wait_for_end_of_turn_without_open_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = crate::hel_worker::DurableWorker::open(
+            temp.path(),
+            "018f9dd2-a3b4-7c8d-9000-123456789abc",
+            "1.0.0",
+        )
+        .unwrap();
+        let response = durable.handle(crate::hel_worker::RequestEnvelope {
+            request_id: "running-prompt".into(),
+            protocol_version: crate::hel_worker::PROTOCOL_VERSION,
+            request: crate::hel_worker::WorkerRequest::Prompt {
+                text: "running".into(),
+                attachments: vec![],
+            },
+        });
+        assert!(matches!(
+            response.body,
+            crate::hel_worker::ResponseBody::Ok {
+                payload: crate::hel_worker::ResponsePayload::Accepted { .. }
+            }
+        ));
+        let worker = Arc::new(Mutex::new(durable));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (checkpoint_tx, checkpoint_rx) = mpsc::unbounded_channel();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let coordinator = tokio::spawn(unix::run_event_coordinator(
+            worker.clone(),
+            event_rx,
+            checkpoint_rx,
+            command_tx,
+        ));
+        let (response_tx, response_rx) = oneshot::channel();
+        checkpoint_tx
+            .send(unix::CheckpointBarrier {
+                envelope: crate::hel_worker::RequestEnvelope {
+                    request_id: "checkpoint-request".into(),
+                    protocol_version: crate::hel_worker::PROTOCOL_VERSION,
+                    request: crate::hel_worker::WorkerRequest::CheckpointWhenQuiescent {
+                        reason: Some("test".into()),
+                    },
+                },
+                response: response_tx,
+            })
+            .unwrap();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), response_rx)
+            .await
+            .expect("checkpoint should not wait for PromptFinished")
+            .unwrap();
+        assert!(matches!(
+            response.body,
+            crate::hel_worker::ResponseBody::Ok {
+                payload: crate::hel_worker::ResponsePayload::Accepted { .. }
+            }
+        ));
+        assert_eq!(
+            worker.lock().unwrap().snapshot().phase,
+            crate::hel_worker::WorkerPhase::Running
         );
 
         drop(event_tx);
