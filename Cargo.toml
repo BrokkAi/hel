@@ -68,6 +68,9 @@ tokio-stream = "0.1"
 toml = "0.8"
 tracing = "0.1"
 unicode-segmentation = "1"
+# Measures display width without the temporary `Line` that `Line::width()`
+# needs; transcript wrapping calls this once per grapheme.
+unicode-width = "0.2"
 url = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 

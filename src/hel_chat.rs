@@ -289,18 +289,41 @@ impl TranscriptSnapshot {
             .any(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty())
     }
 
-    pub(crate) fn rich_tail(&mut self, width: u16, maximum_lines: usize) -> Vec<Line<'static>> {
-        let lines = transcript_entry_lines(
+    #[cfg(test)]
+    fn rich_tail(&mut self, width: u16, maximum_lines: usize) -> Vec<Line<'static>> {
+        self.rich_tail_scrolled(width, maximum_lines, 0).0
+    }
+
+    /// The last `maximum_lines` non-empty rows, skipping `scroll` rows above the
+    /// live tail. Renders only the entries the window touches. Returns the rows
+    /// and the scroll actually applied, clamped to the history available.
+    pub(crate) fn rich_tail_scrolled(
+        &mut self,
+        width: u16,
+        maximum_lines: usize,
+        scroll: usize,
+    ) -> (Vec<Line<'static>>, usize) {
+        prepare_render_cache(
             &self.entries,
             &mut self.render_cache,
             width,
             TranscriptRenderMode::Rich,
-        )
-        .into_iter()
-        .filter(|line| !line_is_empty(line))
-        .collect::<Vec<_>>();
-        let start = lines.len().saturating_sub(maximum_lines);
-        lines.into_iter().skip(start).collect()
+        );
+        let wanted = maximum_lines.saturating_add(scroll);
+        let mut collected: VecDeque<Line<'static>> = VecDeque::new();
+        'entries: for index in (0..self.entries.len()).rev() {
+            let lines = cached_entry_lines(&self.entries, &mut self.render_cache, index);
+            for line in lines.iter().rev().filter(|line| !line_is_empty(line)) {
+                if collected.len() >= wanted {
+                    break 'entries;
+                }
+                collected.push_front(line.clone());
+            }
+        }
+        let applied = scroll.min(collected.len().saturating_sub(maximum_lines));
+        let end = collected.len() - applied;
+        let start = end.saturating_sub(maximum_lines);
+        (collected.drain(start..end).collect(), applied)
     }
 
     pub fn browser_transcript(&self, after_seq: Option<u64>) -> BrowserTranscript {
@@ -434,6 +457,56 @@ const fn tool_status_name(status: ToolStatus) -> &'static str {
     }
 }
 
+/// Where the transcript viewport is pinned. Anchoring to an entry rather than an
+/// absolute row keeps the view stable while the agent appends new rows below,
+/// and lets the renderer touch only the entries the viewport covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptAnchor {
+    /// Follow the newest rows.
+    Bottom,
+    /// The top visible row is `row` rows into `entry`.
+    Row { entry: usize, row: usize },
+}
+
+/// Drop cached rows that a width or mode change invalidated, and size the cache
+/// to the current entry count.
+fn prepare_render_cache(
+    entries: &[ChatEntry],
+    cache: &mut TranscriptRenderCache,
+    width: u16,
+    mode: TranscriptRenderMode,
+) {
+    if cache.width != width || cache.mode != mode {
+        cache.width = width;
+        cache.mode = mode;
+        cache.entries.clear();
+    }
+    cache.entries.resize(entries.len(), None);
+}
+
+/// Rendered rows for one entry, rendering and caching it on first use.
+/// `prepare_render_cache` must have run for the current width and mode.
+fn cached_entry_lines<'cache>(
+    entries: &[ChatEntry],
+    cache: &'cache mut TranscriptRenderCache,
+    index: usize,
+) -> &'cache [Line<'static>] {
+    let entry = &entries[index];
+    let stale = cache.entries[index]
+        .as_ref()
+        .is_none_or(|cached| cached.revision != entry.revision);
+    if stale {
+        cache.entries[index] = Some(CachedEntry {
+            revision: entry.revision,
+            lines: render_transcript_entry(entry, usize::from(cache.width), cache.mode),
+        });
+    }
+    &cache.entries[index]
+        .as_ref()
+        .expect("the entry was just rendered")
+        .lines
+}
+
 impl Default for TranscriptRenderCache {
     fn default() -> Self {
         Self {
@@ -469,9 +542,7 @@ pub struct ChatState {
     current_model: Option<String>,
     current_effort: Option<String>,
     autocomplete: Option<Autocomplete>,
-    scroll_top: usize,
-    follow_bottom: bool,
-    last_content_height: usize,
+    anchor: TranscriptAnchor,
     last_viewport_height: usize,
     render_mode: TranscriptRenderMode,
     render_cache: TranscriptRenderCache,
@@ -517,9 +588,7 @@ impl ChatState {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
             autocomplete: None,
-            scroll_top: 0,
-            follow_bottom: true,
-            last_content_height: 0,
+            anchor: TranscriptAnchor::Bottom,
             last_viewport_height: 0,
             render_mode: TranscriptRenderMode::Rich,
             render_cache: TranscriptRenderCache::default(),
@@ -624,9 +693,7 @@ impl ChatState {
         self.history_search = None;
         self.queued_prompts.clear();
         self.autocomplete = None;
-        self.scroll_top = 0;
-        self.follow_bottom = true;
-        self.last_content_height = 0;
+        self.anchor = TranscriptAnchor::Bottom;
         self.last_viewport_height = 0;
         self.render_mode = TranscriptRenderMode::Rich;
         self.notice = None;
@@ -1406,10 +1473,9 @@ impl ChatState {
                     self.kill_range(self.input_cursor..end);
                 }
                 KeyCode::Home => {
-                    self.scroll_top = 0;
-                    self.follow_bottom = false;
+                    self.anchor = TranscriptAnchor::Row { entry: 0, row: 0 };
                 }
-                KeyCode::End => self.follow_bottom = true,
+                KeyCode::End => self.anchor = TranscriptAnchor::Bottom,
                 _ => {}
             }
             return ChatAction::None;
@@ -1531,25 +1597,159 @@ impl ChatState {
         }
     }
 
-    fn scroll_history_up(&mut self, rows: usize) {
-        if self.follow_bottom {
-            self.scroll_top = self
-                .last_content_height
-                .saturating_sub(self.last_viewport_height);
+    /// Rows for the current anchor, rendering only the entries the viewport
+    /// covers rather than the whole transcript.
+    fn viewport(&mut self, width: u16, height: usize) -> TranscriptViewport {
+        prepare_render_cache(
+            &self.entries,
+            &mut self.render_cache,
+            width,
+            self.render_mode,
+        );
+        let top = TranscriptAnchor::Row { entry: 0, row: 0 };
+        if self.entries.is_empty() {
+            return TranscriptViewport {
+                rows: vec![empty_transcript_row()],
+                anchor: TranscriptAnchor::Bottom,
+                top,
+            };
         }
-        self.follow_bottom = false;
-        self.scroll_top = self.scroll_top.saturating_sub(rows);
+        if let TranscriptAnchor::Row { entry, row } = self.anchor
+            && entry < self.entries.len()
+        {
+            let mut rows = Vec::with_capacity(height);
+            let mut skip = row;
+            for index in entry..self.entries.len() {
+                let lines = cached_entry_lines(&self.entries, &mut self.render_cache, index);
+                for line in lines.iter().skip(skip) {
+                    if rows.len() == height {
+                        break;
+                    }
+                    rows.push(line.clone());
+                }
+                skip = 0;
+                if rows.len() == height {
+                    break;
+                }
+            }
+            // Anchors inside the final screenful cannot fill the viewport; those
+            // views already reach the newest row, so follow the tail instead of
+            // painting a short page.
+            if rows.len() == height {
+                let anchor = TranscriptAnchor::Row { entry, row };
+                return TranscriptViewport {
+                    rows,
+                    anchor,
+                    top: anchor,
+                };
+            }
+        }
+        self.tail_viewport(height)
+    }
+
+    /// The last `height` rows, walking backwards from the newest entry. These
+    /// rows always reach the newest row, so the anchor to store is `Bottom`.
+    fn tail_viewport(&mut self, height: usize) -> TranscriptViewport {
+        let mut rows: VecDeque<Line<'static>> = VecDeque::with_capacity(height);
+        let mut top = TranscriptAnchor::Row { entry: 0, row: 0 };
+        if height == 0 {
+            return TranscriptViewport {
+                rows: rows.into(),
+                anchor: TranscriptAnchor::Bottom,
+                top,
+            };
+        }
+        for index in (0..self.entries.len()).rev() {
+            let lines = cached_entry_lines(&self.entries, &mut self.render_cache, index);
+            let take = height.saturating_sub(rows.len());
+            let start = lines.len().saturating_sub(take);
+            for line in lines[start..].iter().rev() {
+                rows.push_front(line.clone());
+            }
+            top = TranscriptAnchor::Row {
+                entry: index,
+                row: start,
+            };
+            if rows.len() >= height {
+                break;
+            }
+        }
+        TranscriptViewport {
+            rows: rows.into(),
+            anchor: TranscriptAnchor::Bottom,
+            top,
+        }
+    }
+
+    /// Rendered row count for one entry, filling the cache on demand.
+    fn entry_rows(&mut self, index: usize) -> usize {
+        let width = self.render_cache.width;
+        prepare_render_cache(
+            &self.entries,
+            &mut self.render_cache,
+            width,
+            self.render_mode,
+        );
+        cached_entry_lines(&self.entries, &mut self.render_cache, index).len()
+    }
+
+    /// The anchor the current view is showing, resolving `Bottom` into the
+    /// concrete entry and row at the top of the viewport. `None` before the
+    /// first draw, when no width is known to wrap against.
+    fn resolved_anchor(&mut self) -> Option<TranscriptAnchor> {
+        if self.render_cache.width == 0 {
+            return None;
+        }
+        Some(match self.anchor {
+            TranscriptAnchor::Row { entry, row } if entry < self.entries.len() => {
+                TranscriptAnchor::Row { entry, row }
+            }
+            _ => self.tail_viewport(self.last_viewport_height.max(1)).top,
+        })
+    }
+
+    fn scroll_history_up(&mut self, rows: usize) {
+        let Some(TranscriptAnchor::Row { mut entry, mut row }) = self.resolved_anchor() else {
+            // Either no draw has happened yet, or the transcript is shorter than
+            // the viewport and has nothing above it.
+            return;
+        };
+        let mut remaining = rows;
+        while remaining > 0 {
+            if row > 0 {
+                let step = remaining.min(row);
+                row -= step;
+                remaining -= step;
+            } else if entry > 0 {
+                entry -= 1;
+                row = self.entry_rows(entry);
+            } else {
+                break;
+            }
+        }
+        self.anchor = TranscriptAnchor::Row { entry, row };
     }
 
     fn scroll_history_down(&mut self, rows: usize) {
-        let maximum = self
-            .last_content_height
-            .saturating_sub(self.last_viewport_height);
-        self.scroll_top = self.scroll_top.saturating_add(rows);
-        if self.scroll_top >= maximum {
-            self.scroll_top = maximum;
-            self.follow_bottom = true;
+        let Some(TranscriptAnchor::Row { mut entry, mut row }) = self.resolved_anchor() else {
+            return;
+        };
+        let mut remaining = rows;
+        while remaining > 0 {
+            let below = self.entry_rows(entry).saturating_sub(row + 1);
+            if below >= remaining {
+                row += remaining;
+                break;
+            }
+            if entry + 1 >= self.entries.len() {
+                self.anchor = TranscriptAnchor::Bottom;
+                return;
+            }
+            remaining -= below + 1;
+            entry += 1;
+            row = 0;
         }
+        self.anchor = TranscriptAnchor::Row { entry, row };
     }
 
     fn apply_event(&mut self, event: &SequencedEvent) {
@@ -2785,28 +2985,22 @@ fn append_dictation(prefix: &str, transcript: &str) -> String {
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatState) {
-    let lines = transcript_lines(chat, area.width);
     let viewport_height = usize::from(area.height.saturating_sub(2));
-    let maximum = lines.len().saturating_sub(viewport_height);
-    chat.last_content_height = lines.len();
     chat.last_viewport_height = viewport_height;
-    if chat.follow_bottom {
-        chat.scroll_top = maximum;
-    } else {
-        chat.scroll_top = chat.scroll_top.min(maximum);
-    }
-    let title = if chat.follow_bottom {
-        match chat.render_mode {
-            TranscriptRenderMode::Rich => " Conversation ".to_owned(),
-            TranscriptRenderMode::Raw => " Conversation · raw source ".to_owned(),
+    let window = chat.viewport(area.width, viewport_height);
+    // The window resolves and clamps the anchor: an anchor inside the last
+    // screenful snaps back to following the tail.
+    chat.anchor = window.anchor;
+    let title = match (chat.anchor, chat.render_mode) {
+        (TranscriptAnchor::Bottom, TranscriptRenderMode::Rich) => " Conversation ".to_owned(),
+        (TranscriptAnchor::Bottom, TranscriptRenderMode::Raw) => {
+            " Conversation · raw source ".to_owned()
         }
-    } else {
-        format!(
-            " Conversation · rows {}–{} of {} · End to follow ",
-            chat.scroll_top.saturating_add(1),
-            (chat.scroll_top + viewport_height).min(lines.len()),
-            lines.len()
-        )
+        (TranscriptAnchor::Row { entry, .. }, _) => format!(
+            " Conversation · message {} of {} · End to follow ",
+            entry.saturating_add(1),
+            chat.entries.len()
+        ),
     };
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
@@ -2814,9 +3008,9 @@ fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatState) {
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let visible = lines
+    let visible = window
+        .rows
         .into_iter()
-        .skip(chat.scroll_top)
         .take(usize::from(inner.height))
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(visible), inner);
@@ -2859,55 +3053,47 @@ fn render_agent_message_lines(
     .collect()
 }
 
-/// Render the complete transcript into already-wrapped visual rows. Keeping
-/// layout separate from painting makes scrolling a count of actual terminal
-/// rows rather than logical message lines.
+/// Render every row of the transcript. Rendering surfaces are all incremental
+/// now, so this exists only for tests that assert on the whole projection.
+#[cfg(test)]
 fn transcript_lines(chat: &mut ChatState, width: u16) -> Vec<Line<'static>> {
-    transcript_entry_lines(
+    prepare_render_cache(
         &chat.entries,
         &mut chat.render_cache,
         width,
         chat.render_mode,
-    )
-}
-
-fn transcript_entry_lines(
-    entries: &[ChatEntry],
-    render_cache: &mut TranscriptRenderCache,
-    width: u16,
-    mode: TranscriptRenderMode,
-) -> Vec<Line<'static>> {
-    if render_cache.width != width || render_cache.mode != mode {
-        render_cache.width = width;
-        render_cache.mode = mode;
-        render_cache.entries.clear();
-    }
-    render_cache.entries.resize(entries.len(), None);
+    );
     let mut lines = Vec::new();
-    for (index, entry) in entries.iter().enumerate() {
-        let cached = render_cache.entries[index]
-            .as_ref()
-            .filter(|cached| cached.revision == entry.revision)
-            .map(|cached| cached.lines.clone());
-        let entry_lines = cached.unwrap_or_else(|| {
-            let rendered = render_transcript_entry(entry, usize::from(width), mode);
-            render_cache.entries[index] = Some(CachedEntry {
-                revision: entry.revision,
-                lines: rendered.clone(),
-            });
-            rendered
-        });
-        lines.extend(entry_lines);
+    for index in 0..chat.entries.len() {
+        lines.extend_from_slice(cached_entry_lines(
+            &chat.entries,
+            &mut chat.render_cache,
+            index,
+        ));
     }
     if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No messages yet — send a prompt to begin.",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        )));
+        lines.push(empty_transcript_row());
     }
     lines
+}
+
+fn empty_transcript_row() -> Line<'static> {
+    Line::from(Span::styled(
+        "No messages yet — send a prompt to begin.",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    ))
+}
+
+/// The rows a viewport shows, with both the anchor to persist and the concrete
+/// position the rows start at.
+struct TranscriptViewport {
+    rows: Vec<Line<'static>>,
+    /// The anchor to store: `Bottom` whenever these rows reach the newest row.
+    anchor: TranscriptAnchor,
+    /// The entry and row the first visible row came from.
+    top: TranscriptAnchor,
 }
 
 fn render_transcript_entry(
@@ -3192,8 +3378,7 @@ mod tests {
         chat.set_input("draft".into());
         chat.prompt_history.push("previous".into());
         chat.queued_prompts.push_back(queued("queued-1", "queued"));
-        chat.scroll_top = 4;
-        chat.follow_bottom = false;
+        chat.anchor = TranscriptAnchor::Row { entry: 0, row: 4 };
         chat.notice = Some("temporary".into());
         chat.voice_active = true;
 
@@ -3205,8 +3390,7 @@ mod tests {
         assert_eq!(chat.input_cursor, "draft".len());
         assert!(chat.prompt_history.is_empty());
         assert!(chat.queued_prompts.is_empty());
-        assert_eq!(chat.scroll_top, 0);
-        assert!(chat.follow_bottom);
+        assert_eq!(chat.anchor, TranscriptAnchor::Bottom);
         assert!(chat.notice.is_none());
         assert!(!chat.voice_active);
     }
@@ -4243,35 +4427,138 @@ mod tests {
         assert!(text.iter().any(|line| line == "│   gamma"));
     }
 
+    /// A chat with `count` single-line user messages, each naming its index so
+    /// scroll assertions can name the row they expect to see.
+    fn numbered_chat(count: usize) -> ChatState {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries = (0..count)
+            .map(|index| ChatEntry::plain(index as u64, ChatRole::User, format!("message {index}")))
+            .collect();
+        chat
+    }
+
+    /// Draw the chat and return the transcript rows currently on screen.
+    fn drawn_transcript(chat: &mut ChatState, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, chat))
+            .expect("draw chat");
+        let buffer = terminal.backend().buffer();
+        (buffer.area.y..buffer.area.bottom())
+            .map(|y| {
+                (buffer.area.x..buffer.area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn shows(rows: &[String], needle: &str) -> bool {
+        rows.iter().any(|row| row.contains(needle))
+    }
+
+    /// The message bodies on screen, ignoring the title and composer chrome.
+    fn visible_messages(rows: &[String]) -> Vec<String> {
+        rows.iter()
+            .filter(|row| row.starts_with("│ message "))
+            .cloned()
+            .collect()
+    }
+
     #[test]
     fn page_navigation_keeps_end_attached_to_the_latest_message() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.last_content_height = 30;
-        chat.last_viewport_height = 10;
+        let mut chat = numbered_chat(40);
+        let rows = drawn_transcript(&mut chat, 60, 24);
+        assert!(shows(&rows, "message 39"), "opens on the newest message");
+        assert!(!shows(&rows, "End to follow"), "the tail needs no hint");
+
         chat.handle_key(key(KeyCode::PageUp));
-        assert_eq!(chat.scroll_top, 10);
-        assert!(!chat.follow_bottom);
+        let rows = drawn_transcript(&mut chat, 60, 24);
+        assert!(!shows(&rows, "message 39"), "page up leaves the tail");
+        assert!(
+            shows(&rows, "End to follow"),
+            "scrolled back says how to return"
+        );
+
         chat.handle_key(key(KeyCode::PageDown));
-        assert_eq!(chat.scroll_top, 20);
-        assert!(chat.follow_bottom);
+        let rows = drawn_transcript(&mut chat, 60, 24);
+        assert!(shows(&rows, "message 39"), "page down returns to the tail");
+
         chat.handle_key(key(KeyCode::PageUp));
         chat.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
-        assert!(chat.follow_bottom);
+        let rows = drawn_transcript(&mut chat, 60, 24);
+        assert!(
+            shows(&rows, "message 39"),
+            "Ctrl-End follows the tail again"
+        );
+        assert!(!shows(&rows, "End to follow"));
+    }
+
+    #[test]
+    fn control_home_and_end_reach_both_ends_of_a_long_transcript() {
+        let mut chat = numbered_chat(200);
+        let _ = drawn_transcript(&mut chat, 40, 24);
+
+        chat.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+        let rows = drawn_transcript(&mut chat, 40, 24);
+        assert!(shows(&rows, "message 0"), "Ctrl-Home reaches the first row");
+        assert!(!shows(&rows, "message 199"));
+
+        chat.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+        let rows = drawn_transcript(&mut chat, 40, 24);
+        assert!(shows(&rows, "message 199"), "Ctrl-End reaches the last row");
     }
 
     #[test]
     fn mouse_wheel_scrolls_chat_history_and_resumes_following_at_bottom() {
-        let mut chat = ChatState::new(&snapshot(), &[]);
-        chat.last_content_height = 30;
-        chat.last_viewport_height = 10;
+        let mut chat = numbered_chat(40);
+        let _ = drawn_transcript(&mut chat, 40, 24);
 
         chat.handle_mouse(mouse(MouseEventKind::ScrollUp));
-        assert_eq!(chat.scroll_top, 17);
-        assert!(!chat.follow_bottom);
+        let scrolled = drawn_transcript(&mut chat, 40, 24);
+        assert!(!shows(&scrolled, "message 39"), "wheel up leaves the tail");
 
         chat.handle_mouse(mouse(MouseEventKind::ScrollDown));
-        assert_eq!(chat.scroll_top, 20);
-        assert!(chat.follow_bottom);
+        let rows = drawn_transcript(&mut chat, 40, 24);
+        assert!(shows(&rows, "message 39"), "wheel down resumes following");
+        assert!(!rows.iter().any(|row| row.contains("End to follow")));
+    }
+
+    #[test]
+    fn scrolled_history_stays_put_while_new_messages_stream_in() {
+        let mut chat = numbered_chat(40);
+        let _ = drawn_transcript(&mut chat, 40, 24);
+        chat.handle_key(key(KeyCode::PageUp));
+        let before = drawn_transcript(&mut chat, 40, 24);
+
+        for index in 40..50 {
+            chat.entries.push(ChatEntry::plain(
+                index as u64,
+                ChatRole::User,
+                format!("message {index}"),
+            ));
+        }
+        let after = drawn_transcript(&mut chat, 40, 24);
+
+        assert_eq!(
+            visible_messages(&before),
+            visible_messages(&after),
+            "appending messages must not move a scrolled-back viewport"
+        );
+        assert!(!visible_messages(&after).is_empty());
+    }
+
+    #[test]
+    fn a_transcript_shorter_than_the_viewport_cannot_scroll() {
+        let mut chat = numbered_chat(2);
+        let rows = drawn_transcript(&mut chat, 40, 24);
+
+        chat.handle_mouse(mouse(MouseEventKind::ScrollUp));
+        chat.handle_key(key(KeyCode::PageUp));
+
+        assert_eq!(rows, drawn_transcript(&mut chat, 40, 24));
     }
 
     #[test]

@@ -37,6 +37,8 @@ const SUMMARY_RULE: &str = "─";
 const DASHBOARD_FIXED_HEIGHT: u16 = 3;
 const DASHBOARD_PANE_COUNT: usize = 4;
 const MOUSE_SCROLL_ROWS: isize = 3;
+/// Rows one wheel notch moves the selected session's conversation preview.
+const PREVIEW_SCROLL_ROWS: usize = 3;
 const IMPORT_STALL_WARNING_AFTER: Duration = Duration::from_secs(10);
 
 /// A side effect requested by the dashboard.
@@ -602,6 +604,14 @@ pub struct DashboardState {
     focus: Focus,
     pane_areas: Option<[Rect; DASHBOARD_PANE_COUNT]>,
     import_sessions_area: Option<Rect>,
+    /// Hitbox of the selected session's conversation preview, so the wheel can
+    /// scroll that preview instead of moving the selection.
+    selected_preview_area: Option<Rect>,
+    /// Rows the selected session's preview sits above its live tail. Only one
+    /// preview scrolls at a time; selecting another session snaps this back to
+    /// the tail, which is why the owning session is tracked alongside it.
+    preview_scroll: usize,
+    preview_scroll_session: Option<String>,
     mode: Mode,
     notice: Option<String>,
     greeting: String,
@@ -624,6 +634,9 @@ impl DashboardState {
             focus: Focus::Active,
             pane_areas: None,
             import_sessions_area: None,
+            selected_preview_area: None,
+            preview_scroll: 0,
+            preview_scroll_session: None,
             mode: Mode::Dashboard,
             notice: None,
             greeting: "Welcome to Hel".into(),
@@ -1221,6 +1234,22 @@ impl DashboardState {
             return;
         }
         if !matches!(self.mode, Mode::Dashboard) {
+            return;
+        }
+        // The selected session's conversation preview scrolls its own history;
+        // anywhere else the wheel moves the hovered list's selection.
+        if let Some(area) = self.selected_preview_area
+            && rect_contains(area, mouse.column, mouse.row)
+        {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.preview_scroll = self.preview_scroll.saturating_add(PREVIEW_SCROLL_ROWS);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.preview_scroll = self.preview_scroll.saturating_sub(PREVIEW_SCROLL_ROWS);
+                }
+                _ => {}
+            }
             return;
         }
         let hovered = self.pane_areas.and_then(|areas| {
@@ -3659,6 +3688,7 @@ impl ResumeWizard {
 
 pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     dashboard.pane_areas = None;
+    dashboard.selected_preview_area = None;
     let area = frame.area();
     dashboard.import_sessions_area =
         matches!(dashboard.mode, Mode::Import(_)).then(|| import_sessions_pane(area));
@@ -3787,8 +3817,10 @@ fn render_adaptive_dashboard(
     dashboard: &mut DashboardState,
 ) {
     let preview_width = inner.width.saturating_sub(4);
+    // A provisional pass sizes the rows; the authoritative pass below runs once
+    // the pane height, and with it the selected session's line budget, is known.
     let full_active_previews =
-        prepare_active_previews(dashboard, preview_width, SELECTED_TRANSCRIPT_LINES);
+        prepare_active_previews(dashboard, preview_width, SELECTED_TRANSCRIPT_LINES).previews;
     let (active_count, archived_count) = {
         let (active, archived) = partition_sessions(
             dashboard.state.sessions.values(),
@@ -3865,7 +3897,14 @@ fn render_adaptive_dashboard(
     )
     .min(SELECTED_TRANSCRIPT_LINES);
     let active_previews = prepare_active_previews(dashboard, preview_width, selected_lines);
-    render_sessions(frame, panes[0], panes[1], dashboard, &active_previews);
+    dashboard.preview_scroll = active_previews.applied_scroll;
+    render_sessions(
+        frame,
+        panes[0],
+        panes[1],
+        dashboard,
+        &active_previews.previews,
+    );
     render_capacity(frame, panes[2], dashboard);
     render_quotas(frame, panes[3], dashboard);
     render_footer(frame, fixed[2], dashboard);
@@ -3916,7 +3955,7 @@ fn prepare_active_previews(
     dashboard: &mut DashboardState,
     preview_width: u16,
     maximum_selected_lines: usize,
-) -> Vec<Vec<Line<'static>>> {
+) -> ActivePreviews {
     let active_ids = partition_sessions(
         dashboard.state.sessions.values(),
         &dashboard.session_details,
@@ -3929,18 +3968,43 @@ fn prepare_active_previews(
     let selected_active = (dashboard.focus == Focus::Active)
         .then_some(dashboard.session_index)
         .filter(|index| *index < active_ids.len());
-    active_ids
-        .iter()
-        .enumerate()
-        .map(|(index, session_id)| {
-            let detail = dashboard.session_details.get_mut(session_id);
-            if selected_active == Some(index) {
-                active_transcript_tail(detail, preview_width, maximum_selected_lines)
-            } else {
-                active_transcript_tail(detail, preview_width, ACTIVE_MESSAGE_LINES)
-            }
-        })
-        .collect()
+    // Only the selected preview scrolls; moving the selection snaps the one
+    // left behind back to its live tail.
+    let selected_id = selected_active.map(|index| active_ids[index].clone());
+    if dashboard.preview_scroll_session != selected_id {
+        dashboard.preview_scroll_session = selected_id;
+        dashboard.preview_scroll = 0;
+    }
+    let mut previews = Vec::with_capacity(active_ids.len());
+    let mut applied_scroll = 0;
+    for (index, session_id) in active_ids.iter().enumerate() {
+        let selected = selected_active == Some(index);
+        let (maximum_lines, scroll) = if selected {
+            (maximum_selected_lines, dashboard.preview_scroll)
+        } else {
+            (ACTIVE_MESSAGE_LINES, 0)
+        };
+        let detail = dashboard.session_details.get_mut(session_id);
+        let (preview, applied) =
+            active_transcript_tail(detail, preview_width, maximum_lines, scroll);
+        if selected {
+            applied_scroll = applied;
+        }
+        previews.push(preview);
+    }
+    ActivePreviews {
+        previews,
+        applied_scroll,
+    }
+}
+
+/// Preview rows for every active session, plus the scroll the selected
+/// session's preview settled on. The caller decides whether to keep the clamped
+/// scroll, because the pass that measures row heights runs against a provisional
+/// line budget and would otherwise narrow how far the preview can scroll.
+struct ActivePreviews {
+    previews: Vec<Vec<Line<'static>>>,
+    applied_scroll: usize,
 }
 
 fn render_terminal_too_small(frame: &mut Frame, area: Rect, required_height: u16) {
@@ -4382,10 +4446,12 @@ fn render_sessions(
             .saturating_sub(detail_y)
             .min(preview.len() as u16);
         if preview_height > 0 {
-            frame.render_widget(
-                Paragraph::new(preview.clone()),
-                Rect::new(active_area.x + 3, detail_y, preview_width, preview_height),
-            );
+            let preview_area =
+                Rect::new(active_area.x + 3, detail_y, preview_width, preview_height);
+            if selected {
+                dashboard.selected_preview_area = Some(preview_area);
+            }
+            frame.render_widget(Paragraph::new(preview.clone()), preview_area);
         }
         row_y = row_y.saturating_add(preview.len() as u16 + 1 + spacer);
     }
@@ -4631,17 +4697,25 @@ fn active_message_tail(
         .unwrap_or_default()
 }
 
+/// The preview rows for one active session, plus the scroll actually applied
+/// after clamping to the history available.
 fn active_transcript_tail(
     detail: Option<&mut SessionDetail>,
     width: u16,
     maximum_lines: usize,
-) -> Vec<Line<'static>> {
+    scroll: usize,
+) -> (Vec<Line<'static>>, usize) {
     let Some(detail) = detail else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     match detail.transcript.as_mut() {
-        Some(transcript) => transcript.rich_tail(width, maximum_lines),
-        None => active_message_tail(Some(detail), usize::from(width), maximum_lines),
+        Some(transcript) => transcript.rich_tail_scrolled(width, maximum_lines, scroll),
+        // Sessions without a projected transcript only ever show the newest
+        // message, so there is no history to scroll through.
+        None => (
+            active_message_tail(Some(detail), usize::from(width), maximum_lines),
+            0,
+        ),
     }
 }
 
@@ -6541,8 +6615,16 @@ mod tests {
     }
 
     fn apply_transcript(dashboard: &mut DashboardState, events: &[SequencedEvent]) {
+        apply_transcript_for(dashboard, "session-1", events);
+    }
+
+    fn apply_transcript_for(
+        dashboard: &mut DashboardState,
+        session_id: &str,
+        events: &[SequencedEvent],
+    ) {
         let snapshot: WorkerSnapshot = serde_json::from_value(serde_json::json!({
-            "session_id": "session-1",
+            "session_id": session_id,
             "phase": "running",
             "latest_seq": events.last().map_or(0, |event| event.seq),
             "last_checkpoint_seq": null,
@@ -6552,8 +6634,57 @@ mod tests {
         }))
         .unwrap();
         let chat = crate::hel_chat::ChatState::new(&snapshot, events);
-        dashboard.apply_worker_events("session-1", events, 100, false);
-        dashboard.apply_transcript("session-1", chat.transcript_snapshot());
+        dashboard.apply_worker_events(session_id, events, 100, false);
+        dashboard.apply_transcript(session_id, chat.transcript_snapshot());
+    }
+
+    /// A conversation of `count` numbered exchanges, so preview scroll
+    /// assertions can name the message they expect to see. Agent chunks
+    /// coalesce unless separated, so each pairs with its own prompt.
+    fn numbered_conversation(count: u64) -> Vec<SequencedEvent> {
+        (0..count)
+            .flat_map(|index| {
+                [
+                    SequencedEvent {
+                        seq: index * 2 + 1,
+                        recorded_at_ms: None,
+                        request_id: None,
+                        event: WorkerEvent::PromptAccepted {
+                            request_id: format!("request-{index}"),
+                            text: format!("question {index}"),
+                            attachments: Vec::new(),
+                        },
+                    },
+                    adapter_text_event(
+                        index * 2 + 2,
+                        "agent_message_chunk",
+                        &format!("answer {index}"),
+                    ),
+                ]
+            })
+            .collect()
+    }
+
+    /// The text inside one rect, row by row. Session summary rows repeat the
+    /// newest agent message, so preview assertions must look only at the
+    /// preview itself.
+    fn rows_in(terminal: &Terminal<TestBackend>, area: Rect) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn rect_shows(terminal: &Terminal<TestBackend>, area: Rect, needle: &str) -> bool {
+        rows_in(terminal, area)
+            .iter()
+            .any(|row| row.contains(needle))
     }
 
     #[test]
@@ -7870,6 +8001,183 @@ mod tests {
         assert_eq!(dashboard.quota_index, 2);
         assert_eq!(dashboard.session_index, 0);
         assert_eq!(dashboard.focus, Focus::Active);
+    }
+
+    /// A dashboard with `count` running sessions, each carrying a numbered
+    /// conversation long enough to scroll.
+    fn dashboard_with_conversations(count: usize) -> DashboardState {
+        let sessions = (0..count)
+            .map(|index| {
+                let mut session = archived_session();
+                session.id = format!("session-{index}");
+                session.state = SessionState::Running;
+                (session.id.clone(), session)
+            })
+            .collect();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        let events = numbered_conversation(14);
+        for index in 0..count {
+            apply_transcript_for(&mut dashboard, &format!("session-{index}"), &events);
+        }
+        dashboard
+    }
+
+    #[test]
+    fn wheel_over_the_selected_preview_scrolls_its_conversation_not_the_session_list() {
+        let mut dashboard = dashboard_with_conversations(3);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw previews");
+        let preview = dashboard
+            .selected_preview_area
+            .expect("the selected session exposes a preview hitbox");
+        assert!(
+            rect_shows(&terminal, preview, "answer 13"),
+            "opens on the tail"
+        );
+
+        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw scrolled preview");
+
+        assert!(
+            !rect_shows(&terminal, preview, "answer 13"),
+            "the wheel scrolled the preview above its live tail"
+        );
+        assert!(
+            rect_shows(&terminal, preview, "question 12"),
+            "older rows came into view"
+        );
+        assert_eq!(
+            dashboard.session_index, 0,
+            "scrolling a preview must not move the selection"
+        );
+        assert_eq!(dashboard.focus, Focus::Active);
+    }
+
+    #[test]
+    fn wheel_below_the_selected_preview_still_moves_the_session_selection() {
+        let mut dashboard = dashboard_with_conversations(3);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw previews");
+        let pane_areas = dashboard.pane_areas.expect("dashboard pane hitboxes");
+        assert!(dashboard.selected_preview_area.is_some());
+
+        // The Active pane's own header sits outside every preview hitbox.
+        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane_areas[0]));
+
+        assert_eq!(dashboard.session_index, 2);
+        assert_eq!(dashboard.preview_scroll, 0);
+    }
+
+    #[test]
+    fn selecting_another_session_snaps_the_previous_preview_back_to_its_tail() {
+        let mut dashboard = dashboard_with_conversations(3);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw previews");
+        let preview = dashboard.selected_preview_area.expect("preview hitbox");
+        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw scrolled preview");
+        assert!(dashboard.preview_scroll > 0, "the preview is scrolled back");
+
+        dashboard.move_selection(1);
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw after moving the selection");
+        assert_eq!(
+            dashboard.preview_scroll, 0,
+            "the new selection starts at its own tail"
+        );
+
+        dashboard.move_selection(-1);
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw after returning to the first session");
+
+        assert_eq!(dashboard.preview_scroll, 0);
+        let preview = dashboard.selected_preview_area.expect("preview hitbox");
+        assert!(
+            rect_shows(&terminal, preview, "answer 13"),
+            "the preview left behind snapped back to its live tail"
+        );
+    }
+
+    #[test]
+    fn preview_scroll_reaches_the_oldest_row_in_a_constrained_terminal() {
+        // A short pane gives the selected preview fewer lines than
+        // SELECTED_TRANSCRIPT_LINES, so the provisional sizing pass must not cap
+        // how far the preview can scroll.
+        let mut dashboard = dashboard_with_conversations(1);
+        let mut terminal = Terminal::new(TestBackend::new(120, 26)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw previews");
+        let preview = dashboard
+            .selected_preview_area
+            .expect("preview hitbox in a short terminal");
+        assert!(
+            preview.height < SELECTED_TRANSCRIPT_LINES as u16,
+            "the preview must be line-constrained for this test to mean anything"
+        );
+
+        for _ in 0..60 {
+            dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
+            terminal
+                .draw(|frame| render(frame, &mut dashboard))
+                .expect("draw scrolled preview");
+        }
+
+        assert!(
+            rect_shows(&terminal, preview, "question 0"),
+            "a constrained preview still reaches the oldest message"
+        );
+    }
+
+    #[test]
+    fn preview_scroll_stops_at_the_oldest_row_of_the_conversation() {
+        let mut dashboard = dashboard_with_conversations(1);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw previews");
+        let preview = dashboard.selected_preview_area.expect("preview hitbox");
+
+        for _ in 0..40 {
+            dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
+            terminal
+                .draw(|frame| render(frame, &mut dashboard))
+                .expect("draw scrolled preview");
+        }
+        let clamped = dashboard.preview_scroll;
+
+        assert!(
+            rect_shows(&terminal, preview, "question 0"),
+            "reaches the oldest message"
+        );
+        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, preview));
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw at the top");
+        assert_eq!(
+            dashboard.preview_scroll, clamped,
+            "scrolling past the oldest row is clamped"
+        );
     }
 
     #[test]

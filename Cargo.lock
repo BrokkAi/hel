@@ -1389,6 +1389,7 @@ dependencies = [
  "tower",
  "tracing",
  "unicode-segmentation",
+ "unicode-width",
  "url",
  "zip",
 ]
