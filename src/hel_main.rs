@@ -320,6 +320,7 @@ struct WarmWorker {
     spec: CommandSpec,
     client: WorkerClient,
     chat: hel::hel_chat::ChatState,
+    opening_events: Vec<SequencedEvent>,
 }
 
 enum WorkerPollCommand {
@@ -1399,34 +1400,78 @@ async fn execute_resource_command(command: &CommandSpec) -> Result<CommandOutput
 
 fn spawn_dashboard_worker_poller() -> (
     tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
-    tokio::sync::mpsc::Receiver<WorkerPollUpdate>,
+    tokio::sync::mpsc::UnboundedReceiver<WorkerPollUpdate>,
+    tokio::sync::mpsc::Sender<WorkerPollCommand>,
+) {
+    spawn_dashboard_worker_poller_with_interval(WORKER_POLL_INTERVAL)
+}
+
+struct CompletedWorkerPoll {
+    worker: WarmWorker,
+    events: Vec<SequencedEvent>,
+    phase: WorkerPhase,
+    transcript: Option<hel::hel_chat::TranscriptSnapshot>,
+    connected: bool,
+}
+
+struct WorkerPollCompletion {
+    target: WorkerPollTarget,
+    result: std::result::Result<CompletedWorkerPoll, String>,
+}
+
+fn spawn_dashboard_worker_poller_with_interval(
+    poll_interval: Duration,
+) -> (
+    tokio::sync::watch::Sender<Vec<WorkerPollTarget>>,
+    tokio::sync::mpsc::UnboundedReceiver<WorkerPollUpdate>,
     tokio::sync::mpsc::Sender<WorkerPollCommand>,
 ) {
     let (targets_tx, mut targets_rx) = tokio::sync::watch::channel(Vec::<WorkerPollTarget>::new());
-    let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(64);
+    let (updates_tx, updates_rx) = tokio::sync::mpsc::unbounded_channel();
     let (commands_tx, mut commands_rx) = tokio::sync::mpsc::channel(8);
+    let (completions_tx, mut completions_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut targets: std::collections::BTreeMap<String, WorkerPollTarget> =
             std::collections::BTreeMap::new();
         let mut clients: std::collections::BTreeMap<String, WarmWorker> =
             std::collections::BTreeMap::new();
         let mut checked_out = std::collections::BTreeSet::new();
+        let mut polling = std::collections::BTreeMap::<String, CommandSpec>::new();
+        let mut pending_checkouts = std::collections::BTreeMap::new();
         let mut failures: std::collections::BTreeMap<String, (u32, String)> =
             std::collections::BTreeMap::new();
-        let mut interval = tokio::time::interval(WORKER_POLL_INTERVAL);
+        let mut interval = tokio::time::interval(poll_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if !poll_dashboard_workers(&targets, &mut clients, &checked_out, &mut failures, &updates_tx).await {
-                        break;
+                    for target in targets.values() {
+                        if checked_out.contains(&target.session_id)
+                            || polling.contains_key(&target.session_id)
+                        {
+                            continue;
+                        }
+                        let worker = clients.remove(&target.session_id).filter(|worker| worker.spec == target.spec);
+                        polling.insert(target.session_id.clone(), target.spec.clone());
+                        let target = target.clone();
+                        let completions = completions_tx.clone();
+                        tokio::spawn(async move {
+                            let completion = poll_dashboard_worker(target, worker).await;
+                            let _ = completions.send(completion);
+                        });
                     }
                 }
                 command = commands_rx.recv() => {
                     match command {
                         Some(WorkerPollCommand::Checkout { session_id, reply }) => {
-                            checked_out.insert(session_id.clone());
-                            let _ = reply.send(clients.remove(&session_id));
+                            if polling.contains_key(&session_id) {
+                                if let Some(previous) = pending_checkouts.insert(session_id, reply) {
+                                    let _ = previous.send(None);
+                                }
+                            } else {
+                                checked_out.insert(session_id.clone());
+                                let _ = reply.send(clients.remove(&session_id));
+                            }
                         }
                         Some(WorkerPollCommand::Checkin { session_id, worker }) => {
                             checked_out.remove(&session_id);
@@ -1437,6 +1482,77 @@ fn spawn_dashboard_worker_poller() -> (
                             }
                         }
                         None => break,
+                    }
+                }
+                completion = completions_rx.recv() => {
+                    let Some(completion) = completion else { break };
+                    let session_id = completion.target.session_id.clone();
+                    let current_poll = polling
+                        .get(&session_id)
+                        .is_some_and(|spec| spec == &completion.target.spec);
+                    if current_poll {
+                        polling.remove(&session_id);
+                    }
+                    let target_is_current = current_poll
+                        && targets
+                            .get(&session_id)
+                            .is_some_and(|target| target.spec == completion.target.spec);
+                    if !target_is_current {
+                        if let Some(reply) = pending_checkouts.remove(&session_id) {
+                            if targets.contains_key(&session_id) {
+                                checked_out.insert(session_id);
+                            }
+                            let _ = reply.send(None);
+                        }
+                        continue;
+                    }
+                    match completion.result {
+                        Ok(completed) => {
+                            let recovered = failures.remove(&session_id).is_some();
+                            if let Some(reply) = pending_checkouts.remove(&session_id) {
+                                checked_out.insert(session_id);
+                                let mut worker = completed.worker;
+                                worker.opening_events = completed.events;
+                                let _ = reply.send(Some(worker));
+                                continue;
+                            }
+                            if completed.connected || recovered {
+                                let _ = updates_tx.send(WorkerPollUpdate {
+                                    session_id: session_id.clone(),
+                                    payload: WorkerPollPayload::Connected,
+                                });
+                            }
+                            if !completed.events.is_empty() || completed.connected {
+                                let _ = updates_tx.send(WorkerPollUpdate {
+                                    session_id: session_id.clone(),
+                                    payload: WorkerPollPayload::Events {
+                                        events: completed.events,
+                                        phase: completed.phase,
+                                        transcript: completed
+                                            .transcript
+                                            .expect("changed worker poll includes transcript"),
+                                    },
+                                });
+                            }
+                            clients.insert(session_id, completed.worker);
+                        }
+                        Err(detail) => {
+                            if let Some(reply) = pending_checkouts.remove(&session_id) {
+                                checked_out.insert(session_id.clone());
+                                let _ = reply.send(None);
+                            }
+                            let entry = failures.entry(session_id.clone()).or_insert((0, String::new()));
+                            entry.0 += 1;
+                            entry.1 = detail;
+                            if entry.0 == WORKER_POLL_FAILURE_THRESHOLD {
+                                let _ = updates_tx.send(WorkerPollUpdate {
+                                    session_id,
+                                    payload: WorkerPollPayload::Unreachable {
+                                        detail: entry.1.clone(),
+                                    },
+                                });
+                            }
+                        }
                     }
                 }
                 changed = targets_rx.changed() => {
@@ -1453,6 +1569,25 @@ fn spawn_dashboard_worker_poller() -> (
                         targets.get(id).is_some_and(|target| target.spec == worker.spec)
                     });
                     checked_out.retain(|id| targets.contains_key(id));
+                    failures.retain(|id, _| targets.contains_key(id));
+                    let stale_pending = pending_checkouts
+                        .keys()
+                        .filter(|id| {
+                            polling
+                                .get(*id)
+                                .zip(targets.get(*id))
+                                .is_none_or(|(polling, target)| polling != &target.spec)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for session_id in stale_pending {
+                        if targets.contains_key(&session_id) {
+                            checked_out.insert(session_id.clone());
+                        }
+                        if let Some(reply) = pending_checkouts.remove(&session_id) {
+                            let _ = reply.send(None);
+                        }
+                    }
                 }
             }
         }
@@ -1460,145 +1595,53 @@ fn spawn_dashboard_worker_poller() -> (
     (targets_tx, updates_rx, commands_tx)
 }
 
-async fn poll_dashboard_workers(
-    targets: &std::collections::BTreeMap<String, WorkerPollTarget>,
-    clients: &mut std::collections::BTreeMap<String, WarmWorker>,
-    checked_out: &std::collections::BTreeSet<String>,
-    failures: &mut std::collections::BTreeMap<String, (u32, String)>,
-    updates: &tokio::sync::mpsc::Sender<WorkerPollUpdate>,
-) -> bool {
-    for target in targets.values() {
-        if checked_out.contains(&target.session_id) {
-            continue;
-        }
-        let synced = match clients.get_mut(&target.session_id) {
-            Some(worker) if worker.spec == target.spec => {
-                Some(tokio::time::timeout(WORKER_POLL_TIMEOUT, worker.client.sync()).await)
-            }
-            _ => None,
-        };
-        let failure = match synced {
-            Some(Ok(Ok(events))) => {
-                let recovered = failures.remove(&target.session_id).is_some();
-                let worker = clients
-                    .get_mut(&target.session_id)
-                    .expect("a successfully synced worker remains cached");
+async fn poll_dashboard_worker(
+    target: WorkerPollTarget,
+    worker: Option<WarmWorker>,
+) -> WorkerPollCompletion {
+    let connected = worker.is_none();
+    let result = tokio::time::timeout(WORKER_POLL_TIMEOUT, async {
+        let (worker, events) = match worker {
+            Some(mut worker) => {
+                let events = worker.client.sync().await?;
                 worker.chat.apply_events(&events);
-                let phase = worker.chat.phase();
-                let transcript = worker.chat.transcript_snapshot();
-                if recovered
-                    && updates
-                        .send(WorkerPollUpdate {
-                            session_id: target.session_id.clone(),
-                            payload: WorkerPollPayload::Connected,
-                        })
-                        .await
-                        .is_err()
-                {
-                    return false;
-                }
-                if !events.is_empty()
-                    && updates
-                        .send(WorkerPollUpdate {
-                            session_id: target.session_id.clone(),
-                            payload: WorkerPollPayload::Events {
-                                events,
-                                phase,
-                                transcript,
-                            },
-                        })
-                        .await
-                        .is_err()
-                {
-                    return false;
-                }
-                None
-            }
-            Some(Ok(Err(error))) => {
-                clients.remove(&target.session_id);
-                Some(format!("{error:#}"))
-            }
-            Some(Err(_)) => {
-                clients.remove(&target.session_id);
-                Some("worker poll timed out".to_string())
+                (worker, events)
             }
             None => {
-                let connected = tokio::time::timeout(WORKER_POLL_TIMEOUT, async {
-                    let mut client =
-                        WorkerClient::connect(&target.spec, &target.session_id).await?;
-                    let bootstrap = client.bootstrap().await?;
-                    Ok::<_, anyhow::Error>((client, bootstrap))
-                })
-                .await;
-                match connected {
-                    Ok(Ok((client, bootstrap))) => {
-                        failures.remove(&target.session_id);
-                        let events = bootstrap.events.clone();
-                        let chat =
-                            hel::hel_chat::ChatState::new(&bootstrap.snapshot, &bootstrap.events);
-                        let phase = chat.phase();
-                        let transcript = chat.transcript_snapshot();
-                        clients.insert(
-                            target.session_id.clone(),
-                            WarmWorker {
-                                spec: target.spec.clone(),
-                                client,
-                                chat,
-                            },
-                        );
-                        if updates
-                            .send(WorkerPollUpdate {
-                                session_id: target.session_id.clone(),
-                                payload: WorkerPollPayload::Connected,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return false;
-                        }
-                        if updates
-                            .send(WorkerPollUpdate {
-                                session_id: target.session_id.clone(),
-                                payload: WorkerPollPayload::Events {
-                                    events,
-                                    phase,
-                                    transcript,
-                                },
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return false;
-                        }
-                        None
-                    }
-                    Ok(Err(error)) => Some(format!("{error:#}")),
-                    Err(_) => Some("worker connect timed out".to_string()),
-                }
+                let mut client = WorkerClient::connect(&target.spec, &target.session_id).await?;
+                let bootstrap = client.bootstrap().await?;
+                let events = bootstrap.events.clone();
+                let chat = hel::hel_chat::ChatState::new(&bootstrap.snapshot, &bootstrap.events);
+                (
+                    WarmWorker {
+                        spec: target.spec.clone(),
+                        client,
+                        chat,
+                        opening_events: Vec::new(),
+                    },
+                    events,
+                )
             }
         };
-        if let Some(detail) = failure {
-            let entry = failures
-                .entry(target.session_id.clone())
-                .or_insert((0, String::new()));
-            entry.0 += 1;
-            entry.1 = detail;
-            if entry.0 == WORKER_POLL_FAILURE_THRESHOLD {
-                let detail = entry.1.clone();
-                if updates
-                    .send(WorkerPollUpdate {
-                        session_id: target.session_id.clone(),
-                        payload: WorkerPollPayload::Unreachable { detail },
-                    })
-                    .await
-                    .is_err()
-                {
-                    return false;
-                }
-            }
-        }
-    }
-    true
+        let phase = worker.chat.phase();
+        let transcript =
+            (connected || !events.is_empty()).then(|| worker.chat.transcript_snapshot());
+        Ok::<_, anyhow::Error>(CompletedWorkerPoll {
+            worker,
+            events,
+            phase,
+            transcript,
+            connected,
+        })
+    })
+    .await;
+    let result = match result {
+        Ok(Ok(completed)) => Ok(completed),
+        Ok(Err(error)) => Err(format!("{error:#}")),
+        Err(_) if connected => Err("worker connect timed out".to_string()),
+        Err(_) => Err("worker poll timed out".to_string()),
+    };
+    WorkerPollCompletion { target, result }
 }
 
 fn current_epoch_seconds() -> u64 {
@@ -2421,6 +2464,35 @@ async fn run_dashboard() -> Result<()> {
                 let result = match warm {
                     Some(worker) => {
                         let spec = worker.spec;
+                        if let Err(error) = apply_worker_poll_update(
+                            &mut controller,
+                            &mut dashboard,
+                            WorkerPollUpdate {
+                                session_id: session_id.clone(),
+                                payload: WorkerPollPayload::Connected,
+                            },
+                        ) {
+                            dashboard.set_notice(format!("Could not save worker state: {error:#}"));
+                        }
+                        if !worker.opening_events.is_empty() {
+                            recovery_context
+                                .observe(&worker.opening_events, worker.chat.phase())
+                                .await;
+                            let update = WorkerPollUpdate {
+                                session_id: session_id.clone(),
+                                payload: WorkerPollPayload::Events {
+                                    events: worker.opening_events,
+                                    phase: worker.chat.phase(),
+                                    transcript: worker.chat.transcript_snapshot(),
+                                },
+                            };
+                            if let Err(error) =
+                                apply_worker_poll_update(&mut controller, &mut dashboard, update)
+                            {
+                                dashboard
+                                    .set_notice(format!("Could not save harness title: {error:#}"));
+                            }
+                        }
                         hel::hel_chat::run_chat(
                             &mut terminal.terminal,
                             worker.client,
@@ -2429,7 +2501,17 @@ async fn run_dashboard() -> Result<()> {
                             Some(recovery_context.clone()),
                         )
                         .await
-                        .map(|(exit, client, chat)| (exit, Some(WarmWorker { spec, client, chat })))
+                        .map(|(exit, client, chat)| {
+                            (
+                                exit,
+                                Some(WarmWorker {
+                                    spec,
+                                    client,
+                                    chat,
+                                    opening_events: Vec::new(),
+                                }),
+                            )
+                        })
                     }
                     None => {
                         async {
@@ -2443,7 +2525,15 @@ async fn run_dashboard() -> Result<()> {
                                 Some(recovery_context),
                             )
                             .await?;
-                            Ok((exit, Some(WarmWorker { spec, client, chat })))
+                            Ok((
+                                exit,
+                                Some(WarmWorker {
+                                    spec,
+                                    client,
+                                    chat,
+                                    opening_events: Vec::new(),
+                                }),
+                            ))
                         }
                         .await
                     }
@@ -3399,6 +3489,38 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn slow_worker_poll_does_not_block_another_session_checkout() {
+        let (targets, _updates, commands) =
+            spawn_dashboard_worker_poller_with_interval(Duration::from_millis(10));
+        targets.send_replace(vec![
+            WorkerPollTarget {
+                session_id: "a-slow".into(),
+                spec: CommandSpec::new("sh", ["-c", "sleep 5"]),
+            },
+            WorkerPollTarget {
+                session_id: "b-fast".into(),
+                spec: CommandSpec::new("false", std::iter::empty::<&str>()),
+            },
+        ]);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (reply, received) = tokio::sync::oneshot::channel();
+        commands
+            .send(WorkerPollCommand::Checkout {
+                session_id: "b-fast".into(),
+                reply,
+            })
+            .await
+            .unwrap();
+
+        let checked_out = tokio::time::timeout(Duration::from_millis(250), received)
+            .await
+            .expect("checkout should not wait for the unrelated slow worker")
+            .expect("worker poller should answer checkout");
+        assert!(checked_out.is_none());
+    }
 
     #[test]
     fn resource_samples_are_throttled_to_one_per_minute() {
