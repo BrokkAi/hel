@@ -187,9 +187,6 @@ fn ci_failed(facts: &GreetingFacts, _: &Clock) -> bool {
 fn raw_localhost(facts: &GreetingFacts, _: &Clock) -> bool {
     facts.raw_localhost_active
 }
-fn container(facts: &GreetingFacts, _: &Clock) -> bool {
-    facts.container_active
-}
 fn remote(facts: &GreetingFacts, _: &Clock) -> bool {
     facts.remote_active
 }
@@ -215,7 +212,7 @@ const fn greeting(
     }
 }
 
-const GREETINGS: [Greeting; 50] = [
+const GREETINGS: [Greeting; 48] = [
     greeting("Welcome to Hel, $firstname", Group::Always, yes),
     greeting(
         "Abandon boilerplate, all ye who enter here",
@@ -223,7 +220,6 @@ const GREETINGS: [Greeting; 50] = [
         yes,
     ),
     greeting("We're on a highway to Hel", Group::Always, yes),
-    greeting("A warm welcome from the coldest realm", Group::Always, yes),
     greeting("To Hel with boilerplate", Group::Always, yes),
     greeting("Here be daemons", Group::Always, yes),
     greeting("Let's raise a little Hel, $firstname", Group::Always, yes),
@@ -236,11 +232,7 @@ const GREETINGS: [Greeting; 50] = [
     ),
     greeting("One prompt closer to done", Group::Always, yes),
     greeting("Prompt boldly, commit carefully", Group::Always, yes),
-    greeting(
-        "Good code has no fear of the underworld",
-        Group::Always,
-        yes,
-    ),
+    greeting("Good code goes to Hel and back", Group::Always, yes),
     greeting(
         "It's a good night to write code, $firstname",
         Group::Time,
@@ -298,7 +290,7 @@ const GREETINGS: [Greeting; 50] = [
         active_turn,
     ),
     greeting(
-        "$profile_name is contemplating the abyss",
+        "$profile_name gazes into the diff, and the diff gazes back",
         Group::State,
         active_turn,
     ),
@@ -308,7 +300,7 @@ const GREETINGS: [Greeting; 50] = [
         active_turn,
     ),
     greeting(
-        "The road to Hel is paved with committed intentions",
+        "The road to Hel is paved with good intentions",
         Group::Repository,
         clean,
     ),
@@ -370,11 +362,6 @@ const GREETINGS: [Greeting; 50] = [
         raw_localhost,
     ),
     greeting(
-        "The containers are sealed and the agents are contained",
-        Group::Target,
-        container,
-    ),
-    greeting(
         "There's a remote agent at the other end of the wire",
         Group::Target,
         remote,
@@ -401,8 +388,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_fifty_unpunctuated_greetings_and_required_first_entry() {
-        assert_eq!(GREETINGS.len(), 50);
+    fn catalog_has_forty_eight_unpunctuated_greetings_and_required_first_entry() {
+        assert_eq!(GREETINGS.len(), 48);
         assert_eq!(GREETINGS[0].text, "Welcome to Hel, $firstname");
         assert!(
             GREETINGS

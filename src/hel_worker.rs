@@ -113,6 +113,16 @@ pub enum RelayRequest {
     InstallCredentials {
         data: String,
     },
+    /// Report non-secret metadata for this session's synced skills trees.
+    /// Handled on the connection like credential requests; the durable relay
+    /// never sees them.
+    SkillsState,
+    /// Replace this session's synced skills trees with a base64-encoded
+    /// `hel_skills` archive. The destination directories are fixed by the
+    /// worker launch config and the harness skills whitelist.
+    InstallSkills {
+        data: String,
+    },
 }
 
 impl RelayRequest {
@@ -126,6 +136,8 @@ impl RelayRequest {
             Self::CredentialState => "credential_state",
             Self::ReadCredentials => "read_credentials",
             Self::InstallCredentials { .. } => "install_credentials",
+            Self::SkillsState => "skills_state",
+            Self::InstallSkills { .. } => "install_skills",
         }
     }
 }
@@ -190,6 +202,11 @@ pub enum RelayResponsePayload {
     /// socket, never recorded.
     Credentials {
         data: String,
+    },
+    /// Fingerprint of a session's synced skills trees. Not secret.
+    SkillsState {
+        present: bool,
+        fingerprint: String,
     },
 }
 
@@ -881,10 +898,12 @@ impl DurableRelay {
             }
             RelayRequest::CredentialState
             | RelayRequest::ReadCredentials
-            | RelayRequest::InstallCredentials { .. } => {
+            | RelayRequest::InstallCredentials { .. }
+            | RelayRequest::SkillsState
+            | RelayRequest::InstallSkills { .. } => {
                 return Ok(relay_error(
                     RelayErrorCode::InvalidState,
-                    "credential requests must be handled by the live relay transport",
+                    "credential and skills requests must be handled by the live relay transport",
                     false,
                     None,
                 ));

@@ -60,6 +60,7 @@ pub enum ChatAction {
     RemoveQueuedPrompt { id: String, text: String },
     SetConfig { key: String, value: String },
     Cancel,
+    PasteFromClipboard,
     ToggleVoice,
     Back,
     QuitDetach,
@@ -117,11 +118,32 @@ struct QueuedPrompt {
 struct HistorySearch {
     original_input: String,
     original_cursor: usize,
+    generation: u64,
     query: String,
     scope: HistoryScope,
     matches: Vec<PromptHistoryEntry>,
     selected: Option<usize>,
     unavailable: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct HistorySearchRequest {
+    generation: u64,
+    session_id: String,
+    bundle_id: Option<String>,
+    scope: HistoryScope,
+    query: String,
+    local_history: Vec<String>,
+}
+
+#[derive(Debug)]
+enum ChatIoUpdate {
+    ProjectHistoryPrefetched(std::result::Result<Vec<PromptHistoryEntry>, String>),
+    HistorySearchResults {
+        generation: u64,
+        result: std::result::Result<Vec<PromptHistoryEntry>, String>,
+    },
+    ClipboardText(std::result::Result<String, String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -503,6 +525,51 @@ fn materialized_chat_entries(session: &MaterializedSession) -> Vec<ChatEntry> {
         .collect()
 }
 
+fn materialized_chat_entries_reusing(
+    session: &MaterializedSession,
+    previous: Vec<ChatEntry>,
+) -> Vec<ChatEntry> {
+    let mut previous = previous.into_iter();
+    session
+        .transcript
+        .iter()
+        .map(|item| {
+            if let Some(entry) = previous.next()
+                && entry_matches_transcript_item(&entry, item)
+            {
+                let mut entry = entry;
+                entry.seq = session.applied_event_ordinal.max(item.position);
+                return entry;
+            }
+            materialized_chat_entry(item, session.applied_event_ordinal)
+        })
+        .collect()
+}
+
+fn entry_matches_transcript_item(entry: &ChatEntry, item: &TranscriptItem) -> bool {
+    entry.start_seq == item.position
+        && entry.recorded_at_ms == Some(item.created_at_ms)
+        && entry.revision == u64::try_from(item.last_changed_at_ms).unwrap_or_default()
+        && matches!(
+            (&entry.role, &item.body),
+            (ChatRole::User, TranscriptBody::User { .. })
+                | (ChatRole::Agent, TranscriptBody::Agent { .. })
+                | (ChatRole::Thought, TranscriptBody::Thought { .. })
+                | (ChatRole::Tool, TranscriptBody::Tool { .. })
+                | (ChatRole::Plan, TranscriptBody::Plan { .. })
+                | (ChatRole::System, TranscriptBody::System { .. })
+        )
+        && match &item.body {
+            TranscriptBody::Agent { .. } | TranscriptBody::Thought { .. } => {
+                entry.message_id.as_deref() == Some(item.stable_id.as_str())
+            }
+            TranscriptBody::Tool { .. } => {
+                entry.tool_call_id.as_deref() == Some(item.stable_id.as_str())
+            }
+            _ => true,
+        }
+}
+
 fn materialized_chat_entry(item: &TranscriptItem, frontier: u64) -> ChatEntry {
     let mut entry = match &item.body {
         TranscriptBody::User { content } => ChatEntry::plain(
@@ -799,12 +866,16 @@ pub struct ChatState {
     entries: Vec<ChatEntry>,
     input: String,
     input_cursor: usize,
+    project_history: Vec<String>,
+    project_history_error: Option<String>,
     prompt_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
     kill_buffer: String,
     preferred_column: Option<usize>,
     history_search: Option<HistorySearch>,
+    next_history_search_generation: u64,
+    pending_history_search: Option<HistorySearchRequest>,
     queued_prompts: VecDeque<QueuedPrompt>,
     recovery_busy: bool,
     goal_prompt_active: bool,
@@ -834,12 +905,16 @@ impl ChatState {
             entries: Vec::new(),
             input: String::new(),
             input_cursor: 0,
+            project_history: Vec::new(),
+            project_history_error: None,
             prompt_history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
             kill_buffer: String::new(),
             preferred_column: None,
             history_search: None,
+            next_history_search_generation: 0,
+            pending_history_search: None,
             queued_prompts: VecDeque::new(),
             recovery_busy: false,
             goal_prompt_active: snapshot
@@ -912,6 +987,7 @@ impl ChatState {
             session.applied_event_ordinal,
         );
         let mut state = Self::new(&snapshot, &[]);
+        state.latest_seq = u64::MAX;
         state.apply_materialized(session, config_options, available_commands);
         state
     }
@@ -922,6 +998,7 @@ impl ChatState {
         config_options: &[SessionConfigOption],
         available_commands: &[AvailableCommand],
     ) {
+        let rebuild_projection = session.applied_event_ordinal != self.latest_seq;
         self.phase = match session.execution {
             MaterializedExecutionState::Idle => WorkerPhase::Idle,
             MaterializedExecutionState::Running { .. } => WorkerPhase::Running,
@@ -929,15 +1006,18 @@ impl ChatState {
             MaterializedExecutionState::Closed => WorkerPhase::Closed,
         };
         self.latest_seq = session.applied_event_ordinal;
-        self.entries = materialized_chat_entries(session);
-        self.queued_prompts = session
-            .queued_prompts
-            .iter()
-            .map(|prompt| QueuedPrompt {
-                id: prompt.command_id.clone(),
-                text: materialized_content_text(&prompt.content),
-            })
-            .collect();
+        if rebuild_projection {
+            self.entries =
+                materialized_chat_entries_reusing(session, std::mem::take(&mut self.entries));
+            self.queued_prompts = session
+                .queued_prompts
+                .iter()
+                .map(|prompt| QueuedPrompt {
+                    id: prompt.command_id.clone(),
+                    text: materialized_content_text(&prompt.content),
+                })
+                .collect();
+        }
         self.set_config_options(config_options);
         self.agent_commands = available_commands.to_vec();
         self.rebuild_command_choices();
@@ -953,7 +1033,6 @@ impl ChatState {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
             .or_else(|| config_current_value(config_options, "effort"));
-        self.render_cache.entries.clear();
     }
 
     #[cfg(test)]
@@ -984,15 +1063,19 @@ impl ChatState {
         self.bundle_id = Some(bundle_id.into());
     }
 
-    fn record_accepted_prompt(&mut self, sequence: u64, text: &str) {
-        let Some(bundle_id) = self.bundle_id.as_deref() else {
-            return;
-        };
-        if let Err(error) =
-            crate::hel_database::record_prompt(&self.session_id, bundle_id, sequence, None, text)
+    fn set_project_history(&mut self, entries: Vec<PromptHistoryEntry>) {
+        self.project_history_error = None;
+        self.project_history = entries.into_iter().rev().map(|entry| entry.text).collect();
+        if let Some(index) = self.history_index
+            && index >= self.navigation_history().len()
         {
-            self.set_notice(format!("Prompt sent, but history was not saved: {error:#}"));
+            self.history_index = None;
+            self.history_draft.clear();
         }
+    }
+
+    fn set_project_history_unavailable(&mut self, error: String) {
+        self.project_history_error = Some(error);
     }
 
     pub fn latest_seq(&self) -> u64 {
@@ -1501,39 +1584,58 @@ impl ChatState {
         self.history_search = Some(HistorySearch {
             original_input: self.input.clone(),
             original_cursor: self.input_cursor,
+            generation: self.next_history_search_generation,
             query: String::new(),
             scope: HistoryScope::Project,
             matches: Vec::new(),
             selected: None,
             unavailable: None,
         });
+        self.pending_history_search = None;
     }
 
     fn refresh_history_search(&mut self) {
         let Some(search) = self.history_search.as_ref() else {
             return;
         };
+        let generation = self.next_history_search_generation.wrapping_add(1);
+        self.next_history_search_generation = generation;
         let query = search.query.clone();
         let scope = search.scope;
-        let original = (search.original_input.clone(), search.original_cursor);
-        let result = if query.is_empty() {
-            Ok(Vec::new())
-        } else if let Some(bundle_id) = self.bundle_id.as_deref() {
-            crate::hel_database::search_prompts(&self.session_id, bundle_id, scope, &query)
+        if let Some(search) = self.history_search.as_mut() {
+            search.generation = generation;
+        }
+        if query.is_empty() {
+            self.pending_history_search = None;
+            self.apply_history_search_results(generation, Ok(Vec::new()));
         } else {
-            Ok(self
-                .prompt_history
-                .iter()
-                .rev()
-                .enumerate()
-                .filter(|(_, text)| text.to_lowercase().contains(&query.to_lowercase()))
-                .map(|(index, text)| PromptHistoryEntry {
-                    id: -(index as i64) - 1,
-                    session_id: self.session_id.clone(),
-                    text: text.clone(),
-                })
-                .collect())
+            self.pending_history_search = Some(HistorySearchRequest {
+                generation,
+                session_id: self.session_id.clone(),
+                bundle_id: self.bundle_id.clone(),
+                scope,
+                query,
+                local_history: self.prompt_history.clone(),
+            });
+        }
+    }
+
+    fn take_history_search_request(&mut self) -> Option<HistorySearchRequest> {
+        self.pending_history_search.take()
+    }
+
+    fn apply_history_search_results(
+        &mut self,
+        generation: u64,
+        result: std::result::Result<Vec<PromptHistoryEntry>, String>,
+    ) {
+        let Some(search) = self.history_search.as_ref() else {
+            return;
         };
+        if search.generation != generation {
+            return;
+        }
+        let original = (search.original_input.clone(), search.original_cursor);
         match result {
             Ok(matches) => {
                 if let Some(search) = self.history_search.as_mut() {
@@ -1558,9 +1660,40 @@ impl ChatState {
                 self.input = original.0;
                 self.input_cursor = original.1;
                 self.history_search = None;
-                self.notice = Some(format!("History unavailable: {error:#}"));
+                self.notice = Some(format!("History unavailable: {error}"));
                 self.update_autocomplete();
             }
+        }
+    }
+
+    fn local_history_search_results(request: &HistorySearchRequest) -> Vec<PromptHistoryEntry> {
+        request
+            .local_history
+            .iter()
+            .rev()
+            .enumerate()
+            .filter(|(_, text)| text.to_lowercase().contains(&request.query.to_lowercase()))
+            .map(|(index, text)| PromptHistoryEntry {
+                id: -(index as i64) - 1,
+                session_id: request.session_id.clone(),
+                text: text.clone(),
+            })
+            .collect()
+    }
+
+    fn resolve_history_search_request(
+        request: HistorySearchRequest,
+    ) -> std::result::Result<Vec<PromptHistoryEntry>, String> {
+        if let Some(bundle_id) = request.bundle_id.as_deref() {
+            crate::hel_database::search_prompts(
+                &request.session_id,
+                bundle_id,
+                request.scope,
+                &request.query,
+            )
+            .map_err(|error| format!("{error:#}"))
+        } else {
+            Ok(Self::local_history_search_results(&request))
         }
     }
 
@@ -1741,28 +1874,21 @@ impl ChatState {
         self.history_draft.clear();
     }
 
+    fn navigation_history(&self) -> Vec<String> {
+        let mut history = self.project_history.clone();
+        history.extend(self.prompt_history.iter().cloned());
+        history
+    }
+
     fn move_history(&mut self, delta: isize) {
-        let history = if let Some(bundle_id) = self.bundle_id.as_deref() {
-            crate::hel_database::search_prompts(
-                &self.session_id,
-                bundle_id,
-                HistoryScope::Project,
-                "",
-            )
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .rev()
-                    .map(|entry| entry.text)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|error| {
-                self.notice = Some(format!("History unavailable: {error:#}"));
-                self.prompt_history.clone()
-            })
-        } else {
-            self.prompt_history.clone()
-        };
+        let history = self.navigation_history();
+        if let Some(error) = self
+            .bundle_id
+            .as_ref()
+            .and(self.project_history_error.as_ref())
+        {
+            self.notice = Some(format!("History unavailable: {error}"));
+        }
         if history.is_empty() {
             return;
         }
@@ -1885,11 +2011,7 @@ impl ChatState {
         if code == KeyCode::Char('v')
             && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
         {
-            match crate::hel_clipboard::read_text() {
-                Ok(text) => self.handle_paste(&text),
-                Err(error) => self.set_notice(format!("Paste failed: {error:#}")),
-            }
-            return ChatAction::None;
+            return ChatAction::PasteFromClipboard;
         }
 
         if modifiers.contains(KeyModifiers::ALT) && code == KeyCode::Char('v') {
@@ -2308,7 +2430,6 @@ impl ChatState {
         match &event.event {
             WorkerEvent::PromptAccepted { text, .. } => {
                 self.mark_prompt_submitted(text);
-                self.record_accepted_prompt(event.seq, text);
                 self.entries.push(
                     ChatEntry::plain(event.seq, ChatRole::User, text)
                         .with_recorded_at(event.recorded_at_ms),
@@ -2345,7 +2466,6 @@ impl ChatState {
             WorkerEvent::QueuedPromptPromoted { prompt, .. } => {
                 self.queued_prompts.retain(|queued| queued.id != prompt.id);
                 self.phase = WorkerPhase::Running;
-                self.record_accepted_prompt(event.seq, &prompt.text);
                 self.entries.push(
                     ChatEntry::plain(event.seq, ChatRole::User, &prompt.text)
                         .with_recorded_at(event.recorded_at_ms),
@@ -3343,6 +3463,44 @@ fn queue_chat_remote_operation(
     }
 }
 
+fn dispatch_history_search_request(
+    chat: &mut ChatState,
+    updates: &tokio::sync::mpsc::UnboundedSender<ChatIoUpdate>,
+) {
+    let Some(request) = chat.take_history_search_request() else {
+        return;
+    };
+    let generation = request.generation;
+    let updates = updates.clone();
+    tokio::spawn(async move {
+        let result = match tokio::task::spawn_blocking(move || {
+            ChatState::resolve_history_search_request(request)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(format!("history search task failed: {error}")),
+        };
+        let _ = updates.send(ChatIoUpdate::HistorySearchResults { generation, result });
+    });
+}
+
+fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) {
+    match update {
+        ChatIoUpdate::ProjectHistoryPrefetched(Ok(entries)) => chat.set_project_history(entries),
+        ChatIoUpdate::ProjectHistoryPrefetched(Err(error)) => {
+            chat.set_project_history_unavailable(error);
+        }
+        ChatIoUpdate::HistorySearchResults { generation, result } => {
+            chat.apply_history_search_results(generation, result);
+        }
+        ChatIoUpdate::ClipboardText(Ok(text)) => chat.handle_paste(&text),
+        ChatIoUpdate::ClipboardText(Err(error)) => {
+            chat.set_notice(format!("Paste failed: {error}"));
+        }
+    }
+}
+
 /// Run chat until the user returns to the dashboard or quits Hel. Either exit
 /// detaches the proxy and leaves the target worker alive.
 pub async fn run_chat(
@@ -3370,6 +3528,29 @@ pub async fn run_chat(
         },
     );
     chat.set_history_context(bundle_id);
+    let (chat_io_tx, mut chat_io_rx) = tokio::sync::mpsc::unbounded_channel::<ChatIoUpdate>();
+    {
+        let updates = chat_io_tx.clone();
+        let session_id = session.session_id().to_owned();
+        let bundle_id = bundle_id.to_owned();
+        tokio::spawn(async move {
+            let result = match tokio::task::spawn_blocking(move || {
+                crate::hel_database::search_prompts(
+                    &session_id,
+                    &bundle_id,
+                    HistoryScope::Project,
+                    "",
+                )
+                .map_err(|error| format!("{error:#}"))
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(format!("history prefetch task failed: {error}")),
+            };
+            let _ = updates.send(ChatIoUpdate::ProjectHistoryPrefetched(result));
+        });
+    }
     if let Some(detail) = recovery
         .as_ref()
         .and_then(|recovery| recovery.session.last_checkpoint_error.as_deref())
@@ -3396,6 +3577,10 @@ pub async fn run_chat(
             } else {
                 chat.set_notice("Chat background worker stopped unexpectedly");
             }
+        }
+        while let Ok(update) = chat_io_rx.try_recv() {
+            apply_chat_io_update(&mut chat, update);
+            dispatch_history_search_request(&mut chat, &chat_io_tx);
         }
         while let Ok(update) = voice_updates_rx.try_recv() {
             match update {
@@ -3486,6 +3671,21 @@ pub async fn run_chat(
                             &mut chat,
                         );
                     }
+                    ChatAction::PasteFromClipboard => {
+                        let updates = chat_io_tx.clone();
+                        tokio::spawn(async move {
+                            let result = match tokio::task::spawn_blocking(|| {
+                                crate::hel_clipboard::read_text()
+                                    .map_err(|error| format!("{error:#}"))
+                            })
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(error) => Err(format!("clipboard task failed: {error}")),
+                            };
+                            let _ = updates.send(ChatIoUpdate::ClipboardText(result));
+                        });
+                    }
                     ChatAction::ToggleVoice => {
                         if let Some(cancel) = voice_cancel.as_ref() {
                             let _ = cancel.send(());
@@ -3522,6 +3722,7 @@ pub async fn run_chat(
                     }
                 }
             }
+            dispatch_history_search_request(&mut chat, &chat_io_tx);
             pending = event::poll(Duration::from_millis(0))?;
         }
         while session.has_changed()? {
@@ -4414,6 +4615,15 @@ mod tests {
         KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
     }
 
+    fn apply_pending_history_search(chat: &mut ChatState) {
+        let request = chat
+            .take_history_search_request()
+            .expect("history search request was queued");
+        let generation = request.generation;
+        let result = ChatState::resolve_history_search_request(request);
+        chat.apply_history_search_results(generation, result);
+    }
+
     fn queued(id: &str, text: &str) -> QueuedPrompt {
         QueuedPrompt {
             id: id.into(),
@@ -5072,8 +5282,11 @@ mod tests {
         chat.set_input("unfinished".into());
         chat.handle_key(ctrl('r'));
         chat.handle_key(key(KeyCode::Char('f')));
+        apply_pending_history_search(&mut chat);
         chat.handle_key(key(KeyCode::Char('i')));
+        apply_pending_history_search(&mut chat);
         chat.handle_key(key(KeyCode::Char('x')));
+        apply_pending_history_search(&mut chat);
         assert_eq!(chat.input, "fix renderer");
         chat.handle_key(ctrl('r'));
         assert_eq!(chat.input, "fix parser");
@@ -5083,10 +5296,77 @@ mod tests {
         chat.handle_key(ctrl('r'));
         for character in "renderer".chars() {
             chat.handle_key(key(KeyCode::Char(character)));
+            apply_pending_history_search(&mut chat);
         }
         chat.handle_key(key(KeyCode::Enter));
         assert_eq!(chat.input, "fix renderer");
         assert!(chat.history_search.is_none());
+    }
+
+    #[test]
+    fn stale_history_search_results_are_dropped() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.prompt_history = vec!["fix parser".into(), "fix renderer".into()];
+        chat.set_input("draft".into());
+
+        chat.handle_key(ctrl('r'));
+        chat.handle_key(key(KeyCode::Char('f')));
+        let stale = chat
+            .take_history_search_request()
+            .expect("first search request");
+        chat.handle_key(key(KeyCode::Char('i')));
+        let current = chat
+            .take_history_search_request()
+            .expect("second search request");
+
+        chat.apply_history_search_results(
+            stale.generation,
+            Ok(vec![PromptHistoryEntry {
+                id: 1,
+                session_id: "1234567890".into(),
+                text: "fix parser".into(),
+            }]),
+        );
+        assert_eq!(chat.input, "draft");
+
+        let generation = current.generation;
+        let result = ChatState::resolve_history_search_request(current);
+        chat.apply_history_search_results(generation, result);
+        assert_eq!(chat.input, "fix renderer");
+    }
+
+    #[test]
+    fn ctrl_v_returns_paste_request_action() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+
+        assert_eq!(chat.handle_key(ctrl('v')), ChatAction::PasteFromClipboard);
+        assert!(chat.input.is_empty());
+    }
+
+    #[test]
+    fn move_history_uses_prefetched_project_history_and_local_prompts() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_history_context("bundle");
+        chat.set_project_history(vec![
+            PromptHistoryEntry {
+                id: 2,
+                session_id: "other".into(),
+                text: "project newest".into(),
+            },
+            PromptHistoryEntry {
+                id: 1,
+                session_id: "other".into(),
+                text: "project oldest".into(),
+            },
+        ]);
+        chat.record_prompt_history("local prompt");
+
+        chat.handle_key(key(KeyCode::Up));
+        assert_eq!(chat.input, "local prompt");
+        chat.handle_key(key(KeyCode::Up));
+        assert_eq!(chat.input, "project newest");
+        chat.handle_key(key(KeyCode::Up));
+        assert_eq!(chat.input, "project oldest");
     }
 
     #[test]
@@ -6001,6 +6281,38 @@ mod tests {
                 .iter()
                 .any(|line| line == "○ step-11")
         );
+    }
+
+    #[test]
+    fn apply_materialized_skips_rebuild_at_same_ordinal() {
+        let mut session = MaterializedSession::empty("session-same-ordinal");
+        session.applied_event_ordinal = 1;
+        session.transcript.push(TranscriptItem {
+            stable_id: "user:1".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 10,
+            last_changed_at_ms: 10,
+            body: TranscriptBody::User {
+                content: vec![serde_json::json!("first")],
+            },
+        });
+
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+        assert_eq!(chat.entries[0].text, "first");
+
+        session.transcript[0].body = TranscriptBody::User {
+            content: vec![serde_json::json!("changed without new ordinal")],
+        };
+        session.queued_prompts.push(MaterializedQueuedPrompt {
+            command_id: "queued".into(),
+            content: vec![serde_json::json!("queued prompt")],
+            queued_at_ms: 20,
+        });
+        chat.apply_materialized(&session, &[], &[]);
+
+        assert_eq!(chat.entries[0].text, "first");
+        assert!(chat.queued_prompts.is_empty());
     }
 
     #[test]
