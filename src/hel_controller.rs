@@ -5319,6 +5319,13 @@ fn workspace_paths(
     Ok((primary_path, additional))
 }
 
+// npx fallbacks for images that do not already carry an ACP bridge. Keep these
+// in lockstep with the global npm installs in
+// containers/Containerfile.agent-dev; bridge_pins_match_containerfile() below
+// fails the build when they drift.
+const CODEX_ACP_FALLBACK_VERSION: &str = "1.1.14";
+const CLAUDE_AGENT_ACP_FALLBACK_VERSION: &str = "0.68.0";
+
 fn bridge_launch(
     harness: crate::hel_config::HarnessKind,
     executable: Option<&Path>,
@@ -5336,14 +5343,14 @@ fn bridge_launch(
             "sh".into(),
             vec![
                 "-lc".into(),
-                format!("if command -v codex-acp >/dev/null 2>&1; then exec codex-acp; fi; {}; exec npx -y @agentclientprotocol/codex-acp@1.1.14", ensure_node_script()),
+                format!("if command -v codex-acp >/dev/null 2>&1; then exec codex-acp; fi; {}; exec npx -y @agentclientprotocol/codex-acp@{CODEX_ACP_FALLBACK_VERSION}", ensure_node_script()),
             ],
         ),
         crate::hel_config::HarnessKind::Claude => (
             "sh".into(),
             vec![
                 "-lc".into(),
-                format!("if command -v claude-agent-acp >/dev/null 2>&1; then exec claude-agent-acp; fi; {}; exec npx -y @agentclientprotocol/claude-agent-acp@0.68.0", ensure_node_script()),
+                format!("if command -v claude-agent-acp >/dev/null 2>&1; then exec claude-agent-acp; fi; {}; exec npx -y @agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_FALLBACK_VERSION}", ensure_node_script()),
             ],
         ),
         crate::hel_config::HarnessKind::Kimi => (
@@ -7175,6 +7182,27 @@ mod tests {
 
         let (_, claude_arguments) = bridge_launch(crate::hel_config::HarnessKind::Claude, None);
         assert!(claude_arguments[1].contains("@agentclientprotocol/claude-agent-acp@0.68.0"));
+    }
+
+    #[test]
+    fn bridge_fallback_pins_match_the_agent_dev_containerfile() {
+        const CONTAINERFILE: &str = include_str!("../containers/Containerfile.agent-dev");
+
+        let codex = format!("codex-acp@{CODEX_ACP_FALLBACK_VERSION}");
+        assert!(
+            CONTAINERFILE.contains(&codex),
+            "containers/Containerfile.agent-dev must install {codex}. The image and the \
+             bridge_launch() npx fallbacks have to stay in lockstep, otherwise a container \
+             session and an npx session run different adapter versions."
+        );
+
+        let claude = format!("claude-agent-acp@{CLAUDE_AGENT_ACP_FALLBACK_VERSION}");
+        assert!(
+            CONTAINERFILE.contains(&claude),
+            "containers/Containerfile.agent-dev must install {claude}. The image and the \
+             bridge_launch() npx fallbacks have to stay in lockstep, otherwise a container \
+             session and an npx session run different adapter versions."
+        );
     }
 
     #[test]

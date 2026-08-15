@@ -30,10 +30,22 @@ uses that companion to run its session relay inside Linux containers when the
 controller binary itself isn't a Linux binary for the container's
 architecture.
 
-## Build the agent-dev image
+## Get the agent-dev image
 
 hel ships a reference container image with everything a session needs
-pre-installed. Build it once:
+pre-installed: Rust, Node 24, Git, GitHub CLI, and the Codex and Claude ACP
+bridges. It's published at `ghcr.io/brokkai/hel/agent-dev:latest`, public and
+multi-arch for both `linux/amd64` and `linux/arm64`, so the same image name
+works whether hel is running it through Podman, Apple's `container` runtime,
+or an arm64 SSH host.
+
+You don't need to do anything to get it: `hel setup`'s image prompt already
+defaults to this published image, and `podman run` (and Apple's `container
+run`) pull an image automatically the first time it's needed. Accepting the
+default when you run `hel setup`, below, is enough.
+
+Building it yourself remains a supported alternative, for example to
+customize the image or to work offline:
 
 ```console
 podman build --pull=always \
@@ -41,15 +53,6 @@ podman build --pull=always \
   --tag localhost/hel/agent-dev:latest \
   containers
 ```
-
-This bakes in Rust, Node 24, Git, GitHub CLI, and the Codex and Claude ACP
-bridges.
-
-You don't have to use this image. `hel setup`'s image prompt defaults to
-`ubuntu:24.04`, and a plain Ubuntu image works: hel auto-installs Git, GitHub
-CLI, and Node the first time a session needs them. But that installation runs
-inside every new container, which slows down the start of each session. The
-agent-dev image avoids that cost.
 
 ## Run `hel setup`
 
@@ -62,8 +65,14 @@ GitHub origin of the current directory, and which local container runtimes
 are usable. If a usable runtime exists, it prompts you for:
 
 1. Which runtime to use, defaulting to its recommendation.
-2. The container image, defaulting to `ubuntu:24.04` — enter
-   `localhost/hel/agent-dev:latest` here if you built the image above.
+2. The container image, defaulting to `ghcr.io/brokkai/hel/agent-dev:latest`
+   — press Enter to accept it, or enter `localhost/hel/agent-dev:latest` here
+   if you built the image yourself above.
+
+A plain image such as `ubuntu:24.04` still works if you enter it here: hel
+auto-installs Git, GitHub CLI, and Node the first time a session needs them.
+But that installation runs inside every new container, which slows down the
+start of each session. The default agent-dev image avoids that cost.
 
 It then shows a summary of what it's about to write and asks you to confirm
 before writing `config.toml`. After you confirm, it runs a smoke test: it

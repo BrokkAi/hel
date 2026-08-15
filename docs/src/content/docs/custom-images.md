@@ -5,7 +5,9 @@ description: What a container image must provide to work as a hel local-podman, 
 
 hel can run a session in any container image that meets a small contract.
 `containers/Containerfile.agent-dev` is the reference image and satisfies all
-of it; start there if you're building your own.
+of it; start there if you're building your own. CI publishes this image as
+`ghcr.io/brokkai/hel/agent-dev:latest`, multi-arch for `linux/amd64` and
+`linux/arm64`.
 
 ## The entrypoint
 

@@ -51,7 +51,16 @@ wrapped in a noninteractive `ssh` call to the configured host. Every
 remediation below then applies on that remote host, as the user that SSH logs
 in as.
 
-Build Hel's bundled agent-development image when a local image is desired:
+Hel's bundled agent-development image is published at
+`ghcr.io/brokkai/hel/agent-dev:latest` (multi-arch: `linux/amd64` and
+`linux/arm64`, public, no authentication needed to pull). Pull it directly:
+
+```console
+podman pull ghcr.io/brokkai/hel/agent-dev:latest
+```
+
+Building it locally remains a supported alternative, for example to customize
+the image or to work offline:
 
 ```console
 podman build --pull=always \
@@ -160,18 +169,18 @@ usable subordinate range.
 
 ### 3. The configured runtime image is available
 
-For a registry-hosted image, set `IMAGE` to the exact `image` value from the
+For Hel's published image, set `IMAGE` to the exact `image` value from the
 Hel target and pull it:
 
 ```console
-IMAGE=ghcr.io/your-org/agent-dev:latest
+IMAGE=ghcr.io/brokkai/hel/agent-dev:latest
 podman pull "$IMAGE"
 podman image exists "$IMAGE"
 ```
 
-Both commands must exit zero. Replace the example with the configured image.
-For Hel's locally built `localhost/hel/agent-dev:latest`, build it with the
-command above and verify it without attempting a registry pull:
+Both commands must exit zero. Replace the example with the configured image
+if it differs. For Hel's locally built `localhost/hel/agent-dev:latest`, build
+it with the command above and verify it without attempting a registry pull:
 
 ```console
 podman image exists localhost/hel/agent-dev:latest

@@ -40,7 +40,21 @@ cargo build --release
 ./target/release/hel setup
 ```
 
-For a local Podman target, build the agent-development image with:
+For a local Podman target, pull the published agent-development image:
+
+```console
+podman pull ghcr.io/brokkai/hel/agent-dev:latest
+```
+
+The image includes Rust, Node 24, Git, GitHub CLI, the Codex ACP bridge, and the
+Claude ACP bridge. Hel copies its session relay and the selected harness profile
+into each new container. Kimi Code uses Hel's official on-demand installer
+fallback. The image is multi-arch (`linux/amd64` and `linux/arm64`), so the
+same name works on both architectures, is public, and needs no authentication
+to pull.
+
+Building it yourself remains a supported alternative, for example to customize
+the image or to work offline:
 
 ```console
 podman build --pull=always \
@@ -49,18 +63,16 @@ podman build --pull=always \
   containers
 ```
 
-The image includes Rust, Node 24, Git, GitHub CLI, the Codex ACP bridge, and the
-Claude ACP bridge. Hel copies its session relay and the selected harness profile
-into each new container. Kimi Code uses Hel's official on-demand installer
-fallback.
-
 Configure it as a target with:
 
 ```toml
 [targets.podman]
 kind = "local-podman"
-image = "localhost/hel/agent-dev:latest"
+image = "ghcr.io/brokkai/hel/agent-dev:latest"
 ```
+
+Use the `localhost/hel/agent-dev:latest` tag instead if you built the image
+locally.
 
 See [docs/PODMAN.md](docs/PODMAN.md) for the rootless installation,
 verification, and remediation contract Hel enforces before local-Podman
@@ -166,7 +178,7 @@ destination = "private-local"
 
 [targets.podman]
 kind = "local-podman"
-image = "ghcr.io/your-org/agent-dev:latest"
+image = "ghcr.io/brokkai/hel/agent-dev:latest"
 # Optional. Selects the image platform and the matching hel worker architecture.
 # platform = "linux/amd64"
 # Optional template defaults used by non-interactive callers. The dashboard's
@@ -186,7 +198,7 @@ kind = "local-bare"
 
 [targets.mac-container]
 kind = "apple-container"
-image = "ghcr.io/your-org/agent-dev:latest"
+image = "ghcr.io/brokkai/hel/agent-dev:latest"
 
 [targets.builder]
 kind = "ssh-bare"
@@ -196,7 +208,7 @@ workspace_prefix = ".local/share/hel/workspaces"
 [targets.builder-podman]
 kind = "ssh-podman"
 host = "builder"
-image = "ghcr.io/your-org/agent-dev:latest"
+image = "ghcr.io/brokkai/hel/agent-dev:latest"
 
 [targets.ec2]
 kind = "aws-ec2"

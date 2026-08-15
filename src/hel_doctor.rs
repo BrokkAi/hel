@@ -19,6 +19,11 @@ use crate::hel_targets::{
     verify_local_podman, verify_ssh_podman,
 };
 
+// Only the image for the Apple container smoke test when the config has no
+// apple-container target. This intentionally stays a small stock image rather
+// than hel_setup::DEFAULT_IMAGE: the check just proves the runtime can start a
+// container, and pulling the multi-gigabyte agent-dev image to do that would be
+// a poor trade.
 const DEFAULT_CONTAINER_IMAGE: &str = "ubuntu:24.04";
 const APPLE_CONTAINER_INSTALL_URL: &str = "https://github.com/apple/container#initial-install";
 
