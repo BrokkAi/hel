@@ -64,6 +64,7 @@ use hel::hel_worker_runtime::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use tokio_stream::StreamExt as _;
 
 #[derive(Debug, Parser)]
 #[command(name = "hel", version, about = "ACP session control plane")]
@@ -305,6 +306,11 @@ const RESOURCE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const CAPACITY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const WORKER_DIAGNOSIS_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONCURRENT_PHONE_ACTIONS: usize = 4;
+/// Redraw cadence for displays that move with the wall clock: turn timers,
+/// countdowns, and elapsed times.
+const DASHBOARD_CLOCK_TICK: Duration = Duration::from_secs(1);
+/// Redraw cadence while the import progress dialog is on screen.
+const IMPORT_PROGRESS_TICK: Duration = Duration::from_millis(125);
 const QUOTA_REFRESH_NOTICE: &str = "Refreshing profile quotas…";
 const QUOTA_REFRESHED_NOTICE: &str = "Profile quotas refreshed.";
 
@@ -3162,6 +3168,36 @@ fn git_output(arguments: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Replaces the dashboard's event stream, dropping the old one first.
+///
+/// Once polled, an `EventStream` leaves a reader thread inside crossterm's
+/// internal reader, where it holds the reader lock and consumes terminal input.
+/// Anything else that reads the terminal needs that thread gone first. Building
+/// the replacement takes the same lock, which is why the old stream goes first.
+fn restart_event_stream(events: event::EventStream) -> event::EventStream {
+    drop(events);
+    event::EventStream::new()
+}
+
+/// Applies one terminal event to the dashboard and reports the work it asks
+/// for. Every event redraws, so events that carry no action still return
+/// `None` rather than being skipped.
+fn dashboard_event_action(dashboard: &mut DashboardState, event: Event) -> DashboardAction {
+    match event {
+        Event::Key(key) => dashboard.handle_key(key),
+        Event::Paste(pasted) => {
+            dashboard.handle_paste(&pasted);
+            DashboardAction::None
+        }
+        Event::Mouse(mouse) => {
+            dashboard.handle_mouse(mouse);
+            DashboardAction::None
+        }
+        // Resize and focus changes only need the redraw.
+        _ => DashboardAction::None,
+    }
+}
+
 async fn run_dashboard() -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         println!("Welcome to Hel");
@@ -3269,24 +3305,184 @@ async fn run_dashboard() -> Result<()> {
     let mut manual_quota_refresh_generation = None;
     let mut checkpoint_archive_targets_seen = std::collections::BTreeMap::new();
     let mut checkpoint_archive_generation = 0_u64;
+    let mut events = event::EventStream::new();
+    // `interval_at` so the first tick is a period away rather than immediate,
+    // and `Delay` so a tick that was gated off does not fire a burst to catch
+    // up when it comes back.
+    let mut clock_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + DASHBOARD_CLOCK_TICK,
+        DASHBOARD_CLOCK_TICK,
+    );
+    clock_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut import_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + IMPORT_PROGRESS_TICK,
+        IMPORT_PROGRESS_TICK,
+    );
+    import_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A closed feed reports `None` for ever, which would leave its arm
+    // permanently ready. Each flag retires its own arm instead.
+    let (mut quota_open, mut sessions_open, mut recovery_open, mut credentials_open) =
+        (true, true, true, true);
+    let (mut resource_open, mut capacity_open, mut aws_options_open, mut import_profiles_open) =
+        (true, true, true, true);
+    let (mut import_tasks_open, mut lifecycle_open, mut dashboard_io_open) = (true, true, true);
+    // The first pass always draws; after that a redraw needs a wakeup, and the
+    // poll targets are recomputed only after the controller may have changed.
+    let mut dirty = true;
+    let mut controller_changed = true;
 
     loop {
-        let checkpoint_archive_targets = checkpoint_archive_targets(&controller);
-        if checkpoint_archive_targets != checkpoint_archive_targets_seen {
-            checkpoint_archive_targets_seen = checkpoint_archive_targets.clone();
-            checkpoint_archive_generation = checkpoint_archive_generation.wrapping_add(1).max(1);
-            spawn_checkpoint_archive_size_refresh(
-                checkpoint_archive_generation,
-                checkpoint_archive_targets,
-                dashboard_io_tx.clone(),
-            );
+        if controller_changed {
+            controller_changed = false;
+            let checkpoint_archive_targets = checkpoint_archive_targets(&controller);
+            if checkpoint_archive_targets != checkpoint_archive_targets_seen {
+                checkpoint_archive_targets_seen = checkpoint_archive_targets.clone();
+                checkpoint_archive_generation =
+                    checkpoint_archive_generation.wrapping_add(1).max(1);
+                spawn_checkpoint_archive_size_refresh(
+                    checkpoint_archive_generation,
+                    checkpoint_archive_targets,
+                    dashboard_io_tx.clone(),
+                );
+            }
+            let capacity_targets = controller.deployment_capacity_targets();
+            if *capacity_targets_tx.borrow() != capacity_targets {
+                capacity_targets_tx.send_replace(capacity_targets.clone());
+                dashboard.set_deployment_capacity_targets(capacity_targets);
+                dirty = true;
+            }
         }
-        let capacity_targets = controller.deployment_capacity_targets();
-        if *capacity_targets_tx.borrow() != capacity_targets {
-            capacity_targets_tx.send_replace(capacity_targets.clone());
-            dashboard.set_deployment_capacity_targets(capacity_targets);
+        if dirty {
+            dirty = false;
+            terminal
+                .terminal
+                .draw(|frame| render(frame, &mut dashboard))?;
         }
-        while let Ok(update) = quota_updates_rx.try_recv() {
+        let mut action = DashboardAction::None;
+        let mut quota_update = None;
+        let mut session_update = None;
+        let mut recovery_result = None;
+        let mut credential_result = None;
+        let mut resource_update = None;
+        let mut capacity_update = None;
+        let mut aws_options = None;
+        let mut import_profile = None;
+        let mut import_task_update = None;
+        let mut lifecycle_update = None;
+        let mut dashboard_io_update = None;
+        // The winning arm takes the message that woke the loop; the drains
+        // below batch whatever is queued behind it, so one wakeup is one draw.
+        tokio::select! {
+            _ = termination.cancelled() => break,
+            event = events.next() => {
+                let Some(event) = event else { break };
+                action = dashboard_event_action(&mut dashboard, event?);
+                // Key repeats and pastes arrive as several ready events. The
+                // buffered ones are handled before drawing, but the first event
+                // that asks for work ends the batch so that dispatch still
+                // follows input order.
+                while matches!(action, DashboardAction::None) {
+                    // A zero timeout rather than a no-op waker: `EventStream`
+                    // arms its reader thread with the waker it was last polled
+                    // with, so a no-op waker here would swallow the next wakeup.
+                    let Ok(Some(event)) =
+                        tokio::time::timeout(Duration::ZERO, events.next()).await
+                    else {
+                        break;
+                    };
+                    action = dashboard_event_action(&mut dashboard, event?);
+                }
+                controller_changed = true;
+                dirty = true;
+            }
+            update = quota_updates_rx.recv(), if quota_open => match update {
+                Some(update) => {
+                    quota_update = Some(update);
+                    dirty = true;
+                }
+                None => quota_open = false,
+            },
+            update = worker_updates_rx.recv(), if sessions_open => match update {
+                Some(update) => {
+                    session_update = Some(update);
+                    dirty = true;
+                }
+                None => sessions_open = false,
+            },
+            result = recovery.result(), if recovery_open => match result {
+                Some(result) => {
+                    recovery_result = Some(result);
+                    dirty = true;
+                }
+                None => recovery_open = false,
+            },
+            result = credential_sync.result(), if credentials_open => match result {
+                Some(result) => {
+                    credential_result = Some(result);
+                    dirty = true;
+                }
+                None => credentials_open = false,
+            },
+            update = resource_updates_rx.recv(), if resource_open => match update {
+                Some(update) => {
+                    resource_update = Some(update);
+                    dirty = true;
+                }
+                None => resource_open = false,
+            },
+            update = capacity_updates_rx.recv(), if capacity_open => match update {
+                Some(update) => {
+                    capacity_update = Some(update);
+                    dirty = true;
+                }
+                None => capacity_open = false,
+            },
+            options = aws_resource_options_rx.recv(), if aws_options_open => match options {
+                Some(options) => {
+                    aws_options = Some(options);
+                    dirty = true;
+                }
+                None => aws_options_open = false,
+            },
+            profile = import_updates_rx.recv(), if import_profiles_open => match profile {
+                Some(profile) => {
+                    import_profile = Some(profile);
+                    dirty = true;
+                }
+                None => import_profiles_open = false,
+            },
+            update = import_task_rx.recv(), if import_tasks_open => match update {
+                Some(update) => {
+                    import_task_update = Some(update);
+                    dirty = true;
+                }
+                None => import_tasks_open = false,
+            },
+            update = lifecycle_updates_rx.recv(), if lifecycle_open => match update {
+                Some(update) => {
+                    lifecycle_update = Some(update);
+                    dirty = true;
+                }
+                None => lifecycle_open = false,
+            },
+            update = dashboard_io_rx.recv(), if dashboard_io_open => match update {
+                Some(update) => {
+                    dashboard_io_update = Some(update);
+                    dirty = true;
+                }
+                None => dashboard_io_open = false,
+            },
+            // Turn clocks, countdowns, and credential-sync backoffs move on
+            // their own, so the dashboard redraws once a second regardless.
+            _ = clock_tick.tick() => dirty = true,
+            // The import dialog reports how long a step has stalled; it needs a
+            // faster tick, and only while it is on screen.
+            _ = import_tick.tick(), if active_import.is_some() => dirty = true,
+        }
+        while let Some(update) = quota_update
+            .take()
+            .or_else(|| quota_updates_rx.try_recv().ok())
+        {
             match update {
                 QuotaUpdate::Refreshing { profile_ids } => {
                     dashboard.begin_quota_refresh(profile_ids)
@@ -3302,7 +3498,11 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
         }
-        while let Ok(update) = worker_updates_rx.try_recv() {
+        while let Some(update) = session_update
+            .take()
+            .or_else(|| worker_updates_rx.try_recv().ok())
+        {
+            controller_changed = true;
             let session_id = update.session_id.clone();
             let connected = update.view.connected;
             let connection_error = update.view.error.clone();
@@ -3371,32 +3571,51 @@ async fn run_dashboard() -> Result<()> {
             &credential_sync_handle,
             Instant::now(),
         );
-        while let Some(result) = recovery.try_result() {
+        while let Some(result) = recovery_result.take().or_else(|| recovery.try_result()) {
+            controller_changed = true;
             apply_recovery_result(&mut controller, &mut dashboard, result);
         }
-        while let Some(result) = credential_sync.try_result() {
+        while let Some(result) = credential_result
+            .take()
+            .or_else(|| credential_sync.try_result())
+        {
             if let Some(notice) = credential_sync_notices.notice(&result) {
                 dashboard.set_notice(notice);
             }
         }
-        while let Ok(update) = resource_updates_rx.try_recv() {
+        while let Some(update) = resource_update
+            .take()
+            .or_else(|| resource_updates_rx.try_recv().ok())
+        {
             dashboard.apply_resource_usage(&update.session_id, update.usage);
         }
-        while let Ok(update) = capacity_updates_rx.try_recv() {
+        while let Some(update) = capacity_update
+            .take()
+            .or_else(|| capacity_updates_rx.try_recv().ok())
+        {
             dashboard.apply_deployment_capacity(
                 &update.target_id,
                 update.result,
                 update.sampled_at_epoch_seconds,
             );
         }
-        while let Ok((target_id, result)) = aws_resource_options_rx.try_recv() {
+        while let Some((target_id, result)) = aws_options
+            .take()
+            .or_else(|| aws_resource_options_rx.try_recv().ok())
+        {
             resolving_aws_resource_options.remove(&target_id);
             dashboard.apply_aws_resource_options(&target_id, result);
         }
-        while let Ok((discovery_id, profile)) = import_updates_rx.try_recv() {
+        while let Some((discovery_id, profile)) = import_profile
+            .take()
+            .or_else(|| import_updates_rx.try_recv().ok())
+        {
             dashboard.apply_import_profile(discovery_id, profile);
         }
-        while let Ok(update) = import_task_rx.try_recv() {
+        while let Some(update) = import_task_update
+            .take()
+            .or_else(|| import_task_rx.try_recv().ok())
+        {
             match update {
                 DashboardImportUpdate::Progress {
                     task_id,
@@ -3453,7 +3672,11 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
         }
-        while let Ok(update) = lifecycle_updates_rx.try_recv() {
+        while let Some(update) = lifecycle_update
+            .take()
+            .or_else(|| lifecycle_updates_rx.try_recv().ok())
+        {
+            controller_changed = true;
             let session_id = update.session_id.clone();
             let operation = lifecycle_operations.remove(&session_id);
             dashboard.finish_session_operation(&session_id);
@@ -3462,7 +3685,11 @@ async fn run_dashboard() -> Result<()> {
                 dashboard_io_tx.clone(),
             );
         }
-        while let Ok(update) = dashboard_io_rx.try_recv() {
+        while let Some(update) = dashboard_io_update
+            .take()
+            .or_else(|| dashboard_io_rx.try_recv().ok())
+        {
+            controller_changed = true;
             match update {
                 DashboardIoUpdate::WorkerRecordPersistence {
                     session_id,
@@ -3726,27 +3953,6 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
         }
-        terminal
-            .terminal
-            .draw(|frame| render(frame, &mut dashboard))?;
-        if termination.is_cancelled() {
-            break;
-        }
-        if !event::poll(Duration::from_millis(250))? {
-            continue;
-        }
-        let action = match event::read()? {
-            Event::Key(key) => dashboard.handle_key(key),
-            Event::Paste(pasted) => {
-                dashboard.handle_paste(&pasted);
-                DashboardAction::None
-            }
-            Event::Mouse(mouse) => {
-                dashboard.handle_mouse(mouse);
-                DashboardAction::None
-            }
-            _ => continue,
-        };
         match action {
             DashboardAction::None => {}
             DashboardAction::QuitDetach => {
@@ -3760,6 +3966,11 @@ async fn run_dashboard() -> Result<()> {
                 break;
             }
             DashboardAction::OpenConfig => {
+                // The setup dialog reads the terminal itself, and a live event
+                // stream's reader thread consumes terminal input. Retire the
+                // stream first; the replacement reads nothing until it is polled
+                // again at the top of the loop.
+                events = restart_event_stream(events);
                 terminal.suspend()?;
                 let setup_result = run_setup_dialog(&config_path());
                 terminal.resume()?;
@@ -4002,6 +4213,10 @@ async fn run_dashboard() -> Result<()> {
                     session: session_record,
                     config: controller.config.clone(),
                 };
+                // The chat UI reads events synchronously, and this loop's event
+                // stream parks a reader thread inside crossterm's internal
+                // reader lock. Hand that lock back for the duration of the chat.
+                events = restart_event_stream(events);
                 let result = async {
                     let mut managed = worker_commands_tx.session(session_id.clone()).await?;
                     let exit = hel::hel_chat::run_chat(
@@ -4975,6 +5190,33 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dashboard loop batches buffered input and stops at the first event
+    /// that asks for work, so events that only need a redraw must report no
+    /// action and actionable keys must report theirs.
+    #[test]
+    fn only_events_that_ask_for_work_end_an_input_batch() {
+        let mut dashboard = DashboardState::new(
+            HelConfig::default(),
+            HelState::default(),
+            std::collections::BTreeMap::new(),
+        );
+
+        assert!(matches!(
+            dashboard_event_action(&mut dashboard, Event::Resize(80, 24)),
+            DashboardAction::None
+        ));
+        assert!(matches!(
+            dashboard_event_action(
+                &mut dashboard,
+                Event::Key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+            ),
+            DashboardAction::QuitDetach
+        ));
+    }
 
     #[test]
     fn worker_diagnosis_is_coalesced_for_one_unreachable_episode() {
