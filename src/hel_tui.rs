@@ -4,6 +4,7 @@
 //! Input is reduced to [`DashboardAction`] values for the controller to run.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
@@ -22,7 +23,7 @@ use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use crate::hel_quota::{ProfileQuota, QuotaWindow};
 use crate::hel_state::{
     HelState, MaterializedExecutionState, MaterializedSession, SessionRecord,
-    SessionResourceAllocation, SessionState, TranscriptBody,
+    SessionResourceAllocation, SessionState, TranscriptBody, TranscriptItem,
 };
 use crate::hel_targets::{
     AdditionalMount, DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage,
@@ -561,7 +562,7 @@ struct SessionDetail {
     materialized_applied_event_ordinal: Option<u64>,
     current_turn_started_at: Option<u64>,
     last_activity_at_ms: Option<u64>,
-    last_agent_message: Option<String>,
+    last_agent_message: Option<Arc<str>>,
     /// Latest agent-content ordinals retained so a state-only read-cursor
     /// update can recompute the single unread count exactly.
     agent_message_latest_content_ordinals: Vec<u64>,
@@ -570,6 +571,82 @@ struct SessionDetail {
     transcript: Option<TranscriptSnapshot>,
     transcript_hydration: TranscriptHydration,
     queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
+    /// What the last projection derived, so the next one only rescans the
+    /// transcript items that changed.
+    projection: MaterializedProjectionCache,
+}
+
+/// Per-item results the previous session projection derived, kept so the next
+/// projection can reuse them.
+///
+/// Transcript items are shared by pointer and copied on write, so the items
+/// two consecutive projections agree on are the ones that are pointer-equal.
+/// Everything before the first difference keeps its cached result, and the
+/// per-item JSON work is spent only on the changed tail.
+#[derive(Debug, Default, Clone)]
+pub struct MaterializedProjectionCache {
+    /// The transcript these results were derived from.
+    transcript: Vec<Arc<TranscriptItem>>,
+    /// Transcript index and latest content ordinal of every agent message that
+    /// has content, in transcript order.
+    agent_messages: Vec<(usize, u64)>,
+    /// Transcript index and text of the last agent message with text.
+    last_agent_message: Option<(usize, Arc<str>)>,
+}
+
+impl MaterializedProjectionCache {
+    /// How many leading items this cache and `transcript` share by pointer.
+    fn unchanged_prefix(&self, transcript: &[Arc<TranscriptItem>]) -> usize {
+        self.transcript
+            .iter()
+            .zip(transcript)
+            .take_while(|(cached, current)| Arc::ptr_eq(cached, current))
+            .count()
+    }
+}
+
+/// The last agent message with text in `transcript[range]`, searched from the
+/// end so it stops at the first one it finds.
+fn last_agent_message_in(
+    transcript: &[Arc<TranscriptItem>],
+    range: std::ops::Range<usize>,
+) -> Option<(usize, Arc<str>)> {
+    let start = range.start;
+    transcript[range]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(offset, item)| {
+            let TranscriptBody::Agent { chunks, .. } = &item.body else {
+                return None;
+            };
+            let text = crate::hel_chat::materialized_chunks_text(chunks);
+            (!text.trim().is_empty()).then(|| (start + offset, Arc::from(text)))
+        })
+}
+
+/// The last agent message with text, scanning the changed tail first and
+/// reusing the previous answer when it still holds.
+///
+/// The previous answer holds when it came from an item inside the unchanged
+/// prefix: nothing after that item had a message, or the previous scan would
+/// have stopped later. "No message at all" holds outright, because the
+/// previous scan covered every item the prefix is made of. Only an answer
+/// that came from an item that changed forces a rescan of the prefix, and
+/// that rescan still stops at the first message it finds.
+fn last_agent_message(
+    transcript: &[Arc<TranscriptItem>],
+    unchanged_prefix: usize,
+    previous: &MaterializedProjectionCache,
+) -> Option<(usize, Arc<str>)> {
+    if let Some(found) = last_agent_message_in(transcript, unchanged_prefix..transcript.len()) {
+        return Some(found);
+    }
+    match &previous.last_agent_message {
+        Some((index, text)) if *index < unchanged_prefix => Some((*index, text.clone())),
+        Some(_) => last_agent_message_in(transcript, 0..unchanged_prefix),
+        None => None,
+    }
 }
 
 pub struct PreparedMaterializedSessionDetail {
@@ -578,17 +655,21 @@ pub struct PreparedMaterializedSessionDetail {
     session_title: Option<String>,
     current_turn_started_at: Option<u64>,
     last_activity_at_ms: Option<u64>,
-    last_agent_message: Option<String>,
+    last_agent_message: Option<Arc<str>>,
     agent_message_latest_content_ordinals: Vec<u64>,
     unread_agent_messages: usize,
     transcript: TranscriptSnapshot,
     queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
+    projection: MaterializedProjectionCache,
 }
 
 impl PreparedMaterializedSessionDetail {
+    /// Projects one session for the dashboard, reusing what `previous`
+    /// derived for the transcript items that did not change.
     pub fn from_materialized(
         session: MaterializedSession,
         detached_after_event_ordinal: u64,
+        previous: MaterializedProjectionCache,
     ) -> Self {
         let current_turn_started_at = match session.execution {
             MaterializedExecutionState::Running { started_at_ms } => {
@@ -598,22 +679,29 @@ impl PreparedMaterializedSessionDetail {
             | MaterializedExecutionState::Closing
             | MaterializedExecutionState::Closed => None,
         };
-        let last_agent_message = session.transcript.iter().rev().find_map(|item| {
-            let TranscriptBody::Agent { chunks, .. } = &item.body else {
-                return None;
-            };
-            let text = crate::hel_chat::materialized_chunks_text(chunks);
-            (!text.trim().is_empty()).then(|| text.clone())
-        });
-        let agent_message_latest_content_ordinals = session
-            .transcript
+        let unchanged_prefix = previous.unchanged_prefix(&session.transcript);
+        let last_agent_message =
+            last_agent_message(&session.transcript, unchanged_prefix, &previous);
+        // Unread counting needs every agent message, so the list is carried
+        // forward and only its changed tail is rebuilt.
+        let mut agent_messages = previous.agent_messages;
+        agent_messages
+            .truncate(agent_messages.partition_point(|(index, _)| *index < unchanged_prefix));
+        for (index, item) in session.transcript.iter().enumerate().skip(unchanged_prefix) {
+            if item.is_nonempty_agent_message()
+                && let Some(ordinal) = item.latest_content_event_ordinal
+            {
+                agent_messages.push((index, ordinal));
+            }
+        }
+        let agent_message_latest_content_ordinals = agent_messages
             .iter()
-            .filter(|item| item.is_nonempty_agent_message())
-            .filter_map(|item| item.latest_content_event_ordinal)
-            .collect();
-        let unread_agent_messages =
-            usize::try_from(session.unread_agent_messages_after(detached_after_event_ordinal))
-                .unwrap_or(usize::MAX);
+            .map(|(_, ordinal)| *ordinal)
+            .collect::<Vec<_>>();
+        let unread_agent_messages = agent_message_latest_content_ordinals
+            .iter()
+            .filter(|ordinal| **ordinal > detached_after_event_ordinal)
+            .count();
         let queued_prompts = session
             .queued_prompts
             .iter()
@@ -637,11 +725,18 @@ impl PreparedMaterializedSessionDetail {
             session_title,
             current_turn_started_at,
             last_activity_at_ms,
-            last_agent_message,
+            last_agent_message: last_agent_message
+                .as_ref()
+                .map(|(_, text)| Arc::clone(text)),
             agent_message_latest_content_ordinals,
             unread_agent_messages,
             transcript,
             queued_prompts,
+            projection: MaterializedProjectionCache {
+                transcript: session.transcript,
+                agent_messages,
+                last_agent_message,
+            },
         }
     }
 }
@@ -941,12 +1036,24 @@ impl DashboardState {
             .sessions
             .get(&session.session_id)
             .map_or(0, |record| record.detached_after_event_ordinal);
+        let previous = self.take_projection_cache(&session.session_id);
         self.apply_prepared_materialized_session(
             PreparedMaterializedSessionDetail::from_materialized(
                 session.clone(),
                 detached_after_event_ordinal,
+                previous,
             ),
         );
+    }
+
+    /// Hands the last projection's per-item results to the next projection,
+    /// which runs off the UI task. A projection that never comes back, or one
+    /// that arrives too late to apply, only costs the next one a full rescan.
+    pub fn take_projection_cache(&mut self, session_id: &str) -> MaterializedProjectionCache {
+        self.session_details
+            .get_mut(session_id)
+            .map(|detail| std::mem::take(&mut detail.projection))
+            .unwrap_or_default()
     }
 
     pub fn apply_prepared_materialized_session(
@@ -973,6 +1080,7 @@ impl DashboardState {
         detail.transcript = Some(prepared.transcript);
         detail.transcript_hydration = TranscriptHydration::Ready;
         detail.queued_prompts = prepared.queued_prompts;
+        detail.projection = prepared.projection;
         if let Some(title) = prepared.session_title.as_ref()
             && let Some(record) = self.state.sessions.get_mut(&prepared.session_id)
         {
@@ -7326,10 +7434,18 @@ mod tests {
         stale.applied_event_ordinal = 1;
 
         assert!(dashboard.apply_prepared_materialized_session(
-            PreparedMaterializedSessionDetail::from_materialized(latest, 0),
+            PreparedMaterializedSessionDetail::from_materialized(
+                latest,
+                0,
+                MaterializedProjectionCache::default(),
+            ),
         ));
         assert!(!dashboard.apply_prepared_materialized_session(
-            PreparedMaterializedSessionDetail::from_materialized(stale, 0),
+            PreparedMaterializedSessionDetail::from_materialized(
+                stale,
+                0,
+                MaterializedProjectionCache::default(),
+            ),
         ));
 
         assert_eq!(
@@ -7337,6 +7453,118 @@ mod tests {
                 .last_agent_message
                 .as_deref(),
             Some("latest")
+        );
+    }
+
+    /// Rewrites one agent message the way the projection does: the item is
+    /// copied, so every other handle in the transcript survives.
+    fn set_agent_text(item: &mut Arc<TranscriptItem>, text: &str, content_ordinal: u64) {
+        let item = Arc::make_mut(item);
+        item.body = TranscriptBody::Agent {
+            chunks: vec![serde_json::json!({
+                "content": {"type": "text", "text": text}
+            })],
+            streaming: false,
+        };
+        item.latest_content_event_ordinal = Some(content_ordinal);
+        item.last_changed_at_ms = i64::try_from(content_ordinal).unwrap() * 1_000;
+    }
+
+    /// The projection reuses per-item results across updates, so every shape
+    /// of transcript change must land where a full rescan would.
+    #[test]
+    fn incremental_projection_matches_a_full_rescan_through_transcript_changes() {
+        let detached_after_event_ordinal = 1;
+        // One transcript, changed the way the projection changes it: items are
+        // appended, and an item that changes is replaced by a copy while the
+        // rest keep their handles.
+        let mut transcript: Vec<Arc<TranscriptItem>> = Vec::new();
+        let mut updates = vec![transcript.clone()];
+        transcript.push(agent_message(1, "first"));
+        transcript.push(thought(2, "thinking"));
+        updates.push(transcript.clone());
+        transcript.push(agent_message(3, "answer"));
+        updates.push(transcript.clone());
+        // More content streams into the tail message.
+        set_agent_text(&mut transcript[2], "answer, at length", 4);
+        updates.push(transcript.clone());
+        // The tail message loses its text, so the previous answer no longer
+        // holds and the earlier items have to decide it.
+        set_agent_text(&mut transcript[2], "   ", 5);
+        updates.push(transcript.clone());
+        // An item inside the unchanged prefix changes.
+        set_agent_text(&mut transcript[0], "first, corrected", 6);
+        updates.push(transcript.clone());
+        // A restore rebuilds every item, sharing no handles.
+        transcript = vec![agent_message(1, "restored"), agent_message(2, "and again")];
+        updates.push(transcript.clone());
+        // A checkpoint restore leaves a shorter transcript.
+        transcript.truncate(1);
+        updates.push(transcript);
+
+        let mut cache = MaterializedProjectionCache::default();
+        for (index, transcript) in updates.into_iter().enumerate() {
+            let session = materialized_session_for("session-1", transcript);
+            let incremental = PreparedMaterializedSessionDetail::from_materialized(
+                session.clone(),
+                detached_after_event_ordinal,
+                cache,
+            );
+            let rescanned = PreparedMaterializedSessionDetail::from_materialized(
+                session,
+                detached_after_event_ordinal,
+                MaterializedProjectionCache::default(),
+            );
+            assert_eq!(
+                incremental.last_agent_message, rescanned.last_agent_message,
+                "last agent message after update {index}"
+            );
+            assert_eq!(
+                incremental.agent_message_latest_content_ordinals,
+                rescanned.agent_message_latest_content_ordinals,
+                "agent ordinals after update {index}"
+            );
+            assert_eq!(
+                incremental.unread_agent_messages, rescanned.unread_agent_messages,
+                "unread count after update {index}"
+            );
+            cache = incremental.projection;
+        }
+    }
+
+    /// Unchanged items keep their handles, so a projection that follows one
+    /// only reads the items that changed.
+    #[test]
+    fn projection_rereads_only_the_changed_tail() {
+        let head = vec![agent_message(1, "first"), thought(2, "thinking")];
+        let mut transcript = head.clone();
+        transcript.push(agent_message(3, "answer"));
+        let first = PreparedMaterializedSessionDetail::from_materialized(
+            materialized_session_for("session-1", transcript.clone()),
+            0,
+            MaterializedProjectionCache::default(),
+        );
+
+        transcript.push(agent_message(4, "and more"));
+        assert_eq!(
+            first.projection.unchanged_prefix(&transcript),
+            3,
+            "appending leaves the earlier items untouched"
+        );
+
+        let mut streamed = transcript.clone();
+        Arc::make_mut(&mut streamed[3]).last_changed_at_ms = 9_000;
+        assert_eq!(
+            first.projection.unchanged_prefix(&streamed),
+            3,
+            "a copy-on-write update only breaks the item it touches"
+        );
+
+        let restored = vec![agent_message(1, "first"), thought(2, "thinking")];
+        assert_eq!(
+            first.projection.unchanged_prefix(&restored),
+            0,
+            "rebuilt items share nothing, so everything is read again"
         );
     }
 

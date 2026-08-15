@@ -1166,17 +1166,15 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                     }
                     if let Some(snapshot) = update.view.snapshot {
                         if let Some(session) = controller.state.sessions.get(&update.session_id).cloned() {
-                            recovery_observer
-                                .observe(hel::hel_recovery::RecoveryObservation {
-                                    session,
-                                    config: controller.config.clone(),
-                                    latest_completed_turn_ordinal:
-                                        hel::hel_recovery::latest_completed_turn_ordinal(
-                                            &snapshot.materialized,
-                                        ),
-                                    execution: snapshot.materialized.execution,
-                                })
-                                .await;
+                            recovery_observer.observe(hel::hel_recovery::RecoveryObservation {
+                                session,
+                                config: controller.config.clone(),
+                                latest_completed_turn_ordinal:
+                                    hel::hel_recovery::latest_completed_turn_ordinal(
+                                        &snapshot.materialized,
+                                    ),
+                                execution: snapshot.materialized.execution,
+                            });
                         }
                         conversations.insert(
                             update.session_id.clone(),
@@ -2495,12 +2493,14 @@ fn spawn_worker_record_persistence(
 fn spawn_materialized_session_projection(
     materialized: MaterializedSession,
     detached_after_event_ordinal: u64,
+    previous: hel::hel_tui::MaterializedProjectionCache,
     updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
 ) {
     tokio::task::spawn_blocking(move || {
         let detail = PreparedMaterializedSessionDetail::from_materialized(
             materialized,
             detached_after_event_ordinal,
+            previous,
         );
         let _ = updates.send(DashboardIoUpdate::MaterializedSessionProjection {
             detail: Box::new(detail),
@@ -3627,17 +3627,16 @@ async fn run_dashboard() -> Result<()> {
                 if let Some(ordinal) = snapshot.latest_auth_failure_ordinal {
                     auth_failure_syncs.observe(&session_id, &session.last_profile, ordinal);
                 }
-                recovery_observer
-                    .observe(hel::hel_recovery::RecoveryObservation {
-                        session,
-                        config: controller.config.clone(),
-                        latest_completed_turn_ordinal:
-                            hel::hel_recovery::latest_completed_turn_ordinal(
-                                &snapshot.materialized,
-                            ),
-                        execution: snapshot.materialized.execution,
-                    })
-                    .await;
+                // Queued, never awaited: the copy decision belongs to the
+                // coordinator, and the dashboard loop must stay free to draw.
+                recovery_observer.observe(hel::hel_recovery::RecoveryObservation {
+                    session,
+                    config: controller.config.clone(),
+                    latest_completed_turn_ordinal: hel::hel_recovery::latest_completed_turn_ordinal(
+                        &snapshot.materialized,
+                    ),
+                    execution: snapshot.materialized.execution,
+                });
             }
             let materialized = update
                 .view
@@ -3658,9 +3657,11 @@ async fn run_dashboard() -> Result<()> {
                             .sessions
                             .get(&session_id)
                             .map_or(0, |session| session.detached_after_event_ordinal);
+                        let previous = dashboard.take_projection_cache(&session_id);
                         spawn_materialized_session_projection(
                             materialized,
                             detached_after_event_ordinal,
+                            previous,
                             dashboard_io_tx.clone(),
                         );
                     }

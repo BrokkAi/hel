@@ -203,7 +203,37 @@ pub struct ChatEntry {
     plan: Vec<PlanLine>,
     #[serde(default, skip_serializing_if = "is_false")]
     leading_omitted: bool,
+    /// The materialized transcript item this entry was derived from, when it
+    /// came from the controller's projection. Provenance only, so it is
+    /// neither serialized nor part of the entry's value.
+    #[serde(skip)]
+    source: TranscriptSource,
 }
+
+/// Handle on the transcript item an entry was derived from. Unchanged items
+/// keep the same `Arc` from one projection to the next, so a pointer
+/// comparison replaces re-reading the item and re-parsing its JSON.
+///
+/// The handle records where an entry came from, not what it says, so two
+/// entries with equal content are equal whatever they were derived from.
+#[derive(Debug, Clone, Default)]
+struct TranscriptSource(Option<Arc<TranscriptItem>>);
+
+impl TranscriptSource {
+    fn is(&self, item: &Arc<TranscriptItem>) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|source| Arc::ptr_eq(source, item))
+    }
+}
+
+impl PartialEq for TranscriptSource {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for TranscriptSource {}
 
 impl ChatEntry {
     fn plain(seq: u64, role: ChatRole, text: impl Into<String>) -> Self {
@@ -222,6 +252,7 @@ impl ChatEntry {
             tool_locations: Vec::new(),
             plan: Vec::new(),
             leading_omitted: false,
+            source: TranscriptSource::default(),
         }
     }
 
@@ -246,6 +277,7 @@ impl ChatEntry {
             tool_locations: Vec::new(),
             plan: Vec::new(),
             leading_omitted: false,
+            source: TranscriptSource::default(),
         }
     }
 
@@ -265,6 +297,7 @@ impl ChatEntry {
             tool_locations: Vec::new(),
             plan,
             leading_omitted: false,
+            source: TranscriptSource::default(),
         }
     }
 
@@ -554,6 +587,11 @@ fn materialized_chat_entries(session: &MaterializedSession) -> Vec<ChatEntry> {
         .collect()
 }
 
+/// Rebuilds the entry list, keeping the entries whose transcript item did not
+/// change. An unchanged item is the same `Arc` as in the previous projection,
+/// so pointer identity settles reuse without reading a single field. The
+/// field comparison is the fallback for items that were rebuilt with equal
+/// content, which is what a restore from the canonical log produces.
 fn materialized_chat_entries_reusing(
     session: &MaterializedSession,
     previous: Vec<ChatEntry>,
@@ -563,11 +601,16 @@ fn materialized_chat_entries_reusing(
         .transcript
         .iter()
         .map(|item| {
-            if let Some(entry) = previous.next()
-                && entry_matches_transcript_item(&entry, item)
-            {
-                let mut entry = entry;
+            let Some(mut entry) = previous.next() else {
+                return materialized_chat_entry(item, session.applied_event_ordinal);
+            };
+            if entry.source.is(item) {
                 entry.seq = session.applied_event_ordinal.max(item.position);
+                return entry;
+            }
+            if entry_matches_transcript_item(&entry, item) {
+                entry.seq = session.applied_event_ordinal.max(item.position);
+                entry.source = TranscriptSource(Some(item.clone()));
                 return entry;
             }
             materialized_chat_entry(item, session.applied_event_ordinal)
@@ -599,7 +642,7 @@ fn entry_matches_transcript_item(entry: &ChatEntry, item: &TranscriptItem) -> bo
         }
 }
 
-fn materialized_chat_entry(item: &TranscriptItem, frontier: u64) -> ChatEntry {
+fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEntry {
     let mut entry = match &item.body {
         TranscriptBody::User { content } => ChatEntry::plain(
             item.position,
@@ -656,6 +699,7 @@ fn materialized_chat_entry(item: &TranscriptItem, frontier: u64) -> ChatEntry {
     ) {
         entry.message_id = Some(item.stable_id.clone());
     }
+    entry.source = TranscriptSource(Some(item.clone()));
     entry
 }
 
@@ -7000,6 +7044,95 @@ mod tests {
 
         assert_eq!(chat.entries[0].text, "first");
         assert!(chat.queued_prompts.is_empty());
+    }
+
+    fn user_transcript_item(position: u64, text: &str) -> Arc<TranscriptItem> {
+        Arc::new(TranscriptItem {
+            stable_id: format!("user:{position}"),
+            position,
+            latest_content_event_ordinal: None,
+            created_at_ms: position as i64 * 10,
+            last_changed_at_ms: position as i64 * 10,
+            body: TranscriptBody::User {
+                content: vec![serde_json::json!(text)],
+            },
+        })
+    }
+
+    #[test]
+    fn appending_a_chunk_reuses_earlier_entries_by_pointer_identity() {
+        let mut session = MaterializedSession::empty("session-pointer-reuse");
+        session.applied_event_ordinal = 3;
+        session.transcript = vec![
+            user_transcript_item(1, "first"),
+            user_transcript_item(2, "second"),
+            agent_transcript_item("agent:3", 3),
+        ];
+
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+        // Nothing about these entries matches their item any more, so only a
+        // pointer comparison can reuse them.
+        for (index, entry) in chat.entries.iter_mut().take(2).enumerate() {
+            entry.text = format!("reused {index}");
+            entry.revision = u64::MAX;
+            entry.recorded_at_ms = None;
+        }
+
+        let tail = Arc::make_mut(&mut session.transcript[2]);
+        let TranscriptBody::Agent { chunks, .. } = &mut tail.body else {
+            panic!("expected an agent message");
+        };
+        chunks.push(serde_json::json!({
+            "content": {"type": "text", "text": " again"}
+        }));
+        tail.last_changed_at_ms = 40;
+        tail.latest_content_event_ordinal = Some(4);
+        session.applied_event_ordinal = 4;
+        chat.apply_materialized(&session, &[], &[]);
+
+        assert_eq!(chat.entries.len(), 3);
+        assert_eq!(chat.entries[0].text, "reused 0");
+        assert_eq!(chat.entries[1].text, "reused 1");
+        assert!(chat.entries[0].source.is(&session.transcript[0]));
+        assert!(chat.entries[1].source.is(&session.transcript[1]));
+        assert_eq!(chat.entries[2].text, "hello again");
+        assert!(chat.entries[2].source.is(&session.transcript[2]));
+    }
+
+    #[test]
+    fn restored_transcript_reuses_entries_through_the_field_fallback() {
+        let mut session = MaterializedSession::empty("session-restored");
+        session.applied_event_ordinal = 2;
+        session.transcript = vec![
+            user_transcript_item(1, "first"),
+            user_transcript_item(2, "second"),
+        ];
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+        chat.entries[0].text = "reused".into();
+
+        // A restore rebuilds every item, so nothing is pointer-identical even
+        // though the content is unchanged.
+        let mut restored = MaterializedSession::empty("session-restored");
+        restored.applied_event_ordinal = 3;
+        restored.transcript = vec![
+            user_transcript_item(1, "first"),
+            user_transcript_item(2, "second"),
+            agent_transcript_item("agent:3", 3),
+        ];
+        chat.apply_materialized(&restored, &[], &[]);
+
+        assert_eq!(
+            chat.entries
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            ["reused", "second", "hello"]
+        );
+        // Reuse re-points the entry at the item it now stands for, so the next
+        // projection can take the pointer path again.
+        for (entry, item) in chat.entries.iter().zip(&restored.transcript) {
+            assert!(entry.source.is(item));
+        }
     }
 
     #[test]
