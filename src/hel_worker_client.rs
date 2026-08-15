@@ -323,6 +323,27 @@ impl RelayClient {
         )
     }
 
+    /// Return the fingerprint of this session's synced skills trees without
+    /// transferring the tree itself.
+    pub async fn skills_state(&mut self) -> Result<crate::hel_skills::SkillsSyncState> {
+        skills_sync_state(self.call(RelayRequest::SkillsState).await?)
+    }
+
+    /// Replace this session's synced skills trees with an encoded
+    /// `hel_skills::SkillsArchive`. The destination directories are fixed by
+    /// the session's launch config and the harness skills whitelist.
+    pub async fn install_skills(
+        &mut self,
+        archive_bytes: &[u8],
+    ) -> Result<crate::hel_skills::SkillsSyncState> {
+        skills_sync_state(
+            self.call(RelayRequest::InstallSkills {
+                data: BASE64.encode(archive_bytes),
+            })
+            .await?,
+        )
+    }
+
     pub async fn submit(
         &mut self,
         command_id: impl Into<String>,
@@ -455,6 +476,19 @@ fn credential_snapshot(payload: RelayResponsePayload) -> Result<CredentialSnapsh
             freshness_epoch_ms,
         }),
         _ => bail!("relay returned an unexpected credential state response"),
+    }
+}
+
+fn skills_sync_state(payload: RelayResponsePayload) -> Result<crate::hel_skills::SkillsSyncState> {
+    match payload {
+        RelayResponsePayload::SkillsState {
+            present,
+            fingerprint,
+        } => Ok(crate::hel_skills::SkillsSyncState {
+            present,
+            fingerprint,
+        }),
+        _ => bail!("relay returned an unexpected skills state response"),
     }
 }
 

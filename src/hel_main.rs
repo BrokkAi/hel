@@ -1984,13 +1984,22 @@ impl CredentialSyncNotices {
             return notice;
         }
 
-        let actions = result.actions();
-        (actions > 0).then(|| {
-            format!(
-                "Refreshed harness credentials for profile {} across {actions} session(s).",
+        let mut parts = Vec::new();
+        let credentials = result.credential_sessions();
+        if credentials > 0 {
+            parts.push(format!(
+                "Refreshed harness credentials for profile {} across {credentials} session(s).",
                 result.profile_id
-            )
-        })
+            ));
+        }
+        let skills = result.skills_sessions();
+        if skills > 0 {
+            parts.push(format!(
+                "Synced skills for profile {} to {skills} session(s).",
+                result.profile_id
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join(" "))
     }
 }
 
@@ -4795,7 +4804,7 @@ mod tests {
             failure: None,
             outcomes: vec![CredentialSyncOutcome {
                 session_id: "018f9dd2-a3b4".into(),
-                outcome: Ok(CredentialSyncAction::Pushed),
+                outcome: Ok(vec![CredentialSyncAction::Pushed]),
             }],
         };
         let notice = notices.notice(&pushed).unwrap();
@@ -4866,7 +4875,7 @@ mod tests {
             failure: None,
             outcomes: vec![CredentialSyncOutcome {
                 session_id: "018f9dd2-a3b4".into(),
-                outcome: Ok(CredentialSyncAction::Pushed),
+                outcome: Ok(vec![CredentialSyncAction::Pushed]),
             }],
         };
         let refreshed = notices.notice(&healthy).unwrap();
@@ -4895,6 +4904,41 @@ mod tests {
         // Another profile failing the same way is its own key.
         assert!(notices.notice(&failed("personal")).is_some());
         assert_eq!(notices.notice(&failed("work")), None);
+    }
+
+    #[test]
+    fn skills_and_credential_syncs_each_speak_in_the_notice() {
+        use hel::hel_credentials::{
+            CredentialSyncAction, CredentialSyncOutcome, CredentialSyncResult,
+        };
+
+        let result = CredentialSyncResult {
+            profile_id: "work".into(),
+            triggered_by: None,
+            failure: None,
+            outcomes: vec![
+                CredentialSyncOutcome {
+                    session_id: "018f9dd2-a3b4".into(),
+                    outcome: Ok(vec![
+                        CredentialSyncAction::Pushed,
+                        CredentialSyncAction::SkillsPushed,
+                    ]),
+                },
+                CredentialSyncOutcome {
+                    session_id: "018f9dd2-bbbb".into(),
+                    outcome: Ok(vec![CredentialSyncAction::SkillsPushed]),
+                },
+            ],
+        };
+        let notice = CredentialSyncNotices::default().notice(&result).unwrap();
+        assert!(
+            notice.contains("Refreshed harness credentials for profile work across 1 session(s)."),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("Synced skills for profile work to 2 session(s)."),
+            "{notice}"
+        );
     }
 
     #[test]

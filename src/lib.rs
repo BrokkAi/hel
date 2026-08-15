@@ -28,6 +28,7 @@ pub mod hel_resources;
 pub mod hel_server;
 pub mod hel_session_manager;
 pub mod hel_setup;
+pub mod hel_skills;
 pub mod hel_state;
 pub mod hel_targets;
 pub mod hel_tui;

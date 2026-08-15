@@ -86,6 +86,8 @@ fn is_relay_v1_method(method: &str) -> bool {
             | "credential_state"
             | "read_credentials"
             | "install_credentials"
+            | "skills_state"
+            | "install_skills"
     )
 }
 
@@ -159,6 +161,33 @@ mod tests {
         );
 
         let caller_selected_path = br#"{"request_id":"r3","protocol_version":1,"request":{"method":"read_credentials","params":{"path":"/tmp/stolen"}}}"#;
+        assert!(matches!(
+            decode_relay_request(caller_selected_path).unwrap(),
+            DecodedRelayRequest::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn skills_methods_decode_on_the_relay_v1_floor_without_a_path() {
+        let state =
+            br#"{"request_id":"r1","protocol_version":1,"request":{"method":"skills_state"}}"#;
+        let DecodedRelayRequest::Known(envelope) = decode_relay_request(state).unwrap() else {
+            panic!("skills_state should decode");
+        };
+        assert_eq!(envelope.request, RelayRequest::SkillsState);
+
+        let install = br#"{"request_id":"r2","protocol_version":1,"request":{"method":"install_skills","params":{"data":"SEVMU0tJTDE="}}}"#;
+        let DecodedRelayRequest::Known(envelope) = decode_relay_request(install).unwrap() else {
+            panic!("install_skills should decode");
+        };
+        assert_eq!(
+            envelope.request,
+            RelayRequest::InstallSkills {
+                data: "SEVMU0tJTDE=".into()
+            }
+        );
+
+        let caller_selected_path = br#"{"request_id":"r3","protocol_version":1,"request":{"method":"install_skills","params":{"data":"e30=","path":"/tmp/planted"}}}"#;
         assert!(matches!(
             decode_relay_request(caller_selected_path).unwrap(),
             DecodedRelayRequest::Invalid { .. }

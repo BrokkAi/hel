@@ -728,9 +728,12 @@ mod unix {
                     RelayRequest::CredentialState
                         | RelayRequest::ReadCredentials
                         | RelayRequest::InstallCredentials { .. }
+                        | RelayRequest::SkillsState
+                        | RelayRequest::InstallSkills { .. }
                 ) {
-                    // Credential bytes stay on this connection. They never
-                    // reach DurableRelay, its journal, or its command ledger.
+                    // Credential and skills bytes stay on this connection.
+                    // They never reach DurableRelay, its journal, or its
+                    // command ledger.
                     let response = credential_response(envelope, &credentials).await;
                     write_response(&mut writer, &response).await?;
                     continue;
@@ -781,9 +784,9 @@ mod unix {
         }
     }
 
-    /// Serve a credential request against this relay's own harness home. File
-    /// work runs on a blocking thread so neither the socket task nor the ACP
-    /// coordinator is stalled by filesystem I/O.
+    /// Serve a credential or skills request against this relay's own harness
+    /// home. File work runs on a blocking thread so neither the socket task
+    /// nor the ACP coordinator is stalled by filesystem I/O.
     async fn credential_response(
         envelope: RelayRequestEnvelope,
         credentials: &std::result::Result<CredentialEndpoint, String>,
@@ -856,6 +859,9 @@ mod unix {
         use crate::hel_credentials::{
             CredentialSnapshot, MAX_CREDENTIAL_BYTES, read_credential_file, write_credential_file,
         };
+        use crate::hel_skills::{
+            MAX_SKILLS_ARCHIVE_BYTES, SkillsArchive, collect_skills, install_skills,
+        };
         use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -886,7 +892,37 @@ mod unix {
                     &bytes,
                 )))
             }
-            other => bail!("{} is not a credential request", other.method_name()),
+            RelayRequest::SkillsState => {
+                let archive = collect_skills(endpoint.harness, &endpoint.home)?;
+                Ok(skills_state_payload(&archive.state()))
+            }
+            RelayRequest::InstallSkills { data } => {
+                // Base64 inflates by a third; rejecting early keeps a hostile
+                // controller from making the worker buffer an endless frame.
+                if data.len() > MAX_SKILLS_ARCHIVE_BYTES * 2 {
+                    bail!(
+                        "skills payload is above the {MAX_SKILLS_ARCHIVE_BYTES} byte archive limit"
+                    );
+                }
+                let bytes = BASE64
+                    .decode(data.as_bytes())
+                    .context("decode skills payload")?;
+                let archive = SkillsArchive::decode(&bytes)?;
+                install_skills(endpoint.harness, &endpoint.home, &archive)?;
+                let installed = collect_skills(endpoint.harness, &endpoint.home)?;
+                Ok(skills_state_payload(&installed.state()))
+            }
+            other => bail!(
+                "{} is not a credential or skills request",
+                other.method_name()
+            ),
+        }
+    }
+
+    fn skills_state_payload(state: &crate::hel_skills::SkillsSyncState) -> RelayResponsePayload {
+        RelayResponsePayload::SkillsState {
+            present: state.present,
+            fingerprint: state.fingerprint.clone(),
         }
     }
 
@@ -1143,12 +1179,14 @@ mod unix {
     }
 }
 
-/// Where this relay's harness keeps its credentials, resolved solely from the
-/// launch config. Credential requests carry no path, so a caller cannot steer
-/// a read or write outside the session's harness home.
+/// Where this relay's harness keeps its home, resolved solely from the launch
+/// config. Credential and skills requests carry no path, so a caller cannot
+/// steer a read or write outside the session's harness home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialEndpoint {
     pub harness: HarnessKind,
+    /// The session's harness home; skills trees sync under it.
+    pub home: PathBuf,
     pub marker: PathBuf,
 }
 
@@ -1162,6 +1200,7 @@ fn credential_endpoint(
     })?;
     Ok(CredentialEndpoint {
         harness: config.harness,
+        home: PathBuf::from(home.as_str()),
         marker: crate::hel_setup::harness_authentication_marker(
             config.harness,
             Path::new(home.as_str()),
@@ -1279,6 +1318,110 @@ mod relay_tests {
         RelayRequest::InstallCredentials {
             data: base64::engine::general_purpose::STANDARD.encode(bytes),
         }
+    }
+
+    fn skills_install_request(bytes: &[u8]) -> RelayRequest {
+        use base64::Engine as _;
+        RelayRequest::InstallSkills {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
+    fn skills_state_of(payload: RelayResponsePayload) -> crate::hel_skills::SkillsSyncState {
+        let RelayResponsePayload::SkillsState {
+            present,
+            fingerprint,
+        } = payload
+        else {
+            panic!("expected a skills state payload, got {payload:?}");
+        };
+        crate::hel_skills::SkillsSyncState {
+            present,
+            fingerprint,
+        }
+    }
+
+    #[test]
+    fn skills_state_reports_an_empty_home_then_a_synced_tree() {
+        let home = tempfile::tempdir().unwrap();
+        let endpoint = credential_endpoint(&launch_config(&home.path().to_string_lossy())).unwrap();
+
+        let empty = skills_state_of(
+            unix::apply_credential_request(&endpoint, &RelayRequest::SkillsState).unwrap(),
+        );
+        assert!(!empty.present);
+
+        std::fs::create_dir_all(home.path().join("skills/review")).unwrap();
+        std::fs::write(home.path().join("skills/review/SKILL.md"), b"review").unwrap();
+        let state = skills_state_of(
+            unix::apply_credential_request(&endpoint, &RelayRequest::SkillsState).unwrap(),
+        );
+        let expected = crate::hel_skills::collect_skills(HarnessKind::Codex, home.path()).unwrap();
+        assert!(state.present);
+        assert_eq!(state.fingerprint, expected.fingerprint());
+    }
+
+    #[test]
+    fn install_skills_replaces_the_session_tree_and_reports_the_new_state() {
+        let canonical = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(canonical.path().join("skills/review")).unwrap();
+        std::fs::write(canonical.path().join("skills/review/SKILL.md"), b"v1").unwrap();
+        let archive =
+            crate::hel_skills::collect_skills(HarnessKind::Codex, canonical.path()).unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("skills/stale")).unwrap();
+        std::fs::write(home.path().join("skills/stale/SKILL.md"), b"old").unwrap();
+        let endpoint = credential_endpoint(&launch_config(&home.path().to_string_lossy())).unwrap();
+
+        let state = skills_state_of(
+            unix::apply_credential_request(&endpoint, &skills_install_request(&archive.encode()))
+                .unwrap(),
+        );
+        assert_eq!(state, archive.state());
+        assert_eq!(
+            std::fs::read(home.path().join("skills/review/SKILL.md")).unwrap(),
+            b"v1"
+        );
+        assert!(!home.path().join("skills/stale").exists());
+
+        let empty = crate::hel_skills::SkillsArchive::default();
+        let state = skills_state_of(
+            unix::apply_credential_request(&endpoint, &skills_install_request(&empty.encode()))
+                .unwrap(),
+        );
+        assert!(!state.present);
+        assert!(!home.path().join("skills").exists());
+    }
+
+    #[test]
+    fn install_skills_rejects_garbage_and_leaves_the_tree_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("skills")).unwrap();
+        std::fs::write(home.path().join("skills/keep.md"), b"keep").unwrap();
+        let endpoint = credential_endpoint(&launch_config(&home.path().to_string_lossy())).unwrap();
+
+        let error = unix::apply_credential_request(
+            &endpoint,
+            &skills_install_request(b"garbage-with-enough-length"),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("magic"), "{error:#}");
+        assert_eq!(
+            std::fs::read(home.path().join("skills/keep.md")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn non_credential_requests_are_not_served_by_the_home_handler() {
+        let error =
+            unix::apply_credential_request(&test_credentials().unwrap(), &RelayRequest::Status)
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("credential or skills"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

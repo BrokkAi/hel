@@ -232,11 +232,7 @@ const GREETINGS: [Greeting; 48] = [
     ),
     greeting("One prompt closer to done", Group::Always, yes),
     greeting("Prompt boldly, commit carefully", Group::Always, yes),
-    greeting(
-        "Good code goes to Hel and back",
-        Group::Always,
-        yes,
-    ),
+    greeting("Good code goes to Hel and back", Group::Always, yes),
     greeting(
         "It's a good night to write code, $firstname",
         Group::Time,
