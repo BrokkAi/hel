@@ -134,7 +134,7 @@ pub enum SessionOperationKind {
 impl SessionOperationKind {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Launching => "Launching",
+            Self::Launching => "Launch",
             Self::Resuming => "Resuming",
             Self::Pausing => "Pausing",
             Self::Destroying => "Destroying",
