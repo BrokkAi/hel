@@ -56,7 +56,7 @@ use hel::hel_targets::{
 };
 use hel::hel_tui::{
     DashboardAction, DashboardState, ImportProfileOption, ImportSessionOption,
-    SessionOperationKind, render,
+    PreparedMaterializedSessionDetail, SessionOperationKind, render,
 };
 use hel::hel_worker::RelayCommand;
 use hel::hel_worker_runtime::{
@@ -1153,7 +1153,9 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                         &credential_sync_handle,
                         Instant::now(),
                     );
-                    if let Err(error) = apply_worker_record_update(&mut controller, &update) {
+                    if let Err(error) =
+                        apply_worker_record_update(&mut controller, &update, None)
+                    {
                         tracing::warn!(session_id = %update.session_id, "could not persist relay session metadata: {error:#}");
                     }
                     if let Some(snapshot) = update.view.snapshot {
@@ -2366,12 +2368,10 @@ fn apply_worker_poll_update(
     controller: &mut Controller,
     dashboard: &mut DashboardState,
     update: WorkerPollUpdate,
+    dashboard_io_tx: &tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
 ) -> Result<bool> {
-    if apply_worker_record_update(controller, &update)? {
+    if apply_worker_record_update(controller, &update, Some(dashboard_io_tx))? {
         dashboard.set_state(controller.state.clone());
-    }
-    if let Some(snapshot) = update.view.snapshot.as_ref() {
-        dashboard.apply_materialized_session(&snapshot.materialized);
     }
     if let Some(detail) = update.view.error {
         dashboard.mark_transcript_unavailable(&update.session_id);
@@ -2386,6 +2386,7 @@ fn apply_worker_poll_update(
 fn apply_worker_record_update(
     controller: &mut Controller,
     update: &WorkerPollUpdate,
+    dashboard_io_tx: Option<&tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>>,
 ) -> Result<bool> {
     let Some(snapshot) = update.view.snapshot.as_ref() else {
         return Ok(false);
@@ -2403,17 +2404,32 @@ fn apply_worker_record_update(
             .is_some_and(|message| message.starts_with("relay unreachable:"));
     let mut changed = false;
     if let Some(title) = changed_title {
-        hel::hel_database::set_session_acp_title(&update.session_id, title.as_deref())?;
+        if dashboard_io_tx.is_none() {
+            hel::hel_database::set_session_acp_title(&update.session_id, title.as_deref())?;
+        }
         controller
             .state
             .sessions
             .get_mut(&update.session_id)
             .expect("session disappeared while updating its ACP title")
             .acp_session_title = title;
+        if let Some(dashboard_io_tx) = dashboard_io_tx {
+            spawn_worker_record_persistence(
+                update.session_id.clone(),
+                WorkerRecordPersistence::AcpTitle {
+                    title: snapshot.materialized.session_title.clone(),
+                },
+                dashboard_io_tx.clone(),
+            );
+        }
         changed = true;
     }
-    if reconnect_observed && hel::hel_database::mark_session_relay_reconnected(&update.session_id)?
-    {
+    let reconnect_applies = if dashboard_io_tx.is_some() {
+        reconnect_observed
+    } else {
+        reconnect_observed && hel::hel_database::mark_session_relay_reconnected(&update.session_id)?
+    };
+    if reconnect_applies {
         let session = controller
             .state
             .sessions
@@ -2421,9 +2437,305 @@ fn apply_worker_record_update(
             .expect("session disappeared while recording relay reconnection");
         session.state = SessionState::Running;
         session.last_error = None;
+        if let Some(dashboard_io_tx) = dashboard_io_tx {
+            spawn_worker_record_persistence(
+                update.session_id.clone(),
+                WorkerRecordPersistence::RelayReconnect,
+                dashboard_io_tx.clone(),
+            );
+        }
         changed = true;
     }
     Ok(changed)
+}
+
+enum WorkerRecordPersistence {
+    AcpTitle { title: Option<String> },
+    RelayReconnect,
+}
+
+fn spawn_worker_record_persistence(
+    session_id: String,
+    operation: WorkerRecordPersistence,
+    updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let result = match &operation {
+            WorkerRecordPersistence::AcpTitle { title } => {
+                hel::hel_database::set_session_acp_title(&session_id, title.as_deref())
+            }
+            WorkerRecordPersistence::RelayReconnect => {
+                hel::hel_database::mark_session_relay_reconnected(&session_id).map(|_| ())
+            }
+        }
+        .map_err(|error| format!("{error:#}"));
+        let _ = updates.send(DashboardIoUpdate::WorkerRecordPersistence {
+            session_id,
+            operation,
+            result,
+        });
+    });
+}
+
+fn spawn_materialized_session_projection(
+    materialized: MaterializedSession,
+    detached_after_event_ordinal: u64,
+    updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let detail = PreparedMaterializedSessionDetail::from_materialized(
+            materialized,
+            detached_after_event_ordinal,
+        );
+        let _ = updates.send(DashboardIoUpdate::MaterializedSessionProjection {
+            detail: Box::new(detail),
+        });
+    });
+}
+
+fn spawn_lifecycle_reload(
+    reload: LifecycleReload,
+    updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let result = Controller::load().map_err(|error| format!("{error:#}"));
+        let _ = updates.send(DashboardIoUpdate::LifecycleReloaded(Box::new(
+            LifecycleReloaded { reload, result },
+        )));
+    });
+}
+
+fn spawn_dashboard_rename(
+    session_id: String,
+    title: String,
+    updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let result = (|| -> Result<String> {
+            let mut controller = Controller::load()?;
+            controller.rename_session(&session_id, &title)
+        })()
+        .map_err(|error| format!("{error:#}"));
+        let _ = updates.send(DashboardIoUpdate::RenameSession {
+            session_id,
+            title,
+            result,
+        });
+    });
+}
+
+fn spawn_detached_read_receipt_persist(
+    session_id: String,
+    event_ordinal: u64,
+    updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let result =
+            hel::hel_database::advance_detached_after_event_ordinal(&session_id, event_ordinal)
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"));
+        let _ = updates.send(DashboardIoUpdate::DetachedReadReceipt { session_id, result });
+    });
+}
+
+fn spawn_create_bundle(
+    source: String,
+    updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let result = (|| -> Result<CreatedBundleUpdate> {
+            // Load fresh so a concurrent background save (e.g. an import
+            // apply) is not clobbered by a stale UI-time config snapshot.
+            let mut config = Controller::load()?.config;
+            let bundle_id = create_quick_bundle(&mut config, &source)?;
+            config.save()?;
+            Ok(CreatedBundleUpdate { config, bundle_id })
+        })()
+        .map_err(|error| format!("{error:#}"));
+        let _ = updates.send(DashboardIoUpdate::CreatedBundle {
+            result: Box::new(result),
+        });
+    });
+}
+
+fn spawn_imported_session_apply(
+    mut imported: DashboardImportSuccess,
+    pending: PendingDashboardImport,
+    updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let result = (|| -> Result<ImportedDashboardSessionApply> {
+            let session = imported
+                .controller
+                .state
+                .sessions
+                .remove(&imported.session_id)
+                .context("import worker did not return its new session")?;
+            let bundle = imported
+                .controller
+                .config
+                .bundles
+                .get(&session.bundle_id)
+                .cloned()
+                .context("import worker did not return its session bundle")?;
+            let mut config = Controller::load()?.config;
+            config
+                .bundles
+                .insert(session.bundle_id.clone(), bundle.clone());
+            config.save()?;
+            persist_imported_session(&session)?;
+            Ok(ImportedDashboardSessionApply {
+                harness: imported.harness,
+                native_session_id: pending.native_session_id,
+                bundle_id: session.bundle_id.clone(),
+                bundle,
+                session,
+            })
+        })()
+        .map_err(|error| format!("{error:#}"));
+        let _ = updates.send(DashboardIoUpdate::ImportedSessionApplied {
+            result: Box::new(result),
+        });
+    });
+}
+
+fn checkpoint_archive_targets(
+    controller: &Controller,
+) -> std::collections::BTreeMap<String, PathBuf> {
+    controller
+        .state
+        .sessions
+        .values()
+        .filter(|session| session.state == SessionState::Archived)
+        .filter_map(|session| {
+            session
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| (session.id.clone(), checkpoint.archive_path.clone()))
+        })
+        .collect()
+}
+
+fn spawn_checkpoint_archive_size_refresh(
+    generation: u64,
+    targets: std::collections::BTreeMap<String, PathBuf>,
+    updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let sizes = targets
+            .into_iter()
+            .map(|(session_id, path)| {
+                let size = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+                (session_id, size)
+            })
+            .collect();
+        let _ = updates.send(DashboardIoUpdate::CheckpointArchiveSizes { generation, sizes });
+    });
+}
+
+fn spawn_dashboard_create_session(
+    action: DashboardAction,
+    updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+    lifecycle_updates: tokio::sync::mpsc::UnboundedSender<LifecycleUpdate>,
+    runtime: tokio::runtime::Handle,
+) {
+    tokio::task::spawn_blocking(move || {
+        let DashboardAction::CreateSession {
+            profile_id,
+            bundle_id,
+            project_directory,
+            target_template_id,
+            additional_mounts,
+            allow_dirty_local,
+            resource_allocation,
+        } = action.clone()
+        else {
+            return;
+        };
+        let registered = (|| -> Result<Option<RegisteredDashboardSession>> {
+            let mut controller = Controller::load()?;
+            if !allow_dirty_local && project_directory.is_none() {
+                let dirty = controller
+                    .config
+                    .bundles
+                    .get(&bundle_id)
+                    .with_context(|| format!("unknown bundle {bundle_id:?}"))
+                    .and_then(hel::hel_local_git::dirty_local_repositories)?;
+                if !dirty.is_empty() {
+                    let repositories = dirty
+                        .into_iter()
+                        .map(|repository| {
+                            format!("{}: {}", repository.path.display(), repository.summary)
+                        })
+                        .collect();
+                    let _ = updates.send(DashboardIoUpdate::CreateSession(Box::new(
+                        DashboardCreateSessionUpdate::DirtyLocal {
+                            action,
+                            repositories,
+                        },
+                    )));
+                    return Ok(None);
+                }
+            }
+            let title = format!(
+                "{} via {profile_id}",
+                project_directory
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| bundle_id.clone())
+            );
+            let session_id = controller.register_session_with_resources(
+                &profile_id,
+                &bundle_id,
+                &target_template_id,
+                title,
+                SessionLaunchOptions {
+                    additional_mounts,
+                    allow_dirty_local,
+                    resource_allocation,
+                    project_directory,
+                    session_title_override: None,
+                },
+            )?;
+            let session = controller
+                .state
+                .sessions
+                .get(&session_id)
+                .expect("newly registered session exists")
+                .clone();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            Ok(Some(RegisteredDashboardSession { session, cancelled }))
+        })();
+        let Some(registered) = (match registered {
+            Ok(registered) => registered,
+            Err(error) => {
+                let _ = updates.send(DashboardIoUpdate::CreateSession(Box::new(
+                    DashboardCreateSessionUpdate::Failed(format!("{error:#}")),
+                )));
+                None
+            }
+        }) else {
+            return;
+        };
+        let session_id = registered.session.id.clone();
+        let cancelled = registered.cancelled.clone();
+        if updates
+            .send(DashboardIoUpdate::CreateSession(Box::new(
+                DashboardCreateSessionUpdate::Registered(Box::new(registered)),
+            )))
+            .is_err()
+        {
+            cancelled.store(true, Ordering::Release);
+        }
+        let result = (|| -> Result<()> {
+            let mut controller = Controller::load()?;
+            let executor = CancellableProcessExecutor::new(cancelled);
+            runtime.block_on(controller.provision_session_controlled(&session_id, &executor))
+        })()
+        .map(|()| LifecycleSuccess::Created)
+        .map_err(|error| format!("{error:#}"));
+        let _ = lifecycle_updates.send(LifecycleUpdate { session_id, result });
+    });
 }
 
 fn spawn_worker_diagnosis(
@@ -2605,6 +2917,43 @@ struct LifecycleUpdate {
     result: std::result::Result<LifecycleSuccess, String>,
 }
 
+struct RegisteredDashboardSession {
+    session: SessionRecord,
+    cancelled: Arc<AtomicBool>,
+}
+
+enum DashboardCreateSessionUpdate {
+    DirtyLocal {
+        action: DashboardAction,
+        repositories: Vec<String>,
+    },
+    Registered(Box<RegisteredDashboardSession>),
+    Failed(String),
+}
+
+struct ImportedDashboardSessionApply {
+    harness: &'static str,
+    native_session_id: String,
+    session: SessionRecord,
+    bundle_id: String,
+    bundle: ProjectBundle,
+}
+
+struct CreatedBundleUpdate {
+    config: HelConfig,
+    bundle_id: String,
+}
+
+struct LifecycleReload {
+    update: LifecycleUpdate,
+    operation: Option<ActiveLifecycleOperation>,
+}
+
+struct LifecycleReloaded {
+    reload: LifecycleReload,
+    result: std::result::Result<Controller, String>,
+}
+
 fn interrupted_close_session_ids(controller: &Controller) -> Vec<String> {
     controller
         .state
@@ -2666,6 +3015,35 @@ fn spawn_interrupted_close_recovery(
 }
 
 enum DashboardIoUpdate {
+    WorkerRecordPersistence {
+        session_id: String,
+        operation: WorkerRecordPersistence,
+        result: std::result::Result<(), String>,
+    },
+    MaterializedSessionProjection {
+        detail: Box<PreparedMaterializedSessionDetail>,
+    },
+    CreateSession(Box<DashboardCreateSessionUpdate>),
+    RenameSession {
+        session_id: String,
+        title: String,
+        result: std::result::Result<String, String>,
+    },
+    DetachedReadReceipt {
+        session_id: String,
+        result: std::result::Result<(), String>,
+    },
+    CreatedBundle {
+        result: Box<std::result::Result<CreatedBundleUpdate, String>>,
+    },
+    ImportedSessionApplied {
+        result: Box<std::result::Result<ImportedDashboardSessionApply, String>>,
+    },
+    LifecycleReloaded(Box<LifecycleReloaded>),
+    CheckpointArchiveSizes {
+        generation: u64,
+        sizes: std::collections::BTreeMap<String, Option<u64>>,
+    },
     WorkerDiagnosis {
         session_id: String,
         episode_id: u64,
@@ -2880,8 +3258,20 @@ async fn run_dashboard() -> Result<()> {
     let mut worker_diagnoses = WorkerDiagnosisTracker::default();
     let termination = hel::termination::Coordinator::install().token();
     let mut manual_quota_refresh_generation = None;
+    let mut checkpoint_archive_targets_seen = std::collections::BTreeMap::new();
+    let mut checkpoint_archive_generation = 0_u64;
 
     loop {
+        let checkpoint_archive_targets = checkpoint_archive_targets(&controller);
+        if checkpoint_archive_targets != checkpoint_archive_targets_seen {
+            checkpoint_archive_targets_seen = checkpoint_archive_targets.clone();
+            checkpoint_archive_generation = checkpoint_archive_generation.wrapping_add(1).max(1);
+            spawn_checkpoint_archive_size_refresh(
+                checkpoint_archive_generation,
+                checkpoint_archive_targets,
+                dashboard_io_tx.clone(),
+            );
+        }
         let capacity_targets = controller.deployment_capacity_targets();
         if *capacity_targets_tx.borrow() != capacity_targets {
             capacity_targets_tx.send_replace(capacity_targets.clone());
@@ -2925,9 +3315,31 @@ async fn run_dashboard() -> Result<()> {
                     })
                     .await;
             }
-            match apply_worker_poll_update(&mut controller, &mut dashboard, update) {
+            let materialized = update
+                .view
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.materialized.clone());
+            match apply_worker_poll_update(
+                &mut controller,
+                &mut dashboard,
+                update,
+                &dashboard_io_tx,
+            ) {
                 Ok(true) => {
                     let _ = resource_triggers_tx.try_send(session_id.clone());
+                    if let Some(materialized) = materialized {
+                        let detached_after_event_ordinal = controller
+                            .state
+                            .sessions
+                            .get(&session_id)
+                            .map_or(0, |session| session.detached_after_event_ordinal);
+                        spawn_materialized_session_projection(
+                            materialized,
+                            detached_after_event_ordinal,
+                            dashboard_io_tx.clone(),
+                        );
+                    }
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -3011,60 +3423,14 @@ async fn run_dashboard() -> Result<()> {
                                 prompt.has_untracked_files,
                             );
                         }
-                        Ok(DashboardImportTaskResult::Imported(mut imported)) => {
-                            let applied = (|| -> Result<()> {
-                                let session = imported
-                                    .controller
-                                    .state
-                                    .sessions
-                                    .remove(&imported.session_id)
-                                    .context("import worker did not return its new session")?;
-                                let bundle = imported
-                                    .controller
-                                    .config
-                                    .bundles
-                                    .get(&session.bundle_id)
-                                    .cloned()
-                                    .context("import worker did not return its session bundle")?;
-                                controller
-                                    .config
-                                    .bundles
-                                    .insert(session.bundle_id.clone(), bundle);
-                                controller
-                                    .state
-                                    .sessions
-                                    .insert(session.id.clone(), session);
-                                controller.config.save()?;
-                                persist_imported_session(
-                                    controller
-                                        .state
-                                        .sessions
-                                        .get(&imported.session_id)
-                                        .context("imported session disappeared before save")?,
-                                )?;
-                                Ok(())
-                            })();
+                        Ok(DashboardImportTaskResult::Imported(imported)) => {
                             dashboard.finish_import();
-                            match applied {
-                                Ok(()) => {
-                                    dashboard.set_config(controller.config.clone());
-                                    dashboard.set_state(controller.state.clone());
-                                    refresh_dashboard_poll_targets(
-                                        &controller,
-                                        &worker_targets_tx,
-                                        &resource_targets_tx,
-                                        &credential_sync_handle,
-                                        &lifecycle_operations.keys().cloned().collect(),
-                                    );
-                                    dashboard.set_notice(format!(
-                                        "Imported {} session {}.",
-                                        imported.harness, pending.native_session_id
-                                    ));
-                                }
-                                Err(error) => {
-                                    dashboard.set_notice(format!("Import failed: {error:#}"));
-                                }
-                            }
+                            dashboard.set_notice("Saving imported session…");
+                            spawn_imported_session_apply(
+                                imported,
+                                pending,
+                                dashboard_io_tx.clone(),
+                            );
                         }
                         Ok(DashboardImportTaskResult::Cancelled) => {
                             dashboard.finish_import();
@@ -3079,82 +3445,233 @@ async fn run_dashboard() -> Result<()> {
             }
         }
         while let Ok(update) = lifecycle_updates_rx.try_recv() {
-            let session_id = update.session_id;
+            let session_id = update.session_id.clone();
             let operation = lifecycle_operations.remove(&session_id);
             dashboard.finish_session_operation(&session_id);
-            if let Err(error) = controller.reload() {
-                dashboard.set_notice(format!("Could not reload completed operation: {error:#}"));
-                continue;
-            }
-            dashboard.set_state(controller.state.clone());
-            match update.result {
-                Ok(LifecycleSuccess::Created) => {
-                    dashboard.select_active_session(&session_id);
-                    dashboard.set_notice(format!(
-                        "Session {} is ready; press Enter to open it",
-                        short_id(&session_id)
-                    ));
-                    request_dashboard_quota_refresh(
-                        &controller,
-                        &mut dashboard,
-                        &quota_profiles_tx,
-                    );
-                }
-                Ok(LifecycleSuccess::Resumed {
-                    profile_id,
-                    target_id,
-                    materialized,
-                }) => {
-                    dashboard.apply_materialized_session(&materialized);
-                    dashboard.select_active_session(&session_id);
-                    dashboard.set_notice(format!(
-                        "Resumed {} with {profile_id} on {target_id}",
-                        short_id(&session_id)
-                    ));
-                    request_dashboard_quota_refresh(
-                        &controller,
-                        &mut dashboard,
-                        &quota_profiles_tx,
-                    );
-                }
-                Ok(LifecycleSuccess::Closed) => {
-                    dashboard.set_notice(format!("Paused {}", short_id(&session_id)));
-                }
-                Ok(LifecycleSuccess::Destroyed) => dashboard.set_notice(format!(
-                    "Destroyed {} without an archive",
-                    short_id(&session_id)
-                )),
-                Ok(LifecycleSuccess::DeletedActive) => dashboard.set_notice(format!(
-                    "Deleted active session {} without checkpointing",
-                    short_id(&session_id)
-                )),
-                Ok(LifecycleSuccess::DeletedArchived) => dashboard.set_notice(format!(
-                    "Permanently deleted paused session {}",
-                    short_id(&session_id)
-                )),
-                Err(error) => {
-                    if operation
-                        .as_ref()
-                        .is_some_and(|operation| operation.kind == SessionOperationKind::Pausing)
-                    {
-                        dashboard.show_close_failure(session_id.clone(), error);
-                    } else {
-                        let label =
-                            operation.map_or("Operation", |operation| operation.kind.label());
-                        dashboard.set_notice(format!("{label} failed: {error}"));
-                    }
-                }
-            }
-            refresh_dashboard_poll_targets(
-                &controller,
-                &worker_targets_tx,
-                &resource_targets_tx,
-                &credential_sync_handle,
-                &lifecycle_operations.keys().cloned().collect(),
+            spawn_lifecycle_reload(
+                LifecycleReload { update, operation },
+                dashboard_io_tx.clone(),
             );
         }
         while let Ok(update) = dashboard_io_rx.try_recv() {
             match update {
+                DashboardIoUpdate::WorkerRecordPersistence {
+                    session_id,
+                    operation,
+                    result,
+                } => {
+                    if let Err(error) = result {
+                        match operation {
+                            WorkerRecordPersistence::AcpTitle { .. } => dashboard
+                                .set_notice(format!("Could not save harness title: {error}")),
+                            WorkerRecordPersistence::RelayReconnect => {
+                                dashboard.set_notice(format!(
+                                    "Could not save relay reconnect for {}: {error}",
+                                    short_id(&session_id)
+                                ))
+                            }
+                        }
+                    }
+                }
+                DashboardIoUpdate::MaterializedSessionProjection { detail } => {
+                    dashboard.apply_prepared_materialized_session(*detail);
+                }
+                DashboardIoUpdate::CreateSession(update) => match *update {
+                    DashboardCreateSessionUpdate::DirtyLocal {
+                        action,
+                        repositories,
+                    } => dashboard.show_dirty_local_confirmation(action, repositories),
+                    DashboardCreateSessionUpdate::Registered(registered) => {
+                        let registered = *registered;
+                        let session_id = registered.session.id.clone();
+                        controller
+                            .state
+                            .sessions
+                            .insert(session_id.clone(), registered.session);
+                        dashboard.set_state(controller.state.clone());
+                        dashboard.begin_session_operation(
+                            session_id.clone(),
+                            SessionOperationKind::Launching,
+                            None,
+                        );
+                        dashboard.set_notice(format!("Launching {}…", short_id(&session_id)));
+                        lifecycle_operations.insert(
+                            session_id,
+                            ActiveLifecycleOperation {
+                                cancelled: registered.cancelled,
+                                kind: SessionOperationKind::Launching,
+                            },
+                        );
+                    }
+                    DashboardCreateSessionUpdate::Failed(error) => {
+                        dashboard.set_notice(format!("Could not create session: {error}"));
+                    }
+                },
+                DashboardIoUpdate::RenameSession {
+                    session_id,
+                    title,
+                    result,
+                } => match result {
+                    Ok(title) => {
+                        if let Some(session) = controller.state.sessions.get_mut(&session_id) {
+                            session.session_title_override = Some(title.clone());
+                            session.updated_at = chrono::Utc::now().to_rfc3339();
+                        }
+                        dashboard.set_state(controller.state.clone());
+                        dashboard.set_notice(format!("Renamed session to {title}"));
+                    }
+                    Err(error) => {
+                        dashboard.set_notice(format!("Rename failed for {title}: {error}"));
+                    }
+                },
+                DashboardIoUpdate::DetachedReadReceipt { session_id, result } => {
+                    if let Err(error) = result {
+                        dashboard.set_notice(format!(
+                            "Could not save read status for {}: {error}",
+                            short_id(&session_id)
+                        ));
+                    }
+                }
+                DashboardIoUpdate::CreatedBundle { result } => match *result {
+                    Ok(created) => {
+                        controller.config = created.config;
+                        let followup = dashboard
+                            .apply_created_bundle(controller.config.clone(), &created.bundle_id);
+                        if let DashboardAction::ResolveAwsResourceOptions {
+                            target_template_ids,
+                        } = followup
+                        {
+                            for target_template_id in target_template_ids {
+                                if resolving_aws_resource_options.insert(target_template_id.clone())
+                                {
+                                    spawn_aws_resource_options_resolution(
+                                        controller.config.clone(),
+                                        target_template_id,
+                                        aws_resource_options_tx.clone(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        dashboard.set_notice(format!("Could not create bundle: {error}"));
+                    }
+                },
+                DashboardIoUpdate::ImportedSessionApplied { result } => match *result {
+                    Ok(applied) => {
+                        controller
+                            .config
+                            .bundles
+                            .insert(applied.bundle_id, applied.bundle);
+                        controller
+                            .state
+                            .sessions
+                            .insert(applied.session.id.clone(), applied.session);
+                        dashboard.set_config(controller.config.clone());
+                        dashboard.set_state(controller.state.clone());
+                        refresh_dashboard_poll_targets(
+                            &controller,
+                            &worker_targets_tx,
+                            &resource_targets_tx,
+                            &credential_sync_handle,
+                            &lifecycle_operations.keys().cloned().collect(),
+                        );
+                        dashboard.set_notice(format!(
+                            "Imported {} session {}.",
+                            applied.harness, applied.native_session_id
+                        ));
+                    }
+                    Err(error) => dashboard.set_notice(format!("Import failed: {error}")),
+                },
+                DashboardIoUpdate::LifecycleReloaded(reloaded) => {
+                    let reloaded = *reloaded;
+                    let LifecycleReload { update, operation } = reloaded.reload;
+                    let session_id = update.session_id;
+                    match reloaded.result {
+                        Ok(loaded) => {
+                            controller = loaded;
+                            dashboard.set_state(controller.state.clone());
+                            match update.result {
+                                Ok(LifecycleSuccess::Created) => {
+                                    dashboard.select_active_session(&session_id);
+                                    dashboard.set_notice(format!(
+                                        "Session {} is ready; press Enter to open it",
+                                        short_id(&session_id)
+                                    ));
+                                    request_dashboard_quota_refresh(
+                                        &controller,
+                                        &mut dashboard,
+                                        &quota_profiles_tx,
+                                    );
+                                }
+                                Ok(LifecycleSuccess::Resumed {
+                                    profile_id,
+                                    target_id,
+                                    materialized,
+                                }) => {
+                                    dashboard.apply_materialized_session(&materialized);
+                                    dashboard.select_active_session(&session_id);
+                                    dashboard.set_notice(format!(
+                                        "Resumed {} with {profile_id} on {target_id}",
+                                        short_id(&session_id)
+                                    ));
+                                    request_dashboard_quota_refresh(
+                                        &controller,
+                                        &mut dashboard,
+                                        &quota_profiles_tx,
+                                    );
+                                }
+                                Ok(LifecycleSuccess::Closed) => {
+                                    dashboard
+                                        .set_notice(format!("Paused {}", short_id(&session_id)));
+                                }
+                                Ok(LifecycleSuccess::Destroyed) => dashboard.set_notice(format!(
+                                    "Destroyed {} without an archive",
+                                    short_id(&session_id)
+                                )),
+                                Ok(LifecycleSuccess::DeletedActive) => {
+                                    dashboard.set_notice(format!(
+                                        "Deleted active session {} without checkpointing",
+                                        short_id(&session_id)
+                                    ))
+                                }
+                                Ok(LifecycleSuccess::DeletedArchived) => {
+                                    dashboard.set_notice(format!(
+                                        "Permanently deleted paused session {}",
+                                        short_id(&session_id)
+                                    ))
+                                }
+                                Err(error) => {
+                                    if operation.as_ref().is_some_and(|operation| {
+                                        operation.kind == SessionOperationKind::Pausing
+                                    }) {
+                                        dashboard.show_close_failure(session_id.clone(), error);
+                                    } else {
+                                        let label =
+                                            operation.as_ref().map_or("Operation", |operation| {
+                                                operation.kind.label()
+                                            });
+                                        dashboard.set_notice(format!("{label} failed: {error}"));
+                                    }
+                                }
+                            }
+                            refresh_dashboard_poll_targets(
+                                &controller,
+                                &worker_targets_tx,
+                                &resource_targets_tx,
+                                &credential_sync_handle,
+                                &lifecycle_operations.keys().cloned().collect(),
+                            );
+                        }
+                        Err(error) => dashboard
+                            .set_notice(format!("Could not reload completed operation: {error}")),
+                    }
+                }
+                DashboardIoUpdate::CheckpointArchiveSizes { generation, sizes } => {
+                    if generation == checkpoint_archive_generation {
+                        dashboard.apply_checkpoint_archive_sizes(sizes);
+                    }
+                }
                 DashboardIoUpdate::WorkerDiagnosis {
                     session_id,
                     episode_id,
@@ -3364,13 +3881,8 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
             DashboardAction::RenameSession { session_id, title } => {
-                match controller.rename_session(&session_id, &title) {
-                    Ok(title) => {
-                        dashboard.set_state(controller.state.clone());
-                        dashboard.set_notice(format!("Renamed session to {title}"));
-                    }
-                    Err(error) => dashboard.set_notice(format!("Rename failed: {error:#}")),
-                }
+                dashboard.set_notice("Renaming session…");
+                spawn_dashboard_rename(session_id, title, dashboard_io_tx.clone());
             }
             DashboardAction::CompleteMountSource {
                 target_template_id,
@@ -3441,105 +3953,21 @@ async fn run_dashboard() -> Result<()> {
                 allow_dirty_local,
                 resource_allocation,
             } => {
-                if !allow_dirty_local && project_directory.is_none() {
-                    let dirty = controller
-                        .config
-                        .bundles
-                        .get(&bundle_id)
-                        .with_context(|| format!("unknown bundle {bundle_id:?}"))
-                        .and_then(hel::hel_local_git::dirty_local_repositories);
-                    match dirty {
-                        Ok(dirty) if !dirty.is_empty() => {
-                            let repositories = dirty
-                                .into_iter()
-                                .map(|repository| {
-                                    format!("{}: {}", repository.path.display(), repository.summary)
-                                })
-                                .collect();
-                            dashboard.show_dirty_local_confirmation(
-                                DashboardAction::CreateSession {
-                                    profile_id,
-                                    bundle_id,
-                                    project_directory,
-                                    target_template_id,
-                                    additional_mounts,
-                                    allow_dirty_local: false,
-                                    resource_allocation,
-                                },
-                                repositories,
-                            );
-                            continue;
-                        }
-                        Err(error) => {
-                            dashboard.set_notice(format!(
-                                "Could not inspect local repository: {error:#}"
-                            ));
-                            continue;
-                        }
-                        _ => {}
-                    }
-                }
-                let title = format!(
-                    "{} via {profile_id}",
-                    project_directory
-                        .as_ref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| bundle_id.clone())
-                );
-                match controller.register_session_with_resources(
-                    &profile_id,
-                    &bundle_id,
-                    &target_template_id,
-                    title,
-                    SessionLaunchOptions {
+                dashboard.set_notice("Preparing session launch…");
+                spawn_dashboard_create_session(
+                    DashboardAction::CreateSession {
+                        profile_id,
+                        bundle_id,
+                        project_directory,
+                        target_template_id,
                         additional_mounts,
                         allow_dirty_local,
                         resource_allocation,
-                        project_directory,
-                        session_title_override: None,
                     },
-                ) {
-                    Ok(session_id) => {
-                        dashboard.set_state(controller.state.clone());
-                        dashboard.begin_session_operation(
-                            session_id.clone(),
-                            SessionOperationKind::Launching,
-                            None,
-                        );
-                        dashboard.set_notice(format!("Launching {}…", short_id(&session_id)));
-                        let cancelled = Arc::new(AtomicBool::new(false));
-                        lifecycle_operations.insert(
-                            session_id.clone(),
-                            ActiveLifecycleOperation {
-                                cancelled: cancelled.clone(),
-                                kind: SessionOperationKind::Launching,
-                            },
-                        );
-                        let updates = lifecycle_updates_tx.clone();
-                        let operation_session_id = session_id.clone();
-                        let runtime = tokio::runtime::Handle::current();
-                        tokio::task::spawn_blocking(move || {
-                            let result =
-                                (|| -> Result<()> {
-                                    let mut controller = Controller::load()?;
-                                    let executor = CancellableProcessExecutor::new(cancelled);
-                                    runtime.block_on(controller.provision_session_controlled(
-                                        &operation_session_id,
-                                        &executor,
-                                    ))
-                                })()
-                                .map(|()| LifecycleSuccess::Created)
-                                .map_err(|error| format!("{error:#}"));
-                            let _ = updates.send(LifecycleUpdate {
-                                session_id: operation_session_id,
-                                result,
-                            });
-                        });
-                    }
-                    Err(error) => {
-                        dashboard.set_notice(format!("Could not create session: {error:#}"))
-                    }
-                }
+                    dashboard_io_tx.clone(),
+                    lifecycle_updates_tx.clone(),
+                    tokio::runtime::Handle::current(),
+                );
             }
             DashboardAction::Open { session_id } => {
                 let session_record = controller
@@ -3583,10 +4011,25 @@ async fn run_dashboard() -> Result<()> {
                             apply_recovery_result(&mut controller, &mut dashboard, result);
                         }
                         let read_result = controller
-                            .mark_session_detached_after(&session_id, detached_after_event_ordinal);
+                            .state
+                            .sessions
+                            .get_mut(&session_id)
+                            .map(|session| {
+                                session.detached_after_event_ordinal = session
+                                    .detached_after_event_ordinal
+                                    .max(detached_after_event_ordinal);
+                            })
+                            .with_context(|| format!("unknown session {session_id}"));
                         dashboard.set_state(controller.state.clone());
                         match read_result {
-                            Ok(()) => dashboard.clear_notice(),
+                            Ok(()) => {
+                                dashboard.clear_notice();
+                                spawn_detached_read_receipt_persist(
+                                    session_id.clone(),
+                                    detached_after_event_ordinal,
+                                    dashboard_io_tx.clone(),
+                                );
+                            }
                             Err(error) => dashboard.set_notice(format!(
                                 "Could not save read status for {}: {error:#}",
                                 short_id(&session_id)
@@ -3724,31 +4167,8 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
             DashboardAction::CreateBundle { source } => {
-                match create_quick_bundle(&mut controller.config, &source) {
-                    Ok(bundle_id) => {
-                        controller.config.save()?;
-                        let followup =
-                            dashboard.apply_created_bundle(controller.config.clone(), &bundle_id);
-                        if let DashboardAction::ResolveAwsResourceOptions {
-                            target_template_ids,
-                        } = followup
-                        {
-                            for target_template_id in target_template_ids {
-                                if resolving_aws_resource_options.insert(target_template_id.clone())
-                                {
-                                    spawn_aws_resource_options_resolution(
-                                        controller.config.clone(),
-                                        target_template_id,
-                                        aws_resource_options_tx.clone(),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        dashboard.set_notice(format!("Could not create bundle: {error:#}"))
-                    }
-                }
+                dashboard.set_notice("Creating bundle…");
+                spawn_create_bundle(source, dashboard_io_tx.clone());
             }
             DashboardAction::ForceDestroy { session_id } => {
                 dashboard.begin_session_operation(
