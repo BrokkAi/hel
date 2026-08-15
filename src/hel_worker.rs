@@ -2930,8 +2930,12 @@ fn read_restored_relay_seed(root: &Path) -> Result<Option<RestoredRelaySeed>> {
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
+    // Directory fsync is only available on Unix; Windows cannot open a
+    // directory handle through File::open.
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 

@@ -8004,9 +8004,11 @@ mod tests {
                 .unwrap();
         assert!(inspection.primary_checkout);
         assert_eq!(inspection.upstream.as_deref(), Some("origin/master"));
+        // git rev-parse canonicalizes symlinks (macOS tempdirs live behind the
+        // /var -> /private/var link), so compare against the canonical path.
         assert_eq!(
             inspection.source_project_directory,
-            repository.path().join("nested")
+            repository.path().canonicalize().unwrap().join("nested")
         );
 
         let session_id = "0123456789abcdef0123456789abcdef";

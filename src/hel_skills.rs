@@ -509,19 +509,17 @@ mod tests {
         assert!(!home.path().join("skills").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_refuses_a_symlinked_destination() {
         let home = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(elsewhere.path(), home.path().join("skills")).unwrap();
-            let archive = archive(&[("skills/evil", b"payload")]);
-            let error = install_skills(HarnessKind::Codex, home.path(), &archive).unwrap_err();
-            let chain = format!("{error:#}");
-            assert!(chain.contains("symbolic link"), "{chain}");
-            assert!(!elsewhere.path().join("evil").exists());
-        }
+        std::os::unix::fs::symlink(elsewhere.path(), home.path().join("skills")).unwrap();
+        let archive = archive(&[("skills/evil", b"payload")]);
+        let error = install_skills(HarnessKind::Codex, home.path(), &archive).unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(chain.contains("symbolic link"), "{chain}");
+        assert!(!elsewhere.path().join("evil").exists());
     }
 
     #[test]
