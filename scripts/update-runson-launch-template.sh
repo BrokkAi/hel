@@ -7,7 +7,7 @@ set -euo pipefail
 REGION="${AWS_REGION:-us-east-1}"
 TEMPLATE_NAME="hel-runson"
 SOURCE_OWNER="135269210855"
-SOURCE_NAME_PATTERN="runs-on-v2.2-ubuntu24-full-x64-*"
+SOURCE_NAME_PATTERN="runs-on-v2.2-ubuntu26-full-x64-*"
 INSTANCE_TYPE="m8i-flex.large"
 ROOT_VOLUME_GIB=60
 SSH_PUBLIC_KEY="${HOME}/.ssh/vastai.pub"
@@ -20,7 +20,7 @@ usage() {
     printf '%s\n' \
         'Usage: scripts/update-runson-launch-template.sh [options]' \
         '' \
-        'Copies the newest RunsOn Ubuntu 24 AMI into this AWS account, then creates a' \
+        'Copies the newest RunsOn Ubuntu 26 AMI into this AWS account, then creates a' \
         'new default version of the hel-runson launch template.' \
         '' \
         'Options:' \

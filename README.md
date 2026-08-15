@@ -218,7 +218,7 @@ ssh_user = "ubuntu"
 address_source = "public-dns"
 ```
 
-For the rotating RunsOn Ubuntu 24 image, use the included updater instead of
+For the rotating RunsOn Ubuntu 26 image, use the included updater instead of
 pinning an upstream AMI ID. It copies the newest RunsOn image into your AWS
 account, makes that copy the default version of `hel-runson`, refreshes the
 controller's SSH ingress, and can add the matching target on its first run:
