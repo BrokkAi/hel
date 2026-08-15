@@ -4508,7 +4508,7 @@ pub fn render_agent_message_tail(
     if width == 0 || maximum_lines == 0 {
         return Vec::new();
     }
-    let lines = render_agent_message_lines(source, width, Style::default().fg(Color::Green))
+    let lines = render_agent_message_lines(source, width, Style::default().fg(Color::Yellow))
         .into_iter()
         .filter(|line| !line_is_empty(line))
         .collect::<Vec<_>>();
@@ -4693,7 +4693,7 @@ fn entry_visual(entry: &ChatEntry) -> EntryVisual {
             }
         }
         ChatRole::Agent => {
-            let style = Style::default().fg(Color::Green);
+            let style = Style::default().fg(Color::Yellow);
             EntryVisual {
                 glyph: "●",
                 label: "Agent".into(),
@@ -6241,7 +6241,7 @@ mod tests {
     fn blank_rows_inside_messages_keep_the_role_gutter() {
         for (role, color) in [
             (ChatRole::User, Color::Cyan),
-            (ChatRole::Agent, Color::Green),
+            (ChatRole::Agent, Color::Yellow),
         ] {
             let entry = ChatEntry::plain(1, role, "1. first\n\n2. second");
             let lines = render_transcript_entry(&entry, 80, TranscriptRenderMode::Rich);
