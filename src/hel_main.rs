@@ -3986,6 +3986,17 @@ async fn run_dashboard() -> Result<()> {
                     .with_context(|| format!("unknown session {session_id}"))?
                     .clone();
                 let bundle_id = session_record.bundle_id.clone();
+                let other_sessions = controller
+                    .state
+                    .sessions
+                    .values()
+                    .filter(|record| record.id != session_id && record.state.is_active())
+                    .map(|record| hel::hel_chat::OtherSessionIdentity {
+                        session_id: record.id.clone(),
+                        display_title: record.display_title().to_owned(),
+                        detached_after_event_ordinal: record.detached_after_event_ordinal,
+                    })
+                    .collect::<Vec<_>>();
                 let recovery_context = hel::hel_recovery::RecoveryContext {
                     observer: recovery_observer.clone(),
                     session: session_record,
@@ -3998,6 +4009,8 @@ async fn run_dashboard() -> Result<()> {
                         &mut managed,
                         &bundle_id,
                         Some(recovery_context),
+                        worker_commands_tx.clone(),
+                        other_sessions,
                     )
                     .await?;
                     Ok::<_, anyhow::Error>((exit, managed.view()))

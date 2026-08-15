@@ -2,7 +2,7 @@
 
 mod rendering;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::time::Duration;
 
@@ -31,7 +31,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::hel_acp::RuntimeEvent;
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
 use crate::hel_recovery::RecoveryContext;
-use crate::hel_session_manager::{ManagedSessionHandle, new_command_id};
+use crate::hel_session_manager::{ManagedSessionHandle, SessionManagerControl, new_command_id};
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, TranscriptBody,
     TranscriptItem,
@@ -144,6 +144,25 @@ enum ChatIoUpdate {
         result: std::result::Result<Vec<PromptHistoryEntry>, String>,
     },
     ClipboardText(std::result::Result<String, String>),
+    OtherSessions(Vec<OtherSessionActivity>),
+}
+
+/// Identity and read receipt of another session, snapshotted when the chat
+/// opens. The receipt stays fixed for the visit: it is the ordinal the user
+/// last saw in that session, not a live value.
+#[derive(Debug, Clone)]
+pub struct OtherSessionIdentity {
+    pub session_id: String,
+    pub display_title: String,
+    pub detached_after_event_ordinal: u64,
+}
+
+/// What the activity header says about one other session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OtherSessionActivity {
+    name: String,
+    running: bool,
+    unread: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -343,7 +362,10 @@ enum ToolCollapse {
     /// Member of a collapsed run whose summary renders on the run head.
     Hidden,
     /// Head of a collapsed run spanning `self..end` (end exclusive).
-    Summary { end: usize, fingerprint: u64 },
+    Summary {
+        end: usize,
+        fingerprint: u64,
+    },
 }
 
 /// A read-only copy of the projected conversation that can be rendered by
@@ -892,6 +914,7 @@ pub struct ChatState {
     render_cache: TranscriptRenderCache,
     notice: Option<String>,
     voice_active: bool,
+    other_sessions: Vec<OtherSessionActivity>,
 }
 
 impl ChatState {
@@ -942,6 +965,7 @@ impl ChatState {
             render_cache: TranscriptRenderCache::default(),
             notice: None,
             voice_active: false,
+            other_sessions: Vec::new(),
         };
         state.apply_events(events);
         // Bootstrap replays the full canonical log for transcript projection,
@@ -3498,7 +3522,157 @@ fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) {
         ChatIoUpdate::ClipboardText(Err(error)) => {
             chat.set_notice(format!("Paste failed: {error}"));
         }
+        ChatIoUpdate::OtherSessions(sessions) => chat.other_sessions = sessions,
     }
+}
+
+/// How many names each header group shows before collapsing the rest into a
+/// `+K` count.
+const ACTIVITY_HEADER_NAMES: usize = 3;
+
+/// One-row summary of the sessions the user is not looking at. `None` means
+/// nothing is waiting or running elsewhere, and the row is not drawn at all.
+fn activity_header_line(sessions: &[OtherSessionActivity]) -> Option<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut waiting = sessions
+        .iter()
+        .filter(|session| !session.running && session.unread > 0)
+        .collect::<Vec<_>>();
+    let mut active = sessions
+        .iter()
+        .filter(|session| session.running)
+        .collect::<Vec<_>>();
+    if waiting.is_empty() && active.is_empty() {
+        return None;
+    }
+    waiting.sort_by(|left, right| left.name.cmp(&right.name));
+    active.sort_by(|left, right| {
+        right
+            .unread
+            .cmp(&left.unread)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    let mut spans = Vec::new();
+    if !waiting.is_empty() {
+        spans.push(Span::styled("Waiting for your input in ", dim));
+        push_header_names(&mut spans, &waiting, Color::Yellow, false);
+    }
+    if !active.is_empty() {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", dim));
+        }
+        spans.push(Span::styled("Activity in ", dim));
+        push_header_names(&mut spans, &active, Color::Green, true);
+    }
+    Some(Line::from(spans))
+}
+
+fn push_header_names(
+    spans: &mut Vec<Span<'static>>,
+    sessions: &[&OtherSessionActivity],
+    name_color: Color,
+    show_unread: bool,
+) {
+    let dim = Style::default().fg(Color::DarkGray);
+    for (index, session) in sessions.iter().take(ACTIVITY_HEADER_NAMES).enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(", ", dim));
+        }
+        spans.push(Span::styled(
+            session.name.clone(),
+            Style::default().fg(name_color),
+        ));
+        if show_unread && session.unread > 0 {
+            spans.push(Span::styled(format!(" ({})", session.unread), dim));
+        }
+    }
+    let remaining = sessions.len().saturating_sub(ACTIVITY_HEADER_NAMES);
+    if remaining > 0 {
+        spans.push(Span::styled(format!(" +{remaining}"), dim));
+    }
+}
+
+fn other_session_activity(
+    identity: &OtherSessionIdentity,
+    session: &MaterializedSession,
+) -> OtherSessionActivity {
+    OtherSessionActivity {
+        name: identity.display_title.clone(),
+        running: matches!(
+            session.execution,
+            MaterializedExecutionState::Running { .. }
+        ),
+        unread: session.unread_agent_messages_after(identity.detached_after_event_ordinal),
+    }
+}
+
+/// How often the poller retries sessions with no live actor. Resolving costs a
+/// manager round trip, and an archived or lost session never resolves.
+const OTHER_SESSION_RESOLVE_TICKS: u64 = 5;
+
+/// Poll the other sessions once a second so the chat view can show what is
+/// happening elsewhere. The task ends when the chat loop drops its receiver,
+/// so it cannot outlive the view it feeds.
+fn spawn_other_session_poller(
+    control: SessionManagerControl,
+    others: Vec<OtherSessionIdentity>,
+    updates: tokio::sync::mpsc::UnboundedSender<ChatIoUpdate>,
+) {
+    if others.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut resolved: HashMap<String, ManagedSessionHandle> = HashMap::new();
+        let mut sent: Vec<OtherSessionActivity> = Vec::new();
+        let mut tick: u64 = 0;
+        while !updates.is_closed() {
+            if tick.is_multiple_of(OTHER_SESSION_RESOLVE_TICKS) {
+                for identity in &others {
+                    if resolved.contains_key(&identity.session_id) {
+                        continue;
+                    }
+                    // No live actor is normal for archived or lost sessions.
+                    if let Ok(handle) = control.session(identity.session_id.clone()).await {
+                        resolved.insert(identity.session_id.clone(), handle);
+                    }
+                }
+            }
+            let mut summaries = Vec::with_capacity(others.len());
+            let mut stopped = Vec::new();
+            for identity in &others {
+                let Some(handle) = resolved.get(&identity.session_id) else {
+                    continue;
+                };
+                if handle.has_changed().is_err() {
+                    stopped.push(identity.session_id.clone());
+                    continue;
+                }
+                // `with_view` reads in place; `view()` would clone the whole
+                // transcript of every other session once a second.
+                let summary = handle.with_view(|view| {
+                    view.snapshot
+                        .as_ref()
+                        .map(|snapshot| other_session_activity(identity, &snapshot.materialized))
+                });
+                summaries.extend(summary);
+            }
+            for session_id in stopped {
+                resolved.remove(&session_id);
+            }
+            if summaries != sent {
+                if updates
+                    .send(ChatIoUpdate::OtherSessions(summaries.clone()))
+                    .is_err()
+                {
+                    return;
+                }
+                sent = summaries;
+            }
+            tick = tick.wrapping_add(1);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
 }
 
 /// Run chat until the user returns to the dashboard or quits Hel. Either exit
@@ -3508,6 +3682,8 @@ pub async fn run_chat(
     session: &mut ManagedSessionHandle,
     bundle_id: &str,
     recovery: Option<RecoveryContext>,
+    control: SessionManagerControl,
+    others: Vec<OtherSessionIdentity>,
 ) -> Result<ChatExit> {
     let view = session.view();
     let needs_initial_sync = view.snapshot.is_none();
@@ -3551,6 +3727,7 @@ pub async fn run_chat(
             let _ = updates.send(ChatIoUpdate::ProjectHistoryPrefetched(result));
         });
     }
+    spawn_other_session_poller(control, others, chat_io_tx.clone());
     if let Some(detail) = recovery
         .as_ref()
         .and_then(|recovery| recovery.session.last_checkpoint_error.as_deref())
@@ -3743,6 +3920,8 @@ pub async fn run_chat(
 
 pub fn render(frame: &mut Frame, chat: &mut ChatState) {
     let inner = frame.area();
+    let activity_header = activity_header_line(&chat.other_sessions);
+    let header_rows = u16::from(activity_header.is_some());
     let visible_queued = chat.queued_prompts.len().min(3) as u16;
     let prompt_width = usize::from(inner.width.saturating_sub(2)).max(1);
     let input_rows = input_visual_rows(&chat.input, prompt_width) as u16;
@@ -3750,21 +3929,33 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
         .saturating_add(visible_queued)
         .saturating_add(2)
         .max(4);
-    let maximum_prompt_height = inner.height.saturating_sub(6).max(3);
+    let maximum_prompt_height = inner.height.saturating_sub(6 + header_rows).max(3);
     let prompt_height = desired_prompt_height.min(maximum_prompt_height);
+    let mut constraints = Vec::with_capacity(4);
+    if activity_header.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.extend([
+        Constraint::Min(5),
+        Constraint::Length(prompt_height),
+        Constraint::Length(1),
+    ]);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(5),
-            Constraint::Length(prompt_height),
-            Constraint::Length(1),
-        ])
+        .constraints(constraints)
         .split(inner);
-    render_transcript(frame, chunks[0], chat);
+    let (transcript_area, prompt_area, footer_area) = {
+        let start = usize::from(header_rows);
+        (chunks[start], chunks[start + 1], chunks[start + 2])
+    };
+    if let Some(header) = activity_header {
+        frame.render_widget(Paragraph::new(header), chunks[0]);
+    }
+    render_transcript(frame, transcript_area, chat);
     let queued = chat.queued_prompts.len();
     let prompt_title = prompt_title(chat, queued);
     let prompt_block = Block::default().borders(Borders::ALL).title(prompt_title);
-    let prompt_inner = prompt_block.inner(chunks[1]);
+    let prompt_inner = prompt_block.inner(prompt_area);
     let mut prompt_lines = chat
         .queued_prompts
         .iter()
@@ -3804,7 +3995,7 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
             .wrap(Wrap { trim: false })
             .scroll((input_scroll as u16, 0))
             .block(prompt_block),
-        chunks[1],
+        prompt_area,
     );
     if chat.history_search.is_none() {
         set_input_cursor(
@@ -3830,19 +4021,19 @@ pub fn render(frame: &mut Frame, chat: &mut ChatState) {
         .unwrap_or(default_footer);
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
-        chunks[2],
+        footer_area,
     );
     if let Some(search) = chat.history_search.as_ref()
-        && chunks[2].width > 0
+        && footer_area.width > 0
     {
         let prefix = format!("reverse-i-search [{}]: ", history_scope_name(search.scope));
         let column = display_width(&prefix) + display_width(&search.query);
         frame.set_cursor_position((
-            chunks[2].x + column.min(usize::from(chunks[2].width.saturating_sub(1))) as u16,
-            chunks[2].y,
+            footer_area.x + column.min(usize::from(footer_area.width.saturating_sub(1))) as u16,
+            footer_area.y,
         ));
     }
-    render_autocomplete(frame, chunks[1], chat);
+    render_autocomplete(frame, prompt_area, chat);
 }
 
 fn prompt_title(chat: &ChatState, queued: usize) -> String {
@@ -4963,6 +5154,203 @@ mod tests {
         assert_ne!(buffer[(buffer.area.x, buffer.area.y)].symbol(), "┌");
     }
 
+    fn other_session(name: &str, running: bool, unread: u64) -> OtherSessionActivity {
+        OtherSessionActivity {
+            name: name.to_owned(),
+            running,
+            unread,
+        }
+    }
+
+    fn activity_header_text(sessions: &[OtherSessionActivity]) -> Option<String> {
+        activity_header_line(sessions).map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+    }
+
+    fn activity_header_span_color(sessions: &[OtherSessionActivity], text: &str) -> Option<Color> {
+        activity_header_line(sessions)?
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == text)
+            .and_then(|span| span.style.fg)
+    }
+
+    #[test]
+    fn activity_header_lists_waiting_then_running_sessions() {
+        let sessions = [
+            other_session("relay", true, 3),
+            other_session("docs", false, 1),
+            other_session("importer", true, 0),
+            other_session("api-fix", false, 7),
+            other_session("quiet", false, 0),
+        ];
+
+        assert_eq!(
+            activity_header_text(&sessions).as_deref(),
+            Some("Waiting for your input in api-fix, docs · Activity in relay (3), importer")
+        );
+        assert_eq!(
+            activity_header_span_color(&sessions, "api-fix"),
+            Some(Color::Yellow)
+        );
+        assert_eq!(
+            activity_header_span_color(&sessions, "relay"),
+            Some(Color::Green)
+        );
+        assert_eq!(
+            activity_header_span_color(&sessions, "Waiting for your input in "),
+            Some(Color::DarkGray)
+        );
+        assert_eq!(
+            activity_header_span_color(&sessions, " (3)"),
+            Some(Color::DarkGray)
+        );
+    }
+
+    #[test]
+    fn activity_header_is_absent_without_waiting_or_running_sessions() {
+        assert!(activity_header_line(&[]).is_none());
+        assert!(
+            activity_header_line(&[
+                other_session("docs", false, 0),
+                other_session("api", false, 0)
+            ])
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn activity_header_omits_an_empty_group_and_its_separator() {
+        assert_eq!(
+            activity_header_text(&[
+                other_session("relay", true, 2),
+                other_session("docs", false, 0)
+            ])
+            .as_deref(),
+            Some("Activity in relay (2)")
+        );
+        assert_eq!(
+            activity_header_text(&[other_session("docs", false, 4)]).as_deref(),
+            Some("Waiting for your input in docs")
+        );
+    }
+
+    #[test]
+    fn activity_header_sorts_by_unread_then_name_and_caps_each_group() {
+        let sessions = [
+            other_session("zeta", true, 1),
+            other_session("alpha", true, 9),
+            other_session("beta", true, 9),
+            other_session("gamma", true, 5),
+            other_session("delta", true, 2),
+        ];
+
+        assert_eq!(
+            activity_header_text(&sessions).as_deref(),
+            Some("Activity in alpha (9), beta (9), gamma (5) +2")
+        );
+
+        let waiting = [
+            other_session("delta", false, 1),
+            other_session("alpha", false, 9),
+            other_session("charlie", false, 2),
+            other_session("bravo", false, 4),
+        ];
+        assert_eq!(
+            activity_header_text(&waiting).as_deref(),
+            Some("Waiting for your input in alpha, bravo, charlie +1")
+        );
+    }
+
+    #[test]
+    fn activity_header_drops_the_parenthetical_when_a_running_session_has_no_unread() {
+        assert_eq!(
+            activity_header_text(&[other_session("relay", true, 0)]).as_deref(),
+            Some("Activity in relay")
+        );
+    }
+
+    #[test]
+    fn activity_header_summarizes_idle_and_running_sessions_from_a_materialized_session() {
+        let identity = OtherSessionIdentity {
+            session_id: "other".into(),
+            display_title: "api-fix".into(),
+            detached_after_event_ordinal: 4,
+        };
+        let mut session = MaterializedSession::empty("other");
+        session.transcript = vec![
+            agent_transcript_item("seen", 3),
+            agent_transcript_item("fresh", 5),
+            agent_transcript_item("newer", 6),
+        ];
+
+        assert_eq!(
+            other_session_activity(&identity, &session),
+            other_session("api-fix", false, 2)
+        );
+
+        session.execution = MaterializedExecutionState::Running { started_at_ms: 7 };
+        assert_eq!(
+            other_session_activity(&identity, &session),
+            other_session("api-fix", true, 2)
+        );
+    }
+
+    fn agent_transcript_item(stable_id: &str, ordinal: u64) -> TranscriptItem {
+        TranscriptItem {
+            stable_id: stable_id.to_owned(),
+            position: ordinal,
+            latest_content_event_ordinal: Some(ordinal),
+            created_at_ms: 0,
+            last_changed_at_ms: 0,
+            body: TranscriptBody::Agent {
+                chunks: vec![serde_json::json!({
+                    "content": {"type": "text", "text": "hello"}
+                })],
+                streaming: false,
+            },
+        }
+    }
+
+    #[test]
+    fn chat_view_shows_the_activity_header_only_when_other_sessions_are_busy() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        let row = |terminal: &Terminal<TestBackend>, offset: u16| {
+            let buffer = terminal.backend().buffer();
+            (buffer.area.x..buffer.area.right())
+                .map(|x| buffer[(x, buffer.area.y + offset)].symbol())
+                .collect::<String>()
+        };
+
+        terminal
+            .draw(|frame| render(frame, &mut chat))
+            .expect("draw chat");
+        assert!(!row(&terminal, 0).contains("Waiting for your input in"));
+        assert!(row(&terminal, 0).contains("Conversation"));
+
+        apply_chat_io_update(
+            &mut chat,
+            ChatIoUpdate::OtherSessions(vec![
+                other_session("docs", false, 2),
+                other_session("relay", true, 1),
+            ]),
+        );
+        terminal
+            .draw(|frame| render(frame, &mut chat))
+            .expect("draw chat");
+        assert_eq!(
+            row(&terminal, 0).trim_end(),
+            "Waiting for your input in docs · Activity in relay (1)"
+        );
+        // The transcript keeps its own chrome, one row lower.
+        assert!(row(&terminal, 1).contains("Conversation"));
+    }
+
     #[test]
     fn composer_title_identifies_an_active_advertised_goal() {
         let mut chat = ChatState::new(&snapshot(), &[]);
@@ -5804,8 +6192,12 @@ mod tests {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.entries.push(completed_tool(1, "grep -rn alpha src"));
         chat.entries.push(completed_tool(2, "grep -rn beta src"));
-        chat.entries
-            .push(ChatEntry::tool(3, "cat notes.md", None, ToolStatus::Running));
+        chat.entries.push(ChatEntry::tool(
+            3,
+            "cat notes.md",
+            None,
+            ToolStatus::Running,
+        ));
 
         assert_eq!(
             transcript_text(&mut chat, 80),
