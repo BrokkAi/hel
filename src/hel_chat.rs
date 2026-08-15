@@ -310,6 +310,18 @@ struct TranscriptRenderCache {
     width: u16,
     mode: TranscriptRenderMode,
     entries: Vec<Option<CachedEntry>>,
+    collapse: Vec<ToolCollapse>,
+}
+
+/// Whether an entry renders on its own, heads a collapsed run of completed
+/// tools, or is folded into the run above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCollapse {
+    None,
+    /// Member of a collapsed run whose summary renders on the run head.
+    Hidden,
+    /// Head of a collapsed run spanning `self..end` (end exclusive).
+    Summary { end: usize, fingerprint: u64 },
 }
 
 /// A read-only copy of the projected conversation that can be rendered by
@@ -677,6 +689,62 @@ fn prepare_render_cache(
         cache.entries.clear();
     }
     cache.entries.resize(entries.len(), None);
+    let collapse = tool_collapse_states(entries, mode);
+    for (index, state) in collapse.iter().enumerate() {
+        if cache.collapse.get(index) != Some(state) {
+            cache.entries[index] = None;
+        }
+    }
+    cache.collapse = collapse;
+}
+
+fn is_completed_tool(entry: &ChatEntry) -> bool {
+    entry.role == ChatRole::Tool && entry.tool_status == Some(ToolStatus::Completed)
+}
+
+/// Collapse state per entry. In rich mode a maximal run of two or more
+/// consecutive completed tools renders as one summary cell; every other entry,
+/// including a pending, running, or failed tool, breaks the run. Raw mode never
+/// collapses so the full commands stay inspectable.
+fn tool_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> Vec<ToolCollapse> {
+    let mut states = vec![ToolCollapse::None; entries.len()];
+    if mode != TranscriptRenderMode::Rich {
+        return states;
+    }
+    let mut start = 0;
+    while start < entries.len() {
+        if !is_completed_tool(&entries[start]) {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < entries.len() && is_completed_tool(&entries[end]) {
+            end += 1;
+        }
+        if end - start > 1 {
+            // A member's update does not bump the head's revision, so fold the
+            // members' revisions into the head's state: the summary's cached
+            // rows then drop whenever any member changes.
+            let fingerprint = entries[start..end].iter().fold(0u64, |accumulated, entry| {
+                accumulated.wrapping_mul(31).wrapping_add(entry.revision)
+            });
+            states[start] = ToolCollapse::Summary { end, fingerprint };
+            states[start + 1..end].fill(ToolCollapse::Hidden);
+        }
+        start = end;
+    }
+    states
+}
+
+/// The single cell that stands in for a run of completed tools: the first word
+/// of each member's title, in order.
+fn collapsed_tool_entry(members: &[ChatEntry]) -> ChatEntry {
+    let titles = members
+        .iter()
+        .map(|member| member.text.split_whitespace().next().unwrap_or("tool"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    ChatEntry::tool(members[0].seq, titles, None, ToolStatus::Completed)
 }
 
 /// Rendered rows for one entry, rendering and caching it on first use.
@@ -691,9 +759,18 @@ fn cached_entry_lines<'cache>(
         .as_ref()
         .is_none_or(|cached| cached.revision != entry.revision);
     if stale {
+        let width = usize::from(cache.width);
+        let lines = match cache.collapse[index] {
+            ToolCollapse::None => render_transcript_entry(entry, width, cache.mode),
+            ToolCollapse::Hidden => Vec::new(),
+            ToolCollapse::Summary { end, .. } => {
+                let summary = collapsed_tool_entry(&entries[index..end]);
+                render_transcript_entry(&summary, width, cache.mode)
+            }
+        };
         cache.entries[index] = Some(CachedEntry {
             revision: entry.revision,
-            lines: render_transcript_entry(entry, usize::from(cache.width), cache.mode),
+            lines,
         });
     }
     &cache.entries[index]
@@ -708,6 +785,7 @@ impl Default for TranscriptRenderCache {
             width: 0,
             mode: TranscriptRenderMode::Rich,
             entries: Vec::new(),
+            collapse: Vec::new(),
         }
     }
 }
@@ -5338,6 +5416,135 @@ mod tests {
                 "│ /workspace/src/lib.rs  +1 −1",
                 ""
             ]
+        );
+    }
+
+    fn completed_tool(seq: u64, title: &str) -> ChatEntry {
+        ChatEntry::tool(seq, title, None, ToolStatus::Completed)
+    }
+
+    #[test]
+    fn completed_tool_run_collapses_to_single_summary_cell() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
+        chat.entries.push(completed_tool(2, "grep -rn beta src"));
+        chat.entries.push(completed_tool(3, "cat notes.md"));
+
+        let text = transcript_text(&mut chat, 80);
+
+        assert_eq!(text, ["✓ Tool · done", "│ grep, grep, cat", ""]);
+    }
+
+    #[test]
+    fn agent_message_between_completed_tools_prevents_collapsing() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
+        chat.entries
+            .push(ChatEntry::plain(2, ChatRole::Agent, "found it"));
+        chat.entries.push(completed_tool(3, "cat notes.md"));
+
+        let text = transcript_text(&mut chat, 80);
+
+        assert_eq!(
+            text,
+            [
+                "✓ Tool · done",
+                "│ grep -rn alpha src",
+                "",
+                "● Agent",
+                "│ found it",
+                "",
+                "✓ Tool · done",
+                "│ cat notes.md",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_tool_renders_alone_and_breaks_the_collapsed_run() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
+        chat.entries.push(completed_tool(2, "grep -rn beta src"));
+        chat.entries.push(ChatEntry::tool(
+            3,
+            "cat missing.md",
+            None,
+            ToolStatus::Failed,
+        ));
+        chat.entries.push(completed_tool(4, "rg gamma src"));
+        chat.entries.push(completed_tool(5, "rg delta src"));
+
+        let text = transcript_text(&mut chat, 80);
+
+        assert_eq!(
+            text,
+            [
+                "✓ Tool · done",
+                "│ grep, grep",
+                "",
+                "× Tool · failed",
+                "│ cat missing.md",
+                "",
+                "✓ Tool · done",
+                "│ rg, rg",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_mode_renders_every_completed_tool_in_full() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.render_mode = TranscriptRenderMode::Raw;
+        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
+        chat.entries.push(completed_tool(2, "grep -rn beta src"));
+        chat.entries.push(completed_tool(3, "cat notes.md"));
+
+        let text = transcript_text(&mut chat, 80);
+
+        assert_eq!(
+            text,
+            [
+                "✓ Tool · done",
+                "│ grep -rn alpha src",
+                "",
+                "✓ Tool · done",
+                "│ grep -rn beta src",
+                "",
+                "✓ Tool · done",
+                "│ cat notes.md",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn completing_a_running_tool_extends_the_cached_collapsed_summary() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
+        chat.entries.push(completed_tool(2, "grep -rn beta src"));
+        chat.entries
+            .push(ChatEntry::tool(3, "cat notes.md", None, ToolStatus::Running));
+
+        assert_eq!(
+            transcript_text(&mut chat, 80),
+            [
+                "✓ Tool · done",
+                "│ grep, grep",
+                "",
+                "● Tool · running",
+                "│ cat notes.md",
+                "",
+            ]
+        );
+
+        chat.entries[2].touch(4);
+        chat.entries[2].tool_status = Some(ToolStatus::Completed);
+
+        assert_eq!(
+            transcript_text(&mut chat, 80),
+            ["✓ Tool · done", "│ grep, grep, cat", ""]
         );
     }
 
