@@ -40,6 +40,17 @@ removes that exact container with `podman rm --force` only after checkpointing.
 container from the configured image. The setup smoke test may pull that image;
 the normal preflight deliberately does not.
 
+`hel doctor --json` runs those three checks only when a `local-podman` target
+exists, and then checks `podman image exists` for each configured
+`local-podman` image. `hel doctor --json --smoke` replaces that presence check
+with the full disposable run/exec/remove test, so it automates
+[Verification](#verification) sections 3 and 4 for every configured image.
+
+An `ssh-podman` target gets the same probes and the same smoke test, each
+wrapped in a noninteractive `ssh` call to the configured host. Every
+remediation below then applies on that remote host, as the user that SSH logs
+in as.
+
 Build Hel's bundled agent-development image when a local image is desired:
 
 ```console
@@ -106,6 +117,9 @@ podman system migrate
 ## Verification
 
 Every command here is a postcondition. Resolve a failure before running Hel.
+Run them by hand to diagnose a host; `hel doctor --json --smoke` checks
+sections 1 through 4 for every configured target and reports the same failures
+with an exact remediation.
 
 ### 1. Podman is installed and supported
 

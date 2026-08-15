@@ -3023,6 +3023,17 @@ fn preflight_target(template: &TargetTemplate, executor: &impl CommandExecutor) 
                     "local Podman preflight failed; run `hel doctor` for actionable prerequisites: {error:#}"
                 )
             }),
+        TargetTemplate::SshPodman { ssh, .. } => {
+            let ssh = backend_ssh(ssh);
+            hel_targets::verify_ssh_podman(&ssh, executor)
+                .map(|_| ())
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "remote Podman preflight failed for {}; run `hel doctor` for actionable prerequisites: {error:#}",
+                        ssh.destination
+                    )
+                })
+        }
         TargetTemplate::AppleContainer { .. } => {
             let command = CommandSpec::new("container", ["system", "status"])
                 .purpose("preflight Apple container runtime");
@@ -4584,7 +4595,7 @@ fn is_bare_project_target(template: &TargetTemplate) -> bool {
     )
 }
 
-fn backend_ssh(ssh: &SshConnection) -> SshTarget {
+pub(crate) fn backend_ssh(ssh: &SshConnection) -> SshTarget {
     let destination = match &ssh.user {
         Some(user) => format!("{user}@{}", ssh.host),
         None => ssh.host.clone(),
@@ -7615,6 +7626,39 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("hel doctor"));
+        assert!(error.contains("Podman 4.0.0"));
+    }
+
+    #[test]
+    fn ssh_podman_preflight_failures_name_the_destination_and_recommend_doctor() {
+        let template = TargetTemplate::SshPodman {
+            ssh: SshConnection {
+                host: "example.test".into(),
+                user: Some("dev".into()),
+                identity_file: None,
+                extra_args: vec![],
+            },
+            container: ConfigContainer {
+                image: "ubuntu:24.04".into(),
+                platform: None,
+                cpus: None,
+                memory: None,
+                environment: std::collections::BTreeMap::new(),
+            },
+        };
+        let executor = PreflightExecutor {
+            outputs: RefCell::new(vec![CommandOutput {
+                status: 0,
+                stdout: b"podman version 3.4.7\n".to_vec(),
+                stderr: vec![],
+            }]),
+        };
+
+        let error = preflight_target(&template, &executor)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hel doctor"));
+        assert!(error.contains("dev@example.test"));
         assert!(error.contains("Podman 4.0.0"));
     }
 
