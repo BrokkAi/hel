@@ -259,6 +259,7 @@ pub struct SessionLaunchOptions {
     pub allow_dirty_local: bool,
     pub resource_allocation: Option<SessionResourceAllocation>,
     pub project_directory: Option<PathBuf>,
+    pub session_title_override: Option<String>,
 }
 
 pub struct SessionResumeOptions {
@@ -576,7 +577,7 @@ impl Controller {
         let mut relay = StandaloneSession::connect_command(&spec, session_id)
             .await
             .context("orphan relay did not complete the v1 handshake")?;
-        let native_session_id = wait_for_native_session(&mut relay).await?;
+        let native_session_id = wait_for_native_session(&mut relay, executor).await?;
         self.state.sessions.insert(session_id.to_owned(), record);
         self.mark_worker_connected(session_id, Some(native_session_id))?;
         if let Some(title) = relay.snapshot().materialized.session_title {
@@ -798,6 +799,20 @@ impl Controller {
         cleanup_managed_worktree(executor, worktree)
     }
 
+    fn cleanup_new_session_worktree_after_failure(
+        &self,
+        session_id: &str,
+        executor: &impl CommandExecutor,
+    ) -> Result<()> {
+        if executor.cancellation_requested() {
+            let cleanup_executor =
+                CancellableProcessExecutor::with_timeout(Duration::from_secs(15));
+            self.cleanup_new_session_worktree(session_id, &cleanup_executor)
+        } else {
+            self.cleanup_new_session_worktree(session_id, executor)
+        }
+    }
+
     fn fail_new_session_with_cleanup(
         &mut self,
         session_id: &str,
@@ -806,7 +821,7 @@ impl Controller {
     ) -> Result<anyhow::Error> {
         let original = format!("{error:#}");
         let cleanup_error = self
-            .cleanup_new_session_worktree(session_id, executor)
+            .cleanup_new_session_worktree_after_failure(session_id, executor)
             .err()
             .map(|cleanup_error| format!("{cleanup_error:#}"));
         let failure = apply_failed_new_session_rollback(
@@ -866,6 +881,7 @@ impl Controller {
                 allow_dirty_local,
                 resource_allocation: None,
                 project_directory: None,
+                session_title_override: None,
             },
         )
     }
@@ -883,7 +899,14 @@ impl Controller {
             allow_dirty_local,
             resource_allocation,
             project_directory,
+            session_title_override,
         } = options;
+        let session_title_override = match session_title_override {
+            Some(title) => {
+                Some(normalize_session_title(&title).context("session name cannot be empty")?)
+            }
+            None => None,
+        };
         let profile = self
             .config
             .profiles
@@ -948,7 +971,7 @@ impl Controller {
             target: None,
             native_session_id: None,
             acp_session_title: None,
-            session_title_override: None,
+            session_title_override,
             created_at: now.clone(),
             updated_at: now,
             detached_after_event_ordinal: 0,
@@ -977,11 +1000,26 @@ impl Controller {
         session_id: &str,
         executor: &(impl CommandExecutor + Sync),
     ) -> Result<()> {
+        self.provision_session_controlled_with_commit(session_id, executor, || Ok(()))
+            .await
+    }
+
+    pub async fn provision_session_controlled_with_commit(
+        &mut self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+        grant_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let github_token = controller_github_token();
         self.provision_session_with_github_token(session_id, executor, github_token.as_deref())
             .await?;
         match self.install_and_connect_worker(session_id, executor).await {
-            Ok(native_session_id) => self.mark_worker_connected(session_id, native_session_id),
+            Ok(native_session_id) => {
+                if let Err(error) = grant_commit() {
+                    return Err(self.rollback_failed_new_session(session_id, error, executor)?);
+                }
+                self.mark_worker_connected(session_id, native_session_id)
+            }
             Err(error) => Err(self.rollback_failed_new_session(session_id, error, executor)?),
         }
     }
@@ -1011,7 +1049,8 @@ impl Controller {
             })(),
             None => Ok(()),
         };
-        let worktree_cleanup = self.cleanup_new_session_worktree(session_id, executor);
+        let worktree_cleanup =
+            self.cleanup_new_session_worktree_after_failure(session_id, executor);
         let cleanup_error = [target_cleanup, worktree_cleanup]
             .into_iter()
             .filter_map(Result::err)
@@ -1281,7 +1320,7 @@ impl Controller {
         let reconnect = &hel_targets::reconnect_plan(&backend, session_id)?.commands[0];
         let readiness = async {
             let mut relay = StandaloneSession::connect_command(reconnect, session_id).await?;
-            let native_session_id = wait_for_native_session(&mut relay).await?;
+            let native_session_id = wait_for_native_session(&mut relay, executor).await?;
             Ok(Some(native_session_id))
         }
         .await;
@@ -1960,7 +1999,7 @@ impl Controller {
             start_worker(executor, &backend, &worker_root)?;
             let spec = self.reconnect_command(session_id)?;
             let mut relay = StandaloneSession::connect_command(&spec, session_id).await?;
-            let native_session_id = wait_for_native_session(&mut relay).await?;
+            let native_session_id = wait_for_native_session(&mut relay, executor).await?;
             if same_harness {
                 if native_session_id != archive.manifest.session.native_session_id {
                     bail!(
@@ -3101,20 +3140,92 @@ fn canonical_handoff_text(snapshot: &CanonicalSessionSnapshot, maximum_bytes: us
     format!("{PREFIX}{transcript}")
 }
 
-async fn wait_for_native_session(relay: &mut StandaloneSession) -> Result<String> {
+enum NativeSessionReadiness {
+    Waiting,
+    Ready(String),
+    Closed,
+}
+
+trait NativeSessionProbe {
+    async fn native_session_readiness(&mut self) -> Result<NativeSessionReadiness>;
+}
+
+impl NativeSessionProbe for StandaloneSession {
+    async fn native_session_readiness(&mut self) -> Result<NativeSessionReadiness> {
+        let snapshot = self.sync().await?;
+        if let Some(native_session_id) = snapshot.operational.native_session_id {
+            Ok(NativeSessionReadiness::Ready(native_session_id))
+        } else if snapshot.operational.execution == RelayExecutionState::Closed {
+            Ok(NativeSessionReadiness::Closed)
+        } else {
+            Ok(NativeSessionReadiness::Waiting)
+        }
+    }
+}
+
+async fn wait_for_native_session(
+    relay: &mut impl NativeSessionProbe,
+    executor: &impl CommandExecutor,
+) -> Result<String> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let snapshot = relay.sync().await?;
-        if let Some(native_session_id) = snapshot.operational.native_session_id {
-            return Ok(native_session_id);
+        if executor.cancellation_requested() {
+            bail!("operation cancelled while waiting for ACP runtime startup");
         }
-        if snapshot.operational.execution == RelayExecutionState::Closed {
-            bail!("ACP runtime stopped before starting its session");
+        let readiness = {
+            let readiness = relay.native_session_readiness();
+            tokio::pin!(readiness);
+            loop {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    bail!("ACP runtime did not report session startup");
+                }
+                let cancellation_poll =
+                    std::cmp::min(deadline, now + std::time::Duration::from_millis(25));
+                tokio::select! {
+                    readiness = &mut readiness => break readiness?,
+                    _ = tokio::time::sleep_until(cancellation_poll) => {
+                        if executor.cancellation_requested() {
+                            bail!("operation cancelled while waiting for ACP runtime startup");
+                        }
+                    }
+                }
+            }
+        };
+        if executor.cancellation_requested() {
+            bail!("operation cancelled while waiting for ACP runtime startup");
+        }
+        match readiness {
+            NativeSessionReadiness::Ready(native_session_id) => return Ok(native_session_id),
+            NativeSessionReadiness::Closed => {
+                bail!("ACP runtime stopped before starting its session")
+            }
+            NativeSessionReadiness::Waiting => {}
+        }
+        if executor.cancellation_requested() {
+            bail!("operation cancelled while waiting for ACP runtime startup");
         }
         if tokio::time::Instant::now() >= deadline {
             bail!("ACP runtime did not report session startup");
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let next_poll = std::cmp::min(
+            deadline,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+        );
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= next_poll {
+                break;
+            }
+            tokio::time::sleep_until(std::cmp::min(
+                next_poll,
+                now + std::time::Duration::from_millis(25),
+            ))
+            .await;
+            if executor.cancellation_requested() {
+                bail!("operation cancelled while waiting for ACP runtime startup");
+            }
+        }
     }
 }
 
@@ -6093,6 +6204,77 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn native_session_wait_stops_as_soon_as_cancellation_is_observed() {
+        struct CancellingProbe {
+            cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            polls: usize,
+        }
+
+        impl NativeSessionProbe for CancellingProbe {
+            async fn native_session_readiness(&mut self) -> Result<NativeSessionReadiness> {
+                self.polls += 1;
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::Release);
+                Ok(NativeSessionReadiness::Waiting)
+            }
+        }
+
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executor = CancellableProcessExecutor::new(cancelled.clone());
+        let mut probe = CancellingProbe {
+            cancelled,
+            polls: 0,
+        };
+
+        let error = wait_for_native_session(&mut probe, &executor)
+            .await
+            .unwrap_err();
+
+        assert_eq!(probe.polls, 1);
+        assert!(
+            error
+                .to_string()
+                .contains("operation cancelled while waiting for ACP runtime startup")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_session_wait_cancels_while_readiness_probe_is_pending() {
+        struct PendingProbe {
+            polls: usize,
+        }
+
+        impl NativeSessionProbe for PendingProbe {
+            async fn native_session_readiness(&mut self) -> Result<NativeSessionReadiness> {
+                self.polls += 1;
+                std::future::pending().await
+            }
+        }
+
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executor = CancellableProcessExecutor::new(cancelled.clone());
+        let mut probe = PendingProbe { polls: 0 };
+        let cancellation = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let started = tokio::time::Instant::now();
+
+        let error = wait_for_native_session(&mut probe, &executor)
+            .await
+            .unwrap_err();
+        cancellation.await.unwrap();
+
+        assert_eq!(probe.polls, 1);
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+        assert!(
+            error
+                .to_string()
+                .contains("operation cancelled while waiting for ACP runtime startup")
+        );
+    }
+
     #[test]
     fn startup_reconciliation_only_removes_unreferenced_controller_checkpoints() {
         let directory = tempfile::tempdir().unwrap();
@@ -7795,6 +7977,51 @@ mod tests {
             .output()
             .unwrap();
         assert!(!output.status.success());
+    }
+
+    #[test]
+    fn cancelled_new_session_cleanup_removes_managed_worktree_and_branch() {
+        let repository = committed_repository();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let worktree = ManagedWorktree {
+            source_project_directory: repository.path().to_path_buf(),
+            source_repository: repository.path().to_path_buf(),
+            worktree_root: repository.path().join(".hel/worktrees").join(session_id),
+            branch: format!("hel/{session_id}"),
+            target: ManagedWorktreeTarget::Local,
+        };
+        create_managed_worktree(&ProcessExecutor, &worktree, None).unwrap();
+
+        let mut session = checkpoint_test_session(session_id);
+        session.project_directory = Some(worktree.worktree_root.clone());
+        session.managed_worktree = Some(worktree.clone());
+        let controller = Controller {
+            config: HelConfig::default(),
+            state: HelState {
+                sessions: BTreeMap::from([(session_id.into(), session)]),
+                ..HelState::default()
+            },
+        };
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let executor = CancellableProcessExecutor::new(cancelled);
+
+        controller
+            .cleanup_new_session_worktree_after_failure(session_id, &executor)
+            .unwrap();
+
+        assert!(!worktree.worktree_root.exists());
+        assert!(!repository.path().join(".hel").exists());
+        let branch = Command::new("git")
+            .arg("-C")
+            .arg(repository.path())
+            .args([
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{}", worktree.branch),
+            ])
+            .output()
+            .unwrap();
+        assert!(!branch.status.success());
     }
 
     #[test]

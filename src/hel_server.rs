@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::{Component, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -202,6 +203,10 @@ impl ViewerSnapshot {
             .map(|(id, target)| ViewerTarget {
                 id: id.clone(),
                 kind: target_kind_name(target).into(),
+                requires_project_directory: matches!(
+                    target,
+                    TargetTemplate::LocalBare | TargetTemplate::SshBare { .. }
+                ),
             })
             .collect();
         let bundles = config
@@ -216,10 +221,6 @@ impl ViewerSnapshot {
                     .map(|repository| ViewerRepository {
                         id: repository.id.clone(),
                         github: repository.github.clone(),
-                        local: repository
-                            .local
-                            .as_ref()
-                            .map(|path| path.to_string_lossy().into_owned()),
                         destination: repository.destination.to_string_lossy().into_owned(),
                     })
                     .collect(),
@@ -290,6 +291,7 @@ pub struct ViewerQuota {
 pub struct ViewerTarget {
     pub id: String,
     pub kind: String,
+    pub requires_project_directory: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,7 +307,6 @@ pub struct ViewerBundle {
 pub struct ViewerRepository {
     pub id: String,
     pub github: Option<String>,
-    pub local: Option<String>,
     pub destination: String,
 }
 
@@ -320,6 +321,8 @@ pub enum ControllerAction {
         bundle_id: String,
         target_id: String,
         title: String,
+        #[serde(default)]
+        project_directory: Option<PathBuf>,
     },
     Resume {
         session_id: String,
@@ -339,6 +342,9 @@ pub enum ControllerAction {
         text: String,
     },
     Close {
+        session_id: String,
+    },
+    Cancel {
         session_id: String,
     },
     RemoveQueuedPrompt {
@@ -600,6 +606,7 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
             bundle_id,
             target_id,
             title,
+            project_directory,
         } => {
             validate_public_id(profile_id)?;
             validate_public_id(bundle_id)?;
@@ -607,7 +614,22 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
             validate_title(title)?;
             require_profile(snapshot, profile_id)?;
             require_bundle(snapshot, bundle_id)?;
-            require_target(snapshot, target_id)?;
+            let target = require_target(snapshot, target_id)?;
+            if target.requires_project_directory != project_directory.is_some() {
+                return Err(ApiError::bad_request(
+                    "project_directory is required exactly for bare targets",
+                ));
+            }
+            if let Some(directory) = project_directory
+                && (!directory.is_absolute()
+                    || directory
+                        .components()
+                        .any(|component| component == Component::ParentDir))
+            {
+                return Err(ApiError::bad_request(
+                    "project_directory must be an absolute safe path",
+                ));
+            }
         }
         ControllerAction::Resume {
             session_id,
@@ -624,6 +646,7 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
         }
         ControllerAction::Open { session_id }
         | ControllerAction::Close { session_id }
+        | ControllerAction::Cancel { session_id }
         | ControllerAction::Read { session_id, .. } => {
             validate_public_id(session_id)?;
             require_session_record(snapshot, session_id)?;
@@ -683,12 +706,14 @@ fn require_profile<'a>(
         .ok_or_else(|| ApiError::bad_request("unknown profile"))
 }
 
-fn require_target(snapshot: &ViewerSnapshot, id: &str) -> Result<(), ApiError> {
+fn require_target<'a>(
+    snapshot: &'a ViewerSnapshot,
+    id: &str,
+) -> Result<&'a ViewerTarget, ApiError> {
     snapshot
         .targets
         .iter()
-        .any(|target| target.id == id)
-        .then_some(())
+        .find(|target| target.id == id)
         .ok_or_else(|| ApiError::bad_request("unknown target"))
 }
 
@@ -954,12 +979,13 @@ const VIEWER_HTML: &str = r##"<!doctype html>
 <style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}textarea{width:100%;box-sizing:border-box;min-height:76px}#conversation-feed{min-height:30vh}</style></head>
 <body><header><div><h1>HEL</h1><div class="dim">Welcome to Hel.</div></div><button id="logout" class="hidden">Sign out</button></header>
 <main id="login" class="card"><h2>Unlock viewer</h2><p class="dim">Enter the six-digit code shown by <code>hel server</code>.</p><form id="login-form" class="row"><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required><button>Enter</button></form><p id="login-error"></p></main>
-<main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><button>Start</button></form><p id="action-error"></p></section><section><h2>Sessions</h2><div id="sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div></section><form id="prompt-form" class="card"><textarea id="prompt-text" maxlength="65536" placeholder="Message the agent" required></textarea><button>Send or queue</button><p id="conversation-error"></p></form></section></main>
+<main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><input id="new-project-directory" class="hidden" placeholder="Absolute project directory"><button>Start</button></form><p id="action-error"></p></section><section><h2>Sessions</h2><div id="sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div></section><form id="prompt-form" class="card"><textarea id="prompt-text" maxlength="65536" placeholder="Message the agent" required></textarea><button>Send or queue</button><p id="conversation-error"></p></form></section></main>
 <script>
-const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue');let snapshot,currentSession,cursor=0,eventsStarted=false;
+const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),newProjectDirectory=document.querySelector('#new-project-directory'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue');let snapshot,currentSession,cursor=0,eventsStarted=false;
 async function request(url,options={}){const response=await fetch(url,{...options,headers:{'content-type':'application/json',...(options.headers||{})}});if(response.status===401)throw new Error('unauthorized');if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||response.statusText)}return response.status===204?null:response.json()}
 function options(items,selected){return items.map(x=>`<option value="${escapeAttr(x.id)}" ${x.id===selected?'selected':''}>${escapeHtml(x.id)}</option>`).join('')}
-async function refresh(){try{snapshot=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);sessions.innerHTML=snapshot.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span> ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available?'':'disabled'}>Open</button><button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Archive</button></div></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);document.querySelector('#conversation-state').textContent=session.state}}if(!eventsStarted){eventsStarted=true;const source=new EventSource('/api/events');source.addEventListener('revision',()=>{refresh();if(currentSession)loadConversation(true)})}}catch(e){if(e.message==='unauthorized'){login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}}}
+function syncProjectDirectory(){const required=snapshot?.targets.find(x=>x.id===newTarget.value)?.requires_project_directory===true;newProjectDirectory.classList.toggle('hidden',!required);newProjectDirectory.required=required;if(!required)newProjectDirectory.value=''}
+async function refresh(){try{snapshot=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);syncProjectDirectory();sessions.innerHTML=snapshot.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span> ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available?'':'disabled'}>Open</button>${x.state==='provisioning'?`<button class="danger" data-action="cancel" data-id="${escapeAttr(x.id)}">Cancel</button>`:`<button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Archive</button>`}</div></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);document.querySelector('#conversation-state').textContent=session.state}}if(!eventsStarted){eventsStarted=true;const source=new EventSource('/api/events');source.addEventListener('revision',()=>{refresh();if(currentSession)loadConversation(true)})}}catch(e){if(e.message==='unauthorized'){login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}}}
 function renderQueue(session){queue.innerHTML=(session.queued_prompts||[]).map((x,i)=>`<div class="queue-item"><span>${i+1}. ${escapeHtml(x.text)}</span><button class="danger" data-queue-id="${escapeAttr(x.id)}">Remove</button></div>`).join('')||'<p class="dim">No queued prompts.</p>'}
 function renderEntries(entries,replace){if(replace)feed.innerHTML='';for(const entry of entries){let node=document.querySelector(`[data-entry-id="${entry.id}"]`);if(!node){node=document.createElement('article');node.dataset.entryId=entry.id;feed.append(node)}node.className=`entry ${entry.role}`;const title=document.createElement('strong');title.textContent=entry.label;const body=document.createElement('pre');body.textContent=entry.lines.join('\n');node.replaceChildren(title,body)}window.scrollTo(0,document.body.scrollHeight)}
 async function loadConversation(delta=false){if(!currentSession)return;try{const result=await request(`/api/conversations/${encodeURIComponent(currentSession)}${delta&&cursor?`?after_seq=${cursor}`:''}`);renderEntries(result.entries,!delta||result.reset);cursor=result.latest_seq;await request(`/api/conversations/${encodeURIComponent(currentSession)}/read`,{method:'POST',body:JSON.stringify({through:cursor})})}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
@@ -967,7 +993,8 @@ async function openConversation(id){currentSession=id;cursor=0;location.hash=`co
 function showDashboard(){currentSession=null;cursor=0;location.hash='';conversation.classList.add('hidden');dashboard.classList.remove('hidden')}
 document.querySelector('#login-form').onsubmit=async e=>{e.preventDefault();try{await request('/auth/session',{method:'POST',body:JSON.stringify({code:document.querySelector('#code').value})});document.querySelector('#login-error').textContent='';refresh()}catch(err){document.querySelector('#login-error').textContent=err.message}};
 logout.onclick=async()=>{await request('/auth/session',{method:'DELETE'});location.reload()};
-newForm.onsubmit=async e=>{e.preventDefault();try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'new',title:document.querySelector('#new-title').value,profile_id:newProfile.value,bundle_id:newBundle.value,target_id:newTarget.value})});document.querySelector('#new-title').value='';actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
+newTarget.onchange=syncProjectDirectory;
+newForm.onsubmit=async e=>{e.preventDefault();const target=snapshot.targets.find(x=>x.id===newTarget.value);try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'new',title:document.querySelector('#new-title').value,profile_id:newProfile.value,bundle_id:newBundle.value,target_id:newTarget.value,project_directory:target?.requires_project_directory?newProjectDirectory.value:null})});document.querySelector('#new-title').value='';actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
 sessions.onclick=async e=>{const button=e.target.closest('button[data-action]');if(!button)return;if(button.dataset.action==='open')return openConversation(button.dataset.id);if(button.dataset.action==='close'&&!confirm('Save a recovery copy, archive, and destroy this session target? Queued prompts will be preserved.'))return;const body={action:button.dataset.action,session_id:button.dataset.id};if(button.dataset.action==='resume'){body.profile_id=button.dataset.profile;body.target_id=button.dataset.target;const session=snapshot.sessions.find(x=>x.id===button.dataset.id);body.queue='start';if(session?.queued_prompts?.length){const choice=prompt(`This session has ${session.queued_prompts.length} queued prompt(s). Type start to run them after resume, or discard to remove them.`,'start');if(choice===null)return;if(!['start','discard'].includes(choice.toLowerCase()))return alert('Enter start or discard.');body.queue=choice.toLowerCase()}}try{await request('/api/actions',{method:'POST',body:JSON.stringify(body)});actionError.textContent='';await refresh()}catch(err){actionError.textContent=err.message}};
 document.querySelector('#back').onclick=showDashboard;
 document.querySelector('#prompt-form').onsubmit=async e=>{e.preventDefault();const text=document.querySelector('#prompt-text');try{await request('/api/actions',{method:'POST',body:JSON.stringify({action:'prompt',session_id:currentSession,text:text.value})});text.value='';document.querySelector('#conversation-error').textContent='';await refresh()}catch(err){document.querySelector('#conversation-error').textContent=err.message}};
@@ -1010,24 +1037,27 @@ mod tests {
                     repositories: vec![ProjectRepository {
                         id: "hel".into(),
                         github: Some("owner/hel".into()),
-                        local: None,
+                        local: Some("/private/source/hel".into()),
                         destination: "hel".into(),
                         git_ref: None,
                     }],
                 },
             )]),
-            targets: BTreeMap::from([(
-                "podman".into(),
-                TargetTemplate::LocalPodman {
-                    container: ContainerTemplate {
-                        image: "secret.registry/image".into(),
-                        platform: None,
-                        cpus: None,
-                        memory: None,
-                        environment: BTreeMap::from([("TOKEN".into(), "secret-target".into())]),
+            targets: BTreeMap::from([
+                (
+                    "podman".into(),
+                    TargetTemplate::LocalPodman {
+                        container: ContainerTemplate {
+                            image: "secret.registry/image".into(),
+                            platform: None,
+                            cpus: None,
+                            memory: None,
+                            environment: BTreeMap::from([("TOKEN".into(), "secret-target".into())]),
+                        },
                     },
-                },
-            )]),
+                ),
+                ("raw".into(), TargetTemplate::LocalBare),
+            ]),
         };
         let state = HelState {
             version: STATE_VERSION,
@@ -1200,6 +1230,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bare_new_action_forwards_an_explicit_safe_project_directory() {
+        let (app, mut actions) = app();
+        let cookie = login_cookie(&app).await;
+        let response = tokio::spawn(
+            app.oneshot(
+                Request::post("/api/actions")
+                    .header(COOKIE, cookie)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"action":"new","profile_id":"codex-1","bundle_id":"hel","target_id":"raw","title":"Raw work","project_directory":"/work/project"}"#,
+                    ))
+                    .unwrap(),
+            ),
+        );
+        let action = actions.recv().await.unwrap();
+        assert_eq!(
+            action.action,
+            ControllerAction::New {
+                profile_id: "codex-1".into(),
+                bundle_id: "hel".into(),
+                target_id: "raw".into(),
+                title: "Raw work".into(),
+                project_directory: Some(PathBuf::from("/work/project")),
+            }
+        );
+        action.reply.send(Ok(())).unwrap();
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+    }
+
+    #[test]
+    fn new_action_requires_project_directory_exactly_for_bare_targets() {
+        let (config, state) = sample_config_state();
+        let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+        let action = |target_id: &str, project_directory: Option<PathBuf>| ControllerAction::New {
+            profile_id: "codex-1".into(),
+            bundle_id: "hel".into(),
+            target_id: target_id.into(),
+            title: "New work".into(),
+            project_directory,
+        };
+
+        assert!(validate_action(&action("podman", None), &snapshot).is_ok());
+        assert_eq!(
+            validate_action(&action("podman", Some("/work".into())), &snapshot)
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            validate_action(&action("raw", None), &snapshot)
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            validate_action(&action("raw", Some("relative".into())), &snapshot)
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            validate_action(&action("raw", Some("/work/../secret".into())), &snapshot)
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(validate_action(&action("raw", Some("/work/project".into())), &snapshot).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancel_action_is_typed_and_forwarded() {
+        let (app, mut actions) = app();
+        let cookie = login_cookie(&app).await;
+        let response = tokio::spawn(
+            app.oneshot(
+                Request::post("/api/actions")
+                    .header(COOKIE, cookie)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"action":"cancel","session_id":"session-1"}"#,
+                    ))
+                    .unwrap(),
+            ),
+        );
+        let action = actions.recv().await.unwrap();
+        assert_eq!(
+            action.action,
+            ControllerAction::Cancel {
+                session_id: "session-1".into(),
+            }
+        );
+        action.reply.send(Ok(())).unwrap();
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+    }
+
+    #[tokio::test]
     async fn action_validation_accepts_cross_harness_resume_and_rejects_unknown() {
         let (mut config, state) = sample_config_state();
         config.profiles.insert(
@@ -1252,6 +1384,14 @@ mod tests {
         assert!(body.contains("session-1"));
         assert!(!body.contains("secret-token"));
         assert!(!body.contains("native-secret-id"));
+        assert!(!body.contains("/private/source/hel"));
+
+        let snapshot: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let repository = &snapshot["bundles"][0]["repositories"][0];
+        assert_eq!(repository["id"], "hel");
+        assert_eq!(repository["github"], "owner/hel");
+        assert_eq!(repository["destination"], "hel");
+        assert!(repository.get("local").is_none());
     }
 
     #[tokio::test]

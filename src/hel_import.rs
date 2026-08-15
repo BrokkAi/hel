@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail, ensure};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 use serde_json::{Value, json};
 
@@ -1288,6 +1288,7 @@ pub fn read_claude_transcript(path: &Path) -> Result<ClaudeTranscript> {
         let record: Value = serde_json::from_str(line).with_context(|| {
             format!("parse Claude session {} line {}", path.display(), index + 1)
         })?;
+        let recorded_at_ms = native_recorded_at_ms(&record);
         if cwd.is_none() {
             cwd = record
                 .get("cwd")
@@ -1329,6 +1330,7 @@ pub fn read_claude_transcript(path: &Path) -> Result<ClaudeTranscript> {
                 let request_id = format!("import-{}", events.len() + 1);
                 push_event(
                     &mut events,
+                    recorded_at_ms,
                     WorkerEvent::PromptAccepted {
                         request_id,
                         text: text.to_owned(),
@@ -1355,6 +1357,7 @@ pub fn read_claude_transcript(path: &Path) -> Result<ClaudeTranscript> {
                     }
                     push_event(
                         &mut events,
+                        recorded_at_ms,
                         WorkerEvent::Adapter {
                             kind: "session_update".into(),
                             payload: json!({
@@ -1376,7 +1379,7 @@ pub fn read_claude_transcript(path: &Path) -> Result<ClaudeTranscript> {
                     .and_then(Value::as_str)
                     == Some("end_turn")
                 {
-                    push_event(&mut events, WorkerEvent::TurnCompleted);
+                    push_event(&mut events, recorded_at_ms, WorkerEvent::TurnCompleted);
                 }
             }
             _ => {}
@@ -1389,6 +1392,7 @@ pub fn read_claude_transcript(path: &Path) -> Result<ClaudeTranscript> {
         "Claude session cwd is not absolute: {}",
         cwd.display()
     );
+    finalize_import_event_times(&mut events, path)?;
     let edited_paths = claude_edited_paths(path)?;
     Ok(ClaudeTranscript {
         cwd,
@@ -1413,6 +1417,7 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
         let record: Value = serde_json::from_str(line).with_context(|| {
             format!("parse Codex session {} line {}", path.display(), index + 1)
         })?;
+        let recorded_at_ms = native_recorded_at_ms(&record);
         if record.get("type").and_then(Value::as_str) == Some("session_meta") {
             if cwd.is_none() {
                 cwd = record
@@ -1456,10 +1461,11 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
                 let Some(text) = codex_completed_item_text(&record) else {
                     continue;
                 };
-                finish_imported_turn(&mut events);
+                finish_imported_turn(&mut events, None);
                 let request_id = format!("import-{}", events.len() + 1);
                 push_event(
                     &mut events,
+                    recorded_at_ms,
                     WorkerEvent::PromptAccepted {
                         request_id,
                         text: text.to_owned(),
@@ -1477,6 +1483,7 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
                 };
                 push_event(
                     &mut events,
+                    recorded_at_ms,
                     WorkerEvent::Adapter {
                         kind: "session_update".into(),
                         payload: json!({
@@ -1489,7 +1496,9 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
                     },
                 );
             }
-            Some("turn_complete" | "turn_aborted") => finish_imported_turn(&mut events),
+            Some("turn_complete" | "turn_aborted") => {
+                finish_imported_turn(&mut events, recorded_at_ms)
+            }
             _ => {}
         }
     }
@@ -1501,13 +1510,14 @@ pub fn read_codex_transcript(path: &Path) -> Result<CodexTranscript> {
         saw_user,
         "Codex paginated session contains no importable user messages"
     );
-    finish_imported_turn(&mut events);
+    finish_imported_turn(&mut events, None);
     let cwd = cwd.context("Codex session does not declare its original cwd")?;
     ensure!(
         cwd.is_absolute(),
         "Codex session cwd is not absolute: {}",
         cwd.display()
     );
+    finalize_import_event_times(&mut events, path)?;
     Ok(CodexTranscript {
         cwd,
         edited_paths: edited_paths.into_iter().collect(),
@@ -1560,6 +1570,7 @@ pub fn read_kimi_transcript(session_path: &Path) -> Result<KimiTranscript> {
                 index + 1
             )
         })?;
+        let recorded_at_ms = native_recorded_at_ms(&record);
         if matches!(
             record.get("type").and_then(Value::as_str),
             Some("context.compaction" | "context.compacted" | "compaction")
@@ -1574,7 +1585,7 @@ pub fn read_kimi_transcript(session_path: &Path) -> Result<KimiTranscript> {
             Some("turn.prompt" | "turn.steer")
                 if record.pointer("/origin/kind").and_then(Value::as_str) == Some("user") =>
             {
-                finish_imported_turn(&mut events);
+                finish_imported_turn(&mut events, None);
                 let text = record
                     .pointer("/input")
                     .and_then(Value::as_array)
@@ -1589,6 +1600,7 @@ pub fn read_kimi_transcript(session_path: &Path) -> Result<KimiTranscript> {
                     let request_id = format!("import-{}", events.len() + 1);
                     push_event(
                         &mut events,
+                        recorded_at_ms,
                         WorkerEvent::PromptAccepted {
                             request_id,
                             text,
@@ -1613,6 +1625,7 @@ pub fn read_kimi_transcript(session_path: &Path) -> Result<KimiTranscript> {
                 };
                 push_event(
                     &mut events,
+                    recorded_at_ms,
                     WorkerEvent::Adapter {
                         kind: "session_update".into(),
                         payload: json!({
@@ -1628,7 +1641,8 @@ pub fn read_kimi_transcript(session_path: &Path) -> Result<KimiTranscript> {
             _ => {}
         }
     }
-    finish_imported_turn(&mut events);
+    finish_imported_turn(&mut events, None);
+    finalize_import_event_times(&mut events, &wire_path)?;
     let edited_paths = kimi_edited_paths(session_path)?;
     Ok(KimiTranscript {
         cwd,
@@ -1799,24 +1813,66 @@ fn collect_files_named(root: &Path, extension: &str, output: &mut Vec<PathBuf>) 
     Ok(())
 }
 
-fn finish_imported_turn(events: &mut Vec<SequencedEvent>) {
+fn finish_imported_turn(events: &mut Vec<SequencedEvent>, recorded_at_ms: Option<i64>) {
     if !events.is_empty()
         && !matches!(
             events.last().map(|event| &event.event),
             Some(WorkerEvent::TurnCompleted)
         )
     {
-        push_event(events, WorkerEvent::TurnCompleted);
+        push_event(events, recorded_at_ms, WorkerEvent::TurnCompleted);
     }
 }
 
-fn push_event(events: &mut Vec<SequencedEvent>, event: WorkerEvent) {
+fn push_event(events: &mut Vec<SequencedEvent>, recorded_at_ms: Option<i64>, event: WorkerEvent) {
     events.push(SequencedEvent {
         seq: events.len() as u64 + 1,
-        recorded_at_ms: None,
+        recorded_at_ms,
         request_id: None,
         event,
     });
+}
+
+fn native_recorded_at_ms(record: &Value) -> Option<i64> {
+    record
+        .get("timestamp")
+        .or_else(|| record.get("time"))
+        .and_then(Value::as_str)
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.timestamp_millis())
+}
+
+/// Native streams predate Hel's durable event clock in some harness versions.
+/// Preserve their record timestamps when available; otherwise use the source
+/// artifact's modification time. Clamping regressions keeps the imported
+/// sequence and its activity watermark monotonic even if the native clock
+/// moved backwards while the session was being recorded.
+fn finalize_import_event_times(events: &mut [SequencedEvent], source_path: &Path) -> Result<()> {
+    let Some(first) = events.first() else {
+        return Ok(());
+    };
+    let mut last_recorded_at_ms = match events.iter().find_map(|event| event.recorded_at_ms) {
+        Some(recorded_at_ms) => recorded_at_ms,
+        None => DateTime::<Utc>::from(
+            fs::metadata(source_path)
+                .with_context(|| format!("stat import source {}", source_path.display()))?
+                .modified()
+                .with_context(|| format!("read import source mtime {}", source_path.display()))?,
+        )
+        .timestamp_millis(),
+    };
+    last_recorded_at_ms = first
+        .recorded_at_ms
+        .unwrap_or(last_recorded_at_ms)
+        .max(last_recorded_at_ms);
+    for event in events {
+        last_recorded_at_ms = event
+            .recorded_at_ms
+            .unwrap_or(last_recorded_at_ms)
+            .max(last_recorded_at_ms);
+        event.recorded_at_ms = Some(last_recorded_at_ms);
+    }
+    Ok(())
 }
 
 pub fn session_edit_targets(
@@ -2157,7 +2213,8 @@ fn import_claude_session_inner(
         false,
     )?;
     let session_id = new_session_id()?;
-    let canonical_session = canonical_import_session(&session_id, &transcript.events)?;
+    let canonical_session =
+        canonical_import_session(&session_id, &transcript.events, &source.jsonl_path)?;
     let timestamp = timestamp();
     let profile_id = import_profile_id(config, profile_id, HarnessKind::Claude, claude_home)?;
     let target_id = default_import_target_id(config);
@@ -2391,7 +2448,8 @@ fn import_native_session(
     let native_artifacts =
         collect_import_native_artifacts(harness, harness_home, native_session_id, source_path)?;
     let session_id = new_session_id()?;
-    let canonical_session = canonical_import_session(&session_id, &transcript.events)?;
+    let canonical_session =
+        canonical_import_session(session_id.as_str(), &transcript.events, source_path)?;
     let timestamp = timestamp();
     let profile_id = import_profile_id(config, profile_id, harness, harness_home)?;
     let target_id = default_import_target_id(config);
@@ -2601,11 +2659,24 @@ fn collect_local_repositories(
 fn canonical_import_session(
     session_id: &str,
     events: &[SequencedEvent],
+    source_path: &Path,
 ) -> Result<crate::hel_archive::CanonicalSessionSnapshot> {
+    let mut events = events.to_vec();
+    finalize_import_event_times(&mut events, source_path)?;
     let latest = events.last().map_or(0, |event| event.seq);
     let snapshot = WorkerSnapshot::summary(session_id.to_owned(), WorkerPhase::Idle, latest);
-    let mut materialized = ChatState::new(&snapshot, events).materialized_session();
-    materialized.session_title = harness_session_title(events);
+    let mut materialized = ChatState::new(&snapshot, &events).materialized_session();
+    materialized.session_title = harness_session_title(&events);
+    if let Some(last_activity_at_ms) = events.iter().filter_map(|event| event.recorded_at_ms).max()
+    {
+        materialized.last_activity_at_ms = Some(
+            materialized
+                .last_activity_at_ms
+                .map_or(last_activity_at_ms, |current| {
+                    current.max(last_activity_at_ms)
+                }),
+        );
+    }
     canonical_session_from_materialized(&materialized)
 }
 
@@ -3215,6 +3286,150 @@ mod tests {
     }
 
     #[test]
+    fn nonempty_codex_import_materializes_and_validates_canonical_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        initialize_repository(&app, "app");
+
+        let codex_home = directory.path().join("codex");
+        let native_session_id = "019feb6c-5ffc-7c12-ad99-bdeaeb6be79d";
+        let rollout = codex_home
+            .join("sessions/2026/08/14")
+            .join(format!("rollout-{native_session_id}.jsonl"));
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        let records = [
+            json!({
+                "timestamp": "2026-08-14T12:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": native_session_id,
+                    "cwd": app,
+                    "history_mode": "paginated"
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-14T12:00:01.250Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"type": "text", "text": "import this"}]
+                    }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-14T12:00:02.500Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "AgentMessage",
+                        "content": [{"type": "Text", "text": "imported"}]
+                    }
+                }
+            }),
+            json!({
+                "timestamp": "2026-08-14T12:00:03.750Z",
+                "type": "event_msg",
+                "payload": {"type": "turn_complete", "turn_id": "turn-1"}
+            }),
+        ];
+        fs::write(
+            &rollout,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let transcript = read_codex_transcript(&rollout).unwrap();
+        let expected_user_time = DateTime::parse_from_rfc3339("2026-08-14T12:00:01.250Z")
+            .unwrap()
+            .timestamp_millis();
+        let expected_agent_time = DateTime::parse_from_rfc3339("2026-08-14T12:00:02.500Z")
+            .unwrap()
+            .timestamp_millis();
+        let expected_activity = DateTime::parse_from_rfc3339("2026-08-14T12:00:03.750Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            transcript
+                .events
+                .iter()
+                .map(|event| event.recorded_at_ms)
+                .collect::<Vec<_>>(),
+            [
+                Some(expected_user_time),
+                Some(expected_agent_time),
+                Some(expected_activity)
+            ]
+        );
+        let metadata = fs::metadata(&rollout).unwrap();
+        let source = LocatedCodexSession {
+            native_session_id: native_session_id.into(),
+            jsonl_path: rollout,
+            modified_at: metadata.modified().unwrap(),
+            title: "Imported Codex session".into(),
+            cwd: app,
+            git_branch: "main".into(),
+            size_bytes: metadata.len(),
+            history_mode: CodexHistoryMode::Paginated,
+        };
+        let mut config = HelConfig::default();
+        config.bundles.insert(
+            "app".into(),
+            ProjectBundle {
+                primary_repo: "app".into(),
+                repositories: vec![ProjectRepository {
+                    id: "app".into(),
+                    github: Some("example/app".into()),
+                    local: None,
+                    destination: "app".into(),
+                    git_ref: None,
+                }],
+            },
+        );
+        let archive_directory = directory.path().join("archives");
+        fs::create_dir_all(&archive_directory).unwrap();
+        let mut state = HelState::default();
+
+        let imported = import_codex_session(
+            &config,
+            &mut state,
+            CodexImportRequest {
+                codex_home: &codex_home,
+                source: &source,
+                transcript: &transcript,
+                bundle_id: "app",
+                profile_id: None,
+                title: None,
+                archive_directory: &archive_directory,
+            },
+        )
+        .unwrap();
+        let verified =
+            crate::hel_archive::verify_archive_streaming(&imported.archive_path).unwrap();
+        assert_eq!(verified.canonical_session.event_frontier, 3);
+        assert_eq!(
+            verified.canonical_session.session.last_activity_at_ms,
+            Some(expected_activity)
+        );
+        assert_eq!(verified.canonical_session.transcript.len(), 2);
+        assert_eq!(
+            verified.canonical_session.transcript[0].created_at_ms,
+            expected_user_time
+        );
+        assert_eq!(
+            verified.canonical_session.transcript[1].created_at_ms,
+            expected_agent_time
+        );
+        assert!(state.sessions.contains_key(&imported.session_id));
+    }
+
+    #[test]
     fn codex_paginated_import_ignores_compaction_artifacts() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("rollout.jsonl");
@@ -3607,8 +3822,9 @@ mod tests {
             r#"{"workDir":"/work/app"}"#,
         )
         .unwrap();
+        let wire_path = directory.path().join("agents/main/wire.jsonl");
         fs::write(
-            directory.path().join("agents/main/wire.jsonl"),
+            &wire_path,
             concat!(
                 r#"{"type":"turn.prompt","origin":{"kind":"user"},"input":[{"type":"text","text":"first prompt"}]}"#,
                 "\n",
@@ -3623,6 +3839,9 @@ mod tests {
             ),
         )
         .unwrap();
+        let expected_fallback =
+            DateTime::<Utc>::from(fs::metadata(&wire_path).unwrap().modified().unwrap())
+                .timestamp_millis();
 
         let transcript = read_kimi_transcript(directory.path()).unwrap();
         assert_eq!(transcript.cwd, PathBuf::from("/work/app"));
@@ -3650,6 +3869,12 @@ mod tests {
             transcript.events[5].event,
             WorkerEvent::TurnCompleted
         ));
+        assert!(
+            transcript
+                .events
+                .iter()
+                .all(|event| event.recorded_at_ms == Some(expected_fallback))
+        );
     }
 
     #[test]
