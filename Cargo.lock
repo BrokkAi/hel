@@ -1359,7 +1359,6 @@ dependencies = [
  "axum-server",
  "base64",
  "chrono",
- "clap",
  "crossterm",
  "dirs",
  "flate2",
@@ -1392,6 +1391,41 @@ dependencies = [
  "unicode-width",
  "url",
  "zip",
+]
+
+[[package]]
+name = "hel-cli"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "axum-server",
+ "chrono",
+ "clap",
+ "crossterm",
+ "dirs",
+ "hel",
+ "hel-tui",
+ "libc",
+ "ratatui",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
+name = "hel-tui"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "crossterm",
+ "hel",
+ "ratatui",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

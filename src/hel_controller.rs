@@ -5718,14 +5718,51 @@ fn install_worker_files(
             )?;
         }
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
-            let upload = format!("~/.cache/hel/uploads/{session_id}");
+            // The worker binary is 10-30 MB and identical across sessions, so
+            // keep it in a content-addressed cache on the remote host and copy
+            // it over the wire only once per unique binary.
+            let digest = worker_binary_digest(worker_binary)?;
+            // Home-relative, not "~/": ssh_command_spec single-quotes every
+            // argument, so a tilde would stay literal in the remote shell
+            // while scp expands it, and the two sides would disagree. Both
+            // ssh commands (cwd is the login home) and scp resolve a relative
+            // path against the remote home.
+            let cache_dir = format!(".cache/hel/workers/{digest}");
+            let cached_worker = format!("{cache_dir}/hel");
+            let cached = matches!(
+                executor.execute(
+                    &ssh_command_spec(ssh, ["test", "-f", &cached_worker])
+                        .purpose("probe cached remote Hel worker"),
+                ),
+                Ok(output) if output.status == 0
+            );
+            if !cached {
+                execute_checked(
+                    executor,
+                    ssh_command_spec(ssh, ["mkdir", "-p", &cache_dir])
+                        .purpose("create remote worker cache"),
+                )?;
+                let partial = format!("{cache_dir}/hel.partial-{session_id}");
+                execute_checked(
+                    executor,
+                    scp_command_spec(ssh, worker_binary, &partial, false)
+                        .purpose("upload remote Podman worker binary"),
+                )?;
+                // Rename within the cache directory so the final path only
+                // ever names a complete upload.
+                execute_checked(
+                    executor,
+                    ssh_command_spec(ssh, ["mv", &partial, &cached_worker])
+                        .purpose("publish cached remote Hel worker"),
+                )?;
+            }
+            let upload = format!(".cache/hel/uploads/{session_id}");
             execute_checked(
                 executor,
                 ssh_command_spec(ssh, ["mkdir", "-p", &upload])
                     .purpose("create remote upload staging"),
             )?;
             for (source, name) in [
-                (worker_binary, "hel"),
                 (launch_config, "launch.json"),
                 (ownership, "ownership.json"),
             ] {
@@ -5753,7 +5790,7 @@ fn install_worker_files(
                 vec![
                     "podman".into(),
                     "cp".into(),
-                    format!("{upload}/hel"),
+                    cached_worker.clone(),
                     format!("{container_id}:{worker_root}/hel"),
                 ],
                 vec![
@@ -5802,6 +5839,17 @@ fn install_worker_files(
         }
     }
     Ok(())
+}
+
+/// Content address for the worker binary, used as the remote cache key.
+fn worker_binary_digest(worker_binary: &Path) -> Result<String> {
+    let bytes = std::fs::read(worker_binary).with_context(|| {
+        format!(
+            "failed to read worker binary {} for cache addressing",
+            worker_binary.display()
+        )
+    })?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7355,6 +7403,184 @@ mod tests {
         let streams = executor.streams.borrow();
         assert_eq!(streams.len(), 1);
         assert_eq!(&streams[0][..2], &[0x1f, 0x8b]);
+    }
+
+    struct PodmanInstallExecutor {
+        commands: RefCell<Vec<CommandSpec>>,
+        worker_cached: bool,
+    }
+
+    impl CommandExecutor for PodmanInstallExecutor {
+        fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+            self.commands.borrow_mut().push(command.clone());
+            let probing_cache = command
+                .args
+                .iter()
+                .any(|argument| argument.contains("'test' '-f'"));
+            let status = if probing_cache && !self.worker_cached {
+                1
+            } else {
+                0
+            };
+            Ok(CommandOutput {
+                status,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    struct PodmanInstallFixture {
+        _root: tempfile::TempDir,
+        worker_binary: PathBuf,
+        launch_config: PathBuf,
+        ownership: PathBuf,
+        profile_stage: PathBuf,
+        locator: hel_targets::TargetLocator,
+        digest: String,
+    }
+
+    fn podman_install_fixture() -> PodmanInstallFixture {
+        let root = tempfile::tempdir().unwrap();
+        let worker_binary = root.path().join("hel");
+        std::fs::write(&worker_binary, b"worker-binary-bytes").unwrap();
+        let launch_config = root.path().join("launch.json");
+        std::fs::write(&launch_config, b"{}").unwrap();
+        let ownership = root.path().join("ownership.json");
+        std::fs::write(&ownership, b"{}").unwrap();
+        let profile_stage = root.path().join("profile");
+        std::fs::create_dir_all(&profile_stage).unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"worker-binary-bytes"));
+        PodmanInstallFixture {
+            _root: root,
+            worker_binary,
+            launch_config,
+            ownership,
+            profile_stage,
+            locator: hel_targets::TargetLocator::SshPodman {
+                ssh: SshTarget {
+                    destination: "user@example.test".into(),
+                    ssh_args: Vec::new(),
+                },
+                container_id: "container-1".into(),
+            },
+            digest,
+        }
+    }
+
+    fn run_podman_install(worker_cached: bool) -> (Vec<CommandSpec>, PodmanInstallFixture) {
+        let fixture = podman_install_fixture();
+        let executor = PodmanInstallExecutor {
+            commands: RefCell::new(Vec::new()),
+            worker_cached,
+        };
+        install_worker_files(
+            &executor,
+            &fixture.locator,
+            "0123456789abcdef0123456789abcdef",
+            "/workspace/.hel/worker",
+            "/workspace/.hel/profile",
+            &fixture.worker_binary,
+            &fixture.launch_config,
+            &fixture.ownership,
+            &fixture.profile_stage,
+        )
+        .unwrap();
+        let commands = executor.commands.borrow().clone();
+        (commands, fixture)
+    }
+
+    fn rendered(commands: &[CommandSpec]) -> Vec<String> {
+        commands
+            .iter()
+            .map(|command| format!("{} {}", command.program, command.args.join(" ")))
+            .collect()
+    }
+
+    #[test]
+    fn ssh_podman_install_caches_the_worker_binary_on_a_cache_miss() {
+        let (commands, fixture) = run_podman_install(false);
+        let lines = rendered(&commands);
+        let digest = &fixture.digest;
+        let cache_dir = format!(".cache/hel/workers/{digest}");
+        let session = "0123456789abcdef0123456789abcdef";
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("ssh") && line.contains("'test' '-f'")),
+            "expected a cache probe, got {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains('~')),
+            "remote staging paths must be home-relative: ssh arguments are \
+             single-quoted so a tilde stays literal in the remote shell while \
+             scp expands it, got {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("ssh")
+                && line.contains(&format!("'mkdir' '-p' '{cache_dir}'"))),
+            "expected the cache directory to be created, got {lines:#?}"
+        );
+        let partial = format!("{cache_dir}/hel.partial-{session}");
+        assert!(
+            lines.iter().any(|line| line
+                == &format!(
+                    "scp {} user@example.test:{partial}",
+                    fixture.worker_binary.display()
+                )),
+            "expected the worker to be uploaded to the partial cache path, got {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("ssh")
+                && line.contains(&format!("'mv' '{partial}' '{cache_dir}/hel'"))),
+            "expected an atomic rename into the cache, got {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("'podman' 'cp'")
+                && line.contains(&format!("'{cache_dir}/hel'"))),
+            "expected podman cp to read the cached worker, got {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("scp")
+                && line.ends_with(&format!(
+                    "user@example.test:.cache/hel/uploads/{session}/hel"
+                ))),
+            "the worker must not be staged in the per-session upload directory, got {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn ssh_podman_install_skips_the_worker_upload_on_a_cache_hit() {
+        let (commands, fixture) = run_podman_install(true);
+        let lines = rendered(&commands);
+        let digest = &fixture.digest;
+        let cache_dir = format!(".cache/hel/workers/{digest}");
+        let session = "0123456789abcdef0123456789abcdef";
+
+        assert!(
+            !lines.iter().any(|line| line.starts_with("scp")
+                && line.contains(&fixture.worker_binary.display().to_string())),
+            "a cached worker must not be re-uploaded, got {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("'mv'")),
+            "a cache hit must not rename anything, got {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("'podman' 'cp'")
+                && line.contains(&format!("'{cache_dir}/hel'"))),
+            "expected podman cp to read the cached worker, got {lines:#?}"
+        );
+        for name in ["launch.json", "ownership.json"] {
+            assert!(
+                lines.iter().any(|line| line.starts_with("scp")
+                    && line.ends_with(&format!(
+                        "user@example.test:.cache/hel/uploads/{session}/{name}"
+                    ))),
+                "expected {name} to still be uploaded per session, got {lines:#?}"
+            );
+        }
     }
 
     #[test]

@@ -919,10 +919,14 @@ pub fn workspace_for(template: &TargetTemplate, session_id: &str) -> Result<Stri
             workspace_prefix, ..
         } => {
             validate_workspace_prefix(workspace_prefix)?;
-            Ok(format!(
-                "{}/{session_id}",
-                workspace_prefix.trim_end_matches('/')
-            ))
+            // Interpret a leading "~/" as home-relative. Remote commands are
+            // single-quoted, so a literal tilde would name a directory called
+            // "~"; a relative path resolves against the login home for ssh
+            // and scp alike.
+            let prefix = workspace_prefix
+                .strip_prefix("~/")
+                .unwrap_or(workspace_prefix);
+            Ok(format!("{}/{session_id}", prefix.trim_end_matches('/')))
         }
     }
 }
@@ -2135,6 +2139,8 @@ fn validate_relative_path(value: &str) -> Result<()> {
 fn validate_workspace_prefix(value: &str) -> Result<()> {
     if value.is_empty()
         || value == "/"
+        || value == "~"
+        || value == "~/"
         || value.contains('\0')
         || value.split('/').any(|part| part == "..")
     {
@@ -3027,6 +3033,31 @@ mod tests {
             close.commands[0].args.last().unwrap(),
             "i-0123456789abcdef0"
         );
+    }
+
+    #[test]
+    fn tilde_workspace_prefix_becomes_home_relative() {
+        // Remote commands are single-quoted, so a literal "~" would name a
+        // real directory instead of the login home.
+        let template = TargetTemplate::SshBare {
+            ssh: ssh(),
+            workspace_prefix: "~/hel".into(),
+        };
+        assert_eq!(
+            workspace_for(&template, SESSION).unwrap(),
+            format!("hel/{SESSION}")
+        );
+
+        for degenerate in ["~", "~/"] {
+            let template = TargetTemplate::SshBare {
+                ssh: ssh(),
+                workspace_prefix: degenerate.into(),
+            };
+            assert!(
+                workspace_for(&template, SESSION).is_err(),
+                "prefix {degenerate:?} must be rejected"
+            );
+        }
     }
 
     #[test]
