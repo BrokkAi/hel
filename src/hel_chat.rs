@@ -4500,6 +4500,9 @@ fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatState) {
 const ROLE_GUTTER: &str = "│ ";
 const ROLE_GUTTER_WIDTH: usize = 2;
 
+/// The last rows of an agent message for a small preview viewport, rendered
+/// by the same pipeline as the conversation view. Only viewport concerns
+/// differ: no header row, blank rows dropped, at most `maximum_lines` kept.
 pub fn render_agent_message_tail(
     source: &str,
     width: usize,
@@ -4508,30 +4511,13 @@ pub fn render_agent_message_tail(
     if width == 0 || maximum_lines == 0 {
         return Vec::new();
     }
-    let lines = render_agent_message_lines(source, width, Style::default().fg(Color::Yellow))
+    let entry = ChatEntry::plain(0, ChatRole::Agent, source);
+    let lines = entry_body_rows(&entry, width, TranscriptRenderMode::Rich)
         .into_iter()
         .filter(|line| !line_is_empty(line))
         .collect::<Vec<_>>();
     let start = lines.len().saturating_sub(maximum_lines);
     lines.into_iter().skip(start).collect()
-}
-
-fn render_agent_message_lines(
-    source: &str,
-    width: usize,
-    agent_style: Style,
-) -> Vec<Line<'static>> {
-    let content_width = width.saturating_sub(ROLE_GUTTER_WIDTH).max(1);
-    markdown_lines(
-        &sanitize_terminal_text(source),
-        Style::default(),
-        agent_style,
-        content_width,
-    )
-    .into_iter()
-    .flat_map(|logical| wrap_styled_line(logical.line, content_width, logical.continuation_indent))
-    .map(|line| with_role_gutter(line, agent_style))
-    .collect()
 }
 
 /// Render every row of the transcript. Rendering surfaces are all incremental
@@ -4599,16 +4585,27 @@ fn render_transcript_entry(
         Span::styled(label, visual.header_style.add_modifier(Modifier::BOLD)),
     ]);
     out.extend(wrap_styled_line(header, width, ROLE_GUTTER_WIDTH));
-
-    let content_width = width.saturating_sub(ROLE_GUTTER_WIDTH).max(1);
-    let logical_lines = entry_logical_lines(entry, mode, &visual, content_width);
-    for logical in logical_lines {
-        for row in wrap_styled_line(logical.line, content_width, logical.continuation_indent) {
-            out.push(with_role_gutter(row, visual.rail_style));
-        }
-    }
+    out.extend(entry_body_rows(entry, width, mode));
     out.push(Line::from(""));
     out
+}
+
+/// The gutter-prefixed body rows of one entry, shared between the full
+/// conversation view and the dashboard preview tail.
+fn entry_body_rows(
+    entry: &ChatEntry,
+    width: usize,
+    mode: TranscriptRenderMode,
+) -> Vec<Line<'static>> {
+    let visual = entry_visual(entry);
+    let content_width = width.saturating_sub(ROLE_GUTTER_WIDTH).max(1);
+    entry_logical_lines(entry, mode, &visual, content_width)
+        .into_iter()
+        .flat_map(|logical| {
+            wrap_styled_line(logical.line, content_width, logical.continuation_indent)
+        })
+        .map(|row| with_role_gutter(row, visual.rail_style))
+        .collect()
 }
 
 fn format_event_time(recorded_at_ms: Option<i64>) -> Option<String> {
@@ -6235,6 +6232,24 @@ mod tests {
         let text = transcript_text(&mut chat, 12);
 
         assert_eq!(text, ["❯ You", "│ alpha beta", "│ gamma", ""]);
+    }
+
+    #[test]
+    fn agent_preview_tail_matches_the_conversation_body_rows() {
+        let text = "# heading\n\nfirst paragraph with some words to wrap\n\n- alpha\n- beta";
+        let entry = ChatEntry::plain(0, ChatRole::Agent, text);
+        let body = render_transcript_entry(&entry, 40, TranscriptRenderMode::Rich)
+            .into_iter()
+            .skip(1) // header row
+            .filter(|line| !line_is_empty(line))
+            .collect::<Vec<_>>();
+        assert!(!body.is_empty());
+
+        assert_eq!(render_agent_message_tail(text, 40, usize::MAX), body);
+        assert_eq!(
+            render_agent_message_tail(text, 40, 2),
+            body[body.len() - 2..].to_vec()
+        );
     }
 
     #[test]
