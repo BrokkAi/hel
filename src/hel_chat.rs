@@ -3,7 +3,6 @@
 mod rendering;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,11 +14,9 @@ use agent_client_protocol::schema::v1::{
 };
 use anyhow::Result;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use ratatui::Frame;
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -32,7 +29,9 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::hel_acp::RuntimeEvent;
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
 use crate::hel_recovery::RecoveryContext;
-use crate::hel_session_manager::{ManagedSessionHandle, SessionManagerControl, new_command_id};
+use crate::hel_session_manager::{
+    ManagedSessionHandle, ManagedSessionView, SessionManagerControl, new_command_id,
+};
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, TranscriptBody,
     TranscriptItem,
@@ -48,10 +47,17 @@ use rendering::{
 
 const MOUSE_SCROLL_ROWS: usize = 3;
 
+/// What one terminal event asked the chat to do.
+///
+/// `None` means the event only changed local state, which lets the caller keep
+/// draining a paste burst before it redraws. Both exits report the ordinal the
+/// user has now seen, which becomes the session's read receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatExit {
-    Detached { last_seen_event_ordinal: u64 },
-    QuitDetached { last_seen_event_ordinal: u64 },
+pub enum ChatEventOutcome {
+    None,
+    Handled,
+    Back { last_seen_event_ordinal: u64 },
+    QuitDetach { last_seen_event_ordinal: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3107,6 +3113,13 @@ impl ChatRemoteSupervisor {
         self.results.try_recv()
     }
 
+    /// Waits for the next result. `None` means the worker is gone and no
+    /// further result can arrive, so the caller must stop awaiting this feed.
+    /// Cancel safe: an unfinished `recv` takes no message.
+    async fn recv(&mut self) -> Option<ChatRemoteResult> {
+        self.results.recv().await
+    }
+
     async fn take_finished(&mut self) -> Option<std::result::Result<(), tokio::task::JoinError>> {
         if !self
             .worker
@@ -3676,250 +3689,434 @@ fn spawn_other_session_poller(
     });
 }
 
-/// Run chat until the user returns to the dashboard or quits Hel. Either exit
-/// detaches the proxy and leaves the target worker alive.
-pub async fn run_chat(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    session: &mut ManagedSessionHandle,
-    bundle_id: &str,
-    recovery: Option<RecoveryContext>,
-    control: SessionManagerControl,
-    others: Vec<OtherSessionIdentity>,
-) -> Result<ChatExit> {
-    let view = session.view();
-    let needs_initial_sync = view.snapshot.is_none();
-    let mut chat = view.snapshot.map_or_else(
-        || {
-            ChatState::from_materialized(
-                &MaterializedSession::empty(session.session_id()),
-                &[],
-                &[],
-            )
-        },
-        |snapshot| {
-            ChatState::from_materialized(
-                &snapshot.materialized,
-                &snapshot.operational.config_options,
-                &snapshot.operational.available_commands,
-            )
-        },
-    );
-    chat.set_history_context(bundle_id);
-    let (chat_io_tx, mut chat_io_rx) = tokio::sync::mpsc::unbounded_channel::<ChatIoUpdate>();
-    {
-        let updates = chat_io_tx.clone();
-        let session_id = session.session_id().to_owned();
-        let bundle_id = bundle_id.to_owned();
-        tokio::spawn(async move {
-            let result = match tokio::task::spawn_blocking(move || {
-                crate::hel_database::search_prompts(
-                    &session_id,
-                    &bundle_id,
-                    HistoryScope::Project,
-                    "",
-                )
-                .map_err(|error| format!("{error:#}"))
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => Err(format!("history prefetch task failed: {error}")),
-            };
-            let _ = updates.send(ChatIoUpdate::ProjectHistoryPrefetched(result));
-        });
+/// Applies one session view to the chat. `false` means the session manager has
+/// stopped and can never send again, so its feed must not be awaited any more.
+///
+/// This runs whether or not the chat is on screen: a warm chat behind the
+/// session list stays as current as one the user is watching.
+fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -> bool {
+    let view = match view {
+        Ok(view) => view,
+        Err(error) => {
+            // Keep the transcript readable rather than tearing the dashboard
+            // down around a stopped manager.
+            state.set_notice(format!("connection lost: {error:#}"));
+            return false;
+        }
+    };
+    if let Some(snapshot) = view.snapshot {
+        state.apply_materialized(
+            &snapshot.materialized,
+            &snapshot.operational.config_options,
+            &snapshot.operational.available_commands,
+        );
     }
-    spawn_other_session_poller(control, others, chat_io_tx.clone());
-    if let Some(detail) = recovery
-        .as_ref()
-        .and_then(|recovery| recovery.session.last_checkpoint_error.as_deref())
-    {
-        chat.set_notice(format!("Recovery copy failed: {detail}"));
+    if let Some(error) = view.error {
+        state.set_notice(format!("connection lost: {error}"));
     }
-    let (voice_updates_tx, mut voice_updates_rx) =
-        tokio::sync::mpsc::unbounded_channel::<VoiceUpdate>();
-    let mut remote = ChatRemoteSupervisor::spawn(session.clone());
-    if needs_initial_sync {
-        chat.set_notice("Connecting to session relay…");
-        queue_chat_remote_operation(remote.operations(), ChatRemoteOperation::Sync, &mut chat);
-    }
-    let mut voice_cancel: Option<std::sync::mpsc::Sender<()>> = None;
-    let mut voice_prefix = String::new();
-    loop {
-        chat.recovery_busy = recovery.as_ref().is_some_and(RecoveryContext::is_busy);
-        while let Ok(result) = remote.try_recv() {
-            apply_chat_remote_result(&mut chat, result);
+    true
+}
+
+/// The user has left the chat. Reports how far they have now read and clears
+/// the interaction state that should not follow them back in.
+fn detach_chat(state: &mut ChatState, quit: bool) -> ChatEventOutcome {
+    let last_seen_event_ordinal = state.latest_seq();
+    state.reset_interaction();
+    if quit {
+        ChatEventOutcome::QuitDetach {
+            last_seen_event_ordinal,
         }
-        if let Some(result) = remote.take_finished().await {
-            if let Err(error) = result {
-                chat.set_notice(format!("Chat background worker failed: {error}"));
-            } else {
-                chat.set_notice("Chat background worker stopped unexpectedly");
-            }
-        }
-        while let Ok(update) = chat_io_rx.try_recv() {
-            apply_chat_io_update(&mut chat, update);
-            dispatch_history_search_request(&mut chat, &chat_io_tx);
-        }
-        while let Ok(update) = voice_updates_rx.try_recv() {
-            match update {
-                VoiceUpdate::Partial(text) => {
-                    chat.set_input(append_dictation(&voice_prefix, &text))
-                }
-                VoiceUpdate::Status(status) => chat.set_notice(status),
-                VoiceUpdate::Finished(result) => {
-                    chat.voice_active = false;
-                    voice_cancel = None;
-                    match result {
-                        Ok(text) => {
-                            chat.set_input(append_dictation(&voice_prefix, &text));
-                            chat.notice = None;
-                        }
-                        Err(error) => {
-                            chat.set_notice(crate::speech::dictation_error_message(&error))
-                        }
-                    }
-                }
-            }
-        }
-        terminal.draw(|frame| render(frame, &mut chat))?;
-        // Drain every queued input event before redrawing or syncing: a paste
-        // delivers thousands of key events, and one draw + worker sync per
-        // character would lag the trailing Enter by minutes.
-        let mut pending = event::poll(Duration::from_millis(150))?;
-        while pending {
-            let action = match event::read()? {
-                Event::Key(key) => Some(chat.handle_key(key)),
-                Event::Paste(pasted) => {
-                    chat.handle_paste(&pasted);
-                    None
-                }
-                Event::Mouse(mouse) => {
-                    chat.handle_mouse(mouse);
-                    None
-                }
-                _ => None,
-            };
-            if let Some(action) = action {
-                match action {
-                    ChatAction::None => {}
-                    ChatAction::Prompt(text) => {
-                        chat.set_notice("Sending prompt…");
-                        queue_chat_remote_operation(
-                            remote.operations(),
-                            ChatRemoteOperation::Prompt {
-                                command_id: new_command_id("prompt")?,
-                                text,
-                                session_id: session.session_id().to_owned(),
-                                bundle_id: bundle_id.to_owned(),
-                            },
-                            &mut chat,
-                        );
-                    }
-                    ChatAction::RemoveQueuedPrompt { id, text } => {
-                        chat.set_notice("Removing queued prompt…");
-                        queue_chat_remote_operation(
-                            remote.operations(),
-                            ChatRemoteOperation::RemoveQueuedPrompt {
-                                command_id: new_command_id("remove-prompt")?,
-                                id,
-                                text,
-                            },
-                            &mut chat,
-                        );
-                    }
-                    ChatAction::SetConfig { key, value } => {
-                        chat.set_notice("Sending configuration update…");
-                        queue_chat_remote_operation(
-                            remote.operations(),
-                            ChatRemoteOperation::SetConfig {
-                                command_id: new_command_id("set-config")?,
-                                key,
-                                value,
-                            },
-                            &mut chat,
-                        );
-                    }
-                    ChatAction::Cancel => {
-                        chat.set_notice("Sending cancellation request…");
-                        queue_chat_remote_operation(
-                            remote.operations(),
-                            ChatRemoteOperation::Cancel {
-                                command_id: new_command_id("cancel")?,
-                            },
-                            &mut chat,
-                        );
-                    }
-                    ChatAction::PasteFromClipboard => {
-                        let updates = chat_io_tx.clone();
-                        tokio::spawn(async move {
-                            let result = match tokio::task::spawn_blocking(|| {
-                                crate::hel_clipboard::read_text()
-                                    .map_err(|error| format!("{error:#}"))
-                            })
-                            .await
-                            {
-                                Ok(result) => result,
-                                Err(error) => Err(format!("clipboard task failed: {error}")),
-                            };
-                            let _ = updates.send(ChatIoUpdate::ClipboardText(result));
-                        });
-                    }
-                    ChatAction::ToggleVoice => {
-                        if let Some(cancel) = voice_cancel.as_ref() {
-                            let _ = cancel.send(());
-                            chat.set_notice("Stopping voice dictation…");
-                        } else if !crate::speech::voice_input_supported() {
-                            chat.set_notice(
-                            "Voice helper unavailable; install hel-voice-worker beside hel or set HEL_VOICE_WORKER",
-                        );
-                        } else {
-                            let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
-                            voice_cancel = Some(cancel_tx);
-                            voice_prefix.clone_from(&chat.input);
-                            chat.voice_active = true;
-                            chat.set_notice("Listening… press Alt-V again to stop");
-                            spawn_dictation(voice_updates_tx.clone(), cancel_rx);
-                        }
-                    }
-                    action @ (ChatAction::Back | ChatAction::QuitDetach) => {
-                        if let Some(cancel) = voice_cancel.take() {
-                            let _ = cancel.send(());
-                        }
-                        let last_seen_event_ordinal = chat.latest_seq();
-                        chat.reset_interaction();
-                        let exit = if action == ChatAction::QuitDetach {
-                            ChatExit::QuitDetached {
-                                last_seen_event_ordinal,
-                            }
-                        } else {
-                            ChatExit::Detached {
-                                last_seen_event_ordinal,
-                            }
-                        };
-                        return Ok(exit);
-                    }
-                }
-            }
-            dispatch_history_search_request(&mut chat, &chat_io_tx);
-            pending = event::poll(Duration::from_millis(0))?;
-        }
-        while session.has_changed()? {
-            let view = session.changed().await?;
-            if let Some(snapshot) = view.snapshot {
-                chat.apply_materialized(
-                    &snapshot.materialized,
-                    &snapshot.operational.config_options,
-                    &snapshot.operational.available_commands,
-                );
-            }
-            if let Some(error) = view.error {
-                chat.set_notice(format!("connection lost: {error}"));
-            }
+    } else {
+        ChatEventOutcome::Back {
+            last_seen_event_ordinal,
         }
     }
 }
 
-pub fn render(frame: &mut Frame, chat: &mut ChatState) {
+/// A chat view and every background feed behind it.
+///
+/// The dashboard owns one of these while a session is open and keeps it after
+/// the user returns to the session list, so the view stays current off screen
+/// and reopening the same session is only a redraw. Dropping it detaches the
+/// proxy and leaves the target worker alive.
+pub struct ActiveChat {
+    state: ChatState,
+    session: ManagedSessionHandle,
+    bundle_id: String,
+    recovery: Option<RecoveryContext>,
+    remote: ChatRemoteSupervisor,
+    /// Held so the receiver never reports the feed closed, and so spawned
+    /// clipboard and history tasks have somewhere to report.
+    chat_io_tx: tokio::sync::mpsc::UnboundedSender<ChatIoUpdate>,
+    chat_io_rx: tokio::sync::mpsc::UnboundedReceiver<ChatIoUpdate>,
+    /// Held for the same reason, and cloned into each dictation thread.
+    voice_updates_tx: tokio::sync::mpsc::UnboundedSender<VoiceUpdate>,
+    voice_updates_rx: tokio::sync::mpsc::UnboundedReceiver<VoiceUpdate>,
+    voice_cancel: Option<std::sync::mpsc::Sender<()>>,
+    voice_prefix: String,
+    /// A closed feed reports `None` for ever, which would leave its arm
+    /// permanently ready. Each flag retires its own arm instead.
+    remote_open: bool,
+    session_open: bool,
+}
+
+impl ActiveChat {
+    /// Builds the view from the session's current snapshot and starts its
+    /// background feeds. Cheap enough to call from the dashboard loop: every
+    /// slow step is a spawned task.
+    pub fn open(
+        session: ManagedSessionHandle,
+        bundle_id: &str,
+        recovery: Option<RecoveryContext>,
+        control: SessionManagerControl,
+        others: Vec<OtherSessionIdentity>,
+    ) -> Self {
+        let view = session.view();
+        let needs_initial_sync = view.snapshot.is_none();
+        let mut state = view.snapshot.map_or_else(
+            || {
+                ChatState::from_materialized(
+                    &MaterializedSession::empty(session.session_id()),
+                    &[],
+                    &[],
+                )
+            },
+            |snapshot| {
+                ChatState::from_materialized(
+                    &snapshot.materialized,
+                    &snapshot.operational.config_options,
+                    &snapshot.operational.available_commands,
+                )
+            },
+        );
+        state.set_history_context(bundle_id);
+        let (chat_io_tx, chat_io_rx) = tokio::sync::mpsc::unbounded_channel::<ChatIoUpdate>();
+        {
+            let updates = chat_io_tx.clone();
+            let session_id = session.session_id().to_owned();
+            let bundle_id = bundle_id.to_owned();
+            tokio::spawn(async move {
+                let result = match tokio::task::spawn_blocking(move || {
+                    crate::hel_database::search_prompts(
+                        &session_id,
+                        &bundle_id,
+                        HistoryScope::Project,
+                        "",
+                    )
+                    .map_err(|error| format!("{error:#}"))
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(format!("history prefetch task failed: {error}")),
+                };
+                let _ = updates.send(ChatIoUpdate::ProjectHistoryPrefetched(result));
+            });
+        }
+        spawn_other_session_poller(control, others, chat_io_tx.clone());
+        if let Some(detail) = recovery
+            .as_ref()
+            .and_then(|recovery| recovery.session.last_checkpoint_error.as_deref())
+        {
+            state.set_notice(format!("Recovery copy failed: {detail}"));
+        }
+        let (voice_updates_tx, voice_updates_rx) =
+            tokio::sync::mpsc::unbounded_channel::<VoiceUpdate>();
+        let remote = ChatRemoteSupervisor::spawn(session.clone());
+        if needs_initial_sync {
+            state.set_notice("Connecting to session relay…");
+            queue_chat_remote_operation(remote.operations(), ChatRemoteOperation::Sync, &mut state);
+        }
+        Self {
+            state,
+            session,
+            bundle_id: bundle_id.to_owned(),
+            recovery,
+            remote,
+            chat_io_tx,
+            chat_io_rx,
+            voice_updates_tx,
+            voice_updates_rx,
+            voice_cancel: None,
+            voice_prefix: String::new(),
+            remote_open: true,
+            session_open: true,
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.session.session_id()
+    }
+
+    /// Waits for the next background message, applies it, and drains whatever
+    /// queued behind it, so one wakeup costs one redraw.
+    ///
+    /// `None` means no chat is warm, and the feed never wakes the caller. Cancel
+    /// safe: every arm is a cancel-safe receive, and a message is applied only
+    /// once its arm has won.
+    pub async fn pump(chat: Option<&mut Self>) {
+        let Some(chat) = chat else {
+            return std::future::pending().await;
+        };
+        enum Wakeup {
+            Remote(Option<ChatRemoteResult>),
+            Io(ChatIoUpdate),
+            Voice(VoiceUpdate),
+            // Boxed: a view carries the whole session snapshot, and the enum
+            // is built on every wakeup.
+            View(Box<Result<ManagedSessionView>>),
+        }
+        // The senders for the I/O and voice feeds live in this struct, so those
+        // receivers cannot report a closed channel and need no retirement flag.
+        let wakeup = tokio::select! {
+            result = chat.remote.recv(), if chat.remote_open => Wakeup::Remote(result),
+            Some(update) = chat.chat_io_rx.recv() => Wakeup::Io(update),
+            Some(update) = chat.voice_updates_rx.recv() => Wakeup::Voice(update),
+            view = chat.session.changed(), if chat.session_open => Wakeup::View(Box::new(view)),
+        };
+        match wakeup {
+            Wakeup::Remote(Some(result)) => apply_chat_remote_result(&mut chat.state, result),
+            Wakeup::Remote(None) => chat.remote_open = false,
+            Wakeup::Io(update) => chat.apply_io_update(update),
+            Wakeup::Voice(update) => chat.apply_voice_update(update),
+            Wakeup::View(view) => chat.apply_session_view(*view),
+        }
+        chat.drain().await;
+        chat.report_worker_death().await;
+    }
+
+    async fn drain(&mut self) {
+        while let Ok(result) = self.remote.try_recv() {
+            apply_chat_remote_result(&mut self.state, result);
+        }
+        while let Ok(update) = self.chat_io_rx.try_recv() {
+            self.apply_io_update(update);
+        }
+        while let Ok(update) = self.voice_updates_rx.try_recv() {
+            self.apply_voice_update(update);
+        }
+        while self.session_open && self.session.has_changed().unwrap_or(false) {
+            let view = self.session.changed().await;
+            self.apply_session_view(view);
+        }
+    }
+
+    /// Reports a background worker that stopped on its own. Cheap enough to
+    /// check on every wakeup: it only joins a handle that already finished.
+    async fn report_worker_death(&mut self) {
+        let Some(result) = self.remote.take_finished().await else {
+            return;
+        };
+        if let Err(error) = result {
+            self.state
+                .set_notice(format!("Chat background worker failed: {error}"));
+        } else {
+            self.state
+                .set_notice("Chat background worker stopped unexpectedly");
+        }
+    }
+
+    fn apply_io_update(&mut self, update: ChatIoUpdate) {
+        apply_chat_io_update(&mut self.state, update);
+        dispatch_history_search_request(&mut self.state, &self.chat_io_tx);
+    }
+
+    fn apply_voice_update(&mut self, update: VoiceUpdate) {
+        match update {
+            VoiceUpdate::Partial(text) => self
+                .state
+                .set_input(append_dictation(&self.voice_prefix, &text)),
+            VoiceUpdate::Status(status) => self.state.set_notice(status),
+            VoiceUpdate::Finished(result) => {
+                self.state.voice_active = false;
+                self.voice_cancel = None;
+                match result {
+                    Ok(text) => {
+                        self.state
+                            .set_input(append_dictation(&self.voice_prefix, &text));
+                        self.state.notice = None;
+                    }
+                    Err(error) => self
+                        .state
+                        .set_notice(crate::speech::dictation_error_message(&error)),
+                }
+            }
+        }
+    }
+
+    fn apply_session_view(&mut self, view: Result<ManagedSessionView>) {
+        self.session_open = apply_session_view(&mut self.state, view);
+    }
+
+    /// Applies one terminal event and reports what it asked for.
+    pub fn handle_event(&mut self, event: Event) -> ChatEventOutcome {
+        let action = match event {
+            Event::Key(key) => self.state.handle_key(key),
+            Event::Paste(pasted) => {
+                self.state.handle_paste(&pasted);
+                ChatAction::None
+            }
+            Event::Mouse(mouse) => {
+                self.state.handle_mouse(mouse);
+                ChatAction::None
+            }
+            // Resize and focus changes only need the redraw.
+            _ => ChatAction::None,
+        };
+        let outcome = self.dispatch(action);
+        dispatch_history_search_request(&mut self.state, &self.chat_io_tx);
+        outcome
+    }
+
+    /// A command ID for one remote operation. `None` means the system random
+    /// source failed, which leaves the command unsent rather than closing the
+    /// view the user is reading.
+    fn command_id(&mut self, prefix: &str) -> Option<String> {
+        match new_command_id(prefix) {
+            Ok(command_id) => Some(command_id),
+            Err(error) => {
+                self.state
+                    .set_notice(format!("Could not identify the command: {error:#}"));
+                None
+            }
+        }
+    }
+
+    fn dispatch(&mut self, action: ChatAction) -> ChatEventOutcome {
+        match action {
+            ChatAction::None => return ChatEventOutcome::None,
+            ChatAction::Prompt(text) => {
+                let Some(command_id) = self.command_id("prompt") else {
+                    restore_unsent_input(&mut self.state, &text);
+                    return ChatEventOutcome::Handled;
+                };
+                self.state.set_notice("Sending prompt…");
+                queue_chat_remote_operation(
+                    self.remote.operations(),
+                    ChatRemoteOperation::Prompt {
+                        command_id,
+                        text,
+                        session_id: self.session.session_id().to_owned(),
+                        bundle_id: self.bundle_id.clone(),
+                    },
+                    &mut self.state,
+                );
+            }
+            ChatAction::RemoveQueuedPrompt { id, text } => {
+                let Some(command_id) = self.command_id("remove-prompt") else {
+                    return ChatEventOutcome::Handled;
+                };
+                self.state.set_notice("Removing queued prompt…");
+                queue_chat_remote_operation(
+                    self.remote.operations(),
+                    ChatRemoteOperation::RemoveQueuedPrompt {
+                        command_id,
+                        id,
+                        text,
+                    },
+                    &mut self.state,
+                );
+            }
+            ChatAction::SetConfig { key, value } => {
+                let Some(command_id) = self.command_id("set-config") else {
+                    restore_unsent_input(&mut self.state, &format!("/{key} {value}"));
+                    return ChatEventOutcome::Handled;
+                };
+                self.state.set_notice("Sending configuration update…");
+                queue_chat_remote_operation(
+                    self.remote.operations(),
+                    ChatRemoteOperation::SetConfig {
+                        command_id,
+                        key,
+                        value,
+                    },
+                    &mut self.state,
+                );
+            }
+            ChatAction::Cancel => {
+                let Some(command_id) = self.command_id("cancel") else {
+                    return ChatEventOutcome::Handled;
+                };
+                self.state.set_notice("Sending cancellation request…");
+                queue_chat_remote_operation(
+                    self.remote.operations(),
+                    ChatRemoteOperation::Cancel { command_id },
+                    &mut self.state,
+                );
+            }
+            ChatAction::PasteFromClipboard => {
+                let updates = self.chat_io_tx.clone();
+                tokio::spawn(async move {
+                    let result = match tokio::task::spawn_blocking(|| {
+                        crate::hel_clipboard::read_text().map_err(|error| format!("{error:#}"))
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => Err(format!("clipboard task failed: {error}")),
+                    };
+                    let _ = updates.send(ChatIoUpdate::ClipboardText(result));
+                });
+            }
+            ChatAction::ToggleVoice => {
+                if let Some(cancel) = self.voice_cancel.as_ref() {
+                    let _ = cancel.send(());
+                    self.state.set_notice("Stopping voice dictation…");
+                } else if !crate::speech::voice_input_supported() {
+                    self.state.set_notice(
+                        "Voice helper unavailable; install hel-voice-worker beside hel or set HEL_VOICE_WORKER",
+                    );
+                } else {
+                    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+                    self.voice_cancel = Some(cancel_tx);
+                    self.voice_prefix.clone_from(&self.state.input);
+                    self.state.voice_active = true;
+                    self.state
+                        .set_notice("Listening… press Alt-V again to stop");
+                    spawn_dictation(self.voice_updates_tx.clone(), cancel_rx);
+                }
+            }
+            action @ (ChatAction::Back | ChatAction::QuitDetach) => {
+                self.cancel_dictation();
+                return detach_chat(&mut self.state, action == ChatAction::QuitDetach);
+            }
+        }
+        ChatEventOutcome::Handled
+    }
+
+    /// Stops any dictation thread. The thread reports `Finished`, which clears
+    /// the view's voice state, so this only asks it to stop.
+    fn cancel_dictation(&mut self) {
+        if let Some(cancel) = self.voice_cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+
+    /// Draws the view. The recovery flag is read here rather than tracked,
+    /// because the checkpoint gate moves without telling the dashboard.
+    pub fn draw(&mut self, frame: &mut Frame) {
+        self.state.recovery_busy = self.recovery_busy();
+        render(frame, &mut self.state);
+    }
+
+    fn recovery_busy(&self) -> bool {
+        self.recovery.as_ref().is_some_and(RecoveryContext::is_busy)
+    }
+
+    /// Whether the checkpoint title on screen is stale. The chat has no other
+    /// time-driven text, so this is what a clock tick has to redraw for.
+    pub fn recovery_title_is_stale(&self) -> bool {
+        self.recovery_busy() != self.state.recovery_busy
+    }
+}
+
+impl Drop for ActiveChat {
+    fn drop(&mut self) {
+        self.cancel_dictation();
+    }
+}
+
+fn render(frame: &mut Frame, chat: &mut ChatState) {
     let inner = frame.area();
     let activity_header = activity_header_line(&chat.other_sessions);
     let header_rows = u16::from(activity_header.is_some());
@@ -4775,6 +4972,7 @@ fn line_is_empty(line: &Line<'_>) -> bool {
 mod tests {
     use super::*;
     use crate::hel_worker::{ActivePrompt, WorkerSnapshot};
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     fn snapshot() -> WorkerSnapshot {
@@ -4886,6 +5084,102 @@ mod tests {
         assert_eq!(chat.anchor, TranscriptAnchor::Bottom);
         assert!(chat.notice.is_none());
         assert!(!chat.voice_active);
+    }
+
+    fn managed_view(session: MaterializedSession) -> ManagedSessionView {
+        let session_id = session.session_id.clone();
+        let latest_ordinal = session.applied_event_ordinal;
+        let latest_digest = session.applied_event_digest.clone();
+        ManagedSessionView {
+            snapshot: Some(crate::hel_session_manager::ManagedSessionSnapshot {
+                materialized: session,
+                latest_auth_failure_ordinal: None,
+                operational: crate::hel_worker::RelayOperationalState {
+                    session_id,
+                    execution: crate::hel_worker::RelayExecutionState::Idle,
+                    latest_ordinal,
+                    latest_digest: latest_digest.clone(),
+                    acknowledged_through: latest_ordinal,
+                    acknowledged_digest: latest_digest,
+                    recovery_floor_ordinal: 0,
+                    recovery_floor_digest: RELAY_EVENT_GENESIS_DIGEST.into(),
+                    native_session_id: None,
+                    agent_capabilities: None,
+                    agent_info: None,
+                    config_options: Vec::new(),
+                    available_commands: Vec::new(),
+                    config: BTreeMap::new(),
+                    active_prompt: None,
+                    queued_prompts: Vec::new(),
+                    checkpoint_barrier: None,
+                    checkpoint_ready: None,
+                },
+            }),
+            connected: true,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn an_off_screen_chat_follows_the_session_view() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        let mut session = MaterializedSession::empty("session-warm");
+        session.applied_event_ordinal = 5;
+        session.applied_event_digest = "a".repeat(64);
+        session.transcript = vec![agent_transcript_item("first", 5)];
+
+        assert!(apply_session_view(
+            &mut chat,
+            Ok(managed_view(session.clone()))
+        ));
+        assert_eq!(chat.latest_seq(), 5);
+        assert_eq!(chat.entries.len(), 1);
+
+        session.applied_event_ordinal = 8;
+        session.transcript.push(agent_transcript_item("second", 8));
+        assert!(apply_session_view(&mut chat, Ok(managed_view(session))));
+        assert_eq!(chat.latest_seq(), 8);
+        assert_eq!(chat.entries.len(), 2);
+    }
+
+    #[test]
+    fn a_stopped_session_manager_retires_its_feed_and_says_so() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+
+        let open = apply_session_view(&mut chat, Err(anyhow::anyhow!("session manager stopped")));
+
+        assert!(!open);
+        assert_eq!(
+            chat.notice.as_deref(),
+            Some("connection lost: session manager stopped")
+        );
+    }
+
+    #[test]
+    fn leaving_the_chat_reports_the_ordinal_the_user_has_read() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        let mut session = MaterializedSession::empty("session-read");
+        session.applied_event_ordinal = 12;
+        session.transcript = vec![agent_transcript_item("first", 12)];
+        apply_session_view(&mut chat, Ok(managed_view(session)));
+        chat.queued_prompts.push_back(queued("queued-1", "queued"));
+
+        assert_eq!(
+            detach_chat(&mut chat, false),
+            ChatEventOutcome::Back {
+                last_seen_event_ordinal: 12
+            }
+        );
+        // The transcript stays warm for the next visit; the interaction state
+        // that belonged to the visit does not.
+        assert_eq!(chat.entries.len(), 1);
+        assert!(chat.queued_prompts.is_empty());
+        assert_eq!(
+            detach_chat(&mut chat, true),
+            ChatEventOutcome::QuitDetach {
+                last_seen_event_ordinal: 12
+            }
+        );
     }
 
     #[test]
