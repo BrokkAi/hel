@@ -44,3 +44,6 @@ target*/
 docs/.astro/
 docs/dist/
 docs/node_modules/
+
+# Generated at build time from docs/PODMAN.md; see docs/scripts/sync-podman.mjs
+docs/src/content/docs/podman.md

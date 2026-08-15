@@ -167,10 +167,16 @@ destination = "private-local"
 [targets.podman]
 kind = "local-podman"
 image = "ghcr.io/your-org/agent-dev:latest"
+# Optional. Selects the image platform and the matching hel worker architecture.
+# platform = "linux/amd64"
 # Optional template defaults used by non-interactive callers. The dashboard's
 # target step can override these for one launch without changing the image.
 cpus = "8"
 memory = "32g"
+
+# Optional. Extra container environment variables, merged in at container start.
+# [targets.podman.environment]
+# RUSTFLAGS = "-D warnings"
 
 # Run in an isolated local Git worktree. Selecting a primary checkout creates
 # .hel/worktrees/<session-id>; selecting an existing linked worktree uses it in
@@ -365,5 +371,17 @@ force-destroy is the data-loss escape hatch.
 Relay protocol v1 and recovery-archive schema v2 are the compatibility floor
 for this design. Hel rejects the retired worker protocol and older checkpoint
 schemas instead of attempting a partial conversion.
+
+### Recovering orphaned containers
+
+A crash of Hel or its host can leave a managed container running but
+untracked. `hel recover scan [--json]` lists containers carrying Hel's
+`dev.hel.managed` label, scoped to configured targets, that aren't in
+Hel's own state. `hel recover adopt --session <id> --target <id> [--profile
+<id>] [--bundle <id>]` reconnects one as a tracked session; `--profile` and
+`--bundle` are only required for containers created before Hel recorded
+ownership markers. `hel recover destroy --session <id> --target <id>
+--confirm <id>` removes an orphan without adopting it; `--confirm` must
+repeat the session ID exactly.
 
 Hel is licensed under `GPL-3.0-only`.

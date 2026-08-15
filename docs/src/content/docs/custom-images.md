@@ -1,0 +1,96 @@
+---
+title: Custom container images
+description: What a container image must provide to work as a hel local-podman, apple-container, or ssh-podman target.
+---
+
+hel can run a session in any container image that meets a small contract.
+`containers/Containerfile.agent-dev` is the reference image and satisfies all
+of it; start there if you're building your own.
+
+## The entrypoint
+
+hel starts a session's container detached, running `sleep infinity` as its
+command, and runs every later command — the worker upload, Git, the harness,
+and the ACP bridge — with `exec` against that running container. Your image
+needs a POSIX shell and a `sleep` binary on `PATH`. It does not need any
+particular process supervisor or init system beyond that.
+
+## Git and GitHub CLI
+
+If `git` or `gh` is missing, hel installs both itself the first time a
+session needs them, using whichever of `apt-get`, `dnf`, `yum`, or `apk` it
+finds, and configures `gh auth git-credential` as the HTTPS credential helper
+for `github.com` and `gist.github.com`. That auto-install needs root or
+passwordless `sudo` inside the container, plus one of those package managers.
+
+If your image runs as a non-root user with no `sudo`, or uses a different
+package manager, bake `git` and `gh` into the image yourself. Either way,
+`gh` is what lets HTTPS Git pushes work using the `GH_TOKEN` hel injects into
+the container (see [Container targets](/containers/)).
+
+## ACP bridges
+
+For each harness, hel first looks for an image-baked bridge binary on
+`PATH`: `codex-acp`, `claude-agent-acp`, or `kimi`. If it doesn't find one, it
+falls back to running the bridge with `npx -y`, pinned to hel's pinned
+fallback versions. That fallback needs `npx`; if it's missing, hel tries to
+install Node using the same package-manager detection it uses for Git.
+
+Baking the bridges in, the way the reference image does, avoids that
+per-session install cost and pins the exact bridge version through the image
+instead of through hel's fallback.
+
+## Workspace and hel's own files
+
+Sessions work under `/workspace`. Separately, hel writes its own session
+relay binary and a staged, allowlisted copy of the harness profile
+(credentials, config, skills, and similar) under `/var/lib/hel/` inside the
+container — for example `/var/lib/hel/workers/<session-id>` and
+`/var/lib/hel/profiles/<session-id>`.
+
+hel creates these directories itself with `mkdir -p` and writes into them
+with plain file copies; it does not pass any specific user to `podman exec`,
+so those commands run as whatever user the image's `USER` (or its absence)
+puts them in. A rootless Podman container defaults to root inside when no
+`USER` is set, which can write anywhere. If your image sets a non-root
+`USER`, as the reference image does with its `hel` user, that user needs
+write access to `/workspace` and `/var/lib/hel` — the reference image grants
+it by creating both directories and `chown`-ing them to `hel:hel` before
+switching to that user.
+
+## Resource metrics
+
+hel samples `/sys/fs/cgroup` (`memory.current`, `memory.max`,
+`memory.swap.current`, `memory.swap.max`, `cpu.stat`, `cpu.max`) inside the
+container to drive the CPU and memory numbers in the resource pane. This
+needs cgroup v2. If those files aren't readable, the sampling command
+fails, and hel silently drops that failed sample instead of raising an
+error — the session keeps running normally, but the resource pane won't show
+current numbers for it. Nothing about running the container or the session
+itself depends on cgroup v2 being present.
+
+## What you can't override
+
+The container-template configuration exposes exactly five keys: `image`,
+`platform`, `cpus`, `memory`, and `environment`. There's no configuration key
+for arbitrary extra `podman run`/`container run` arguments. hel derives the
+rest of the run command itself — the generated container name and the
+`dev.hel.session` / `dev.hel.managed` ownership labels it uses to find and
+recover its own containers later — and validates that nothing can override
+those before starting a container.
+
+## Example target
+
+```toml
+[targets.podman]
+kind = "local-podman"
+image = "localhost/hel/agent-dev:latest"
+# Selects the image platform and the matching hel worker architecture.
+platform = "linux/amd64"
+cpus = "8"
+memory = "32g"
+
+[targets.podman.environment]
+# Extra container environment variables, merged in at container start.
+RUSTFLAGS = "-D warnings"
+```
