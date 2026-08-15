@@ -47,11 +47,13 @@ pub fn project_relay_event(
 }
 
 /// Apply a mutation to the actor's sole in-memory projection after the same
-/// mutation and frontier have committed atomically in SQLite.
+/// mutation and frontier have committed atomically in SQLite. The mutation is
+/// consumed so its committed values move into the projection instead of being
+/// copied a second time.
 pub fn apply_committed_projection_event(
     current: &mut MaterializedSession,
     event: &RelayEvent,
-    mutation: &MaterializedSessionMutation,
+    mutation: MaterializedSessionMutation,
 ) -> Result<()> {
     validate_relay_event(
         current.applied_event_ordinal,
@@ -61,13 +63,13 @@ pub fn apply_committed_projection_event(
     if let Some(execution) = mutation.execution {
         current.execution = execution;
     }
-    if let Some(title) = &mutation.session_title {
-        current.session_title.clone_from(title);
+    if let Some(title) = mutation.session_title {
+        current.session_title = title;
     }
-    if let Some(configuration) = &mutation.configuration {
-        current.configuration.clone_from(configuration);
+    if let Some(configuration) = mutation.configuration {
+        current.configuration = configuration;
     }
-    for item_mutation in &mutation.transcript {
+    for item_mutation in mutation.transcript {
         match item_mutation {
             TranscriptMutation::Upsert(item) => {
                 item.validate(event.ordinal)?;
@@ -106,23 +108,23 @@ pub fn apply_committed_projection_event(
                     // it; otherwise publish a fresh item so snapshots taken
                     // earlier keep the value they were given.
                     if let Some(owned) = Arc::get_mut(existing) {
-                        owned.clone_from(item);
+                        *owned = item;
                     } else {
-                        *existing = Arc::new(item.clone());
+                        *existing = Arc::new(item);
                     }
                 } else {
-                    current.transcript.push(Arc::new(item.clone()));
+                    current.transcript.push(Arc::new(item));
                 }
             }
             TranscriptMutation::Remove { stable_id } => {
                 current
                     .transcript
-                    .retain(|item| item.stable_id != *stable_id);
+                    .retain(|item| item.stable_id != stable_id);
             }
         }
     }
-    if let Some(queued_prompts) = &mutation.queued_prompts {
-        current.queued_prompts.clone_from(queued_prompts);
+    if let Some(queued_prompts) = mutation.queued_prompts {
+        current.queued_prompts = queued_prompts;
     }
     if let Some(activity) = mutation.last_activity_at_ms {
         current.last_activity_at_ms = Some(
@@ -754,7 +756,7 @@ mod tests {
 
     fn apply(session: &mut MaterializedSession, event: RelayEvent) {
         let projected = project_relay_event(session, &event).unwrap();
-        apply_committed_projection_event(session, &event, &projected.mutation).unwrap();
+        apply_committed_projection_event(session, &event, projected.mutation).unwrap();
     }
 
     fn apply_observation(session: &mut MaterializedSession, observation: RelayObservation) {
@@ -1206,7 +1208,7 @@ mod tests {
         assert!(projected.mutation.configuration.is_none());
         assert!(projected.mutation.queued_prompts.is_none());
         assert_eq!(session.transcript.len(), 10_000);
-        apply_committed_projection_event(&mut session, &next, &projected.mutation).unwrap();
+        apply_committed_projection_event(&mut session, &next, projected.mutation).unwrap();
         assert_eq!(session.transcript.len(), 10_001);
     }
 

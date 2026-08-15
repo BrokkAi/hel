@@ -3822,19 +3822,40 @@ fn render_adaptive_dashboard(
     dashboard: &mut DashboardState,
 ) {
     let preview_width = inner.width.saturating_sub(4);
-    // A provisional pass sizes the rows; the authoritative pass below runs once
-    // the pane height, and with it the selected session's line budget, is known.
-    let full_active_previews =
-        prepare_active_previews(dashboard, preview_width, SELECTED_TRANSCRIPT_LINES).previews;
-    let (active_count, archived_count) = {
-        let (active, archived) = partition_sessions(
-            dashboard.state.sessions.values(),
-            &dashboard.session_details,
-            dashboard.session_order,
-        );
-        (active.len(), archived.len())
-    };
-    let active_row_heights = full_active_previews
+    // One ordering for the whole frame: the panes, the previews, and the row
+    // widgets all read this partition.
+    let (active, archived) = partition_sessions(
+        dashboard.state.sessions.values(),
+        &dashboard.session_details,
+        dashboard.session_order,
+    );
+    let (active_count, archived_count) = (active.len(), archived.len());
+    let selected_active = (dashboard.focus == Focus::Active)
+        .then_some(dashboard.session_index)
+        .filter(|index| *index < active_count);
+    // Only the selected preview scrolls; moving the selection snaps the one
+    // left behind back to its live tail.
+    let selected_id = selected_active.map(|index| active[index].id.clone());
+    if dashboard.preview_scroll_session != selected_id {
+        dashboard.preview_scroll_session = selected_id;
+        dashboard.preview_scroll = 0;
+    }
+    // Row heights need the previews, and the selected session's line budget
+    // needs the allocated pane height. Every unselected preview is the same in
+    // both passes, so the transcript tails are walked once here and only the
+    // selected preview is rebuilt below when the pane came up short.
+    let mut active_previews = prepare_active_previews(
+        &active,
+        &mut dashboard.session_details,
+        PreviewRequest {
+            width: preview_width,
+            selected: selected_active,
+            scroll: dashboard.preview_scroll,
+            selected_lines: SELECTED_TRANSCRIPT_LINES,
+        },
+    );
+    let active_row_heights = active_previews
+        .previews
         .iter()
         .map(|preview| preview.len() as u16 + 1)
         .collect::<Vec<_>>();
@@ -3905,15 +3926,33 @@ fn render_adaptive_dashboard(
             .saturating_sub(SESSION_TABLE_CHROME_HEIGHT + 1),
     )
     .min(SELECTED_TRANSCRIPT_LINES);
-    let active_previews = prepare_active_previews(dashboard, preview_width, selected_lines);
+    // The sizing pass gave the selected preview the full line budget; redo just
+    // that row when the allocated pane grants it fewer lines, so its scroll is
+    // clamped against the height it actually renders at.
+    if selected_lines != SELECTED_TRANSCRIPT_LINES
+        && let Some(index) = selected_active
+    {
+        let (preview, applied) = active_transcript_tail(
+            dashboard.session_details.get_mut(&active[index].id),
+            preview_width,
+            selected_lines,
+            dashboard.preview_scroll,
+        );
+        active_previews.previews[index] = preview;
+        active_previews.applied_scroll = applied;
+    }
     dashboard.preview_scroll = active_previews.applied_scroll;
-    render_sessions(
+    if let Some(preview_area) = render_sessions(
         frame,
         panes[0],
         panes[1],
         dashboard,
+        &active,
+        &archived,
         &active_previews.previews,
-    );
+    ) {
+        dashboard.selected_preview_area = Some(preview_area);
+    }
     render_capacity(frame, panes[2], dashboard);
     render_quotas(frame, panes[3], dashboard);
     render_footer(frame, fixed[2], dashboard);
@@ -3960,42 +3999,33 @@ fn active_pane_height(row_heights: &[u16], rows: usize) -> u16 {
         .saturating_add(spacers)
 }
 
+/// What one frame asks of the active previews: the width they wrap to, which
+/// row is selected, how far that row's preview is scrolled, and the line budget
+/// the selected row may use.
+struct PreviewRequest {
+    width: u16,
+    selected: Option<usize>,
+    scroll: usize,
+    selected_lines: usize,
+}
+
 fn prepare_active_previews(
-    dashboard: &mut DashboardState,
-    preview_width: u16,
-    maximum_selected_lines: usize,
+    active: &[&SessionRecord],
+    session_details: &mut BTreeMap<String, SessionDetail>,
+    request: PreviewRequest,
 ) -> ActivePreviews {
-    let active_ids = partition_sessions(
-        dashboard.state.sessions.values(),
-        &dashboard.session_details,
-        dashboard.session_order,
-    )
-    .0
-    .into_iter()
-    .map(|session| session.id.clone())
-    .collect::<Vec<_>>();
-    let selected_active = (dashboard.focus == Focus::Active)
-        .then_some(dashboard.session_index)
-        .filter(|index| *index < active_ids.len());
-    // Only the selected preview scrolls; moving the selection snaps the one
-    // left behind back to its live tail.
-    let selected_id = selected_active.map(|index| active_ids[index].clone());
-    if dashboard.preview_scroll_session != selected_id {
-        dashboard.preview_scroll_session = selected_id;
-        dashboard.preview_scroll = 0;
-    }
-    let mut previews = Vec::with_capacity(active_ids.len());
+    let mut previews = Vec::with_capacity(active.len());
     let mut applied_scroll = 0;
-    for (index, session_id) in active_ids.iter().enumerate() {
-        let selected = selected_active == Some(index);
+    for (index, session) in active.iter().enumerate() {
+        let selected = request.selected == Some(index);
         let (maximum_lines, scroll) = if selected {
-            (maximum_selected_lines, dashboard.preview_scroll)
+            (request.selected_lines, request.scroll)
         } else {
             (ACTIVE_MESSAGE_LINES, 0)
         };
-        let detail = dashboard.session_details.get_mut(session_id);
+        let detail = session_details.get_mut(&session.id);
         let (preview, applied) =
-            active_transcript_tail(detail, preview_width, maximum_lines, scroll);
+            active_transcript_tail(detail, request.width, maximum_lines, scroll);
         if selected {
             applied_scroll = applied;
         }
@@ -4373,18 +4403,17 @@ fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) 
     );
 }
 
+/// Draws the Active and Paused panes and reports the selected session's
+/// preview hitbox, if one was drawn.
 fn render_sessions(
     frame: &mut Frame,
     active_area: Rect,
     archived_area: Rect,
-    dashboard: &mut DashboardState,
+    dashboard: &DashboardState,
+    active: &[&SessionRecord],
+    archived: &[&SessionRecord],
     active_previews: &[Vec<Line<'static>>],
-) {
-    let (active, archived) = partition_sessions(
-        dashboard.state.sessions.values(),
-        &dashboard.session_details,
-        dashboard.session_order,
-    );
+) -> Option<Rect> {
     let now_epoch_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -4429,6 +4458,7 @@ fn render_sessions(
     let active_offset = active_state.offset();
     let mut row_y = active_area.y + SESSION_TABLE_CHROME_HEIGHT;
     let mut visible_sessions = 0;
+    let mut selected_preview_area = None;
     for (index, _session) in active.iter().enumerate().skip(active_offset) {
         let preview = &active_previews[index];
         let spacer = u16::from(index > 0);
@@ -4467,7 +4497,7 @@ fn render_sessions(
             let preview_area =
                 Rect::new(active_area.x + 3, detail_y, preview_width, preview_height);
             if selected {
-                dashboard.selected_preview_area = Some(preview_area);
+                selected_preview_area = Some(preview_area);
             }
             frame.render_widget(Paragraph::new(preview.clone()), preview_area);
         }
@@ -4525,6 +4555,7 @@ fn render_sessions(
                 .saturating_sub(SESSION_TABLE_CHROME_HEIGHT),
         ),
     );
+    selected_preview_area
 }
 
 fn render_session_scrollbar(
@@ -8478,6 +8509,133 @@ mod tests {
         assert_eq!(
             dashboard.preview_scroll, clamped,
             "scrolling past the oldest row is clamped"
+        );
+    }
+
+    /// Active sessions whose previews differ in length, plus paused sessions,
+    /// capacity rows, and quota rows, so every pane contributes to the layout.
+    fn mixed_fleet_dashboard() -> DashboardState {
+        let sessions = (0..4)
+            .map(|index| {
+                let mut session = archived_session();
+                session.id = format!("session-{index}");
+                if index < 2 {
+                    session.state = SessionState::Running;
+                }
+                (session.id.clone(), session)
+            })
+            .collect();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        apply_materialized_transcript_for(&mut dashboard, "session-0", numbered_conversation(14));
+        apply_materialized_transcript_for(&mut dashboard, "session-1", numbered_conversation(1));
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        dashboard
+    }
+
+    /// Pane rectangles, the selected preview hitbox, and the row each session
+    /// summary and preview line lands on. Volatile text (turn clocks, message
+    /// timestamps) is reduced to a tag so the fingerprint is pure geometry.
+    fn layout_fingerprint(terminal: &Terminal<TestBackend>, dashboard: &DashboardState) -> String {
+        let mut lines = Vec::new();
+        for (index, area) in dashboard
+            .pane_areas
+            .expect("dashboard pane hitboxes")
+            .iter()
+            .enumerate()
+        {
+            lines.push(format!(
+                "pane {index}: {},{} {}x{}",
+                area.x, area.y, area.width, area.height
+            ));
+        }
+        let preview = dashboard
+            .selected_preview_area
+            .expect("selected preview hitbox");
+        lines.push(format!(
+            "preview: {},{} {}x{}",
+            preview.x, preview.y, preview.width, preview.height
+        ));
+        let buffer = terminal.backend().buffer();
+        for y in buffer.area.y..buffer.area.bottom() {
+            let text = (buffer.area.x..buffer.area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            let text = text.trim_end();
+            if text.contains("unread") {
+                lines.push(format!("row {y}: session summary"));
+            } else if let Some(start) = text.find("question ").or_else(|| text.find("answer ")) {
+                // Trailing pane border and scrollbar glyphs are not part of the
+                // message text.
+                let message = text[start..].trim_end_matches(['║', '│', '█', '▲', '▼', ' ']);
+                lines.push(format!("row {y}: {message}"));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// Locks the Active pane's layout for a fleet that mixes preview lengths
+    /// with paused, capacity, and quota rows. Both the row-sizing pass and the
+    /// pass that renders previews feed these numbers.
+    #[test]
+    fn dashboard_layout_is_stable_for_a_mixed_fleet() {
+        let mut dashboard = mixed_fleet_dashboard();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw the mixed fleet");
+
+        assert_eq!(
+            layout_fingerprint(&terminal, &dashboard),
+            concat!(
+                "pane 0: 0,1 120x22\n",
+                "pane 1: 0,23 120x5\n",
+                "pane 2: 0,28 120x4\n",
+                "pane 3: 0,32 120x6\n",
+                "preview: 3,4 116x10\n",
+                "row 3: session summary\n",
+                "row 5: answer 11\n",
+                "row 7: question 12\n",
+                "row 9: answer 12\n",
+                "row 11: question 13\n",
+                "row 13: answer 13\n",
+                "row 15: session summary\n",
+                "row 17: question 0\n",
+                "row 19: answer 0",
+            )
+        );
+    }
+
+    /// The same fleet in a terminal too short for the full preview budget, so
+    /// the selected session's line allowance comes from the allocated pane.
+    #[test]
+    fn dashboard_layout_is_stable_when_the_active_pane_is_squeezed() {
+        let mut dashboard = mixed_fleet_dashboard();
+        let mut terminal = Terminal::new(TestBackend::new(120, 26)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw the squeezed fleet");
+
+        assert_eq!(
+            layout_fingerprint(&terminal, &dashboard),
+            concat!(
+                "pane 0: 0,1 120x9\n",
+                "pane 1: 0,10 120x5\n",
+                "pane 2: 0,15 120x4\n",
+                "pane 3: 0,19 120x5\n",
+                "preview: 3,4 116x5\n",
+                "row 3: session summary\n",
+                "row 4: answer 12\n",
+                "row 6: question 13\n",
+                "row 8: answer 13",
+            )
         );
     }
 
