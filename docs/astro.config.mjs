@@ -97,6 +97,14 @@ export default defineConfig({
           ],
         },
         {
+          label: 'Containers',
+          items: [
+            { label: 'Container targets', slug: 'containers' },
+            { label: 'Podman for Hel', slug: 'podman' },
+            { label: 'Custom container images', slug: 'custom-images' },
+          ],
+        },
+        {
           label: 'Extend Mjolnir',
           items: [
             { label: 'Other agents and models', slug: 'adapters' },

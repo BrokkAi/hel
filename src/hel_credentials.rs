@@ -867,21 +867,18 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn canonical_write_refuses_a_symlinked_destination() {
         let home = tempfile::tempdir().unwrap();
         let elsewhere = home.path().join("elsewhere.json");
         std::fs::write(&elsewhere, b"{}").unwrap();
         let path = home.path().join("auth.json");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
-        #[cfg(unix)]
-        {
-            let error = write_credential_file(&path, &codex_credentials("2026-01-01T00:00:00Z"))
-                .unwrap_err();
-            assert!(error.to_string().contains("symbolic link"));
-            assert_eq!(std::fs::read(&elsewhere).unwrap(), b"{}");
-        }
+        let error =
+            write_credential_file(&path, &codex_credentials("2026-01-01T00:00:00Z")).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"{}");
     }
 
     #[test]

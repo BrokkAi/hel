@@ -3062,6 +3062,17 @@ fn preflight_target(template: &TargetTemplate, executor: &impl CommandExecutor) 
                     "local Podman preflight failed; run `hel doctor` for actionable prerequisites: {error:#}"
                 )
             }),
+        TargetTemplate::SshPodman { ssh, .. } => {
+            let ssh = backend_ssh(ssh);
+            hel_targets::verify_ssh_podman(&ssh, executor)
+                .map(|_| ())
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "remote Podman preflight failed for {}; run `hel doctor` for actionable prerequisites: {error:#}",
+                        ssh.destination
+                    )
+                })
+        }
         TargetTemplate::AppleContainer { .. } => {
             let command = CommandSpec::new("container", ["system", "status"])
                 .purpose("preflight Apple container runtime");
@@ -4695,7 +4706,7 @@ fn is_bare_project_target(template: &TargetTemplate) -> bool {
     )
 }
 
-fn backend_ssh(ssh: &SshConnection) -> SshTarget {
+pub(crate) fn backend_ssh(ssh: &SshConnection) -> SshTarget {
     let destination = match &ssh.user {
         Some(user) => format!("{user}@{}", ssh.host),
         None => ssh.host.clone(),
@@ -5419,6 +5430,13 @@ fn workspace_paths(
     Ok((primary_path, additional))
 }
 
+// npx fallbacks for images that do not already carry an ACP bridge. Keep these
+// in lockstep with the global npm installs in
+// containers/Containerfile.agent-dev; bridge_pins_match_containerfile() below
+// fails the build when they drift.
+const CODEX_ACP_FALLBACK_VERSION: &str = "1.1.14";
+const CLAUDE_AGENT_ACP_FALLBACK_VERSION: &str = "0.68.0";
+
 fn bridge_launch(
     harness: crate::hel_config::HarnessKind,
     executable: Option<&Path>,
@@ -5436,14 +5454,14 @@ fn bridge_launch(
             "sh".into(),
             vec![
                 "-lc".into(),
-                format!("if command -v codex-acp >/dev/null 2>&1; then exec codex-acp; fi; {}; exec npx -y @agentclientprotocol/codex-acp@1.1.14", ensure_node_script()),
+                format!("if command -v codex-acp >/dev/null 2>&1; then exec codex-acp; fi; {}; exec npx -y @agentclientprotocol/codex-acp@{CODEX_ACP_FALLBACK_VERSION}", ensure_node_script()),
             ],
         ),
         crate::hel_config::HarnessKind::Claude => (
             "sh".into(),
             vec![
                 "-lc".into(),
-                format!("if command -v claude-agent-acp >/dev/null 2>&1; then exec claude-agent-acp; fi; {}; exec npx -y @agentclientprotocol/claude-agent-acp@0.68.0", ensure_node_script()),
+                format!("if command -v claude-agent-acp >/dev/null 2>&1; then exec claude-agent-acp; fi; {}; exec npx -y @agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_FALLBACK_VERSION}", ensure_node_script()),
             ],
         ),
         crate::hel_config::HarnessKind::Kimi => (
@@ -7349,6 +7367,27 @@ mod tests {
     }
 
     #[test]
+    fn bridge_fallback_pins_match_the_agent_dev_containerfile() {
+        const CONTAINERFILE: &str = include_str!("../containers/Containerfile.agent-dev");
+
+        let codex = format!("codex-acp@{CODEX_ACP_FALLBACK_VERSION}");
+        assert!(
+            CONTAINERFILE.contains(&codex),
+            "containers/Containerfile.agent-dev must install {codex}. The image and the \
+             bridge_launch() npx fallbacks have to stay in lockstep, otherwise a container \
+             session and an npx session run different adapter versions."
+        );
+
+        let claude = format!("claude-agent-acp@{CLAUDE_AGENT_ACP_FALLBACK_VERSION}");
+        assert!(
+            CONTAINERFILE.contains(&claude),
+            "containers/Containerfile.agent-dev must install {claude}. The image and the \
+             bridge_launch() npx fallbacks have to stay in lockstep, otherwise a container \
+             session and an npx session run different adapter versions."
+        );
+    }
+
+    #[test]
     fn kimi_default_bridge_uses_bash_for_the_official_installer() {
         let (command, arguments) = bridge_launch(crate::hel_config::HarnessKind::Kimi, None);
         assert_eq!(command, "sh");
@@ -7801,6 +7840,39 @@ mod tests {
     }
 
     #[test]
+    fn ssh_podman_preflight_failures_name_the_destination_and_recommend_doctor() {
+        let template = TargetTemplate::SshPodman {
+            ssh: SshConnection {
+                host: "example.test".into(),
+                user: Some("dev".into()),
+                identity_file: None,
+                extra_args: vec![],
+            },
+            container: ConfigContainer {
+                image: "ubuntu:24.04".into(),
+                platform: None,
+                cpus: None,
+                memory: None,
+                environment: std::collections::BTreeMap::new(),
+            },
+        };
+        let executor = PreflightExecutor {
+            outputs: RefCell::new(vec![CommandOutput {
+                status: 0,
+                stdout: b"podman version 3.4.7\n".to_vec(),
+                stderr: vec![],
+            }]),
+        };
+
+        let error = preflight_target(&template, &executor)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hel doctor"));
+        assert!(error.contains("dev@example.test"));
+        assert!(error.contains("Podman 4.0.0"));
+    }
+
+    #[test]
     fn apple_container_preflight_failures_recommend_doctor() {
         let template = TargetTemplate::AppleContainer {
             container: ConfigContainer {
@@ -7932,9 +8004,11 @@ mod tests {
                 .unwrap();
         assert!(inspection.primary_checkout);
         assert_eq!(inspection.upstream.as_deref(), Some("origin/master"));
+        // git rev-parse canonicalizes symlinks (macOS tempdirs live behind the
+        // /var -> /private/var link), so compare against the canonical path.
         assert_eq!(
             inspection.source_project_directory,
-            repository.path().join("nested")
+            repository.path().canonicalize().unwrap().join("nested")
         );
 
         let session_id = "0123456789abcdef0123456789abcdef";

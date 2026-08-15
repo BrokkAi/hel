@@ -533,47 +533,113 @@ pub struct PodmanPreflight {
     pub version: String,
 }
 
+/// Where the Podman prerequisite probes run.
+///
+/// The same postconditions apply locally and over SSH; only the command
+/// wrapping and the wording of a failure differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PodmanHost<'a> {
+    Local,
+    Ssh(&'a SshTarget),
+}
+
+impl PodmanHost<'_> {
+    /// Sentence opener for every failure raised by these probes.
+    fn failure(self) -> String {
+        match self {
+            Self::Local => "Podman preflight failed".to_owned(),
+            Self::Ssh(ssh) => format!("Remote Podman preflight failed on {}", ssh.destination),
+        }
+    }
+
+    /// Prefix that says where a remediation must be applied.
+    fn remediation_scope(self) -> String {
+        match self {
+            Self::Local => String::new(),
+            Self::Ssh(ssh) => format!("On {}: ", ssh.destination),
+        }
+    }
+
+    fn command(self, args: &[&str], purpose: &'static str) -> CommandSpec {
+        match self {
+            Self::Local => CommandSpec::new(args[0], args[1..].iter().copied()).purpose(purpose),
+            Self::Ssh(ssh) => ssh_validation_command(
+                ssh,
+                args.iter().map(|arg| (*arg).to_owned()).collect(),
+                purpose,
+            ),
+        }
+    }
+}
+
 /// Verify the fast local preconditions for Hel's rootless Podman target.
 ///
 /// This intentionally never pulls an image. Image availability is verified by
 /// `hel setup`'s smoke test and by the subsequent target creation command.
 pub fn verify_local_podman(executor: &impl CommandExecutor) -> Result<PodmanPreflight> {
+    verify_podman(PodmanHost::Local, executor)
+}
+
+/// Verify the same rootless Podman preconditions on an SSH host.
+///
+/// The probes run through the noninteractive SSH options, so an unreachable
+/// host fails fast instead of blocking doctor or session preflight.
+pub fn verify_ssh_podman(
+    ssh: &SshTarget,
+    executor: &impl CommandExecutor,
+) -> Result<PodmanPreflight> {
+    let host = PodmanHost::Ssh(ssh);
+    validate_ssh(ssh).map_err(|error| {
+        anyhow::anyhow!(
+            "{}: the configured SSH destination is unusable ({error}). Set a valid `host` (and optional `user`) for this ssh-podman target. See {PODMAN_DOCUMENTATION_PATH}.",
+            host.failure()
+        )
+    })?;
+    verify_podman(host, executor)
+}
+
+fn verify_podman(host: PodmanHost<'_>, executor: &impl CommandExecutor) -> Result<PodmanPreflight> {
     let version = execute_podman_preflight(
         executor,
-        CommandSpec::new("podman", ["--version"]).purpose("check Podman version"),
+        host,
+        &["podman", "--version"],
+        "check Podman version",
         "Postcondition `podman --version` succeeds with Podman 4.0.0 or newer",
         "Install or upgrade Podman: Debian/Ubuntu `sudo apt update && sudo apt install -y podman uidmap`; Fedora `sudo dnf install -y podman shadow-utils`.",
     )?;
-    let version = parse_podman_version(&version.stdout)?;
+    let version = parse_podman_version(host, &version.stdout)?;
 
     let rootless = execute_podman_preflight(
         executor,
-        CommandSpec::new(
-            "podman",
-            ["info", "--format", "{{.Host.Security.Rootless}}"],
-        )
-        .purpose("check rootless Podman mode"),
+        host,
+        &["podman", "info", "--format", "{{.Host.Security.Rootless}}"],
+        "check rootless Podman mode",
         "Postcondition `podman info --format '{{.Host.Security.Rootless}}'` prints `true`",
         "Run Hel as the ordinary user without `sudo`; if a remote Podman connection is configured, unset `CONTAINER_HOST` or select the rootless local connection.",
     )?;
     let rootless_output = String::from_utf8_lossy(&rootless.stdout);
     if rootless_output.trim() != "true" {
         bail!(
-            "Podman preflight failed: Postcondition `podman info --format '{{{{.Host.Security.Rootless}}}}'` prints `true` returned {:?}. Run Hel as the ordinary user without `sudo`; if a remote Podman connection is configured, unset `CONTAINER_HOST` or select the rootless local connection. See {PODMAN_DOCUMENTATION_PATH}.",
-            rootless_output.trim()
+            "{}: Postcondition `podman info --format '{{{{.Host.Security.Rootless}}}}'` prints `true` returned {:?}. {}Run Hel as the ordinary user without `sudo`; if a remote Podman connection is configured, unset `CONTAINER_HOST` or select the rootless local connection. See {PODMAN_DOCUMENTATION_PATH}.",
+            host.failure(),
+            rootless_output.trim(),
+            host.remediation_scope(),
         );
     }
 
     let uid_map = execute_podman_preflight(
         executor,
-        CommandSpec::new("podman", ["unshare", "cat", "/proc/self/uid_map"])
-            .purpose("check rootless Podman UID map"),
+        host,
+        &["podman", "unshare", "cat", "/proc/self/uid_map"],
+        "check rootless Podman UID map",
         "Postcondition `podman unshare cat /proc/self/uid_map` maps container UIDs 0 and 1",
         "Install UID-map helpers (`sudo apt install -y uidmap` on Debian/Ubuntu or `sudo dnf install -y shadow-utils` on Fedora), then add subordinate ranges with `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 \"$USER\"` and start a fresh login session.",
     )?;
     if !valid_rootless_uid_map(&uid_map.stdout) {
         bail!(
-            "Podman preflight failed: Postcondition `podman unshare cat /proc/self/uid_map` maps container UIDs 0 and 1 was not met. Add subordinate ranges with `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 \"$USER\"`, verify `/etc/subuid` and `/etc/subgid`, then log out and back in. See {PODMAN_DOCUMENTATION_PATH}."
+            "{}: Postcondition `podman unshare cat /proc/self/uid_map` maps container UIDs 0 and 1 was not met. {}Add subordinate ranges with `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 \"$USER\"`, verify `/etc/subuid` and `/etc/subgid`, then log out and back in. See {PODMAN_DOCUMENTATION_PATH}.",
+            host.failure(),
+            host.remediation_scope(),
         );
     }
 
@@ -582,32 +648,65 @@ pub fn verify_local_podman(executor: &impl CommandExecutor) -> Result<PodmanPref
 
 fn execute_podman_preflight(
     executor: &impl CommandExecutor,
-    command: CommandSpec,
+    host: PodmanHost<'_>,
+    args: &[&str],
+    purpose: &'static str,
     postcondition: &str,
     remediation: &str,
 ) -> Result<CommandOutput> {
-    let output = executor.execute(&command).map_err(|error| {
-        anyhow::anyhow!(
-            "Podman preflight failed: {postcondition}. {remediation} See {PODMAN_DOCUMENTATION_PATH}. Underlying error: {error}"
-        )
-    })?;
+    let command = host.command(args, purpose);
+    let failure = host.failure();
+    let scope = host.remediation_scope();
+    let output = match executor.execute(&command) {
+        Ok(output) => output,
+        Err(error) => match ssh_transport_failure(host, &error.to_string()) {
+            Some(message) => bail!("{message}"),
+            None => bail!(
+                "{failure}: {postcondition}. {scope}{remediation} See {PODMAN_DOCUMENTATION_PATH}. Underlying error: {error}"
+            ),
+        },
+    };
+    if output.status == SSH_TRANSPORT_EXIT_STATUS
+        && let Some(message) =
+            ssh_transport_failure(host, String::from_utf8_lossy(&output.stderr).trim())
+    {
+        bail!("{message}");
+    }
     if output.status != 0 {
         bail!(
-            "Podman preflight failed: {postcondition}. {remediation} See {PODMAN_DOCUMENTATION_PATH}. Podman reported: {}",
+            "{failure}: {postcondition}. {scope}{remediation} See {PODMAN_DOCUMENTATION_PATH}. Podman reported: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     Ok(output)
 }
 
-fn parse_podman_version(stdout: &[u8]) -> Result<String> {
+/// `ssh` reserves exit status 255 for its own connection failures; the Podman
+/// probes never produce it. Reporting that case separately keeps an
+/// unreachable host from being mistaken for a broken Podman installation.
+const SSH_TRANSPORT_EXIT_STATUS: i32 = 255;
+
+fn ssh_transport_failure(host: PodmanHost<'_>, reported: &str) -> Option<String> {
+    let PodmanHost::Ssh(ssh) = host else {
+        return None;
+    };
+    let destination = &ssh.destination;
+    Some(format!(
+        "{}: SSH could not run the probes on {destination}. Verify that `ssh {destination}` succeeds noninteractively from this host. See {PODMAN_DOCUMENTATION_PATH}. ssh reported: {reported}",
+        host.failure()
+    ))
+}
+
+fn parse_podman_version(host: PodmanHost<'_>, stdout: &[u8]) -> Result<String> {
+    let failure = host.failure();
+    let scope = host.remediation_scope();
     let version = String::from_utf8_lossy(stdout).trim().to_owned();
     let Some(candidate) = version
         .split_whitespace()
         .find(|part| part.as_bytes().first().is_some_and(u8::is_ascii_digit))
     else {
         bail!(
-            "Podman preflight failed: Postcondition `podman --version` succeeds with Podman 4.0.0 or newer returned {version:?}. Install or upgrade Podman: Debian/Ubuntu `sudo apt update && sudo apt install -y podman uidmap`; Fedora `sudo dnf install -y podman shadow-utils`. See {PODMAN_DOCUMENTATION_PATH}."
+            "{failure}: Postcondition `podman --version` succeeds with Podman 4.0.0 or newer returned {version:?}. {scope}Install or upgrade Podman: Debian/Ubuntu `sudo apt update && sudo apt install -y podman uidmap`; Fedora `sudo dnf install -y podman shadow-utils`. See {PODMAN_DOCUMENTATION_PATH}."
         );
     };
     let Some(major) = candidate
@@ -616,12 +715,12 @@ fn parse_podman_version(stdout: &[u8]) -> Result<String> {
         .and_then(|part| part.parse::<u32>().ok())
     else {
         bail!(
-            "Podman preflight failed: Postcondition `podman --version` succeeds with Podman 4.0.0 or newer returned {version:?}. Install or upgrade Podman: Debian/Ubuntu `sudo apt update && sudo apt install -y podman uidmap`; Fedora `sudo dnf install -y podman shadow-utils`. See {PODMAN_DOCUMENTATION_PATH}."
+            "{failure}: Postcondition `podman --version` succeeds with Podman 4.0.0 or newer returned {version:?}. {scope}Install or upgrade Podman: Debian/Ubuntu `sudo apt update && sudo apt install -y podman uidmap`; Fedora `sudo dnf install -y podman shadow-utils`. See {PODMAN_DOCUMENTATION_PATH}."
         );
     };
     if major < PODMAN_MINIMUM_MAJOR_VERSION {
         bail!(
-            "Podman preflight failed: Postcondition `podman --version` succeeds with Podman 4.0.0 or newer was not met (found {candidate}). Upgrade Podman to 4.0.0 or newer: Debian/Ubuntu `sudo apt update && sudo apt install -y podman uidmap`; Fedora `sudo dnf install -y podman shadow-utils`. See {PODMAN_DOCUMENTATION_PATH}."
+            "{failure}: Postcondition `podman --version` succeeds with Podman 4.0.0 or newer was not met (found {candidate}). {scope}Upgrade Podman to 4.0.0 or newer: Debian/Ubuntu `sudo apt update && sudo apt install -y podman uidmap`; Fedora `sudo dnf install -y podman shadow-utils`. See {PODMAN_DOCUMENTATION_PATH}."
         );
     }
     Ok(candidate.to_owned())
@@ -1007,21 +1106,41 @@ pub fn provision_bare_project_plan(
 /// setup catches an unusable image or runtime before the first session exists.
 pub fn setup_smoke_plan(template: &TargetTemplate, smoke_id: &str) -> Result<CommandPlan> {
     let name = resource_name(smoke_id)?;
-    let (engine, container) = match template {
-        TargetTemplate::LocalPodman(container) => ("podman", container),
-        TargetTemplate::AppleContainer(container) => ("container", container),
-        _ => bail!("setup smoke tests require a local container target"),
+    let (engine, container, boundary) = match template {
+        TargetTemplate::LocalPodman(container) => ("podman", container, ExecutionBoundary::Direct),
+        TargetTemplate::AppleContainer(container) => {
+            ("container", container, ExecutionBoundary::Direct)
+        }
+        TargetTemplate::SshPodman { ssh, container } => {
+            validate_ssh(ssh)?;
+            ("podman", container, ExecutionBoundary::Ssh(ssh))
+        }
+        _ => bail!("setup smoke tests require a local container or ssh-podman target"),
     };
     validate_container_template(container)?;
+
+    let mut run = vec![engine.to_owned()];
+    run.extend(container_run_args(engine, container, &name, smoke_id, &[])?);
+    let exec = vec![
+        engine.to_owned(),
+        "exec".to_owned(),
+        "-i".to_owned(),
+        name.clone(),
+        "true".to_owned(),
+    ];
+    let remove = vec![
+        engine.to_owned(),
+        "rm".to_owned(),
+        "--force".to_owned(),
+        name,
+    ];
 
     Ok(CommandPlan {
         description: format!("smoke test Hel setup target {smoke_id}"),
         commands: vec![
-            container_run(engine, container, &name, smoke_id, &[])?
-                .purpose("create disposable setup container"),
-            container_exec(engine, &name, ["true"]).purpose("execute setup smoke command"),
-            CommandSpec::new(engine, ["rm", "--force", &name])
-                .purpose("remove disposable setup container"),
+            at_boundary(boundary, run).purpose("create disposable setup container"),
+            at_boundary(boundary, exec).purpose("execute setup smoke command"),
+            at_boundary(boundary, remove).purpose("remove disposable setup container"),
         ],
     })
 }
@@ -2233,6 +2352,123 @@ mod tests {
         assert!(error.contains("maps container UIDs 0 and 1"));
         assert!(error.contains("usermod --add-subuids"));
         assert!(error.contains(PODMAN_DOCUMENTATION_PATH));
+    }
+
+    #[test]
+    fn ssh_podman_preflight_runs_every_probe_through_noninteractive_ssh() {
+        let executor = PodmanPreflightExecutor::with_outputs([
+            podman_output(b"podman version 5.4.2\n"),
+            podman_output(b"true\n"),
+            podman_output(b"         0       1000          1\n         1     100000      65536\n"),
+        ]);
+
+        let preflight = verify_ssh_podman(&ssh(), &executor).unwrap();
+
+        assert_eq!(preflight.version, "5.4.2");
+        let seen = executor.seen.borrow();
+        assert_eq!(seen.len(), 3);
+        for command in seen.iter() {
+            assert_eq!(command.program, "ssh");
+            assert!(command.args.contains(&"BatchMode=yes".to_owned()));
+            assert!(command.args.contains(&"ConnectTimeout=3".to_owned()));
+            assert!(command.args.contains(&"dev@example.test".to_owned()));
+            assert!(command.args.last().unwrap().starts_with("'podman'"));
+        }
+        assert!(
+            seen[2]
+                .args
+                .last()
+                .unwrap()
+                .contains("'/proc/self/uid_map'")
+        );
+    }
+
+    #[test]
+    fn ssh_podman_preflight_failures_name_the_destination_and_remote_scope() {
+        let executor =
+            PodmanPreflightExecutor::with_outputs([podman_output(b"podman version 3.4.7\n")]);
+
+        let error = verify_ssh_podman(&ssh(), &executor)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Remote Podman preflight failed on dev@example.test"));
+        assert!(error.contains("On dev@example.test: Upgrade Podman"));
+        assert!(error.contains(PODMAN_DOCUMENTATION_PATH));
+    }
+
+    #[test]
+    fn ssh_podman_preflight_reports_an_unreachable_host_separately_from_podman() {
+        let executor = PodmanPreflightExecutor::with_outputs([CommandOutput {
+            status: 255,
+            stdout: vec![],
+            stderr: b"ssh: connect to host example.test port 22: Connection timed out".to_vec(),
+        }]);
+
+        let error = verify_ssh_podman(&ssh(), &executor)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("SSH could not run the probes on dev@example.test"));
+        assert!(error.contains("Connection timed out"));
+        assert!(!error.contains("Podman 4.0.0"));
+    }
+
+    #[test]
+    fn ssh_podman_preflight_rejects_an_unusable_destination_without_running_ssh() {
+        let executor = PodmanPreflightExecutor::with_outputs([]);
+        let target = SshTarget {
+            destination: "--oProxyCommand=touch /tmp/pwn".to_owned(),
+            ssh_args: vec![],
+        };
+
+        let error = verify_ssh_podman(&target, &executor)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("SSH destination is unusable"));
+        assert!(executor.seen.borrow().is_empty());
+    }
+
+    #[test]
+    fn setup_smoke_plan_wraps_every_ssh_podman_command_in_ssh() {
+        let plan = setup_smoke_plan(
+            &TargetTemplate::SshPodman {
+                ssh: ssh(),
+                container: ContainerTemplate {
+                    image: "ubuntu:24.04".to_owned(),
+                    extra_run_args: vec![],
+                },
+            },
+            "setup-123",
+        )
+        .unwrap();
+
+        assert_eq!(plan.commands.len(), 3);
+        for command in &plan.commands {
+            assert_eq!(command.program, "ssh");
+            assert!(command.args.contains(&"dev@example.test".to_owned()));
+            assert!(command.args.last().unwrap().starts_with("'podman'"));
+        }
+        assert!(
+            plan.commands[0]
+                .args
+                .last()
+                .unwrap()
+                .contains("'run' '--init'")
+        );
+        assert!(plan.commands[1].args.last().unwrap().ends_with("'true'"));
+        assert!(
+            plan.commands[2]
+                .args
+                .last()
+                .unwrap()
+                .contains("'rm' '--force'")
+        );
+        assert_eq!(
+            plan.commands[2].purpose,
+            "remove disposable setup container"
+        );
     }
 
     #[test]

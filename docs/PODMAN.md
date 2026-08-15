@@ -40,7 +40,27 @@ removes that exact container with `podman rm --force` only after checkpointing.
 container from the configured image. The setup smoke test may pull that image;
 the normal preflight deliberately does not.
 
-Build Hel's bundled agent-development image when a local image is desired:
+`hel doctor --json` runs those three checks only when a `local-podman` target
+exists, and then checks `podman image exists` for each configured
+`local-podman` image. `hel doctor --json --smoke` replaces that presence check
+with the full disposable run/exec/remove test, so it automates
+[Verification](#verification) sections 3 and 4 for every configured image.
+
+An `ssh-podman` target gets the same probes and the same smoke test, each
+wrapped in a noninteractive `ssh` call to the configured host. Every
+remediation below then applies on that remote host, as the user that SSH logs
+in as.
+
+Hel's bundled agent-development image is published at
+`ghcr.io/brokkai/hel/agent-dev:latest` (multi-arch: `linux/amd64` and
+`linux/arm64`, public, no authentication needed to pull). Pull it directly:
+
+```console
+podman pull ghcr.io/brokkai/hel/agent-dev:latest
+```
+
+Building it locally remains a supported alternative, for example to customize
+the image or to work offline:
 
 ```console
 podman build --pull=always \
@@ -106,6 +126,9 @@ podman system migrate
 ## Verification
 
 Every command here is a postcondition. Resolve a failure before running Hel.
+Run them by hand to diagnose a host; `hel doctor --json --smoke` checks
+sections 1 through 4 for every configured target and reports the same failures
+with an exact remediation.
 
 ### 1. Podman is installed and supported
 
@@ -146,18 +169,18 @@ usable subordinate range.
 
 ### 3. The configured runtime image is available
 
-For a registry-hosted image, set `IMAGE` to the exact `image` value from the
+For Hel's published image, set `IMAGE` to the exact `image` value from the
 Hel target and pull it:
 
 ```console
-IMAGE=ghcr.io/your-org/agent-dev:latest
+IMAGE=ghcr.io/brokkai/hel/agent-dev:latest
 podman pull "$IMAGE"
 podman image exists "$IMAGE"
 ```
 
-Both commands must exit zero. Replace the example with the configured image.
-For Hel's locally built `localhost/hel/agent-dev:latest`, build it with the
-command above and verify it without attempting a registry pull:
+Both commands must exit zero. Replace the example with the configured image
+if it differs. For Hel's locally built `localhost/hel/agent-dev:latest`, build
+it with the command above and verify it without attempting a registry pull:
 
 ```console
 podman image exists localhost/hel/agent-dev:latest

@@ -7,15 +7,23 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::hel_config::{ContainerTemplate, HarnessKind, HelConfig, TargetTemplate, config_path};
-use crate::hel_controller::{WorkerBinaryAvailability, worker_binary_prerequisite_for_arch};
+use crate::hel_controller::{
+    WorkerBinaryAvailability, backend_ssh, worker_binary_prerequisite_for_arch,
+};
 use crate::hel_setup::{
     DiscoveredHome, discover_harness_homes, harness_authentication_marker, harness_is_authenticated,
 };
 use crate::hel_targets::{
     CommandExecutor, CommandSpec, ContainerTemplate as RuntimeContainerTemplate, ProcessExecutor,
-    TargetTemplate as RuntimeTargetTemplate, run_setup_smoke_test, verify_local_podman,
+    SshTarget as RuntimeSshTarget, TargetTemplate as RuntimeTargetTemplate, run_setup_smoke_test,
+    verify_local_podman, verify_ssh_podman,
 };
 
+// Only the image for the Apple container smoke test when the config has no
+// apple-container target. This intentionally stays a small stock image rather
+// than hel_setup::DEFAULT_IMAGE: the check just proves the runtime can start a
+// container, and pulling the multi-gigabyte agent-dev image to do that would be
+// a poor trade.
 const DEFAULT_CONTAINER_IMAGE: &str = "ubuntu:24.04";
 const APPLE_CONTAINER_INSTALL_URL: &str = "https://github.com/apple/container#initial-install";
 
@@ -124,7 +132,8 @@ pub fn run_with(
     let (config, mut checks) = configuration_checks();
     checks.push(harness_discovery_check(config.as_ref()));
     checks.extend(harness_checks(config.as_ref()));
-    checks.push(podman_check(executor));
+    checks.extend(podman_checks(config.as_ref(), executor, options.smoke));
+    checks.extend(ssh_podman_checks(config.as_ref(), executor, options.smoke));
     checks.extend(worker_binary_checks(config.as_ref()));
     checks.push(apple_container_check(
         &apple_platform,
@@ -220,7 +229,9 @@ pub fn setup_instructions(platform: InstructionsPlatform) -> String {
 This page is self-contained. Follow this exact loop as the user who will run Hel:\n\n\
 1. Run `hel doctor --json`.\n\
 2. Follow every `fixable` remediation from its JSON output.\n\
-3. Run `hel doctor --json` again. Repeat until no check is `fixable`.\n\n\
+3. Run `hel doctor --json` again. Repeat until no check is `fixable`.\n\
+4. Finish with `hel doctor --json --smoke` to verify every configured container\n\
+   image end to end, and resolve anything it reports as `fixable`.\n\n\
 For a coding-agent handoff, provide this entire instructions page together with\n\
 the latest `hel doctor --json` output.\n\n\
 ## Linux Podman postconditions\n\n{}",
@@ -384,7 +395,39 @@ fn harness_login_remediation(kind: HarnessKind, home: &std::path::Path) -> Strin
     }
 }
 
-fn podman_check(executor: &impl CommandExecutor) -> DoctorCheck {
+/// Host Podman prerequisites, then one image check per `local-podman` target.
+///
+/// The image checks run only after the host preflight passes, because a broken
+/// Podman installation already reports its own actionable check.
+fn podman_checks(
+    config: Option<&HelConfig>,
+    executor: &impl CommandExecutor,
+    smoke: bool,
+) -> Vec<DoctorCheck> {
+    let preflight = podman_check(config, executor);
+    let preflight_passed = preflight.status == CheckStatus::Ready;
+    let mut checks = vec![preflight];
+    if preflight_passed {
+        checks.extend(podman_image_checks(config, executor, smoke));
+    }
+    checks
+}
+
+fn podman_check(config: Option<&HelConfig>, executor: &impl CommandExecutor) -> DoctorCheck {
+    let Some(config) = config else {
+        return DoctorCheck::unsupported(
+            "runtime.podman",
+            "Rootless Podman",
+            "Podman prerequisites cannot be evaluated until config.toml is valid.",
+        );
+    };
+    if local_podman_targets(config).is_empty() {
+        return DoctorCheck::unsupported(
+            "runtime.podman",
+            "Rootless Podman",
+            "No local-podman target is configured.",
+        );
+    }
     match verify_local_podman(executor) {
         Ok(preflight) => DoctorCheck::ready(
             "runtime.podman",
@@ -403,15 +446,213 @@ fn podman_check(executor: &impl CommandExecutor) -> DoctorCheck {
     }
 }
 
+fn local_podman_targets(config: &HelConfig) -> Vec<(&String, &ContainerTemplate)> {
+    config
+        .targets
+        .iter()
+        .filter_map(|(id, target)| match target {
+            TargetTemplate::LocalPodman { container } => Some((id, container)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn podman_image_checks(
+    config: Option<&HelConfig>,
+    executor: &impl CommandExecutor,
+    smoke: bool,
+) -> Vec<DoctorCheck> {
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    local_podman_targets(config)
+        .into_iter()
+        .map(|(id, container)| podman_image_check(id, &container.image, executor, smoke))
+        .collect()
+}
+
+fn podman_image_check(
+    id: &str,
+    image: &str,
+    executor: &impl CommandExecutor,
+    smoke: bool,
+) -> DoctorCheck {
+    let check_id = format!("runtime.podman.image.{id}");
+    let title = format!("Podman image for target {id}");
+    if smoke {
+        let target = RuntimeTargetTemplate::LocalPodman(RuntimeContainerTemplate {
+            image: image.to_owned(),
+            extra_run_args: vec![],
+        });
+        return match run_setup_smoke_test(&target, &doctor_smoke_id(), executor) {
+            Ok(()) => DoctorCheck::ready(
+                check_id,
+                title,
+                format!("Disposable run/exec/remove smoke test passed for image {image}."),
+            ),
+            Err(error) => DoctorCheck::fixable(
+                check_id,
+                title,
+                format!(
+                    "Disposable run/exec/remove smoke test failed for image {image}: {error:#}"
+                ),
+                "Fix the configured image or Podman runtime, then run `hel doctor --json --smoke` again.",
+            ),
+        };
+    }
+
+    let command = CommandSpec::new("podman", ["image", "exists", image])
+        .purpose("check Podman image presence");
+    match executor.execute(&command) {
+        Ok(output) if output.status == 0 => DoctorCheck::ready(
+            check_id,
+            title,
+            format!("Image {image} is present in local Podman storage."),
+        ),
+        Ok(_) => DoctorCheck::fixable(
+            check_id,
+            title,
+            format!("Image {image} is not present in local Podman storage."),
+            missing_image_remediation(image),
+        ),
+        Err(error) => DoctorCheck::fixable(
+            check_id,
+            title,
+            format!(
+                "Could not check whether image {image} is present in local Podman storage: {error}"
+            ),
+            missing_image_remediation(image),
+        ),
+    }
+}
+
+fn missing_image_remediation(image: &str) -> String {
+    format!(
+        "Pull it with `podman pull {image}`, build it from containers/Containerfile.agent-dev, or run `hel doctor --json --smoke` to verify the full pull-and-run path."
+    )
+}
+
+/// One check per `ssh-podman` target: the same Podman probes, run over SSH.
+fn ssh_podman_checks(
+    config: Option<&HelConfig>,
+    executor: &impl CommandExecutor,
+    smoke: bool,
+) -> Vec<DoctorCheck> {
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    config
+        .targets
+        .iter()
+        .filter_map(|(id, target)| match target {
+            TargetTemplate::SshPodman { ssh, container } => Some(ssh_podman_check(
+                id,
+                &backend_ssh(ssh),
+                &container.image,
+                executor,
+                smoke,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn ssh_podman_check(
+    id: &str,
+    ssh: &RuntimeSshTarget,
+    image: &str,
+    executor: &impl CommandExecutor,
+    smoke: bool,
+) -> DoctorCheck {
+    let check_id = format!("runtime.ssh-podman.{id}");
+    let title = format!("Remote Podman for target {id}");
+    let destination = &ssh.destination;
+    let preflight = match verify_ssh_podman(ssh, executor) {
+        Ok(preflight) => preflight,
+        Err(error) => {
+            let detail = format!("{error:#}");
+            let remediation = match podman_remediation_match(&detail) {
+                Some(remediation) => format!("On {destination}: {remediation}"),
+                None => format!(
+                    "Verify `ssh {destination}` succeeds noninteractively from this host, then install rootless Podman 4 or newer there (see docs/PODMAN.md)."
+                ),
+            };
+            return DoctorCheck::fixable(check_id, title, detail, remediation);
+        }
+    };
+    if !smoke {
+        return DoctorCheck::ready(
+            check_id,
+            title,
+            format!(
+                "Remote rootless Podman {} is available via {destination}. Run `hel doctor --json --smoke` to verify the image end to end.",
+                preflight.version
+            ),
+        );
+    }
+
+    let target = RuntimeTargetTemplate::SshPodman {
+        ssh: ssh.clone(),
+        container: RuntimeContainerTemplate {
+            image: image.to_owned(),
+            extra_run_args: vec![],
+        },
+    };
+    match run_setup_smoke_test(&target, &doctor_smoke_id(), executor) {
+        Ok(()) => DoctorCheck::ready(
+            check_id,
+            title,
+            format!(
+                "Disposable run/exec/remove smoke test passed for image {image} on {destination}."
+            ),
+        ),
+        Err(error) => DoctorCheck::fixable(
+            check_id,
+            title,
+            format!(
+                "Disposable run/exec/remove smoke test failed for image {image} on {destination}: {error:#}"
+            ),
+            format!(
+                "Fix the configured image or Podman runtime on {destination}, then run `hel doctor --json --smoke` again."
+            ),
+        ),
+    }
+}
+
+/// Shared disposable-container identity for every doctor smoke test.
+fn doctor_smoke_id() -> String {
+    format!(
+        "doctor-{}-{:x}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
+}
+
 fn podman_remediation(detail: &str) -> &'static str {
+    podman_remediation_match(detail).unwrap_or(
+        "Install Podman with `sudo apt update && sudo apt install -y podman uidmap` (Debian/Ubuntu) or `sudo dnf install -y podman shadow-utils` (Fedora).",
+    )
+}
+
+/// Map a Podman preflight failure to its specific remediation, if one applies.
+fn podman_remediation_match(detail: &str) -> Option<&'static str> {
     if detail.contains("Podman 4.0.0") {
-        "Upgrade Podman: Debian/Ubuntu `sudo apt update && sudo apt install -y podman uidmap`; Fedora `sudo dnf install -y podman shadow-utils`."
+        Some(
+            "Upgrade Podman: Debian/Ubuntu `sudo apt update && sudo apt install -y podman uidmap`; Fedora `sudo dnf install -y podman shadow-utils`.",
+        )
     } else if detail.contains("podman unshare") {
-        "Install UID mapping support with `sudo apt install -y uidmap` (Debian/Ubuntu) or `sudo dnf install -y shadow-utils` (Fedora), add `/etc/subuid` and `/etc/subgid` entries, then log out and back in."
+        Some(
+            "Install UID mapping support with `sudo apt install -y uidmap` (Debian/Ubuntu) or `sudo dnf install -y shadow-utils` (Fedora), add `/etc/subuid` and `/etc/subgid` entries, then log out and back in.",
+        )
     } else if detail.contains("Rootless") {
-        "Run Hel without `sudo`; unset `CONTAINER_HOST` and select the rootless local Podman connection."
+        Some(
+            "Run Hel without `sudo`; unset `CONTAINER_HOST` and select the rootless local Podman connection.",
+        )
     } else {
-        "Install Podman with `sudo apt update && sudo apt install -y podman uidmap` (Debian/Ubuntu) or `sudo dnf install -y podman shadow-utils` (Fedora)."
+        None
     }
 }
 
@@ -429,7 +670,8 @@ fn worker_binary_checks(config: Option<&HelConfig>) -> Vec<DoctorCheck> {
         .iter()
         .filter_map(|(id, target)| match target {
             TargetTemplate::LocalPodman { container }
-            | TargetTemplate::AppleContainer { container } => Some((id, container)),
+            | TargetTemplate::AppleContainer { container } => Some((id, container, false)),
+            TargetTemplate::SshPodman { container, .. } => Some((id, container, true)),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -437,12 +679,23 @@ fn worker_binary_checks(config: Option<&HelConfig>) -> Vec<DoctorCheck> {
         return vec![DoctorCheck::unsupported(
             "worker.containers",
             "Container worker binary",
-            "No local container target is configured.",
+            "No container target is configured.",
         )];
     }
     containers
         .into_iter()
-        .map(|(id, container)| worker_binary_check(id, container))
+        .map(|(id, container, remote)| {
+            if remote && container.platform.is_none() {
+                // The remote CPU architecture is only observable once the host
+                // is reachable, so an explicit `platform` is required here.
+                return DoctorCheck::unsupported(
+                    format!("worker.{id}"),
+                    format!("Container worker binary for target {id}"),
+                    "Set `platform` on this ssh-podman target to check its worker binary; the remote architecture is unknown until provisioning.",
+                );
+            }
+            worker_binary_check(id, container)
+        })
         .collect()
 }
 
@@ -611,15 +864,7 @@ pub fn apple_container_check(
         image,
         extra_run_args: vec![],
     });
-    let smoke_id = format!(
-        "doctor-{}-{:x}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-    match run_setup_smoke_test(&target, &smoke_id, executor) {
+    match run_setup_smoke_test(&target, &doctor_smoke_id(), executor) {
         Ok(()) => DoctorCheck::ready(
             "runtime.apple-container",
             "Apple container runtime",
@@ -693,6 +938,363 @@ mod tests {
             stdout: stdout.as_ref().to_vec(),
             stderr: vec![],
         }
+    }
+
+    fn failed(stderr: impl AsRef<[u8]>) -> CommandOutput {
+        CommandOutput {
+            status: 1,
+            stdout: vec![],
+            stderr: stderr.as_ref().to_vec(),
+        }
+    }
+
+    /// The three host probes `verify_local_podman`/`verify_ssh_podman` run.
+    fn passing_podman_probes() -> Vec<Result<CommandOutput>> {
+        vec![
+            Ok(output(b"podman version 5.4.2\n")),
+            Ok(output(b"true\n")),
+            Ok(output(
+                b"         0       1000          1\n         1     100000      65536\n",
+            )),
+        ]
+    }
+
+    fn container(image: &str) -> ContainerTemplate {
+        ContainerTemplate {
+            image: image.to_owned(),
+            platform: None,
+            cpus: None,
+            memory: None,
+            environment: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn ssh_connection() -> crate::hel_config::SshConnection {
+        crate::hel_config::SshConnection {
+            host: "example.test".into(),
+            user: Some("dev".into()),
+            identity_file: None,
+            extra_args: vec![],
+        }
+    }
+
+    fn config_with(targets: impl IntoIterator<Item = (&'static str, TargetTemplate)>) -> HelConfig {
+        HelConfig {
+            targets: targets
+                .into_iter()
+                .map(|(id, target)| (id.to_owned(), target))
+                .collect(),
+            ..HelConfig::default()
+        }
+    }
+
+    fn runtime_ssh() -> RuntimeSshTarget {
+        backend_ssh(&ssh_connection())
+    }
+
+    #[test]
+    fn podman_check_is_unsupported_without_a_valid_config() {
+        let executor = FakeExecutor::new([]);
+
+        let check = podman_check(None, &executor);
+
+        assert_eq!(check.status, CheckStatus::Unsupported);
+        assert_eq!(
+            check.detail,
+            "Podman prerequisites cannot be evaluated until config.toml is valid."
+        );
+        assert!(executor.commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn podman_check_is_unsupported_without_a_local_podman_target() {
+        let executor = FakeExecutor::new([]);
+        let config = config_with([(
+            "apple",
+            TargetTemplate::AppleContainer {
+                container: container("ubuntu:24.04"),
+            },
+        )]);
+
+        let check = podman_check(Some(&config), &executor);
+
+        assert_eq!(check.status, CheckStatus::Unsupported);
+        assert_eq!(check.detail, "No local-podman target is configured.");
+        assert!(executor.commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn podman_check_probes_the_host_when_a_local_podman_target_exists() {
+        let executor = FakeExecutor::new(passing_podman_probes());
+        let config = config_with([(
+            "podman",
+            TargetTemplate::LocalPodman {
+                container: container("ubuntu:24.04"),
+            },
+        )]);
+
+        let check = podman_check(Some(&config), &executor);
+
+        assert_eq!(check.status, CheckStatus::Ready);
+        assert!(check.detail.contains("Podman 5.4.2"));
+        assert_eq!(executor.commands.borrow().len(), 3);
+    }
+
+    #[test]
+    fn podman_check_is_fixable_with_an_upgrade_remediation_for_an_old_runtime() {
+        let executor = FakeExecutor::new([Ok(output(b"podman version 3.4.7\n"))]);
+        let config = config_with([(
+            "podman",
+            TargetTemplate::LocalPodman {
+                container: container("ubuntu:24.04"),
+            },
+        )]);
+
+        let check = podman_check(Some(&config), &executor);
+
+        assert_eq!(check.status, CheckStatus::Fixable);
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("Upgrade Podman")
+        );
+    }
+
+    #[test]
+    fn podman_image_check_is_ready_when_the_image_is_present() {
+        let executor = FakeExecutor::new([Ok(output(b""))]);
+
+        let check =
+            podman_image_check("podman", "localhost/hel/agent-dev:latest", &executor, false);
+
+        assert_eq!(check.id, "runtime.podman.image.podman");
+        assert_eq!(check.title, "Podman image for target podman");
+        assert_eq!(check.status, CheckStatus::Ready);
+        assert_eq!(
+            executor.commands.borrow()[0].args,
+            vec!["image", "exists", "localhost/hel/agent-dev:latest"]
+        );
+    }
+
+    #[test]
+    fn podman_image_check_is_fixable_with_a_pull_remediation_when_the_image_is_missing() {
+        let executor = FakeExecutor::new([Ok(failed(b""))]);
+
+        let check = podman_image_check("podman", "ghcr.io/example/dev:1", &executor, false);
+
+        assert_eq!(check.status, CheckStatus::Fixable);
+        assert!(
+            check
+                .detail
+                .contains("is not present in local Podman storage")
+        );
+        assert_eq!(
+            check.remediation.as_deref(),
+            Some(
+                "Pull it with `podman pull ghcr.io/example/dev:1`, build it from containers/Containerfile.agent-dev, or run `hel doctor --json --smoke` to verify the full pull-and-run path."
+            )
+        );
+    }
+
+    #[test]
+    fn podman_image_check_smoke_runs_a_disposable_container() {
+        let executor = FakeExecutor::new([
+            Ok(output(b"created\n")),
+            Ok(output(b"ok\n")),
+            Ok(output(b"removed\n")),
+        ]);
+
+        let check = podman_image_check("podman", "ubuntu:24.04", &executor, true);
+
+        assert_eq!(check.status, CheckStatus::Ready);
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 3);
+        assert!(commands.iter().all(|command| command.program == "podman"));
+        assert_eq!(commands[0].args[0], "run");
+        assert_eq!(commands[1].args[0], "exec");
+        assert_eq!(commands[2].args[0], "rm");
+    }
+
+    #[test]
+    fn image_checks_are_skipped_when_the_host_podman_preflight_fails() {
+        let executor = FakeExecutor::new([Ok(output(b"podman version 3.4.7\n"))]);
+        let config = config_with([(
+            "podman",
+            TargetTemplate::LocalPodman {
+                container: container("ubuntu:24.04"),
+            },
+        )]);
+
+        let checks = podman_checks(Some(&config), &executor, false);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].id, "runtime.podman");
+    }
+
+    #[test]
+    fn image_checks_follow_a_passing_preflight_for_each_local_podman_target() {
+        let mut responses = passing_podman_probes();
+        responses.push(Ok(output(b"")));
+        responses.push(Ok(failed(b"")));
+        let executor = FakeExecutor::new(responses);
+        let config = config_with([
+            (
+                "alpha",
+                TargetTemplate::LocalPodman {
+                    container: container("ubuntu:24.04"),
+                },
+            ),
+            (
+                "beta",
+                TargetTemplate::LocalPodman {
+                    container: container("ghcr.io/example/dev:1"),
+                },
+            ),
+        ]);
+
+        let checks = podman_checks(Some(&config), &executor, false);
+
+        assert_eq!(
+            checks
+                .iter()
+                .map(|check| check.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "runtime.podman",
+                "runtime.podman.image.alpha",
+                "runtime.podman.image.beta"
+            ]
+        );
+        assert_eq!(checks[1].status, CheckStatus::Ready);
+        assert_eq!(checks[2].status, CheckStatus::Fixable);
+    }
+
+    #[test]
+    fn ssh_podman_check_is_ready_after_ssh_wrapped_probes_without_smoke() {
+        let executor = FakeExecutor::new(passing_podman_probes());
+
+        let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, false);
+
+        assert_eq!(check.id, "runtime.ssh-podman.remote");
+        assert_eq!(check.title, "Remote Podman for target remote");
+        assert_eq!(check.status, CheckStatus::Ready);
+        assert!(check.detail.contains("Remote rootless Podman 5.4.2"));
+        assert!(check.detail.contains("dev@example.test"));
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 3);
+        for command in commands.iter() {
+            assert_eq!(command.program, "ssh");
+            assert!(command.args.contains(&"dev@example.test".to_owned()));
+            assert!(command.args.last().unwrap().starts_with("'podman'"));
+        }
+    }
+
+    #[test]
+    fn ssh_podman_check_failure_scopes_the_remediation_to_the_remote_host() {
+        let executor = FakeExecutor::new([Ok(output(b"podman version 3.4.7\n"))]);
+
+        let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, false);
+
+        assert_eq!(check.status, CheckStatus::Fixable);
+        assert!(check.detail.contains("dev@example.test"));
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .unwrap()
+                .starts_with("On dev@example.test: Upgrade Podman")
+        );
+    }
+
+    #[test]
+    fn ssh_podman_check_unreachable_host_recommends_verifying_ssh() {
+        let executor =
+            FakeExecutor::new([Err(anyhow!("ssh: connect to host example.test: timeout"))]);
+
+        let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, false);
+
+        assert_eq!(check.status, CheckStatus::Fixable);
+        assert_eq!(
+            check.remediation.as_deref(),
+            Some(
+                "Verify `ssh dev@example.test` succeeds noninteractively from this host, then install rootless Podman 4 or newer there (see docs/PODMAN.md)."
+            )
+        );
+    }
+
+    #[test]
+    fn ssh_podman_check_smoke_runs_an_ssh_wrapped_disposable_container() {
+        let mut responses = passing_podman_probes();
+        responses.extend([
+            Ok(output(b"created\n")),
+            Ok(output(b"ok\n")),
+            Ok(output(b"removed\n")),
+        ]);
+        let executor = FakeExecutor::new(responses);
+
+        let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, true);
+
+        assert_eq!(check.status, CheckStatus::Ready);
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 6);
+        for command in commands.iter().skip(3) {
+            assert_eq!(command.program, "ssh");
+            assert!(command.args.contains(&"dev@example.test".to_owned()));
+        }
+        assert!(commands[3].args.last().unwrap().contains("'run' '--init'"));
+        assert!(commands[4].args.last().unwrap().ends_with("'true'"));
+        assert!(commands[5].args.last().unwrap().contains("'rm' '--force'"));
+    }
+
+    #[test]
+    fn ssh_podman_checks_are_skipped_without_a_valid_config() {
+        let executor = FakeExecutor::new([]);
+
+        assert!(ssh_podman_checks(None, &executor, false).is_empty());
+        assert!(executor.commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn worker_check_for_an_ssh_podman_target_without_platform_is_unsupported() {
+        let config = config_with([(
+            "remote",
+            TargetTemplate::SshPodman {
+                ssh: ssh_connection(),
+                container: container("ubuntu:24.04"),
+            },
+        )]);
+
+        let checks = worker_binary_checks(Some(&config));
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].id, "worker.remote");
+        assert_eq!(checks[0].status, CheckStatus::Unsupported);
+        assert_eq!(
+            checks[0].detail,
+            "Set `platform` on this ssh-podman target to check its worker binary; the remote architecture is unknown until provisioning."
+        );
+    }
+
+    #[test]
+    fn worker_check_for_an_ssh_podman_target_with_platform_uses_the_normal_check() {
+        let mut remote = container("ubuntu:24.04");
+        remote.platform = Some("linux/amd64".into());
+        let config = config_with([(
+            "remote",
+            TargetTemplate::SshPodman {
+                ssh: ssh_connection(),
+                container: remote,
+            },
+        )]);
+
+        let checks = worker_binary_checks(Some(&config));
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].id, "worker.remote");
+        assert_ne!(checks[0].status, CheckStatus::Unsupported);
+        assert!(checks[0].detail.contains("x86_64-unknown-linux-musl"));
     }
 
     #[test]
@@ -870,6 +1472,7 @@ mod tests {
     fn linux_instructions_embed_podman_postconditions_and_doctor_loop() {
         let instructions = setup_instructions(InstructionsPlatform::Linux);
         assert!(instructions.contains("hel doctor --json"));
+        assert!(instructions.contains("hel doctor --json --smoke"));
         assert!(instructions.contains("podman unshare cat /proc/self/uid_map"));
         assert!(instructions.contains("Podman **4.0.0 or newer**"));
     }

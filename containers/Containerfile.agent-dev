@@ -1,5 +1,5 @@
-ARG NODE_IMAGE=docker.io/library/node:24-bookworm
-ARG RUST_IMAGE=docker.io/library/rust:1-bookworm
+ARG NODE_IMAGE=docker.io/library/node:24-trixie
+ARG RUST_IMAGE=docker.io/library/rust:1-trixie
 
 FROM ${NODE_IMAGE} AS node
 FROM ${RUST_IMAGE}
@@ -7,7 +7,7 @@ FROM ${RUST_IMAGE}
 LABEL org.opencontainers.image.title="Hel agent development environment" \
       org.opencontainers.image.source="https://github.com/BrokkAi/hel"
 
-# The Node image and Rust image share the Bookworm base. Copying /usr/local
+# The Node image and Rust image share the Trixie base. Copying /usr/local
 # brings in Node, npm, npx, Corepack, and the headers needed by native modules.
 COPY --from=node /usr/local/ /usr/local/
 
@@ -45,11 +45,20 @@ RUN apt-get update \
 # not version-pinned yet.
 RUN npm install --global --no-audit --no-fund \
         @agentclientprotocol/codex-acp@1.1.14 \
-        @agentclientprotocol/claude-agent-acp@0.66.0 \
+        @agentclientprotocol/claude-agent-acp@0.68.0 \
     && npm cache clean --force
 
-RUN rustup component add clippy rustfmt \
-    && rustup target add x86_64-unknown-linux-musl
+# Buildx sets TARGETARCH per platform; the dpkg fallback keeps a plain
+# single-arch `podman build` working.
+ARG TARGETARCH
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
+    && case "$ARCH" in \
+        amd64) MUSL=x86_64-unknown-linux-musl ;; \
+        arm64) MUSL=aarch64-unknown-linux-musl ;; \
+        *) echo "unsupported arch $ARCH" >&2; exit 1 ;; \
+    esac \
+    && rustup component add clippy rustfmt \
+    && rustup target add "$MUSL"
 
 RUN useradd --create-home --shell /bin/bash hel \
     && mkdir -p /workspace /var/lib/hel \

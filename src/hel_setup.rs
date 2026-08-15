@@ -18,7 +18,11 @@ use crate::hel_targets::{
     verify_local_podman,
 };
 
-const DEFAULT_IMAGE: &str = "ubuntu:24.04";
+// Published from containers/Containerfile.agent-dev by
+// .github/workflows/publish-agent-dev-image.yml. It already carries Node, Rust,
+// Git, gh, and the pinned ACP bridges, so a first session does not have to
+// install them.
+const DEFAULT_IMAGE: &str = "ghcr.io/brokkai/hel/agent-dev:latest";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredHome {
