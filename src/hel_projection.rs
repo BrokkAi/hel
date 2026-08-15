@@ -1,6 +1,7 @@
 //! Controller-owned projection of the durable ACP relay stream.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{SessionUpdate, ToolCall};
 use anyhow::{Context, Result, bail};
@@ -101,9 +102,16 @@ pub fn apply_committed_projection_event(
                             item.stable_id
                         );
                     }
-                    existing.clone_from(item);
+                    // Reuse the item in place when no published snapshot shares
+                    // it; otherwise publish a fresh item so snapshots taken
+                    // earlier keep the value they were given.
+                    if let Some(owned) = Arc::get_mut(existing) {
+                        owned.clone_from(item);
+                    } else {
+                        *existing = Arc::new(item.clone());
+                    }
                 } else {
-                    current.transcript.push(item.clone());
+                    current.transcript.push(Arc::new(item.clone()));
                 }
             }
             TranscriptMutation::Remove { stable_id } => {
@@ -335,7 +343,7 @@ fn project_session_update(
                 .transcript
                 .iter()
                 .find(|item| item.stable_id == stable_id)
-                .cloned()
+                .map(|item| TranscriptItem::clone(item))
                 .with_context(|| {
                     format!(
                         "ACP updated tool call {} before creating it",
@@ -374,7 +382,7 @@ fn project_session_update(
                     item.position > latest_user_position
                         && matches!(item.body, TranscriptBody::Plan { .. })
                 })
-                .cloned()
+                .map(|item| TranscriptItem::clone(item))
             {
                 item.body = TranscriptBody::Plan { plan };
                 item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
@@ -453,7 +461,7 @@ fn push_stream_chunk(
             }
         });
     if let Some(index) = existing {
-        let mut item = current.transcript[index].clone();
+        let mut item = TranscriptItem::clone(&current.transcript[index]);
         match &mut item.body {
             TranscriptBody::Agent { chunks, streaming } if agent => {
                 chunks.push(serde_json::to_value(chunk)?);
@@ -518,7 +526,7 @@ fn close_stream_kind(
             _ => continue,
         };
         if streaming {
-            let mut closed = item.clone();
+            let mut closed = TranscriptItem::clone(item);
             match &mut closed.body {
                 TranscriptBody::Agent { streaming, .. }
                 | TranscriptBody::Thought { streaming, .. } => *streaming = false,
@@ -682,14 +690,14 @@ pub fn materialized_session_from_canonical(
                     TranscriptBody::System { text: text.clone() }
                 }
             };
-            Ok(TranscriptItem {
+            Ok(Arc::new(TranscriptItem {
                 stable_id: item.stable_id.clone(),
                 position: item.position,
                 latest_content_event_ordinal: item.latest_content_event_ordinal,
                 created_at_ms: item.created_at_ms,
                 last_changed_at_ms: item.last_changed_at_ms,
                 body,
-            })
+            }))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(MaterializedSession {
@@ -1020,7 +1028,7 @@ mod tests {
         session.applied_event_ordinal = 2;
         session.applied_event_digest = "a".repeat(64);
         session.execution = MaterializedExecutionState::Running { started_at_ms: 100 };
-        session.transcript.push(TranscriptItem {
+        session.transcript.push(Arc::new(TranscriptItem {
             stable_id: "agent:answer-1".into(),
             position: 2,
             latest_content_event_ordinal: Some(2),
@@ -1032,7 +1040,7 @@ mod tests {
                 })],
                 streaming: true,
             },
-        });
+        }));
 
         apply_observation(
             &mut session,
@@ -1081,7 +1089,7 @@ mod tests {
         session.applied_event_digest = "a".repeat(64);
         session.last_activity_at_ms = Some(40);
         session.session_title = Some("Build it".into());
-        session.transcript.push(TranscriptItem {
+        session.transcript.push(Arc::new(TranscriptItem {
             stable_id: "agent:a".into(),
             position: 2,
             latest_content_event_ordinal: Some(4),
@@ -1095,8 +1103,8 @@ mod tests {
                 })],
                 streaming: false,
             },
-        });
-        session.transcript.push(TranscriptItem {
+        }));
+        session.transcript.push(Arc::new(TranscriptItem {
             stable_id: "thought:t".into(),
             position: 3,
             latest_content_event_ordinal: None,
@@ -1114,8 +1122,8 @@ mod tests {
                 })],
                 streaming: false,
             },
-        });
-        session.transcript.push(TranscriptItem {
+        }));
+        session.transcript.push(Arc::new(TranscriptItem {
             stable_id: "tool:call-1".into(),
             position: 4,
             latest_content_event_ordinal: None,
@@ -1132,8 +1140,8 @@ mod tests {
                     "_meta": {"provider": "test"}
                 }),
             },
-        });
-        session.transcript.push(TranscriptItem {
+        }));
+        session.transcript.push(Arc::new(TranscriptItem {
             stable_id: "plan:4".into(),
             position: 4,
             latest_content_event_ordinal: None,
@@ -1150,7 +1158,7 @@ mod tests {
                     "_meta": {"planProvider": "test"}
                 }),
             },
-        });
+        }));
         let canonical = canonical_session_from_materialized(&session).unwrap();
         canonical.validate().unwrap();
         let restored = materialized_session_from_canonical("session-1", &canonical).unwrap();
@@ -1167,15 +1175,17 @@ mod tests {
         session.applied_event_digest = "a".repeat(64);
         session.last_activity_at_ms = Some(10_000);
         session.transcript = (1..=10_000)
-            .map(|position| TranscriptItem {
-                stable_id: format!("system:{position}"),
-                position,
-                latest_content_event_ordinal: None,
-                created_at_ms: i64::try_from(position).unwrap(),
-                last_changed_at_ms: i64::try_from(position).unwrap(),
-                body: TranscriptBody::System {
-                    text: format!("event {position}"),
-                },
+            .map(|position| {
+                Arc::new(TranscriptItem {
+                    stable_id: format!("system:{position}"),
+                    position,
+                    latest_content_event_ordinal: None,
+                    created_at_ms: i64::try_from(position).unwrap(),
+                    last_changed_at_ms: i64::try_from(position).unwrap(),
+                    body: TranscriptBody::System {
+                        text: format!("event {position}"),
+                    },
+                })
             })
             .collect();
         let next = event(
@@ -1198,5 +1208,77 @@ mod tests {
         assert_eq!(session.transcript.len(), 10_000);
         apply_committed_projection_event(&mut session, &next, &projected.mutation).unwrap();
         assert_eq!(session.transcript.len(), 10_001);
+    }
+
+    fn agent_chunk(text: &str, message_id: &str) -> RelayObservation {
+        RelayObservation::SessionUpdate {
+            update: Box::new(SessionUpdate::AgentMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(text),
+                ))
+                .message_id(message_id),
+            )),
+        }
+    }
+
+    fn end_turn() -> RelayObservation {
+        RelayObservation::CommandCompleted {
+            command_id: "prompt-1".into(),
+            outcome: RelayCommandOutcome::Prompt {
+                stop_reason: "end_turn".into(),
+            },
+        }
+    }
+
+    fn agent_text(item: &TranscriptItem) -> String {
+        let TranscriptBody::Agent { chunks, .. } = &item.body else {
+            panic!("expected an agent message, got {:?}", item.body);
+        };
+        crate::hel_chat::materialized_chunks_text(chunks)
+    }
+
+    #[test]
+    fn appending_a_transcript_item_leaves_earlier_items_shared_with_older_snapshots() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, agent_chunk("answer", "answer-1"));
+        apply_observation(&mut session, end_turn());
+        let published = session.clone();
+
+        apply_observation(
+            &mut session,
+            RelayObservation::Warning {
+                message: "disk is nearly full".into(),
+            },
+        );
+
+        assert_eq!(published.transcript.len(), 1);
+        assert_eq!(session.transcript.len(), 2);
+        assert!(
+            Arc::ptr_eq(&session.transcript[0], &published.transcript[0]),
+            "cloning a session must share earlier transcript items, not copy them"
+        );
+    }
+
+    #[test]
+    fn appending_a_chunk_replaces_only_the_streaming_tail_item() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, agent_chunk("finished", "answer-1"));
+        apply_observation(&mut session, end_turn());
+        apply_observation(&mut session, agent_chunk("hel", "answer-2"));
+        let published = session.clone();
+
+        apply_observation(&mut session, agent_chunk("lo", "answer-2"));
+
+        assert_eq!(session.transcript.len(), 2);
+        assert!(
+            Arc::ptr_eq(&session.transcript[0], &published.transcript[0]),
+            "finalized items stay shared while the tail streams"
+        );
+        assert!(
+            !Arc::ptr_eq(&session.transcript[1], &published.transcript[1]),
+            "the streaming tail must be replaced, not mutated in place"
+        );
+        assert_eq!(agent_text(&published.transcript[1]), "hel");
+        assert_eq!(agent_text(&session.transcript[1]), "hello");
     }
 }

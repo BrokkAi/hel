@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -906,7 +907,7 @@ fn load_materialized_session_with(
                 last_changed_at_ms,
                 body_json,
             )| {
-                Ok(TranscriptItem {
+                Ok(Arc::new(TranscriptItem {
                     stable_id,
                     position,
                     latest_content_event_ordinal,
@@ -915,7 +916,7 @@ fn load_materialized_session_with(
                     body: serde_json::from_str(&body_json).with_context(|| {
                         format!("parse materialized transcript body for session {session_id}")
                     })?,
-                })
+                }))
             },
         )
         .collect::<Result<Vec<_>>>()?;
@@ -2158,7 +2159,7 @@ mod tests {
                 ("effort".into(), serde_json::json!("high")),
             ]),
             transcript: vec![
-                TranscriptItem {
+                Arc::new(TranscriptItem {
                     stable_id: "user:1".into(),
                     position: 1,
                     latest_content_event_ordinal: None,
@@ -2170,8 +2171,8 @@ mod tests {
                             "text": "build it"
                         })],
                     },
-                },
-                TranscriptItem {
+                }),
+                Arc::new(TranscriptItem {
                     stable_id: "agent:2".into(),
                     position: 2,
                     latest_content_event_ordinal: Some(2),
@@ -2185,8 +2186,8 @@ mod tests {
                         })],
                         streaming: false,
                     },
-                },
-                TranscriptItem {
+                }),
+                Arc::new(TranscriptItem {
                     stable_id: "tool:call-1".into(),
                     position: 3,
                     latest_content_event_ordinal: None,
@@ -2208,8 +2209,8 @@ mod tests {
                             "_meta": {"provider": "test"}
                         }),
                     },
-                },
-                TranscriptItem {
+                }),
+                Arc::new(TranscriptItem {
                     stable_id: "plan:1".into(),
                     position: 4,
                     latest_content_event_ordinal: None,
@@ -2226,7 +2227,7 @@ mod tests {
                             "_meta": {"planProvider": "test"}
                         }),
                     },
-                },
+                }),
             ],
             queued_prompts: vec![MaterializedQueuedPrompt {
                 command_id: "prompt-2".into(),

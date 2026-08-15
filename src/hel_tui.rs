@@ -6247,6 +6247,7 @@ fn refresh_age(now: u64, refreshed: u64) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -6762,21 +6763,21 @@ mod tests {
         }
     }
 
-    fn transcript_item(position: u64, body: TranscriptBody) -> TranscriptItem {
+    fn transcript_item(position: u64, body: TranscriptBody) -> Arc<TranscriptItem> {
         let at_ms = i64::try_from(position).unwrap() * 1_000;
         let latest_content_event_ordinal =
             matches!(&body, TranscriptBody::Agent { .. }).then_some(position);
-        TranscriptItem {
+        Arc::new(TranscriptItem {
             stable_id: format!("item-{position}"),
             position,
             latest_content_event_ordinal,
             created_at_ms: at_ms,
             last_changed_at_ms: at_ms,
             body,
-        }
+        })
     }
 
-    fn agent_message(position: u64, text: impl Into<String>) -> TranscriptItem {
+    fn agent_message(position: u64, text: impl Into<String>) -> Arc<TranscriptItem> {
         transcript_item(
             position,
             TranscriptBody::Agent {
@@ -6788,7 +6789,7 @@ mod tests {
         )
     }
 
-    fn thought(position: u64, text: impl Into<String>) -> TranscriptItem {
+    fn thought(position: u64, text: impl Into<String>) -> Arc<TranscriptItem> {
         transcript_item(
             position,
             TranscriptBody::Thought {
@@ -6802,7 +6803,7 @@ mod tests {
 
     fn materialized_session_for(
         session_id: &str,
-        transcript: Vec<TranscriptItem>,
+        transcript: Vec<Arc<TranscriptItem>>,
     ) -> MaterializedSession {
         let frontier = transcript
             .iter()
@@ -6828,7 +6829,7 @@ mod tests {
 
     fn apply_materialized_transcript(
         dashboard: &mut DashboardState,
-        transcript: Vec<TranscriptItem>,
+        transcript: Vec<Arc<TranscriptItem>>,
     ) {
         apply_materialized_transcript_for(dashboard, "session-1", transcript);
     }
@@ -6836,7 +6837,7 @@ mod tests {
     fn apply_materialized_transcript_for(
         dashboard: &mut DashboardState,
         session_id: &str,
-        transcript: Vec<TranscriptItem>,
+        transcript: Vec<Arc<TranscriptItem>>,
     ) {
         dashboard.apply_materialized_session(&materialized_session_for(session_id, transcript));
     }
@@ -6844,7 +6845,7 @@ mod tests {
     /// A conversation of `count` numbered exchanges, so preview scroll
     /// assertions can name the message they expect to see. Agent chunks
     /// coalesce unless separated, so each pairs with its own prompt.
-    fn numbered_conversation(count: u64) -> Vec<TranscriptItem> {
+    fn numbered_conversation(count: u64) -> Vec<Arc<TranscriptItem>> {
         (0..count)
             .flat_map(|index| {
                 [
@@ -7118,7 +7119,7 @@ mod tests {
         assert_eq!(dashboard.selected_session().unwrap().id, "session-b");
 
         let mut second = agent_message(1, "second");
-        second.last_changed_at_ms = 2_000_000_100_000;
+        Arc::make_mut(&mut second).last_changed_at_ms = 2_000_000_100_000;
         apply_materialized_transcript_for(&mut dashboard, "session-b", vec![second]);
         dashboard.handle_key(key(KeyCode::Char('s')));
         assert_eq!(dashboard.session_order, SessionOrder::RecentActivity);
@@ -7129,7 +7130,7 @@ mod tests {
         assert_eq!(dashboard.selected_session().unwrap().id, "session-b");
 
         let mut later_thought = thought(1, "later thought");
-        later_thought.last_changed_at_ms = 2_000_000_200_000;
+        Arc::make_mut(&mut later_thought).last_changed_at_ms = 2_000_000_200_000;
         apply_materialized_transcript_for(&mut dashboard, "session-c", vec![later_thought]);
         assert_eq!(
             ordered_ids(&dashboard),
@@ -7137,7 +7138,7 @@ mod tests {
         );
 
         let mut newest = agent_message(1, "newest");
-        newest.last_changed_at_ms = 2_000_000_300_000;
+        Arc::make_mut(&mut newest).last_changed_at_ms = 2_000_000_300_000;
         apply_materialized_transcript_for(&mut dashboard, "session-a", vec![newest]);
         assert_eq!(
             ordered_ids(&dashboard),
@@ -7170,7 +7171,7 @@ mod tests {
                 }),
             },
         );
-        later_tool.last_changed_at_ms = 2_000_000_400_000;
+        Arc::make_mut(&mut later_tool).last_changed_at_ms = 2_000_000_400_000;
         apply_materialized_transcript_for(&mut dashboard, "session-b", vec![later_tool]);
         assert_eq!(
             ordered_ids(&dashboard),
@@ -7256,8 +7257,8 @@ mod tests {
         );
 
         let mut updated = agent_message(1, "first continuation");
-        updated.latest_content_event_ordinal = Some(2);
-        updated.last_changed_at_ms = 2_000;
+        Arc::make_mut(&mut updated).latest_content_event_ordinal = Some(2);
+        Arc::make_mut(&mut updated).last_changed_at_ms = 2_000;
         let mut projection = materialized_session_for("session-1", vec![updated]);
         projection.applied_event_ordinal = 2;
         dashboard.apply_materialized_session(&projection);

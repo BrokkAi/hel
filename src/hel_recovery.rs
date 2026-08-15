@@ -381,16 +381,18 @@ mod tests {
     fn completed(position: u64) -> MaterializedSession {
         let mut session = MaterializedSession::empty("session-1");
         session.applied_event_ordinal = position;
-        session.transcript.push(crate::hel_state::TranscriptItem {
-            stable_id: format!("user:{position}"),
-            position,
-            latest_content_event_ordinal: None,
-            created_at_ms: 1,
-            last_changed_at_ms: 1,
-            body: TranscriptBody::User {
-                content: vec![serde_json::json!({"type": "text", "text": "go"})],
-            },
-        });
+        session
+            .transcript
+            .push(Arc::new(crate::hel_state::TranscriptItem {
+                stable_id: format!("user:{position}"),
+                position,
+                latest_content_event_ordinal: None,
+                created_at_ms: 1,
+                last_changed_at_ms: 1,
+                body: TranscriptBody::User {
+                    content: vec![serde_json::json!({"type": "text", "text": "go"})],
+                },
+            }));
         session
     }
 

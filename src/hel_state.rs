@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -174,7 +175,9 @@ pub struct MaterializedSession {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub configuration: BTreeMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub transcript: Vec<TranscriptItem>,
+    /// Transcript items are shared by pointer so cloning a snapshot copies
+    /// handles rather than the whole conversation.
+    pub transcript: Vec<Arc<TranscriptItem>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_prompts: Vec<MaterializedQueuedPrompt>,
 }
@@ -972,7 +975,7 @@ mod tests {
         assert_eq!(materialized.last_activity_at_ms(), None);
 
         materialized.execution = MaterializedExecutionState::Running { started_at_ms: 300 };
-        materialized.transcript.push(TranscriptItem {
+        materialized.transcript.push(Arc::new(TranscriptItem {
             stable_id: "system:1".into(),
             position: 1,
             latest_content_event_ordinal: None,
@@ -981,7 +984,7 @@ mod tests {
             body: TranscriptBody::System {
                 text: "working".into(),
             },
-        });
+        }));
         materialized.queued_prompts.push(MaterializedQueuedPrompt {
             command_id: "prompt-2".into(),
             content: Vec::new(),
@@ -996,6 +999,41 @@ mod tests {
         assert_eq!(materialized.last_activity_at_ms(), Some(500));
         materialized.execution = MaterializedExecutionState::Idle;
         assert_eq!(materialized.last_activity_at_ms(), Some(500));
+    }
+
+    /// Shared transcript items must stay plain JSON on the wire: sharing is a
+    /// controller memory concern, not part of the serialized shape.
+    #[test]
+    fn shared_transcript_items_serialize_as_plain_items() {
+        let mut materialized = MaterializedSession::empty("session-1");
+        materialized.applied_event_ordinal = 1;
+        materialized.applied_event_digest = "a".repeat(64);
+        let item = Arc::new(TranscriptItem {
+            stable_id: "system:1".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 10,
+            last_changed_at_ms: 10,
+            body: TranscriptBody::System {
+                text: "started".into(),
+            },
+        });
+        // The same item twice would be deduplicated by serde's pointer-aware
+        // encodings; stable ids keep it a legal transcript.
+        materialized.transcript.push(Arc::clone(&item));
+        let mut second = TranscriptItem::clone(&item);
+        second.stable_id = "system:2".into();
+        materialized.transcript.push(Arc::new(second));
+        materialized.validate().unwrap();
+
+        let encoded = serde_json::to_value(&materialized).unwrap();
+        assert_eq!(encoded["transcript"][0]["stable_id"], "system:1");
+        assert_eq!(encoded["transcript"][0]["body"]["kind"], "system");
+        assert_eq!(encoded["transcript"][0]["body"]["text"], "started");
+        assert_eq!(encoded["transcript"][1]["stable_id"], "system:2");
+
+        let restored: MaterializedSession = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored, materialized);
     }
 
     #[test]

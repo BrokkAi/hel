@@ -4,6 +4,7 @@ mod rendering;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
@@ -1251,7 +1252,7 @@ impl ChatState {
                     },
                 };
                 let timestamp = entry.recorded_at_ms.unwrap_or_default();
-                TranscriptItem {
+                Arc::new(TranscriptItem {
                     stable_id,
                     position: entry.start_seq,
                     latest_content_event_ordinal: (entry.role == ChatRole::Agent)
@@ -1259,7 +1260,7 @@ impl ChatState {
                     created_at_ms: timestamp,
                     last_changed_at_ms: timestamp,
                     body,
-                }
+                })
             })
             .collect::<Vec<_>>();
         let started_at_ms = self
@@ -5300,8 +5301,8 @@ mod tests {
         );
     }
 
-    fn agent_transcript_item(stable_id: &str, ordinal: u64) -> TranscriptItem {
-        TranscriptItem {
+    fn agent_transcript_item(stable_id: &str, ordinal: u64) -> Arc<TranscriptItem> {
+        Arc::new(TranscriptItem {
             stable_id: stable_id.to_owned(),
             position: ordinal,
             latest_content_event_ordinal: Some(ordinal),
@@ -5313,7 +5314,7 @@ mod tests {
                 })],
                 streaming: false,
             },
-        }
+        })
     }
 
     #[test]
@@ -6621,7 +6622,7 @@ mod tests {
         session.applied_event_ordinal = 2;
         session.applied_event_digest = "a".repeat(64);
         session.transcript = vec![
-            TranscriptItem {
+            Arc::new(TranscriptItem {
                 stable_id: "tool:inspect".into(),
                 position: 1,
                 latest_content_event_ordinal: None,
@@ -6636,8 +6637,8 @@ mod tests {
                         "locations": locations
                     }),
                 },
-            },
-            TranscriptItem {
+            }),
+            Arc::new(TranscriptItem {
                 stable_id: "plan:current".into(),
                 position: 2,
                 latest_content_event_ordinal: None,
@@ -6646,7 +6647,7 @@ mod tests {
                 body: TranscriptBody::Plan {
                     plan: serde_json::json!({"entries": plan}),
                 },
-            },
+            }),
         ];
 
         let entries = materialized_chat_entries(&session);
@@ -6679,7 +6680,7 @@ mod tests {
     fn apply_materialized_skips_rebuild_at_same_ordinal() {
         let mut session = MaterializedSession::empty("session-same-ordinal");
         session.applied_event_ordinal = 1;
-        session.transcript.push(TranscriptItem {
+        session.transcript.push(Arc::new(TranscriptItem {
             stable_id: "user:1".into(),
             position: 1,
             latest_content_event_ordinal: None,
@@ -6688,12 +6689,12 @@ mod tests {
             body: TranscriptBody::User {
                 content: vec![serde_json::json!("first")],
             },
-        });
+        }));
 
         let mut chat = ChatState::from_materialized(&session, &[], &[]);
         assert_eq!(chat.entries[0].text, "first");
 
-        session.transcript[0].body = TranscriptBody::User {
+        Arc::make_mut(&mut session.transcript[0]).body = TranscriptBody::User {
             content: vec![serde_json::json!("changed without new ordinal")],
         };
         session.queued_prompts.push(MaterializedQueuedPrompt {
