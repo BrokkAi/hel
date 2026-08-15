@@ -642,8 +642,13 @@ async fn run_session_actor(
                         connection = None;
                         failures = failures.saturating_add(1);
                         if failures >= UNREACHABLE_FAILURE_THRESHOLD {
+                            // Bind the clone first: borrowing inside the call
+                            // would hold the watch read guard while
+                            // `publish_view` takes the write lock, deadlocking
+                            // this actor on its own view.
+                            let snapshot = view_tx.borrow().snapshot.clone();
                             publish_view(&target.session_id, ManagedSessionView {
-                                snapshot: view_tx.borrow().snapshot.clone(),
+                                snapshot,
                                 connected: false,
                                 error: Some(format!("{error:#}")),
                             }, &view_tx, &updates);
@@ -825,14 +830,22 @@ fn publish_view(
     watch: &watch::Sender<ManagedSessionView>,
     updates: &CoalescedUpdateSender,
 ) {
-    if *watch.borrow() == view {
-        return;
-    }
-    watch.send_replace(view.clone());
-    updates.send(SessionManagerUpdate {
-        session_id: session_id.to_owned(),
-        view,
+    // Compare and replace under one lock acquisition; a separate
+    // `watch.borrow()` check would reacquire the lock and invite the
+    // read-then-write deadlock this function's callers must avoid.
+    let changed = watch.send_if_modified(|current| {
+        if *current == view {
+            return false;
+        }
+        *current = view.clone();
+        true
     });
+    if changed {
+        updates.send(SessionManagerUpdate {
+            session_id: session_id.to_owned(),
+            view,
+        });
+    }
 }
 
 pub struct StandaloneSession {
@@ -1198,6 +1211,80 @@ mod tests {
         assert!(lifecycle.return_lease(3));
         assert!(!lifecycle.should_stop());
         assert!(lifecycle.accepts_new_work());
+    }
+
+    const UNREACHABLE_VIEW_TEST_CHILD: &str = "HEL_TEST_UNREACHABLE_RELAY_CHILD";
+
+    #[tokio::test(start_paused = true)]
+    async fn unreachable_relay_publishes_error_view() {
+        // HEL_DATA_DIR is process-global, so run the database-backed half in
+        // an exact child test instead of racing unrelated tests in this
+        // process.
+        if std::env::var_os(UNREACHABLE_VIEW_TEST_CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let test_name = format!(
+                "{}::unreachable_relay_publishes_error_view",
+                module_path!()
+                    .strip_prefix("hel::")
+                    .unwrap_or(module_path!())
+            );
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(UNREACHABLE_VIEW_TEST_CHILD, "1")
+                .env("HEL_DATA_DIR", directory.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated unreachable relay test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // A regression in the publish path deadlocks the actor instead of
+        // returning an error, so convert a hang into a hard failure.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(60));
+            eprintln!("unreachable relay error view was never published");
+            std::process::exit(101);
+        });
+
+        let (_commands_tx, commands_rx) = mpsc::channel(4);
+        let (_releases_tx, releases_rx) = mpsc::unbounded_channel();
+        let (_retirement_tx, retirement_rx) = watch::channel(false);
+        let (view_tx, mut view_rx) = watch::channel(ManagedSessionView::default());
+        let (updates_tx, mut updates_rx) = coalesced_update_channel();
+        tokio::spawn(run_session_actor(
+            target("hel-relay-program-that-does-not-exist"),
+            commands_rx,
+            releases_rx,
+            retirement_rx,
+            view_tx,
+            updates_tx,
+        ));
+
+        loop {
+            view_rx.changed().await.unwrap();
+            let view = view_rx.borrow_and_update().clone();
+            if !view.connected {
+                let error = view
+                    .error
+                    .expect("unreachable view carries the connect error");
+                assert!(
+                    error.contains("session relay proxy"),
+                    "unexpected error: {error}"
+                );
+                break;
+            }
+        }
+        let update = updates_rx
+            .recv()
+            .await
+            .expect("dashboard feed received the error view");
+        assert_eq!(update.session_id, "session-1");
+        assert!(!update.view.connected);
     }
 
     #[test]
