@@ -343,7 +343,10 @@ enum ToolCollapse {
     /// Member of a collapsed run whose summary renders on the run head.
     Hidden,
     /// Head of a collapsed run spanning `self..end` (end exclusive).
-    Summary { end: usize, fingerprint: u64 },
+    Summary {
+        end: usize,
+        fingerprint: u64,
+    },
 }
 
 /// A read-only copy of the projected conversation that can be rendered by
@@ -5804,8 +5807,12 @@ mod tests {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.entries.push(completed_tool(1, "grep -rn alpha src"));
         chat.entries.push(completed_tool(2, "grep -rn beta src"));
-        chat.entries
-            .push(ChatEntry::tool(3, "cat notes.md", None, ToolStatus::Running));
+        chat.entries.push(ChatEntry::tool(
+            3,
+            "cat notes.md",
+            None,
+            ToolStatus::Running,
+        ));
 
         assert_eq!(
             transcript_text(&mut chat, 80),
