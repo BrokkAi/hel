@@ -57,7 +57,7 @@ Prefer hand-written test fakes over mocking or dependency-injection frameworks.
 Do not redirect Cargo or other build output into `/tmp`. If sandbox restrictions
 block normal build storage, run the build outside the sandbox.
 
-Unit tests are colocated in module-level `#[cfg(test)]` blocks. `tests/` holds only the PTY termination test and the `tests/e2e/` shell/expect harness.
+Unit tests are colocated in module-level `#[cfg(test)]` blocks. `crates/hel-cli/tests/` holds the PTY termination test, and `tests/e2e/` holds the shell/expect harness.
 
 ## Coding Style & Naming Conventions
 

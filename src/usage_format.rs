@@ -121,10 +121,7 @@ fn normalize_reset_at(value: &str, now: DateTime<FixedOffset>) -> Option<DateTim
 }
 
 /// Render a session's current-turn clock, leaving idle sessions blank.
-pub(crate) fn format_turn_clock(
-    now_epoch_seconds: u64,
-    current_turn_started_at: Option<u64>,
-) -> String {
+pub fn format_turn_clock(now_epoch_seconds: u64, current_turn_started_at: Option<u64>) -> String {
     if let Some(started_at) = current_turn_started_at {
         let elapsed = now_epoch_seconds.saturating_sub(started_at);
         return format!("{:02}:{:02}", elapsed / 60, elapsed % 60);

@@ -423,7 +423,7 @@ impl TranscriptSnapshot {
         Self::from_entries_at(entries, session.applied_event_ordinal)
     }
 
-    pub(crate) fn has_assistant_messages(&self) -> bool {
+    pub fn has_assistant_messages(&self) -> bool {
         self.entries
             .iter()
             .any(|entry| entry.role == ChatRole::Agent && !entry.text.trim().is_empty())
@@ -437,7 +437,7 @@ impl TranscriptSnapshot {
     /// The last `maximum_lines` non-empty rows, skipping `scroll` rows above the
     /// live tail. Renders only the entries the window touches. Returns the rows
     /// and the scroll actually applied, clamped to the history available.
-    pub(crate) fn rich_tail_scrolled(
+    pub fn rich_tail_scrolled(
         &mut self,
         width: u16,
         maximum_lines: usize,
@@ -661,7 +661,7 @@ pub fn materialized_content_text(content: &[serde_json::Value]) -> String {
         .join("\n")
 }
 
-pub(crate) fn materialized_chunks_text(chunks: &[serde_json::Value]) -> String {
+pub fn materialized_chunks_text(chunks: &[serde_json::Value]) -> String {
     chunks
         .iter()
         .filter_map(|value| serde_json::from_value::<ContentChunk>(value.clone()).ok())
@@ -4500,7 +4500,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, chat: &mut ChatState) {
 const ROLE_GUTTER: &str = "│ ";
 const ROLE_GUTTER_WIDTH: usize = 2;
 
-pub(crate) fn render_agent_message_tail(
+pub fn render_agent_message_tail(
     source: &str,
     width: usize,
     maximum_lines: usize,

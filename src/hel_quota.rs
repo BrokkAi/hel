@@ -43,19 +43,19 @@ pub struct ProfileQuota {
 }
 
 impl ProfileQuota {
-    pub(crate) fn weekly_window(&self) -> Option<&QuotaWindow> {
+    pub fn weekly_window(&self) -> Option<&QuotaWindow> {
         self.windows
             .iter()
             .find(|window| is_weekly_quota_window(&window.label))
     }
 
-    pub(crate) fn five_hour_window(&self) -> Option<&QuotaWindow> {
+    pub fn five_hour_window(&self) -> Option<&QuotaWindow> {
         self.windows
             .iter()
             .find(|window| is_short_quota_window(&window.label))
     }
 
-    pub(crate) fn five_hour_projects_exhaustion(&self) -> bool {
+    pub fn five_hour_projects_exhaustion(&self) -> bool {
         self.five_hour_window().is_some_and(|window| {
             projects_exhaustion_before_reset(window, self.refreshed_at_epoch_seconds)
         })

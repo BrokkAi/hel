@@ -17,14 +17,14 @@ use ratatui::widgets::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::hel_chat::{TranscriptSnapshot, materialized_content_text, render_agent_message_tail};
-use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
-use crate::hel_quota::{ProfileQuota, QuotaWindow};
-use crate::hel_state::{
+use hel::hel_chat::{TranscriptSnapshot, materialized_content_text, render_agent_message_tail};
+use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate};
+use hel::hel_quota::{ProfileQuota, QuotaWindow};
+use hel::hel_state::{
     HelState, MaterializedExecutionState, MaterializedSession, SessionRecord,
     SessionResourceAllocation, SessionState, TranscriptBody,
 };
-use crate::hel_targets::{
+use hel::hel_targets::{
     AdditionalMount, DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage,
     SessionResourceUsage, default_mount_destination, path_completion,
 };
@@ -503,8 +503,7 @@ fn validate_mount_entry(mounts: &MountWizard) -> Option<String> {
         source: mounts.source.clone().into(),
         destination: mounts.destination.clone().into(),
     };
-    if let Err(error) = crate::hel_targets::validate_additional_mounts(std::slice::from_ref(&mount))
-    {
+    if let Err(error) = hel::hel_targets::validate_additional_mounts(std::slice::from_ref(&mount)) {
         return Some(error.to_string());
     }
     let duplicate = mounts.mounts.iter().enumerate().any(|(index, existing)| {
@@ -569,7 +568,7 @@ struct SessionDetail {
     resource_usage: Option<SessionResourceUsage>,
     transcript: Option<TranscriptSnapshot>,
     transcript_hydration: TranscriptHydration,
-    queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
+    queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
 }
 
 pub struct PreparedMaterializedSessionDetail {
@@ -582,7 +581,7 @@ pub struct PreparedMaterializedSessionDetail {
     agent_message_latest_content_ordinals: Vec<u64>,
     unread_agent_messages: usize,
     transcript: TranscriptSnapshot,
-    queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
+    queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
 }
 
 impl PreparedMaterializedSessionDetail {
@@ -602,7 +601,7 @@ impl PreparedMaterializedSessionDetail {
             let TranscriptBody::Agent { chunks, .. } = &item.body else {
                 return None;
             };
-            let text = crate::hel_chat::materialized_chunks_text(chunks);
+            let text = hel::hel_chat::materialized_chunks_text(chunks);
             (!text.trim().is_empty()).then(|| text.clone())
         });
         let agent_message_latest_content_ordinals = session
@@ -617,7 +616,7 @@ impl PreparedMaterializedSessionDetail {
         let queued_prompts = session
             .queued_prompts
             .iter()
-            .map(|prompt| crate::hel_worker::QueuedPrompt {
+            .map(|prompt| hel::hel_worker::QueuedPrompt {
                 id: prompt.command_id.clone(),
                 text: materialized_content_text(&prompt.content),
                 attachments: Vec::new(),
@@ -991,7 +990,7 @@ impl DashboardState {
     pub fn apply_queued_prompts(
         &mut self,
         session_id: &str,
-        queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
+        queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
     ) {
         self.session_details
             .entry(session_id.to_owned())
@@ -1161,7 +1160,7 @@ impl DashboardState {
             return DashboardAction::None;
         }
         if is_paste_shortcut(key) {
-            match crate::hel_clipboard::read_text() {
+            match hel::hel_clipboard::read_text() {
                 Ok(text) => self.handle_paste(&text),
                 Err(error) => self.notice = Some(format!("Paste failed: {error:#}")),
             }
@@ -4617,7 +4616,7 @@ fn session_values(
         let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
         format!("Launch {}s", now_epoch_seconds.saturating_sub(started_at))
     } else {
-        crate::usage_format::format_turn_clock(
+        hel::usage_format::format_turn_clock(
             now_epoch_seconds,
             detail.and_then(|detail| detail.current_turn_started_at),
         )
@@ -6252,11 +6251,11 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::hel_config::{
+    use hel::hel_config::{
         CONFIG_VERSION, ContainerTemplate, HarnessProfile, ProjectBundle, ProjectRepository,
         SshConnection,
     };
-    use crate::hel_state::{CheckpointMetadata, STATE_VERSION, TranscriptItem};
+    use hel::hel_state::{CheckpointMetadata, STATE_VERSION, TranscriptItem};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -7236,7 +7235,7 @@ mod tests {
         let mut initial = materialized_session_for("session-1", vec![agent_message(1, "first ")]);
         initial
             .queued_prompts
-            .push(crate::hel_state::MaterializedQueuedPrompt {
+            .push(hel::hel_state::MaterializedQueuedPrompt {
                 command_id: "queued-1".into(),
                 content: vec![serde_json::json!({ "type": "text", "text": "next task" })],
                 queued_at_ms: 0,
@@ -7460,7 +7459,7 @@ mod tests {
             launch_template: "hel".into(),
             launch_template_version: None,
             ssh_user: "ubuntu".into(),
-            address_source: crate::hel_config::AwsAddressSource::PublicIp,
+            address_source: hel::hel_config::AwsAddressSource::PublicIp,
             identity_file: None,
             ssh_args: Vec::new(),
         };
@@ -8122,7 +8121,7 @@ mod tests {
             launch_template: "hel".into(),
             launch_template_version: None,
             ssh_user: "ubuntu".into(),
-            address_source: crate::hel_config::AwsAddressSource::PublicIp,
+            address_source: hel::hel_config::AwsAddressSource::PublicIp,
             identity_file: None,
             ssh_args: Vec::new(),
         };
@@ -9512,12 +9511,12 @@ mod tests {
         session.project_directory = Some(PathBuf::from(
             "/home/user/Projects/source/.hel/worktrees/session-1",
         ));
-        session.managed_worktree = Some(crate::hel_state::ManagedWorktree {
+        session.managed_worktree = Some(hel::hel_state::ManagedWorktree {
             source_project_directory: PathBuf::from("/home/user/Projects/source"),
             source_repository: PathBuf::from("/home/user/Projects/source"),
             worktree_root: PathBuf::from("/home/user/Projects/source/.hel/worktrees/session-1"),
             branch: "hel/session-1".into(),
-            target: crate::hel_state::ManagedWorktreeTarget::Local,
+            target: hel::hel_state::ManagedWorktreeTarget::Local,
         });
         assert_eq!(session_project(&config, &session), "source");
     }
