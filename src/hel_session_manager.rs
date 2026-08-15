@@ -824,6 +824,35 @@ async fn sync_actor_connection(
     }
 }
 
+/// Cheap equivalence for published views.
+///
+/// The materialized projection is a function of the relay event chain, so its
+/// transcript can only differ when the applied event frontier differs. Every
+/// sync tick would otherwise walk the whole conversation to prove nothing
+/// changed. The remaining scalars are compared directly because they are small
+/// and bound the projection's non-transcript state.
+fn view_is_unchanged(current: &ManagedSessionView, next: &ManagedSessionView) -> bool {
+    if current.connected != next.connected || current.error != next.error {
+        return false;
+    }
+    match (&current.snapshot, &next.snapshot) {
+        (None, None) => true,
+        (Some(current), Some(next)) => {
+            let (current_session, next_session) = (&current.materialized, &next.materialized);
+            current.latest_auth_failure_ordinal == next.latest_auth_failure_ordinal
+                && current.operational == next.operational
+                && current_session.session_id == next_session.session_id
+                && current_session.applied_event_ordinal == next_session.applied_event_ordinal
+                && current_session.applied_event_digest == next_session.applied_event_digest
+                && current_session.last_activity_at_ms == next_session.last_activity_at_ms
+                && current_session.execution == next_session.execution
+                && current_session.session_title == next_session.session_title
+                && current_session.queued_prompts == next_session.queued_prompts
+        }
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
 fn publish_view(
     session_id: &str,
     view: ManagedSessionView,
@@ -834,7 +863,7 @@ fn publish_view(
     // `watch.borrow()` check would reacquire the lock and invite the
     // read-then-write deadlock this function's callers must avoid.
     let changed = watch.send_if_modified(|current| {
-        if *current == view {
+        if view_is_unchanged(current, &view) {
             return false;
         }
         *current = view.clone();
@@ -1043,10 +1072,12 @@ impl StandaloneSession {
                 &projected.mutation,
             )? {
                 ProjectionApplyOutcome::Applied => {
+                    // The mutation is durable now, so hand its values to the
+                    // in-memory projection rather than copying them again.
                     apply_committed_projection_event(
                         &mut self.materialized,
                         event,
-                        &projected.mutation,
+                        projected.mutation,
                     )?;
                     if relay_event_reports_auth_failure(event) {
                         self.latest_auth_failure_ordinal = Some(event.ordinal);
@@ -1132,6 +1163,140 @@ mod tests {
             session_id: "session-1".to_owned(),
             spec: CommandSpec::new(program, std::iter::empty::<&str>()),
         }
+    }
+
+    /// A connected view carrying a conversation, so republishing it exercises
+    /// the case a whole-transcript comparison would have to walk.
+    fn view_at_ordinal(ordinal: u64) -> ManagedSessionView {
+        let digest = "a".repeat(64);
+        let mut materialized = MaterializedSession::empty("session-1");
+        materialized.applied_event_ordinal = ordinal;
+        materialized.applied_event_digest = digest.clone();
+        materialized.transcript = (1..=200)
+            .map(|position| {
+                Arc::new(crate::hel_state::TranscriptItem {
+                    stable_id: format!("system:{position}"),
+                    position,
+                    latest_content_event_ordinal: None,
+                    created_at_ms: 1,
+                    last_changed_at_ms: 1,
+                    body: crate::hel_state::TranscriptBody::System {
+                        text: format!("event {position}"),
+                    },
+                })
+            })
+            .collect();
+        ManagedSessionView {
+            snapshot: Some(ManagedSessionSnapshot {
+                materialized,
+                operational: RelayOperationalState {
+                    session_id: "session-1".into(),
+                    execution: crate::hel_worker::RelayExecutionState::Idle,
+                    latest_ordinal: ordinal,
+                    latest_digest: digest.clone(),
+                    acknowledged_through: ordinal,
+                    acknowledged_digest: digest,
+                    recovery_floor_ordinal: 0,
+                    recovery_floor_digest: crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST.into(),
+                    native_session_id: None,
+                    agent_capabilities: None,
+                    agent_info: None,
+                    config_options: Vec::new(),
+                    available_commands: Vec::new(),
+                    config: BTreeMap::new(),
+                    active_prompt: None,
+                    queued_prompts: Vec::new(),
+                    checkpoint_barrier: None,
+                    checkpoint_ready: None,
+                },
+                latest_auth_failure_ordinal: None,
+            }),
+            connected: true,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn republishing_an_unchanged_view_notifies_nobody() {
+        let (view_tx, mut view_rx) = watch::channel(ManagedSessionView::default());
+        let (updates_tx, mut updates_rx) = coalesced_update_channel();
+
+        publish_view("session-1", view_at_ordinal(7), &view_tx, &updates_tx);
+        assert!(view_rx.has_changed().expect("watch stays open"));
+        assert_eq!(
+            updates_rx.try_recv().expect("the first view is news").view,
+            view_at_ordinal(7)
+        );
+        let _ = view_rx.borrow_and_update();
+
+        publish_view("session-1", view_at_ordinal(7), &view_tx, &updates_tx);
+
+        assert!(
+            !view_rx.has_changed().expect("watch stays open"),
+            "a sync tick that moved nothing must not wake the dashboard"
+        );
+        assert!(updates_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn publishing_an_advanced_event_frontier_notifies_watchers() {
+        let (view_tx, mut view_rx) = watch::channel(ManagedSessionView::default());
+        let (updates_tx, mut updates_rx) = coalesced_update_channel();
+        publish_view("session-1", view_at_ordinal(7), &view_tx, &updates_tx);
+        let _ = updates_rx.try_recv();
+        let _ = view_rx.borrow_and_update();
+
+        publish_view("session-1", view_at_ordinal(8), &view_tx, &updates_tx);
+
+        assert!(view_rx.has_changed().expect("watch stays open"));
+        let update = updates_rx.try_recv().expect("the advance is news");
+        assert_eq!(update.session_id, "session-1");
+        assert_eq!(
+            update
+                .view
+                .snapshot
+                .expect("published snapshot")
+                .materialized
+                .applied_event_ordinal,
+            8
+        );
+    }
+
+    #[test]
+    fn publishing_relay_state_that_moved_without_the_frontier_notifies_watchers() {
+        let (view_tx, mut view_rx) = watch::channel(ManagedSessionView::default());
+        let (updates_tx, mut updates_rx) = coalesced_update_channel();
+        publish_view("session-1", view_at_ordinal(7), &view_tx, &updates_tx);
+        let _ = updates_rx.try_recv();
+        let _ = view_rx.borrow_and_update();
+
+        let mut view = view_at_ordinal(7);
+        view.snapshot
+            .as_mut()
+            .expect("published snapshot")
+            .operational
+            .execution = crate::hel_worker::RelayExecutionState::Running;
+        publish_view("session-1", view, &view_tx, &updates_tx);
+
+        assert!(view_rx.has_changed().expect("watch stays open"));
+        assert!(updates_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn losing_the_relay_republishes_the_same_snapshot_as_disconnected() {
+        let (view_tx, mut view_rx) = watch::channel(ManagedSessionView::default());
+        let (updates_tx, mut updates_rx) = coalesced_update_channel();
+        publish_view("session-1", view_at_ordinal(7), &view_tx, &updates_tx);
+        let _ = updates_rx.try_recv();
+        let _ = view_rx.borrow_and_update();
+
+        let mut view = view_at_ordinal(7);
+        view.connected = false;
+        view.error = Some("relay is unreachable".into());
+        publish_view("session-1", view, &view_tx, &updates_tx);
+
+        assert!(view_rx.has_changed().expect("watch stays open"));
+        assert!(updates_rx.try_recv().is_ok());
     }
 
     #[test]
