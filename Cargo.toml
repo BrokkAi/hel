@@ -79,3 +79,9 @@ tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+[profile.dev]
+# Line tables keep file:line backtraces while cutting ~230MB of DWARF per
+# binary; links and test builds get materially faster. Use a temporary
+# `debug = 2` override when a debugger needs full variable info.
+debug = "line-tables-only"
