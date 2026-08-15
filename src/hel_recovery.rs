@@ -329,6 +329,15 @@ impl RecoveryCoordinator {
     pub fn try_result(&mut self) -> Option<RecoveryResult> {
         self.results.try_recv().ok()
     }
+
+    /// Waits for the next finished recovery copy.
+    ///
+    /// Event-driven loops select on this instead of polling; `None` means the
+    /// coordinator task has stopped. Cancel-safe, so a lost `select!` race
+    /// keeps the result queued.
+    pub async fn result(&mut self) -> Option<RecoveryResult> {
+        self.results.recv().await
+    }
 }
 
 #[derive(Default)]
