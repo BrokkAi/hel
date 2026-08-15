@@ -262,7 +262,11 @@ file.
 For isolated and remote targets, harness homes are whitelists rather than
 complete dot-directory copies. For Claude, Hel copies `.credentials.json`, `settings.json`, `CLAUDE.md`,
 `skills/`, and `plugins/`; it does not copy transcripts, project history, or
-caches. SSH and GPG keys, package-registry credentials, cloud configuration,
+caches. While sessions run, Hel also reconciles each profile's `skills/` tree
+into every live session on the same sixty-second cycle as credential sync:
+the controller-side home stays authoritative, so skill edits and deletions
+propagate to Codex, Claude, and Kimi sessions within a minute. Sessions whose
+workers predate skills sync are skipped until their target is re-provisioned. SSH and GPG keys, package-registry credentials, cloud configuration,
 shell dotfiles, editor configuration, and toolchain state are not transferred
 automatically. The standard container image includes GitHub CLI. When the
 controller's `gh` is authenticated, Hel passes its active GitHub token to each
