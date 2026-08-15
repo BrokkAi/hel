@@ -134,7 +134,7 @@ pub enum SessionOperationKind {
 impl SessionOperationKind {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Launching => "Launching",
+            Self::Launching => "Launch",
             Self::Resuming => "Resuming",
             Self::Pausing => "Pausing",
             Self::Destroying => "Destroying",
@@ -558,6 +558,7 @@ impl ImportDialog {
 
 #[derive(Debug, Default)]
 struct SessionDetail {
+    materialized_applied_event_ordinal: Option<u64>,
     current_turn_started_at: Option<u64>,
     last_activity_at_ms: Option<u64>,
     last_agent_message: Option<String>,
@@ -569,6 +570,80 @@ struct SessionDetail {
     transcript: Option<TranscriptSnapshot>,
     transcript_hydration: TranscriptHydration,
     queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
+}
+
+pub struct PreparedMaterializedSessionDetail {
+    session_id: String,
+    applied_event_ordinal: u64,
+    session_title: Option<String>,
+    current_turn_started_at: Option<u64>,
+    last_activity_at_ms: Option<u64>,
+    last_agent_message: Option<String>,
+    agent_message_latest_content_ordinals: Vec<u64>,
+    unread_agent_messages: usize,
+    transcript: TranscriptSnapshot,
+    queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
+}
+
+impl PreparedMaterializedSessionDetail {
+    pub fn from_materialized(
+        session: MaterializedSession,
+        detached_after_event_ordinal: u64,
+    ) -> Self {
+        let current_turn_started_at = match session.execution {
+            MaterializedExecutionState::Running { started_at_ms } => {
+                u64::try_from(started_at_ms).ok().map(|value| value / 1_000)
+            }
+            MaterializedExecutionState::Idle
+            | MaterializedExecutionState::Closing
+            | MaterializedExecutionState::Closed => None,
+        };
+        let last_agent_message = session.transcript.iter().rev().find_map(|item| {
+            let TranscriptBody::Agent { chunks, .. } = &item.body else {
+                return None;
+            };
+            let text = crate::hel_chat::materialized_chunks_text(chunks);
+            (!text.trim().is_empty()).then(|| text.clone())
+        });
+        let agent_message_latest_content_ordinals = session
+            .transcript
+            .iter()
+            .filter(|item| item.is_nonempty_agent_message())
+            .filter_map(|item| item.latest_content_event_ordinal)
+            .collect();
+        let unread_agent_messages =
+            usize::try_from(session.unread_agent_messages_after(detached_after_event_ordinal))
+                .unwrap_or(usize::MAX);
+        let queued_prompts = session
+            .queued_prompts
+            .iter()
+            .map(|prompt| crate::hel_worker::QueuedPrompt {
+                id: prompt.command_id.clone(),
+                text: materialized_content_text(&prompt.content),
+                attachments: Vec::new(),
+                created_at_ms: prompt.queued_at_ms,
+            })
+            .collect();
+        let session_id = session.session_id.clone();
+        let applied_event_ordinal = session.applied_event_ordinal;
+        let session_title = session.session_title.clone();
+        let last_activity_at_ms = session
+            .last_activity_at_ms()
+            .and_then(|value| u64::try_from(value).ok());
+        let transcript = TranscriptSnapshot::from_materialized(&session);
+        Self {
+            session_id,
+            applied_event_ordinal,
+            session_title,
+            current_turn_started_at,
+            last_activity_at_ms,
+            last_agent_message,
+            agent_message_latest_content_ordinals,
+            unread_agent_messages,
+            transcript,
+            queued_prompts,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -593,6 +668,7 @@ pub struct DashboardState {
     quotas: BTreeMap<String, ProfileQuota>,
     quota_refreshing: BTreeSet<String>,
     session_details: BTreeMap<String, SessionDetail>,
+    checkpoint_archive_sizes: BTreeMap<String, Option<u64>>,
     session_operations: BTreeMap<String, SessionOperationDisplay>,
     capacity_details: BTreeMap<String, CapacityDetail>,
     session_index: usize,
@@ -623,6 +699,7 @@ impl DashboardState {
             quotas,
             quota_refreshing: BTreeSet::new(),
             session_details: BTreeMap::new(),
+            checkpoint_archive_sizes: BTreeMap::new(),
             session_operations: BTreeMap::new(),
             capacity_details: BTreeMap::new(),
             session_index: 0,
@@ -864,55 +941,44 @@ impl DashboardState {
             .sessions
             .get(&session.session_id)
             .map_or(0, |record| record.detached_after_event_ordinal);
-        let last_agent_message = session.transcript.iter().rev().find_map(|item| {
-            let TranscriptBody::Agent { chunks, .. } = &item.body else {
-                return None;
-            };
-            let text = crate::hel_chat::materialized_chunks_text(chunks);
-            (!text.trim().is_empty()).then(|| text.clone())
-        });
+        self.apply_prepared_materialized_session(
+            PreparedMaterializedSessionDetail::from_materialized(
+                session.clone(),
+                detached_after_event_ordinal,
+            ),
+        );
+    }
+
+    pub fn apply_prepared_materialized_session(
+        &mut self,
+        prepared: PreparedMaterializedSessionDetail,
+    ) -> bool {
         let detail = self
             .session_details
-            .entry(session.session_id.clone())
+            .entry(prepared.session_id.clone())
             .or_default();
-        detail.current_turn_started_at = match session.execution {
-            MaterializedExecutionState::Running { started_at_ms } => {
-                u64::try_from(started_at_ms).ok().map(|value| value / 1_000)
-            }
-            MaterializedExecutionState::Idle
-            | MaterializedExecutionState::Closing
-            | MaterializedExecutionState::Closed => None,
-        };
-        detail.last_activity_at_ms = session
-            .last_activity_at_ms()
-            .and_then(|value| u64::try_from(value).ok());
-        detail.last_agent_message = last_agent_message;
-        detail.agent_message_latest_content_ordinals = session
-            .transcript
-            .iter()
-            .filter(|item| item.is_nonempty_agent_message())
-            .filter_map(|item| item.latest_content_event_ordinal)
-            .collect();
-        detail.unread_agent_messages =
-            usize::try_from(session.unread_agent_messages_after(detached_after_event_ordinal))
-                .unwrap_or(usize::MAX);
-        detail.transcript = Some(TranscriptSnapshot::from_materialized(session));
+        if detail
+            .materialized_applied_event_ordinal
+            .is_some_and(|current| prepared.applied_event_ordinal < current)
+        {
+            return false;
+        }
+        detail.materialized_applied_event_ordinal = Some(prepared.applied_event_ordinal);
+        detail.current_turn_started_at = prepared.current_turn_started_at;
+        detail.last_activity_at_ms = prepared.last_activity_at_ms;
+        detail.last_agent_message = prepared.last_agent_message;
+        detail.agent_message_latest_content_ordinals =
+            prepared.agent_message_latest_content_ordinals;
+        detail.unread_agent_messages = prepared.unread_agent_messages;
+        detail.transcript = Some(prepared.transcript);
         detail.transcript_hydration = TranscriptHydration::Ready;
-        detail.queued_prompts = session
-            .queued_prompts
-            .iter()
-            .map(|prompt| crate::hel_worker::QueuedPrompt {
-                id: prompt.command_id.clone(),
-                text: materialized_content_text(&prompt.content),
-                attachments: Vec::new(),
-                created_at_ms: prompt.queued_at_ms,
-            })
-            .collect();
-        if let Some(title) = session.session_title.as_ref()
-            && let Some(record) = self.state.sessions.get_mut(&session.session_id)
+        detail.queued_prompts = prepared.queued_prompts;
+        if let Some(title) = prepared.session_title.as_ref()
+            && let Some(record) = self.state.sessions.get_mut(&prepared.session_id)
         {
             record.acp_session_title = Some(title.clone());
         }
+        true
     }
 
     pub fn mark_transcript_unavailable(&mut self, session_id: &str) {
@@ -933,8 +999,20 @@ impl DashboardState {
             .queued_prompts = queued_prompts;
     }
 
+    pub fn apply_checkpoint_archive_sizes(&mut self, sizes: BTreeMap<String, Option<u64>>) {
+        self.checkpoint_archive_sizes = sizes;
+    }
+
     pub fn set_notice(&mut self, notice: impl Into<String>) {
         self.notice = Some(notice.into());
+    }
+
+    pub fn replace_notice_if(&mut self, expected: &str, replacement: impl Into<String>) -> bool {
+        if self.notice.as_deref() != Some(expected) {
+            return false;
+        }
+        self.notice = Some(replacement.into());
+        true
     }
 
     pub fn clear_notice(&mut self) {
@@ -1089,9 +1167,8 @@ impl DashboardState {
             }
             return DashboardAction::None;
         }
-        if !matches!(self.mode, Mode::Dashboard)
-            && dashboard_accelerator(key.modifiers)
-            && key.code == KeyCode::Char('c')
+        if dashboard_accelerator(key.modifiers)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
         {
             return DashboardAction::QuitDetach;
         }
@@ -3610,6 +3687,14 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     dashboard.pane_areas = None;
     dashboard.selected_preview_area = None;
     let area = frame.area();
+    if area.width < MINIMUM_TERMINAL_WIDTH {
+        render_terminal_too_small(
+            frame,
+            area,
+            TerminalSizeRequirement::Width(MINIMUM_TERMINAL_WIDTH),
+        );
+        return;
+    }
     dashboard.import_sessions_area =
         matches!(dashboard.mode, Mode::Import(_)).then(|| import_sessions_pane(area));
 
@@ -3786,7 +3871,11 @@ fn render_adaptive_dashboard(
         else {
             unreachable!()
         };
-        render_terminal_too_small(frame, frame_area, required_frame_height);
+        render_terminal_too_small(
+            frame,
+            frame_area,
+            TerminalSizeRequirement::Height(required_frame_height),
+        );
         return;
     };
 
@@ -3927,22 +4016,31 @@ struct ActivePreviews {
     applied_scroll: usize,
 }
 
-fn render_terminal_too_small(frame: &mut Frame, area: Rect, required_height: u16) {
+const MINIMUM_TERMINAL_WIDTH: u16 = 32;
+
+enum TerminalSizeRequirement {
+    Width(u16),
+    Height(u16),
+}
+
+fn render_terminal_too_small(frame: &mut Frame, area: Rect, requirement: TerminalSizeRequirement) {
+    let instructions = match requirement {
+        TerminalSizeRequirement::Width(required_width) => vec![
+            Line::raw(format!("Need at least {required_width} columns.")),
+            Line::raw(format!("Current width: {}.", area.width)),
+        ],
+        TerminalSizeRequirement::Height(required_height) => vec![Line::raw(format!(
+            "Increase height to at least {required_height} rows (currently {}).",
+            area.height
+        ))],
+    };
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                "Terminal too small",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Line::raw(format!(
-                "Increase height to at least {required_height} rows (currently {}).",
-                area.height
-            )),
-        ])
-        .alignment(Alignment::Center),
-        area,
-    );
+    let mut lines = vec![Line::styled(
+        "Terminal too small",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    lines.extend(instructions);
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
 
 fn render_import_progress(frame: &mut Frame, area: Rect, progress: &ImportProgress) {
@@ -4388,6 +4486,11 @@ fn render_sessions(
             session,
             &dashboard.config,
             dashboard.session_operations.get(&session.id),
+            dashboard
+                .checkpoint_archive_sizes
+                .get(&session.id)
+                .copied()
+                .flatten(),
         )
     });
     let archived_focused = dashboard.focus == Focus::Archived;
@@ -4564,12 +4667,8 @@ fn path_leaf(path: &std::path::Path) -> String {
         .into_owned()
 }
 
-fn checkpoint_archive_size(session: &SessionRecord) -> String {
-    session
-        .checkpoint
-        .as_ref()
-        .and_then(|checkpoint| std::fs::metadata(&checkpoint.archive_path).ok())
-        .map(|metadata| format_resource_bytes(metadata.len()))
+fn checkpoint_archive_size(size: Option<u64>) -> String {
+    size.map(format_resource_bytes)
         .unwrap_or_else(|| "—".into())
 }
 
@@ -4718,6 +4817,7 @@ fn archived_session_row(
     session: &SessionRecord,
     config: &HelConfig,
     operation: Option<&SessionOperationDisplay>,
+    archive_size: Option<u64>,
 ) -> Row<'static> {
     let checkpoint = session
         .checkpoint
@@ -4728,7 +4828,7 @@ fn archived_session_row(
         session_project(config, session),
         session.last_profile.clone(),
         checkpoint,
-        checkpoint_archive_size(session),
+        checkpoint_archive_size(archive_size),
         operation.map_or_else(
             || session_name(session).to_string(),
             |operation| format!("{}… {}", operation.kind.label(), session_name(session)),
@@ -5710,8 +5810,9 @@ fn render_picker(
     help: &[&str],
     navigation: PickerNavigation,
 ) {
+    let width_percent = if area.width < 64 { 100 } else { 68 };
     let popup = centered_rect(
-        68,
+        width_percent,
         (choices.len() as u16 + help.len() as u16 + 6).clamp(9, 19),
         area,
     );
@@ -5743,9 +5844,7 @@ fn render_picker(
         ])
         .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         popup,
     );
 }
@@ -6461,6 +6560,61 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_replaces_layouts_narrower_than_32_columns() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        let mut terminal = Terminal::new(TestBackend::new(31, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw narrow dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Terminal too small"));
+        assert!(rendered.contains("Need at least 32 columns"));
+        assert!(rendered.contains("Current width: 31"));
+
+        let mut terminal = Terminal::new(TestBackend::new(32, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw exact minimum-width dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("Terminal too small"));
+        assert!(rendered.contains("Active"));
+    }
+
+    #[test]
+    fn new_session_picker_keeps_choices_and_controls_visible_at_minimum_width() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        assert_eq!(dashboard.handle_key(ctrl_key('n')), DashboardAction::None);
+        let mut terminal = Terminal::new(TestBackend::new(32, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw minimum-width new-session picker");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("claude-1"));
+        assert!(rendered.contains("codex-2"));
+        assert!(rendered.contains("Cancel"));
+        assert!(rendered.contains("Next"));
+    }
+
+    #[test]
     fn dashboard_uses_separate_hotkey_and_notice_rows_without_an_outer_border() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
         dashboard.set_notice("Transient dashboard message");
@@ -6486,6 +6640,28 @@ mod tests {
         };
         assert!(line(buffer.area.bottom() - 2).contains(&format!("{accelerator} for: [N]ew")));
         assert!(line(buffer.area.bottom() - 1).contains("Transient dashboard message"));
+    }
+
+    #[test]
+    fn notice_replacement_does_not_overwrite_a_newer_notice() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.set_notice("Refreshing profile quotas…");
+        assert!(
+            dashboard.replace_notice_if("Refreshing profile quotas…", "Profile quotas refreshed.")
+        );
+        assert_eq!(
+            dashboard.notice.as_deref(),
+            Some("Profile quotas refreshed.")
+        );
+
+        dashboard.set_notice("A later operation failed");
+        assert!(
+            !dashboard.replace_notice_if("Refreshing profile quotas…", "Profile quotas refreshed.")
+        );
+        assert_eq!(
+            dashboard.notice.as_deref(),
+            Some("A later operation failed")
+        );
     }
 
     #[test]
@@ -6522,6 +6698,56 @@ mod tests {
             DashboardAction::None
         );
         assert_eq!(dashboard.focus, Focus::Archived);
+    }
+
+    #[test]
+    fn ctrl_q_quits_without_mutating_any_dashboard_modal() {
+        let mut new_session = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        assert_eq!(new_session.handle_key(ctrl_key('n')), DashboardAction::None);
+
+        let mut resume = dashboard_with_session(archived_session());
+        assert_eq!(
+            resume.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+
+        let mut running = archived_session();
+        running.state = SessionState::Running;
+        running.checkpoint = None;
+        let mut rename = dashboard_with_session(running);
+        assert_eq!(rename.handle_key(ctrl_key('r')), DashboardAction::None);
+
+        let mut import = dashboard_with_session(archived_session());
+        import.show_import_dialog(1, Vec::new());
+
+        let mut importing = dashboard_with_session(archived_session());
+        importing.show_import_progress("Chosen session".into());
+
+        let mut confirm_import = dashboard_with_session(archived_session());
+        confirm_import.show_import_bundle_confirmation(Vec::new(), Vec::new(), false);
+
+        let mut confirm = dashboard_with_session(archived_session());
+        confirm.show_dirty_local_confirmation(DashboardAction::None, vec!["project".into()]);
+
+        for (label, mut dashboard) in [
+            ("new session", new_session),
+            ("resume", resume),
+            ("rename", rename),
+            ("import", import),
+            ("import progress", importing),
+            ("import confirmation", confirm_import),
+            ("confirmation", confirm),
+        ] {
+            assert!(!matches!(dashboard.mode, Mode::Dashboard), "{label}");
+            let mode_before_quit = dashboard.mode.clone();
+
+            assert_eq!(
+                dashboard.handle_key(ctrl_key('q')),
+                DashboardAction::QuitDetach,
+                "{label}"
+            );
+            assert_eq!(dashboard.mode, mode_before_quit, "{label}");
+        }
     }
 
     fn test_capacity_target() -> DeploymentCapacityTarget {
@@ -7054,6 +7280,31 @@ mod tests {
         assert_eq!(
             dashboard.session_details["session-1"].unread_agent_messages,
             0
+        );
+    }
+
+    #[test]
+    fn prepared_materialized_session_drops_stale_ordinals() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        let mut latest = materialized_session_for("session-1", vec![agent_message(2, "latest")]);
+        latest.applied_event_ordinal = 2;
+        let mut stale = materialized_session_for("session-1", vec![agent_message(1, "stale")]);
+        stale.applied_event_ordinal = 1;
+
+        assert!(dashboard.apply_prepared_materialized_session(
+            PreparedMaterializedSessionDetail::from_materialized(latest, 0),
+        ));
+        assert!(!dashboard.apply_prepared_materialized_session(
+            PreparedMaterializedSessionDetail::from_materialized(stale, 0),
+        ));
+
+        assert_eq!(
+            dashboard.session_details["session-1"]
+                .last_agent_message
+                .as_deref(),
+            Some("latest")
         );
     }
 
@@ -9273,15 +9524,36 @@ mod tests {
 
     #[test]
     fn archived_resources_show_the_checkpoint_archive_size() {
-        let directory = tempfile::tempdir().unwrap();
-        let archive = directory.path().join("session.hel.zip");
-        std::fs::write(&archive, vec![0_u8; 1_536]).unwrap();
-        let mut session = archived_session();
-        session.checkpoint.as_mut().unwrap().archive_path = archive;
+        assert_eq!(checkpoint_archive_size(Some(1_536)), "1.5K");
+        assert_eq!(checkpoint_archive_size(None), "—");
+    }
 
-        assert_eq!(checkpoint_archive_size(&session), "1.5K");
-        session.checkpoint.as_mut().unwrap().archive_path = directory.path().join("missing.zip");
-        assert_eq!(checkpoint_archive_size(&session), "—");
+    #[test]
+    fn archived_resources_use_cached_checkpoint_archive_size() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.apply_checkpoint_archive_sizes(BTreeMap::from([(
+            "session-1".to_string(),
+            Some(1_536),
+        )]));
+
+        assert_eq!(
+            dashboard
+                .checkpoint_archive_sizes
+                .get("session-1")
+                .copied()
+                .flatten(),
+            Some(1_536)
+        );
+        assert_eq!(
+            checkpoint_archive_size(
+                dashboard
+                    .checkpoint_archive_sizes
+                    .get("session-1")
+                    .copied()
+                    .flatten()
+            ),
+            "1.5K"
+        );
     }
 
     #[test]

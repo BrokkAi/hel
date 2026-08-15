@@ -7,6 +7,10 @@
 //! background service that reconciles the controller-side canonical copy with
 //! each live session's copy in both directions.
 //!
+//! The same reconcile loop also pushes each profile's synced skills trees
+//! (see `hel_skills`) into live sessions. Skills are not secrets and do not
+//! rotate, so they converge in one direction only: the canonical home wins.
+//!
 //! Credential bytes travel only in worker request and response frames. They
 //! never enter the durable event stream or a checkpoint archive. Fingerprints
 //! and freshness timestamps are not secret and may appear in logs.
@@ -275,12 +279,17 @@ pub enum CredentialSyncAction {
     Pushed,
     /// The session's fresher copy became canonical.
     Pulled,
+    /// The canonical skills trees replaced the session's trees. Skills sync
+    /// is push-only: the controller-side profile home stays authoritative.
+    SkillsPushed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialSyncOutcome {
     pub session_id: String,
-    pub outcome: std::result::Result<CredentialSyncAction, String>,
+    /// Every action taken for the session, or why the reconcile failed. An
+    /// empty action list means the copies already agreed.
+    pub outcome: std::result::Result<Vec<CredentialSyncAction>, String>,
 }
 
 /// Reported to the UI loops only when something happened: an action was taken,
@@ -299,7 +308,11 @@ pub struct CredentialSyncResult {
 impl CredentialSyncResult {
     pub fn pushed_to(&self, session_id: &str) -> bool {
         self.outcomes.iter().any(|outcome| {
-            outcome.session_id == session_id && outcome.outcome == Ok(CredentialSyncAction::Pushed)
+            outcome.session_id == session_id
+                && outcome
+                    .outcome
+                    .as_ref()
+                    .is_ok_and(|actions| actions.contains(&CredentialSyncAction::Pushed))
         })
     }
 
@@ -312,10 +325,43 @@ impl CredentialSyncResult {
             })
     }
 
+    /// Sessions that took at least one action of any kind.
     pub fn actions(&self) -> usize {
         self.outcomes
             .iter()
-            .filter(|outcome| outcome.outcome.is_ok())
+            .filter(|outcome| {
+                outcome
+                    .outcome
+                    .as_ref()
+                    .is_ok_and(|actions| !actions.is_empty())
+            })
+            .count()
+    }
+
+    /// Sessions whose harness credentials were pushed or pulled.
+    pub fn credential_sessions(&self) -> usize {
+        self.count_actions(|action| {
+            matches!(
+                action,
+                CredentialSyncAction::Pushed | CredentialSyncAction::Pulled
+            )
+        })
+    }
+
+    /// Sessions whose skills trees were replaced.
+    pub fn skills_sessions(&self) -> usize {
+        self.count_actions(|action| action == CredentialSyncAction::SkillsPushed)
+    }
+
+    fn count_actions(&self, wanted: impl Fn(CredentialSyncAction) -> bool) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|outcome| {
+                outcome
+                    .outcome
+                    .as_ref()
+                    .is_ok_and(|actions| actions.iter().copied().any(&wanted))
+            })
             .count()
     }
 }
@@ -488,14 +534,14 @@ async fn reconcile_profile(targets: &[CredentialSyncTarget]) -> Vec<CredentialSy
         let mut pulled = false;
         for target in targets {
             match reconcile_session(target).await {
-                Ok(None) => {}
-                Ok(Some(action)) => {
-                    pulled |= action == CredentialSyncAction::Pulled;
+                Ok(actions) if actions.is_empty() => {}
+                Ok(actions) => {
+                    pulled |= actions.contains(&CredentialSyncAction::Pulled);
                     outcomes.insert(
                         target.session_id.clone(),
                         CredentialSyncOutcome {
                             session_id: target.session_id.clone(),
-                            outcome: Ok(action),
+                            outcome: Ok(actions),
                         },
                     );
                 }
@@ -517,10 +563,18 @@ async fn reconcile_profile(targets: &[CredentialSyncTarget]) -> Vec<CredentialSy
     outcomes.into_values().collect()
 }
 
-/// Returns the action taken, or `None` when the copies already agree.
-async fn reconcile_session(target: &CredentialSyncTarget) -> Result<Option<CredentialSyncAction>> {
+/// Returns every action taken; an empty list means the copies already agree.
+async fn reconcile_session(target: &CredentialSyncTarget) -> Result<Vec<CredentialSyncAction>> {
     let canonical_path = harness_authentication_marker(target.harness, &target.profile_home);
     let (canonical, canonical_bytes) = read_credential_file(target.harness, &canonical_path)?;
+    let canonical_skills = crate::hel_skills::collect_skills(target.harness, &target.profile_home)
+        .with_context(|| {
+            format!(
+                "collect canonical skills for profile {} from {}",
+                target.profile_id,
+                target.profile_home.display()
+            )
+        })?;
     let mut client = RelayClient::connect(&target.spec, &target.session_id).await?;
     let result = reconcile_connected(
         &mut client,
@@ -528,6 +582,7 @@ async fn reconcile_session(target: &CredentialSyncTarget) -> Result<Option<Crede
         &canonical_path,
         &canonical,
         &canonical_bytes,
+        &canonical_skills,
     )
     .await;
     // Detach even when the exchange failed; the worker and harness keep
@@ -548,7 +603,9 @@ async fn reconcile_connected(
     canonical_path: &Path,
     canonical: &CredentialSnapshot,
     canonical_bytes: &[u8],
-) -> Result<Option<CredentialSyncAction>> {
+    canonical_skills: &crate::hel_skills::SkillsArchive,
+) -> Result<Vec<CredentialSyncAction>> {
+    let mut actions = Vec::new();
     let session = client.credential_state().await?;
     match reconcile(canonical, &session) {
         SyncAction::None => {
@@ -564,11 +621,10 @@ async fn reconcile_connected(
                     "credential copies differ but neither reports a refresh time; leaving both alone"
                 );
             }
-            Ok(None)
         }
         SyncAction::Push => {
             client.install_credentials(canonical_bytes).await?;
-            Ok(Some(CredentialSyncAction::Pushed))
+            actions.push(CredentialSyncAction::Pushed);
         }
         SyncAction::Pull => {
             let bytes = client.read_credentials().await?;
@@ -584,9 +640,58 @@ async fn reconcile_connected(
                     target.session_id, target.profile_id
                 )
             })?;
-            Ok(Some(CredentialSyncAction::Pulled))
+            actions.push(CredentialSyncAction::Pulled);
         }
     }
+    if reconcile_skills(client, target, canonical_skills).await? {
+        actions.push(CredentialSyncAction::SkillsPushed);
+    }
+    Ok(actions)
+}
+
+/// Converge the session's synced skills trees onto the canonical archive.
+/// Returns true when a push happened. Workers old enough to predate skills
+/// sync answer the unknown method with `InvalidRequest`; those sessions are
+/// skipped quietly until their target is re-provisioned.
+async fn reconcile_skills(
+    client: &mut RelayClient,
+    target: &CredentialSyncTarget,
+    canonical: &crate::hel_skills::SkillsArchive,
+) -> Result<bool> {
+    let canonical_state = canonical.state();
+    let session = match client.skills_state().await {
+        Ok(state) => state,
+        Err(error) if skills_sync_unsupported(&error) => {
+            tracing::debug!(
+                session_id = %target.session_id,
+                profile_id = %target.profile_id,
+                "worker predates skills sync; skipping until the target is re-provisioned"
+            );
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    if session == canonical_state {
+        return Ok(false);
+    }
+    let installed = client.install_skills(&canonical.encode()).await?;
+    if installed != canonical_state {
+        bail!(
+            "session {} skills fingerprint {} does not match the canonical {} after install",
+            target.session_id,
+            installed.fingerprint,
+            canonical_state.fingerprint
+        );
+    }
+    Ok(true)
+}
+
+fn skills_sync_unsupported(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::hel_worker_client::RelayRejected>()
+        .is_some_and(|rejected| {
+            rejected.0.code == crate::hel_worker::RelayErrorCode::InvalidRequest
+        })
 }
 
 #[cfg(test)]

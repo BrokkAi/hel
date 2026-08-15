@@ -293,7 +293,15 @@ impl RecoveryCoordinator {
                                 policy.checkpoint = Some(artifact.metadata.clone());
                             }
                             Err(detail) => {
-                                if let Err(error) = record_recovery_failure(&result.session_id, detail) {
+                                let session_id = result.session_id.clone();
+                                let detail = detail.clone();
+                                let persisted = tokio::task::spawn_blocking(move || {
+                                    record_recovery_failure(&session_id, &detail)
+                                })
+                                .await
+                                .map_err(anyhow::Error::from)
+                                .and_then(|result| result);
+                                if let Err(error) = persisted {
                                     tracing::warn!(session_id = %result.session_id, "could not persist recovery failure: {error:#}");
                                 }
                             }

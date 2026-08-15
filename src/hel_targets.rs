@@ -237,6 +237,13 @@ pub fn path_completion(prefix: &str, candidates: &[String]) -> Option<String> {
 pub trait CommandExecutor {
     fn execute(&self, command: &CommandSpec) -> Result<CommandOutput>;
 
+    /// Whether the operation supervising this executor has requested
+    /// cancellation. Test executors and ordinary process execution are not
+    /// cancellable unless they opt in.
+    fn cancellation_requested(&self) -> bool {
+        false
+    }
+
     fn execute_with_stdin(
         &self,
         _command: &CommandSpec,
@@ -381,6 +388,10 @@ fn terminate_cancellable_child(child: &mut std::process::Child) {
 }
 
 impl CommandExecutor for CancellableProcessExecutor {
+    fn cancellation_requested(&self) -> bool {
+        self.is_cancelled()
+    }
+
     fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
         self.check_cancelled()?;
         let mut child = cancellable_command(command)
