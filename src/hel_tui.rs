@@ -334,6 +334,37 @@ struct ResumeWizard {
 struct RenameEditor {
     session_id: String,
     title: String,
+    focus: RenameFocus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameFocus {
+    Field,
+    Cancel,
+    Save,
+}
+
+const RENAME_BUTTONS: &[&str] = &["Cancel", "Save"];
+const RENAME_FOCUS_ORDER: [RenameFocus; 3] =
+    [RenameFocus::Field, RenameFocus::Cancel, RenameFocus::Save];
+
+impl RenameFocus {
+    /// The button Enter would press. Typing in the field also submits, so Save
+    /// stays highlighted there and exactly one button is ever highlighted.
+    fn button_index(self) -> usize {
+        match self {
+            RenameFocus::Cancel => 0,
+            RenameFocus::Field | RenameFocus::Save => 1,
+        }
+    }
+
+    fn from_button_index(index: usize) -> Self {
+        if index == 0 {
+            RenameFocus::Cancel
+        } else {
+            RenameFocus::Save
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,6 +441,7 @@ struct ImportBundleConfirmation {
 }
 
 const IMPORT_BUNDLE_BUTTONS: &[&str] = &["Cancel", "Continue"];
+const IMPORT_PROGRESS_BUTTONS: &[&str] = &["Cancel"];
 
 /// Button labels for a confirmation dialog, ordered Cancel first and the primary
 /// action last. Typed-confirmation dialogs have no buttons. This is the single
@@ -1251,8 +1283,9 @@ impl DashboardState {
             Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
             Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
             Mode::Import(dialog) => self.handle_import_key(key, dialog),
+            // The only control is the Cancel button, so Enter presses it too.
             Mode::Importing(_) => match key.code {
-                KeyCode::Esc => DashboardAction::CancelImport,
+                KeyCode::Esc | KeyCode::Enter => DashboardAction::CancelImport,
                 _ => DashboardAction::None,
             },
             Mode::ConfirmImportBundle(confirmation) => {
@@ -1268,7 +1301,7 @@ impl DashboardState {
             return;
         }
         match &mut self.mode {
-            Mode::Rename(editor) => {
+            Mode::Rename(editor) if editor.focus == RenameFocus::Field => {
                 let remaining = 64_usize.saturating_sub(editor.title.chars().count());
                 editor.title.extend(pasted.chars().take(remaining));
             }
@@ -1654,6 +1687,7 @@ impl DashboardState {
                 .or(session.acp_session_title.as_ref())
                 .cloned()
                 .unwrap_or_default(),
+            focus: RenameFocus::Field,
         });
     }
 
@@ -1680,6 +1714,26 @@ impl DashboardState {
                 self.cancel_modal();
                 DashboardAction::None
             }
+            KeyCode::Tab | KeyCode::BackTab => {
+                editor.focus =
+                    cycle_control(editor.focus, &RENAME_FOCUS_ORDER, code == KeyCode::BackTab);
+                self.mode = Mode::Rename(editor);
+                DashboardAction::None
+            }
+            // The field has no cursor, so horizontal keys only move between buttons.
+            KeyCode::Left | KeyCode::Right if editor.focus != RenameFocus::Field => {
+                editor.focus = RenameFocus::from_button_index(cycle_button_focus(
+                    editor.focus.button_index(),
+                    RENAME_BUTTONS.len(),
+                    code == KeyCode::Left,
+                ));
+                self.mode = Mode::Rename(editor);
+                DashboardAction::None
+            }
+            KeyCode::Enter if editor.focus == RenameFocus::Cancel => {
+                self.cancel_modal();
+                DashboardAction::None
+            }
             KeyCode::Enter if editor.title.trim().is_empty() => {
                 self.notice = Some("Session name cannot be empty.".into());
                 self.mode = Mode::Rename(editor);
@@ -1692,12 +1746,14 @@ impl DashboardState {
                     title: editor.title,
                 }
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if editor.focus == RenameFocus::Field => {
                 editor.title.pop();
                 self.mode = Mode::Rename(editor);
                 DashboardAction::None
             }
-            KeyCode::Char(character) if editor.title.chars().count() < 64 => {
+            KeyCode::Char(character)
+                if editor.focus == RenameFocus::Field && editor.title.chars().count() < 64 =>
+            {
                 editor.title.push(character);
                 self.mode = Mode::Rename(editor);
                 DashboardAction::None
@@ -4157,8 +4213,6 @@ fn render_terminal_too_small(frame: &mut Frame, area: Rect, requirement: Termina
 }
 
 fn render_import_progress(frame: &mut Frame, area: Rect, progress: &ImportProgress) {
-    let popup = centered_rect(76, 10, area);
-    frame.render_widget(Clear, popup);
     let total = progress
         .total
         .map_or_else(|| "?".into(), |total| total.to_string());
@@ -4177,24 +4231,26 @@ fn render_import_progress(frame: &mut Frame, area: Rect, progress: &ImportProgre
             Style::default().fg(Color::Gray),
         )
     };
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                truncate_text(&progress.session_title, 60),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Line::raw(""),
-            Line::raw(progress.message.clone()),
-            status,
-            Line::styled("Esc cancels this import.", Style::default().fg(Color::Gray)),
-        ])
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " Importing session · progress {}/{total} ",
-            progress.step
-        )))
-        .wrap(Wrap { trim: true }),
-        popup,
-    );
+    let paragraph = Paragraph::new(vec![
+        Line::styled(
+            truncate_text(&progress.session_title, 60),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw(progress.message.clone()),
+        status,
+        Line::raw(""),
+        focused_buttons(IMPORT_PROGRESS_BUTTONS, 0),
+    ])
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        " Importing session · progress {}/{total} ",
+        progress.step
+    )))
+    // `trim: false` keeps the padding inside the leftmost button background.
+    .wrap(Wrap { trim: false });
+    let popup = centered_rect(76, popup_height(&paragraph, 76, 10, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
 }
 
 fn render_import_bundle_confirmation(
@@ -5980,22 +6036,21 @@ fn render_picker(
 }
 
 fn render_rename_editor(frame: &mut Frame, area: Rect, editor: &RenameEditor) {
-    let popup = centered_rect(60, 7, area);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::raw(format!("Session: {}", editor.session_id)),
-            Line::raw(""),
-            Line::styled(editor.title.clone(), Style::default().fg(Color::Cyan)),
-            Line::styled("Enter save · Esc cancel", Style::default().fg(Color::Gray)),
-        ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Rename session "),
-        ),
-        popup,
+    let paragraph = Paragraph::new(vec![
+        Line::raw(format!("Session: {}", editor.session_id)),
+        Line::raw(""),
+        Line::styled(editor.title.clone(), Style::default().fg(Color::Cyan)),
+        Line::raw(""),
+        focused_buttons(RENAME_BUTTONS, editor.focus.button_index()),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Rename session "),
     );
+    let popup = centered_rect(60, popup_height(&paragraph, 60, 8, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
 }
 
 fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &ConfirmDialog) {
@@ -8283,6 +8338,10 @@ mod tests {
     fn rename_uses_acp_title_as_the_initial_value() {
         let mut dashboard = dashboard_with_session(archived_session());
         dashboard.handle_key(ctrl_key('r'));
+        let Mode::Rename(editor) = &dashboard.mode else {
+            panic!("expected rename editor");
+        };
+        assert_eq!(editor.focus, RenameFocus::Field);
         for character in " v2".chars() {
             dashboard.handle_key(key(KeyCode::Char(character)));
         }
@@ -8292,6 +8351,224 @@ mod tests {
                 session_id: "session-1".into(),
                 title: "ACP pretty name v2".into(),
             }
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+    }
+
+    fn dashboard_with_rename_editor() -> DashboardState {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.handle_key(ctrl_key('r'));
+        assert!(matches!(dashboard.mode, Mode::Rename(_)));
+        dashboard
+    }
+
+    fn rename_focus(dashboard: &DashboardState) -> RenameFocus {
+        let Mode::Rename(editor) = &dashboard.mode else {
+            panic!("expected rename editor");
+        };
+        editor.focus
+    }
+
+    #[test]
+    fn rename_editor_cycles_focus_from_the_field_through_both_buttons() {
+        let mut dashboard = dashboard_with_rename_editor();
+        for expected in [
+            RenameFocus::Cancel,
+            RenameFocus::Save,
+            RenameFocus::Field,
+            RenameFocus::Cancel,
+        ] {
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Tab)),
+                DashboardAction::None
+            );
+            assert_eq!(rename_focus(&dashboard), expected);
+        }
+
+        let mut dashboard = dashboard_with_rename_editor();
+        for expected in [RenameFocus::Save, RenameFocus::Cancel, RenameFocus::Field] {
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::BackTab)),
+                DashboardAction::None
+            );
+            assert_eq!(rename_focus(&dashboard), expected);
+        }
+    }
+
+    #[test]
+    fn rename_editor_arrows_move_between_buttons_but_never_edit_the_field() {
+        let mut dashboard = dashboard_with_rename_editor();
+        // The field has no cursor, so arrows there change nothing.
+        for arrow in [KeyCode::Left, KeyCode::Right] {
+            assert_eq!(dashboard.handle_key(key(arrow)), DashboardAction::None);
+            assert_eq!(rename_focus(&dashboard), RenameFocus::Field);
+        }
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(rename_focus(&dashboard), RenameFocus::Cancel);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Right)),
+            DashboardAction::None
+        );
+        assert_eq!(rename_focus(&dashboard), RenameFocus::Save);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Left)),
+            DashboardAction::None
+        );
+        assert_eq!(rename_focus(&dashboard), RenameFocus::Cancel);
+    }
+
+    #[test]
+    fn rename_editor_buttons_ignore_typing_and_backspace() {
+        let mut dashboard = dashboard_with_rename_editor();
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('x'))),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Backspace)),
+            DashboardAction::None
+        );
+        let Mode::Rename(editor) = &dashboard.mode else {
+            panic!("expected rename editor");
+        };
+        assert_eq!(editor.title, "ACP pretty name");
+        assert_eq!(editor.focus, RenameFocus::Cancel);
+    }
+
+    #[test]
+    fn rename_editor_cancel_button_closes_without_renaming() {
+        let mut dashboard = dashboard_with_rename_editor();
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(rename_focus(&dashboard), RenameFocus::Cancel);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+    }
+
+    #[test]
+    fn rename_editor_save_button_renames_like_the_field() {
+        let mut dashboard = dashboard_with_rename_editor();
+        dashboard.handle_key(key(KeyCode::Char('!')));
+        dashboard.handle_key(key(KeyCode::Tab));
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(rename_focus(&dashboard), RenameFocus::Save);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::RenameSession {
+                session_id: "session-1".into(),
+                title: "ACP pretty name!".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn rename_editor_rejects_an_empty_title_from_the_field_and_the_save_button() {
+        for focus_moves in [0, 2] {
+            let mut dashboard = dashboard_with_rename_editor();
+            let Mode::Rename(editor) = &mut dashboard.mode else {
+                panic!("expected rename editor");
+            };
+            editor.title.clear();
+            for _ in 0..focus_moves {
+                dashboard.handle_key(key(KeyCode::Tab));
+            }
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Enter)),
+                DashboardAction::None,
+                "{focus_moves} focus moves"
+            );
+            assert_eq!(
+                dashboard.notice.as_deref(),
+                Some("Session name cannot be empty."),
+                "{focus_moves} focus moves"
+            );
+            assert!(matches!(dashboard.mode, Mode::Rename(_)), "{focus_moves}");
+        }
+    }
+
+    #[test]
+    fn rename_editor_escape_cancels_from_any_focus() {
+        for focus_moves in 0..3 {
+            let mut dashboard = dashboard_with_rename_editor();
+            for _ in 0..focus_moves {
+                dashboard.handle_key(key(KeyCode::Tab));
+            }
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Esc)),
+                DashboardAction::None,
+                "{focus_moves} focus moves"
+            );
+            assert!(matches!(dashboard.mode, Mode::Dashboard), "{focus_moves}");
+        }
+    }
+
+    #[test]
+    fn rename_editor_highlights_save_until_cancel_takes_focus() {
+        let mut dashboard = dashboard_with_rename_editor();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        let mut button_styles = |dashboard: &mut DashboardState| {
+            terminal
+                .draw(|frame| render(frame, dashboard))
+                .expect("draw rename editor");
+            let buffer = terminal.backend().buffer();
+            let lines = buffer_lines(buffer);
+            let row = lines
+                .iter()
+                .position(|line| line.contains(" Cancel ") && line.contains(" Save "))
+                .expect("button row");
+            let y = buffer.area.y + row as u16;
+            assert!(!lines.iter().any(|line| line.contains("Enter save")));
+            (
+                buffer[(buffer.area.x + cell_column(&lines[row], "Cancel"), y)].bg,
+                buffer[(buffer.area.x + cell_column(&lines[row], "Save"), y)].bg,
+            )
+        };
+
+        // The field submits, so Save stays lit while the field has focus.
+        assert_eq!(
+            button_styles(&mut dashboard),
+            (Color::DarkGray, Color::Cyan)
+        );
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(
+            button_styles(&mut dashboard),
+            (Color::Cyan, Color::DarkGray)
+        );
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(
+            button_styles(&mut dashboard),
+            (Color::DarkGray, Color::Cyan)
+        );
+    }
+
+    #[test]
+    fn import_progress_renders_a_focused_cancel_button_that_enter_presses() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.show_import_progress("Chosen session".into());
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw import progress");
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let row = lines
+            .iter()
+            .position(|line| line.contains(" Cancel "))
+            .expect("button row");
+        let y = buffer.area.y + row as u16;
+        let cancel_x = buffer.area.x + cell_column(&lines[row], "Cancel");
+        assert_eq!(buffer[(cancel_x, y)].bg, Color::Cyan);
+        assert_eq!(buffer[(cancel_x - 1, y)].bg, Color::Cyan);
+        assert!(!lines.iter().any(|line| line.contains("Esc cancels this")));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::CancelImport
         );
     }
 
