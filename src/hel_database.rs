@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -313,6 +313,7 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
         migrate_destroying_session_state(connection)?;
     }
     ensure_projection_digest_column(connection)?;
+    ensure_session_draft_input_column(connection)?;
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -474,6 +475,20 @@ fn migrate_destroying_session_state(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Carry unsent chat input across a detach. Added as a structural guard rather
+/// than a new schema version so databases written by either development line
+/// converge, matching `ensure_managed_worktree_column`.
+fn ensure_session_draft_input_column(connection: &Connection) -> Result<()> {
+    if !table_has_column(connection, "sessions", "draft_input")? {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE sessions ADD COLUMN draft_input TEXT NOT NULL DEFAULT '';
+             COMMIT;",
+        )?;
+    }
+    Ok(())
+}
+
 fn ensure_projection_digest_column(connection: &Connection) -> Result<()> {
     let present = connection.query_row(
         "SELECT EXISTS(
@@ -508,7 +523,8 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
                 s.target_template_id, s.state, s.native_session_id, s.acp_session_title,
                 s.session_title_override, c.created_at, s.updated_at,
                 s.detached_after_event_ordinal, s.last_error, s.resource_allocation,
-                s.last_checkpoint_error, s.project_directory, s.managed_worktree
+                s.last_checkpoint_error, s.project_directory, s.managed_worktree,
+                s.draft_input
          FROM sessions s JOIN session_contexts c USING(session_id)
          ORDER BY s.session_id",
     )?;
@@ -552,6 +568,7 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
             created_at: row.get(10)?,
             updated_at: row.get(11)?,
             detached_after_event_ordinal: row.get::<_, u64>(12)?,
+            draft_input: row.get(18)?,
             last_error: row.get(13)?,
             last_checkpoint_error: row.get(15)?,
             checkpoint: None,
@@ -1159,6 +1176,25 @@ fn advance_detached_after_event_ordinal_to(
     )?;
     tx.commit()?;
     Ok(receipt)
+}
+
+/// Overwrite the unsent chat input carried across a detach. Unlike the read
+/// receipt this is not monotonic: a draft can shrink, and an empty string
+/// clears it.
+pub fn set_session_draft_input(session_id: &str, draft: &str) -> Result<()> {
+    set_session_draft_input_at(&database_path(), session_id, draft)
+}
+
+fn set_session_draft_input_at(path: &Path, session_id: &str, draft: &str) -> Result<()> {
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let updated = tx.execute(
+        "UPDATE sessions SET draft_input = ?2 WHERE session_id = ?1",
+        params![session_id, draft],
+    )?;
+    ensure!(updated == 1, "unknown session {session_id}");
+    tx.commit()?;
+    Ok(())
 }
 
 /// Atomically apply the controller's MRU policy for newly used mount sources.
@@ -2132,6 +2168,7 @@ mod tests {
             created_at: "2026-08-12T00:00:00Z".into(),
             updated_at: "2026-08-12T01:00:00Z".into(),
             detached_after_event_ordinal: 7,
+            draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: Some("temporary recovery failure".into()),
             checkpoint: Some(CheckpointMetadata {
@@ -3079,6 +3116,44 @@ mod tests {
         assert_eq!(
             load_state_from(&database).unwrap().sessions["session-1"].detached_after_event_ordinal,
             2
+        );
+    }
+
+    #[test]
+    fn session_draft_input_round_trips_and_an_empty_draft_clears_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        save_session_to(&database, &session("session-1", "project-1")).unwrap();
+
+        assert_eq!(
+            load_state_from(&database).unwrap().sessions["session-1"].draft_input,
+            ""
+        );
+
+        set_session_draft_input_at(&database, "session-1", "half typed thought").unwrap();
+        assert_eq!(
+            load_state_from(&database).unwrap().sessions["session-1"].draft_input,
+            "half typed thought"
+        );
+
+        // An ordinary session save must not roll the draft back.
+        save_session_to(&database, &session("session-1", "project-1")).unwrap();
+        assert_eq!(
+            load_state_from(&database).unwrap().sessions["session-1"].draft_input,
+            "half typed thought"
+        );
+
+        set_session_draft_input_at(&database, "session-1", "").unwrap();
+        assert_eq!(
+            load_state_from(&database).unwrap().sessions["session-1"].draft_input,
+            ""
+        );
+
+        assert!(
+            set_session_draft_input_at(&database, "missing", "text")
+                .unwrap_err()
+                .to_string()
+                .contains("unknown session missing")
         );
     }
 

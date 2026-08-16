@@ -47,10 +47,18 @@ use rendering::{
 
 const MOUSE_SCROLL_ROWS: usize = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatExit {
-    Detached { last_seen_event_ordinal: u64 },
-    QuitDetached { last_seen_event_ordinal: u64 },
+    Detached {
+        last_seen_event_ordinal: u64,
+        /// Unsent input at the moment of detach, empty when the composer was
+        /// clear. The caller persists it so reopening restores the draft.
+        draft: String,
+    },
+    QuitDetached {
+        last_seen_event_ordinal: u64,
+        draft: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1382,6 +1390,15 @@ impl ChatState {
 
     fn clear_input(&mut self) {
         self.set_input(String::new());
+    }
+
+    /// Reinstate the input saved when the user last detached, leaving the
+    /// cursor at the end. An empty draft leaves the composer alone.
+    fn restore_draft(&mut self, draft: String) {
+        if draft.is_empty() {
+            return;
+        }
+        self.set_input(draft);
     }
 
     fn insert_character(&mut self, character: char) {
@@ -3539,6 +3556,22 @@ fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) {
     }
 }
 
+/// Build the exit the chat loop returns, carrying the read receipt and the
+/// unsent draft back to the caller that persists them.
+fn detach_exit(action: &ChatAction, last_seen_event_ordinal: u64, draft: String) -> ChatExit {
+    if action == &ChatAction::QuitDetach {
+        ChatExit::QuitDetached {
+            last_seen_event_ordinal,
+            draft,
+        }
+    } else {
+        ChatExit::Detached {
+            last_seen_event_ordinal,
+            draft,
+        }
+    }
+}
+
 /// How many names each header group shows before collapsing the rest into a
 /// `+K` count.
 const ACTIVITY_HEADER_NAMES: usize = 3;
@@ -3697,6 +3730,7 @@ pub async fn run_chat(
     recovery: Option<RecoveryContext>,
     control: SessionManagerControl,
     others: Vec<OtherSessionIdentity>,
+    draft: String,
 ) -> Result<ChatExit> {
     let view = session.view();
     let needs_initial_sync = view.snapshot.is_none();
@@ -3717,6 +3751,7 @@ pub async fn run_chat(
         },
     );
     chat.set_history_context(bundle_id);
+    chat.restore_draft(draft);
     let (chat_io_tx, mut chat_io_rx) = tokio::sync::mpsc::unbounded_channel::<ChatIoUpdate>();
     {
         let updates = chat_io_tx.clone();
@@ -3898,17 +3933,11 @@ pub async fn run_chat(
                             let _ = cancel.send(());
                         }
                         let last_seen_event_ordinal = chat.latest_seq();
+                        // Capture the draft before the interaction is reset so
+                        // unsent text survives the detach.
+                        let draft = chat.input.clone();
                         chat.reset_interaction();
-                        let exit = if action == ChatAction::QuitDetach {
-                            ChatExit::QuitDetached {
-                                last_seen_event_ordinal,
-                            }
-                        } else {
-                            ChatExit::Detached {
-                                last_seen_event_ordinal,
-                            }
-                        };
-                        return Ok(exit);
+                        return Ok(detach_exit(&action, last_seen_event_ordinal, draft));
                     }
                 }
             }
@@ -4872,6 +4901,61 @@ mod tests {
         assert_eq!(append_dictation("please", "fix this"), "please fix this");
         assert_eq!(append_dictation("", "fix this"), "fix this");
         assert_eq!(append_dictation("please ", ""), "please");
+    }
+
+    #[test]
+    fn a_saved_draft_reopens_in_the_composer_with_the_cursor_at_its_end() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+
+        chat.restore_draft("half typed thought".into());
+
+        assert_eq!(chat.input, "half typed thought");
+        assert_eq!(chat.input_cursor, "half typed thought".len());
+    }
+
+    #[test]
+    fn an_empty_saved_draft_leaves_the_composer_untouched() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("typed since opening".into());
+
+        chat.restore_draft(String::new());
+
+        assert_eq!(chat.input, "typed since opening");
+    }
+
+    #[test]
+    fn detaching_carries_the_unsent_input_into_the_exit() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("half typed thought".into());
+
+        let draft = chat.input.clone();
+        chat.reset_interaction();
+
+        assert_eq!(
+            detach_exit(&ChatAction::Back, 12, draft.clone()),
+            ChatExit::Detached {
+                last_seen_event_ordinal: 12,
+                draft: "half typed thought".into(),
+            }
+        );
+        assert_eq!(
+            detach_exit(&ChatAction::QuitDetach, 12, draft),
+            ChatExit::QuitDetached {
+                last_seen_event_ordinal: 12,
+                draft: "half typed thought".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn detaching_an_empty_composer_carries_an_empty_draft() {
+        assert_eq!(
+            detach_exit(&ChatAction::Back, 3, String::new()),
+            ChatExit::Detached {
+                last_seen_event_ordinal: 3,
+                draft: String::new(),
+            }
+        );
     }
 
     #[test]

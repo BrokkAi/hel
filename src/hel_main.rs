@@ -2533,18 +2533,30 @@ fn spawn_dashboard_rename(
     });
 }
 
-fn spawn_detached_read_receipt_persist(
+/// Longest the quit path waits for the detach write before giving up.
+const DETACH_PERSIST_QUIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Persist everything one detach produces: the read receipt and the unsent
+/// draft. They describe the same moment and the same row, so one task keeps
+/// them together and gives the quit path a single handle to await.
+fn spawn_detached_session_state_persist(
     session_id: String,
     event_ordinal: u64,
+    draft: String,
     updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        let result =
+        let receipt =
             hel::hel_database::advance_detached_after_event_ordinal(&session_id, event_ordinal)
-                .map(|_| ())
-                .map_err(|error| format!("{error:#}"));
-        let _ = updates.send(DashboardIoUpdate::DetachedReadReceipt { session_id, result });
-    });
+                .map(|_| ());
+        // Save the draft even when the receipt was rejected: losing typed text
+        // is worse than an out-of-date read marker.
+        let saved_draft = hel::hel_database::set_session_draft_input(&session_id, &draft);
+        let result = receipt
+            .and(saved_draft)
+            .map_err(|error| format!("{error:#}"));
+        let _ = updates.send(DashboardIoUpdate::DetachedSessionState { session_id, result });
+    })
 }
 
 fn spawn_create_bundle(
@@ -3038,7 +3050,7 @@ enum DashboardIoUpdate {
         title: String,
         result: std::result::Result<String, String>,
     },
-    DetachedReadReceipt {
+    DetachedSessionState {
         session_id: String,
         result: std::result::Result<(), String>,
     },
@@ -3533,10 +3545,10 @@ async fn run_dashboard() -> Result<()> {
                         dashboard.set_notice(format!("Rename failed for {title}: {error}"));
                     }
                 },
-                DashboardIoUpdate::DetachedReadReceipt { session_id, result } => {
+                DashboardIoUpdate::DetachedSessionState { session_id, result } => {
                     if let Err(error) = result {
                         dashboard.set_notice(format!(
-                            "Could not save read status for {}: {error}",
+                            "Could not save draft and read status for {}: {error}",
                             short_id(&session_id)
                         ));
                     }
@@ -3986,6 +3998,7 @@ async fn run_dashboard() -> Result<()> {
                     .with_context(|| format!("unknown session {session_id}"))?
                     .clone();
                 let bundle_id = session_record.bundle_id.clone();
+                let saved_draft = session_record.draft_input.clone();
                 let other_sessions = controller
                     .state
                     .sessions
@@ -4011,6 +4024,7 @@ async fn run_dashboard() -> Result<()> {
                         Some(recovery_context),
                         worker_commands_tx.clone(),
                         other_sessions,
+                        saved_draft,
                     )
                     .await?;
                     Ok::<_, anyhow::Error>((exit, managed.view()))
@@ -4018,13 +4032,15 @@ async fn run_dashboard() -> Result<()> {
                 .await;
                 match result {
                     Ok((exit, view)) => {
-                        let (detached_after_event_ordinal, quit_after_detach) = match exit {
+                        let (detached_after_event_ordinal, draft, quit_after_detach) = match exit {
                             hel::hel_chat::ChatExit::Detached {
                                 last_seen_event_ordinal,
-                            } => (last_seen_event_ordinal, false),
+                                draft,
+                            } => (last_seen_event_ordinal, draft, false),
                             hel::hel_chat::ChatExit::QuitDetached {
                                 last_seen_event_ordinal,
-                            } => (last_seen_event_ordinal, true),
+                                draft,
+                            } => (last_seen_event_ordinal, draft, true),
                         };
                         if let Some(snapshot) = view.snapshot {
                             dashboard.apply_materialized_session(&snapshot.materialized);
@@ -4040,24 +4056,37 @@ async fn run_dashboard() -> Result<()> {
                                 session.detached_after_event_ordinal = session
                                     .detached_after_event_ordinal
                                     .max(detached_after_event_ordinal);
+                                session.draft_input.clone_from(&draft);
                             })
                             .with_context(|| format!("unknown session {session_id}"));
                         dashboard.set_state(controller.state.clone());
-                        match read_result {
+                        let persist = match read_result {
                             Ok(()) => {
                                 dashboard.clear_notice();
-                                spawn_detached_read_receipt_persist(
+                                Some(spawn_detached_session_state_persist(
                                     session_id.clone(),
                                     detached_after_event_ordinal,
+                                    draft,
                                     dashboard_io_tx.clone(),
-                                );
+                                ))
                             }
-                            Err(error) => dashboard.set_notice(format!(
-                                "Could not save read status for {}: {error:#}",
-                                short_id(&session_id)
-                            )),
-                        }
+                            Err(error) => {
+                                dashboard.set_notice(format!(
+                                    "Could not save draft and read status for {}: {error:#}",
+                                    short_id(&session_id)
+                                ));
+                                None
+                            }
+                        };
                         if quit_after_detach {
+                            // Quitting returns from this loop straight to
+                            // process exit, so the detach write has to land
+                            // first. Bounded so a stuck database cannot hang
+                            // the quit.
+                            if let Some(persist) = persist {
+                                let _ = tokio::time::timeout(DETACH_PERSIST_QUIT_TIMEOUT, persist)
+                                    .await;
+                            }
                             quit_detached = true;
                             break;
                         }
@@ -5053,6 +5082,7 @@ mod tests {
             created_at: "2026-08-14T00:00:00Z".into(),
             updated_at: "2026-08-14T00:00:00Z".into(),
             detached_after_event_ordinal: 0,
+            draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: None,
@@ -5562,6 +5592,7 @@ mod tests {
                 created_at: "2026-08-12T00:00:00Z".into(),
                 updated_at: "2026-08-12T00:00:00Z".into(),
                 detached_after_event_ordinal: 0,
+                draft_input: String::new(),
                 last_error: None,
                 last_checkpoint_error: None,
                 checkpoint: Some(hel::hel_state::CheckpointMetadata {

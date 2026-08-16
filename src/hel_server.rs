@@ -1082,6 +1082,7 @@ mod tests {
                     created_at: "now".into(),
                     updated_at: "now".into(),
                     detached_after_event_ordinal: 0,
+                    draft_input: String::new(),
                     last_error: Some("secret-token at /highly/secret/codex".into()),
                     last_checkpoint_error: None,
                     checkpoint: None,
