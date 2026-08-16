@@ -526,6 +526,7 @@ enum WorkerCommand {
     },
     /// Build a target-side archive for verified controller transfer.
     ExportCheckpoint {
+        /// Export specification path, or `-` to read it from standard input.
         #[arg(long)]
         spec: PathBuf,
     },
@@ -5489,6 +5490,21 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The controller streams a checkpoint spec by asking the worker to read
+    /// `--spec -`, so that dash has to survive argument parsing as a value.
+    #[test]
+    fn export_checkpoint_accepts_a_dash_for_a_streamed_spec() {
+        let cli = Cli::try_parse_from(["hel", "worker", "export-checkpoint", "--spec", "-"])
+            .expect("a streamed spec is a valid export argument");
+        let Some(Command::Worker(WorkerArgs {
+            command: WorkerCommand::ExportCheckpoint { spec },
+        })) = cli.command
+        else {
+            panic!("export-checkpoint did not parse as a worker command");
+        };
+        assert_eq!(spec, PathBuf::from("-"));
+    }
 
     /// The dashboard loop batches buffered input and stops at the first event
     /// that asks for work, so events that only need a redraw must report no

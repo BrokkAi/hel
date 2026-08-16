@@ -547,7 +547,12 @@ impl CommandExecutor for CancellableProcessExecutor {
             .join()
             .map_err(|_| anyhow::anyhow!("streamed command stderr reader panicked"))??;
         let (status, input_result) = process_result?;
-        input_result?;
+        if status.success() {
+            // A child that exited first explains the failure through its own
+            // status and stderr; the broken pipe that exit caused would only
+            // hide it. A successful child must not hide an input error.
+            input_result?;
+        }
         Ok(CommandOutput {
             status: status.code().unwrap_or(-1),
             stdout,
