@@ -286,6 +286,48 @@ const UNEXPECTED_PERMISSION_REQUEST_WARNING: &str = "The agent made a permission
 /// fill the whole stderr tail and bury the real failure in worker exit records.
 const ADAPTER_CHATTER_PREFIX: &str = "Unexpected case: ";
 
+/// Grok Build's `exit_plan_mode` tool asks the client whether the agent may
+/// leave plan mode. It is an ACP ext method, so it reaches Hel untyped, and
+/// the ext framing prefixes the method name with `_`. Both spellings are
+/// accepted so a bridge that sends the bare name still works.
+const EXIT_PLAN_MODE_METHOD: &str = "x.ai/exit_plan_mode";
+
+fn is_exit_plan_mode_method(method: &str) -> bool {
+    method.strip_prefix('_').unwrap_or(method) == EXIT_PLAN_MODE_METHOD
+}
+
+/// Hel answers `exit_plan_mode` the way it answers a permission request: an
+/// unrestricted target approves, so the agent leaves plan mode and proceeds; a
+/// restricted target declines, so plan mode stays active and the person
+/// decides. `feedback` belongs with `cancelled` only, and Hel has none to
+/// give — nobody has read the plan yet.
+fn exit_plan_mode_outcome(auto_approve: bool) -> &'static str {
+    if auto_approve {
+        "approved"
+    } else {
+        "cancelled"
+    }
+}
+
+fn exit_plan_mode_response(auto_approve: bool) -> serde_json::Value {
+    serde_json::json!({ "outcome": exit_plan_mode_outcome(auto_approve) })
+}
+
+fn exit_plan_mode_report(auto_approve: bool) -> String {
+    if auto_approve {
+        "The agent asked to leave plan mode. Hel approved it, because this target runs unrestricted.".to_owned()
+    } else {
+        "The agent asked to leave plan mode. Hel declined, so plan mode stays active and the plan is yours to accept.".to_owned()
+    }
+}
+
+fn unsupported_client_request_report(method: &str) -> String {
+    format!(
+        "The agent sent the client request {method}, which Hel does not implement. \
+         Hel answered with a method-not-found error rather than leaving the agent waiting."
+    )
+}
+
 /// The part of a bridge stderr tail worth attaching to a failing result.
 /// Returns `None` when only adapter chatter was captured, so a failure keeps
 /// its own error text instead of gaining misleading context.
@@ -354,6 +396,7 @@ where
 {
     let notification_events = events.clone();
     let permission_events = events.clone();
+    let ext_events = events.clone();
     let auto_approve_permissions = spec.force_unrestricted_mode;
     let scratch_outputs = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
     let notification_scratch_outputs = scratch_outputs.clone();
@@ -428,6 +471,36 @@ where
                         selected.option_id.clone(),
                     )),
                 ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // Catch-all, registered last so the typed handlers above win. The ACP
+        // crate parks an unhandled request that carries a session id instead of
+        // rejecting it, so without this an agent that sends an ext request Hel
+        // does not know waits for a reply that never comes, and its turn never
+        // ends. Hel answers every incoming request, always.
+        .on_receive_request(
+            async move |request: agent_client_protocol::UntypedMessage, responder, _cx| {
+                let method = request.method().to_owned();
+                if is_exit_plan_mode_method(&method) {
+                    ext_events
+                        .send(RuntimeEvent::Warning {
+                            message: exit_plan_mode_report(auto_approve_permissions),
+                        })
+                        .await
+                        .map_err(|_| relay_event_channel_error())?;
+                    return responder.respond(exit_plan_mode_response(auto_approve_permissions));
+                }
+                ext_events
+                    .send(RuntimeEvent::Warning {
+                        message: unsupported_client_request_report(&method),
+                    })
+                    .await
+                    .map_err(|_| relay_event_channel_error())?;
+                responder.respond_with_error(
+                    agent_client_protocol::Error::method_not_found()
+                        .data(serde_json::Value::String(method)),
+                )
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -1339,6 +1412,163 @@ mod tests {
             }
         }
         prompts
+    }
+
+    /// Answers `initialize` and `session/new`, then — while the prompt is in
+    /// flight — sends the client an ext request and publishes the answer as
+    /// soon as it arrives, so a silent client shows up as a timeout.
+    async fn ext_request_bridge(
+        stream: tokio::io::DuplexStream,
+        method: &'static str,
+        answered: tokio::sync::oneshot::Sender<serde_json::Value>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (read, mut write) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read).lines();
+        let mut answered = Some(answered);
+        while let Some(line) = lines.next_line().await.expect("read bridge input") {
+            let message: serde_json::Value =
+                serde_json::from_str(&line).expect("bridge input must be JSON-RPC");
+            if message.get("id").and_then(serde_json::Value::as_str) == Some("ext-1") {
+                if let Some(answered) = answered.take() {
+                    let _ = answered.send(message);
+                }
+                continue;
+            }
+            let Some(request_method) = message.get("method").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let id = message
+                .get("id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let response = match request_method {
+                "initialize" => {
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": 1}})
+                }
+                "session/new" => {
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"sessionId": "scripted"}})
+                }
+                // Ask the client to leave plan mode without answering the
+                // prompt: the turn only ends once the client replies, which is
+                // exactly the hang this guards against.
+                "session/prompt" => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "ext-1",
+                    "method": method,
+                    "params": {
+                        "sessionId": "scripted",
+                        "toolCallId": "call-1",
+                        "planContent": "1. do the thing",
+                    },
+                }),
+                _ => continue,
+            };
+            if write
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+
+    async fn answer_to_ext_request(
+        method: &'static str,
+        force_unrestricted_mode: bool,
+    ) -> serde_json::Value {
+        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+        let (answered_tx, answered_rx) = tokio::sync::oneshot::channel();
+        let bridge = tokio::spawn(ext_request_bridge(bridge_stream, method, answered_tx));
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
+
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        // Drain events so a full channel can never be mistaken for silence.
+        let events = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let spec = LaunchSpec {
+            command: "scripted".into(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: std::env::current_dir().unwrap(),
+            additional_directories: Vec::new(),
+            resume_session: None,
+            harness: HarnessKind::Grok,
+            force_unrestricted_mode,
+        };
+        let driver = tokio::spawn(drive(transport, spec, request_rx, event_tx));
+        request_tx
+            .send(CommandRequest::Prompt {
+                request_id: "first".into(),
+                prompt: vec![ContentBlock::Text(TextContent::new("plan it"))],
+            })
+            .await
+            .unwrap();
+
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), answered_rx)
+            .await
+            .expect("Hel must answer every incoming request instead of leaving the agent waiting")
+            .expect("the bridge must publish the answer");
+
+        drop(request_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
+        bridge.abort();
+        events.abort();
+        answer
+    }
+
+    #[test]
+    fn exit_plan_mode_is_recognized_with_and_without_the_ext_prefix() {
+        assert!(is_exit_plan_mode_method("_x.ai/exit_plan_mode"));
+        assert!(is_exit_plan_mode_method("x.ai/exit_plan_mode"));
+        assert!(!is_exit_plan_mode_method("_x.ai/other"));
+        assert!(!is_exit_plan_mode_method("session/request_permission"));
+    }
+
+    #[test]
+    fn exit_plan_mode_is_approved_when_unrestricted_and_cancelled_when_restricted() {
+        assert_eq!(
+            exit_plan_mode_response(true),
+            serde_json::json!({"outcome": "approved"})
+        );
+        // No `feedback`: it is only meaningful with `cancelled`, and Hel has
+        // none — the plan has not been read by anyone yet.
+        assert_eq!(
+            exit_plan_mode_response(false),
+            serde_json::json!({"outcome": "cancelled"})
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrestricted_session_approves_the_agents_exit_plan_mode_request() {
+        let answer = answer_to_ext_request("_x.ai/exit_plan_mode", true).await;
+        assert_eq!(answer["result"], serde_json::json!({"outcome": "approved"}));
+    }
+
+    #[tokio::test]
+    async fn a_restricted_session_cancels_the_agents_exit_plan_mode_request() {
+        let answer = answer_to_ext_request("_x.ai/exit_plan_mode", false).await;
+        assert_eq!(
+            answer["result"],
+            serde_json::json!({"outcome": "cancelled"})
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_client_request_is_answered_with_an_error_rather_than_silence() {
+        let answer = answer_to_ext_request("_someone.example/unknown", true).await;
+        assert!(
+            answer.get("result").is_none(),
+            "an unimplemented request must not be answered with a result: {answer}"
+        );
+        assert_eq!(
+            answer["error"]["code"], -32601,
+            "expected a method-not-found error: {answer}"
+        );
     }
 
     #[tokio::test]
