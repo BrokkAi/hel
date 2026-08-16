@@ -20,7 +20,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
@@ -4671,14 +4671,18 @@ impl Drop for ActiveChat {
 
 fn render(frame: &mut Frame, chat: &mut ChatState) {
     let inner = frame.area();
-    // The pane never takes more than a third of the screen.
+    // The pane never takes more than a third of the screen. Its border eats
+    // two columns, so the text inside wraps to that narrower width.
+    let pane_width = usize::from(inner.width.saturating_sub(2)).max(1);
     let pane = conversations_pane(
         chat,
         now_epoch_seconds(),
-        usize::from(inner.width),
+        pane_width,
         usize::from(inner.height / 3).clamp(1, CONVERSATIONS_PANE_MAX_ROWS),
     );
-    let pane_rows = pane.lines.len() as u16;
+    // The pane always lists at least the current session, so this always has
+    // room for its own top and bottom border rows.
+    let conversations_height = pane.lines.len() as u16 + 2;
     let visible_queued = chat.queued_prompts.len().min(3) as u16;
     let prompt_width = usize::from(inner.width.saturating_sub(2)).max(1);
     let input_rows = input_visual_rows(&chat.input, prompt_width) as u16;
@@ -4686,12 +4690,12 @@ fn render(frame: &mut Frame, chat: &mut ChatState) {
         .saturating_add(visible_queued)
         .saturating_add(2)
         .max(4);
-    let maximum_prompt_height = inner.height.saturating_sub(6 + pane_rows).max(3);
+    let maximum_prompt_height = inner.height.saturating_sub(6 + conversations_height).max(3);
     let prompt_height = desired_prompt_height.min(maximum_prompt_height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(pane_rows),
+            Constraint::Length(conversations_height),
             Constraint::Min(5),
             Constraint::Length(prompt_height),
             Constraint::Length(1),
@@ -4699,27 +4703,50 @@ fn render(frame: &mut Frame, chat: &mut ChatState) {
         .split(inner);
     let (conversations_area, transcript_area, prompt_area, footer_area) =
         (chunks[0], chunks[1], chunks[2], chunks[3]);
-    chat.conversations_area = Some(conversations_area);
-    frame.render_widget(Paragraph::new(pane.lines), conversations_area);
+    // Focus shows as a double border on whichever pane owns the keyboard, so
+    // the split stays obvious without the eye following a moving band.
+    let conversations_border = if chat.focus == ChatFocus::Conversations {
+        BorderType::Double
+    } else {
+        BorderType::Plain
+    };
+    let prompt_border = if chat.focus == ChatFocus::Prompt {
+        BorderType::Double
+    } else {
+        BorderType::Plain
+    };
+    let conversations_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(conversations_border)
+        .title("Active");
+    let conversations_inner = conversations_block.inner(conversations_area);
+    // Consumers (mouse hover/click/scroll) map a screen row against this
+    // rect, so it must be the pane's inner area, not the bordered outline.
+    chat.conversations_area = Some(conversations_inner);
+    frame.render_widget(conversations_block, conversations_area);
+    frame.render_widget(Paragraph::new(pane.lines), conversations_inner);
     if chat.focus == ChatFocus::Conversations
         && let Some(row) = pane.current_row
-        && let Some(y) = conversations_area
+        && let Some(y) = conversations_inner
             .y
             .checked_add(row as u16)
-            .filter(|y| *y < conversations_area.bottom())
+            .filter(|y| *y < conversations_inner.bottom())
     {
         // A band behind the current row, the way the session list marks its
         // selection, so the focused pane is obvious. Only the background moves:
         // each row keeps the colours that say what its session is doing.
         let buffer = frame.buffer_mut();
-        for x in conversations_area.x..conversations_area.right() {
+        for x in conversations_inner.x..conversations_inner.right() {
             buffer[(x, y)].set_bg(Color::DarkGray);
         }
     }
     render_transcript(frame, transcript_area, chat);
     let queued = chat.queued_prompts.len();
     let prompt_title = prompt_title(chat, queued);
-    let prompt_block = Block::default().borders(Borders::ALL).title(prompt_title);
+    let prompt_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(prompt_border)
+        .title(prompt_title);
     let prompt_inner = prompt_block.inner(prompt_area);
     let mut prompt_lines = chat
         .queued_prompts
@@ -6307,8 +6334,11 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("gpt-5.6-sol · high · Running · Esc cancels"));
+        // No outer frame wraps the whole session (that's what the corner
+        // border belongs to now: the conversations pane's own "Active" box,
+        // not a re-introduced session title bar).
         assert!(!rendered.contains("HEL /"));
-        assert_ne!(buffer[(buffer.area.x, buffer.area.y)].symbol(), "┌");
+        assert_eq!(buffer[(buffer.area.x, buffer.area.y)].symbol(), "┌");
     }
 
     fn other_session(
@@ -6604,6 +6634,9 @@ mod tests {
         let pane = chat
             .conversations_area
             .expect("the pane records its hitbox");
+        // The border consumes the outer top row, so the hitbox other
+        // consumers (mouse mapping, the band) use starts one row lower.
+        assert_eq!(pane.y, 1, "the pane's border pushes its hitbox down a row");
 
         chat.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane));
 
@@ -6620,6 +6653,16 @@ mod tests {
         for _ in 0..5 {
             chat.handle_mouse(mouse_in(MouseEventKind::ScrollUp, pane));
         }
+        assert_eq!(window_projects(&chat, 7)[0], "project-0");
+
+        // The border row just above the hitbox belongs to the frame, not the
+        // pane, so hovering it does not move the pane's window.
+        chat.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: pane.x,
+            row: pane.y - 1,
+            modifiers: KeyModifiers::NONE,
+        });
         assert_eq!(window_projects(&chat, 7)[0], "project-0");
 
         // Below the pane the wheel is the transcript's again.
@@ -6657,17 +6700,26 @@ mod tests {
         let mut chat = windowed_chat(3, 1);
         chat.focus_conversations();
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).expect("terminal");
-        let banded = |terminal: &Terminal<TestBackend>, y: u16| {
-            let buffer = terminal.backend().buffer();
-            (buffer.area.x..buffer.area.right()).all(|x| buffer[(x, y)].bg == Color::DarkGray)
-        };
 
         terminal
             .draw(|frame| render(frame, &mut chat))
             .expect("draw chat");
-        assert!(banded(&terminal, 1), "the current session's row is banded");
-        assert!(!banded(&terminal, 0));
-        assert!(!banded(&terminal, 2));
+        // The band only covers the pane's inner hitbox: the border columns to
+        // either side keep drawing border characters, not the band.
+        let pane = chat
+            .conversations_area
+            .expect("the pane records its hitbox");
+        let banded = |terminal: &Terminal<TestBackend>, y: u16| {
+            let buffer = terminal.backend().buffer();
+            (pane.x..pane.right()).all(|x| buffer[(x, y)].bg == Color::DarkGray)
+        };
+        // Row 0 is the pane's top border; rows 1-3 are the three sessions,
+        // with the current one (index 1 in the list) at y = 2.
+        assert!(!banded(&terminal, 0), "the top border draws no band");
+        assert!(!banded(&terminal, 1));
+        assert!(banded(&terminal, 2), "the current session's row is banded");
+        assert!(!banded(&terminal, 3));
+        assert!(!banded(&terminal, 4), "the bottom border draws no band");
         // Nothing places a cursor while the list has focus, so it stays where
         // the terminal left it.
         terminal.backend_mut().assert_cursor_position((0, 0));
@@ -6676,15 +6728,86 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &mut chat))
             .expect("draw chat");
-        assert!(!banded(&terminal, 1), "an unfocused pane draws no band");
+        assert!(!banded(&terminal, 2), "an unfocused pane draws no band");
         let cursor = terminal
             .backend_mut()
             .get_cursor_position()
             .expect("cursor position");
         assert!(
-            cursor.y > 2,
-            "the prompt's cursor sits in the composer, below the pane"
+            cursor.y > 4,
+            "the prompt's cursor sits in the composer, below the bordered pane"
         );
+    }
+
+    #[test]
+    fn the_conversations_pane_border_is_titled_active() {
+        let mut chat = windowed_chat(3, 1);
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut chat))
+            .expect("draw chat");
+
+        let buffer = terminal.backend().buffer();
+        let top_border: String = (buffer.area.x..buffer.area.right())
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect();
+        assert!(
+            top_border.contains("Active"),
+            "the pane's border carries the title: {top_border:?}"
+        );
+    }
+
+    #[test]
+    fn focus_shows_as_a_double_border_and_tab_swaps_which_pane_has_it() {
+        let mut chat = windowed_chat(3, 1);
+        chat.focus_conversations();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).expect("terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut chat))
+            .expect("draw chat");
+        // Both panes sit at the left edge, so their top border's row is
+        // identified by which corner glyph it draws, not a hardcoded y. The
+        // right corner is read from the same row, clear of the title text
+        // that starts right after the left one.
+        let (pane_top, prompt_top, right) = {
+            let buffer = terminal.backend().buffer();
+            let pane_top = (buffer.area.y..buffer.area.bottom())
+                .find(|&y| buffer[(0, y)].symbol() == "╔")
+                .expect("the focused conversations pane draws a double border");
+            let prompt_top = (buffer.area.y..buffer.area.bottom())
+                .find(|&y| buffer[(0, y)].symbol() == "┌")
+                .expect("the unfocused composer draws a single border");
+            (pane_top, prompt_top, buffer.area.right() - 1)
+        };
+        let left_corner = |terminal: &Terminal<TestBackend>, y: u16| -> String {
+            terminal.backend().buffer()[(0, y)].symbol().to_owned()
+        };
+        let right_corner = |terminal: &Terminal<TestBackend>, y: u16| -> String {
+            terminal.backend().buffer()[(right, y)].symbol().to_owned()
+        };
+        assert_eq!(right_corner(&terminal, pane_top), "╗");
+        assert_eq!(right_corner(&terminal, prompt_top), "┐");
+
+        chat.handle_key(key(KeyCode::Tab));
+        assert_eq!(chat.focus, ChatFocus::Prompt);
+        terminal
+            .draw(|frame| render(frame, &mut chat))
+            .expect("draw chat");
+
+        assert_eq!(
+            left_corner(&terminal, pane_top),
+            "┌",
+            "focus left the pane, so its border goes single"
+        );
+        assert_eq!(right_corner(&terminal, pane_top), "┐");
+        assert_eq!(
+            left_corner(&terminal, prompt_top),
+            "╔",
+            "focus landed on the composer, so its border goes double"
+        );
+        assert_eq!(right_corner(&terminal, prompt_top), "╗");
     }
 
     #[test]
@@ -6804,12 +6927,25 @@ mod tests {
                 .map(|x| buffer[(x, buffer.area.y + offset)].symbol())
                 .collect::<String>()
         };
+        // Strips exactly the pane's left/right border columns (not the
+        // caret's own leading spaces), so a row's session text compares the
+        // same way it did before the border wrapped it.
+        let bordered_row = |terminal: &Terminal<TestBackend>, offset: u16| -> String {
+            let full = row(terminal, offset);
+            let mut chars = full.chars();
+            chars.next();
+            chars.next_back();
+            chars.as_str().trim_end().to_owned()
+        };
 
         terminal
             .draw(|frame| render(frame, &mut chat))
             .expect("draw chat");
-        assert_eq!(row(&terminal, 0).trim_end(), "› current [idle]");
-        assert!(row(&terminal, 1).contains("Conversation"));
+        // Row 0 is the pane's own top border; the header row sits inside it.
+        assert_eq!(bordered_row(&terminal, 1), "› current [idle]");
+        // Row 2 is the pane's bottom border, so the transcript's chrome
+        // starts at row 3.
+        assert!(row(&terminal, 3).contains("Conversation"));
 
         apply_chat_io_update(
             &mut chat,
@@ -6818,13 +6954,11 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &mut chat))
             .expect("draw chat");
-        assert_eq!(row(&terminal, 0).trim_end(), "› current [idle]");
-        assert_eq!(
-            row(&terminal, 1).trim_end(),
-            "  docs [idle] wrote the guide"
-        );
-        // The transcript keeps its own chrome, below the header.
-        assert!(row(&terminal, 2).contains("Conversation"));
+        assert_eq!(bordered_row(&terminal, 1), "› current [idle]");
+        assert_eq!(bordered_row(&terminal, 2), "  docs [idle] wrote the guide");
+        // The transcript keeps its own chrome, below the header and the
+        // pane's now-taller bottom border.
+        assert!(row(&terminal, 4).contains("Conversation"));
     }
 
     #[test]
