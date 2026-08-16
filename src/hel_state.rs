@@ -524,6 +524,10 @@ pub struct SessionRecord {
     pub created_at: String,
     pub updated_at: String,
     pub detached_after_event_ordinal: u64,
+    /// Unsent chat input carried across a detach, so returning to a session
+    /// restores what the user was typing. Empty means no draft.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub draft_input: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -838,6 +842,7 @@ mod tests {
             created_at: "2026-08-09T12:00:00Z".into(),
             updated_at: "2026-08-09T12:01:00Z".into(),
             detached_after_event_ordinal: 0,
+            draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: Some(CheckpointMetadata {
@@ -917,6 +922,19 @@ mod tests {
         let ordinal = session.remove("detached_after_event_ordinal").unwrap();
         session.insert("last_viewed_event_sequence".into(), ordinal);
         assert!(serde_json::from_value::<HelState>(old_detach_cursor).is_err());
+    }
+
+    #[test]
+    fn state_written_before_drafts_loads_with_an_empty_draft() {
+        let session_id = "0123456789abcdef";
+        let mut without_draft = serde_json::to_value(sample_state()).unwrap();
+        let session = without_draft["sessions"][session_id]
+            .as_object_mut()
+            .unwrap();
+        session.remove("draft_input");
+
+        let state = serde_json::from_value::<HelState>(without_draft).unwrap();
+        assert_eq!(state.sessions[session_id].draft_input, "");
     }
 
     #[test]

@@ -842,23 +842,36 @@ fn is_completed_tool(entry: &ChatEntry) -> bool {
     entry.role == ChatRole::Tool && entry.tool_status == Some(ToolStatus::Completed)
 }
 
+/// The newest completed tool keeps its full detail until the next request
+/// starts. Scanning backwards, the first `User` entry ends protection and the
+/// first completed tool claims it; every other entry is transparent.
+fn protected_tool_index(entries: &[ChatEntry]) -> Option<usize> {
+    entries
+        .iter()
+        .rposition(|entry| entry.role == ChatRole::User || is_completed_tool(entry))
+        .filter(|&index| is_completed_tool(&entries[index]))
+}
+
 /// Collapse state per entry. In rich mode a maximal run of two or more
 /// consecutive completed tools renders as one summary cell; every other entry,
-/// including a pending, running, or failed tool, breaks the run. Raw mode never
-/// collapses so the full commands stay inspectable.
+/// including a pending, running, or failed tool, breaks the run. The protected
+/// newest result breaks runs too and never joins one. Raw mode never collapses
+/// so the full commands stay inspectable.
 fn tool_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> Vec<ToolCollapse> {
     let mut states = vec![ToolCollapse::None; entries.len()];
     if mode != TranscriptRenderMode::Rich {
         return states;
     }
+    let protected = protected_tool_index(entries);
+    let collapsible = |index: usize| is_completed_tool(&entries[index]) && Some(index) != protected;
     let mut start = 0;
     while start < entries.len() {
-        if !is_completed_tool(&entries[start]) {
+        if !collapsible(start) {
             start += 1;
             continue;
         }
         let mut end = start + 1;
-        while end < entries.len() && is_completed_tool(&entries[end]) {
+        while end < entries.len() && collapsible(end) {
             end += 1;
         }
         if end - start > 1 {
@@ -1420,6 +1433,15 @@ impl ChatState {
 
     fn clear_input(&mut self) {
         self.set_input(String::new());
+    }
+
+    /// Reinstate the input saved when the user last detached, leaving the
+    /// cursor at the end. An empty draft leaves the composer alone.
+    fn restore_draft(&mut self, draft: String) {
+        if draft.is_empty() {
+            return;
+        }
+        self.set_input(draft);
     }
 
     fn insert_character(&mut self, character: char) {
@@ -3808,12 +3830,17 @@ impl ActiveChat {
     /// Builds the view from the session's current snapshot and starts its
     /// background feeds. Cheap enough to call from the dashboard loop: every
     /// slow step is a spawned task.
+    ///
+    /// `draft` is the unsent input saved when this session was last detached.
+    /// Only a fresh view takes it: a warm chat the dashboard kept alive already
+    /// holds newer input than the database copy.
     pub fn open(
         session: ManagedSessionHandle,
         bundle_id: &str,
         recovery: Option<RecoveryContext>,
         control: SessionManagerControl,
         others: Vec<OtherSessionIdentity>,
+        draft: String,
     ) -> Self {
         let view = session.view();
         let needs_initial_sync = view.snapshot.is_none();
@@ -3834,6 +3861,7 @@ impl ActiveChat {
             },
         );
         state.set_history_context(bundle_id);
+        state.restore_draft(draft);
         let (chat_io_tx, chat_io_rx) = tokio::sync::mpsc::unbounded_channel::<ChatIoUpdate>();
         {
             let updates = chat_io_tx.clone();
@@ -3890,6 +3918,12 @@ impl ActiveChat {
 
     pub fn session_id(&self) -> &str {
         self.session.session_id()
+    }
+
+    /// The composer's current text. The dashboard saves this on detach so
+    /// unsent input survives a quit or a crash while the view is off screen.
+    pub fn draft(&self) -> &str {
+        &self.state.input
     }
 
     /// Waits for the next background message, applies it, and drains whatever
@@ -5099,6 +5133,78 @@ mod tests {
         assert_eq!(append_dictation("please", "fix this"), "please fix this");
         assert_eq!(append_dictation("", "fix this"), "fix this");
         assert_eq!(append_dictation("please ", ""), "please");
+    }
+
+    #[test]
+    fn a_saved_draft_reopens_in_the_composer_with_the_cursor_at_its_end() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+
+        chat.restore_draft("half typed thought".into());
+
+        assert_eq!(chat.input, "half typed thought");
+        assert_eq!(chat.input_cursor, "half typed thought".len());
+    }
+
+    #[test]
+    fn an_empty_saved_draft_leaves_the_composer_untouched() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("typed since opening".into());
+
+        chat.restore_draft(String::new());
+
+        assert_eq!(chat.input, "typed since opening");
+    }
+
+    /// Mirrors what `ActiveChat::open` does for a session with no warm view:
+    /// build the state from the snapshot, then seed the saved draft.
+    fn freshly_opened_chat(saved_draft: &str) -> ChatState {
+        let mut chat =
+            ChatState::from_materialized(&MaterializedSession::empty("session-fresh"), &[], &[]);
+        chat.set_history_context("bundle-1");
+        chat.restore_draft(saved_draft.to_owned());
+        chat
+    }
+
+    #[test]
+    fn a_fresh_chat_opens_with_the_session_s_saved_draft_in_the_composer() {
+        let chat = freshly_opened_chat("half typed thought");
+
+        assert_eq!(chat.input, "half typed thought");
+        assert_eq!(chat.input_cursor, "half typed thought".len());
+    }
+
+    #[test]
+    fn a_fresh_chat_for_a_session_with_no_saved_draft_opens_empty() {
+        assert_eq!(freshly_opened_chat("").input, "");
+    }
+
+    #[test]
+    fn detaching_leaves_the_unsent_input_where_the_dashboard_saves_it_from() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("half typed thought".into());
+
+        // Both detaches keep the composer intact: the warm chat goes on holding
+        // it, and the dashboard reads it here to write it to the session row.
+        assert!(matches!(
+            detach_chat(&mut chat, false),
+            ChatEventOutcome::Back { .. }
+        ));
+        assert_eq!(chat.input, "half typed thought");
+
+        assert!(matches!(
+            detach_chat(&mut chat, true),
+            ChatEventOutcome::QuitDetach { .. }
+        ));
+        assert_eq!(chat.input, "half typed thought");
+    }
+
+    #[test]
+    fn detaching_an_empty_composer_leaves_an_empty_draft_to_save() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+
+        detach_chat(&mut chat, false);
+
+        assert_eq!(chat.input, "");
     }
 
     #[test]
@@ -6436,7 +6542,90 @@ mod tests {
 
         let text = transcript_text(&mut chat, 80);
 
-        assert_eq!(text, ["✓ Tool · done", "│ grep, grep, cat", ""]);
+        assert_eq!(
+            text,
+            [
+                "✓ Tool · done",
+                "│ grep, grep",
+                "",
+                "✓ Tool · done",
+                "│ cat notes.md",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn completed_tool_run_collapses_fully_once_a_new_request_starts() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
+        chat.entries.push(completed_tool(2, "grep -rn beta src"));
+        chat.entries.push(completed_tool(3, "cat notes.md"));
+        chat.entries
+            .push(ChatEntry::plain(4, ChatRole::User, "now ship it"));
+
+        let text = transcript_text(&mut chat, 80);
+
+        assert_eq!(
+            text,
+            [
+                "✓ Tool · done",
+                "│ grep, grep, cat",
+                "",
+                "❯ You",
+                "│ now ship it",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn newest_completed_tool_leaves_a_lone_predecessor_expanded() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
+        chat.entries.push(completed_tool(2, "cat notes.md"));
+
+        let text = transcript_text(&mut chat, 80);
+
+        assert_eq!(
+            text,
+            [
+                "✓ Tool · done",
+                "│ grep -rn alpha src",
+                "",
+                "✓ Tool · done",
+                "│ cat notes.md",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_later_completed_tool_collapses_the_earlier_run_entirely() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
+        chat.entries.push(completed_tool(2, "grep -rn beta src"));
+        chat.entries.push(completed_tool(3, "cat notes.md"));
+        chat.entries
+            .push(ChatEntry::plain(4, ChatRole::Agent, "found it"));
+        chat.entries.push(completed_tool(5, "rg gamma src"));
+
+        let text = transcript_text(&mut chat, 80);
+
+        assert_eq!(
+            text,
+            [
+                "✓ Tool · done",
+                "│ grep, grep, cat",
+                "",
+                "● Agent",
+                "│ found it",
+                "",
+                "✓ Tool · done",
+                "│ rg gamma src",
+                "",
+            ]
+        );
     }
 
     #[test]
@@ -6481,6 +6670,8 @@ mod tests {
 
         let text = transcript_text(&mut chat, 80);
 
+        // The trailing run's last member is the newest result, so it stays
+        // expanded and leaves its single predecessor alone.
         assert_eq!(
             text,
             [
@@ -6491,7 +6682,31 @@ mod tests {
                 "│ cat missing.md",
                 "",
                 "✓ Tool · done",
+                "│ rg gamma src",
+                "",
+                "✓ Tool · done",
+                "│ rg delta src",
+                "",
+            ]
+        );
+
+        chat.entries
+            .push(ChatEntry::plain(6, ChatRole::User, "now ship it"));
+
+        assert_eq!(
+            transcript_text(&mut chat, 80),
+            [
+                "✓ Tool · done",
+                "│ grep, grep",
+                "",
+                "× Tool · failed",
+                "│ cat missing.md",
+                "",
+                "✓ Tool · done",
                 "│ rg, rg",
+                "",
+                "❯ You",
+                "│ now ship it",
                 "",
             ]
         );
@@ -6524,7 +6739,7 @@ mod tests {
     }
 
     #[test]
-    fn completing_a_running_tool_extends_the_cached_collapsed_summary() {
+    fn completing_a_running_tool_moves_protection_and_collapses_the_earlier_run() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.entries.push(completed_tool(1, "grep -rn alpha src"));
         chat.entries.push(completed_tool(2, "grep -rn beta src"));
@@ -6539,7 +6754,10 @@ mod tests {
             transcript_text(&mut chat, 80),
             [
                 "✓ Tool · done",
-                "│ grep, grep",
+                "│ grep -rn alpha src",
+                "",
+                "✓ Tool · done",
+                "│ grep -rn beta src",
                 "",
                 "● Tool · running",
                 "│ cat notes.md",
@@ -6550,9 +6768,18 @@ mod tests {
         chat.entries[2].touch(4);
         chat.entries[2].tool_status = Some(ToolStatus::Completed);
 
+        // Protection moved to the newly completed tool, so the two entries
+        // above must re-render even though neither revision changed.
         assert_eq!(
             transcript_text(&mut chat, 80),
-            ["✓ Tool · done", "│ grep, grep, cat", ""]
+            [
+                "✓ Tool · done",
+                "│ grep, grep",
+                "",
+                "✓ Tool · done",
+                "│ cat notes.md",
+                "",
+            ]
         );
     }
 
