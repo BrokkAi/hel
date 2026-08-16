@@ -18,7 +18,9 @@ use ratatui::widgets::{
 };
 use sha2::{Digest, Sha256};
 
-use hel::hel_chat::{TranscriptSnapshot, materialized_content_text, render_agent_message_tail};
+use hel::hel_chat::{
+    Notices, TranscriptSnapshot, materialized_content_text, render_agent_message_tail,
+};
 use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use hel::hel_quota::{ProfileQuota, QuotaWindow};
 use hel::hel_state::{
@@ -27,7 +29,7 @@ use hel::hel_state::{
 };
 use hel::hel_targets::{
     AdditionalMount, DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage,
-    SessionResourceUsage, default_mount_destination, path_completion,
+    ProvisionStage, SessionResourceUsage, default_mount_destination, path_completion,
 };
 
 const FORCE_CONFIRMATION: &str = "DESTROY";
@@ -153,6 +155,7 @@ struct SessionOperationDisplay {
     kind: SessionOperationKind,
     started_at_epoch_seconds: u64,
     placeholder: Option<SessionRecord>,
+    stage: Option<ProvisionStage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -885,7 +888,7 @@ pub struct DashboardState {
     preview_scroll: usize,
     preview_scroll_session: Option<String>,
     mode: Mode,
-    notice: Option<String>,
+    notices: Notices,
     greeting: String,
 }
 
@@ -911,7 +914,7 @@ impl DashboardState {
             preview_scroll: 0,
             preview_scroll_session: None,
             mode: Mode::Dashboard,
-            notice: None,
+            notices: Notices::default(),
             greeting: "Welcome to Hel".into(),
         };
         dashboard.session_details = dashboard
@@ -972,10 +975,19 @@ impl DashboardState {
                     .unwrap_or_default()
                     .as_secs(),
                 placeholder,
+                stage: None,
             },
         );
         self.apply_operation_projection();
         self.clamp_selections();
+    }
+
+    /// Name the launch phase in flight; a finished or unknown operation is
+    /// left alone.
+    pub fn set_session_operation_stage(&mut self, session_id: &str, stage: ProvisionStage) {
+        if let Some(operation) = self.session_operations.get_mut(session_id) {
+            operation.stage = Some(stage);
+        }
     }
 
     pub fn rekey_session_operation(&mut self, previous: &str, session_id: String) {
@@ -1214,20 +1226,27 @@ impl DashboardState {
         self.checkpoint_archive_sizes = sizes;
     }
 
+    /// Installs the process-wide notifications bar, so every view reports
+    /// through one shared slot.
+    pub fn share_notices(&mut self, notices: Notices) {
+        self.notices = notices;
+    }
+
     pub fn set_notice(&mut self, notice: impl Into<String>) {
-        self.notice = Some(notice.into());
+        self.notices.set(notice);
     }
 
     pub fn replace_notice_if(&mut self, expected: &str, replacement: impl Into<String>) -> bool {
-        if self.notice.as_deref() != Some(expected) {
-            return false;
-        }
-        self.notice = Some(replacement.into());
-        true
+        self.notices.replace_if(expected, replacement)
     }
 
     pub fn clear_notice(&mut self) {
-        self.notice = None;
+        self.notices.clear();
+    }
+
+    /// The current shared notice, if any.
+    pub fn notice(&self) -> Option<String> {
+        self.notices.current()
     }
 
     /// Show the recovery choices after a checkpointed close could not finish.
@@ -1375,7 +1394,7 @@ impl DashboardState {
         if is_paste_shortcut(key) {
             match hel::hel_clipboard::read_text() {
                 Ok(text) => self.handle_paste(&text),
-                Err(error) => self.notice = Some(format!("Paste failed: {error:#}")),
+                Err(error) => self.notices.set(format!("Paste failed: {error:#}")),
             }
             return DashboardAction::None;
         }
@@ -1385,7 +1404,7 @@ impl DashboardState {
             return DashboardAction::QuitDetach;
         }
 
-        self.notice = None;
+        self.notices.clear();
         match self.mode.clone() {
             Mode::Dashboard => self.handle_dashboard_key(key),
             Mode::New(wizard) => self.handle_new_key(key.code, wizard),
@@ -1807,7 +1826,7 @@ impl DashboardState {
                 .map(|operation| operation.kind)
         });
         if let Some(operation) = operation {
-            self.notice = Some(format!(
+            self.notices.set(format!(
                 "{} is in progress; press Ctrl+X to cancel it.",
                 operation.label()
             ));
@@ -1844,7 +1863,7 @@ impl DashboardState {
                 DashboardAction::None
             }
             KeyCode::Enter if editor.title.trim().is_empty() => {
-                self.notice = Some("Session name cannot be empty.".into());
+                self.notices.set("Session name cannot be empty.");
                 self.mode = Mode::Rename(editor);
                 DashboardAction::None
             }
@@ -2010,7 +2029,7 @@ impl DashboardState {
                     DashboardAction::None
                 }
                 KeyCode::Enter if wizard.new_bundle_source.trim().is_empty() => {
-                    self.notice = Some("Repository source cannot be empty.".into());
+                    self.notices.set("Repository source cannot be empty.");
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
@@ -2135,7 +2154,7 @@ impl DashboardState {
                 if matches!(target, TargetTemplate::AwsEc2 { .. })
                     && wizard.resource_allocation.is_none()
                 {
-                    self.notice = Some(
+                    self.notices.set(
                         wizard
                             .sizing_error
                             .clone()
@@ -2478,7 +2497,8 @@ impl DashboardState {
             .iter()
             .position(|id| *id == bundle_id)
         else {
-            self.notice = Some(format!("Created bundle {bundle_id:?} was not found."));
+            self.notices
+                .set(format!("Created bundle {bundle_id:?} was not found."));
             return DashboardAction::None;
         };
         wizard.bundle = index;
@@ -2856,7 +2876,7 @@ impl DashboardState {
                     TargetTemplate::AwsEc2 { .. }
                 ) && wizard.resource_allocation.is_none()
                 {
-                    self.notice = Some(
+                    self.notices.set(
                         wizard
                             .sizing_error
                             .clone()
@@ -3374,7 +3394,8 @@ impl DashboardState {
 
     fn begin_new(&mut self) -> DashboardAction {
         if self.config.profiles.is_empty() || self.config.targets.is_empty() {
-            self.notice = Some("Configure at least one profile and target first.".into());
+            self.notices
+                .set("Configure at least one profile and target first.");
             return DashboardAction::None;
         }
         let recent = most_recent_configured_session(&self.config, &self.state);
@@ -3426,15 +3447,18 @@ impl DashboardState {
             return DashboardAction::None;
         };
         if session.state.is_active() && session.state != SessionState::Error {
-            self.notice = Some("This session is active; press Enter to open it.".into());
+            self.notices
+                .set("This session is active; press Enter to open it.");
             return DashboardAction::None;
         }
         if session.checkpoint.is_none() {
-            self.notice = Some("This session has no verified recovery copy to resume.".into());
+            self.notices
+                .set("This session has no verified recovery copy to resume.");
             return DashboardAction::None;
         }
         if self.compatible_profiles(&session.id).is_empty() || self.config.targets.is_empty() {
-            self.notice = Some("Resume needs a profile and a target template.".into());
+            self.notices
+                .set("Resume needs a profile and a target template.");
             return DashboardAction::None;
         }
         let profile = self
@@ -3487,7 +3511,7 @@ impl DashboardState {
             return DashboardAction::None;
         };
         if let Some(operation) = self.session_operations.get(&session.id) {
-            self.notice = Some(format!(
+            self.notices.set(format!(
                 "{} is in progress; press Ctrl+X to cancel it.",
                 operation.kind.label()
             ));
@@ -3497,7 +3521,7 @@ impl DashboardState {
             if session.checkpoint.is_some() {
                 return self.begin_resume();
             } else {
-                self.notice = Some(
+                self.notices.set(
                     session
                         .last_error
                         .clone()
@@ -3752,18 +3776,7 @@ fn partition_sessions<'a>(
         Some(_) | None => session_timestamp(&session.updated_at)
             .and_then(|timestamp| timestamp.checked_mul(1_000)),
     };
-    let sequence = |left: &&SessionRecord, right: &&SessionRecord| {
-        match (
-            session_timestamp(&left.created_at),
-            session_timestamp(&right.created_at),
-        ) {
-            (Some(left), Some(right)) => left.cmp(&right),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
-        .then_with(|| left.id.cmp(&right.id))
-    };
+    let sequence = |left: &&SessionRecord, right: &&SessionRecord| left.compare_by_creation(right);
     let sort = |left: &&SessionRecord, right: &&SessionRecord| match order {
         SessionOrder::Sequence => sequence(left, right),
         SessionOrder::RecentActivity => activity_timestamp(right)
@@ -4939,11 +4952,14 @@ fn session_values(
     config: &HelConfig,
 ) -> (String, String, String, String, String) {
     let clock = if let Some(operation) = operation {
-        format!(
-            "{} {}s",
-            operation.kind.label(),
-            now_epoch_seconds.saturating_sub(operation.started_at_epoch_seconds)
-        )
+        let elapsed = now_epoch_seconds.saturating_sub(operation.started_at_epoch_seconds);
+        let label = match (operation.stage, operation.kind) {
+            (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => {
+                stage.label()
+            }
+            _ => operation.kind.label(),
+        };
+        format!("{label} {elapsed}s")
     } else if session.state == SessionState::Provisioning {
         let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
         format!("Launch {}s", now_epoch_seconds.saturating_sub(started_at))
@@ -4957,7 +4973,7 @@ fn session_values(
         clock,
         session.last_profile.clone(),
         session.target_template_id.clone(),
-        session_project(config, session),
+        session.project_name(config),
         session_name(session).to_string(),
     )
 }
@@ -4968,34 +4984,6 @@ fn session_updated_at_epoch_seconds(session: &SessionRecord) -> Option<u64> {
         .timestamp()
         .try_into()
         .ok()
-}
-
-fn session_project(config: &HelConfig, session: &SessionRecord) -> String {
-    if let Some(worktree) = &session.managed_worktree {
-        return path_leaf(&worktree.source_repository);
-    }
-    if let Some(project_directory) = &session.project_directory {
-        return path_leaf(project_directory);
-    }
-    config
-        .bundles
-        .get(&session.bundle_id)
-        .and_then(|bundle| {
-            bundle
-                .repositories
-                .iter()
-                .find(|repository| repository.id == bundle.primary_repo)
-                .or_else(|| bundle.repositories.first())
-        })
-        .map(|repository| path_leaf(&repository.destination))
-        .unwrap_or_else(|| path_leaf(std::path::Path::new(&session.bundle_id)))
-}
-
-fn path_leaf(path: &std::path::Path) -> String {
-    path.file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn checkpoint_archive_size(size: Option<u64>) -> String {
@@ -5026,19 +5014,12 @@ fn session_name(session: &SessionRecord) -> &str {
     session.display_title()
 }
 
-/// Color of an active session's summary band. The terminal palette's plain
-/// yellow (amber/orange in common palettes) is the default; a session whose
-/// turn has ended with output the user has not read yet switches to the
-/// brighter light yellow until it is opened.
+/// Color of an active session's summary band. A session whose detail has not
+/// loaded yet keeps the default.
 fn session_band_color(detail: Option<&SessionDetail>) -> Color {
-    let turn_ended = detail.is_some_and(|detail| {
-        detail.current_turn_started_at.is_none() && detail.unread_agent_messages > 0
-    });
-    if turn_ended {
-        Color::LightYellow
-    } else {
-        Color::Yellow
-    }
+    hel::hel_chat::turn_band_color(
+        detail.is_none_or(|detail| detail.current_turn_started_at.is_some()),
+    )
 }
 
 fn unread_line(unread_count: usize) -> Line<'static> {
@@ -5173,7 +5154,7 @@ fn archived_session_row(
         .map(|checkpoint| checkpoint_time_display(&checkpoint.created_at))
         .unwrap_or_else(|| "never".into());
     Row::new([
-        session_project(config, session),
+        session.project_name(config),
         session.last_profile.clone(),
         checkpoint,
         checkpoint_archive_size(archive_size),
@@ -5486,7 +5467,7 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
                 Style::default().fg(Color::DarkGray),
             ),
             Line::styled(
-                dashboard.notice.as_deref().unwrap_or_default(),
+                dashboard.notices.current().unwrap_or_default(),
                 Style::default().fg(Color::Yellow),
             ),
         ]),
@@ -7022,7 +7003,7 @@ mod tests {
             dashboard.replace_notice_if("Refreshing profile quotas…", "Profile quotas refreshed.")
         );
         assert_eq!(
-            dashboard.notice.as_deref(),
+            dashboard.notice().as_deref(),
             Some("Profile quotas refreshed.")
         );
 
@@ -7031,8 +7012,33 @@ mod tests {
             !dashboard.replace_notice_if("Refreshing profile quotas…", "Profile quotas refreshed.")
         );
         assert_eq!(
-            dashboard.notice.as_deref(),
+            dashboard.notice().as_deref(),
             Some("A later operation failed")
+        );
+    }
+
+    /// The dashboard and every other view (chat, background workers) share
+    /// one notifications bar: a clone installed with `share_notices` sees
+    /// what the dashboard sets, and the dashboard sees what the clone sets.
+    #[test]
+    fn a_shared_notice_is_visible_through_every_clone_of_the_handle() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        let shared = Notices::default();
+        dashboard.share_notices(shared.clone());
+
+        dashboard.set_notice("Background import finished");
+        assert_eq!(
+            shared.current().as_deref(),
+            Some("Background import finished")
+        );
+
+        shared.clear();
+        assert_eq!(dashboard.notice(), None);
+
+        shared.set("Quota refresh finished");
+        assert_eq!(
+            dashboard.notice().as_deref(),
+            Some("Quota refresh finished")
         );
     }
 
@@ -7855,13 +7861,16 @@ mod tests {
     }
 
     #[test]
-    fn ended_turn_with_unread_output_brightens_the_summary_band() {
+    fn ended_turn_brightens_the_summary_band_even_after_output_is_read() {
         let mut session = archived_session();
         session.state = SessionState::Running;
+        // The detach cursor sits past the only agent message, so nothing is
+        // unread; the band still brightens because no turn is in flight.
+        session.detached_after_event_ordinal = 1;
         let mut dashboard = dashboard_with_session(session);
         dashboard.focus = Focus::Quotas;
         let mut materialized =
-            materialized_session_for("session-1", vec![agent_message(1, "hidden response")]);
+            materialized_session_for("session-1", vec![agent_message(1, "seen response")]);
         materialized.execution = MaterializedExecutionState::Idle;
         dashboard.apply_materialized_session(&materialized);
         let mut terminal = Terminal::new(TestBackend::new(140, 28)).expect("terminal");
@@ -7874,9 +7883,13 @@ mod tests {
                 let row = (buffer.area.x..buffer.area.right())
                     .map(|x| buffer[(x, *y)].symbol())
                     .collect::<String>();
-                row.contains("1 unread") && row.contains("codex-1")
+                row.contains("ACP pretty name")
             })
             .expect("active status row");
+        let status = (buffer.area.x..buffer.area.right())
+            .map(|x| buffer[(x, status_y)].symbol())
+            .collect::<String>();
+        assert!(!status.contains("unread"));
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .filter(|x| summary_text_cell(&buffer[(*x, status_y)]))
@@ -8807,7 +8820,7 @@ mod tests {
                 "{focus_moves} focus moves"
             );
             assert_eq!(
-                dashboard.notice.as_deref(),
+                dashboard.notice().as_deref(),
                 Some("Session name cannot be empty."),
                 "{focus_moves} focus moves"
             );
@@ -9449,7 +9462,7 @@ mod tests {
             DashboardAction::None
         );
         assert_eq!(
-            dashboard.notice.as_deref(),
+            dashboard.notice().as_deref(),
             Some("worker bootstrap failed: upload failed")
         );
     }
@@ -10413,41 +10426,6 @@ mod tests {
     }
 
     #[test]
-    fn project_uses_primary_bundle_leaf_or_raw_directory_leaf() {
-        let mut config = config();
-        config
-            .bundles
-            .get_mut("hel")
-            .unwrap()
-            .repositories
-            .push(ProjectRepository {
-                id: "docs".into(),
-                github: Some("BrokkAi/docs".into()),
-                local: None,
-                destination: PathBuf::from("documentation"),
-                git_ref: None,
-            });
-        let mut session = archived_session();
-
-        assert_eq!(session_project(&config, &session), "hel");
-
-        session.project_directory = Some(PathBuf::from("/home/user/Projects/raw-project"));
-        assert_eq!(session_project(&config, &session), "raw-project");
-
-        session.project_directory = Some(PathBuf::from(
-            "/home/user/Projects/source/.hel/worktrees/session-1",
-        ));
-        session.managed_worktree = Some(hel::hel_state::ManagedWorktree {
-            source_project_directory: PathBuf::from("/home/user/Projects/source"),
-            source_repository: PathBuf::from("/home/user/Projects/source"),
-            worktree_root: PathBuf::from("/home/user/Projects/source/.hel/worktrees/session-1"),
-            branch: "hel/session-1".into(),
-            target: hel::hel_state::ManagedWorktreeTarget::Local,
-        });
-        assert_eq!(session_project(&config, &session), "source");
-    }
-
-    #[test]
     fn archived_resources_show_the_checkpoint_archive_size() {
         assert_eq!(checkpoint_archive_size(Some(1_536)), "1.5K");
         assert_eq!(checkpoint_archive_size(None), "—");
@@ -10521,7 +10499,7 @@ mod tests {
     }
 
     #[test]
-    fn active_idle_clock_is_blank() {
+    fn active_session_with_no_turn_in_flight_reads_idle() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let detail = SessionDetail {
@@ -10530,7 +10508,7 @@ mod tests {
         };
 
         let (clock, _, _, _, _) = session_values(&session, Some(&detail), None, 1_480, &config());
-        assert_eq!(clock, "");
+        assert_eq!(clock, "[idle]");
     }
 
     #[test]
@@ -10621,6 +10599,58 @@ mod tests {
 
         let (clock, _, _, _, _) = session_values(&session, None, None, 1_012, &config());
         assert_eq!(clock, "Launch 12s");
+    }
+
+    fn operation(
+        kind: SessionOperationKind,
+        stage: Option<ProvisionStage>,
+    ) -> SessionOperationDisplay {
+        SessionOperationDisplay {
+            kind,
+            started_at_epoch_seconds: 1_000,
+            placeholder: None,
+            stage,
+        }
+    }
+
+    #[test]
+    fn launch_clock_names_the_reported_stage() {
+        let session = archived_session();
+        let operation = operation(
+            SessionOperationKind::Launching,
+            Some(ProvisionStage::Booting),
+        );
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Boot 12s");
+    }
+
+    #[test]
+    fn launch_clock_falls_back_to_the_kind_label_without_a_stage() {
+        let session = archived_session();
+        let operation = operation(SessionOperationKind::Launching, None);
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Launch 12s");
+    }
+
+    #[test]
+    fn a_stage_does_not_rename_a_non_launch_operation() {
+        let session = archived_session();
+        let operation = operation(SessionOperationKind::Pausing, Some(ProvisionStage::Syncing));
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Pausing 12s");
+    }
+
+    #[test]
+    fn setting_a_stage_for_an_unknown_session_is_ignored() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.set_session_operation_stage("missing", ProvisionStage::Booting);
+        assert!(dashboard.session_operations.is_empty());
     }
 
     #[test]

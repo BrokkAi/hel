@@ -42,7 +42,7 @@ use hel::hel_server::{
 };
 use hel::hel_session_manager::{
     RelaySessionTarget, SessionManagerControl, SessionManagerUpdate, SessionManagerUpdates,
-    new_command_id, spawn_session_manager,
+    ViewError, new_command_id, spawn_session_manager,
 };
 use hel::hel_setup::{SetupOutcome, github_repository_from_origin, run_setup_dialog};
 use hel::hel_state::{
@@ -52,7 +52,7 @@ use hel::hel_state::{
 use hel::hel_targets::{
     CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec,
     DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage, ProcessExecutor,
-    SessionResourceProbe, SessionResourceUsage,
+    ProvisionStage, SessionResourceProbe, SessionResourceUsage,
 };
 use hel::hel_worker::RelayCommand;
 use hel::hel_worker_runtime::{
@@ -2387,12 +2387,25 @@ fn apply_worker_poll_update(
     if apply_worker_record_update(controller, &update, Some(dashboard_io_tx))? {
         dashboard.set_state(controller.state.clone());
     }
-    if let Some(detail) = update.view.error {
-        dashboard.mark_transcript_unavailable(&update.session_id);
-        dashboard.set_notice(format!(
-            "Session {}: relay unreachable: {detail}; collecting worker diagnostics…",
-            &update.session_id[..update.session_id.len().min(8)]
-        ));
+    match update.view.error {
+        Some(ViewError::Unreachable(detail)) => {
+            dashboard.mark_transcript_unavailable(&update.session_id);
+            dashboard.set_notice(format!(
+                "Session {}: relay unreachable: {detail}; collecting worker diagnostics…",
+                &update.session_id[..update.session_id.len().min(8)]
+            ));
+        }
+        Some(ViewError::ProjectionIntegrity(detail)) => {
+            // Deterministic failure: no worker diagnostics, and no
+            // "relay unreachable:" last_error, which reconnect handling
+            // reserves for genuinely unreachable relays.
+            dashboard.mark_transcript_unavailable(&update.session_id);
+            dashboard.set_notice(format!(
+                "Session {}: transcript projection failed: {detail}",
+                &update.session_id[..update.session_id.len().min(8)]
+            ));
+        }
+        None => {}
     }
     Ok(update.view.snapshot.is_some())
 }
@@ -2757,7 +2770,11 @@ fn spawn_dashboard_create_session(
         }
         let result = (|| -> Result<()> {
             let mut controller = Controller::load()?;
-            let executor = CancellableProcessExecutor::new(cancelled);
+            let executor = StageReportingExecutor::new(
+                CancellableProcessExecutor::new(cancelled),
+                session_id.clone(),
+                updates,
+            );
             runtime.block_on(controller.provision_session_controlled(&session_id, &executor))
         })()
         .map(|()| LifecycleSuccess::Created)
@@ -3089,6 +3106,72 @@ enum DashboardIoUpdate {
         directory: String,
         result: std::result::Result<(), String>,
     },
+    LifecycleStage {
+        session_id: String,
+        stage: ProvisionStage,
+    },
+}
+
+/// Reports the launch stage of each command a lifecycle operation runs, so the
+/// session clock can name the work in flight.
+struct StageReportingExecutor<E: CommandExecutor> {
+    inner: E,
+    session_id: String,
+    updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+    reported: std::sync::Mutex<Option<ProvisionStage>>,
+}
+
+impl<E: CommandExecutor> StageReportingExecutor<E> {
+    fn new(
+        inner: E,
+        session_id: String,
+        updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+    ) -> Self {
+        Self {
+            inner,
+            session_id,
+            updates,
+            reported: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn report(&self, command: &CommandSpec) {
+        let Some(stage) = command.stage else {
+            return;
+        };
+        let mut reported = self
+            .reported
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *reported == Some(stage) {
+            return;
+        }
+        *reported = Some(stage);
+        let _ = self.updates.send(DashboardIoUpdate::LifecycleStage {
+            session_id: self.session_id.clone(),
+            stage,
+        });
+    }
+}
+
+impl<E: CommandExecutor> CommandExecutor for StageReportingExecutor<E> {
+    fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        self.report(command);
+        self.inner.execute(command)
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.inner.cancellation_requested()
+    }
+
+    fn execute_with_stdin(
+        &self,
+        command: &CommandSpec,
+        input: &mut (dyn std::io::Read + Send),
+    ) -> Result<CommandOutput> {
+        self.report(command);
+        self.inner.execute_with_stdin(command, input)
+    }
 }
 
 fn startup_greeting(controller: &Controller) -> String {
@@ -3209,6 +3292,7 @@ async fn open_chat_view(
     session_id: &str,
     sessions: &SessionManagerControl,
     recovery_observer: &hel::hel_recovery::RecoveryObserver,
+    notices: hel::hel_chat::Notices,
 ) -> Result<hel::hel_chat::ActiveChat> {
     let session_record = controller
         .state
@@ -3220,17 +3304,30 @@ async fn open_chat_view(
     // Only a fresh view is seeded: a warm chat the loop kept alive holds newer
     // input than this saved copy.
     let saved_draft = session_record.draft_input.clone();
-    let other_sessions = controller
+    // The header lists every active session in the order the session list
+    // shows them, so each one keeps the same place in both views.
+    let mut active = controller
         .state
         .sessions
         .values()
-        .filter(|record| record.id != session_id && record.state.is_active())
-        .map(|record| hel::hel_chat::OtherSessionIdentity {
-            session_id: record.id.clone(),
-            display_title: record.display_title().to_owned(),
-            detached_after_event_ordinal: record.detached_after_event_ordinal,
-        })
+        .filter(|record| record.state.is_active())
         .collect::<Vec<_>>();
+    active.sort_by(|left, right| left.compare_by_creation(right));
+    let mut header = hel::hel_chat::SessionHeaderIdentity {
+        project: session_record.project_name(&controller.config),
+        ..hel::hel_chat::SessionHeaderIdentity::default()
+    };
+    for (position, record) in active.into_iter().enumerate() {
+        if record.id == session_id {
+            header.position = position;
+            continue;
+        }
+        header.others.push(hel::hel_chat::OtherSessionIdentity {
+            session_id: record.id.clone(),
+            position,
+            project: record.project_name(&controller.config),
+        });
+    }
     let recovery_context = hel::hel_recovery::RecoveryContext {
         observer: recovery_observer.clone(),
         session: session_record,
@@ -3242,8 +3339,9 @@ async fn open_chat_view(
         &bundle_id,
         Some(recovery_context),
         sessions.clone(),
-        other_sessions,
+        header,
         saved_draft,
+        notices,
     ))
 }
 
@@ -3313,6 +3411,10 @@ async fn run_dashboard() -> Result<()> {
         controller.state.clone(),
         std::collections::BTreeMap::new(),
     );
+    // One notifications bar for the whole process: the dashboard and every
+    // chat view opened below report through the same shared handle.
+    let notices = hel::hel_chat::Notices::default();
+    dashboard.share_notices(notices.clone());
     for (session_id, queued) in projected_queued_prompts(&controller)? {
         dashboard.apply_queued_prompts(&session_id, queued);
     }
@@ -3607,11 +3709,12 @@ async fn run_dashboard() -> Result<()> {
             },
             // Turn clocks, countdowns, and credential-sync backoffs move on
             // their own, so the dashboard redraws once a second regardless.
-            // The chat has no animation; its only time-driven text is the
-            // checkpoint title, so it redraws only when that flag has moved.
+            // The chat redraws only when its own time-driven text has moved:
+            // a running turn clock in the session header, or the checkpoint
+            // title.
             _ = clock_tick.tick() => {
                 dirty |= match (view, active_chat.as_ref()) {
-                    (View::Chat, Some(chat)) => chat.recovery_title_is_stale(),
+                    (View::Chat, Some(chat)) => chat.needs_clock_tick(),
                     _ => true,
                 };
             }
@@ -3647,7 +3750,11 @@ async fn run_dashboard() -> Result<()> {
             controller_changed = true;
             let session_id = update.session_id.clone();
             let connected = update.view.connected;
-            let connection_error = update.view.error.clone();
+            // Only unreachable relays drive the worker diagnostics flow.
+            let connection_error = match update.view.error.as_ref() {
+                Some(ViewError::Unreachable(detail)) => Some(detail.clone()),
+                Some(ViewError::ProjectionIntegrity(_)) | None => None,
+            };
             if let Some(snapshot) = update.view.snapshot.as_ref()
                 && let Some(session) = controller.state.sessions.get(&session_id).cloned()
             {
@@ -3851,6 +3958,9 @@ async fn run_dashboard() -> Result<()> {
                             }
                         }
                     }
+                }
+                DashboardIoUpdate::LifecycleStage { session_id, stage } => {
+                    dashboard.set_session_operation_stage(&session_id, stage);
                 }
                 DashboardIoUpdate::MaterializedSessionProjection { detail } => {
                     dashboard.apply_prepared_materialized_session(*detail);
@@ -4390,6 +4500,7 @@ async fn run_dashboard() -> Result<()> {
                         &session_id,
                         &worker_commands_tx,
                         &recovery_observer,
+                        notices.clone(),
                     )
                     .await
                     {
@@ -4433,6 +4544,7 @@ async fn run_dashboard() -> Result<()> {
                     },
                 );
                 let updates = lifecycle_updates_tx.clone();
+                let stage_updates = dashboard_io_tx.clone();
                 let observer = recovery_observer.clone();
                 let operation_session_id = session_id.clone();
                 let operation_profile_id = profile_id.clone();
@@ -4446,7 +4558,11 @@ async fn run_dashboard() -> Result<()> {
                             &cancelled,
                         )?;
                         let mut controller = Controller::load()?;
-                        let executor = CancellableProcessExecutor::new(cancelled);
+                        let executor = StageReportingExecutor::new(
+                            CancellableProcessExecutor::new(cancelled),
+                            operation_session_id.clone(),
+                            stage_updates,
+                        );
                         runtime.block_on(controller.resume_session_controlled(
                             &operation_session_id,
                             &operation_profile_id,
