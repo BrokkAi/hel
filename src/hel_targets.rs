@@ -318,56 +318,126 @@ impl CommandExecutor for ProcessExecutor {
         command: &CommandSpec,
         input: &mut (dyn Read + Send),
     ) -> Result<CommandOutput> {
-        let mut child = Command::new(&command.program)
-            .args(&command.args)
-            .envs(&command.env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("run {} for {}", command.program, command.purpose))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("streamed command stdin missing")?;
-        let mut stdout = child
-            .stdout
-            .take()
-            .context("streamed command stdout missing")?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .context("streamed command stderr missing")?;
-        let stdout_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            std::io::copy(&mut stdout, &mut bytes).map(|_| bytes)
-        });
-        let stderr_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            std::io::copy(&mut stderr, &mut bytes).map(|_| bytes)
-        });
-        let copy = std::io::copy(input, &mut stdin);
-        let flush = stdin.flush();
-        drop(stdin);
-        let status = child
-            .wait()
-            .with_context(|| format!("wait for {} for {}", command.program, command.purpose))?;
-        let stdout = stdout_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("streamed command stdout reader panicked"))??;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("streamed command stderr reader panicked"))??;
-        if status.success() {
-            copy.context("stream command input")?;
-            flush.context("flush command input")?;
-        }
-        Ok(CommandOutput {
-            status: status.code().unwrap_or(-1),
-            stdout,
-            stderr,
-        })
+        let mut process = Command::new(&command.program);
+        process.args(&command.args).envs(&command.env);
+        // Plain process execution is not cancellable, so the transfer only
+        // ends when the child does.
+        stream_command_with_stdin(process, command, input, &|| false)
     }
+}
+
+/// Streams `input` into a freshly spawned child and collects its output.
+///
+/// Both executors share this one implementation because the pipe edge cases
+/// below are easy to get subtly wrong in a second copy.
+///
+/// `is_cancelled` reports whether the supervising operation wants the transfer
+/// abandoned; [`ProcessExecutor`] passes a check that is never true, which also
+/// makes the kill path below unreachable for it.
+fn stream_command_with_stdin(
+    mut process: Command,
+    command: &CommandSpec,
+    input: &mut (dyn Read + Send),
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<CommandOutput> {
+    if is_cancelled() {
+        bail!("operation cancelled");
+    }
+    let mut child = process
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run {} for {}", command.program, command.purpose))?;
+    let stdin = child
+        .stdin
+        .take()
+        .context("streamed command stdin missing")?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("streamed command stdout missing")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("streamed command stderr missing")?;
+    // Reader threads keep the child's output pipes drained; a child that fills
+    // one while nobody reads would block instead of exiting.
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::copy(&mut stdout, &mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::copy(&mut stderr, &mut bytes).map(|_| bytes)
+    });
+    let process_result = std::thread::scope(|scope| -> Result<_> {
+        // Pipe writes can block forever when a remote helper stops reading.
+        // Keep the writer off the supervising thread so cancellation can kill
+        // the process group and thereby close the blocked pipe.
+        let input_writer = scope.spawn(move || -> Result<()> {
+            // Owning `stdin` here is what closes the pipe's write end once the
+            // transfer finishes. A child that reads to EOF, such as
+            // `hel worker export-checkpoint --spec -`, never exits while any
+            // copy of the write end is still open.
+            let mut stdin = stdin;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                // Checking before each chunk makes large checkpoint copies
+                // cooperatively cancellable without changing the executor
+                // interface.
+                if is_cancelled() {
+                    bail!("operation cancelled");
+                }
+                let count = input.read(&mut buffer).context("read command input")?;
+                if count == 0 {
+                    break;
+                }
+                stdin
+                    .write_all(&buffer[..count])
+                    .context("stream command input")?;
+            }
+            stdin.flush().context("flush command input")
+        });
+        let status = loop {
+            if is_cancelled() {
+                terminate_cancellable_child(&mut child);
+                let _ = input_writer.join();
+                bail!("operation cancelled while {}", command.purpose);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                Err(error) => {
+                    terminate_cancellable_child(&mut child);
+                    let _ = input_writer.join();
+                    return Err(error).with_context(|| format!("wait for {}", command.purpose));
+                }
+            }
+        };
+        let input_result = input_writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("streamed command input writer panicked"))?;
+        Ok((status, input_result))
+    });
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("streamed command stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("streamed command stderr reader panicked"))??;
+    let (status, input_result) = process_result?;
+    if status.success() {
+        // A child that exited first explains the failure through its own
+        // status and stderr; the broken pipe that exit caused would only hide
+        // it. A successful child must not hide an input error.
+        input_result?;
+    }
+    Ok(CommandOutput {
+        status: status.code().unwrap_or(-1),
+        stdout,
+        stderr,
+    })
 }
 
 #[derive(Clone)]
@@ -396,6 +466,13 @@ impl CancellableProcessExecutor {
             cancelled: Arc::new(AtomicBool::new(false)),
             deadline: Some(Instant::now() + timeout),
         }
+    }
+
+    /// Bounds an existing flag-based executor with a deadline, so a wedged
+    /// child becomes a reported failure instead of running forever.
+    pub fn with_deadline(mut self, timeout: Duration) -> Self {
+        self.deadline = Some(Instant::now() + timeout);
+        self
     }
 
     fn check_cancelled(&self) -> Result<()> {
@@ -485,92 +562,10 @@ impl CommandExecutor for CancellableProcessExecutor {
         command: &CommandSpec,
         input: &mut (dyn Read + Send),
     ) -> Result<CommandOutput> {
-        self.check_cancelled()?;
-        // Streamed transfers already isolate stdout/stderr reader threads.
-        // Checking before each input chunk makes large checkpoint copies
-        // cooperatively cancellable without changing the executor interface.
-        let mut child = cancellable_command(command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("run {} for {}", command.program, command.purpose))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("streamed command stdin missing")?;
-        let mut stdout = child
-            .stdout
-            .take()
-            .context("streamed command stdout missing")?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .context("streamed command stderr missing")?;
-        let stdout_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            std::io::copy(&mut stdout, &mut bytes).map(|_| bytes)
-        });
-        let stderr_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            std::io::copy(&mut stderr, &mut bytes).map(|_| bytes)
-        });
-        let process_result = std::thread::scope(|scope| -> Result<_> {
-            // Pipe writes can block forever when a remote helper stops reading.
-            // Keep the writer off the supervising thread so cancellation can
-            // kill the process group and thereby close the blocked pipe.
-            let input_writer = scope.spawn(|| -> Result<()> {
-                let mut buffer = [0_u8; 64 * 1024];
-                loop {
-                    self.check_cancelled()?;
-                    let count = input.read(&mut buffer).context("read command input")?;
-                    if count == 0 {
-                        break;
-                    }
-                    stdin
-                        .write_all(&buffer[..count])
-                        .context("stream command input")?;
-                }
-                stdin.flush().context("flush command input")
-            });
-            let status = loop {
-                if self.is_cancelled() {
-                    terminate_cancellable_child(&mut child);
-                    let _ = input_writer.join();
-                    bail!("operation cancelled while {}", command.purpose);
-                }
-                match child.try_wait() {
-                    Ok(Some(status)) => break status,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-                    Err(error) => {
-                        terminate_cancellable_child(&mut child);
-                        let _ = input_writer.join();
-                        return Err(error).with_context(|| format!("wait for {}", command.purpose));
-                    }
-                }
-            };
-            let input_result = input_writer
-                .join()
-                .map_err(|_| anyhow::anyhow!("streamed command input writer panicked"))?;
-            Ok((status, input_result))
-        });
-        let stdout = stdout_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("streamed command stdout reader panicked"))??;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("streamed command stderr reader panicked"))??;
-        let (status, input_result) = process_result?;
-        if status.success() {
-            // A child that exited first explains the failure through its own
-            // status and stderr; the broken pipe that exit caused would only
-            // hide it. A successful child must not hide an input error.
-            input_result?;
-        }
-        Ok(CommandOutput {
-            status: status.code().unwrap_or(-1),
-            stdout,
-            stderr,
+        // The child runs in its own process group so cancellation can kill the
+        // whole group, which is what releases a writer blocked on a full pipe.
+        stream_command_with_stdin(cancellable_command(command), command, input, &|| {
+            self.is_cancelled()
         })
     }
 }
@@ -2395,6 +2390,39 @@ mod tests {
         assert_eq!(output.status, 0);
         assert_eq!(output.stdout, b"streamed input");
         assert!(output.stderr.is_empty());
+    }
+
+    /// A child that reads its stdin to end of file, as the checkpoint export
+    /// worker does, only exits once the write end of the pipe is closed. Every
+    /// executor that streams stdin has to close it after the last chunk.
+    fn assert_streams_to_eof(executor: &dyn CommandExecutor) {
+        let payload = vec![b'x'; 256 * 1024];
+        let mut input = std::io::Cursor::new(payload.clone());
+        let started = std::time::Instant::now();
+
+        let output = executor
+            .execute_with_stdin(
+                &CommandSpec::new("sh", ["-c", "cat"]).purpose("echo a stream read to eof"),
+                &mut input,
+            )
+            .unwrap();
+
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout, payload);
+        assert!(output.stderr.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn process_executor_completes_a_stream_against_a_child_that_reads_to_eof() {
+        assert_streams_to_eof(&ProcessExecutor);
+    }
+
+    #[test]
+    fn cancellable_executor_completes_a_stream_against_a_child_that_reads_to_eof() {
+        assert_streams_to_eof(&CancellableProcessExecutor::new(Arc::new(AtomicBool::new(
+            false,
+        ))));
     }
 
     fn bundle() -> ProjectBundleSpec {
