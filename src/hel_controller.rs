@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use agent_client_protocol::schema::v1::{ContentBlock, Plan, TextContent, ToolCall};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::hel_archive::{
@@ -1371,8 +1372,16 @@ impl Controller {
                 )?
             };
 
-            let outputs =
-                preflight_target(template, executor).and_then(|()| provision.execute(executor))?;
+            let outputs = preflight_target(template, executor).and_then(|()| {
+                let started = Instant::now();
+                let result = provision.execute_concurrent(executor);
+                tracing::debug!(
+                    session_id,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "provisioning plan execution completed"
+                );
+                result
+            })?;
             locator_after_provision(
                 template,
                 &target,
@@ -1569,7 +1578,14 @@ impl Controller {
         .write(&ownership_path)?;
         let profile_stage = staging.path().join("profile");
         if !matches!(backend, hel_targets::TargetLocator::LocalBare { .. }) {
-            stage_profile(profile, &profile_stage)?;
+            let started = Instant::now();
+            let result = stage_profile(profile, &profile_stage);
+            tracing::debug!(
+                session_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                "profile staging completed"
+            );
+            result?;
         }
         let worker_binary = worker_binary_for(&backend, executor)?;
 
@@ -5361,7 +5377,7 @@ fn locator_after_provision(
     backend: &hel_targets::TargetTemplate,
     session_id: &str,
     first_output: Option<&CommandOutput>,
-    executor: &impl CommandExecutor,
+    executor: &(impl CommandExecutor + Sync),
     bundle: Option<&ProjectBundleSpec>,
 ) -> Result<TargetLocator> {
     let generated = hel_targets::resource_name(session_id)?;
@@ -5481,7 +5497,7 @@ fn locator_after_provision(
                 session_id,
                 bundle.context("AWS provisioning requires a project bundle")?,
             )?
-            .execute(executor)?;
+            .execute_concurrent(executor)?;
             TargetLocator::AwsEc2 {
                 instance_id,
                 address: Some(address),
@@ -6078,12 +6094,16 @@ fn stage_profile(profile: &crate::hel_config::HarnessProfile, destination: &Path
             "plugins",
         ],
     };
-    for name in allowlist {
+    // Allowlist entries (and, within each, a copied directory's children) are
+    // independent of one another, so copying them concurrently shortens the
+    // stage step for profiles with large skills/plugins trees.
+    allowlist.par_iter().try_for_each(|name| -> Result<()> {
         let from = source.join(name);
         if from.exists() {
             copy_profile_entry(&from, &destination.join(name))?;
         }
-    }
+        Ok(())
+    })?;
     append_hel_container_environment(profile.kind, destination)
 }
 
@@ -6117,24 +6137,50 @@ fn append_hel_container_environment(
 }
 
 fn copy_profile_entry(source: &Path, destination: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(source)?;
+    let metadata = std::fs::symlink_metadata(source)
+        .with_context(|| format!("read staged profile entry metadata {}", source.display()))?;
     if metadata.file_type().is_symlink() {
         return Ok(());
     }
     if metadata.is_file() {
         if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create staged profile directory {}", parent.display()))?;
         }
-        std::fs::copy(source, destination)?;
+        std::fs::copy(source, destination).with_context(|| {
+            format!(
+                "copy staged profile file {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
         return Ok(());
     }
     if metadata.is_dir() {
-        std::fs::create_dir_all(destination)?;
-        for entry in std::fs::read_dir(source)? {
-            let entry = entry?;
-            copy_profile_entry(&entry.path(), &destination.join(entry.file_name()))?;
-        }
-        std::fs::set_permissions(destination, metadata.permissions())?;
+        std::fs::create_dir_all(destination).with_context(|| {
+            format!("create staged profile directory {}", destination.display())
+        })?;
+        let entries = std::fs::read_dir(source)
+            .with_context(|| format!("list staged profile directory {}", source.display()))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| {
+                format!(
+                    "read staged profile directory entries in {}",
+                    source.display()
+                )
+            })?;
+        // Sibling entries in one directory are independent, so recurse in
+        // parallel; this is the level most likely to hold many files (e.g. a
+        // skills or plugins tree).
+        entries.par_iter().try_for_each(|entry| {
+            copy_profile_entry(&entry.path(), &destination.join(entry.file_name()))
+        })?;
+        std::fs::set_permissions(destination, metadata.permissions()).with_context(|| {
+            format!(
+                "set permissions for staged profile directory {}",
+                destination.display()
+            )
+        })?;
     }
     Ok(())
 }

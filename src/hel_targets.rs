@@ -79,6 +79,12 @@ pub struct CommandSpec {
     pub purpose: String,
     #[serde(default)]
     pub stage: Option<ProvisionStage>,
+    /// Commands that share this marker and appear consecutively in a plan's
+    /// command list may run concurrently under
+    /// [`CommandPlan::execute_concurrent`]. Commands without a marker, or
+    /// whose neighbors do not share it, keep running strictly in plan order.
+    #[serde(default)]
+    pub parallel_group: Option<u32>,
 }
 
 impl CommandSpec {
@@ -92,6 +98,7 @@ impl CommandSpec {
             env: BTreeMap::new(),
             purpose: String::new(),
             stage: None,
+            parallel_group: None,
         }
     }
 
@@ -102,6 +109,13 @@ impl CommandSpec {
 
     pub fn stage(mut self, stage: ProvisionStage) -> Self {
         self.stage = Some(stage);
+        self
+    }
+
+    /// Mark this command as eligible to run concurrently with its
+    /// plan-adjacent siblings that share the same group.
+    pub fn parallel_group(mut self, group: u32) -> Self {
+        self.parallel_group = Some(group);
         self
     }
 }
@@ -803,6 +817,86 @@ impl CommandPlan {
             outputs.push(output);
         }
         Ok(outputs)
+    }
+
+    /// Execute the plan the same way [`Self::execute`] does, except that
+    /// commands sharing a [`CommandSpec::parallel_group`] marker and
+    /// appearing consecutively in `commands` run concurrently as one batch.
+    ///
+    /// A batch starts only once every earlier command has succeeded, and a
+    /// batch that fails reports the first failure in plan order regardless
+    /// of which command finished first — the same fail-fast contract
+    /// [`Self::execute`] provides between individual commands. This method
+    /// requires a `Sync` executor because a batch shares it across threads;
+    /// [`Self::execute`] keeps working with non-`Sync` executors such as
+    /// test fakes built on `RefCell`.
+    pub fn execute_concurrent(
+        &self,
+        executor: &(impl CommandExecutor + Sync),
+    ) -> Result<Vec<CommandOutput>> {
+        let mut outputs = Vec::with_capacity(self.commands.len());
+        let mut index = 0;
+        while index < self.commands.len() {
+            let group = self.commands[index].parallel_group;
+            let mut end = index + 1;
+            if group.is_some() {
+                while end < self.commands.len() && self.commands[end].parallel_group == group {
+                    end += 1;
+                }
+            }
+            let batch = &self.commands[index..end];
+            if let [command] = batch {
+                outputs.push(checked_command_output(command, executor.execute(command)?)?);
+            } else {
+                let results: Vec<Result<CommandOutput>> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = batch
+                        .iter()
+                        .map(|command| scope.spawn(|| executor.execute(command)))
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|handle| match handle.join() {
+                            Ok(result) => result,
+                            Err(panic) => Err(anyhow::anyhow!(
+                                "concurrent command thread panicked: {}",
+                                command_thread_panic_message(panic.as_ref())
+                            )),
+                        })
+                        .collect()
+                });
+                for (command, result) in batch.iter().zip(results) {
+                    outputs.push(checked_command_output(command, result?)?);
+                }
+            }
+            index = end;
+        }
+        Ok(outputs)
+    }
+}
+
+/// Fail the same way [`CommandPlan::execute`] does for a non-zero exit
+/// status; kept as a shared helper so [`CommandPlan::execute_concurrent`]
+/// reports identical error text.
+fn checked_command_output(command: &CommandSpec, output: CommandOutput) -> Result<CommandOutput> {
+    if output.status != 0 {
+        bail!(
+            "{} failed with status {}: {}",
+            command.purpose,
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(output)
+}
+
+/// Describe a spawned command thread's panic payload for error context.
+fn command_thread_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
     }
 }
 
@@ -1822,6 +1916,11 @@ pub fn install_git_plan(boundary: ExecutionBoundary<'_>) -> CommandPlan {
     }
 }
 
+/// Shared [`CommandSpec::parallel_group`] marker for one bundle's per-repository
+/// clone/init commands. Every `clone_commands` call builds its own
+/// [`CommandPlan`], so a single fixed marker never mixes batches across plans.
+const BUNDLE_REPOSITORIES_PARALLEL_GROUP: u32 = 1;
+
 fn clone_commands(
     bundle: &ProjectBundleSpec,
     workspace: &str,
@@ -1842,7 +1941,8 @@ fn clone_commands(
             commands.push(
                 wrap(vec!["git".into(), "init".into(), "--".into(), destination])
                     .purpose(format!("initialize {}", repository.destination))
-                    .stage(ProvisionStage::Syncing),
+                    .stage(ProvisionStage::Syncing)
+                    .parallel_group(BUNDLE_REPOSITORIES_PARALLEL_GROUP),
             );
             continue;
         };
@@ -1856,7 +1956,8 @@ fn clone_commands(
         commands.push(
             wrap(args)
                 .purpose(format!("clone {}", repository.destination))
-                .stage(ProvisionStage::Syncing),
+                .stage(ProvisionStage::Syncing)
+                .parallel_group(BUNDLE_REPOSITORIES_PARALLEL_GROUP),
         );
     }
     commands
@@ -2277,6 +2378,7 @@ fn is_runtime_container_id(value: &str) -> bool {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::sync::{Barrier, Mutex};
 
     const SESSION: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
 
@@ -2599,6 +2701,47 @@ mod tests {
                 .unwrap()
                 .contains("gh auth git-credential")
         );
+    }
+
+    #[test]
+    fn podman_plan_only_marks_per_repository_clone_commands_for_parallel_execution() {
+        let plan = provision_plan(
+            &TargetTemplate::LocalPodman(ContainerTemplate {
+                image: "ubuntu:24.04".to_owned(),
+                extra_run_args: vec![],
+            }),
+            SESSION,
+            &bundle(),
+            &[],
+        )
+        .unwrap();
+
+        let bootstrap = plan
+            .commands
+            .iter()
+            .find(|command| command.purpose == "install Git")
+            .unwrap();
+        assert_eq!(bootstrap.parallel_group, None);
+
+        let mkdir = plan
+            .commands
+            .iter()
+            .find(|command| command.purpose == "create bundle workspace")
+            .unwrap();
+        assert_eq!(mkdir.parallel_group, None);
+
+        let clone_app = plan
+            .commands
+            .iter()
+            .find(|command| command.purpose == "clone app")
+            .unwrap();
+        let clone_lib = plan
+            .commands
+            .iter()
+            .find(|command| command.purpose == "clone libs/lib")
+            .unwrap();
+        assert!(clone_app.parallel_group.is_some());
+        assert_eq!(clone_app.parallel_group, clone_lib.parallel_group);
     }
 
     #[test]
@@ -3271,6 +3414,209 @@ mod tests {
         };
         assert!(plan.execute(&executor).is_err());
         assert_eq!(executor.seen.borrow().len(), 2);
+    }
+
+    /// A `Sync` counterpart to [`FakeExecutor`], usable with
+    /// [`CommandPlan::execute_concurrent`].
+    struct SyncFakeExecutor {
+        seen: Mutex<Vec<CommandSpec>>,
+        fail_at: Option<usize>,
+    }
+
+    impl CommandExecutor for SyncFakeExecutor {
+        fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+            let mut seen = self.seen.lock().unwrap();
+            let index = seen.len();
+            seen.push(command.clone());
+            Ok(CommandOutput {
+                status: i32::from(self.fail_at == Some(index)),
+                stdout: vec![],
+                stderr: b"failure".to_vec(),
+            })
+        }
+    }
+
+    #[test]
+    fn ungrouped_plans_behave_identically_under_both_execution_methods() {
+        let commands = vec![
+            CommandSpec::new("one", std::iter::empty::<String>()).purpose("one"),
+            CommandSpec::new("two", std::iter::empty::<String>()).purpose("two"),
+            CommandSpec::new("three", std::iter::empty::<String>()).purpose("three"),
+        ];
+        let sequential_plan = CommandPlan {
+            description: "test".to_owned(),
+            commands: commands.clone(),
+        };
+        let concurrent_plan = CommandPlan {
+            description: "test".to_owned(),
+            commands,
+        };
+
+        let sequential_executor = SyncFakeExecutor {
+            seen: Mutex::new(vec![]),
+            fail_at: None,
+        };
+        let sequential_outputs = sequential_plan.execute(&sequential_executor).unwrap();
+
+        let concurrent_executor = SyncFakeExecutor {
+            seen: Mutex::new(vec![]),
+            fail_at: None,
+        };
+        let concurrent_outputs = concurrent_plan
+            .execute_concurrent(&concurrent_executor)
+            .unwrap();
+
+        assert_eq!(sequential_outputs, concurrent_outputs);
+        assert_eq!(
+            sequential_executor.seen.into_inner().unwrap(),
+            concurrent_executor.seen.into_inner().unwrap(),
+            "an ungrouped plan runs its commands in the same order either way"
+        );
+    }
+
+    /// Blocks every command on a barrier sized to the batch, so this only
+    /// returns if [`CommandPlan::execute_concurrent`] actually starts the
+    /// whole batch before any command in it completes.
+    struct BarrierExecutor {
+        seen: Mutex<Vec<CommandSpec>>,
+        barrier: Barrier,
+    }
+
+    impl CommandExecutor for BarrierExecutor {
+        fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+            self.seen.lock().unwrap().push(command.clone());
+            self.barrier.wait();
+            Ok(CommandOutput {
+                status: 0,
+                stdout: vec![],
+                stderr: vec![],
+            })
+        }
+    }
+
+    #[test]
+    fn grouped_commands_run_concurrently() {
+        let plan = CommandPlan {
+            description: "test".to_owned(),
+            commands: vec![
+                CommandSpec::new("one", std::iter::empty::<String>())
+                    .purpose("one")
+                    .parallel_group(7),
+                CommandSpec::new("two", std::iter::empty::<String>())
+                    .purpose("two")
+                    .parallel_group(7),
+                CommandSpec::new("three", std::iter::empty::<String>())
+                    .purpose("three")
+                    .parallel_group(7),
+            ],
+        };
+        let executor = BarrierExecutor {
+            seen: Mutex::new(vec![]),
+            barrier: Barrier::new(3),
+        };
+
+        let outputs = plan.execute_concurrent(&executor).unwrap();
+
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(executor.seen.into_inner().unwrap().len(), 3);
+    }
+
+    /// Fails "first" slowly and "third" immediately, so a plan-order failure
+    /// report (rather than a completion-order one) can only pick "first".
+    struct OrderSensitiveFailureExecutor {
+        seen: Mutex<Vec<CommandSpec>>,
+    }
+
+    impl CommandExecutor for OrderSensitiveFailureExecutor {
+        fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+            self.seen.lock().unwrap().push(command.clone());
+            match command.purpose.as_str() {
+                "first" => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    Ok(CommandOutput {
+                        status: 1,
+                        stdout: vec![],
+                        stderr: b"first failed".to_vec(),
+                    })
+                }
+                "third" => Ok(CommandOutput {
+                    status: 1,
+                    stdout: vec![],
+                    stderr: b"third failed".to_vec(),
+                }),
+                _ => Ok(CommandOutput {
+                    status: 0,
+                    stdout: vec![],
+                    stderr: vec![],
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn batch_failure_reports_the_first_in_plan_order_failure_and_blocks_later_commands() {
+        let plan = CommandPlan {
+            description: "test".to_owned(),
+            commands: vec![
+                CommandSpec::new("a", std::iter::empty::<String>())
+                    .purpose("first")
+                    .parallel_group(3),
+                CommandSpec::new("b", std::iter::empty::<String>())
+                    .purpose("second")
+                    .parallel_group(3),
+                CommandSpec::new("c", std::iter::empty::<String>())
+                    .purpose("third")
+                    .parallel_group(3),
+                CommandSpec::new("d", std::iter::empty::<String>()).purpose("fourth"),
+            ],
+        };
+        let executor = OrderSensitiveFailureExecutor {
+            seen: Mutex::new(vec![]),
+        };
+
+        let error = plan.execute_concurrent(&executor).unwrap_err();
+
+        assert!(
+            error.to_string().starts_with("first failed with status 1"),
+            "expected the plan-order failure (\"first\"), got: {error}"
+        );
+        let seen = executor.seen.into_inner().unwrap();
+        assert_eq!(
+            seen.len(),
+            3,
+            "the whole failing batch starts even though it fails"
+        );
+        assert!(
+            !seen.iter().any(|command| command.purpose == "fourth"),
+            "a command after a failed batch must not start"
+        );
+    }
+
+    #[test]
+    fn failure_before_a_batch_prevents_the_batch_from_starting() {
+        let plan = CommandPlan {
+            description: "test".to_owned(),
+            commands: vec![
+                CommandSpec::new("gate", std::iter::empty::<String>()).purpose("gate"),
+                CommandSpec::new("a", std::iter::empty::<String>())
+                    .purpose("batch-a")
+                    .parallel_group(9),
+                CommandSpec::new("b", std::iter::empty::<String>())
+                    .purpose("batch-b")
+                    .parallel_group(9),
+            ],
+        };
+        let executor = SyncFakeExecutor {
+            seen: Mutex::new(vec![]),
+            fail_at: Some(0),
+        };
+
+        assert!(plan.execute_concurrent(&executor).is_err());
+        assert_eq!(
+            executor.seen.into_inner().unwrap().len(),
+            1,
+            "a batch must not start once an earlier command has already failed"
+        );
     }
 
     #[test]
