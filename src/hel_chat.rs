@@ -962,7 +962,10 @@ pub struct ChatState {
     entries: Vec<ChatEntry>,
     input: String,
     input_cursor: usize,
+    /// Stored prompts from other sessions in this project, oldest-first.
     project_history: Vec<String>,
+    /// Stored prompts from this session, oldest-first.
+    session_history: Vec<String>,
     project_history_error: Option<String>,
     prompt_history: Vec<String>,
     history_index: Option<usize>,
@@ -1008,6 +1011,7 @@ impl ChatState {
             input: String::new(),
             input_cursor: 0,
             project_history: Vec::new(),
+            session_history: Vec::new(),
             project_history_error: None,
             prompt_history: Vec::new(),
             history_index: None,
@@ -1189,7 +1193,13 @@ impl ChatState {
 
     fn set_project_history(&mut self, entries: Vec<PromptHistoryEntry>) {
         self.project_history_error = None;
-        self.project_history = entries.into_iter().rev().map(|entry| entry.text).collect();
+        // Entries arrive newest-first; split this session's prompts from the
+        // rest of the project so history navigation reaches them first.
+        let (session, project): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|entry| entry.session_id == self.session_id);
+        self.session_history = session.into_iter().rev().map(|entry| entry.text).collect();
+        self.project_history = project.into_iter().rev().map(|entry| entry.text).collect();
         if let Some(index) = self.history_index
             && index >= self.navigation_history().len()
         {
@@ -2027,6 +2037,7 @@ impl ChatState {
 
     fn navigation_history(&self) -> Vec<String> {
         let mut history = self.project_history.clone();
+        history.extend(self.session_history.iter().cloned());
         history.extend(self.prompt_history.iter().cloned());
         history
     }
@@ -6479,6 +6490,52 @@ mod tests {
         assert_eq!(chat.input, "project newest");
         chat.handle_key(key(KeyCode::Up));
         assert_eq!(chat.input, "project oldest");
+    }
+
+    #[test]
+    fn move_history_walks_this_session_before_the_rest_of_the_project() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_history_context("bundle");
+        // Newest-first, with this session's prompts interleaved with another's.
+        chat.set_project_history(vec![
+            PromptHistoryEntry {
+                id: 4,
+                session_id: "other".into(),
+                text: "other newest".into(),
+            },
+            PromptHistoryEntry {
+                id: 3,
+                session_id: "1234567890".into(),
+                text: "mine newest".into(),
+            },
+            PromptHistoryEntry {
+                id: 2,
+                session_id: "other".into(),
+                text: "other oldest".into(),
+            },
+            PromptHistoryEntry {
+                id: 1,
+                session_id: "1234567890".into(),
+                text: "mine oldest".into(),
+            },
+        ]);
+        chat.record_prompt_history("this visit");
+
+        let mut recalled = Vec::new();
+        for _ in 0..5 {
+            chat.handle_key(key(KeyCode::Up));
+            recalled.push(chat.input.clone());
+        }
+        assert_eq!(
+            recalled,
+            vec![
+                "this visit",
+                "mine newest",
+                "mine oldest",
+                "other newest",
+                "other oldest",
+            ]
+        );
     }
 
     #[test]
