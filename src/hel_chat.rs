@@ -30,7 +30,7 @@ use crate::hel_acp::RuntimeEvent;
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
 use crate::hel_recovery::RecoveryContext;
 use crate::hel_session_manager::{
-    ManagedSessionHandle, ManagedSessionView, SessionManagerControl, new_command_id,
+    ManagedSessionHandle, ManagedSessionView, SessionManagerControl, ViewError, new_command_id,
 };
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, TranscriptBody,
@@ -3983,7 +3983,14 @@ fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -
         );
     }
     if let Some(error) = view.error {
-        state.set_notice(format!("connection lost: {error}"));
+        match error {
+            ViewError::Unreachable(detail) => {
+                state.set_notice(format!("connection lost: {detail}"))
+            }
+            ViewError::ProjectionIntegrity(detail) => {
+                state.set_notice(format!("transcript projection failed: {detail}"))
+            }
+        }
     }
     true
 }

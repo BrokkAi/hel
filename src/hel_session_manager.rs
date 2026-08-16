@@ -13,7 +13,8 @@ use crate::hel_database::{
     ProjectionApplyOutcome, apply_projection_event, save_materialized_session,
 };
 use crate::hel_projection::{
-    apply_committed_projection_event, materialized_session_from_canonical, project_relay_event,
+    ProjectionIntegrityError, apply_committed_projection_event,
+    materialized_session_from_canonical, project_relay_event,
 };
 use crate::hel_state::MaterializedSession;
 use crate::hel_targets::CommandSpec;
@@ -52,11 +53,28 @@ pub struct ManagedSessionSnapshot {
     pub latest_auth_failure_ordinal: Option<u64>,
 }
 
+/// Why a managed session stopped producing fresh views. The kind matters to
+/// callers: an unreachable relay is worth retrying and diagnosing, while a
+/// projection integrity failure is deterministic and needs a different report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewError {
+    Unreachable(String),
+    ProjectionIntegrity(String),
+}
+
+impl ViewError {
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Unreachable(detail) | Self::ProjectionIntegrity(detail) => detail,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ManagedSessionView {
     pub snapshot: Option<ManagedSessionSnapshot>,
     pub connected: bool,
-    pub error: Option<String>,
+    pub error: Option<ViewError>,
 }
 
 #[derive(Debug, Clone)]
@@ -666,7 +684,11 @@ async fn run_session_actor(
                     Err(error) => {
                         connection = None;
                         failures = failures.saturating_add(1);
-                        if failures >= UNREACHABLE_FAILURE_THRESHOLD {
+                        // A projection integrity failure repeats on every
+                        // retry, so report it at once rather than waiting for
+                        // the unreachable threshold.
+                        let integrity = projection_integrity_failure(&error);
+                        if integrity || failures >= UNREACHABLE_FAILURE_THRESHOLD {
                             // Bind the clone first: borrowing inside the call
                             // would hold the watch read guard while
                             // `publish_view` takes the write lock, deadlocking
@@ -675,7 +697,11 @@ async fn run_session_actor(
                             publish_view(&target.session_id, ManagedSessionView {
                                 snapshot,
                                 connected: false,
-                                error: Some(format!("{error:#}")),
+                                error: Some(if integrity {
+                                    ViewError::ProjectionIntegrity(format!("{error:#}"))
+                                } else {
+                                    ViewError::Unreachable(format!("{error:#}"))
+                                }),
                             }, &view_tx, &updates);
                         }
                         interval.reset_after(reconnect_delay(failures));
@@ -1211,6 +1237,12 @@ fn relay_desynchronized(error: &anyhow::Error) -> bool {
     })
 }
 
+fn projection_integrity_failure(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<ProjectionIntegrityError>().is_some())
+}
+
 pub fn new_command_id(prefix: &str) -> Result<String> {
     ensure!(!prefix.trim().is_empty(), "command ID prefix is required");
     let mut random = [0_u8; 16];
@@ -1377,7 +1409,7 @@ mod tests {
 
         let mut view = view_at_ordinal(7);
         view.connected = false;
-        view.error = Some("relay is unreachable".into());
+        view.error = Some(ViewError::Unreachable("relay is unreachable".into()));
         publish_view("session-1", view, &view_tx, &updates_tx);
 
         assert!(view_rx.has_changed().expect("watch stays open"));
@@ -1523,8 +1555,8 @@ mod tests {
                     .error
                     .expect("unreachable view carries the connect error");
                 assert!(
-                    error.contains("session relay proxy"),
-                    "unexpected error: {error}"
+                    error.detail().contains("session relay proxy"),
+                    "unexpected error: {error:?}"
                 );
                 break;
             }
@@ -1816,13 +1848,25 @@ mod tests {
     }
 
     #[test]
+    fn projection_integrity_failure_is_detected_only_for_integrity_errors() {
+        let integrity = anyhow::Error::from(ProjectionIntegrityError(
+            "transcript item \"tool:call-1\" changed immutable identity fields".into(),
+        ))
+        .context("apply projection event");
+        assert!(projection_integrity_failure(&integrity));
+
+        let unreachable = anyhow::anyhow!("connection refused").context("connect relay proxy");
+        assert!(!projection_integrity_failure(&unreachable));
+    }
+
+    #[test]
     fn dashboard_updates_keep_only_the_latest_view_per_session() {
         let (sender, mut receiver) = coalesced_update_channel();
         for revision in 0..1_000 {
             sender.send(SessionManagerUpdate {
                 session_id: "session-1".into(),
                 view: ManagedSessionView {
-                    error: Some(format!("revision-{revision}")),
+                    error: Some(ViewError::Unreachable(format!("revision-{revision}"))),
                     ..ManagedSessionView::default()
                 },
             });
@@ -1830,7 +1874,7 @@ mod tests {
         sender.send(SessionManagerUpdate {
             session_id: "session-2".into(),
             view: ManagedSessionView {
-                error: Some("other".into()),
+                error: Some(ViewError::Unreachable("other".into())),
                 ..ManagedSessionView::default()
             },
         });
@@ -1847,8 +1891,8 @@ mod tests {
             .into_iter()
             .map(|update| (update.session_id, update.view.error.unwrap()))
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(updates["session-1"], "revision-999");
-        assert_eq!(updates["session-2"], "other");
+        assert_eq!(updates["session-1"].detail(), "revision-999");
+        assert_eq!(updates["session-2"].detail(), "other");
         assert!(receiver.try_recv().is_err());
     }
 }

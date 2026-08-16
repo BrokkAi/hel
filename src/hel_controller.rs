@@ -43,7 +43,8 @@ use crate::hel_state::{
 };
 use crate::hel_targets::{
     self, AdditionalMount, AwsTemplate, CancellableProcessExecutor, CommandExecutor, CommandOutput,
-    CommandSpec, ContainerTemplate, ProcessExecutor, ProjectBundleSpec, RepositorySpec, SshTarget,
+    CommandSpec, ContainerTemplate, ProcessExecutor, ProjectBundleSpec, ProvisionStage,
+    RepositorySpec, SshTarget,
 };
 use crate::hel_worker::{RelayCommand, RelayCursor, RelayExecutionState};
 use crate::hel_worker_runtime::{WorkerLaunchConfig, WorkerOwnership};
@@ -1309,6 +1310,7 @@ impl Controller {
         session_id: &str,
         executor: &impl CommandExecutor,
     ) -> Result<Option<String>> {
+        let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
         let (backend, worker_root) = self.prepare_worker_files(session_id, executor)?;
         install_attached_resources(&self.state, session_id, &backend, &worker_root, executor)?;
         self.connect_local_repositories(
@@ -1922,6 +1924,7 @@ impl Controller {
                 ProvisioningFailureDisposition::Preserve,
             )
             .await?;
+            let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
             let (backend, worker_root) = self.prepare_worker_files(session_id, executor)?;
             let harness_home = target_profile_home(&backend, session_id, &profile);
             let workspace_root = if let Some(project_directory) = &previous.project_directory {
@@ -3087,7 +3090,8 @@ fn preflight_target(template: &TargetTemplate, executor: &impl CommandExecutor) 
         }
         TargetTemplate::AppleContainer { .. } => {
             let command = CommandSpec::new("container", ["system", "status"])
-                .purpose("preflight Apple container runtime");
+                .purpose("preflight Apple container runtime")
+                .stage(ProvisionStage::Provisioning);
             let output = executor.execute(&command).map_err(|error| {
                 anyhow::anyhow!(
                     "Apple container preflight failed; run `hel doctor` for actionable prerequisites: {error}"
@@ -4997,6 +5001,47 @@ fn cleanup_failed_provision(
     }
 }
 
+/// How long a freshly launched EC2 instance may take to accept SSH.
+const AWS_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
+const AWS_SSH_READY_RETRY_DELAY: Duration = Duration::from_secs(3);
+
+/// Poll a remote host until it accepts SSH, or until the deadline passes.
+///
+/// `now` and `sleep` are injected so tests can drive the deadline without
+/// waiting in real time.
+fn wait_for_ssh_ready(
+    executor: &impl CommandExecutor,
+    probe: &CommandSpec,
+    timeout: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> Result<()> {
+    let started = now();
+    loop {
+        if executor.cancellation_requested() {
+            bail!("cancelled while waiting for SSH on the new instance");
+        }
+        let failure = match executor.execute(probe) {
+            Ok(output) if output.status == 0 => return Ok(()),
+            Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            Err(error) => error.to_string(),
+        };
+        if now().duration_since(started) >= timeout {
+            bail!(
+                "{} timed out after {}s: {}",
+                probe.purpose,
+                timeout.as_secs(),
+                if failure.is_empty() {
+                    "the SSH probe reported no error output"
+                } else {
+                    failure.as_str()
+                }
+            );
+        }
+        sleep(AWS_SSH_READY_RETRY_DELAY);
+    }
+}
+
 fn locator_after_provision(
     canonical: &TargetTemplate,
     backend: &hel_targets::TargetTemplate,
@@ -5054,12 +5099,13 @@ fn locator_after_provision(
                         region.clone(),
                         "ec2".into(),
                         "wait".into(),
-                        "instance-status-ok".into(),
+                        "instance-running".into(),
                         "--instance-ids".into(),
                         instance_id.clone(),
                     ],
                 )
-                .purpose("wait for EC2 session instance"),
+                .purpose("wait for EC2 session instance to run")
+                .stage(ProvisionStage::Booting),
             )?;
             let field = match address_source {
                 AwsAddressSource::PublicDns => "PublicDnsName",
@@ -5086,7 +5132,8 @@ fn locator_after_provision(
                         "text".into(),
                     ],
                 )
-                .purpose("resolve EC2 session address"),
+                .purpose("resolve EC2 session address")
+                .stage(ProvisionStage::Booting),
             )?;
             let address = String::from_utf8(address.stdout)
                 .context("AWS address was not UTF-8")?
@@ -5099,6 +5146,15 @@ fn locator_after_provision(
                 destination: format!("{ssh_user}@{address}"),
                 ssh_args: ssh_args_with_identity(ssh_args, identity_file.as_deref()),
             };
+            wait_for_ssh_ready(
+                executor,
+                &ssh_command_spec(&ssh, ["true"])
+                    .purpose("wait for EC2 SSH availability")
+                    .stage(ProvisionStage::Booting),
+                AWS_SSH_READY_TIMEOUT,
+                Instant::now,
+                std::thread::sleep,
+            )?;
             let backend_locator = hel_targets::TargetLocator::AwsEc2 {
                 profile: profile.clone(),
                 region: region.clone(),
@@ -5427,6 +5483,45 @@ fn ensure_git_broker(
             );
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Reports every command an installer issues as one launch stage, so progress
+/// stays accurate without threading the stage through each `CommandSpec`.
+/// A command that already names a stage keeps it.
+struct StagedExecutor<'a, E: CommandExecutor> {
+    inner: &'a E,
+    stage: ProvisionStage,
+}
+
+impl<'a, E: CommandExecutor> StagedExecutor<'a, E> {
+    fn new(inner: &'a E, stage: ProvisionStage) -> Self {
+        Self { inner, stage }
+    }
+
+    fn staged(&self, command: &CommandSpec) -> CommandSpec {
+        if command.stage.is_some() {
+            return command.clone();
+        }
+        command.clone().stage(self.stage)
+    }
+}
+
+impl<E: CommandExecutor> CommandExecutor for StagedExecutor<'_, E> {
+    fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        self.inner.execute(&self.staged(command))
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.inner.cancellation_requested()
+    }
+
+    fn execute_with_stdin(
+        &self,
+        command: &CommandSpec,
+        input: &mut (dyn std::io::Read + Send),
+    ) -> Result<CommandOutput> {
+        self.inner.execute_with_stdin(&self.staged(command), input)
     }
 }
 
@@ -6845,6 +6940,119 @@ mod tests {
             }
             value => panic!("unexpected lock probe expectation {value:?}"),
         }
+    }
+
+    /// A fake executor that fails the SSH probe a fixed number of times.
+    struct SshProbeExecutor {
+        failures_remaining: RefCell<u32>,
+        attempts: RefCell<u32>,
+        cancel_after: Option<u32>,
+    }
+
+    impl SshProbeExecutor {
+        fn new(failures: u32) -> Self {
+            Self {
+                failures_remaining: RefCell::new(failures),
+                attempts: RefCell::new(0),
+                cancel_after: None,
+            }
+        }
+    }
+
+    impl CommandExecutor for SshProbeExecutor {
+        fn execute(&self, _command: &CommandSpec) -> Result<CommandOutput> {
+            *self.attempts.borrow_mut() += 1;
+            let mut remaining = self.failures_remaining.borrow_mut();
+            if *remaining == 0 {
+                return Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
+            *remaining -= 1;
+            Ok(CommandOutput {
+                status: 255,
+                stdout: Vec::new(),
+                stderr: b"ssh: connect to host 10.0.0.1 port 22: Connection refused\n".to_vec(),
+            })
+        }
+
+        fn cancellation_requested(&self) -> bool {
+            self.cancel_after
+                .is_some_and(|limit| *self.attempts.borrow() >= limit)
+        }
+    }
+
+    fn ssh_probe_spec() -> CommandSpec {
+        CommandSpec::new("ssh", ["host", "true"]).purpose("wait for EC2 SSH availability")
+    }
+
+    /// A virtual clock advanced only by the injected sleep hook.
+    fn virtual_clock() -> (std::rc::Rc<std::cell::Cell<Instant>>, Instant) {
+        let start = Instant::now();
+        (std::rc::Rc::new(std::cell::Cell::new(start)), start)
+    }
+
+    #[test]
+    fn ssh_readiness_wait_succeeds_after_failed_probes() {
+        let executor = SshProbeExecutor::new(3);
+        let (clock, _) = virtual_clock();
+        let sleep_clock = clock.clone();
+        wait_for_ssh_ready(
+            &executor,
+            &ssh_probe_spec(),
+            Duration::from_secs(300),
+            {
+                let clock = clock.clone();
+                move || clock.get()
+            },
+            move |delay| sleep_clock.set(sleep_clock.get() + delay),
+        )
+        .expect("the wait succeeds once SSH answers");
+        assert_eq!(*executor.attempts.borrow(), 4);
+    }
+
+    #[test]
+    fn ssh_readiness_wait_gives_up_at_the_deadline_and_reports_the_last_error() {
+        let executor = SshProbeExecutor::new(u32::MAX);
+        let (clock, _) = virtual_clock();
+        let sleep_clock = clock.clone();
+        let error = wait_for_ssh_ready(
+            &executor,
+            &ssh_probe_spec(),
+            Duration::from_secs(30),
+            {
+                let clock = clock.clone();
+                move || clock.get()
+            },
+            move |delay| sleep_clock.set(sleep_clock.get() + delay),
+        )
+        .expect_err("the wait stops at the deadline");
+        let message = error.to_string();
+        assert!(message.contains("timed out after 30s"), "{message}");
+        assert!(message.contains("Connection refused"), "{message}");
+    }
+
+    #[test]
+    fn ssh_readiness_wait_stops_when_cancellation_is_requested() {
+        let mut executor = SshProbeExecutor::new(u32::MAX);
+        executor.cancel_after = Some(2);
+        let (clock, _) = virtual_clock();
+        let sleep_clock = clock.clone();
+        let error = wait_for_ssh_ready(
+            &executor,
+            &ssh_probe_spec(),
+            Duration::from_secs(300),
+            {
+                let clock = clock.clone();
+                move || clock.get()
+            },
+            move |delay| sleep_clock.set(sleep_clock.get() + delay),
+        )
+        .expect_err("the wait stops when cancelled");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert_eq!(*executor.attempts.borrow(), 2);
     }
 
     #[test]

@@ -29,7 +29,7 @@ use hel::hel_state::{
 };
 use hel::hel_targets::{
     AdditionalMount, DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage,
-    SessionResourceUsage, default_mount_destination, path_completion,
+    ProvisionStage, SessionResourceUsage, default_mount_destination, path_completion,
 };
 
 const FORCE_CONFIRMATION: &str = "DESTROY";
@@ -155,6 +155,7 @@ struct SessionOperationDisplay {
     kind: SessionOperationKind,
     started_at_epoch_seconds: u64,
     placeholder: Option<SessionRecord>,
+    stage: Option<ProvisionStage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -974,10 +975,19 @@ impl DashboardState {
                     .unwrap_or_default()
                     .as_secs(),
                 placeholder,
+                stage: None,
             },
         );
         self.apply_operation_projection();
         self.clamp_selections();
+    }
+
+    /// Name the launch phase in flight; a finished or unknown operation is
+    /// left alone.
+    pub fn set_session_operation_stage(&mut self, session_id: &str, stage: ProvisionStage) {
+        if let Some(operation) = self.session_operations.get_mut(session_id) {
+            operation.stage = Some(stage);
+        }
     }
 
     pub fn rekey_session_operation(&mut self, previous: &str, session_id: String) {
@@ -4942,11 +4952,14 @@ fn session_values(
     config: &HelConfig,
 ) -> (String, String, String, String, String) {
     let clock = if let Some(operation) = operation {
-        format!(
-            "{} {}s",
-            operation.kind.label(),
-            now_epoch_seconds.saturating_sub(operation.started_at_epoch_seconds)
-        )
+        let elapsed = now_epoch_seconds.saturating_sub(operation.started_at_epoch_seconds);
+        let label = match (operation.stage, operation.kind) {
+            (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => {
+                stage.label()
+            }
+            _ => operation.kind.label(),
+        };
+        format!("{label} {elapsed}s")
     } else if session.state == SessionState::Provisioning {
         let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
         format!("Launch {}s", now_epoch_seconds.saturating_sub(started_at))
@@ -10586,6 +10599,58 @@ mod tests {
 
         let (clock, _, _, _, _) = session_values(&session, None, None, 1_012, &config());
         assert_eq!(clock, "Launch 12s");
+    }
+
+    fn operation(
+        kind: SessionOperationKind,
+        stage: Option<ProvisionStage>,
+    ) -> SessionOperationDisplay {
+        SessionOperationDisplay {
+            kind,
+            started_at_epoch_seconds: 1_000,
+            placeholder: None,
+            stage,
+        }
+    }
+
+    #[test]
+    fn launch_clock_names_the_reported_stage() {
+        let session = archived_session();
+        let operation = operation(
+            SessionOperationKind::Launching,
+            Some(ProvisionStage::Booting),
+        );
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Boot 12s");
+    }
+
+    #[test]
+    fn launch_clock_falls_back_to_the_kind_label_without_a_stage() {
+        let session = archived_session();
+        let operation = operation(SessionOperationKind::Launching, None);
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Launch 12s");
+    }
+
+    #[test]
+    fn a_stage_does_not_rename_a_non_launch_operation() {
+        let session = archived_session();
+        let operation = operation(SessionOperationKind::Pausing, Some(ProvisionStage::Syncing));
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Pausing 12s");
+    }
+
+    #[test]
+    fn setting_a_stage_for_an_unknown_session_is_ignored() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.set_session_operation_stage("missing", ProvisionStage::Booting);
+        assert!(dashboard.session_operations.is_empty());
     }
 
     #[test]
