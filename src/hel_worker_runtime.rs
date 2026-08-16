@@ -131,6 +131,14 @@ mod unix {
         // failed startup must never leave a fresh endpoint that looks live.
         let durable_relay =
             DurableRelay::open(&root, &config.session_id, env!("CARGO_PKG_VERSION"))?;
+        // Durable state recovered, so any exit record belongs to a previous
+        // life of this worker. Leaving it would make the controller read this
+        // startup as another death.
+        let exit_record = root.join("worker-exit.json");
+        if exit_record.exists() {
+            std::fs::remove_file(&exit_record)
+                .with_context(|| format!("clear stale exit record {}", exit_record.display()))?;
+        }
         let socket = root.join("control.sock");
         if socket.exists() {
             match UnixStream::connect(&socket).await {

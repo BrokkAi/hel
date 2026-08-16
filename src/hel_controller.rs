@@ -6071,8 +6071,16 @@ fn start_worker(
 ) -> Result<()> {
     let binary = format!("{worker_root}/hel");
     let config = format!("{worker_root}/launch.json");
+    // The exit record describes the worker's previous life. Clear it as part
+    // of the launch, before the new daemon can be probed: the startup connect
+    // loop treats that file as proof the worker it just started has died, so
+    // a stale record would abort every restart.
+    let clear_exit_record = format!(
+        "rm -f {}; ",
+        hel_targets::join_remote_command(&[format!("{worker_root}/worker-exit.json")]),
+    );
     let detached_script = format!(
-        "nohup {} >{} 2>&1 </dev/null &",
+        "{clear_exit_record}nohup {} >{} 2>&1 </dev/null &",
         hel_targets::join_remote_command(&[
             binary.clone(),
             "worker".into(),
@@ -6087,7 +6095,7 @@ fn start_worker(
     // Redirect daemon output to worker.log in every launch mode; an
     // unexplained dead worker is undebuggable without it.
     let exec_script = format!(
-        "exec {} >{} 2>&1",
+        "{clear_exit_record}exec {} >{} 2>&1",
         hel_targets::join_remote_command(&[
             binary.clone(),
             "worker".into(),
@@ -7028,6 +7036,56 @@ mod tests {
         assert_eq!(session.state, SessionState::Closing);
         assert_eq!(session.updated_at, "2026-08-14T12:00:00Z");
         assert!(session.last_checkpoint_error.is_none());
+    }
+
+    /// A worker that died leaves an exit record behind. Starting a new worker
+    /// must clear it first, or the startup connect loop reads the previous
+    /// death as this worker's and gives up on a healthy daemon.
+    #[test]
+    fn starting_a_worker_clears_the_previous_exit_record_before_launching() {
+        struct RecordingExecutor {
+            commands: RefCell<Vec<CommandSpec>>,
+        }
+
+        impl CommandExecutor for RecordingExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.commands.borrow_mut().push(command.clone());
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        for locator in [
+            hel_targets::TargetLocator::LocalBare {
+                worker_root: "/worker/root".into(),
+            },
+            hel_targets::TargetLocator::LocalPodman {
+                container_id: "container-1".into(),
+            },
+        ] {
+            let executor = RecordingExecutor {
+                commands: RefCell::new(Vec::new()),
+            };
+            start_worker(&executor, &locator, "/worker/root").unwrap();
+
+            let commands = executor.commands.borrow();
+            let script = commands
+                .iter()
+                .flat_map(|command| command.args.iter())
+                .find(|argument| argument.contains("worker-exit.json"))
+                .unwrap_or_else(|| {
+                    panic!("no launch script cleared the exit record: {commands:?}")
+                });
+            let cleared = script.find("rm -f").expect("the exit record is removed");
+            let launched = script.find("worker").expect("the daemon is launched");
+            assert!(
+                cleared < launched,
+                "the exit record must be cleared before the daemon starts: {script}"
+            );
+        }
     }
 
     #[test]
