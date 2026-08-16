@@ -3,22 +3,36 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{SessionUpdate, ToolCall};
+use agent_client_protocol::schema::v1::{ContentBlock, SessionUpdate, TextContent, ToolCall};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::hel_archive::{
-    CanonicalExecutionState, CanonicalQueuedPrompt, CanonicalSessionSnapshot,
-    CanonicalSessionState, CanonicalTranscriptBody, CanonicalTranscriptItem,
+    CanonicalExecutionState, CanonicalQueuedCommandKind, CanonicalQueuedPrompt,
+    CanonicalSessionSnapshot, CanonicalSessionState, CanonicalTranscriptBody,
+    CanonicalTranscriptItem,
 };
 use crate::hel_database::{MaterializedSessionMutation, TranscriptMutation};
 use crate::hel_state::{
-    MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, TranscriptBody,
-    TranscriptItem, normalize_session_title,
+    MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
+    TranscriptBody, TranscriptItem, config_command_text, normalize_session_title,
 };
 use crate::hel_worker::{
     RelayCommand, RelayCommandKind, RelayEvent, RelayObservation, validate_relay_event,
 };
+
+/// A deterministic projection integrity violation. Retrying cannot fix it, so
+/// callers must report it separately from transport failures.
+#[derive(Debug)]
+pub struct ProjectionIntegrityError(pub String);
+
+impl std::fmt::Display for ProjectionIntegrityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProjectionIntegrityError {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectedRelayEvent {
@@ -81,16 +95,18 @@ pub fn apply_committed_projection_event(
                     if existing.position != item.position
                         || existing.created_at_ms != item.created_at_ms
                     {
-                        bail!(
+                        return Err(ProjectionIntegrityError(format!(
                             "transcript item {:?} changed immutable identity fields",
                             item.stable_id
-                        );
+                        ))
+                        .into());
                     }
                     if item.last_changed_at_ms < existing.last_changed_at_ms {
-                        bail!(
+                        return Err(ProjectionIntegrityError(format!(
                             "transcript item {:?} moved its changed timestamp backwards",
                             item.stable_id
-                        );
+                        ))
+                        .into());
                     }
                     if existing
                         .latest_content_event_ordinal
@@ -99,10 +115,11 @@ pub fn apply_committed_projection_event(
                                 .is_none_or(|next| next < existing)
                         })
                     {
-                        bail!(
+                        return Err(ProjectionIntegrityError(format!(
                             "transcript item {:?} moved its latest content ordinal backwards",
                             item.stable_id
-                        );
+                        ))
+                        .into());
                     }
                     // Reuse the item in place when no published snapshot shares
                     // it; otherwise publish a fresh item so snapshots taken
@@ -178,10 +195,29 @@ fn project_observation(
                 queue.retain(|queued| queued.command_id != *command_id);
                 queue.push(MaterializedQueuedPrompt {
                     command_id: command_id.clone(),
+                    kind: QueuedCommandKind::Prompt,
                     content: prompt
                         .iter()
                         .map(serde_json::to_value)
                         .collect::<serde_json::Result<_>>()?,
+                    queued_at_ms: *created_at_ms,
+                });
+                mutation.queued_prompts = Some(queue);
+            }
+            // A configuration change waits in the same queue as prompts and is
+            // displayed as the composer text that produced it.
+            RelayCommand::SetConfig { key, value } => {
+                let mut queue = current.queued_prompts.clone();
+                queue.retain(|queued| queued.command_id != *command_id);
+                queue.push(MaterializedQueuedPrompt {
+                    command_id: command_id.clone(),
+                    kind: QueuedCommandKind::SetConfig {
+                        key: key.clone(),
+                        value: value.clone(),
+                    },
+                    content: vec![serde_json::to_value(ContentBlock::Text(TextContent::new(
+                        config_command_text(key, value),
+                    )))?],
                     queued_at_ms: *created_at_ms,
                 });
                 mutation.queued_prompts = Some(queue);
@@ -203,25 +239,29 @@ fn project_observation(
                 .position(|queued| queued.command_id == *command_id)
             {
                 let mut queue = current.queued_prompts.clone();
-                let prompt = queue.remove(index);
+                let entry = queue.remove(index);
                 mutation.queued_prompts = Some(queue);
-                close_streams(current, mutation, event.recorded_at_ms);
-                upsert(
-                    mutation,
-                    TranscriptItem {
-                        stable_id: format!("user:{command_id}"),
-                        position: event.ordinal,
-                        latest_content_event_ordinal: None,
-                        created_at_ms: *started_at_ms,
-                        last_changed_at_ms: *started_at_ms,
-                        body: TranscriptBody::User {
-                            content: prompt.content,
+                // A configuration change applies between turns: it never
+                // becomes a transcript turn and never starts the turn clock.
+                if entry.kind.is_prompt() {
+                    close_streams(current, mutation, event.recorded_at_ms);
+                    upsert(
+                        mutation,
+                        TranscriptItem {
+                            stable_id: format!("user:{command_id}"),
+                            position: event.ordinal,
+                            latest_content_event_ordinal: None,
+                            created_at_ms: *started_at_ms,
+                            last_changed_at_ms: *started_at_ms,
+                            body: TranscriptBody::User {
+                                content: entry.content,
+                            },
                         },
-                    },
-                );
-                mutation.execution = Some(MaterializedExecutionState::Running {
-                    started_at_ms: *started_at_ms,
-                });
+                    );
+                    mutation.execution = Some(MaterializedExecutionState::Running {
+                        started_at_ms: *started_at_ms,
+                    });
+                }
             }
         }
         RelayObservation::CommandCompleted {
@@ -248,7 +288,9 @@ fn project_observation(
                 }),
                 crate::hel_worker::RelayCommandOutcome::Configured
                 | crate::hel_worker::RelayCommandOutcome::Cancelled
-                | crate::hel_worker::RelayCommandOutcome::CheckpointCompleted => {}
+                | crate::hel_worker::RelayCommandOutcome::CheckpointCompleted
+                | crate::hel_worker::RelayCommandOutcome::CheckpointReleased
+                | crate::hel_worker::RelayCommandOutcome::RecoveryFloorAdvanced => {}
             }
             if queue != current.queued_prompts {
                 mutation.queued_prompts = Some(queue);
@@ -311,32 +353,58 @@ fn project_session_update(
     update: &SessionUpdate,
     mutation: &mut MaterializedSessionMutation,
 ) -> Result<()> {
+    let running = matches!(
+        mutation.execution.as_ref().unwrap_or(&current.execution),
+        MaterializedExecutionState::Running { .. }
+    );
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             close_stream_kind(current, mutation, false, event.recorded_at_ms);
-            push_stream_chunk(current, mutation, event, true, chunk)?;
+            push_stream_chunk(current, mutation, event, true, running, chunk)?;
         }
         SessionUpdate::AgentThoughtChunk(chunk) => {
             close_stream_kind(current, mutation, true, event.recorded_at_ms);
-            push_stream_chunk(current, mutation, event, false, chunk)?;
+            push_stream_chunk(current, mutation, event, false, running, chunk)?;
         }
         // CommandStarted is the controller's canonical local user message.
         SessionUpdate::UserMessageChunk(_) => {}
         SessionUpdate::ToolCall(call) => {
             close_streams(current, mutation, event.recorded_at_ms);
-            upsert(
-                mutation,
-                TranscriptItem {
-                    stable_id: format!("tool:{}", call.tool_call_id),
-                    position: event.ordinal,
-                    latest_content_event_ordinal: None,
-                    created_at_ms: event.recorded_at_ms,
-                    last_changed_at_ms: event.recorded_at_ms,
-                    body: TranscriptBody::Tool {
-                        call: serde_json::to_value(call)?,
+            let stable_id = format!("tool:{}", call.tool_call_id);
+            // Agents re-send a whole `tool_call` for an id they already
+            // reported, both when they revise a call and when a resumed
+            // session replays its history. Merge into the existing item so the
+            // immutable identity fields survive.
+            if let Some(mut item) = current
+                .transcript
+                .iter()
+                .find(|item| item.stable_id == stable_id)
+                .map(|item| TranscriptItem::clone(item))
+            {
+                let TranscriptBody::Tool { call: existing } = &mut item.body else {
+                    bail!(
+                        "ACP tool call {} conflicts with transcript item {stable_id}",
+                        call.tool_call_id
+                    );
+                };
+                *existing = serde_json::to_value(call)?;
+                item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
+                upsert(mutation, item);
+            } else {
+                upsert(
+                    mutation,
+                    TranscriptItem {
+                        stable_id,
+                        position: event.ordinal,
+                        latest_content_event_ordinal: None,
+                        created_at_ms: event.recorded_at_ms,
+                        last_changed_at_ms: event.recorded_at_ms,
+                        body: TranscriptBody::Tool {
+                            call: serde_json::to_value(call)?,
+                        },
                     },
-                },
-            );
+                );
+            }
         }
         SessionUpdate::ToolCallUpdate(update) => {
             close_streams(current, mutation, event.recorded_at_ms);
@@ -431,6 +499,10 @@ fn push_stream_chunk(
     mutation: &mut MaterializedSessionMutation,
     event: &RelayEvent,
     agent: bool,
+    // ACP permits trailing session updates after a prompt completes or is cancelled. A chunk
+    // recorded while the session is not running is complete by definition, so it must not
+    // (re)open a stream: checkpoint export requires no open streams at an idle barrier.
+    running: bool,
     chunk: &agent_client_protocol::schema::v1::ContentChunk,
 ) -> Result<()> {
     let explicit_id = chunk.message_id.as_ref().map(|id| {
@@ -467,11 +539,11 @@ fn push_stream_chunk(
         match &mut item.body {
             TranscriptBody::Agent { chunks, streaming } if agent => {
                 chunks.push(serde_json::to_value(chunk)?);
-                *streaming = true;
+                *streaming = running;
             }
             TranscriptBody::Thought { chunks, streaming } if !agent => {
                 chunks.push(serde_json::to_value(chunk)?);
-                *streaming = true;
+                *streaming = running;
             }
             _ => bail!(
                 "ACP message ID conflicts with transcript item {}",
@@ -502,12 +574,12 @@ fn push_stream_chunk(
             body: if agent {
                 TranscriptBody::Agent {
                     chunks: vec![serde_json::to_value(chunk)?],
-                    streaming: true,
+                    streaming: running,
                 }
             } else {
                 TranscriptBody::Thought {
                     chunks: vec![serde_json::to_value(chunk)?],
-                    streaming: true,
+                    streaming: running,
                 }
             },
         },
@@ -655,6 +727,15 @@ pub fn canonical_session_from_materialized(
             .iter()
             .map(|prompt| CanonicalQueuedPrompt {
                 command_id: prompt.command_id.clone(),
+                kind: match &prompt.kind {
+                    QueuedCommandKind::Prompt => CanonicalQueuedCommandKind::Prompt,
+                    QueuedCommandKind::SetConfig { key, value } => {
+                        CanonicalQueuedCommandKind::SetConfig {
+                            key: key.clone(),
+                            value: value.clone(),
+                        }
+                    }
+                },
                 content: prompt.content.clone(),
                 queued_at_ms: prompt.queued_at_ms,
             })
@@ -723,6 +804,15 @@ pub fn materialized_session_from_canonical(
             .iter()
             .map(|prompt| MaterializedQueuedPrompt {
                 command_id: prompt.command_id.clone(),
+                kind: match &prompt.kind {
+                    CanonicalQueuedCommandKind::Prompt => QueuedCommandKind::Prompt,
+                    CanonicalQueuedCommandKind::SetConfig { key, value } => {
+                        QueuedCommandKind::SetConfig {
+                            key: key.clone(),
+                            value: value.clone(),
+                        }
+                    }
+                },
                 content: prompt.content.clone(),
                 queued_at_ms: prompt.queued_at_ms,
             })
@@ -817,6 +907,87 @@ mod tests {
     }
 
     #[test]
+    fn agent_chunk_while_idle_is_recorded_closed() {
+        let mut session = MaterializedSession::empty("session-1");
+        session.execution = MaterializedExecutionState::Idle;
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::AgentMessageChunk(
+                    agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("trailing"),
+                    ))
+                    .message_id("msg-1"),
+                )),
+            },
+        );
+        let item = session
+            .transcript
+            .iter()
+            .find(|item| item.stable_id == "agent:msg-1")
+            .expect("trailing chunk recorded");
+        assert!(matches!(
+            &item.body,
+            TranscriptBody::Agent { chunks, streaming }
+                if !*streaming
+                    && crate::hel_chat::materialized_chunks_text(chunks) == "trailing"
+        ));
+    }
+
+    #[test]
+    fn thought_chunk_while_idle_is_recorded_closed() {
+        let mut session = MaterializedSession::empty("session-1");
+        session.execution = MaterializedExecutionState::Idle;
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::AgentThoughtChunk(
+                    agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("late thought"),
+                    ))
+                    .message_id("msg-1"),
+                )),
+            },
+        );
+        let item = session
+            .transcript
+            .iter()
+            .find(|item| item.stable_id == "thought:msg-1")
+            .expect("trailing thought recorded");
+        assert!(matches!(
+            &item.body,
+            TranscriptBody::Thought { streaming, .. } if !*streaming
+        ));
+    }
+
+    #[test]
+    fn agent_chunk_while_running_still_streams() {
+        let mut session = MaterializedSession::empty("session-1");
+        session.execution = MaterializedExecutionState::Running { started_at_ms: 1 };
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::AgentMessageChunk(
+                    agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("live"),
+                    ))
+                    .message_id("msg-1"),
+                )),
+            },
+        );
+        let item = session
+            .transcript
+            .iter()
+            .find(|item| item.stable_id == "agent:msg-1")
+            .expect("live chunk recorded");
+        assert!(matches!(
+            &item.body,
+            TranscriptBody::Agent { chunks, streaming }
+                if *streaming && crate::hel_chat::materialized_chunks_text(chunks) == "live"
+        ));
+    }
+
+    #[test]
     fn backward_relay_clock_never_regresses_transcript_change_times() {
         let mut session = MaterializedSession::empty("session-1");
         let mut first = event(
@@ -888,6 +1059,102 @@ mod tests {
     }
 
     #[test]
+    fn resent_tool_call_keeps_identity_and_replaces_the_call_payload() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(ToolCall::new(
+                    "call-1",
+                    "read file",
+                ))),
+            },
+        );
+        let created = TranscriptItem::clone(&session.transcript[0]);
+        assert_eq!(created.position, 1);
+        assert_eq!(created.created_at_ms, 100);
+
+        let resend = event(
+            &session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(
+                    ToolCall::new("call-1", "read file again")
+                        .status(agent_client_protocol::schema::v1::ToolCallStatus::Completed),
+                )),
+            },
+        );
+        let projected = project_relay_event(&session, &resend).unwrap();
+        let TranscriptMutation::Upsert(item) = projected
+            .mutation
+            .transcript
+            .iter()
+            .find(|mutation| {
+                matches!(mutation, TranscriptMutation::Upsert(item) if item.stable_id == "tool:call-1")
+            })
+            .expect("the re-sent tool call upserts its existing item")
+            .clone()
+        else {
+            unreachable!("matched an upsert above");
+        };
+        assert_eq!(item.position, created.position);
+        assert_eq!(item.created_at_ms, created.created_at_ms);
+        assert_eq!(item.last_changed_at_ms, resend.recorded_at_ms);
+        assert_eq!(
+            item.latest_content_event_ordinal,
+            created.latest_content_event_ordinal
+        );
+        let TranscriptBody::Tool { call } = &item.body else {
+            panic!("re-sent tool call stayed a tool item");
+        };
+        assert_eq!(call["title"], json!("read file again"));
+
+        apply_committed_projection_event(&mut session, &resend, projected.mutation)
+            .expect("the merged item passes the projection integrity checks");
+        assert_eq!(session.transcript.len(), 1);
+        assert_eq!(session.transcript[0].position, created.position);
+    }
+
+    #[test]
+    fn tool_call_update_then_resent_tool_call_survives_the_projection() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(ToolCall::new("call-1", "shell"))),
+            },
+        );
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    "call-1",
+                    ToolCallUpdateFields::new()
+                        .status(agent_client_protocol::schema::v1::ToolCallStatus::Completed),
+                ))),
+            },
+        );
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(ToolCall::new(
+                    "call-1",
+                    "shell (retried)",
+                ))),
+            },
+        );
+
+        assert_eq!(session.transcript.len(), 1);
+        let item = &session.transcript[0];
+        assert_eq!(item.position, 1);
+        assert_eq!(item.created_at_ms, 100);
+        assert_eq!(item.last_changed_at_ms, 300);
+        let TranscriptBody::Tool { call } = &item.body else {
+            panic!("the item stayed a tool item");
+        };
+        assert_eq!(call["title"], json!("shell (retried)"));
+    }
+
+    #[test]
     fn queued_prompt_becomes_user_message_only_when_started() {
         let mut session = MaterializedSession::empty("session-1");
         apply_observation(
@@ -929,10 +1196,60 @@ mod tests {
     }
 
     #[test]
+    fn queued_config_change_starts_without_becoming_a_turn() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandQueued {
+                command_id: "config-1".into(),
+                command: RelayCommand::SetConfig {
+                    key: "model".into(),
+                    value: "sonnet".into(),
+                },
+                created_at_ms: 100,
+            },
+        );
+        assert_eq!(session.queued_prompts.len(), 1);
+        assert_eq!(
+            session.queued_prompts[0].kind,
+            QueuedCommandKind::SetConfig {
+                key: "model".into(),
+                value: "sonnet".into(),
+            }
+        );
+        assert_eq!(
+            crate::hel_chat::materialized_content_text(&session.queued_prompts[0].content),
+            "/model sonnet"
+        );
+
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandStarted {
+                command_id: "config-1".into(),
+                started_at_ms: 200,
+            },
+        );
+        assert!(session.queued_prompts.is_empty());
+        assert!(session.transcript.is_empty());
+        assert_eq!(session.execution, MaterializedExecutionState::Idle);
+
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandCompleted {
+                command_id: "config-1".into(),
+                outcome: RelayCommandOutcome::Configured,
+            },
+        );
+        assert_eq!(session.execution, MaterializedExecutionState::Idle);
+        assert!(session.transcript.is_empty());
+    }
+
+    #[test]
     fn queue_changes_project_only_from_their_completion_events() {
         let mut session = MaterializedSession::empty("session-1");
         session.queued_prompts.push(MaterializedQueuedPrompt {
             command_id: "queued-1".into(),
+            kind: QueuedCommandKind::Prompt,
             content: vec![json!({"type": "text", "text": "later"})],
             queued_at_ms: 10,
         });
@@ -963,11 +1280,13 @@ mod tests {
         session.queued_prompts.extend([
             MaterializedQueuedPrompt {
                 command_id: "queued-2".into(),
+                kind: QueuedCommandKind::Prompt,
                 content: vec![json!({"type": "text", "text": "two"})],
                 queued_at_ms: 20,
             },
             MaterializedQueuedPrompt {
                 command_id: "queued-3".into(),
+                kind: QueuedCommandKind::Prompt,
                 content: vec![json!({"type": "text", "text": "three"})],
                 queued_at_ms: 30,
             },
@@ -1161,8 +1480,24 @@ mod tests {
                 }),
             },
         }));
+        session.queued_prompts.push(MaterializedQueuedPrompt {
+            command_id: "queued-config".into(),
+            kind: QueuedCommandKind::SetConfig {
+                key: "model".into(),
+                value: "sonnet".into(),
+            },
+            content: vec![json!({"type": "text", "text": "/model sonnet"})],
+            queued_at_ms: 50,
+        });
         let canonical = canonical_session_from_materialized(&session).unwrap();
         canonical.validate().unwrap();
+        assert_eq!(
+            canonical.queued_prompts[0].kind,
+            CanonicalQueuedCommandKind::SetConfig {
+                key: "model".into(),
+                value: "sonnet".into(),
+            }
+        );
         let restored = materialized_session_from_canonical("session-1", &canonical).unwrap();
         assert_eq!(restored.applied_event_ordinal, 4);
         assert_eq!(restored.transcript[0].position, 2);

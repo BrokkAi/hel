@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -16,11 +16,22 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
 
 use crate::hel_config::HarnessKind;
 
+/// Baseline schema. Every payload occupies exactly one ZIP entry, so any build
+/// that understands schema 2 can read the archive.
 pub const ARCHIVE_SCHEMA_VERSION: u32 = 2;
+/// Schema 2 plus sharded payloads. A payload larger than
+/// [`PAYLOAD_PART_BYTES`] is written as several `*.helpart.NNNNN` ZIP entries
+/// so compression and verification can run in parallel. Archives declare this
+/// schema only when at least one payload is sharded, which keeps small
+/// sessions readable by builds that predate sharding and makes older builds
+/// reject sharded archives with an explicit version error instead of
+/// misreading part entries.
+pub const ARCHIVE_SCHEMA_VERSION_SHARDED: u32 = 3;
 pub const ARCHIVE_FORMAT: &str = "hel-session";
 pub const EVENT_FRONTIER_GENESIS_DIGEST: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
@@ -30,6 +41,11 @@ const CANONICAL_SESSION_PATH: &str = "canonical/session.json";
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+/// Compressible payloads larger than this are split into parts of this size.
+/// DEFLATE is sequential inside one stream, so parts are what let both the
+/// writer and the reader use every core on a large payload.
+const PAYLOAD_PART_BYTES: usize = 16 * 1024 * 1024;
+const PAYLOAD_PART_SUFFIX: &str = ".helpart.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,11 +187,34 @@ pub enum CanonicalTranscriptBody {
     },
 }
 
+/// What a queued entry does when its turn comes. Archives written before
+/// configuration changes could be queued carry no `kind`, so it defaults to a
+/// prompt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalQueuedCommandKind {
+    #[default]
+    Prompt,
+    SetConfig {
+        key: String,
+        value: String,
+    },
+}
+
+impl CanonicalQueuedCommandKind {
+    fn is_prompt(&self) -> bool {
+        matches!(self, Self::Prompt)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalQueuedPrompt {
     pub command_id: String,
-    /// ACP prompt content blocks in their JSON representation.
+    #[serde(default, skip_serializing_if = "CanonicalQueuedCommandKind::is_prompt")]
+    pub kind: CanonicalQueuedCommandKind,
+    /// ACP content blocks in their JSON representation. A queued configuration
+    /// change carries the composer text that produced it.
     pub content: Vec<serde_json::Value>,
     pub queued_at_ms: i64,
 }
@@ -191,6 +230,18 @@ pub enum PayloadRole {
     GitUntrackedTar { repository_id: String },
 }
 
+/// One byte range of a sharded payload, stored as its own ZIP entry.
+///
+/// Parts are contiguous and ordered: part `i` covers the bytes right after
+/// part `i - 1`, and concatenating every part in order reproduces the payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayloadPartDescriptor {
+    pub path: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PayloadDescriptor {
@@ -199,6 +250,13 @@ pub struct PayloadDescriptor {
     pub size: u64,
     pub mode: u32,
     pub role: PayloadRole,
+    /// Empty for a whole payload stored in one ZIP entry. Otherwise the
+    /// ordered parts the payload was split into; `path` then names no ZIP
+    /// entry of its own and `sha256`/`size` describe the reassembled payload.
+    /// The field is absent from schema-2 manifests, so builds that predate
+    /// sharding also reject it through `deny_unknown_fields`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<PayloadPartDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,7 +371,35 @@ struct PendingPayload<'a> {
 /// the target. Failure leaves an existing destination untouched whenever the
 /// failure occurs before the final same-directory rename.
 pub fn write_archive_atomic(path: &Path, input: &ArchiveInput) -> Result<VerifiedArchiveMetadata> {
-    let (manifest, payloads) = prepare_archive(input)?;
+    write_archive_installed(path, input)?;
+    verify_archive_streaming(path)
+        .with_context(|| format!("verify newly written archive {}", path.display()))
+}
+
+/// Writes and installs an archive exactly as [`write_archive_atomic`] does, then
+/// hashes it in one sequential pass instead of structurally re-reading it.
+///
+/// The checkpoint export path uses this: the target just wrote the ZIP from
+/// validated input, and the controller structurally verifies the same bytes
+/// after downloading them. Callers that install an archive nothing else will
+/// verify must keep using [`write_archive_atomic`].
+pub fn write_archive_hashed(path: &Path, input: &ArchiveInput) -> Result<String> {
+    write_archive_installed(path, input)?;
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    digest_reader(&mut file)
+        .with_context(|| format!("hash newly written archive {}", path.display()))
+}
+
+fn write_archive_installed(path: &Path, input: &ArchiveInput) -> Result<()> {
+    write_archive_installed_with_part_size(path, input, PAYLOAD_PART_BYTES)
+}
+
+fn write_archive_installed_with_part_size(
+    path: &Path,
+    input: &ArchiveInput,
+    part_bytes: usize,
+) -> Result<()> {
+    let (manifest, payloads) = prepare_archive_with_part_size(input, part_bytes)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .with_context(|| format!("create archive directory {}", parent.display()))?;
@@ -334,9 +420,7 @@ pub fn write_archive_atomic(path: &Path, input: &ArchiveInput) -> Result<Verifie
     sync_directory(parent)?;
     drop(payloads);
     drop(manifest);
-
-    verify_archive_streaming(path)
-        .with_context(|| format!("verify newly written archive {}", path.display()))
+    Ok(())
 }
 
 pub fn checkpoint_for_close(path: &Path, input: &ArchiveInput) -> CloseVerification {
@@ -350,9 +434,8 @@ pub fn checkpoint_for_close(path: &Path, input: &ArchiveInput) -> CloseVerificat
 }
 
 pub fn read_archive_verified(path: &Path) -> Result<VerifiedArchive> {
+    let contents = read_verified_zip(path, PayloadRetention::All)?;
     let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let contents = read_verified_zip(&mut file, PayloadRetention::All)?;
-    file.seek(SeekFrom::Start(0))?;
     Ok(VerifiedArchive {
         manifest: contents.manifest,
         payloads: contents.payloads,
@@ -363,10 +446,13 @@ pub fn read_archive_verified(path: &Path) -> Result<VerifiedArchive> {
 /// Verify an archive without materializing repository or native payloads.
 /// Every ZIP entry is still fully read, hashed, and checked; Git untracked
 /// payloads are parsed through the same path-safety validator while streaming.
+///
+/// A sharded untracked tar is the one exception to streaming: its parts are
+/// held in memory long enough to reassemble and parse the tar, because tar
+/// safety is a property of the whole payload rather than of one part.
 pub fn verify_archive_streaming(path: &Path) -> Result<VerifiedArchiveMetadata> {
+    let contents = read_verified_zip(path, PayloadRetention::CanonicalOnly)?;
     let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let contents = read_verified_zip(&mut file, PayloadRetention::CanonicalOnly)?;
-    file.seek(SeekFrom::Start(0))?;
     Ok(VerifiedArchiveMetadata {
         manifest: contents.manifest,
         canonical_session: contents.canonical_session,
@@ -374,7 +460,16 @@ pub fn verify_archive_streaming(path: &Path) -> Result<VerifiedArchiveMetadata> 
     })
 }
 
+#[cfg(test)]
 fn prepare_archive(input: &ArchiveInput) -> Result<(ArchiveManifest, Vec<PendingPayload<'_>>)> {
+    prepare_archive_with_part_size(input, PAYLOAD_PART_BYTES)
+}
+
+fn prepare_archive_with_part_size(
+    input: &ArchiveInput,
+    part_bytes: usize,
+) -> Result<(ArchiveManifest, Vec<PendingPayload<'_>>)> {
+    ensure!(part_bytes > 0, "archive payload part size is zero");
     ensure!(!input.session.id.trim().is_empty(), "session id is empty");
     ensure!(!input.bundle.id.trim().is_empty(), "bundle id is empty");
     validate_secret_free_map(&input.target.details)?;
@@ -478,6 +573,12 @@ fn prepare_archive(input: &ArchiveInput) -> Result<(ArchiveManifest, Vec<Pending
 
     payloads.par_iter_mut().for_each(|payload| {
         payload.descriptor.sha256 = digest_bytes(&payload.data);
+        payload.descriptor.parts = plan_payload_parts(
+            &payload.descriptor.path,
+            &payload.data,
+            payload_compression(&payload.descriptor.role),
+            part_bytes,
+        );
     });
 
     let mut paths = BTreeSet::new();
@@ -488,8 +589,15 @@ fn prepare_archive(input: &ArchiveInput) -> Result<(ArchiveManifest, Vec<Pending
             payload.descriptor.path
         );
     }
+    let sharded = payloads
+        .iter()
+        .any(|payload| !payload.descriptor.parts.is_empty());
     let manifest = ArchiveManifest {
-        schema_version: ARCHIVE_SCHEMA_VERSION,
+        schema_version: if sharded {
+            ARCHIVE_SCHEMA_VERSION_SHARDED
+        } else {
+            ARCHIVE_SCHEMA_VERSION
+        },
         format: ARCHIVE_FORMAT.to_string(),
         session: input.session.clone(),
         target: input.target.clone(),
@@ -522,9 +630,60 @@ fn push_payload<'a>(
         size: data.len() as u64,
         mode: normalized_mode(mode)?,
         role,
+        parts: Vec::new(),
     };
     payloads.push(PendingPayload { descriptor, data });
     Ok(())
+}
+
+/// Git bundles carry packfiles whose objects are already zlib-compressed;
+/// re-deflating one saves well under 1% while costing the whole export window,
+/// so bundles are stored verbatim. Everything else compresses enough to be
+/// worth DEFLATE at the default level.
+fn payload_compression(role: &PayloadRole) -> CompressionMethod {
+    match role {
+        PayloadRole::GitBundle { .. } => CompressionMethod::Stored,
+        PayloadRole::CanonicalSession
+        | PayloadRole::NativeArtifact { .. }
+        | PayloadRole::GitStagedPatch { .. }
+        | PayloadRole::GitUnstagedPatch { .. }
+        | PayloadRole::GitUntrackedTar { .. } => CompressionMethod::Deflated,
+    }
+}
+
+fn payload_part_path(path: &str, index: usize) -> String {
+    format!("{path}{PAYLOAD_PART_SUFFIX}{index:05}")
+}
+
+/// Splits a compressible payload that is larger than `part_bytes` into ordered
+/// parts. Stored payloads keep one entry: they cost no compression time, and
+/// splitting them would only add entries a reader has to stitch back together.
+fn plan_payload_parts(
+    path: &str,
+    data: &[u8],
+    method: CompressionMethod,
+    part_bytes: usize,
+) -> Vec<PayloadPartDescriptor> {
+    if method == CompressionMethod::Stored || data.len() <= part_bytes {
+        return Vec::new();
+    }
+    data.par_chunks(part_bytes)
+        .enumerate()
+        .map(|(index, chunk)| PayloadPartDescriptor {
+            path: payload_part_path(path, index),
+            sha256: digest_bytes(chunk),
+            size: chunk.len() as u64,
+        })
+        .collect()
+}
+
+/// One ZIP entry to write: either a whole payload, one part of a sharded
+/// payload, or the manifest.
+struct PlannedEntry<'a> {
+    name: &'a str,
+    mode: u32,
+    method: CompressionMethod,
+    data: &'a [u8],
 }
 
 fn write_zip(
@@ -532,35 +691,98 @@ fn write_zip(
     manifest: &ArchiveManifest,
     payloads: &[PendingPayload<'_>],
 ) -> Result<()> {
-    let mut writer = zip::ZipWriter::new(output);
     let manifest_bytes =
         serde_json::to_vec_pretty(manifest).context("serialize archive manifest")?;
     ensure!(
         manifest_bytes.len() as u64 <= MAX_MANIFEST_BYTES,
         "archive manifest is too large"
     );
-    writer
-        .start_file(
-            MANIFEST_PATH,
-            SimpleFileOptions::default().unix_permissions(0o600),
-        )
-        .context("start manifest ZIP entry")?;
-    writer
-        .write_all(&manifest_bytes)
-        .context("write manifest ZIP entry")?;
+    let mut entries = vec![PlannedEntry {
+        name: MANIFEST_PATH,
+        mode: 0o600,
+        method: CompressionMethod::Deflated,
+        data: &manifest_bytes,
+    }];
     for payload in payloads {
+        let descriptor = &payload.descriptor;
+        let method = payload_compression(&descriptor.role);
+        if descriptor.parts.is_empty() {
+            entries.push(PlannedEntry {
+                name: &descriptor.path,
+                mode: descriptor.mode,
+                method,
+                data: &payload.data,
+            });
+            continue;
+        }
+        let mut offset = 0_usize;
+        for part in &descriptor.parts {
+            let end = usize::try_from(part.size)
+                .ok()
+                .and_then(|size| offset.checked_add(size))
+                .filter(|end| *end <= payload.data.len())
+                .ok_or_else(|| {
+                    anyhow!("payload '{}' parts do not fit its body", descriptor.path)
+                })?;
+            entries.push(PlannedEntry {
+                name: &part.path,
+                mode: descriptor.mode,
+                method,
+                data: &payload.data[offset..end],
+            });
+            offset = end;
+        }
+        ensure!(
+            offset == payload.data.len(),
+            "payload '{}' parts do not cover its body",
+            descriptor.path
+        );
+    }
+
+    // Compression is the export freeze window, so every entry deflates on its
+    // own core; the container is then assembled sequentially in plan order so
+    // the archive layout stays deterministic.
+    let compressed = entries
+        .par_iter()
+        .map(compress_entry)
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut writer = zip::ZipWriter::new(output);
+    for (entry, buffer) in entries.iter().zip(compressed) {
+        let mut source = zip::ZipArchive::new(Cursor::new(buffer))
+            .with_context(|| format!("reopen compressed ZIP entry '{}'", entry.name))?;
+        let compressed_entry = source
+            .by_index(0)
+            .with_context(|| format!("read compressed ZIP entry '{}'", entry.name))?;
         writer
-            .start_file(
-                &payload.descriptor.path,
-                SimpleFileOptions::default().unix_permissions(payload.descriptor.mode),
-            )
-            .with_context(|| format!("start ZIP entry '{}'", payload.descriptor.path))?;
-        writer
-            .write_all(&payload.data)
-            .with_context(|| format!("write ZIP entry '{}'", payload.descriptor.path))?;
+            .raw_copy_file(compressed_entry)
+            .with_context(|| format!("write ZIP entry '{}'", entry.name))?;
     }
     writer.finish().context("finish Hel archive ZIP")?;
     Ok(())
+}
+
+/// Compresses one entry into a single-entry ZIP so the assembly pass can copy
+/// the finished deflate stream verbatim with [`zip::ZipWriter::raw_copy_file`].
+fn compress_entry(entry: &PlannedEntry<'_>) -> Result<Vec<u8>> {
+    let mut buffer = Cursor::new(Vec::with_capacity(entry.data.len() / 2 + 512));
+    let mut writer = zip::ZipWriter::new(&mut buffer);
+    writer
+        .start_file(
+            entry.name,
+            SimpleFileOptions::default()
+                .compression_method(entry.method)
+                .unix_permissions(entry.mode)
+                .large_file(entry.data.len() as u64 > zip::ZIP64_BYTES_THR),
+        )
+        .with_context(|| format!("start ZIP entry '{}'", entry.name))?;
+    writer
+        .write_all(entry.data)
+        .with_context(|| format!("write ZIP entry '{}'", entry.name))?;
+    writer
+        .finish()
+        .with_context(|| format!("compress ZIP entry '{}'", entry.name))?;
+    Ok(buffer.into_inner())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -575,52 +797,54 @@ struct VerifiedZipContents {
     payloads: BTreeMap<String, Vec<u8>>,
 }
 
-fn read_verified_zip<R: Read + Seek>(
-    reader: R,
-    retention: PayloadRetention,
-) -> Result<VerifiedZipContents> {
-    let mut archive = zip::ZipArchive::new(reader).context("open Hel archive ZIP")?;
-    let manifest_count = (0..archive.len()).try_fold(0_usize, |count, index| {
-        let entry = archive
-            .by_index(index)
-            .with_context(|| format!("read ZIP entry metadata {index}"))?;
-        Ok::<_, anyhow::Error>(count + usize::from(entry.name() == MANIFEST_PATH))
-    })?;
-    ensure!(
-        manifest_count == 1,
-        "archive must contain exactly one {MANIFEST_PATH}"
-    );
-    let manifest_bytes = {
-        let mut entry = archive
-            .by_name(MANIFEST_PATH)
-            .with_context(|| format!("archive is missing {MANIFEST_PATH}"))?;
-        ensure!(!entry.is_dir(), "archive manifest is a directory entry");
-        ensure!(
-            entry.size() <= MAX_MANIFEST_BYTES,
-            "archive manifest is too large"
-        );
-        let mut bytes = Vec::with_capacity(entry.size().min(usize::MAX as u64) as usize);
-        entry
-            .read_to_end(&mut bytes)
-            .context("read archive manifest")?;
-        bytes
-    };
-    let manifest = parse_archive_manifest(&manifest_bytes)?;
+/// Structural facts about one ZIP entry, read from the central directory
+/// before any body is decompressed.
+struct ZipEntryMeta {
+    index: usize,
+    name: String,
+    size: u64,
+    mode: u32,
+}
 
-    let descriptors = manifest
-        .payloads
-        .iter()
-        .map(|descriptor| (descriptor.path.as_str(), descriptor))
-        .collect::<BTreeMap<_, _>>();
-    let expected_paths = descriptors.keys().copied().collect::<BTreeSet<_>>();
+/// What the manifest says a ZIP entry must contain.
+#[derive(Clone, Copy)]
+enum EntryExpectation<'a> {
+    Whole(&'a PayloadDescriptor),
+    Part {
+        payload: &'a PayloadDescriptor,
+        part: &'a PayloadPartDescriptor,
+    },
+}
+
+/// Each parallel reader owns one of these: ZIP entries can only be read one at
+/// a time through a single handle, and the deflate decoder already buffers.
+fn open_archive(path: &Path) -> Result<zip::ZipArchive<File>> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    zip::ZipArchive::new(file).context("open Hel archive ZIP")
+}
+
+/// Payload bodies the caller keeps.
+fn retains_payload(retention: PayloadRetention, role: &PayloadRole) -> bool {
+    retention == PayloadRetention::All || *role == PayloadRole::CanonicalSession
+}
+
+/// Part bodies the reader has to hold until reassembly. Tar safety is a
+/// property of the whole payload, so a sharded untracked tar is reassembled
+/// even when the caller does not want the bytes.
+fn retains_parts(retention: PayloadRetention, role: &PayloadRole) -> bool {
+    retains_payload(retention, role) || matches!(role, PayloadRole::GitUntrackedTar { .. })
+}
+
+fn read_verified_zip(path: &Path, retention: PayloadRetention) -> Result<VerifiedZipContents> {
+    let mut archive = open_archive(path)?;
+    let mut entries = Vec::with_capacity(archive.len());
     let mut actual_paths = BTreeSet::<String>::new();
-    let mut payloads = BTreeMap::new();
-    let mut canonical_session = None;
+    let mut manifest_count = 0_usize;
     let mut total_size = 0_u64;
     for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .with_context(|| format!("read ZIP entry {index}"))?;
+        let entry = archive
+            .by_index_raw(index)
+            .with_context(|| format!("read ZIP entry metadata {index}"))?;
         ensure!(
             !entry.is_dir(),
             "archive contains directory entry '{}'; only files are allowed",
@@ -647,57 +871,104 @@ fn read_verified_zip<R: Read + Seek>(
             actual_paths.insert(name.clone()),
             "duplicate ZIP entry '{name}'"
         );
-        if name == MANIFEST_PATH {
+        manifest_count += usize::from(name == MANIFEST_PATH);
+        entries.push(ZipEntryMeta {
+            index,
+            name,
+            size: entry.size(),
+            mode: entry.unix_mode().unwrap_or(0o600) & 0o7777,
+        });
+    }
+    ensure!(
+        manifest_count == 1,
+        "archive must contain exactly one {MANIFEST_PATH}"
+    );
+    let manifest_bytes = {
+        let mut entry = archive
+            .by_name(MANIFEST_PATH)
+            .with_context(|| format!("archive is missing {MANIFEST_PATH}"))?;
+        ensure!(!entry.is_dir(), "archive manifest is a directory entry");
+        ensure!(
+            entry.size() <= MAX_MANIFEST_BYTES,
+            "archive manifest is too large"
+        );
+        let mut bytes = Vec::with_capacity(entry.size().min(usize::MAX as u64) as usize);
+        entry
+            .read_to_end(&mut bytes)
+            .context("read archive manifest")?;
+        bytes
+    };
+    drop(archive);
+    let manifest = parse_archive_manifest(&manifest_bytes)?;
+
+    let mut expectations = BTreeMap::<&str, EntryExpectation<'_>>::new();
+    for descriptor in &manifest.payloads {
+        if descriptor.parts.is_empty() {
+            expectations.insert(
+                descriptor.path.as_str(),
+                EntryExpectation::Whole(descriptor),
+            );
+            continue;
+        }
+        for part in &descriptor.parts {
+            expectations.insert(
+                part.path.as_str(),
+                EntryExpectation::Part {
+                    payload: descriptor,
+                    part,
+                },
+            );
+        }
+    }
+
+    let mut payload_entries = Vec::with_capacity(entries.len());
+    for meta in &entries {
+        if meta.name == MANIFEST_PATH {
             ensure!(
-                entry.size() == manifest_bytes.len() as u64,
+                meta.size == manifest_bytes.len() as u64,
                 "archive manifest size changed while it was read"
             );
             continue;
         }
-        let descriptor = descriptors
-            .get(name.as_str())
-            .ok_or_else(|| anyhow!("archive contains unlisted payload '{name}'"))?;
-        let mode = entry.unix_mode().unwrap_or(0o600) & 0o7777;
-        ensure!(
-            entry.size() == descriptor.size,
-            "size mismatch for payload '{}'",
-            descriptor.path
-        );
-        ensure!(
-            mode == descriptor.mode,
-            "mode mismatch for payload '{}'",
-            descriptor.path
-        );
+        let expectation = expectations
+            .get(meta.name.as_str())
+            .ok_or_else(|| anyhow!("archive contains unlisted payload '{}'", meta.name))?;
+        payload_entries.push((meta, *expectation));
+    }
+    // Entry names are unique and every one of them is listed, so equal counts
+    // mean the manifest and the container describe the same entry set.
+    ensure!(
+        payload_entries.len() == expectations.len(),
+        "archive payload list does not match manifest"
+    );
 
-        let retain =
-            retention == PayloadRetention::All || descriptor.role == PayloadRole::CanonicalSession;
-        let mut bytes =
-            retain.then(|| Vec::with_capacity(descriptor.size.min(usize::MAX as u64) as usize));
-        let mut digesting = DigestingReader::new(&mut entry);
-        if let Some(bytes) = bytes.as_mut() {
-            digesting
-                .read_to_end(bytes)
-                .with_context(|| format!("read ZIP entry '{name}'"))?;
-        } else if matches!(descriptor.role, PayloadRole::GitUntrackedTar { .. }) {
-            validate_untracked_tar_reader(&mut digesting)
-                .with_context(|| format!("validate payload '{}'", descriptor.path))?;
-            std::io::copy(&mut digesting, &mut std::io::sink())
-                .with_context(|| format!("finish reading ZIP entry '{name}'"))?;
-        } else {
-            std::io::copy(&mut digesting, &mut std::io::sink())
-                .with_context(|| format!("read ZIP entry '{name}'"))?;
+    // DEFLATE cannot be inflated in parallel inside one stream, so read
+    // parallelism comes from entries: each worker owns its own archive handle
+    // and verifies whole entries end to end.
+    let outcomes = payload_entries
+        .par_iter()
+        .map_init(
+            || open_archive(path).map_err(|error| format!("{error:#}")),
+            |archive, (meta, expectation)| {
+                let archive = match archive {
+                    Ok(archive) => archive,
+                    Err(error) => bail!("{error}"),
+                };
+                read_verified_entry(archive, meta, *expectation, retention)
+            },
+        )
+        .collect::<Vec<_>>();
+    let mut bodies = BTreeMap::<&str, Vec<u8>>::new();
+    for ((meta, _), outcome) in payload_entries.iter().zip(outcomes) {
+        if let Some(bytes) = outcome? {
+            bodies.insert(meta.name.as_str(), bytes);
         }
-        let (actual_size, actual_digest) = digesting.finish();
-        ensure!(
-            actual_size == descriptor.size,
-            "size mismatch for payload '{}'",
-            descriptor.path
-        );
-        ensure!(
-            actual_digest == descriptor.sha256,
-            "SHA-256 mismatch for payload '{}'",
-            descriptor.path
-        );
+    }
+
+    let mut payloads = BTreeMap::new();
+    let mut canonical_session = None;
+    for descriptor in &manifest.payloads {
+        let bytes = reassemble_payload(descriptor, &mut bodies, retention)?;
         if matches!(descriptor.role, PayloadRole::GitUntrackedTar { .. })
             && let Some(bytes) = bytes.as_deref()
         {
@@ -723,20 +994,122 @@ fn read_verified_zip<R: Read + Seek>(
             );
         }
     }
-    actual_paths.remove(MANIFEST_PATH);
-    let actual_payload_paths = actual_paths
-        .iter()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    ensure!(
-        expected_paths == actual_payload_paths,
-        "archive payload list does not match manifest"
-    );
     Ok(VerifiedZipContents {
         manifest,
         canonical_session: canonical_session.context("archive canonical session is missing")?,
         payloads,
     })
+}
+
+/// Reads one ZIP entry, verifies it against the manifest, and returns its body
+/// when the caller needs it.
+fn read_verified_entry(
+    archive: &mut zip::ZipArchive<File>,
+    meta: &ZipEntryMeta,
+    expectation: EntryExpectation<'_>,
+    retention: PayloadRetention,
+) -> Result<Option<Vec<u8>>> {
+    let (payload, expected_size, expected_sha256, retain) = match expectation {
+        EntryExpectation::Whole(payload) => (
+            payload,
+            payload.size,
+            payload.sha256.as_str(),
+            retains_payload(retention, &payload.role),
+        ),
+        EntryExpectation::Part { payload, part } => (
+            payload,
+            part.size,
+            part.sha256.as_str(),
+            retains_parts(retention, &payload.role),
+        ),
+    };
+    let label = match expectation {
+        EntryExpectation::Whole(_) => format!("payload '{}'", payload.path),
+        EntryExpectation::Part { .. } => format!("payload part '{}'", meta.name),
+    };
+    ensure!(meta.size == expected_size, "size mismatch for {label}");
+    ensure!(meta.mode == payload.mode, "mode mismatch for {label}");
+    // Only a whole untracked tar can be parsed while it streams past; sharded
+    // ones are reassembled after every part is verified.
+    let stream_untracked_tar = !retain
+        && matches!(expectation, EntryExpectation::Whole(_))
+        && matches!(payload.role, PayloadRole::GitUntrackedTar { .. });
+
+    let name = meta.name.as_str();
+    let mut entry = archive
+        .by_index(meta.index)
+        .with_context(|| format!("read ZIP entry {}", meta.index))?;
+    // Every worker opens the path again, so confirm this handle still sees the
+    // entry the structural pass indexed instead of reporting a replaced file
+    // as payload corruption.
+    let enclosed = entry
+        .enclosed_name()
+        .ok_or_else(|| anyhow!("unsafe ZIP entry path '{}'", entry.name()))?;
+    ensure!(
+        slash_path(&enclosed)? == meta.name,
+        "ZIP entry {} changed while the archive was read",
+        meta.index
+    );
+    let mut bytes =
+        retain.then(|| Vec::with_capacity(expected_size.min(usize::MAX as u64) as usize));
+    let mut digesting = DigestingReader::new(&mut entry);
+    if let Some(bytes) = bytes.as_mut() {
+        digesting
+            .read_to_end(bytes)
+            .with_context(|| format!("read ZIP entry '{name}'"))?;
+    } else if stream_untracked_tar {
+        validate_untracked_tar_reader(&mut digesting)
+            .with_context(|| format!("validate payload '{}'", payload.path))?;
+        std::io::copy(&mut digesting, &mut std::io::sink())
+            .with_context(|| format!("finish reading ZIP entry '{name}'"))?;
+    } else {
+        std::io::copy(&mut digesting, &mut std::io::sink())
+            .with_context(|| format!("read ZIP entry '{name}'"))?;
+    }
+    let (actual_size, actual_digest) = digesting.finish();
+    ensure!(actual_size == expected_size, "size mismatch for {label}");
+    ensure!(
+        actual_digest == expected_sha256,
+        "SHA-256 mismatch for {label}"
+    );
+    Ok(bytes)
+}
+
+/// Turns verified entry bodies back into one payload body. Restore and import
+/// therefore never see part entries, whatever the archive layout is.
+fn reassemble_payload(
+    descriptor: &PayloadDescriptor,
+    bodies: &mut BTreeMap<&str, Vec<u8>>,
+    retention: PayloadRetention,
+) -> Result<Option<Vec<u8>>> {
+    if descriptor.parts.is_empty() {
+        return Ok(bodies.remove(descriptor.path.as_str()));
+    }
+    if !retains_parts(retention, &descriptor.role) {
+        return Ok(None);
+    }
+    let mut assembled = Vec::with_capacity(descriptor.size.min(usize::MAX as u64) as usize);
+    for part in &descriptor.parts {
+        let chunk = bodies.remove(part.path.as_str()).ok_or_else(|| {
+            anyhow!(
+                "payload '{}' is missing part '{}'",
+                descriptor.path,
+                part.path
+            )
+        })?;
+        assembled.extend_from_slice(&chunk);
+    }
+    ensure!(
+        assembled.len() as u64 == descriptor.size,
+        "size mismatch for payload '{}'",
+        descriptor.path
+    );
+    ensure!(
+        digest_bytes(&assembled) == descriptor.sha256,
+        "SHA-256 mismatch for payload '{}'",
+        descriptor.path
+    );
+    Ok(Some(assembled))
 }
 
 struct DigestingReader<R> {
@@ -782,23 +1155,36 @@ fn parse_archive_manifest(manifest_bytes: &[u8]) -> Result<ArchiveManifest> {
         header.format
     );
     ensure!(
-        header.schema_version == ARCHIVE_SCHEMA_VERSION,
+        header.schema_version == ARCHIVE_SCHEMA_VERSION
+            || header.schema_version == ARCHIVE_SCHEMA_VERSION_SHARDED,
         "incompatible Hel archive schema {}; this build requires schema {}",
         header.schema_version,
         ARCHIVE_SCHEMA_VERSION
     );
     let manifest: ArchiveManifest =
-        serde_json::from_slice(manifest_bytes).context("parse schema-2 archive manifest")?;
+        serde_json::from_slice(manifest_bytes).context("parse Hel archive manifest")?;
     validate_manifest(&manifest)?;
     Ok(manifest)
 }
 
+/// The schema an archive must declare for the payload layout it carries.
+/// Sharded payloads are exactly what schema 3 adds, so declaring the wrong
+/// version is a manifest error either way round.
+fn expected_schema_version(payloads: &[PayloadDescriptor]) -> u32 {
+    if payloads.iter().any(|payload| !payload.parts.is_empty()) {
+        ARCHIVE_SCHEMA_VERSION_SHARDED
+    } else {
+        ARCHIVE_SCHEMA_VERSION
+    }
+}
+
 fn validate_manifest(manifest: &ArchiveManifest) -> Result<()> {
+    let expected_schema = expected_schema_version(&manifest.payloads);
     ensure!(
-        manifest.schema_version == ARCHIVE_SCHEMA_VERSION,
+        manifest.schema_version == expected_schema,
         "incompatible Hel archive schema {}; this build requires schema {}",
         manifest.schema_version,
-        ARCHIVE_SCHEMA_VERSION
+        expected_schema
     );
     ensure!(
         manifest.format == ARCHIVE_FORMAT,
@@ -818,7 +1204,7 @@ fn validate_manifest(manifest: &ArchiveManifest) -> Result<()> {
             "manifest cannot describe itself as a payload"
         );
         ensure!(
-            paths.insert(&descriptor.path),
+            paths.insert(descriptor.path.as_str()),
             "duplicate manifest payload '{}'",
             descriptor.path
         );
@@ -833,6 +1219,7 @@ fn validate_manifest(manifest: &ArchiveManifest) -> Result<()> {
             "invalid SHA-256 for payload '{}'",
             descriptor.path
         );
+        validate_payload_parts(descriptor, &mut paths)?;
         if let PayloadRole::NativeArtifact { relative_path } = &descriptor.role {
             validate_archive_relative_path(relative_path)?;
             ensure_not_secret_path(relative_path)?;
@@ -928,6 +1315,59 @@ fn validate_manifest(manifest: &ArchiveManifest) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Checks that a sharded payload can be reassembled exactly, and that its part
+/// entries occupy names nothing else in the archive claims. Every failure here
+/// is loud: a missing, extra, renamed, or reordered part cannot be read as a
+/// silently truncated or scrambled payload.
+fn validate_payload_parts<'a>(
+    descriptor: &'a PayloadDescriptor,
+    paths: &mut BTreeSet<&'a str>,
+) -> Result<()> {
+    if descriptor.parts.is_empty() {
+        return Ok(());
+    }
+    ensure!(
+        descriptor.parts.len() > 1,
+        "payload '{}' is sharded into a single part",
+        descriptor.path
+    );
+    let mut covered = 0_u64;
+    for (index, part) in descriptor.parts.iter().enumerate() {
+        validate_archive_relative_path(Path::new(&part.path))?;
+        ensure!(
+            part.path == payload_part_path(&descriptor.path, index),
+            "payload '{}' part {index} has unexpected path '{}'",
+            descriptor.path,
+            part.path
+        );
+        ensure!(
+            paths.insert(part.path.as_str()),
+            "duplicate manifest payload '{}'",
+            part.path
+        );
+        ensure!(
+            part.size > 0,
+            "payload '{}' part {index} is empty",
+            descriptor.path
+        );
+        ensure!(
+            is_lower_hex_sha256(&part.sha256),
+            "invalid SHA-256 for payload part '{}'",
+            part.path
+        );
+        covered = covered
+            .checked_add(part.size)
+            .ok_or_else(|| anyhow!("payload '{}' part sizes overflow", descriptor.path))?;
+    }
+    ensure!(
+        covered == descriptor.size,
+        "payload '{}' parts cover {covered} bytes but the payload is {} bytes",
+        descriptor.path,
+        descriptor.size
+    );
     Ok(())
 }
 
@@ -1086,6 +1526,13 @@ fn validate_canonical_session(snapshot: &CanonicalSessionSnapshot) -> Result<()>
             "canonical queued prompt '{}' has no content",
             prompt.command_id
         );
+        if let CanonicalQueuedCommandKind::SetConfig { key, value } = &prompt.kind {
+            ensure!(
+                !key.trim().is_empty() && !value.trim().is_empty(),
+                "canonical queued configuration change '{}' is incomplete",
+                prompt.command_id
+            );
+        }
         for (index, content) in prompt.content.iter().enumerate() {
             serde_json::from_value::<agent_client_protocol::schema::v1::ContentBlock>(
                 content.clone(),
@@ -2035,6 +2482,7 @@ fn create_symlink(_target: &Path, _destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::io::{Seek, SeekFrom};
     use std::sync::{Barrier, Mutex};
 
     use super::*;
@@ -2282,6 +2730,7 @@ mod tests {
                 ],
                 queued_prompts: vec![CanonicalQueuedPrompt {
                     command_id: "prompt-4".into(),
+                    kind: CanonicalQueuedCommandKind::Prompt,
                     content: vec![serde_json::json!({"type": "text", "text": "next"})],
                     queued_at_ms: 104,
                 }],
@@ -2377,6 +2826,396 @@ mod tests {
                 .len()
             + verified.archive_sha256.len();
         assert!(retained_metadata_bytes < LARGE_PAYLOAD_BYTES / 100);
+    }
+
+    const TEST_PART_BYTES: usize = 4096;
+
+    fn zip_entry_names(path: &Path) -> Vec<String> {
+        let archive = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
+        archive.file_names().map(str::to_owned).collect()
+    }
+
+    fn zip_entry_method(path: &Path, name: &str) -> CompressionMethod {
+        let mut archive = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
+        archive.by_name(name).unwrap().compression()
+    }
+
+    /// Writes an archive whose native artifact and first untracked tar are both
+    /// larger than `TEST_PART_BYTES`, so the sharded paths are exercised without
+    /// allocating the production 16 MiB threshold.
+    fn sharded_input() -> (ArchiveInput, Vec<u8>, Vec<u8>) {
+        let mut archive_input = input();
+        let native = b"native rollout line\n".repeat(2_000);
+        let untracked = tar_with_file(
+            "notes/large.txt",
+            &b"untracked payload line\n".repeat(1_000),
+            0o644,
+        );
+        archive_input.native_artifacts[0].data = native.clone();
+        archive_input.repositories[0].untracked_tar = untracked.clone();
+        (archive_input, native, untracked)
+    }
+
+    #[test]
+    fn oversized_payloads_shard_into_parts_and_read_back_whole() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sharded.hel.zip");
+        let (archive_input, native, untracked) = sharded_input();
+        write_archive_installed_with_part_size(&path, &archive_input, TEST_PART_BYTES).unwrap();
+
+        let native_path = "native/sessions/native-1/rollout.jsonl";
+        let names = zip_entry_names(&path);
+        assert!(
+            !names.contains(&native_path.to_string()),
+            "a sharded payload owns no entry of its own: {names:?}"
+        );
+        let part_names = names
+            .iter()
+            .filter(|name| name.starts_with(&format!("{native_path}{PAYLOAD_PART_SUFFIX}")))
+            .count();
+        assert_eq!(part_names, native.len().div_ceil(TEST_PART_BYTES));
+        assert!(part_names > 1);
+
+        let metadata = verify_archive_streaming(&path).unwrap();
+        assert_eq!(
+            metadata.manifest.schema_version,
+            ARCHIVE_SCHEMA_VERSION_SHARDED
+        );
+        assert_eq!(metadata.canonical_session, archive_input.canonical_session);
+
+        let verified = read_archive_verified(&path).unwrap();
+        assert_eq!(verified.archive_sha256, metadata.archive_sha256);
+        assert_eq!(
+            verified
+                .payload_by_role(&PayloadRole::NativeArtifact {
+                    relative_path: PathBuf::from("sessions/native-1/rollout.jsonl"),
+                })
+                .unwrap(),
+            native.as_slice()
+        );
+        assert_eq!(
+            verified
+                .payload_by_role(&PayloadRole::GitUntrackedTar {
+                    repository_id: "hel".into(),
+                })
+                .unwrap(),
+            untracked.as_slice()
+        );
+        assert_eq!(
+            verified.canonical_session().unwrap(),
+            archive_input.canonical_session
+        );
+        assert!(
+            verified
+                .payloads
+                .keys()
+                .all(|path| !path.contains(PAYLOAD_PART_SUFFIX)),
+            "restore consumers only ever see whole payload paths"
+        );
+        assert!(verified.payloads.contains_key(native_path));
+    }
+
+    #[test]
+    fn payload_parts_follow_the_threshold_and_never_split_stored_payloads() {
+        let bundle = PayloadRole::GitBundle {
+            repository_id: "hel".into(),
+        };
+        let artifact = PayloadRole::NativeArtifact {
+            relative_path: PathBuf::from("rollout.jsonl"),
+        };
+        assert_eq!(payload_compression(&bundle), CompressionMethod::Stored);
+        assert_eq!(payload_compression(&artifact), CompressionMethod::Deflated);
+
+        let body = vec![b'x'; 10];
+        assert!(
+            plan_payload_parts(
+                "repositories/hel/committed.bundle",
+                &body,
+                CompressionMethod::Stored,
+                4,
+            )
+            .is_empty()
+        );
+        assert!(
+            plan_payload_parts(
+                "native/rollout.jsonl",
+                &body,
+                CompressionMethod::Deflated,
+                10
+            )
+            .is_empty(),
+            "a payload at the threshold stays whole"
+        );
+        let parts = plan_payload_parts(
+            "native/rollout.jsonl",
+            &body,
+            CompressionMethod::Deflated,
+            4,
+        );
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "native/rollout.jsonl.helpart.00000",
+                "native/rollout.jsonl.helpart.00001",
+                "native/rollout.jsonl.helpart.00002",
+            ]
+        );
+        assert_eq!(
+            parts.iter().map(|part| part.size).collect::<Vec<_>>(),
+            [4, 4, 2]
+        );
+        assert_eq!(parts[2].sha256, digest_bytes(&body[8..]));
+    }
+
+    #[test]
+    fn git_bundles_are_stored_and_other_payloads_are_deflated() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stored-bundle.hel.zip");
+        write_archive_atomic(&path, &input()).unwrap();
+
+        assert_eq!(
+            zip_entry_method(&path, "repositories/hel/committed.bundle"),
+            CompressionMethod::Stored
+        );
+        assert_eq!(
+            zip_entry_method(&path, CANONICAL_SESSION_PATH),
+            CompressionMethod::Deflated
+        );
+        assert_eq!(
+            zip_entry_method(&path, "repositories/hel/untracked.tar"),
+            CompressionMethod::Deflated
+        );
+
+        let verified = read_archive_verified(&path).unwrap();
+        assert_eq!(
+            verified
+                .payload_by_role(&PayloadRole::GitBundle {
+                    repository_id: "hel".into(),
+                })
+                .unwrap(),
+            b"bundle-hel"
+        );
+    }
+
+    /// Replaces a repository's untracked tar in an already prepared archive,
+    /// resharding it so the manifest and the payload body stay consistent.
+    fn replace_untracked_tar(
+        manifest: &mut ArchiveManifest,
+        payloads: &mut [PendingPayload<'_>],
+        repository_id: &str,
+        tar: Vec<u8>,
+        part_bytes: usize,
+    ) {
+        let role = PayloadRole::GitUntrackedTar {
+            repository_id: repository_id.to_string(),
+        };
+        let descriptor = manifest
+            .payloads
+            .iter_mut()
+            .find(|payload| payload.role == role)
+            .unwrap();
+        descriptor.size = tar.len() as u64;
+        descriptor.sha256 = digest_bytes(&tar);
+        descriptor.parts = plan_payload_parts(
+            &descriptor.path,
+            &tar,
+            CompressionMethod::Deflated,
+            part_bytes,
+        );
+        let descriptor = descriptor.clone();
+        let payload = payloads
+            .iter_mut()
+            .find(|payload| payload.descriptor.path == descriptor.path)
+            .unwrap();
+        payload.descriptor = descriptor;
+        payload.data = Cow::Owned(tar);
+    }
+
+    #[test]
+    fn streaming_verification_parses_a_sharded_untracked_tar_for_safety() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unsafe-sharded-untracked.hel.zip");
+        let (archive_input, _, _) = sharded_input();
+        let (mut manifest, mut payloads) =
+            prepare_archive_with_part_size(&archive_input, TEST_PART_BYTES).unwrap();
+        let malicious = tar_with_file(".env", &b"secret\n".repeat(2_000), 0o600);
+        assert!(malicious.len() > TEST_PART_BYTES);
+        replace_untracked_tar(
+            &mut manifest,
+            &mut payloads,
+            "hel",
+            malicious,
+            TEST_PART_BYTES,
+        );
+        let mut file = File::create(&path).unwrap();
+        write_zip(&mut file, &manifest, &payloads).unwrap();
+        drop(file);
+
+        let error = format!("{:#}", verify_archive_streaming(&path).unwrap_err());
+        assert!(error.contains("credential/config path"), "{error}");
+    }
+
+    #[test]
+    fn sharded_manifests_reject_reordered_or_missing_parts() {
+        let directory = tempfile::tempdir().unwrap();
+        let (archive_input, _, _) = sharded_input();
+
+        let (mut manifest, payloads) =
+            prepare_archive_with_part_size(&archive_input, TEST_PART_BYTES).unwrap();
+        let descriptor = manifest
+            .payloads
+            .iter_mut()
+            .find(|payload| !payload.parts.is_empty())
+            .unwrap();
+        descriptor.parts.swap(0, 1);
+        let reordered = directory.path().join("reordered.hel.zip");
+        let mut file = File::create(&reordered).unwrap();
+        write_zip(&mut file, &manifest, &payloads).unwrap();
+        drop(file);
+        let error = format!("{:#}", verify_archive_streaming(&reordered).unwrap_err());
+        assert!(error.contains("part 0 has unexpected path"), "{error}");
+
+        let (mut manifest, payloads) =
+            prepare_archive_with_part_size(&archive_input, TEST_PART_BYTES).unwrap();
+        let descriptor = manifest
+            .payloads
+            .iter_mut()
+            .find(|payload| !payload.parts.is_empty())
+            .unwrap();
+        descriptor.parts.pop().unwrap();
+        let truncated = directory.path().join("truncated.hel.zip");
+        let mut file = File::create(&truncated).unwrap();
+        write_zip(&mut file, &manifest, &payloads).unwrap();
+        drop(file);
+        let error = format!("{:#}", verify_archive_streaming(&truncated).unwrap_err());
+        assert!(error.contains("parts cover"), "{error}");
+    }
+
+    #[test]
+    fn readers_without_part_support_reject_sharded_archives() {
+        // The schema-2 wire types as a build that predates sharding sees them.
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyPayloadDescriptor {
+            #[allow(dead_code)]
+            path: String,
+            #[allow(dead_code)]
+            sha256: String,
+            #[allow(dead_code)]
+            size: u64,
+            #[allow(dead_code)]
+            mode: u32,
+            #[allow(dead_code)]
+            role: PayloadRole,
+        }
+        #[derive(Debug, Deserialize)]
+        struct LegacyManifest {
+            schema_version: u32,
+            payloads: Vec<LegacyPayloadDescriptor>,
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sharded.hel.zip");
+        let (archive_input, _, _) = sharded_input();
+        write_archive_installed_with_part_size(&path, &archive_input, TEST_PART_BYTES).unwrap();
+        let mut archive = zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let mut manifest_bytes = Vec::new();
+        archive
+            .by_name(MANIFEST_PATH)
+            .unwrap()
+            .read_to_end(&mut manifest_bytes)
+            .unwrap();
+
+        // Gate 1: the version an old build compares for equality against 2.
+        let header: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(
+            header["schema_version"],
+            serde_json::json!(ARCHIVE_SCHEMA_VERSION_SHARDED)
+        );
+
+        // Gate 2: even ignoring the version, the old payload type cannot parse
+        // a descriptor that carries parts.
+        let error = serde_json::from_slice::<LegacyManifest>(&manifest_bytes).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field `parts`"),
+            "{error}"
+        );
+
+        // Gate 3: an archive that claims schema 2 while carrying parts, or
+        // schema 3 while carrying none, is rejected by this build too.
+        let (mut manifest, payloads) =
+            prepare_archive_with_part_size(&archive_input, TEST_PART_BYTES).unwrap();
+        manifest.schema_version = ARCHIVE_SCHEMA_VERSION;
+        let downgraded = directory.path().join("downgraded.hel.zip");
+        let mut file = File::create(&downgraded).unwrap();
+        write_zip(&mut file, &manifest, &payloads).unwrap();
+        drop(file);
+        let error = format!("{:#}", read_archive_verified(&downgraded).unwrap_err());
+        assert!(
+            error.contains("incompatible Hel archive schema 2; this build requires schema 3"),
+            "{error}"
+        );
+
+        // An archive with no sharded payload stays schema 2 and still parses
+        // with the old wire types, so small sessions keep full compatibility.
+        let whole = directory.path().join("whole.hel.zip");
+        write_archive_atomic(&whole, &input()).unwrap();
+        let mut archive = zip::ZipArchive::new(File::open(&whole).unwrap()).unwrap();
+        let mut whole_manifest = Vec::new();
+        archive
+            .by_name(MANIFEST_PATH)
+            .unwrap()
+            .read_to_end(&mut whole_manifest)
+            .unwrap();
+        let legacy: LegacyManifest = serde_json::from_slice(&whole_manifest).unwrap();
+        assert_eq!(legacy.schema_version, ARCHIVE_SCHEMA_VERSION);
+        assert!(!legacy.payloads.is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_part_fails_the_parallel_read_with_the_part_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("corrupt-part.hel.zip");
+        let (archive_input, _, _) = sharded_input();
+        write_archive_installed_with_part_size(&path, &archive_input, TEST_PART_BYTES).unwrap();
+
+        let corrupt = "native/sessions/native-1/rollout.jsonl.helpart.00001";
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let entry = archive.by_name(corrupt).unwrap();
+        let data_start = entry.data_start();
+        drop(entry);
+        let mut file = archive.into_inner();
+        file.seek(SeekFrom::Start(data_start)).unwrap();
+        file.write_all(b"\xff\xff\xff\xff").unwrap();
+        drop(file);
+
+        for error in [
+            verify_archive_streaming(&path).unwrap_err(),
+            read_archive_verified(&path).unwrap_err(),
+        ] {
+            let error = format!("{error:#}");
+            assert!(error.contains(corrupt), "{error}");
+        }
+    }
+
+    #[test]
+    fn writing_the_same_input_twice_produces_identical_archives() {
+        let directory = tempfile::tempdir().unwrap();
+        let (archive_input, _, _) = sharded_input();
+        let first = directory.path().join("first.hel.zip");
+        let second = directory.path().join("second.hel.zip");
+        write_archive_installed_with_part_size(&first, &archive_input, TEST_PART_BYTES).unwrap();
+        write_archive_installed_with_part_size(&second, &archive_input, TEST_PART_BYTES).unwrap();
+        assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+        assert_eq!(zip_entry_names(&first), zip_entry_names(&second));
     }
 
     #[test]
@@ -2651,6 +3490,50 @@ mod tests {
         let error = write_archive_atomic(&path, &invalid).unwrap_err();
         assert!(format!("{error:#}").contains("has invalid ACP content block 0"));
         assert!(!path.exists());
+
+        invalid = input();
+        invalid.canonical_session.queued_prompts[0].kind = CanonicalQueuedCommandKind::SetConfig {
+            key: "model".into(),
+            value: "  ".into(),
+        };
+        let error = write_archive_atomic(&path, &invalid).unwrap_err();
+        assert!(format!("{error:#}").contains("is incomplete"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn queued_entries_written_before_config_changes_load_as_prompts() {
+        let stored: CanonicalQueuedPrompt = serde_json::from_value(serde_json::json!({
+            "command_id": "queued-1",
+            "content": [{"type": "text", "text": "hello"}],
+            "queued_at_ms": 5,
+        }))
+        .unwrap();
+        assert_eq!(stored.kind, CanonicalQueuedCommandKind::Prompt);
+        // A prompt entry still serializes exactly as it did before.
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap(),
+            serde_json::json!({
+                "command_id": "queued-1",
+                "content": [{"type": "text", "text": "hello"}],
+                "queued_at_ms": 5,
+            })
+        );
+
+        let config = CanonicalQueuedPrompt {
+            command_id: "queued-2".into(),
+            kind: CanonicalQueuedCommandKind::SetConfig {
+                key: "model".into(),
+                value: "sonnet".into(),
+            },
+            content: vec![serde_json::json!({"type": "text", "text": "/model sonnet"})],
+            queued_at_ms: 6,
+        };
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            serde_json::from_value::<CanonicalQueuedPrompt>(encoded).unwrap(),
+            config
+        );
     }
 
     #[test]

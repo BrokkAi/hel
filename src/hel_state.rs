@@ -151,10 +151,39 @@ impl TranscriptItem {
     }
 }
 
+/// What a durable queue entry does when its turn comes.
+///
+/// Serialized without a tag for prompts so entries written before configuration
+/// changes could be queued keep loading unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedCommandKind {
+    #[default]
+    Prompt,
+    SetConfig {
+        key: String,
+        value: String,
+    },
+}
+
+impl QueuedCommandKind {
+    pub fn is_prompt(&self) -> bool {
+        matches!(self, Self::Prompt)
+    }
+}
+
+/// The composer form of a configuration change, used both as the queue entry's
+/// display text and as the text peeled back into the composer for editing.
+pub fn config_command_text(key: &str, value: &str) -> String {
+    format!("/{key} {value}")
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializedQueuedPrompt {
     pub command_id: String,
+    #[serde(default, skip_serializing_if = "QueuedCommandKind::is_prompt")]
+    pub kind: QueuedCommandKind,
     pub content: Vec<serde_json::Value>,
     pub queued_at_ms: i64,
 }
@@ -244,6 +273,14 @@ impl MaterializedSession {
             if !command_ids.insert(prompt.command_id.as_str()) {
                 bail!(
                     "materialized prompt queue contains duplicate command {:?}",
+                    prompt.command_id
+                );
+            }
+            if let QueuedCommandKind::SetConfig { key, value } = &prompt.kind
+                && (key.trim().is_empty() || value.trim().is_empty())
+            {
+                bail!(
+                    "materialized queued configuration change {:?} is incomplete",
                     prompt.command_id
                 );
             }
@@ -524,6 +561,10 @@ pub struct SessionRecord {
     pub created_at: String,
     pub updated_at: String,
     pub detached_after_event_ordinal: u64,
+    /// Unsent chat input carried across a detach, so returning to a session
+    /// restores what the user was typing. Empty means no draft.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub draft_input: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -539,6 +580,47 @@ impl SessionRecord {
             .as_deref()
             .or(self.acp_session_title.as_deref())
             .unwrap_or(&self.id)
+    }
+
+    /// Project this session works in, as the session list and the chat header
+    /// both name it: the source repository of a managed worktree, else the
+    /// project directory, else the bundle's primary repository, else the
+    /// bundle id.
+    pub fn project_name(&self, config: &HelConfig) -> String {
+        if let Some(worktree) = &self.managed_worktree {
+            return path_leaf(&worktree.source_repository);
+        }
+        if let Some(project_directory) = &self.project_directory {
+            return path_leaf(project_directory);
+        }
+        config
+            .bundles
+            .get(&self.bundle_id)
+            .and_then(|bundle| {
+                bundle
+                    .repositories
+                    .iter()
+                    .find(|repository| repository.id == bundle.primary_repo)
+                    .or_else(|| bundle.repositories.first())
+            })
+            .map(|repository| path_leaf(&repository.destination))
+            .unwrap_or_else(|| path_leaf(Path::new(&self.bundle_id)))
+    }
+
+    /// Orders two sessions the way the session list's sequence view does:
+    /// oldest first by creation time, with the id as a stable tiebreak. A
+    /// session whose timestamp does not parse sorts last.
+    pub fn compare_by_creation(&self, other: &Self) -> std::cmp::Ordering {
+        match (
+            created_at_seconds(&self.created_at),
+            created_at_seconds(&other.created_at),
+        ) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| self.id.cmp(&other.id))
     }
 
     fn validate(&self, map_id: &str) -> Result<()> {
@@ -592,6 +674,20 @@ impl SessionRecord {
         }
         Ok(())
     }
+}
+
+/// Last component of a path, falling back to the whole path when it has none.
+fn path_leaf(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn created_at_seconds(timestamp: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|timestamp| timestamp.timestamp())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -838,6 +934,7 @@ mod tests {
             created_at: "2026-08-09T12:00:00Z".into(),
             updated_at: "2026-08-09T12:01:00Z".into(),
             detached_after_event_ordinal: 0,
+            draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: Some(CheckpointMetadata {
@@ -898,6 +995,74 @@ mod tests {
         }
     }
 
+    fn sample_session() -> SessionRecord {
+        sample_state()
+            .sessions
+            .remove("0123456789abcdef")
+            .expect("sample session")
+    }
+
+    #[test]
+    fn project_name_prefers_a_worktree_source_then_a_project_directory_then_the_bundle() {
+        let mut config = sample_config();
+        config
+            .bundles
+            .get_mut("hel")
+            .expect("bundle")
+            .repositories
+            .push(ProjectRepository {
+                id: "docs".into(),
+                github: Some("BrokkAi/docs".into()),
+                local: None,
+                destination: PathBuf::from("documentation"),
+                git_ref: None,
+            });
+        let mut session = sample_session();
+
+        assert_eq!(session.project_name(&config), "hel");
+
+        session.project_directory = Some(PathBuf::from("/home/test/Projects/raw-project"));
+        assert_eq!(session.project_name(&config), "raw-project");
+
+        session.project_directory = Some(PathBuf::from(
+            "/home/test/Projects/source/.hel/worktrees/0123456789abcdef",
+        ));
+        session.managed_worktree = Some(ManagedWorktree {
+            source_project_directory: PathBuf::from("/home/test/Projects/source"),
+            source_repository: PathBuf::from("/home/test/Projects/source"),
+            worktree_root: PathBuf::from(
+                "/home/test/Projects/source/.hel/worktrees/0123456789abcdef",
+            ),
+            branch: "hel/0123456789abcdef".into(),
+            target: ManagedWorktreeTarget::Local,
+        });
+        assert_eq!(session.project_name(&config), "source");
+    }
+
+    #[test]
+    fn sessions_order_by_creation_time_and_fall_back_to_the_id() {
+        let older = sample_session();
+        let mut newer = sample_session();
+        newer.id = "0000000000000001".into();
+        newer.created_at = "2026-08-09T13:00:00Z".into();
+        let mut unparsable = sample_session();
+        unparsable.id = "0000000000000002".into();
+        unparsable.created_at = "not a timestamp".into();
+        let mut same_time = sample_session();
+        same_time.id = "zzzzzzzzzzzzzzzz".into();
+
+        let mut sessions = [&unparsable, &newer, &same_time, &older];
+        sessions.sort_by(|left, right| left.compare_by_creation(right));
+
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| &session.id)
+                .collect::<Vec<_>>(),
+            [&older.id, &same_time.id, &newer.id, &unparsable.id]
+        );
+    }
+
     #[test]
     fn retired_checkpoint_and_detach_cursor_names_are_rejected() {
         let session_id = "0123456789abcdef";
@@ -917,6 +1082,19 @@ mod tests {
         let ordinal = session.remove("detached_after_event_ordinal").unwrap();
         session.insert("last_viewed_event_sequence".into(), ordinal);
         assert!(serde_json::from_value::<HelState>(old_detach_cursor).is_err());
+    }
+
+    #[test]
+    fn state_written_before_drafts_loads_with_an_empty_draft() {
+        let session_id = "0123456789abcdef";
+        let mut without_draft = serde_json::to_value(sample_state()).unwrap();
+        let session = without_draft["sessions"][session_id]
+            .as_object_mut()
+            .unwrap();
+        session.remove("draft_input");
+
+        let state = serde_json::from_value::<HelState>(without_draft).unwrap();
+        assert_eq!(state.sessions[session_id].draft_input, "");
     }
 
     #[test]
@@ -987,6 +1165,7 @@ mod tests {
         }));
         materialized.queued_prompts.push(MaterializedQueuedPrompt {
             command_id: "prompt-2".into(),
+            kind: QueuedCommandKind::Prompt,
             content: Vec::new(),
             queued_at_ms: 500,
         });

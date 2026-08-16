@@ -42,7 +42,7 @@ use hel::hel_server::{
 };
 use hel::hel_session_manager::{
     RelaySessionTarget, SessionManagerControl, SessionManagerUpdate, SessionManagerUpdates,
-    new_command_id, spawn_session_manager,
+    ViewError, new_command_id, spawn_session_manager,
 };
 use hel::hel_setup::{SetupOutcome, github_repository_from_origin, run_setup_dialog};
 use hel::hel_state::{
@@ -52,7 +52,7 @@ use hel::hel_state::{
 use hel::hel_targets::{
     CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec,
     DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage, ProcessExecutor,
-    SessionResourceProbe, SessionResourceUsage,
+    ProvisionStage, SessionResourceProbe, SessionResourceUsage,
 };
 use hel::hel_worker::RelayCommand;
 use hel::hel_worker_runtime::{
@@ -526,6 +526,7 @@ enum WorkerCommand {
     },
     /// Build a target-side archive for verified controller transfer.
     ExportCheckpoint {
+        /// Export specification path, or `-` to read it from standard input.
         #[arg(long)]
         spec: PathBuf,
     },
@@ -2395,12 +2396,25 @@ fn apply_worker_poll_update(
     if apply_worker_record_update(controller, &update, Some(dashboard_io_tx))? {
         dashboard.set_state(controller.state.clone());
     }
-    if let Some(detail) = update.view.error {
-        dashboard.mark_transcript_unavailable(&update.session_id);
-        dashboard.set_notice(format!(
-            "Session {}: relay unreachable: {detail}; collecting worker diagnostics…",
-            &update.session_id[..update.session_id.len().min(8)]
-        ));
+    match update.view.error {
+        Some(ViewError::Unreachable(detail)) => {
+            dashboard.mark_transcript_unavailable(&update.session_id);
+            dashboard.set_notice(format!(
+                "Session {}: relay unreachable: {detail}; collecting worker diagnostics…",
+                &update.session_id[..update.session_id.len().min(8)]
+            ));
+        }
+        Some(ViewError::ProjectionIntegrity(detail)) => {
+            // Deterministic failure: no worker diagnostics, and no
+            // "relay unreachable:" last_error, which reconnect handling
+            // reserves for genuinely unreachable relays.
+            dashboard.mark_transcript_unavailable(&update.session_id);
+            dashboard.set_notice(format!(
+                "Session {}: transcript projection failed: {detail}",
+                &update.session_id[..update.session_id.len().min(8)]
+            ));
+        }
+        None => {}
     }
     Ok(update.view.snapshot.is_some())
 }
@@ -2548,18 +2562,30 @@ fn spawn_dashboard_rename(
     });
 }
 
-fn spawn_detached_read_receipt_persist(
+/// Longest the quit path waits for the detach write before giving up.
+const DETACH_PERSIST_QUIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Persist everything one detach produces: the read receipt and the unsent
+/// draft. They describe the same moment and the same row, so one task keeps
+/// them together and gives the quit path a single handle to await.
+fn spawn_detached_session_state_persist(
     session_id: String,
     event_ordinal: u64,
+    draft: String,
     updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        let result =
+        let receipt =
             hel::hel_database::advance_detached_after_event_ordinal(&session_id, event_ordinal)
-                .map(|_| ())
-                .map_err(|error| format!("{error:#}"));
-        let _ = updates.send(DashboardIoUpdate::DetachedReadReceipt { session_id, result });
-    });
+                .map(|_| ());
+        // Save the draft even when the receipt was rejected: losing typed text
+        // is worse than an out-of-date read marker.
+        let saved_draft = hel::hel_database::set_session_draft_input(&session_id, &draft);
+        let result = receipt
+            .and(saved_draft)
+            .map_err(|error| format!("{error:#}"));
+        let _ = updates.send(DashboardIoUpdate::DetachedSessionState { session_id, result });
+    })
 }
 
 fn spawn_create_bundle(
@@ -2753,7 +2779,11 @@ fn spawn_dashboard_create_session(
         }
         let result = (|| -> Result<()> {
             let mut controller = Controller::load()?;
-            let executor = CancellableProcessExecutor::new(cancelled);
+            let executor = StageReportingExecutor::new(
+                CancellableProcessExecutor::new(cancelled),
+                session_id.clone(),
+                updates,
+            );
             runtime.block_on(controller.provision_session_controlled(&session_id, &executor))
         })()
         .map(|()| LifecycleSuccess::Created)
@@ -3054,7 +3084,7 @@ enum DashboardIoUpdate {
         title: String,
         result: std::result::Result<String, String>,
     },
-    DetachedReadReceipt {
+    DetachedSessionState {
         session_id: String,
         result: std::result::Result<(), String>,
     },
@@ -3086,6 +3116,72 @@ enum DashboardIoUpdate {
         directory: String,
         result: std::result::Result<(), String>,
     },
+    LifecycleStage {
+        session_id: String,
+        stage: ProvisionStage,
+    },
+}
+
+/// Reports the launch stage of each command a lifecycle operation runs, so the
+/// session clock can name the work in flight.
+struct StageReportingExecutor<E: CommandExecutor> {
+    inner: E,
+    session_id: String,
+    updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+    reported: std::sync::Mutex<Option<ProvisionStage>>,
+}
+
+impl<E: CommandExecutor> StageReportingExecutor<E> {
+    fn new(
+        inner: E,
+        session_id: String,
+        updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+    ) -> Self {
+        Self {
+            inner,
+            session_id,
+            updates,
+            reported: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn report(&self, command: &CommandSpec) {
+        let Some(stage) = command.stage else {
+            return;
+        };
+        let mut reported = self
+            .reported
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *reported == Some(stage) {
+            return;
+        }
+        *reported = Some(stage);
+        let _ = self.updates.send(DashboardIoUpdate::LifecycleStage {
+            session_id: self.session_id.clone(),
+            stage,
+        });
+    }
+}
+
+impl<E: CommandExecutor> CommandExecutor for StageReportingExecutor<E> {
+    fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        self.report(command);
+        self.inner.execute(command)
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.inner.cancellation_requested()
+    }
+
+    fn execute_with_stdin(
+        &self,
+        command: &CommandSpec,
+        input: &mut (dyn std::io::Read + Send),
+    ) -> Result<CommandOutput> {
+        self.report(command);
+        self.inner.execute_with_stdin(command, input)
+    }
 }
 
 fn startup_greeting(controller: &Controller) -> String {
@@ -3206,6 +3302,7 @@ async fn open_chat_view(
     session_id: &str,
     sessions: &SessionManagerControl,
     recovery_observer: &hel::hel_recovery::RecoveryObserver,
+    notices: hel::hel_chat::Notices,
 ) -> Result<hel::hel_chat::ActiveChat> {
     let session_record = controller
         .state
@@ -3214,17 +3311,33 @@ async fn open_chat_view(
         .with_context(|| format!("unknown session {session_id}"))?
         .clone();
     let bundle_id = session_record.bundle_id.clone();
-    let other_sessions = controller
+    // Only a fresh view is seeded: a warm chat the loop kept alive holds newer
+    // input than this saved copy.
+    let saved_draft = session_record.draft_input.clone();
+    // The header lists every active session in the order the session list
+    // shows them, so each one keeps the same place in both views.
+    let mut active = controller
         .state
         .sessions
         .values()
-        .filter(|record| record.id != session_id && record.state.is_active())
-        .map(|record| hel::hel_chat::OtherSessionIdentity {
-            session_id: record.id.clone(),
-            display_title: record.display_title().to_owned(),
-            detached_after_event_ordinal: record.detached_after_event_ordinal,
-        })
+        .filter(|record| record.state.is_active())
         .collect::<Vec<_>>();
+    active.sort_by(|left, right| left.compare_by_creation(right));
+    let mut header = hel::hel_chat::SessionHeaderIdentity {
+        project: session_record.project_name(&controller.config),
+        ..hel::hel_chat::SessionHeaderIdentity::default()
+    };
+    for (position, record) in active.into_iter().enumerate() {
+        if record.id == session_id {
+            header.position = position;
+            continue;
+        }
+        header.others.push(hel::hel_chat::OtherSessionIdentity {
+            session_id: record.id.clone(),
+            position,
+            project: record.project_name(&controller.config),
+        });
+    }
     let recovery_context = hel::hel_recovery::RecoveryContext {
         observer: recovery_observer.clone(),
         session: session_record,
@@ -3236,31 +3349,69 @@ async fn open_chat_view(
         &bundle_id,
         Some(recovery_context),
         sessions.clone(),
-        other_sessions,
+        header,
+        saved_draft,
+        notices,
     ))
 }
 
-/// Records how far the user has read in a session and persists it in the
-/// background. A missing session is reported rather than fatal: the receipt is
-/// a convenience, and the session itself is unaffected.
-fn record_chat_read_receipt(
+/// Makes `session_id` the chat the loop holds. A warm chat for the same
+/// session is left as it is, so showing it costs a draw; any other session is
+/// opened fresh, which drops the previous chat and detaches its proxy.
+async fn hold_chat_session(
+    controller: &Controller,
+    active_chat: &mut Option<hel::hel_chat::ActiveChat>,
+    session_id: &str,
+    sessions: &SessionManagerControl,
+    recovery_observer: &hel::hel_recovery::RecoveryObserver,
+    notices: hel::hel_chat::Notices,
+) -> Result<()> {
+    if active_chat
+        .as_ref()
+        .is_some_and(|chat| chat.session_id() == session_id)
+    {
+        // The warm chat is this session: it has been following the worker off
+        // screen, so showing it is only a redraw.
+        return Ok(());
+    }
+    let chat = open_chat_view(controller, session_id, sessions, recovery_observer, notices).await?;
+    // Only one chat stays warm, so the previous one is dropped here; its
+    // supervisor detaches on drop.
+    *active_chat = Some(chat);
+    Ok(())
+}
+
+/// Records what leaving a chat produced — how far the user has read and the
+/// input they left unsent — and persists both in the background. A missing
+/// session is reported rather than fatal: the session itself is unaffected.
+///
+/// The returned handle lets the quit path wait for the write. `None` means
+/// nothing was queued.
+fn record_chat_detach_state(
     controller: &mut Controller,
     dashboard: &mut DashboardState,
     session_id: &str,
     event_ordinal: u64,
+    draft: &str,
     updates: &tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     let Some(session) = controller.state.sessions.get_mut(session_id) else {
         dashboard.set_notice(format!(
-            "Could not save read status for {}: unknown session",
+            "Could not save draft and read status for {}: unknown session",
             short_id(session_id)
         ));
-        return;
+        return None;
     };
     session.detached_after_event_ordinal = session.detached_after_event_ordinal.max(event_ordinal);
+    session.draft_input = draft.to_owned();
     dashboard.set_state(controller.state.clone());
     dashboard.clear_notice();
-    spawn_detached_read_receipt_persist(session_id.to_owned(), event_ordinal, updates.clone());
+    Some(spawn_detached_session_state_persist(
+        session_id.to_owned(),
+        event_ordinal,
+        draft.to_owned(),
+        updates.clone(),
+    ))
 }
 
 /// Applies one terminal event to the dashboard and reports the work it asks
@@ -3296,6 +3447,10 @@ async fn run_dashboard() -> Result<()> {
         controller.state.clone(),
         std::collections::BTreeMap::new(),
     );
+    // One notifications bar for the whole process: the dashboard and every
+    // chat view opened below report through the same shared handle.
+    let notices = hel::hel_chat::Notices::default();
+    dashboard.share_notices(notices.clone());
     for (session_id, queued) in projected_queued_prompts(&controller)? {
         dashboard.apply_queued_prompts(&session_id, queued);
     }
@@ -3590,11 +3745,12 @@ async fn run_dashboard() -> Result<()> {
             },
             // Turn clocks, countdowns, and credential-sync backoffs move on
             // their own, so the dashboard redraws once a second regardless.
-            // The chat has no animation; its only time-driven text is the
-            // checkpoint title, so it redraws only when that flag has moved.
+            // The chat redraws only when its own time-driven text has moved:
+            // a running turn clock in the session header, or the checkpoint
+            // title.
             _ = clock_tick.tick() => {
                 dirty |= match (view, active_chat.as_ref()) {
-                    (View::Chat, Some(chat)) => chat.recovery_title_is_stale(),
+                    (View::Chat, Some(chat)) => chat.needs_clock_tick(),
                     _ => true,
                 };
             }
@@ -3630,7 +3786,11 @@ async fn run_dashboard() -> Result<()> {
             controller_changed = true;
             let session_id = update.session_id.clone();
             let connected = update.view.connected;
-            let connection_error = update.view.error.clone();
+            // Only unreachable relays drive the worker diagnostics flow.
+            let connection_error = match update.view.error.as_ref() {
+                Some(ViewError::Unreachable(detail)) => Some(detail.clone()),
+                Some(ViewError::ProjectionIntegrity(_)) | None => None,
+            };
             if let Some(snapshot) = update.view.snapshot.as_ref()
                 && let Some(session) = controller.state.sessions.get(&session_id).cloned()
             {
@@ -3836,6 +3996,9 @@ async fn run_dashboard() -> Result<()> {
                         }
                     }
                 }
+                DashboardIoUpdate::LifecycleStage { session_id, stage } => {
+                    dashboard.set_session_operation_stage(&session_id, stage);
+                }
                 DashboardIoUpdate::MaterializedSessionProjection { detail } => {
                     dashboard.apply_prepared_materialized_session(*detail);
                 }
@@ -3887,10 +4050,10 @@ async fn run_dashboard() -> Result<()> {
                         dashboard.set_notice(format!("Rename failed for {title}: {error}"));
                     }
                 },
-                DashboardIoUpdate::DetachedReadReceipt { session_id, result } => {
+                DashboardIoUpdate::DetachedSessionState { session_id, result } => {
                     if let Err(error) = result {
                         dashboard.set_notice(format!(
-                            "Could not save read status for {}: {error}",
+                            "Could not save draft and read status for {}: {error}",
                             short_id(&session_id)
                         ));
                     }
@@ -4080,8 +4243,59 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
         }
+        let quitting = matches!(
+            chat_outcome,
+            hel::hel_chat::ChatEventOutcome::QuitDetach { .. }
+        );
         match chat_outcome {
             hel::hel_chat::ChatEventOutcome::None | hel::hel_chat::ChatEventOutcome::Handled => {}
+            hel::hel_chat::ChatEventOutcome::SwitchSession {
+                session_id,
+                last_seen_event_ordinal,
+            } => {
+                // The session being left is saved exactly as `Back` saves it;
+                // only the view it hands over to differs.
+                let detached = active_chat
+                    .as_ref()
+                    .map(|chat| (chat.session_id().to_owned(), chat.draft().to_owned()));
+                if let Some((detached_id, draft)) = detached {
+                    record_chat_detach_state(
+                        &mut controller,
+                        &mut dashboard,
+                        &detached_id,
+                        last_seen_event_ordinal,
+                        &draft,
+                        &dashboard_io_tx,
+                    );
+                }
+                // Keep the session list on the conversation now on screen, so
+                // returning to it lands where the user left off.
+                dashboard.select_active_session(&session_id);
+                // The view stays on a chat either way: the session that opened,
+                // or the one still here with the notice saying why it did not.
+                match hold_chat_session(
+                    &controller,
+                    &mut active_chat,
+                    &session_id,
+                    &worker_commands_tx,
+                    &recovery_observer,
+                    notices.clone(),
+                )
+                .await
+                {
+                    // The user arrived by walking the list, so the pane keeps
+                    // focus and the next key walks on from here.
+                    Ok(()) => {
+                        if let Some(chat) = active_chat.as_mut() {
+                            chat.focus_conversations();
+                        }
+                    }
+                    Err(error) => {
+                        dashboard.set_notice(format!("Could not open session: {error:#}"));
+                    }
+                }
+                dirty = true;
+            }
             hel::hel_chat::ChatEventOutcome::Back {
                 last_seen_event_ordinal,
             }
@@ -4092,22 +4306,29 @@ async fn run_dashboard() -> Result<()> {
                 // keep following the worker and reopening it costs a draw.
                 view = View::Dashboard;
                 dirty = true;
-                if let Some(session_id) = active_chat
+                // The warm chat goes on holding this input in memory, so save
+                // it here: a quit or a crash while it is off screen would
+                // otherwise lose it.
+                let detached = active_chat
                     .as_ref()
-                    .map(|chat| chat.session_id().to_owned())
-                {
-                    record_chat_read_receipt(
+                    .map(|chat| (chat.session_id().to_owned(), chat.draft().to_owned()));
+                let persist = detached.map(|(session_id, draft)| {
+                    record_chat_detach_state(
                         &mut controller,
                         &mut dashboard,
                         &session_id,
                         last_seen_event_ordinal,
+                        &draft,
                         &dashboard_io_tx,
-                    );
-                }
-                if matches!(
-                    chat_outcome,
-                    hel::hel_chat::ChatEventOutcome::QuitDetach { .. }
-                ) {
+                    )
+                });
+                if quitting {
+                    // Quitting leaves this loop for process exit, so the detach
+                    // write has to land first. Bounded so a stuck database
+                    // cannot hang the quit.
+                    if let Some(persist) = persist.flatten() {
+                        let _ = tokio::time::timeout(DETACH_PERSIST_QUIT_TIMEOUT, persist).await;
+                    }
                     quit_detached = true;
                     break;
                 }
@@ -4350,35 +4571,22 @@ async fn run_dashboard() -> Result<()> {
                 );
             }
             DashboardAction::Open { session_id } => {
-                if active_chat
-                    .as_ref()
-                    .is_some_and(|chat| chat.session_id() == session_id)
+                match hold_chat_session(
+                    &controller,
+                    &mut active_chat,
+                    &session_id,
+                    &worker_commands_tx,
+                    &recovery_observer,
+                    notices.clone(),
+                )
+                .await
                 {
-                    // The warm chat is this session: it has been following the
-                    // worker off screen, so showing it is only a redraw.
-                    view = View::Chat;
-                    dirty = true;
-                } else {
-                    match open_chat_view(
-                        &controller,
-                        &session_id,
-                        &worker_commands_tx,
-                        &recovery_observer,
-                    )
-                    .await
-                    {
-                        Ok(chat) => {
-                            // Only one chat stays warm, so the previous one is
-                            // dropped here; its supervisor detaches on drop.
-                            active_chat = Some(chat);
-                            view = View::Chat;
-                            dirty = true;
-                        }
-                        Err(error) => {
-                            dashboard.set_notice(format!("Could not open session: {error:#}"));
-                        }
+                    Ok(()) => view = View::Chat,
+                    Err(error) => {
+                        dashboard.set_notice(format!("Could not open session: {error:#}"));
                     }
                 }
+                dirty = true;
             }
             DashboardAction::ResumeSession {
                 session_id,
@@ -4407,6 +4615,7 @@ async fn run_dashboard() -> Result<()> {
                     },
                 );
                 let updates = lifecycle_updates_tx.clone();
+                let stage_updates = dashboard_io_tx.clone();
                 let observer = recovery_observer.clone();
                 let operation_session_id = session_id.clone();
                 let operation_profile_id = profile_id.clone();
@@ -4420,7 +4629,11 @@ async fn run_dashboard() -> Result<()> {
                             &cancelled,
                         )?;
                         let mut controller = Controller::load()?;
-                        let executor = CancellableProcessExecutor::new(cancelled);
+                        let executor = StageReportingExecutor::new(
+                            CancellableProcessExecutor::new(cancelled),
+                            operation_session_id.clone(),
+                            stage_updates,
+                        );
                         runtime.block_on(controller.resume_session_controlled(
                             &operation_session_id,
                             &operation_profile_id,
@@ -5296,6 +5509,21 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
 
+    /// The controller streams a checkpoint spec by asking the worker to read
+    /// `--spec -`, so that dash has to survive argument parsing as a value.
+    #[test]
+    fn export_checkpoint_accepts_a_dash_for_a_streamed_spec() {
+        let cli = Cli::try_parse_from(["hel", "worker", "export-checkpoint", "--spec", "-"])
+            .expect("a streamed spec is a valid export argument");
+        let Some(Command::Worker(WorkerArgs {
+            command: WorkerCommand::ExportCheckpoint { spec },
+        })) = cli.command
+        else {
+            panic!("export-checkpoint did not parse as a worker command");
+        };
+        assert_eq!(spec, PathBuf::from("-"));
+    }
+
     /// The dashboard loop batches buffered input and stops at the first event
     /// that asks for work, so events that only need a redraw must report no
     /// action and actionable keys must report theirs.
@@ -5400,6 +5628,7 @@ mod tests {
             created_at: "2026-08-14T00:00:00Z".into(),
             updated_at: "2026-08-14T00:00:00Z".into(),
             detached_after_event_ordinal: 0,
+            draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: None,
@@ -5909,6 +6138,7 @@ mod tests {
                 created_at: "2026-08-12T00:00:00Z".into(),
                 updated_at: "2026-08-12T00:00:00Z".into(),
                 detached_after_event_ordinal: 0,
+                draft_input: String::new(),
                 last_error: None,
                 last_checkpoint_error: None,
                 checkpoint: Some(hel::hel_state::CheckpointMetadata {

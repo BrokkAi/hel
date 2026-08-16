@@ -18,7 +18,9 @@ use ratatui::widgets::{
 };
 use sha2::{Digest, Sha256};
 
-use hel::hel_chat::{TranscriptSnapshot, materialized_content_text, render_agent_message_tail};
+use hel::hel_chat::{
+    Notices, TranscriptSnapshot, materialized_content_text, render_agent_message_tail,
+};
 use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use hel::hel_quota::{ProfileQuota, QuotaWindow};
 use hel::hel_state::{
@@ -27,12 +29,14 @@ use hel::hel_state::{
 };
 use hel::hel_targets::{
     AdditionalMount, DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage,
-    SessionResourceUsage, default_mount_destination, path_completion,
+    ProvisionStage, SessionResourceUsage, default_mount_destination, path_completion,
 };
 
 const FORCE_CONFIRMATION: &str = "DESTROY";
 const BASELINE_CPUS: u64 = 8;
 const BASELINE_MEMORY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const FLOOR_CPUS: u64 = 2;
+const FLOOR_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const ACTIVE_MESSAGE_LINES: usize = 4;
 const SELECTED_TRANSCRIPT_LINES: usize = 10;
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
@@ -151,6 +155,10 @@ struct SessionOperationDisplay {
     kind: SessionOperationKind,
     started_at_epoch_seconds: u64,
     placeholder: Option<SessionRecord>,
+    stage: Option<ProvisionStage>,
+    /// When the current `stage` began, so the clock can count that stage's
+    /// progress instead of the whole operation's.
+    stage_started_at_epoch_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +343,37 @@ struct ResumeWizard {
 struct RenameEditor {
     session_id: String,
     title: String,
+    focus: RenameFocus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameFocus {
+    Field,
+    Cancel,
+    Save,
+}
+
+const RENAME_BUTTONS: &[&str] = &["Cancel", "Save"];
+const RENAME_FOCUS_ORDER: [RenameFocus; 3] =
+    [RenameFocus::Field, RenameFocus::Cancel, RenameFocus::Save];
+
+impl RenameFocus {
+    /// The button Enter would press. Typing in the field also submits, so Save
+    /// stays highlighted there and exactly one button is ever highlighted.
+    fn button_index(self) -> usize {
+        match self {
+            RenameFocus::Cancel => 0,
+            RenameFocus::Field | RenameFocus::Save => 1,
+        }
+    }
+
+    fn from_button_index(index: usize) -> Self {
+        if index == 0 {
+            RenameFocus::Cancel
+        } else {
+            RenameFocus::Save
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,6 +402,23 @@ enum Confirmation {
     },
 }
 
+/// A confirmation dialog plus the index of its focused button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfirmDialog {
+    confirmation: Confirmation,
+    focus: usize,
+}
+
+impl ConfirmDialog {
+    fn new(confirmation: Confirmation) -> Self {
+        let focus = primary_button(confirmation_buttons(&confirmation));
+        Self {
+            confirmation,
+            focus,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Mode {
     Dashboard,
@@ -372,7 +428,7 @@ enum Mode {
     Import(ImportDialog),
     Importing(ImportProgress),
     ConfirmImportBundle(ImportBundleConfirmation),
-    Confirm(Confirmation),
+    Confirm(ConfirmDialog),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,6 +447,60 @@ struct ImportBundleConfirmation {
     scratch_git_roots: Vec<String>,
     has_untracked_files: bool,
     ignore_untracked: bool,
+    focus: usize,
+}
+
+const IMPORT_BUNDLE_BUTTONS: &[&str] = &["Cancel", "Continue"];
+const IMPORT_PROGRESS_BUTTONS: &[&str] = &["Cancel"];
+
+/// Button labels for a confirmation dialog, ordered Cancel first and the primary
+/// action last. Typed-confirmation dialogs have no buttons. This is the single
+/// declaration used by both key handling and rendering.
+fn confirmation_buttons(confirmation: &Confirmation) -> &'static [&'static str] {
+    match confirmation {
+        Confirmation::DirtyLocal { .. } => &["Cancel", "Continue"],
+        Confirmation::Close { .. } => &["Cancel", "Pause"],
+        Confirmation::DeleteArchived { .. } => &["Cancel", "Delete"],
+        Confirmation::CloseFailed { .. } => &["Cancel", "Force destroy", "Retry pause"],
+        Confirmation::ForceDestroy { .. } | Confirmation::DeleteActive { .. } => &[],
+    }
+}
+
+/// Index of the primary (rightmost) button, which is focused when a dialog opens.
+fn primary_button(labels: &[&str]) -> usize {
+    labels.len().saturating_sub(1)
+}
+
+/// What a key press means for a focusable button row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ButtonKey {
+    Focus(usize),
+    Activate(usize),
+    Cancel,
+    Ignored,
+}
+
+fn button_row_key(code: KeyCode, focus: usize, count: usize) -> ButtonKey {
+    match code {
+        KeyCode::Tab | KeyCode::Right => ButtonKey::Focus(cycle_button_focus(focus, count, false)),
+        KeyCode::BackTab | KeyCode::Left => {
+            ButtonKey::Focus(cycle_button_focus(focus, count, true))
+        }
+        KeyCode::Enter => ButtonKey::Activate(focus),
+        KeyCode::Esc => ButtonKey::Cancel,
+        _ => ButtonKey::Ignored,
+    }
+}
+
+fn cycle_button_focus(focus: usize, count: usize, reverse: bool) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    if reverse {
+        focus.min(count - 1).checked_sub(1).unwrap_or(count - 1)
+    } else {
+        (focus + 1) % count
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -782,7 +892,7 @@ pub struct DashboardState {
     preview_scroll: usize,
     preview_scroll_session: Option<String>,
     mode: Mode,
-    notice: Option<String>,
+    notices: Notices,
     greeting: String,
 }
 
@@ -808,7 +918,7 @@ impl DashboardState {
             preview_scroll: 0,
             preview_scroll_session: None,
             mode: Mode::Dashboard,
-            notice: None,
+            notices: Notices::default(),
             greeting: "Welcome to Hel".into(),
         };
         dashboard.session_details = dashboard
@@ -869,10 +979,29 @@ impl DashboardState {
                     .unwrap_or_default()
                     .as_secs(),
                 placeholder,
+                stage: None,
+                stage_started_at_epoch_seconds: None,
             },
         );
         self.apply_operation_projection();
         self.clamp_selections();
+    }
+
+    /// Name the launch phase in flight; a finished or unknown operation is
+    /// left alone. Only a stage change resets the per-stage clock, so a
+    /// repeated report of the same stage can't restart its counter.
+    pub fn set_session_operation_stage(&mut self, session_id: &str, stage: ProvisionStage) {
+        if let Some(operation) = self.session_operations.get_mut(session_id)
+            && operation.stage != Some(stage)
+        {
+            operation.stage = Some(stage);
+            operation.stage_started_at_epoch_seconds = Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
+        }
     }
 
     pub fn rekey_session_operation(&mut self, previous: &str, session_id: String) {
@@ -1111,28 +1240,35 @@ impl DashboardState {
         self.checkpoint_archive_sizes = sizes;
     }
 
+    /// Installs the process-wide notifications bar, so every view reports
+    /// through one shared slot.
+    pub fn share_notices(&mut self, notices: Notices) {
+        self.notices = notices;
+    }
+
     pub fn set_notice(&mut self, notice: impl Into<String>) {
-        self.notice = Some(notice.into());
+        self.notices.set(notice);
     }
 
     pub fn replace_notice_if(&mut self, expected: &str, replacement: impl Into<String>) -> bool {
-        if self.notice.as_deref() != Some(expected) {
-            return false;
-        }
-        self.notice = Some(replacement.into());
-        true
+        self.notices.replace_if(expected, replacement)
     }
 
     pub fn clear_notice(&mut self) {
-        self.notice = None;
+        self.notices.clear();
+    }
+
+    /// The current shared notice, if any.
+    pub fn notice(&self) -> Option<String> {
+        self.notices.current()
     }
 
     /// Show the recovery choices after a checkpointed close could not finish.
     pub fn show_close_failure(&mut self, session_id: String, error: impl Into<String>) {
-        self.mode = Mode::Confirm(Confirmation::CloseFailed {
+        self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::CloseFailed {
             session_id,
             error: error.into(),
-        });
+        }));
     }
 
     pub fn show_import_dialog(&mut self, discovery_id: u64, profiles: Vec<ImportProfileOption>) {
@@ -1248,6 +1384,7 @@ impl DashboardState {
             scratch_git_roots,
             has_untracked_files,
             ignore_untracked: has_untracked_files,
+            focus: primary_button(IMPORT_BUNDLE_BUTTONS),
         });
     }
 
@@ -1256,10 +1393,10 @@ impl DashboardState {
         action: DashboardAction,
         repositories: Vec<String>,
     ) {
-        self.mode = Mode::Confirm(Confirmation::DirtyLocal {
+        self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DirtyLocal {
             action,
             repositories,
-        });
+        }));
     }
 
     pub fn finish_import(&mut self) {
@@ -1273,7 +1410,7 @@ impl DashboardState {
         if is_paste_shortcut(key) {
             match hel::hel_clipboard::read_text() {
                 Ok(text) => self.handle_paste(&text),
-                Err(error) => self.notice = Some(format!("Paste failed: {error:#}")),
+                Err(error) => self.notices.set(format!("Paste failed: {error:#}")),
             }
             return DashboardAction::None;
         }
@@ -1283,37 +1420,22 @@ impl DashboardState {
             return DashboardAction::QuitDetach;
         }
 
-        self.notice = None;
+        self.notices.clear();
         match self.mode.clone() {
             Mode::Dashboard => self.handle_dashboard_key(key),
             Mode::New(wizard) => self.handle_new_key(key.code, wizard),
             Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
             Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
             Mode::Import(dialog) => self.handle_import_key(key, dialog),
+            // The only control is the Cancel button, so Enter presses it too.
             Mode::Importing(_) => match key.code {
-                KeyCode::Esc => DashboardAction::CancelImport,
+                KeyCode::Esc | KeyCode::Enter => DashboardAction::CancelImport,
                 _ => DashboardAction::None,
             },
-            Mode::ConfirmImportBundle(mut confirmation) => match key.code {
-                KeyCode::Char(' ') if confirmation.has_untracked_files => {
-                    confirmation.ignore_untracked = !confirmation.ignore_untracked;
-                    self.mode = Mode::ConfirmImportBundle(confirmation);
-                    DashboardAction::None
-                }
-                KeyCode::Char('y') | KeyCode::Enter => DashboardAction::ConfirmImportBundle {
-                    accepted: true,
-                    include_untracked: !confirmation.ignore_untracked,
-                },
-                KeyCode::Char('n') | KeyCode::Esc => DashboardAction::ConfirmImportBundle {
-                    accepted: false,
-                    include_untracked: false,
-                },
-                _ => {
-                    self.mode = Mode::ConfirmImportBundle(confirmation);
-                    DashboardAction::None
-                }
-            },
-            Mode::Confirm(confirmation) => self.handle_confirmation_key(key.code, confirmation),
+            Mode::ConfirmImportBundle(confirmation) => {
+                self.handle_import_bundle_key(key.code, confirmation)
+            }
+            Mode::Confirm(dialog) => self.handle_confirmation_key(key.code, dialog),
         }
     }
 
@@ -1323,7 +1445,7 @@ impl DashboardState {
             return;
         }
         match &mut self.mode {
-            Mode::Rename(editor) => {
+            Mode::Rename(editor) if editor.focus == RenameFocus::Field => {
                 let remaining = 64_usize.saturating_sub(editor.title.chars().count());
                 editor.title.extend(pasted.chars().take(remaining));
             }
@@ -1351,8 +1473,11 @@ impl DashboardState {
                 dialog.filter.push_str(&pasted);
                 dialog.session_index = 0;
             }
-            Mode::Confirm(Confirmation::ForceDestroy { typed, .. })
-            | Mode::Confirm(Confirmation::DeleteActive { typed, .. }) => {
+            Mode::Confirm(ConfirmDialog {
+                confirmation:
+                    Confirmation::ForceDestroy { typed, .. } | Confirmation::DeleteActive { typed, .. },
+                ..
+            }) => {
                 let remaining = FORCE_CONFIRMATION.len().saturating_sub(typed.len());
                 typed.extend(
                     pasted
@@ -1491,9 +1616,9 @@ impl DashboardState {
                     return DashboardAction::None;
                 }
                 if let Some(session) = self.selected_session() {
-                    self.mode = Mode::Confirm(Confirmation::Close {
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::Close {
                         session_id: session.id.clone(),
-                    });
+                    }));
                 }
                 DashboardAction::None
             }
@@ -1502,9 +1627,9 @@ impl DashboardState {
                     return DashboardAction::None;
                 }
                 if let Some(session) = self.selected_session() {
-                    self.mode = Mode::Confirm(Confirmation::DeleteArchived {
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteArchived {
                         session_id: session.id.clone(),
-                    });
+                    }));
                 }
                 DashboardAction::None
             }
@@ -1525,10 +1650,10 @@ impl DashboardState {
                     if !has_assistant_messages {
                         return DashboardAction::DeleteActive { session_id };
                     }
-                    self.mode = Mode::Confirm(Confirmation::DeleteActive {
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
                         session_id,
                         typed: String::new(),
-                    });
+                    }));
                 }
                 DashboardAction::None
             }
@@ -1706,6 +1831,7 @@ impl DashboardState {
                 .or(session.acp_session_title.as_ref())
                 .cloned()
                 .unwrap_or_default(),
+            focus: RenameFocus::Field,
         });
     }
 
@@ -1716,7 +1842,7 @@ impl DashboardState {
                 .map(|operation| operation.kind)
         });
         if let Some(operation) = operation {
-            self.notice = Some(format!(
+            self.notices.set(format!(
                 "{} is in progress; press Ctrl+X to cancel it.",
                 operation.label()
             ));
@@ -1732,8 +1858,28 @@ impl DashboardState {
                 self.cancel_modal();
                 DashboardAction::None
             }
+            KeyCode::Tab | KeyCode::BackTab => {
+                editor.focus =
+                    cycle_control(editor.focus, &RENAME_FOCUS_ORDER, code == KeyCode::BackTab);
+                self.mode = Mode::Rename(editor);
+                DashboardAction::None
+            }
+            // The field has no cursor, so horizontal keys only move between buttons.
+            KeyCode::Left | KeyCode::Right if editor.focus != RenameFocus::Field => {
+                editor.focus = RenameFocus::from_button_index(cycle_button_focus(
+                    editor.focus.button_index(),
+                    RENAME_BUTTONS.len(),
+                    code == KeyCode::Left,
+                ));
+                self.mode = Mode::Rename(editor);
+                DashboardAction::None
+            }
+            KeyCode::Enter if editor.focus == RenameFocus::Cancel => {
+                self.cancel_modal();
+                DashboardAction::None
+            }
             KeyCode::Enter if editor.title.trim().is_empty() => {
-                self.notice = Some("Session name cannot be empty.".into());
+                self.notices.set("Session name cannot be empty.");
                 self.mode = Mode::Rename(editor);
                 DashboardAction::None
             }
@@ -1744,12 +1890,14 @@ impl DashboardState {
                     title: editor.title,
                 }
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if editor.focus == RenameFocus::Field => {
                 editor.title.pop();
                 self.mode = Mode::Rename(editor);
                 DashboardAction::None
             }
-            KeyCode::Char(character) if editor.title.chars().count() < 64 => {
+            KeyCode::Char(character)
+                if editor.focus == RenameFocus::Field && editor.title.chars().count() < 64 =>
+            {
                 editor.title.push(character);
                 self.mode = Mode::Rename(editor);
                 DashboardAction::None
@@ -1897,7 +2045,7 @@ impl DashboardState {
                     DashboardAction::None
                 }
                 KeyCode::Enter if wizard.new_bundle_source.trim().is_empty() => {
-                    self.notice = Some("Repository source cannot be empty.".into());
+                    self.notices.set("Repository source cannot be empty.");
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
@@ -2022,7 +2170,7 @@ impl DashboardState {
                 if matches!(target, TargetTemplate::AwsEc2 { .. })
                     && wizard.resource_allocation.is_none()
                 {
-                    self.notice = Some(
+                    self.notices.set(
                         wizard
                             .sizing_error
                             .clone()
@@ -2365,7 +2513,8 @@ impl DashboardState {
             .iter()
             .position(|id| *id == bundle_id)
         else {
-            self.notice = Some(format!("Created bundle {bundle_id:?} was not found."));
+            self.notices
+                .set(format!("Created bundle {bundle_id:?} was not found."));
             return DashboardAction::None;
         };
         wizard.bundle = index;
@@ -2743,7 +2892,7 @@ impl DashboardState {
                     TargetTemplate::AwsEc2 { .. }
                 ) && wizard.resource_allocation.is_none()
                 {
-                    self.notice = Some(
+                    self.notices.set(
                         wizard
                             .sizing_error
                             .clone()
@@ -3068,81 +3217,113 @@ impl DashboardState {
         action
     }
 
-    fn handle_confirmation_key(
+    fn handle_import_bundle_key(
+        &mut self,
+        code: KeyCode,
+        mut confirmation: ImportBundleConfirmation,
+    ) -> DashboardAction {
+        // The checkbox toggle is independent of which button has focus.
+        if code == KeyCode::Char(' ') && confirmation.has_untracked_files {
+            confirmation.ignore_untracked = !confirmation.ignore_untracked;
+            self.mode = Mode::ConfirmImportBundle(confirmation);
+            return DashboardAction::None;
+        }
+        let cancelled = DashboardAction::ConfirmImportBundle {
+            accepted: false,
+            include_untracked: false,
+        };
+        confirmation.focus =
+            match button_row_key(code, confirmation.focus, IMPORT_BUNDLE_BUTTONS.len()) {
+                ButtonKey::Activate(index) if index == primary_button(IMPORT_BUNDLE_BUTTONS) => {
+                    return DashboardAction::ConfirmImportBundle {
+                        accepted: true,
+                        include_untracked: !confirmation.ignore_untracked,
+                    };
+                }
+                ButtonKey::Activate(_) | ButtonKey::Cancel => return cancelled,
+                ButtonKey::Focus(focus) => focus,
+                ButtonKey::Ignored => confirmation.focus,
+            };
+        self.mode = Mode::ConfirmImportBundle(confirmation);
+        DashboardAction::None
+    }
+
+    fn handle_confirmation_key(&mut self, code: KeyCode, dialog: ConfirmDialog) -> DashboardAction {
+        let ConfirmDialog {
+            confirmation,
+            focus,
+        } = dialog;
+        let buttons = confirmation_buttons(&confirmation);
+        if buttons.is_empty() {
+            return self.handle_typed_confirmation_key(code, confirmation);
+        }
+        let focus = match button_row_key(code, focus, buttons.len()) {
+            ButtonKey::Activate(index) => {
+                return self.activate_confirmation_button(confirmation, index);
+            }
+            ButtonKey::Cancel => {
+                self.cancel_modal();
+                return DashboardAction::None;
+            }
+            ButtonKey::Focus(next) => next,
+            ButtonKey::Ignored => focus,
+        };
+        self.mode = Mode::Confirm(ConfirmDialog {
+            confirmation,
+            focus,
+        });
+        DashboardAction::None
+    }
+
+    /// Runs the button at `index` of `confirmation_buttons`, where index 0 is always Cancel.
+    fn activate_confirmation_button(
+        &mut self,
+        confirmation: Confirmation,
+        index: usize,
+    ) -> DashboardAction {
+        match (confirmation, index) {
+            (Confirmation::DirtyLocal { mut action, .. }, 1) => {
+                if let DashboardAction::CreateSession {
+                    allow_dirty_local, ..
+                } = &mut action
+                {
+                    *allow_dirty_local = true;
+                }
+                self.cancel_modal();
+                action
+            }
+            (Confirmation::Close { session_id }, 1) => {
+                self.cancel_modal();
+                DashboardAction::Close { session_id }
+            }
+            (Confirmation::DeleteArchived { session_id }, 1) => {
+                self.cancel_modal();
+                DashboardAction::DeleteArchived { session_id }
+            }
+            (Confirmation::CloseFailed { session_id, .. }, 1) => {
+                self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
+                    session_id,
+                    typed: String::new(),
+                }));
+                DashboardAction::None
+            }
+            (Confirmation::CloseFailed { session_id, .. }, 2) => {
+                self.cancel_modal();
+                DashboardAction::Close { session_id }
+            }
+            _ => {
+                self.cancel_modal();
+                DashboardAction::None
+            }
+        }
+    }
+
+    fn handle_typed_confirmation_key(
         &mut self,
         code: KeyCode,
         confirmation: Confirmation,
     ) -> DashboardAction {
         match confirmation {
-            Confirmation::DirtyLocal {
-                mut action,
-                repositories,
-            } => match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    if let DashboardAction::CreateSession {
-                        allow_dirty_local, ..
-                    } = &mut action
-                    {
-                        *allow_dirty_local = true;
-                    }
-                    self.cancel_modal();
-                    action
-                }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    self.cancel_modal();
-                    DashboardAction::None
-                }
-                _ => {
-                    self.mode = Mode::Confirm(Confirmation::DirtyLocal {
-                        action,
-                        repositories,
-                    });
-                    DashboardAction::None
-                }
-            },
-            Confirmation::Close { session_id } => match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.cancel_modal();
-                    DashboardAction::Close { session_id }
-                }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    self.cancel_modal();
-                    DashboardAction::None
-                }
-                _ => DashboardAction::None,
-            },
-            Confirmation::DeleteArchived { session_id } => match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.cancel_modal();
-                    DashboardAction::DeleteArchived { session_id }
-                }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    self.cancel_modal();
-                    DashboardAction::None
-                }
-                _ => DashboardAction::None,
-            },
-            Confirmation::CloseFailed { session_id, error } => match code {
-                KeyCode::Char('r') | KeyCode::Char('R') => {
-                    self.cancel_modal();
-                    DashboardAction::Close { session_id }
-                }
-                KeyCode::Char('f') | KeyCode::Char('F') => {
-                    self.mode = Mode::Confirm(Confirmation::ForceDestroy {
-                        session_id,
-                        typed: String::new(),
-                    });
-                    DashboardAction::None
-                }
-                KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => {
-                    self.cancel_modal();
-                    DashboardAction::None
-                }
-                _ => {
-                    self.mode = Mode::Confirm(Confirmation::CloseFailed { session_id, error });
-                    DashboardAction::None
-                }
-            },
             Confirmation::ForceDestroy {
                 session_id,
                 mut typed,
@@ -3153,14 +3334,20 @@ impl DashboardState {
                 }
                 KeyCode::Backspace => {
                     typed.pop();
-                    self.mode = Mode::Confirm(Confirmation::ForceDestroy { session_id, typed });
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
+                        session_id,
+                        typed,
+                    }));
                     DashboardAction::None
                 }
                 KeyCode::Char(c) => {
                     if typed.len() < FORCE_CONFIRMATION.len() {
                         typed.push(c.to_ascii_uppercase());
                     }
-                    self.mode = Mode::Confirm(Confirmation::ForceDestroy { session_id, typed });
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
+                        session_id,
+                        typed,
+                    }));
                     DashboardAction::None
                 }
                 KeyCode::Enter if typed == FORCE_CONFIRMATION => {
@@ -3168,7 +3355,10 @@ impl DashboardState {
                     DashboardAction::ForceDestroy { session_id }
                 }
                 _ => {
-                    self.mode = Mode::Confirm(Confirmation::ForceDestroy { session_id, typed });
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
+                        session_id,
+                        typed,
+                    }));
                     DashboardAction::None
                 }
             },
@@ -3182,14 +3372,20 @@ impl DashboardState {
                 }
                 KeyCode::Backspace => {
                     typed.pop();
-                    self.mode = Mode::Confirm(Confirmation::DeleteActive { session_id, typed });
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
+                        session_id,
+                        typed,
+                    }));
                     DashboardAction::None
                 }
                 KeyCode::Char(c) => {
                     if typed.len() < FORCE_CONFIRMATION.len() {
                         typed.push(c.to_ascii_uppercase());
                     }
-                    self.mode = Mode::Confirm(Confirmation::DeleteActive { session_id, typed });
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
+                        session_id,
+                        typed,
+                    }));
                     DashboardAction::None
                 }
                 KeyCode::Enter if typed == FORCE_CONFIRMATION => {
@@ -3197,16 +3393,25 @@ impl DashboardState {
                     DashboardAction::DeleteActive { session_id }
                 }
                 _ => {
-                    self.mode = Mode::Confirm(Confirmation::DeleteActive { session_id, typed });
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
+                        session_id,
+                        typed,
+                    }));
                     DashboardAction::None
                 }
             },
+            // Button dialogs are handled by `handle_confirmation_key`.
+            other => {
+                self.mode = Mode::Confirm(ConfirmDialog::new(other));
+                DashboardAction::None
+            }
         }
     }
 
     fn begin_new(&mut self) -> DashboardAction {
         if self.config.profiles.is_empty() || self.config.targets.is_empty() {
-            self.notice = Some("Configure at least one profile and target first.".into());
+            self.notices
+                .set("Configure at least one profile and target first.");
             return DashboardAction::None;
         }
         let recent = most_recent_configured_session(&self.config, &self.state);
@@ -3258,15 +3463,18 @@ impl DashboardState {
             return DashboardAction::None;
         };
         if session.state.is_active() && session.state != SessionState::Error {
-            self.notice = Some("This session is active; press Enter to open it.".into());
+            self.notices
+                .set("This session is active; press Enter to open it.");
             return DashboardAction::None;
         }
         if session.checkpoint.is_none() {
-            self.notice = Some("This session has no verified recovery copy to resume.".into());
+            self.notices
+                .set("This session has no verified recovery copy to resume.");
             return DashboardAction::None;
         }
         if self.compatible_profiles(&session.id).is_empty() || self.config.targets.is_empty() {
-            self.notice = Some("Resume needs a profile and a target template.".into());
+            self.notices
+                .set("Resume needs a profile and a target template.");
             return DashboardAction::None;
         }
         let profile = self
@@ -3319,7 +3527,7 @@ impl DashboardState {
             return DashboardAction::None;
         };
         if let Some(operation) = self.session_operations.get(&session.id) {
-            self.notice = Some(format!(
+            self.notices.set(format!(
                 "{} is in progress; press Ctrl+X to cancel it.",
                 operation.kind.label()
             ));
@@ -3329,7 +3537,7 @@ impl DashboardState {
             if session.checkpoint.is_some() {
                 return self.begin_resume();
             } else {
-                self.notice = Some(
+                self.notices.set(
                     session
                         .last_error
                         .clone()
@@ -3584,18 +3792,7 @@ fn partition_sessions<'a>(
         Some(_) | None => session_timestamp(&session.updated_at)
             .and_then(|timestamp| timestamp.checked_mul(1_000)),
     };
-    let sequence = |left: &&SessionRecord, right: &&SessionRecord| {
-        match (
-            session_timestamp(&left.created_at),
-            session_timestamp(&right.created_at),
-        ) {
-            (Some(left), Some(right)) => left.cmp(&right),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
-        .then_with(|| left.id.cmp(&right.id))
-    };
+    let sequence = |left: &&SessionRecord, right: &&SessionRecord| left.compare_by_creation(right);
     let sort = |left: &&SessionRecord, right: &&SessionRecord| match order {
         SessionOrder::Sequence => sequence(left, right),
         SessionOrder::RecentActivity => activity_timestamp(right)
@@ -3702,15 +3899,32 @@ fn adjust_resources(
                     let Some((max_cpus, _)) = limits else {
                         return;
                     };
-                    (cpus.saturating_mul(2).min(max_cpus.max(1)), memory_bytes)
+                    (cpus.saturating_add(8).min(max_cpus.max(1)), memory_bytes)
                 }
                 KeyCode::Char('m') => {
                     let Some((_, max_memory)) = limits else {
                         return;
                     };
-                    (cpus, memory_bytes.saturating_mul(2).min(max_memory.max(1)))
+                    (
+                        cpus,
+                        memory_bytes
+                            .saturating_add(memory_bytes / 2)
+                            .min(max_memory.max(1)),
+                    )
                 }
-                KeyCode::Char('-') if cpus > 1 => (cpus / 2, (memory_bytes / 2).max(1)),
+                KeyCode::Char('-') => {
+                    let next_cpus = if cpus > FLOOR_CPUS {
+                        (cpus / 2).max(FLOOR_CPUS)
+                    } else {
+                        cpus
+                    };
+                    let next_memory = if memory_bytes > FLOOR_MEMORY_BYTES {
+                        (memory_bytes / 2).max(FLOOR_MEMORY_BYTES)
+                    } else {
+                        memory_bytes
+                    };
+                    (next_cpus, next_memory)
+                }
                 _ => return,
             };
             *allocation = Some(SessionResourceAllocation::Container {
@@ -3839,7 +4053,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
         Mode::ConfirmImportBundle(confirmation) => {
             render_import_bundle_confirmation(frame, area, confirmation)
         }
-        Mode::Confirm(confirmation) => render_confirmation(frame, area, confirmation),
+        Mode::Confirm(dialog) => render_confirmation(frame, area, dialog),
         Mode::Dashboard => {}
     }
 }
@@ -3950,6 +4164,17 @@ fn render_adaptive_dashboard(
         dashboard.preview_scroll_session = selected_id;
         dashboard.preview_scroll = 0;
     }
+    // A session mid-launch, mid-resume, or mid-pause has nothing worth
+    // previewing, so its row collapses to just the summary line.
+    let active_collapsed = active
+        .iter()
+        .map(|session| {
+            active_row_collapses_to_summary(
+                dashboard.session_operations.get(&session.id),
+                session.state,
+            )
+        })
+        .collect::<Vec<_>>();
     // Row heights need the previews, and the selected session's line budget
     // needs the allocated pane height. Every unselected preview is the same in
     // both passes, so the transcript tails are walked once here and only the
@@ -3963,6 +4188,7 @@ fn render_adaptive_dashboard(
             scroll: dashboard.preview_scroll,
             selected_lines: SELECTED_TRANSCRIPT_LINES,
         },
+        &active_collapsed,
     );
     let active_row_heights = active_previews
         .previews
@@ -4041,6 +4267,7 @@ fn render_adaptive_dashboard(
     // clamped against the height it actually renders at.
     if selected_lines != SELECTED_TRANSCRIPT_LINES
         && let Some(index) = selected_active
+        && !active_collapsed[index]
     {
         let (preview, applied) = active_transcript_tail(
             dashboard.session_details.get_mut(&active[index].id),
@@ -4076,7 +4303,7 @@ fn render_adaptive_dashboard(
         Mode::ConfirmImportBundle(confirmation) => {
             render_import_bundle_confirmation(frame, frame_area, confirmation)
         }
-        Mode::Confirm(confirmation) => render_confirmation(frame, frame_area, confirmation),
+        Mode::Confirm(dialog) => render_confirmation(frame, frame_area, dialog),
         Mode::Dashboard => {}
     }
 }
@@ -4109,6 +4336,24 @@ fn active_pane_height(row_heights: &[u16], rows: usize) -> u16 {
         .saturating_add(spacers)
 }
 
+/// A launching, resuming, or pausing session — or one caught mid-provisioning
+/// after an interrupted launch with no operation record — has nothing worth
+/// previewing yet, so its Active row collapses to just the summary line.
+fn active_row_collapses_to_summary(
+    operation: Option<&SessionOperationDisplay>,
+    state: SessionState,
+) -> bool {
+    match operation {
+        Some(operation) => matches!(
+            operation.kind,
+            SessionOperationKind::Launching
+                | SessionOperationKind::Resuming
+                | SessionOperationKind::Pausing
+        ),
+        None => state == SessionState::Provisioning,
+    }
+}
+
 /// What one frame asks of the active previews: the width they wrap to, which
 /// row is selected, how far that row's preview is scrolled, and the line budget
 /// the selected row may use.
@@ -4123,10 +4368,15 @@ fn prepare_active_previews(
     active: &[&SessionRecord],
     session_details: &mut BTreeMap<String, SessionDetail>,
     request: PreviewRequest,
+    collapsed: &[bool],
 ) -> ActivePreviews {
     let mut previews = Vec::with_capacity(active.len());
     let mut applied_scroll = 0;
     for (index, session) in active.iter().enumerate() {
+        if collapsed.get(index).copied().unwrap_or(false) {
+            previews.push(Vec::new());
+            continue;
+        }
         let selected = request.selected == Some(index);
         let (maximum_lines, scroll) = if selected {
             (request.selected_lines, request.scroll)
@@ -4184,8 +4434,6 @@ fn render_terminal_too_small(frame: &mut Frame, area: Rect, requirement: Termina
 }
 
 fn render_import_progress(frame: &mut Frame, area: Rect, progress: &ImportProgress) {
-    let popup = centered_rect(76, 10, area);
-    frame.render_widget(Clear, popup);
     let total = progress
         .total
         .map_or_else(|| "?".into(), |total| total.to_string());
@@ -4204,24 +4452,26 @@ fn render_import_progress(frame: &mut Frame, area: Rect, progress: &ImportProgre
             Style::default().fg(Color::Gray),
         )
     };
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                truncate_text(&progress.session_title, 60),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Line::raw(""),
-            Line::raw(progress.message.clone()),
-            status,
-            Line::styled("Esc cancels this import.", Style::default().fg(Color::Gray)),
-        ])
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " Importing session · progress {}/{total} ",
-            progress.step
-        )))
-        .wrap(Wrap { trim: true }),
-        popup,
-    );
+    let paragraph = Paragraph::new(vec![
+        Line::styled(
+            truncate_text(&progress.session_title, 60),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::raw(progress.message.clone()),
+        status,
+        Line::raw(""),
+        focused_buttons(IMPORT_PROGRESS_BUTTONS, 0),
+    ])
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        " Importing session · progress {}/{total} ",
+        progress.step
+    )))
+    // `trim: false` keeps the padding inside the leftmost button background.
+    .wrap(Wrap { trim: false });
+    let popup = centered_rect(76, popup_height(&paragraph, 76, 10, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
 }
 
 fn render_import_bundle_confirmation(
@@ -4229,13 +4479,6 @@ fn render_import_bundle_confirmation(
     area: Rect,
     confirmation: &ImportBundleConfirmation,
 ) {
-    let height = (confirmation.dirty_git_roots.len()
-        + confirmation.omitted_non_git_dirs.len()
-        + confirmation.scratch_git_roots.len()
-        + usize::from(confirmation.has_untracked_files)
-        + 11) as u16;
-    let popup = centered_rect(76, height.clamp(12, 24), area);
-    frame.render_widget(Clear, popup);
     let mut lines = Vec::new();
     if !confirmation.dirty_git_roots.is_empty() {
         lines.push(Line::raw(
@@ -4289,20 +4532,33 @@ fn render_import_bundle_confirmation(
                 .map(|root| Line::styled(root.clone(), Style::default().fg(Color::Yellow))),
         );
     }
-    lines.extend([
-        Line::raw(""),
-        Line::raw("Space toggles checkbox · y/Enter continues · n/Esc cancels."),
-    ]);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Import safety warning "),
-            )
-            .wrap(Wrap { trim: true }),
-        popup,
-    );
+    lines.push(Line::raw(""));
+    if confirmation.has_untracked_files {
+        lines.push(Line::raw("Space toggles the checkbox."));
+        lines.push(Line::raw(""));
+    }
+    lines.push(focused_buttons(IMPORT_BUNDLE_BUTTONS, confirmation.focus));
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Import safety warning "),
+        )
+        // `trim: false` keeps the padding inside the leftmost button background.
+        .wrap(Wrap { trim: false });
+    let popup = centered_rect(76, popup_height(&paragraph, 76, 12, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+/// Popup height that keeps every wrapped line of `paragraph` visible, never
+/// shrinking below the dialog's nominal height.
+fn popup_height(paragraph: &Paragraph, width_percent: u16, nominal: u16, area: Rect) -> u16 {
+    let inner_width = centered_rect(width_percent, 1, area)
+        .width
+        .saturating_sub(2);
+    let wrapped = u16::try_from(paragraph.line_count(inner_width)).unwrap_or(u16::MAX);
+    nominal.max(wrapped)
 }
 
 fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
@@ -4584,7 +4840,7 @@ fn render_sessions(
     let mut row_y = active_area.y + SESSION_TABLE_CHROME_HEIGHT;
     let mut visible_sessions = 0;
     let mut selected_preview_area = None;
-    for (index, _session) in active.iter().enumerate().skip(active_offset) {
+    for (index, session) in active.iter().enumerate().skip(active_offset) {
         let preview = &active_previews[index];
         let spacer = u16::from(index > 0);
         let detail_y = row_y.saturating_add(spacer);
@@ -4601,11 +4857,9 @@ fn render_sessions(
                 active_area.width.saturating_sub(2),
                 1,
             );
+            let band = session_band_color(dashboard.session_details.get(&session.id));
             let buffer = frame.buffer_mut();
-            buffer.set_style(
-                summary_area,
-                Style::default().bg(Color::DarkGray).fg(Color::LightYellow),
-            );
+            buffer.set_style(summary_area, Style::default().bg(Color::DarkGray).fg(band));
             for x in summary_area.x..summary_area.right() {
                 let cell = &mut buffer[(x, info_y)];
                 if cell.symbol() == SUMMARY_RULE {
@@ -4764,11 +5018,17 @@ fn session_values(
     config: &HelConfig,
 ) -> (String, String, String, String, String) {
     let clock = if let Some(operation) = operation {
-        format!(
-            "{} {}s",
-            operation.kind.label(),
-            now_epoch_seconds.saturating_sub(operation.started_at_epoch_seconds)
-        )
+        let (label, started_at) = match (operation.stage, operation.kind) {
+            (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => (
+                stage.label(),
+                operation
+                    .stage_started_at_epoch_seconds
+                    .unwrap_or(operation.started_at_epoch_seconds),
+            ),
+            _ => (operation.kind.label(), operation.started_at_epoch_seconds),
+        };
+        let elapsed = now_epoch_seconds.saturating_sub(started_at);
+        format!("{label} {elapsed}s")
     } else if session.state == SessionState::Provisioning {
         let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
         format!("Launch {}s", now_epoch_seconds.saturating_sub(started_at))
@@ -4782,7 +5042,7 @@ fn session_values(
         clock,
         session.last_profile.clone(),
         session.target_template_id.clone(),
-        session_project(config, session),
+        session.project_name(config),
         session_name(session).to_string(),
     )
 }
@@ -4793,34 +5053,6 @@ fn session_updated_at_epoch_seconds(session: &SessionRecord) -> Option<u64> {
         .timestamp()
         .try_into()
         .ok()
-}
-
-fn session_project(config: &HelConfig, session: &SessionRecord) -> String {
-    if let Some(worktree) = &session.managed_worktree {
-        return path_leaf(&worktree.source_repository);
-    }
-    if let Some(project_directory) = &session.project_directory {
-        return path_leaf(project_directory);
-    }
-    config
-        .bundles
-        .get(&session.bundle_id)
-        .and_then(|bundle| {
-            bundle
-                .repositories
-                .iter()
-                .find(|repository| repository.id == bundle.primary_repo)
-                .or_else(|| bundle.repositories.first())
-        })
-        .map(|repository| path_leaf(&repository.destination))
-        .unwrap_or_else(|| path_leaf(std::path::Path::new(&session.bundle_id)))
-}
-
-fn path_leaf(path: &std::path::Path) -> String {
-    path.file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn checkpoint_archive_size(size: Option<u64>) -> String {
@@ -4849,6 +5081,14 @@ fn format_resource_bytes(bytes: u64) -> String {
 
 fn session_name(session: &SessionRecord) -> &str {
     session.display_title()
+}
+
+/// Color of an active session's summary band. A session whose detail has not
+/// loaded yet keeps the default.
+fn session_band_color(detail: Option<&SessionDetail>) -> Color {
+    hel::hel_chat::turn_band_color(
+        detail.is_none_or(|detail| detail.current_turn_started_at.is_some()),
+    )
 }
 
 fn unread_line(unread_count: usize) -> Line<'static> {
@@ -4929,12 +5169,13 @@ fn active_session_row(
     let (clock, profile, target, project, session_name) =
         session_values(session, detail, operation, now_epoch_seconds, config);
     let unread_count = detail.map_or(0, |detail| detail.unread_agent_messages);
+    let band = session_band_color(detail);
     Row::new([
-        summary_rule_cell(Line::raw(project), layout.rule_width),
-        summary_rule_cell(unread_line(unread_count), layout.rule_width),
-        summary_rule_cell(Line::raw(clock), layout.rule_width),
-        summary_rule_cell(Line::raw(profile), layout.rule_width),
-        summary_rule_cell(Line::raw(target), layout.rule_width),
+        summary_rule_cell(Line::raw(project), layout.rule_width, band),
+        summary_rule_cell(unread_line(unread_count), layout.rule_width, band),
+        summary_rule_cell(Line::raw(clock), layout.rule_width, band),
+        summary_rule_cell(Line::raw(profile), layout.rule_width, band),
+        summary_rule_cell(Line::raw(target), layout.rule_width, band),
         summary_rule_cell(
             Line::raw(recovery_warning_name(
                 session,
@@ -4942,6 +5183,7 @@ fn active_session_row(
                 now_epoch_seconds,
             )),
             layout.rule_width,
+            band,
         ),
     ])
     .height(layout.height)
@@ -4951,10 +5193,10 @@ fn active_session_row(
 /// Trails each summary column with the block's rule glyph so every active
 /// session reads as its own band. Table cells clip the fill at the column edge,
 /// so one pane-wide run works for every column.
-fn summary_rule_cell(content: Line<'static>, rule_width: usize) -> Cell<'static> {
+fn summary_rule_cell(content: Line<'static>, rule_width: usize, band: Color) -> Cell<'static> {
     let mut spans = content.spans;
     for span in &mut spans {
-        span.style = span.style.fg(Color::LightYellow);
+        span.style = span.style.fg(band);
     }
     let gap = if spans.iter().all(|span| span.content.is_empty()) {
         ""
@@ -4981,7 +5223,7 @@ fn archived_session_row(
         .map(|checkpoint| checkpoint_time_display(&checkpoint.created_at))
         .unwrap_or_else(|| "never".into());
     Row::new([
-        session_project(config, session),
+        session.project_name(config),
         session.last_profile.clone(),
         checkpoint,
         checkpoint_archive_size(archive_size),
@@ -5294,7 +5536,7 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
                 Style::default().fg(Color::DarkGray),
             ),
             Line::styled(
-                dashboard.notice.as_deref().unwrap_or_default(),
+                dashboard.notices.current().unwrap_or_default(),
                 Style::default().fg(Color::Yellow),
             ),
         ]),
@@ -5319,6 +5561,16 @@ fn action_buttons(buttons: &[(&str, bool)]) -> Line<'static> {
         spans.push(Span::styled(format!(" {label} "), style));
     }
     Line::from(spans).alignment(Alignment::Center)
+}
+
+/// Renders a button row from its label list, highlighting the focused index.
+fn focused_buttons(labels: &[&'static str], focus: usize) -> Line<'static> {
+    let buttons = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| (*label, index == focus))
+        .collect::<Vec<_>>();
+    action_buttons(&buttons)
 }
 
 fn wizard_buttons(focus: WizardFocus, has_back: bool, next_label: &str) -> Line<'static> {
@@ -5535,7 +5787,7 @@ fn render_new_wizard(
         WizardStep::ProjectDirectory => unreachable!("project directory input was rendered above"),
     };
     let help = if wizard.step == WizardStep::Target {
-        "+ both · c CPU · m memory · - halve · r reset"
+        "+ double · - halve · c +8 CPU · m +50% memory · r reset"
     } else {
         "↑/↓ select · Tab moves focus · Enter activates"
     };
@@ -5929,7 +6181,7 @@ fn render_resume_wizard(
                 })
                 .collect(),
             wizard.target,
-            &["+ both · c CPU · m memory · - halve · r reset"][..],
+            &["+ double · - halve · c +8 CPU · m +50% memory · r reset"][..],
         ),
         WizardStep::Bundle => unreachable!("resume does not select a bundle"),
         WizardStep::Review => unreachable!("review was rendered above"),
@@ -6006,41 +6258,33 @@ fn render_picker(
 }
 
 fn render_rename_editor(frame: &mut Frame, area: Rect, editor: &RenameEditor) {
-    let popup = centered_rect(60, 7, area);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::raw(format!("Session: {}", editor.session_id)),
-            Line::raw(""),
-            Line::styled(editor.title.clone(), Style::default().fg(Color::Cyan)),
-            Line::styled("Enter save · Esc cancel", Style::default().fg(Color::Gray)),
-        ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Rename session "),
-        ),
-        popup,
+    let paragraph = Paragraph::new(vec![
+        Line::raw(format!("Session: {}", editor.session_id)),
+        Line::raw(""),
+        Line::styled(editor.title.clone(), Style::default().fg(Color::Cyan)),
+        Line::raw(""),
+        focused_buttons(RENAME_BUTTONS, editor.focus.button_index()),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Rename session "),
     );
+    let popup = centered_rect(60, popup_height(&paragraph, 60, 8, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
 }
 
-fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmation) {
-    let popup = centered_rect(
-        72,
-        match confirmation {
-            Confirmation::DirtyLocal { repositories, .. } => {
-                (repositories.len() as u16 + 8).clamp(10, 18)
-            }
-            Confirmation::CloseFailed { .. } => 12,
-            Confirmation::Close { .. }
-            | Confirmation::ForceDestroy { .. }
-            | Confirmation::DeleteActive { .. }
-            | Confirmation::DeleteArchived { .. } => 9,
-        },
-        area,
-    );
-    frame.render_widget(Clear, popup);
-    let (title, lines) = match confirmation {
+fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &ConfirmDialog) {
+    let confirmation = &dialog.confirmation;
+    // Minimum height per dialog; `popup_height` grows it to fit wrapped content.
+    let nominal = match confirmation {
+        Confirmation::DirtyLocal { .. } => 11,
+        Confirmation::CloseFailed { .. } => 12,
+        Confirmation::Close { .. } | Confirmation::DeleteArchived { .. } => 10,
+        Confirmation::ForceDestroy { .. } | Confirmation::DeleteActive { .. } => 9,
+    };
+    let (title, mut lines) = match confirmation {
         Confirmation::DirtyLocal { repositories, .. } => {
             let mut lines = vec![
                 Line::raw("The initial worker will include these uncommitted changes:"),
@@ -6052,7 +6296,6 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             lines.extend([
                 Line::raw(""),
                 Line::raw("Pushes back to origin are rejected until the local checkout is clean."),
-                Line::raw("Press y/Enter to continue, or n/Esc to cancel."),
             ]);
             (" Local repository has uncommitted changes ", lines)
         }
@@ -6062,7 +6305,6 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
                 Line::raw("Hel will verify a recovery copy before destroying the target."),
-                Line::raw("Press y/Enter to pause, or n/Esc to cancel."),
             ],
         ),
         Confirmation::DeleteArchived { session_id } => (
@@ -6072,7 +6314,6 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
                 Line::raw(""),
                 Line::raw("Hel will permanently delete the recovery archive and session record."),
                 Line::raw("Any Hel-managed worktree and generated branch will also be deleted."),
-                Line::raw("Press y/Enter to delete, or n/Esc to cancel."),
             ],
         ),
         Confirmation::CloseFailed { session_id, error } => (
@@ -6084,8 +6325,6 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
                     format!("Pause failed: {error}"),
                     Style::default().fg(Color::Yellow),
                 ),
-                Line::raw(""),
-                Line::raw("r retry pause · f force destroy · Esc cancel"),
             ],
         ),
         Confirmation::ForceDestroy { session_id, typed } => (
@@ -6108,17 +6347,23 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             ],
         ),
     };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Red))
-                    .title(title),
-            )
-            .wrap(Wrap { trim: true }),
-        popup,
-    );
+    let buttons = confirmation_buttons(confirmation);
+    if !buttons.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(focused_buttons(buttons, dialog.focus));
+    }
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(title),
+        )
+        // `trim: false` keeps the padding inside the leftmost button background.
+        .wrap(Wrap { trim: false });
+    let popup = centered_rect(72, popup_height(&paragraph, 72, nominal, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
 }
 
 fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
@@ -6176,7 +6421,13 @@ fn move_index(index: &mut usize, len: usize, delta: isize) {
         *index = 0;
         return;
     }
-    *index = ((*index as isize + delta).rem_euclid(len as isize)) as usize;
+    if delta.is_negative() {
+        *index = index.saturating_sub(delta.unsigned_abs());
+    } else {
+        *index = index
+            .saturating_add(delta as usize)
+            .min(len.saturating_sub(1));
+    }
 }
 
 fn nth_key<T>(map: &BTreeMap<String, T>, index: usize) -> String {
@@ -6419,6 +6670,25 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// The drawn buffer as one string per row.
+    fn buffer_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        (buffer.area.y..buffer.area.bottom())
+            .map(|y| {
+                (buffer.area.x..buffer.area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Column of `needle` within a drawn row, counted in cells rather than bytes.
+    fn cell_column(line: &str, needle: &str) -> u16 {
+        let byte = line
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle} in {line:?}"));
+        line[..byte].chars().count() as u16
+    }
+
     /// A drawn summary cell that holds session text rather than the rule fill.
     fn summary_text_cell(cell: &ratatui::buffer::Cell) -> bool {
         let symbol = cell.symbol();
@@ -6528,6 +6798,7 @@ mod tests {
             created_at: "2026-08-09T00:00:00Z".into(),
             updated_at: "2026-08-09T01:00:00Z".into(),
             detached_after_event_ordinal: 0,
+            draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: Some(CheckpointMetadata {
@@ -6565,6 +6836,89 @@ mod tests {
             dashboard.session_operations["session-1"].kind,
             SessionOperationKind::Resuming
         );
+    }
+
+    #[test]
+    fn resuming_session_with_a_transcript_collapses_to_its_summary_line() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw with preview");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Rendered answer"));
+
+        dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Resuming, None);
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw collapsed");
+        let collapsed = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(!collapsed.contains("Rendered answer"));
+        assert!(
+            dashboard.selected_preview_area.is_none(),
+            "a collapsed row has no preview to scroll"
+        );
+
+        dashboard.finish_session_operation("session-1");
+        // Finishing the operation only drops its record; the session state
+        // itself flips back to Running through a later relay update, which a
+        // real resume delivers via `spawn_lifecycle_reload` in main.rs.
+        dashboard
+            .state
+            .sessions
+            .get_mut("session-1")
+            .expect("session")
+            .state = SessionState::Running;
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw restored");
+        let restored = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(restored.contains("Rendered answer"));
+    }
+
+    #[test]
+    fn pausing_session_with_a_transcript_collapses_to_its_summary_line() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
+
+        dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Pausing, None);
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw collapsed");
+        let collapsed = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(!collapsed.contains("Rendered answer"));
+
+        dashboard.finish_session_operation("session-1");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw restored");
+        let restored = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(restored.contains("Rendered answer"));
+    }
+
+    #[test]
+    fn provisioning_without_an_operation_record_collapses_to_its_summary_line() {
+        // Interrupted-launch recovery: the session comes back as Provisioning
+        // with no in-flight operation to track it.
+        let mut session = archived_session();
+        session.state = SessionState::Provisioning;
+        let mut dashboard = dashboard_with_session(session);
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
+        assert!(dashboard.session_operations.is_empty());
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw collapsed");
+        let collapsed = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(!collapsed.contains("Rendered answer"));
     }
 
     #[test]
@@ -6807,7 +7161,7 @@ mod tests {
             dashboard.replace_notice_if("Refreshing profile quotas…", "Profile quotas refreshed.")
         );
         assert_eq!(
-            dashboard.notice.as_deref(),
+            dashboard.notice().as_deref(),
             Some("Profile quotas refreshed.")
         );
 
@@ -6816,8 +7170,33 @@ mod tests {
             !dashboard.replace_notice_if("Refreshing profile quotas…", "Profile quotas refreshed.")
         );
         assert_eq!(
-            dashboard.notice.as_deref(),
+            dashboard.notice().as_deref(),
             Some("A later operation failed")
+        );
+    }
+
+    /// The dashboard and every other view (chat, background workers) share
+    /// one notifications bar: a clone installed with `share_notices` sees
+    /// what the dashboard sets, and the dashboard sees what the clone sets.
+    #[test]
+    fn a_shared_notice_is_visible_through_every_clone_of_the_handle() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        let shared = Notices::default();
+        dashboard.share_notices(shared.clone());
+
+        dashboard.set_notice("Background import finished");
+        assert_eq!(
+            shared.current().as_deref(),
+            Some("Background import finished")
+        );
+
+        shared.clear();
+        assert_eq!(dashboard.notice(), None);
+
+        shared.set("Quota refresh finished");
+        assert_eq!(
+            dashboard.notice().as_deref(),
+            Some("Quota refresh finished")
         );
     }
 
@@ -7395,6 +7774,7 @@ mod tests {
             .queued_prompts
             .push(hel::hel_state::MaterializedQueuedPrompt {
                 command_id: "queued-1".into(),
+                kind: hel::hel_state::QueuedCommandKind::Prompt,
                 content: vec![serde_json::json!({ "type": "text", "text": "next task" })],
                 queued_at_ms: 0,
             });
@@ -7621,10 +8001,11 @@ mod tests {
         assert!(status.find("1 unread") < status.find("codex-1"));
         let buffer = terminal.backend().buffer();
         let status_y = buffer.area.y + status_y as u16;
+        // The fixture's turn is still running, so the band keeps the default.
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .filter(|x| summary_text_cell(&buffer[(*x, status_y)]))
-                .all(|x| buffer[(x, status_y)].fg == Color::LightYellow)
+                .all(|x| buffer[(x, status_y)].fg == Color::Yellow)
         );
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
@@ -7635,6 +8016,43 @@ mod tests {
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .filter(|x| buffer[(*x, status_y)].symbol() == SUMMARY_RULE)
                 .all(|x| buffer[(x, status_y)].fg == Color::Reset)
+        );
+    }
+
+    #[test]
+    fn ended_turn_brightens_the_summary_band_even_after_output_is_read() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        // The detach cursor sits past the only agent message, so nothing is
+        // unread; the band still brightens because no turn is in flight.
+        session.detached_after_event_ordinal = 1;
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.focus = Focus::Quotas;
+        let mut materialized =
+            materialized_session_for("session-1", vec![agent_message(1, "seen response")]);
+        materialized.execution = MaterializedExecutionState::Idle;
+        dashboard.apply_materialized_session(&materialized);
+        let mut terminal = Terminal::new(TestBackend::new(140, 28)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let buffer = terminal.backend().buffer();
+        let status_y = (buffer.area.y..buffer.area.bottom())
+            .find(|y| {
+                let row = (buffer.area.x..buffer.area.right())
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>();
+                row.contains("ACP pretty name")
+            })
+            .expect("active status row");
+        let status = (buffer.area.x..buffer.area.right())
+            .map(|x| buffer[(x, status_y)].symbol())
+            .collect::<String>();
+        assert!(!status.contains("unread"));
+        assert!(
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .filter(|x| summary_text_cell(&buffer[(*x, status_y)]))
+                .all(|x| buffer[(x, status_y)].fg == Color::LightYellow)
         );
     }
 
@@ -7995,7 +8413,10 @@ mod tests {
         assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
         assert!(matches!(
             dashboard.mode,
-            Mode::Confirm(Confirmation::DeleteActive { .. })
+            Mode::Confirm(ConfirmDialog {
+                confirmation: Confirmation::DeleteActive { .. },
+                ..
+            })
         ));
     }
 
@@ -8414,6 +8835,10 @@ mod tests {
     fn rename_uses_acp_title_as_the_initial_value() {
         let mut dashboard = dashboard_with_session(archived_session());
         dashboard.handle_key(ctrl_key('r'));
+        let Mode::Rename(editor) = &dashboard.mode else {
+            panic!("expected rename editor");
+        };
+        assert_eq!(editor.focus, RenameFocus::Field);
         for character in " v2".chars() {
             dashboard.handle_key(key(KeyCode::Char(character)));
         }
@@ -8423,6 +8848,224 @@ mod tests {
                 session_id: "session-1".into(),
                 title: "ACP pretty name v2".into(),
             }
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+    }
+
+    fn dashboard_with_rename_editor() -> DashboardState {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.handle_key(ctrl_key('r'));
+        assert!(matches!(dashboard.mode, Mode::Rename(_)));
+        dashboard
+    }
+
+    fn rename_focus(dashboard: &DashboardState) -> RenameFocus {
+        let Mode::Rename(editor) = &dashboard.mode else {
+            panic!("expected rename editor");
+        };
+        editor.focus
+    }
+
+    #[test]
+    fn rename_editor_cycles_focus_from_the_field_through_both_buttons() {
+        let mut dashboard = dashboard_with_rename_editor();
+        for expected in [
+            RenameFocus::Cancel,
+            RenameFocus::Save,
+            RenameFocus::Field,
+            RenameFocus::Cancel,
+        ] {
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Tab)),
+                DashboardAction::None
+            );
+            assert_eq!(rename_focus(&dashboard), expected);
+        }
+
+        let mut dashboard = dashboard_with_rename_editor();
+        for expected in [RenameFocus::Save, RenameFocus::Cancel, RenameFocus::Field] {
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::BackTab)),
+                DashboardAction::None
+            );
+            assert_eq!(rename_focus(&dashboard), expected);
+        }
+    }
+
+    #[test]
+    fn rename_editor_arrows_move_between_buttons_but_never_edit_the_field() {
+        let mut dashboard = dashboard_with_rename_editor();
+        // The field has no cursor, so arrows there change nothing.
+        for arrow in [KeyCode::Left, KeyCode::Right] {
+            assert_eq!(dashboard.handle_key(key(arrow)), DashboardAction::None);
+            assert_eq!(rename_focus(&dashboard), RenameFocus::Field);
+        }
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(rename_focus(&dashboard), RenameFocus::Cancel);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Right)),
+            DashboardAction::None
+        );
+        assert_eq!(rename_focus(&dashboard), RenameFocus::Save);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Left)),
+            DashboardAction::None
+        );
+        assert_eq!(rename_focus(&dashboard), RenameFocus::Cancel);
+    }
+
+    #[test]
+    fn rename_editor_buttons_ignore_typing_and_backspace() {
+        let mut dashboard = dashboard_with_rename_editor();
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('x'))),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Backspace)),
+            DashboardAction::None
+        );
+        let Mode::Rename(editor) = &dashboard.mode else {
+            panic!("expected rename editor");
+        };
+        assert_eq!(editor.title, "ACP pretty name");
+        assert_eq!(editor.focus, RenameFocus::Cancel);
+    }
+
+    #[test]
+    fn rename_editor_cancel_button_closes_without_renaming() {
+        let mut dashboard = dashboard_with_rename_editor();
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(rename_focus(&dashboard), RenameFocus::Cancel);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+    }
+
+    #[test]
+    fn rename_editor_save_button_renames_like_the_field() {
+        let mut dashboard = dashboard_with_rename_editor();
+        dashboard.handle_key(key(KeyCode::Char('!')));
+        dashboard.handle_key(key(KeyCode::Tab));
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(rename_focus(&dashboard), RenameFocus::Save);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::RenameSession {
+                session_id: "session-1".into(),
+                title: "ACP pretty name!".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn rename_editor_rejects_an_empty_title_from_the_field_and_the_save_button() {
+        for focus_moves in [0, 2] {
+            let mut dashboard = dashboard_with_rename_editor();
+            let Mode::Rename(editor) = &mut dashboard.mode else {
+                panic!("expected rename editor");
+            };
+            editor.title.clear();
+            for _ in 0..focus_moves {
+                dashboard.handle_key(key(KeyCode::Tab));
+            }
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Enter)),
+                DashboardAction::None,
+                "{focus_moves} focus moves"
+            );
+            assert_eq!(
+                dashboard.notice().as_deref(),
+                Some("Session name cannot be empty."),
+                "{focus_moves} focus moves"
+            );
+            assert!(matches!(dashboard.mode, Mode::Rename(_)), "{focus_moves}");
+        }
+    }
+
+    #[test]
+    fn rename_editor_escape_cancels_from_any_focus() {
+        for focus_moves in 0..3 {
+            let mut dashboard = dashboard_with_rename_editor();
+            for _ in 0..focus_moves {
+                dashboard.handle_key(key(KeyCode::Tab));
+            }
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Esc)),
+                DashboardAction::None,
+                "{focus_moves} focus moves"
+            );
+            assert!(matches!(dashboard.mode, Mode::Dashboard), "{focus_moves}");
+        }
+    }
+
+    #[test]
+    fn rename_editor_highlights_save_until_cancel_takes_focus() {
+        let mut dashboard = dashboard_with_rename_editor();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        let mut button_styles = |dashboard: &mut DashboardState| {
+            terminal
+                .draw(|frame| render(frame, dashboard))
+                .expect("draw rename editor");
+            let buffer = terminal.backend().buffer();
+            let lines = buffer_lines(buffer);
+            let row = lines
+                .iter()
+                .position(|line| line.contains(" Cancel ") && line.contains(" Save "))
+                .expect("button row");
+            let y = buffer.area.y + row as u16;
+            assert!(!lines.iter().any(|line| line.contains("Enter save")));
+            (
+                buffer[(buffer.area.x + cell_column(&lines[row], "Cancel"), y)].bg,
+                buffer[(buffer.area.x + cell_column(&lines[row], "Save"), y)].bg,
+            )
+        };
+
+        // The field submits, so Save stays lit while the field has focus.
+        assert_eq!(
+            button_styles(&mut dashboard),
+            (Color::DarkGray, Color::Cyan)
+        );
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(
+            button_styles(&mut dashboard),
+            (Color::Cyan, Color::DarkGray)
+        );
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(
+            button_styles(&mut dashboard),
+            (Color::DarkGray, Color::Cyan)
+        );
+    }
+
+    #[test]
+    fn import_progress_renders_a_focused_cancel_button_that_enter_presses() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.show_import_progress("Chosen session".into());
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw import progress");
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let row = lines
+            .iter()
+            .position(|line| line.contains(" Cancel "))
+            .expect("button row");
+        let y = buffer.area.y + row as u16;
+        let cancel_x = buffer.area.x + cell_column(&lines[row], "Cancel");
+        assert_eq!(buffer[(cancel_x, y)].bg, Color::Cyan);
+        assert_eq!(buffer[(cancel_x - 1, y)].bg, Color::Cyan);
+        assert!(!lines.iter().any(|line| line.contains("Esc cancels this")));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::CancelImport
         );
     }
 
@@ -8489,6 +9132,37 @@ mod tests {
         assert_eq!(dashboard.focus, Focus::Capacity);
         dashboard.handle_key(key(KeyCode::BackTab));
         assert_eq!(dashboard.focus, Focus::Archived);
+    }
+
+    #[test]
+    fn keyboard_selection_stops_at_the_active_panes_ends_instead_of_wrapping() {
+        let sessions = (0..3)
+            .map(|index| {
+                let mut session = archived_session();
+                session.id = format!("session-{index}");
+                session.state = SessionState::Running;
+                (session.id.clone(), session)
+            })
+            .collect();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+
+        assert_eq!(dashboard.session_index, 0);
+        dashboard.handle_key(key(KeyCode::Up));
+        assert_eq!(dashboard.session_index, 0, "Up at the first row stays put");
+
+        dashboard.handle_key(key(KeyCode::Down));
+        dashboard.handle_key(key(KeyCode::Down));
+        assert_eq!(dashboard.session_index, 2);
+        dashboard.handle_key(key(KeyCode::Down));
+        assert_eq!(dashboard.session_index, 2, "Down at the last row stays put");
     }
 
     #[test]
@@ -8978,7 +9652,7 @@ mod tests {
             DashboardAction::None
         );
         assert_eq!(
-            dashboard.notice.as_deref(),
+            dashboard.notice().as_deref(),
             Some("worker bootstrap failed: upload failed")
         );
     }
@@ -9195,6 +9869,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("[x] Ignore untracked files"));
+        assert!(rendered.contains(" Cancel "));
+        assert!(rendered.contains(" Continue "));
+        assert!(rendered.contains("Space toggles the checkbox."));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::ConfirmImportBundle {
@@ -9245,6 +9922,53 @@ mod tests {
 
         assert!(rendered.contains("temporary directories"), "{rendered}");
         assert!(rendered.contains("/tmp/claude-1000/scratch"), "{rendered}");
+    }
+
+    #[test]
+    fn import_safety_buttons_toggle_the_checkbox_and_cancel_from_the_cancel_button() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.show_import_bundle_confirmation(
+            vec!["/work/repo — 1 tracked change · 3 untracked paths".into()],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+
+        // Focus starts on Continue; moving to Cancel does not disturb the checkbox.
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Tab)),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char(' '))),
+            DashboardAction::None
+        );
+        let Mode::ConfirmImportBundle(confirmation) = &dashboard.mode else {
+            panic!("expected import safety confirmation");
+        };
+        assert!(!confirmation.ignore_untracked);
+        assert_eq!(confirmation.focus, 0);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ConfirmImportBundle {
+                accepted: false,
+                include_untracked: false,
+            }
+        );
+
+        dashboard.show_import_bundle_confirmation(Vec::new(), Vec::new(), Vec::new(), false);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('y'))),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::ConfirmImportBundle(_)));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Esc)),
+            DashboardAction::ConfirmImportBundle {
+                accepted: false,
+                include_untracked: false,
+            }
+        );
     }
 
     #[test]
@@ -9683,10 +10407,11 @@ mod tests {
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .all(|x| buffer[(x, info_y)].bg == Color::DarkGray)
         );
+        // The fixture's turn is still running, so the band keeps the default.
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .filter(|x| summary_text_cell(&buffer[(*x, info_y)]))
-                .all(|x| buffer[(x, info_y)].fg == Color::LightYellow)
+                .all(|x| buffer[(x, info_y)].fg == Color::Yellow)
         );
         // The rule fills the gaps and stays the color of the block border.
         assert!(
@@ -9708,7 +10433,7 @@ mod tests {
             .expect("conversation text") as u16;
         assert_ne!(
             buffer[(buffer.area.x + answer_x, conversation_y)].fg,
-            Color::LightYellow
+            Color::Yellow
         );
 
         dashboard.handle_key(key(KeyCode::Tab));
@@ -9919,41 +10644,6 @@ mod tests {
     }
 
     #[test]
-    fn project_uses_primary_bundle_leaf_or_raw_directory_leaf() {
-        let mut config = config();
-        config
-            .bundles
-            .get_mut("hel")
-            .unwrap()
-            .repositories
-            .push(ProjectRepository {
-                id: "docs".into(),
-                github: Some("BrokkAi/docs".into()),
-                local: None,
-                destination: PathBuf::from("documentation"),
-                git_ref: None,
-            });
-        let mut session = archived_session();
-
-        assert_eq!(session_project(&config, &session), "hel");
-
-        session.project_directory = Some(PathBuf::from("/home/user/Projects/raw-project"));
-        assert_eq!(session_project(&config, &session), "raw-project");
-
-        session.project_directory = Some(PathBuf::from(
-            "/home/user/Projects/source/.hel/worktrees/session-1",
-        ));
-        session.managed_worktree = Some(hel::hel_state::ManagedWorktree {
-            source_project_directory: PathBuf::from("/home/user/Projects/source"),
-            source_repository: PathBuf::from("/home/user/Projects/source"),
-            worktree_root: PathBuf::from("/home/user/Projects/source/.hel/worktrees/session-1"),
-            branch: "hel/session-1".into(),
-            target: hel::hel_state::ManagedWorktreeTarget::Local,
-        });
-        assert_eq!(session_project(&config, &session), "source");
-    }
-
-    #[test]
     fn archived_resources_show_the_checkpoint_archive_size() {
         assert_eq!(checkpoint_archive_size(Some(1_536)), "1.5K");
         assert_eq!(checkpoint_archive_size(None), "—");
@@ -10027,7 +10717,7 @@ mod tests {
     }
 
     #[test]
-    fn active_idle_clock_is_blank() {
+    fn active_session_with_no_turn_in_flight_reads_idle() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let detail = SessionDetail {
@@ -10036,7 +10726,7 @@ mod tests {
         };
 
         let (clock, _, _, _, _) = session_values(&session, Some(&detail), None, 1_480, &config());
-        assert_eq!(clock, "");
+        assert_eq!(clock, "[idle]");
     }
 
     #[test]
@@ -10129,6 +10819,98 @@ mod tests {
         assert_eq!(clock, "Launch 12s");
     }
 
+    fn operation(
+        kind: SessionOperationKind,
+        stage: Option<ProvisionStage>,
+    ) -> SessionOperationDisplay {
+        SessionOperationDisplay {
+            kind,
+            started_at_epoch_seconds: 1_000,
+            placeholder: None,
+            stage,
+            stage_started_at_epoch_seconds: stage.map(|_| 1_000),
+        }
+    }
+
+    #[test]
+    fn launch_clock_names_the_reported_stage() {
+        let session = archived_session();
+        let operation = operation(
+            SessionOperationKind::Launching,
+            Some(ProvisionStage::Booting),
+        );
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Boot 12s");
+    }
+
+    #[test]
+    fn launch_clock_falls_back_to_the_kind_label_without_a_stage() {
+        let session = archived_session();
+        let operation = operation(SessionOperationKind::Launching, None);
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Launch 12s");
+    }
+
+    #[test]
+    fn a_stage_does_not_rename_a_non_launch_operation() {
+        let session = archived_session();
+        let operation = operation(SessionOperationKind::Pausing, Some(ProvisionStage::Syncing));
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Pausing 12s");
+    }
+
+    #[test]
+    fn setting_a_stage_for_an_unknown_session_is_ignored() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.set_session_operation_stage("missing", ProvisionStage::Booting);
+        assert!(dashboard.session_operations.is_empty());
+    }
+
+    #[test]
+    fn stage_clock_counts_from_when_the_stage_began_not_the_operation() {
+        let session = archived_session();
+        let mut operation = operation(
+            SessionOperationKind::Launching,
+            Some(ProvisionStage::Booting),
+        );
+        // The operation started at 1_000 but the stage only began at 1_040;
+        // the clock must count from the stage, not the whole operation.
+        operation.stage_started_at_epoch_seconds = Some(1_040);
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_052, &config());
+        assert_eq!(clock, "Boot 12s");
+    }
+
+    #[test]
+    fn repeating_a_stage_report_does_not_reset_its_clock() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.begin_session_operation(
+            "session-1".into(),
+            SessionOperationKind::Launching,
+            None,
+        );
+        dashboard.set_session_operation_stage("session-1", ProvisionStage::Booting);
+        dashboard
+            .session_operations
+            .get_mut("session-1")
+            .expect("operation")
+            .stage_started_at_epoch_seconds = Some(1_000);
+
+        dashboard.set_session_operation_stage("session-1", ProvisionStage::Booting);
+
+        assert_eq!(
+            dashboard.session_operations["session-1"].stage_started_at_epoch_seconds,
+            Some(1_000)
+        );
+    }
+
     #[test]
     fn active_target_and_project_are_separate_cells() {
         let mut config = config();
@@ -10200,6 +10982,136 @@ mod tests {
             allocation,
             Some(SessionResourceAllocation::Container {
                 cpus: 16,
+                memory_bytes: 48 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_minus_clamps_cpu_at_floor_and_keeps_halving_memory() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 2,
+            memory_bytes: 32 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 2,
+                memory_bytes: 16 * gib,
+            })
+        );
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 2,
+                memory_bytes: 8 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_minus_clamps_memory_at_floor_and_keeps_halving_cpu() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 16,
+            memory_bytes: 8 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 8,
+                memory_bytes: 8 * gib,
+            })
+        );
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 4,
+                memory_bytes: 8 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_minus_is_a_no_op_once_both_are_at_their_floors() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 2,
+            memory_bytes: 8 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 2,
+                memory_bytes: 8 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_minus_leaves_values_already_below_floor_unchanged() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 1,
+            memory_bytes: 4 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 1,
+                memory_bytes: 4 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_c_clamps_at_cpu_ceiling() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 60,
+            memory_bytes: 32 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('c'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 64,
+                memory_bytes: 32 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_m_clamps_at_memory_ceiling() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 8,
+            memory_bytes: 60 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('m'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 8,
                 memory_bytes: 64 * gib,
             })
         );
@@ -10229,15 +11141,16 @@ mod tests {
         let mut dashboard = dashboard_with_session(session);
         dashboard.handle_key(ctrl_key('p'));
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('y'))),
+            dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::Close {
                 session_id: "session-1".into()
             }
         );
 
+        // "Retry pause" is the primary button, so it is focused when the dialog opens.
         dashboard.show_close_failure("session-1".into(), "archive unavailable");
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('r'))),
+            dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::Close {
                 session_id: "session-1".into()
             }
@@ -10248,10 +11161,22 @@ mod tests {
             dashboard.handle_key(key(KeyCode::Char('x'))),
             DashboardAction::None
         );
+        // "Force destroy" sits between Cancel and Retry pause.
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('f'))),
+            dashboard.handle_key(key(KeyCode::Left)),
             DashboardAction::None
         );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert!(matches!(
+            dashboard.mode,
+            Mode::Confirm(ConfirmDialog {
+                confirmation: Confirmation::ForceDestroy { .. },
+                ..
+            })
+        ));
         for character in FORCE_CONFIRMATION.chars() {
             assert_eq!(
                 dashboard.handle_key(key(KeyCode::Char(character))),
@@ -10264,6 +11189,260 @@ mod tests {
                 session_id: "session-1".into()
             }
         );
+    }
+
+    #[test]
+    fn close_failure_cancel_button_closes_the_dialog_without_acting() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.show_close_failure("session-1".into(), "archive unavailable");
+
+        // Tab from the rightmost button (Retry pause) wraps to Cancel.
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Tab)),
+            DashboardAction::None
+        );
+        let Mode::Confirm(dialog) = &dashboard.mode else {
+            panic!("expected close failure dialog");
+        };
+        assert_eq!(dialog.focus, 0);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+    }
+
+    fn running_dashboard_with_pause_dialog() -> DashboardState {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.handle_key(ctrl_key('p'));
+        assert!(matches!(
+            dashboard.mode,
+            Mode::Confirm(ConfirmDialog {
+                confirmation: Confirmation::Close { .. },
+                ..
+            })
+        ));
+        dashboard
+    }
+
+    #[test]
+    fn pause_confirmation_focuses_the_primary_button_so_enter_pauses() {
+        let mut dashboard = running_dashboard_with_pause_dialog();
+        let Mode::Confirm(dialog) = &dashboard.mode else {
+            panic!("expected pause confirmation");
+        };
+        assert_eq!(
+            confirmation_buttons(&dialog.confirmation),
+            &["Cancel", "Pause"]
+        );
+        assert_eq!(dialog.focus, 1);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::Close {
+                session_id: "session-1".into()
+            }
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+    }
+
+    #[test]
+    fn pause_confirmation_cycles_focus_and_cancels_from_the_cancel_button() {
+        for cycle_key in [
+            KeyCode::Tab,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::BackTab,
+        ] {
+            let mut dashboard = running_dashboard_with_pause_dialog();
+            assert_eq!(dashboard.handle_key(key(cycle_key)), DashboardAction::None);
+            let Mode::Confirm(dialog) = &dashboard.mode else {
+                panic!("expected pause confirmation to stay open for {cycle_key:?}");
+            };
+            assert_eq!(dialog.focus, 0, "{cycle_key:?}");
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Enter)),
+                DashboardAction::None,
+                "{cycle_key:?}"
+            );
+            assert!(matches!(dashboard.mode, Mode::Dashboard), "{cycle_key:?}");
+        }
+    }
+
+    #[test]
+    fn pause_confirmation_wraps_focus_back_to_the_primary_button() {
+        let mut dashboard = running_dashboard_with_pause_dialog();
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Tab)),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Tab)),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::Close {
+                session_id: "session-1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn pause_confirmation_escape_cancels_from_any_button() {
+        for presses in 0..3 {
+            let mut dashboard = running_dashboard_with_pause_dialog();
+            for _ in 0..presses {
+                dashboard.handle_key(key(KeyCode::Tab));
+            }
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Esc)),
+                DashboardAction::None,
+                "after {presses} focus moves"
+            );
+            assert!(matches!(dashboard.mode, Mode::Dashboard), "{presses}");
+        }
+    }
+
+    #[test]
+    fn pause_confirmation_ignores_the_removed_letter_accelerators() {
+        for accelerator in ['y', 'Y', 'n', 'N'] {
+            let mut dashboard = running_dashboard_with_pause_dialog();
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Char(accelerator))),
+                DashboardAction::None,
+                "{accelerator}"
+            );
+            assert!(
+                matches!(
+                    dashboard.mode,
+                    Mode::Confirm(ConfirmDialog {
+                        confirmation: Confirmation::Close { .. },
+                        ..
+                    })
+                ),
+                "{accelerator}"
+            );
+        }
+    }
+
+    #[test]
+    fn pause_confirmation_renders_cancel_and_pause_buttons_with_pause_focused() {
+        let mut dashboard = running_dashboard_with_pause_dialog();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw pause confirmation");
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let row = lines
+            .iter()
+            .position(|line| line.contains(" Cancel ") && line.contains(" Pause "))
+            .expect("button row");
+        let button_y = buffer.area.y + row as u16;
+        let cancel_x = buffer.area.x + cell_column(&lines[row], "Cancel");
+        let pause_x = buffer.area.x + cell_column(&lines[row], "Pause");
+        assert_eq!(buffer[(pause_x, button_y)].bg, Color::Cyan);
+        assert_eq!(buffer[(cancel_x, button_y)].bg, Color::DarkGray);
+        // Each label keeps its one-cell padding inside the button background.
+        assert_eq!(buffer[(cancel_x - 1, button_y)].bg, Color::DarkGray);
+        assert_eq!(buffer[(pause_x - 1, button_y)].bg, Color::Cyan);
+        assert!(!lines.iter().any(|line| line.contains("Press y/Enter")));
+    }
+
+    #[test]
+    fn button_confirmations_keep_their_button_row_visible() {
+        let confirmations = [
+            Confirmation::Close {
+                session_id: "session-1".into(),
+            },
+            Confirmation::DeleteArchived {
+                session_id: "session-1".into(),
+            },
+            Confirmation::CloseFailed {
+                session_id: "session-1".into(),
+                error: "archive unavailable".into(),
+            },
+            Confirmation::DirtyLocal {
+                action: DashboardAction::None,
+                repositories: vec!["/work/repo".into(), "/work/other".into()],
+            },
+        ];
+        for confirmation in confirmations {
+            for (width, height) in [(120, 30), (100, 24), (72, 22)] {
+                let mut dashboard = dashboard_with_session(archived_session());
+                dashboard.mode = Mode::Confirm(ConfirmDialog::new(confirmation.clone()));
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width, height)).expect("terminal");
+                terminal
+                    .draw(|frame| render(frame, &mut dashboard))
+                    .expect("draw confirmation");
+                let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+                for label in confirmation_buttons(&confirmation) {
+                    assert!(
+                        rendered.contains(&format!(" {label} ")),
+                        "{confirmation:?} at {width}x{height} hides {label}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delete_archived_confirmation_deletes_from_its_primary_button() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.focus = Focus::Archived;
+        dashboard.handle_key(key(KeyCode::Delete));
+        let Mode::Confirm(dialog) = &dashboard.mode else {
+            panic!("expected delete confirmation");
+        };
+        assert_eq!(
+            confirmation_buttons(&dialog.confirmation),
+            &["Cancel", "Delete"]
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::DeleteArchived {
+                session_id: "session-1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn dirty_local_confirmation_continues_or_cancels_from_its_buttons() {
+        let create = |allow_dirty_local| DashboardAction::CreateSession {
+            profile_id: "codex-1".into(),
+            bundle_id: "hel".into(),
+            project_directory: None,
+            target_template_id: "podman".into(),
+            additional_mounts: Vec::new(),
+            allow_dirty_local,
+            resource_allocation: None,
+        };
+
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.show_dirty_local_confirmation(create(false), vec!["project".into()]);
+        assert_eq!(dashboard.handle_key(key(KeyCode::Enter)), create(true));
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.show_dirty_local_confirmation(create(false), vec!["project".into()]);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('y'))),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Tab)),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
     }
 
     #[test]

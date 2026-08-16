@@ -21,7 +21,7 @@ use crate::hel_archive::{
     GitCollectionSpec, GitCommand, GitCommandRunner, GitHistoryMode, NativeArtifact, PayloadRole,
     RepositorySnapshot, SessionManifest, SystemGit, TargetManifest, collect_git_metadata_snapshot,
     collect_git_snapshot, has_origin_refs, read_archive_verified, restore_git_snapshot,
-    verify_archive_streaming, write_archive_atomic,
+    verify_archive_streaming, write_archive_hashed,
 };
 use crate::hel_config::HarnessKind;
 use crate::hel_targets::{
@@ -77,6 +77,14 @@ impl CheckpointExportSpec {
             .with_context(|| format!("parse checkpoint export spec {}", path.display()))
     }
 
+    pub fn read_from(reader: &mut impl std::io::Read) -> Result<Self> {
+        let mut body = Vec::new();
+        reader
+            .read_to_end(&mut body)
+            .context("read checkpoint export spec from standard input")?;
+        serde_json::from_slice(&body).context("parse checkpoint export spec from standard input")
+    }
+
     pub fn write(&self, path: &Path) -> Result<()> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
@@ -105,9 +113,22 @@ pub struct TargetCheckpoint {
     pub event_frontier_digest: String,
 }
 
-/// Hidden target CLI entry point: `hel worker export-checkpoint --spec PATH`.
+/// Spec argument that means "read the export spec from standard input".
+///
+/// Streaming the spec saves one round trip to the target, which is time the
+/// relay spends with ACP dispatch frozen behind the checkpoint barrier.
+pub const EXPORT_SPEC_STDIN: &str = "-";
+
+/// Hidden target CLI entry point: `hel worker export-checkpoint --spec PATH|-`.
 pub fn export_from_spec_file(path: &Path) -> Result<TargetCheckpoint> {
+    if path == Path::new(EXPORT_SPEC_STDIN) {
+        return export_from_spec_reader(&mut std::io::stdin().lock());
+    }
     export_checkpoint(&CheckpointExportSpec::read(path)?)
+}
+
+pub fn export_from_spec_reader(reader: &mut impl std::io::Read) -> Result<TargetCheckpoint> {
+    export_checkpoint(&CheckpointExportSpec::read_from(reader)?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -556,7 +577,11 @@ pub fn export_checkpoint_with_git(
             .with_context(|| format!("repository '{}'", repository.id))
         })
         .collect::<Result<Vec<_>>>()?;
-    let verified = write_archive_atomic(
+    // The export runs while the relay's barrier freezes ACP dispatch, so it
+    // hashes the archive it just wrote instead of structurally re-reading it.
+    // `CheckpointTransfer::execute` performs the one full structural verify,
+    // on the copy the controller actually installs.
+    let sha256 = write_archive_hashed(
         &spec.output_path,
         &ArchiveInput {
             session: spec.session.clone(),
@@ -567,10 +592,9 @@ pub fn export_checkpoint_with_git(
             repositories,
         },
     )?;
-    ensure!(verified.manifest.session.id == spec.session.id);
     Ok(TargetCheckpoint {
         path: spec.output_path.clone(),
-        sha256: verified.archive_sha256,
+        sha256,
         event_frontier,
         event_frontier_digest,
     })
@@ -964,6 +988,14 @@ fn reject_dirty_submodules(runner: &dyn GitCommandRunner, repository: &Path) -> 
     Ok(())
 }
 
+/// Export by streaming the spec to the worker's standard input.
+///
+/// Every wrapper this builds keeps the target's stdin attached: the container
+/// engines are invoked with `exec -i` and `ssh` forwards stdin by default.
+pub fn export_stdin_command(locator: &TargetLocator, session_id: &str) -> Result<CommandSpec> {
+    export_command(locator, session_id, EXPORT_SPEC_STDIN)
+}
+
 pub fn export_command(
     locator: &TargetLocator,
     session_id: &str,
@@ -1119,15 +1151,12 @@ impl CheckpointTransfer<'_> {
         temporary
             .persist(self.destination)
             .map_err(|error| error.error)?;
+        // The bytes were already verified in this same directory and the rename
+        // is atomic, so installation only has to make the copy private and
+        // durable; re-reading it would hash the same archive a second time.
         let post_install = (|| -> Result<()> {
             restrict_permissions(self.destination)?;
-            sync_directory(parent)?;
-            let installed = verify_archive_streaming(self.destination)?;
-            ensure!(
-                installed.archive_sha256 == sha256,
-                "installed archive checksum changed"
-            );
-            Ok(())
+            sync_directory(parent)
         })();
         if let Err(error) = post_install {
             return Err(remove_failed_checkpoint_install(self.destination, error));
@@ -1426,8 +1455,8 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::hel_archive::{
-        CanonicalExecutionState, CanonicalQueuedPrompt, CanonicalSessionState,
-        CanonicalTranscriptItem, GitOutput,
+        CanonicalExecutionState, CanonicalQueuedCommandKind, CanonicalQueuedPrompt,
+        CanonicalSessionState, CanonicalTranscriptItem, GitOutput,
     };
     use crate::hel_targets::CommandOutput;
 
@@ -1927,6 +1956,7 @@ mod tests {
                     }],
                     queued_prompts: vec![CanonicalQueuedPrompt {
                         command_id: "queued-1".into(),
+                        kind: CanonicalQueuedCommandKind::Prompt,
                         content: vec![json!({"type": "text", "text": "next"})],
                         queued_at_ms: 2,
                     }],
@@ -2107,6 +2137,45 @@ mod tests {
         assert_eq!(
             read_archive_verified(&destination).unwrap().archive_sha256,
             gate.sha256()
+        );
+    }
+
+    /// The controller streams the export spec to save a round trip to the
+    /// target. Both spellings have to produce the same archive.
+    #[test]
+    fn a_streamed_spec_exports_the_same_archive_as_a_spec_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut spec, _) = fixture(temp.path());
+        let from_file = export_from_spec_file(&spec.output_path.with_extension("spec.json"))
+            .err()
+            .map(|error| format!("{error:#}"));
+        assert!(
+            from_file.is_some_and(|error| error.contains("read checkpoint export spec")),
+            "a missing spec file must still be reported as a read failure"
+        );
+
+        let spec_path = temp.path().join("checkpoint-spec.json");
+        spec.write(&spec_path).unwrap();
+        let from_file = export_from_spec_file(&spec_path).unwrap();
+        let file_archive = fs::read(&spec.output_path).unwrap();
+
+        spec.output_path = temp.path().join("worker/streamed.hel.zip");
+        let body = serde_json::to_vec(&spec).unwrap();
+        let streamed = export_from_spec_reader(&mut body.as_slice()).unwrap();
+        let streamed_archive = fs::read(&spec.output_path).unwrap();
+
+        assert_eq!(streamed.sha256, from_file.sha256);
+        assert_eq!(streamed.event_frontier, from_file.event_frontier);
+        assert_eq!(
+            streamed.event_frontier_digest,
+            from_file.event_frontier_digest
+        );
+        assert_eq!(streamed_archive, file_archive);
+        assert_eq!(
+            read_archive_verified(&spec.output_path)
+                .unwrap()
+                .archive_sha256,
+            streamed.sha256
         );
     }
 
