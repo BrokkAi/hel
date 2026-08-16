@@ -2277,6 +2277,14 @@ impl ChatState {
                     let start = self.previous_word_start();
                     self.kill_range(start..self.input_cursor);
                 }
+                KeyCode::Char('c') => {
+                    // Stash the abandoned prompt so history can recall it.
+                    if !self.input.is_empty() {
+                        let stashed = std::mem::take(&mut self.input);
+                        self.record_prompt_history(&stashed);
+                        self.clear_input();
+                    }
+                }
                 KeyCode::Char('y') => self.yank(),
                 KeyCode::Char('j') | KeyCode::Char('m') => self.insert_character('\n'),
                 KeyCode::Char('p') => {
@@ -5778,6 +5786,21 @@ mod tests {
         chat.phase = WorkerPhase::Running;
         assert_eq!(chat.handle_key(key(KeyCode::Esc)), ChatAction::Cancel);
         assert_eq!(chat.handle_key(control_c), ChatAction::None);
+    }
+
+    #[test]
+    fn control_c_stashes_the_typed_prompt_into_history_and_clears_the_input() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        for character in "draft prompt".chars() {
+            chat.handle_key(key(KeyCode::Char(character)));
+        }
+
+        assert_eq!(chat.handle_key(ctrl('c')), ChatAction::None);
+        assert!(chat.input.is_empty());
+        assert_eq!(chat.input_cursor, 0);
+
+        chat.handle_key(key(KeyCode::Up));
+        assert_eq!(chat.input, "draft prompt");
     }
 
     #[test]
