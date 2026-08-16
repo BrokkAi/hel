@@ -4605,7 +4605,7 @@ fn render_sessions(
     let active_offset = active_state.offset();
     let mut row_y = active_area.y + SESSION_TABLE_CHROME_HEIGHT;
     let mut visible_sessions = 0;
-    for (index, _session) in active.iter().enumerate().skip(active_offset) {
+    for (index, session) in active.iter().enumerate().skip(active_offset) {
         let preview = &active_previews[index];
         let spacer = u16::from(index > 0);
         let detail_y = row_y.saturating_add(spacer);
@@ -4622,11 +4622,9 @@ fn render_sessions(
                 active_area.width.saturating_sub(2),
                 1,
             );
+            let band = session_band_color(dashboard.session_details.get(&session.id));
             let buffer = frame.buffer_mut();
-            buffer.set_style(
-                summary_area,
-                Style::default().bg(Color::DarkGray).fg(Color::LightYellow),
-            );
+            buffer.set_style(summary_area, Style::default().bg(Color::DarkGray).fg(band));
             for x in summary_area.x..summary_area.right() {
                 let cell = &mut buffer[(x, info_y)];
                 if cell.symbol() == SUMMARY_RULE {
@@ -4871,6 +4869,21 @@ fn session_name(session: &SessionRecord) -> &str {
     session.display_title()
 }
 
+/// Color of an active session's summary band. The terminal palette's plain
+/// yellow (amber/orange in common palettes) is the default; a session whose
+/// turn has ended with output the user has not read yet switches to the
+/// brighter light yellow until it is opened.
+fn session_band_color(detail: Option<&SessionDetail>) -> Color {
+    let turn_ended = detail.is_some_and(|detail| {
+        detail.current_turn_started_at.is_none() && detail.unread_agent_messages > 0
+    });
+    if turn_ended {
+        Color::LightYellow
+    } else {
+        Color::Yellow
+    }
+}
+
 fn unread_line(unread_count: usize) -> Line<'static> {
     if unread_count > 0 {
         Line::from(Span::styled(
@@ -4949,12 +4962,13 @@ fn active_session_row(
     let (clock, profile, target, project, session_name) =
         session_values(session, detail, operation, now_epoch_seconds, config);
     let unread_count = detail.map_or(0, |detail| detail.unread_agent_messages);
+    let band = session_band_color(detail);
     Row::new([
-        summary_rule_cell(Line::raw(project), layout.rule_width),
-        summary_rule_cell(unread_line(unread_count), layout.rule_width),
-        summary_rule_cell(Line::raw(clock), layout.rule_width),
-        summary_rule_cell(Line::raw(profile), layout.rule_width),
-        summary_rule_cell(Line::raw(target), layout.rule_width),
+        summary_rule_cell(Line::raw(project), layout.rule_width, band),
+        summary_rule_cell(unread_line(unread_count), layout.rule_width, band),
+        summary_rule_cell(Line::raw(clock), layout.rule_width, band),
+        summary_rule_cell(Line::raw(profile), layout.rule_width, band),
+        summary_rule_cell(Line::raw(target), layout.rule_width, band),
         summary_rule_cell(
             Line::raw(recovery_warning_name(
                 session,
@@ -4962,6 +4976,7 @@ fn active_session_row(
                 now_epoch_seconds,
             )),
             layout.rule_width,
+            band,
         ),
     ])
     .height(layout.height)
@@ -4971,10 +4986,10 @@ fn active_session_row(
 /// Trails each summary column with the block's rule glyph so every active
 /// session reads as its own band. Table cells clip the fill at the column edge,
 /// so one pane-wide run works for every column.
-fn summary_rule_cell(content: Line<'static>, rule_width: usize) -> Cell<'static> {
+fn summary_rule_cell(content: Line<'static>, rule_width: usize, band: Color) -> Cell<'static> {
     let mut spans = content.spans;
     for span in &mut spans {
-        span.style = span.style.fg(Color::LightYellow);
+        span.style = span.style.fg(band);
     }
     let gap = if spans.iter().all(|span| span.content.is_empty()) {
         ""
@@ -7543,10 +7558,11 @@ mod tests {
         assert!(status.find("1 unread") < status.find("codex-1"));
         let buffer = terminal.backend().buffer();
         let status_y = buffer.area.y + status_y as u16;
+        // The fixture's turn is still running, so the band keeps the default.
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .filter(|x| summary_text_cell(&buffer[(*x, status_y)]))
-                .all(|x| buffer[(x, status_y)].fg == Color::LightYellow)
+                .all(|x| buffer[(x, status_y)].fg == Color::Yellow)
         );
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
@@ -7557,6 +7573,36 @@ mod tests {
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .filter(|x| buffer[(*x, status_y)].symbol() == SUMMARY_RULE)
                 .all(|x| buffer[(x, status_y)].fg == Color::Reset)
+        );
+    }
+
+    #[test]
+    fn ended_turn_with_unread_output_brightens_the_summary_band() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.focus = Focus::Quotas;
+        let mut materialized =
+            materialized_session_for("session-1", vec![agent_message(1, "hidden response")]);
+        materialized.execution = MaterializedExecutionState::Idle;
+        dashboard.apply_materialized_session(&materialized);
+        let mut terminal = Terminal::new(TestBackend::new(140, 28)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let buffer = terminal.backend().buffer();
+        let status_y = (buffer.area.y..buffer.area.bottom())
+            .find(|y| {
+                let row = (buffer.area.x..buffer.area.right())
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>();
+                row.contains("1 unread") && row.contains("codex-1")
+            })
+            .expect("active status row");
+        assert!(
+            (buffer.area.x + 1..buffer.area.right() - 1)
+                .filter(|x| summary_text_cell(&buffer[(*x, status_y)]))
+                .all(|x| buffer[(x, status_y)].fg == Color::LightYellow)
         );
     }
 
@@ -9725,10 +9771,11 @@ mod tests {
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .all(|x| buffer[(x, info_y)].bg == Color::DarkGray)
         );
+        // The fixture's turn is still running, so the band keeps the default.
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .filter(|x| summary_text_cell(&buffer[(*x, info_y)]))
-                .all(|x| buffer[(x, info_y)].fg == Color::LightYellow)
+                .all(|x| buffer[(x, info_y)].fg == Color::Yellow)
         );
         // The rule fills the gaps and stays the color of the block border.
         assert!(
@@ -9750,7 +9797,7 @@ mod tests {
             .expect("conversation text") as u16;
         assert_ne!(
             buffer[(buffer.area.x + answer_x, conversation_y)].fg,
-            Color::LightYellow
+            Color::Yellow
         );
 
         dashboard.handle_key(key(KeyCode::Tab));
