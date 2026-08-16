@@ -388,6 +388,7 @@ struct ImportProgress {
 struct ImportBundleConfirmation {
     dirty_git_roots: Vec<String>,
     omitted_non_git_dirs: Vec<String>,
+    scratch_git_roots: Vec<String>,
     has_untracked_files: bool,
     ignore_untracked: bool,
 }
@@ -1238,11 +1239,13 @@ impl DashboardState {
         &mut self,
         dirty_git_roots: Vec<String>,
         omitted_non_git_dirs: Vec<String>,
+        scratch_git_roots: Vec<String>,
         has_untracked_files: bool,
     ) {
         self.mode = Mode::ConfirmImportBundle(ImportBundleConfirmation {
             dirty_git_roots,
             omitted_non_git_dirs,
+            scratch_git_roots,
             has_untracked_files,
             ignore_untracked: has_untracked_files,
         });
@@ -4228,6 +4231,7 @@ fn render_import_bundle_confirmation(
 ) {
     let height = (confirmation.dirty_git_roots.len()
         + confirmation.omitted_non_git_dirs.len()
+        + confirmation.scratch_git_roots.len()
         + usize::from(confirmation.has_untracked_files)
         + 11) as u16;
     let popup = centered_rect(76, height.clamp(12, 24), area);
@@ -4269,6 +4273,20 @@ fn render_import_bundle_confirmation(
             confirmation.omitted_non_git_dirs.iter().map(|directory| {
                 Line::styled(directory.clone(), Style::default().fg(Color::Yellow))
             }),
+        );
+    }
+    if !confirmation.scratch_git_roots.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::raw(
+            "These scratch repositories are under temporary directories and stay out of the workspace:",
+        ));
+        lines.extend(
+            confirmation
+                .scratch_git_roots
+                .iter()
+                .map(|root| Line::styled(root.clone(), Style::default().fg(Color::Yellow))),
         );
     }
     lines.extend([
@@ -6863,7 +6881,7 @@ mod tests {
         importing.show_import_progress("Chosen session".into());
 
         let mut confirm_import = dashboard_with_session(archived_session());
-        confirm_import.show_import_bundle_confirmation(Vec::new(), Vec::new(), false);
+        confirm_import.show_import_bundle_confirmation(Vec::new(), Vec::new(), Vec::new(), false);
 
         let mut confirm = dashboard_with_session(archived_session());
         confirm.show_dirty_local_confirmation(DashboardAction::None, vec!["project".into()]);
@@ -9162,6 +9180,7 @@ mod tests {
         dashboard.show_import_bundle_confirmation(
             vec!["/work/repo — 1 tracked change · 222561 untracked paths".into()],
             Vec::new(),
+            Vec::new(),
             true,
         );
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
@@ -9187,6 +9206,7 @@ mod tests {
         dashboard.show_import_bundle_confirmation(
             vec!["/work/repo — 222561 untracked paths".into()],
             Vec::new(),
+            Vec::new(),
             true,
         );
         assert_eq!(
@@ -9200,6 +9220,31 @@ mod tests {
                 include_untracked: true,
             }
         );
+    }
+
+    #[test]
+    fn import_safety_lists_scratch_repositories_left_out_of_the_workspace() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.show_import_bundle_confirmation(
+            Vec::new(),
+            Vec::new(),
+            vec!["/tmp/claude-1000/scratch".into()],
+            false,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw safety warning");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("temporary directories"), "{rendered}");
+        assert!(rendered.contains("/tmp/claude-1000/scratch"), "{rendered}");
     }
 
     #[test]
