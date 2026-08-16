@@ -791,23 +791,36 @@ fn is_completed_tool(entry: &ChatEntry) -> bool {
     entry.role == ChatRole::Tool && entry.tool_status == Some(ToolStatus::Completed)
 }
 
+/// The newest completed tool keeps its full detail until the next request
+/// starts. Scanning backwards, the first `User` entry ends protection and the
+/// first completed tool claims it; every other entry is transparent.
+fn protected_tool_index(entries: &[ChatEntry]) -> Option<usize> {
+    entries
+        .iter()
+        .rposition(|entry| entry.role == ChatRole::User || is_completed_tool(entry))
+        .filter(|&index| is_completed_tool(&entries[index]))
+}
+
 /// Collapse state per entry. In rich mode a maximal run of two or more
 /// consecutive completed tools renders as one summary cell; every other entry,
-/// including a pending, running, or failed tool, breaks the run. Raw mode never
-/// collapses so the full commands stay inspectable.
+/// including a pending, running, or failed tool, breaks the run. The protected
+/// newest result breaks runs too and never joins one. Raw mode never collapses
+/// so the full commands stay inspectable.
 fn tool_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> Vec<ToolCollapse> {
     let mut states = vec![ToolCollapse::None; entries.len()];
     if mode != TranscriptRenderMode::Rich {
         return states;
     }
+    let protected = protected_tool_index(entries);
+    let collapsible = |index: usize| is_completed_tool(&entries[index]) && Some(index) != protected;
     let mut start = 0;
     while start < entries.len() {
-        if !is_completed_tool(&entries[start]) {
+        if !collapsible(start) {
             start += 1;
             continue;
         }
         let mut end = start + 1;
-        while end < entries.len() && is_completed_tool(&entries[end]) {
+        while end < entries.len() && collapsible(end) {
             end += 1;
         }
         if end - start > 1 {
@@ -6100,7 +6113,90 @@ mod tests {
 
         let text = transcript_text(&mut chat, 80);
 
-        assert_eq!(text, ["✓ Tool · done", "│ grep, grep, cat", ""]);
+        assert_eq!(
+            text,
+            [
+                "✓ Tool · done",
+                "│ grep, grep",
+                "",
+                "✓ Tool · done",
+                "│ cat notes.md",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn completed_tool_run_collapses_fully_once_a_new_request_starts() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
+        chat.entries.push(completed_tool(2, "grep -rn beta src"));
+        chat.entries.push(completed_tool(3, "cat notes.md"));
+        chat.entries
+            .push(ChatEntry::plain(4, ChatRole::User, "now ship it"));
+
+        let text = transcript_text(&mut chat, 80);
+
+        assert_eq!(
+            text,
+            [
+                "✓ Tool · done",
+                "│ grep, grep, cat",
+                "",
+                "❯ You",
+                "│ now ship it",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn newest_completed_tool_leaves_a_lone_predecessor_expanded() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
+        chat.entries.push(completed_tool(2, "cat notes.md"));
+
+        let text = transcript_text(&mut chat, 80);
+
+        assert_eq!(
+            text,
+            [
+                "✓ Tool · done",
+                "│ grep -rn alpha src",
+                "",
+                "✓ Tool · done",
+                "│ cat notes.md",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_later_completed_tool_collapses_the_earlier_run_entirely() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.entries.push(completed_tool(1, "grep -rn alpha src"));
+        chat.entries.push(completed_tool(2, "grep -rn beta src"));
+        chat.entries.push(completed_tool(3, "cat notes.md"));
+        chat.entries
+            .push(ChatEntry::plain(4, ChatRole::Agent, "found it"));
+        chat.entries.push(completed_tool(5, "rg gamma src"));
+
+        let text = transcript_text(&mut chat, 80);
+
+        assert_eq!(
+            text,
+            [
+                "✓ Tool · done",
+                "│ grep, grep, cat",
+                "",
+                "● Agent",
+                "│ found it",
+                "",
+                "✓ Tool · done",
+                "│ rg gamma src",
+                "",
+            ]
+        );
     }
 
     #[test]
@@ -6145,6 +6241,8 @@ mod tests {
 
         let text = transcript_text(&mut chat, 80);
 
+        // The trailing run's last member is the newest result, so it stays
+        // expanded and leaves its single predecessor alone.
         assert_eq!(
             text,
             [
@@ -6155,7 +6253,31 @@ mod tests {
                 "│ cat missing.md",
                 "",
                 "✓ Tool · done",
+                "│ rg gamma src",
+                "",
+                "✓ Tool · done",
+                "│ rg delta src",
+                "",
+            ]
+        );
+
+        chat.entries
+            .push(ChatEntry::plain(6, ChatRole::User, "now ship it"));
+
+        assert_eq!(
+            transcript_text(&mut chat, 80),
+            [
+                "✓ Tool · done",
+                "│ grep, grep",
+                "",
+                "× Tool · failed",
+                "│ cat missing.md",
+                "",
+                "✓ Tool · done",
                 "│ rg, rg",
+                "",
+                "❯ You",
+                "│ now ship it",
                 "",
             ]
         );
@@ -6188,7 +6310,7 @@ mod tests {
     }
 
     #[test]
-    fn completing_a_running_tool_extends_the_cached_collapsed_summary() {
+    fn completing_a_running_tool_moves_protection_and_collapses_the_earlier_run() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.entries.push(completed_tool(1, "grep -rn alpha src"));
         chat.entries.push(completed_tool(2, "grep -rn beta src"));
@@ -6203,7 +6325,10 @@ mod tests {
             transcript_text(&mut chat, 80),
             [
                 "✓ Tool · done",
-                "│ grep, grep",
+                "│ grep -rn alpha src",
+                "",
+                "✓ Tool · done",
+                "│ grep -rn beta src",
                 "",
                 "● Tool · running",
                 "│ cat notes.md",
@@ -6214,9 +6339,18 @@ mod tests {
         chat.entries[2].touch(4);
         chat.entries[2].tool_status = Some(ToolStatus::Completed);
 
+        // Protection moved to the newly completed tool, so the two entries
+        // above must re-render even though neither revision changed.
         assert_eq!(
             transcript_text(&mut chat, 80),
-            ["✓ Tool · done", "│ grep, grep, cat", ""]
+            [
+                "✓ Tool · done",
+                "│ grep, grep",
+                "",
+                "✓ Tool · done",
+                "│ cat notes.md",
+                "",
+            ]
         );
     }
 
