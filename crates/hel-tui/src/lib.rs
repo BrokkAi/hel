@@ -4148,6 +4148,17 @@ fn render_adaptive_dashboard(
         dashboard.preview_scroll_session = selected_id;
         dashboard.preview_scroll = 0;
     }
+    // A session mid-launch, mid-resume, or mid-pause has nothing worth
+    // previewing, so its row collapses to just the summary line.
+    let active_collapsed = active
+        .iter()
+        .map(|session| {
+            active_row_collapses_to_summary(
+                dashboard.session_operations.get(&session.id),
+                session.state,
+            )
+        })
+        .collect::<Vec<_>>();
     // Row heights need the previews, and the selected session's line budget
     // needs the allocated pane height. Every unselected preview is the same in
     // both passes, so the transcript tails are walked once here and only the
@@ -4161,6 +4172,7 @@ fn render_adaptive_dashboard(
             scroll: dashboard.preview_scroll,
             selected_lines: SELECTED_TRANSCRIPT_LINES,
         },
+        &active_collapsed,
     );
     let active_row_heights = active_previews
         .previews
@@ -4239,6 +4251,7 @@ fn render_adaptive_dashboard(
     // clamped against the height it actually renders at.
     if selected_lines != SELECTED_TRANSCRIPT_LINES
         && let Some(index) = selected_active
+        && !active_collapsed[index]
     {
         let (preview, applied) = active_transcript_tail(
             dashboard.session_details.get_mut(&active[index].id),
@@ -4307,6 +4320,24 @@ fn active_pane_height(row_heights: &[u16], rows: usize) -> u16 {
         .saturating_add(spacers)
 }
 
+/// A launching, resuming, or pausing session — or one caught mid-provisioning
+/// after an interrupted launch with no operation record — has nothing worth
+/// previewing yet, so its Active row collapses to just the summary line.
+fn active_row_collapses_to_summary(
+    operation: Option<&SessionOperationDisplay>,
+    state: SessionState,
+) -> bool {
+    match operation {
+        Some(operation) => matches!(
+            operation.kind,
+            SessionOperationKind::Launching
+                | SessionOperationKind::Resuming
+                | SessionOperationKind::Pausing
+        ),
+        None => state == SessionState::Provisioning,
+    }
+}
+
 /// What one frame asks of the active previews: the width they wrap to, which
 /// row is selected, how far that row's preview is scrolled, and the line budget
 /// the selected row may use.
@@ -4321,10 +4352,15 @@ fn prepare_active_previews(
     active: &[&SessionRecord],
     session_details: &mut BTreeMap<String, SessionDetail>,
     request: PreviewRequest,
+    collapsed: &[bool],
 ) -> ActivePreviews {
     let mut previews = Vec::with_capacity(active.len());
     let mut applied_scroll = 0;
     for (index, session) in active.iter().enumerate() {
+        if collapsed.get(index).copied().unwrap_or(false) {
+            previews.push(Vec::new());
+            continue;
+        }
         let selected = request.selected == Some(index);
         let (maximum_lines, scroll) = if selected {
             (request.selected_lines, request.scroll)
@@ -6761,6 +6797,89 @@ mod tests {
             dashboard.session_operations["session-1"].kind,
             SessionOperationKind::Resuming
         );
+    }
+
+    #[test]
+    fn resuming_session_with_a_transcript_collapses_to_its_summary_line() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw with preview");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Rendered answer"));
+
+        dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Resuming, None);
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw collapsed");
+        let collapsed = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(!collapsed.contains("Rendered answer"));
+        assert!(
+            dashboard.selected_preview_area.is_none(),
+            "a collapsed row has no preview to scroll"
+        );
+
+        dashboard.finish_session_operation("session-1");
+        // Finishing the operation only drops its record; the session state
+        // itself flips back to Running through a later relay update, which a
+        // real resume delivers via `spawn_lifecycle_reload` in main.rs.
+        dashboard
+            .state
+            .sessions
+            .get_mut("session-1")
+            .expect("session")
+            .state = SessionState::Running;
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw restored");
+        let restored = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(restored.contains("Rendered answer"));
+    }
+
+    #[test]
+    fn pausing_session_with_a_transcript_collapses_to_its_summary_line() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
+
+        dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Pausing, None);
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw collapsed");
+        let collapsed = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(!collapsed.contains("Rendered answer"));
+
+        dashboard.finish_session_operation("session-1");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw restored");
+        let restored = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(restored.contains("Rendered answer"));
+    }
+
+    #[test]
+    fn provisioning_without_an_operation_record_collapses_to_its_summary_line() {
+        // Interrupted-launch recovery: the session comes back as Provisioning
+        // with no in-flight operation to track it.
+        let mut session = archived_session();
+        session.state = SessionState::Provisioning;
+        let mut dashboard = dashboard_with_session(session);
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
+        assert!(dashboard.session_operations.is_empty());
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw collapsed");
+        let collapsed = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(!collapsed.contains("Rendered answer"));
     }
 
     #[test]
