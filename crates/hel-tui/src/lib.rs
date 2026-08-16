@@ -3752,18 +3752,7 @@ fn partition_sessions<'a>(
         Some(_) | None => session_timestamp(&session.updated_at)
             .and_then(|timestamp| timestamp.checked_mul(1_000)),
     };
-    let sequence = |left: &&SessionRecord, right: &&SessionRecord| {
-        match (
-            session_timestamp(&left.created_at),
-            session_timestamp(&right.created_at),
-        ) {
-            (Some(left), Some(right)) => left.cmp(&right),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
-        .then_with(|| left.id.cmp(&right.id))
-    };
+    let sequence = |left: &&SessionRecord, right: &&SessionRecord| left.compare_by_creation(right);
     let sort = |left: &&SessionRecord, right: &&SessionRecord| match order {
         SessionOrder::Sequence => sequence(left, right),
         SessionOrder::RecentActivity => activity_timestamp(right)
@@ -4957,7 +4946,7 @@ fn session_values(
         clock,
         session.last_profile.clone(),
         session.target_template_id.clone(),
-        session_project(config, session),
+        session.project_name(config),
         session_name(session).to_string(),
     )
 }
@@ -4968,34 +4957,6 @@ fn session_updated_at_epoch_seconds(session: &SessionRecord) -> Option<u64> {
         .timestamp()
         .try_into()
         .ok()
-}
-
-fn session_project(config: &HelConfig, session: &SessionRecord) -> String {
-    if let Some(worktree) = &session.managed_worktree {
-        return path_leaf(&worktree.source_repository);
-    }
-    if let Some(project_directory) = &session.project_directory {
-        return path_leaf(project_directory);
-    }
-    config
-        .bundles
-        .get(&session.bundle_id)
-        .and_then(|bundle| {
-            bundle
-                .repositories
-                .iter()
-                .find(|repository| repository.id == bundle.primary_repo)
-                .or_else(|| bundle.repositories.first())
-        })
-        .map(|repository| path_leaf(&repository.destination))
-        .unwrap_or_else(|| path_leaf(std::path::Path::new(&session.bundle_id)))
-}
-
-fn path_leaf(path: &std::path::Path) -> String {
-    path.file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn checkpoint_archive_size(size: Option<u64>) -> String {
@@ -5026,17 +4987,12 @@ fn session_name(session: &SessionRecord) -> &str {
     session.display_title()
 }
 
-/// Color of an active session's summary band. The terminal palette's plain
-/// yellow (amber/orange in common palettes) marks a session whose turn is
-/// still running; a session with no turn in flight is waiting on the user
-/// and switches to the brighter light yellow. A session whose detail has
-/// not loaded yet keeps the default.
+/// Color of an active session's summary band. A session whose detail has not
+/// loaded yet keeps the default.
 fn session_band_color(detail: Option<&SessionDetail>) -> Color {
-    if detail.is_some_and(|detail| detail.current_turn_started_at.is_none()) {
-        Color::LightYellow
-    } else {
-        Color::Yellow
-    }
+    hel::hel_chat::turn_band_color(
+        detail.is_none_or(|detail| detail.current_turn_started_at.is_some()),
+    )
 }
 
 fn unread_line(unread_count: usize) -> Line<'static> {
@@ -5171,7 +5127,7 @@ fn archived_session_row(
         .map(|checkpoint| checkpoint_time_display(&checkpoint.created_at))
         .unwrap_or_else(|| "never".into());
     Row::new([
-        session_project(config, session),
+        session.project_name(config),
         session.last_profile.clone(),
         checkpoint,
         checkpoint_archive_size(archive_size),
@@ -10418,41 +10374,6 @@ mod tests {
     }
 
     #[test]
-    fn project_uses_primary_bundle_leaf_or_raw_directory_leaf() {
-        let mut config = config();
-        config
-            .bundles
-            .get_mut("hel")
-            .unwrap()
-            .repositories
-            .push(ProjectRepository {
-                id: "docs".into(),
-                github: Some("BrokkAi/docs".into()),
-                local: None,
-                destination: PathBuf::from("documentation"),
-                git_ref: None,
-            });
-        let mut session = archived_session();
-
-        assert_eq!(session_project(&config, &session), "hel");
-
-        session.project_directory = Some(PathBuf::from("/home/user/Projects/raw-project"));
-        assert_eq!(session_project(&config, &session), "raw-project");
-
-        session.project_directory = Some(PathBuf::from(
-            "/home/user/Projects/source/.hel/worktrees/session-1",
-        ));
-        session.managed_worktree = Some(hel::hel_state::ManagedWorktree {
-            source_project_directory: PathBuf::from("/home/user/Projects/source"),
-            source_repository: PathBuf::from("/home/user/Projects/source"),
-            worktree_root: PathBuf::from("/home/user/Projects/source/.hel/worktrees/session-1"),
-            branch: "hel/session-1".into(),
-            target: hel::hel_state::ManagedWorktreeTarget::Local,
-        });
-        assert_eq!(session_project(&config, &session), "source");
-    }
-
-    #[test]
     fn archived_resources_show_the_checkpoint_archive_size() {
         assert_eq!(checkpoint_archive_size(Some(1_536)), "1.5K");
         assert_eq!(checkpoint_archive_size(None), "—");
@@ -10526,7 +10447,7 @@ mod tests {
     }
 
     #[test]
-    fn active_idle_clock_is_blank() {
+    fn active_session_with_no_turn_in_flight_reads_idle() {
         let mut session = archived_session();
         session.state = SessionState::Running;
         let detail = SessionDetail {
@@ -10535,7 +10456,7 @@ mod tests {
         };
 
         let (clock, _, _, _, _) = session_values(&session, Some(&detail), None, 1_480, &config());
-        assert_eq!(clock, "");
+        assert_eq!(clock, "[idle]");
     }
 
     #[test]
