@@ -1951,7 +1951,7 @@ mod relay_tests {
     }
 
     #[tokio::test]
-    async fn same_priority_controls_dispatch_in_acceptance_order() {
+    async fn same_priority_queue_entries_dispatch_in_acceptance_order() {
         let temp = tempfile::tempdir().unwrap();
         let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
         submit(
@@ -1983,27 +1983,40 @@ mod relay_tests {
             })
             .unwrap();
 
-        let first = command_rx.recv().await.unwrap();
-        let second = command_rx.recv().await.unwrap();
+        // Queue entries run one at a time, so the second change reaches ACP
+        // only after the first is terminal.
         assert!(matches!(
-            first,
+            command_rx.recv().await.unwrap(),
             CommandRequest::SetConfig { request_id, .. }
                 if request_id == "z-accepted-first"
         ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), command_rx.recv())
+                .await
+                .is_err(),
+            "the queued change dispatched while an earlier one was in flight"
+        );
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "z-accepted-first".into(),
+                message: "advance the queue".into(),
+            })
+            .unwrap();
         assert!(matches!(
-            second,
+            tokio::time::timeout(std::time::Duration::from_secs(1), command_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
             CommandRequest::SetConfig { request_id, .. }
                 if request_id == "a-accepted-second"
         ));
 
-        for request_id in ["z-accepted-first", "a-accepted-second"] {
-            event_tx
-                .send(RuntimeEvent::CommandRejected {
-                    request_id: request_id.into(),
-                    message: "test shutdown".into(),
-                })
-                .unwrap();
-        }
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "a-accepted-second".into(),
+                message: "test shutdown".into(),
+            })
+            .unwrap();
         event_tx.send(RuntimeEvent::Stopped).unwrap();
         drop(event_tx);
         drop(wake_tx);
@@ -2014,16 +2027,10 @@ mod relay_tests {
     async fn dispatch_batch_does_not_outgrow_the_bounded_acp_command_channel() {
         let temp = tempfile::tempdir().unwrap();
         let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
-        for (command_id, value) in [("config-first", "first"), ("config-second", "second")] {
-            submit(
-                &mut durable,
-                command_id,
-                RelayCommand::SetConfig {
-                    key: "model".into(),
-                    value: value.into(),
-                },
-            );
-        }
+        // A prompt and the cancel that targets it are both claimable at once,
+        // so only the bounded channel limits the durable batch.
+        submit(&mut durable, "prompt-first", prompt("running"));
+        submit(&mut durable, "cancel-second", RelayCommand::Cancel);
         let relay = Arc::new(Mutex::new(durable));
         let (event_tx, event_rx) = runtime_event_channel();
         let (wake_tx, wake_rx) = mpsc::channel(1);
@@ -2037,10 +2044,7 @@ mod relay_tests {
             })
             .unwrap();
 
-        assert!(matches!(
-            command_rx.recv().await.unwrap(),
-            CommandRequest::SetConfig { request_id, .. } if request_id == "config-first"
-        ));
+        assert_prompt(command_rx.recv().await.unwrap(), "prompt-first", "running");
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(25), command_rx.recv(),)
                 .await
@@ -2050,7 +2054,7 @@ mod relay_tests {
 
         event_tx
             .send(RuntimeEvent::CommandRejected {
-                request_id: "config-first".into(),
+                request_id: "prompt-first".into(),
                 message: "advance the bounded batch".into(),
             })
             .unwrap();
@@ -2059,11 +2063,11 @@ mod relay_tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            CommandRequest::SetConfig { request_id, .. } if request_id == "config-second"
+            CommandRequest::Cancel { request_id } if request_id == "cancel-second"
         ));
         event_tx
             .send(RuntimeEvent::CommandRejected {
-                request_id: "config-second".into(),
+                request_id: "cancel-second".into(),
                 message: "test shutdown".into(),
             })
             .unwrap();
@@ -2103,20 +2107,36 @@ mod relay_tests {
             command_rx.recv().await.unwrap(),
             CommandRequest::SetConfig { request_id, .. } if request_id == "config-first"
         ));
+        // The prompt waits for the configuration change accepted before it.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), command_rx.recv())
+                .await
+                .is_err(),
+            "the prompt dispatched before the earlier configuration change finished"
+        );
+        event_tx
+            .send(RuntimeEvent::ConfigApplied {
+                request_id: "config-first".into(),
+                key: "model".into(),
+                value: "before-prompt".into(),
+                config_options: Vec::new(),
+            })
+            .unwrap();
         assert_prompt(
-            command_rx.recv().await.unwrap(),
+            tokio::time::timeout(std::time::Duration::from_secs(1), command_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
             "prompt-second",
             "after config",
         );
 
-        for request_id in ["config-first", "prompt-second"] {
-            event_tx
-                .send(RuntimeEvent::CommandRejected {
-                    request_id: request_id.into(),
-                    message: "test shutdown".into(),
-                })
-                .unwrap();
-        }
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "prompt-second".into(),
+                message: "test shutdown".into(),
+            })
+            .unwrap();
         event_tx.send(RuntimeEvent::Stopped).unwrap();
         drop(event_tx);
         drop(wake_tx);

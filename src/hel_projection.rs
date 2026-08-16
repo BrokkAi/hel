@@ -3,18 +3,19 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{SessionUpdate, ToolCall};
+use agent_client_protocol::schema::v1::{ContentBlock, SessionUpdate, TextContent, ToolCall};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::hel_archive::{
-    CanonicalExecutionState, CanonicalQueuedPrompt, CanonicalSessionSnapshot,
-    CanonicalSessionState, CanonicalTranscriptBody, CanonicalTranscriptItem,
+    CanonicalExecutionState, CanonicalQueuedCommandKind, CanonicalQueuedPrompt,
+    CanonicalSessionSnapshot, CanonicalSessionState, CanonicalTranscriptBody,
+    CanonicalTranscriptItem,
 };
 use crate::hel_database::{MaterializedSessionMutation, TranscriptMutation};
 use crate::hel_state::{
-    MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, TranscriptBody,
-    TranscriptItem, normalize_session_title,
+    MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
+    TranscriptBody, TranscriptItem, config_command_text, normalize_session_title,
 };
 use crate::hel_worker::{
     RelayCommand, RelayCommandKind, RelayEvent, RelayObservation, validate_relay_event,
@@ -194,10 +195,29 @@ fn project_observation(
                 queue.retain(|queued| queued.command_id != *command_id);
                 queue.push(MaterializedQueuedPrompt {
                     command_id: command_id.clone(),
+                    kind: QueuedCommandKind::Prompt,
                     content: prompt
                         .iter()
                         .map(serde_json::to_value)
                         .collect::<serde_json::Result<_>>()?,
+                    queued_at_ms: *created_at_ms,
+                });
+                mutation.queued_prompts = Some(queue);
+            }
+            // A configuration change waits in the same queue as prompts and is
+            // displayed as the composer text that produced it.
+            RelayCommand::SetConfig { key, value } => {
+                let mut queue = current.queued_prompts.clone();
+                queue.retain(|queued| queued.command_id != *command_id);
+                queue.push(MaterializedQueuedPrompt {
+                    command_id: command_id.clone(),
+                    kind: QueuedCommandKind::SetConfig {
+                        key: key.clone(),
+                        value: value.clone(),
+                    },
+                    content: vec![serde_json::to_value(ContentBlock::Text(TextContent::new(
+                        config_command_text(key, value),
+                    )))?],
                     queued_at_ms: *created_at_ms,
                 });
                 mutation.queued_prompts = Some(queue);
@@ -219,25 +239,29 @@ fn project_observation(
                 .position(|queued| queued.command_id == *command_id)
             {
                 let mut queue = current.queued_prompts.clone();
-                let prompt = queue.remove(index);
+                let entry = queue.remove(index);
                 mutation.queued_prompts = Some(queue);
-                close_streams(current, mutation, event.recorded_at_ms);
-                upsert(
-                    mutation,
-                    TranscriptItem {
-                        stable_id: format!("user:{command_id}"),
-                        position: event.ordinal,
-                        latest_content_event_ordinal: None,
-                        created_at_ms: *started_at_ms,
-                        last_changed_at_ms: *started_at_ms,
-                        body: TranscriptBody::User {
-                            content: prompt.content,
+                // A configuration change applies between turns: it never
+                // becomes a transcript turn and never starts the turn clock.
+                if entry.kind.is_prompt() {
+                    close_streams(current, mutation, event.recorded_at_ms);
+                    upsert(
+                        mutation,
+                        TranscriptItem {
+                            stable_id: format!("user:{command_id}"),
+                            position: event.ordinal,
+                            latest_content_event_ordinal: None,
+                            created_at_ms: *started_at_ms,
+                            last_changed_at_ms: *started_at_ms,
+                            body: TranscriptBody::User {
+                                content: entry.content,
+                            },
                         },
-                    },
-                );
-                mutation.execution = Some(MaterializedExecutionState::Running {
-                    started_at_ms: *started_at_ms,
-                });
+                    );
+                    mutation.execution = Some(MaterializedExecutionState::Running {
+                        started_at_ms: *started_at_ms,
+                    });
+                }
             }
         }
         RelayObservation::CommandCompleted {
@@ -703,6 +727,15 @@ pub fn canonical_session_from_materialized(
             .iter()
             .map(|prompt| CanonicalQueuedPrompt {
                 command_id: prompt.command_id.clone(),
+                kind: match &prompt.kind {
+                    QueuedCommandKind::Prompt => CanonicalQueuedCommandKind::Prompt,
+                    QueuedCommandKind::SetConfig { key, value } => {
+                        CanonicalQueuedCommandKind::SetConfig {
+                            key: key.clone(),
+                            value: value.clone(),
+                        }
+                    }
+                },
                 content: prompt.content.clone(),
                 queued_at_ms: prompt.queued_at_ms,
             })
@@ -771,6 +804,15 @@ pub fn materialized_session_from_canonical(
             .iter()
             .map(|prompt| MaterializedQueuedPrompt {
                 command_id: prompt.command_id.clone(),
+                kind: match &prompt.kind {
+                    CanonicalQueuedCommandKind::Prompt => QueuedCommandKind::Prompt,
+                    CanonicalQueuedCommandKind::SetConfig { key, value } => {
+                        QueuedCommandKind::SetConfig {
+                            key: key.clone(),
+                            value: value.clone(),
+                        }
+                    }
+                },
                 content: prompt.content.clone(),
                 queued_at_ms: prompt.queued_at_ms,
             })
@@ -1154,10 +1196,60 @@ mod tests {
     }
 
     #[test]
+    fn queued_config_change_starts_without_becoming_a_turn() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandQueued {
+                command_id: "config-1".into(),
+                command: RelayCommand::SetConfig {
+                    key: "model".into(),
+                    value: "sonnet".into(),
+                },
+                created_at_ms: 100,
+            },
+        );
+        assert_eq!(session.queued_prompts.len(), 1);
+        assert_eq!(
+            session.queued_prompts[0].kind,
+            QueuedCommandKind::SetConfig {
+                key: "model".into(),
+                value: "sonnet".into(),
+            }
+        );
+        assert_eq!(
+            crate::hel_chat::materialized_content_text(&session.queued_prompts[0].content),
+            "/model sonnet"
+        );
+
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandStarted {
+                command_id: "config-1".into(),
+                started_at_ms: 200,
+            },
+        );
+        assert!(session.queued_prompts.is_empty());
+        assert!(session.transcript.is_empty());
+        assert_eq!(session.execution, MaterializedExecutionState::Idle);
+
+        apply_observation(
+            &mut session,
+            RelayObservation::CommandCompleted {
+                command_id: "config-1".into(),
+                outcome: RelayCommandOutcome::Configured,
+            },
+        );
+        assert_eq!(session.execution, MaterializedExecutionState::Idle);
+        assert!(session.transcript.is_empty());
+    }
+
+    #[test]
     fn queue_changes_project_only_from_their_completion_events() {
         let mut session = MaterializedSession::empty("session-1");
         session.queued_prompts.push(MaterializedQueuedPrompt {
             command_id: "queued-1".into(),
+            kind: QueuedCommandKind::Prompt,
             content: vec![json!({"type": "text", "text": "later"})],
             queued_at_ms: 10,
         });
@@ -1188,11 +1280,13 @@ mod tests {
         session.queued_prompts.extend([
             MaterializedQueuedPrompt {
                 command_id: "queued-2".into(),
+                kind: QueuedCommandKind::Prompt,
                 content: vec![json!({"type": "text", "text": "two"})],
                 queued_at_ms: 20,
             },
             MaterializedQueuedPrompt {
                 command_id: "queued-3".into(),
+                kind: QueuedCommandKind::Prompt,
                 content: vec![json!({"type": "text", "text": "three"})],
                 queued_at_ms: 30,
             },
@@ -1386,8 +1480,24 @@ mod tests {
                 }),
             },
         }));
+        session.queued_prompts.push(MaterializedQueuedPrompt {
+            command_id: "queued-config".into(),
+            kind: QueuedCommandKind::SetConfig {
+                key: "model".into(),
+                value: "sonnet".into(),
+            },
+            content: vec![json!({"type": "text", "text": "/model sonnet"})],
+            queued_at_ms: 50,
+        });
         let canonical = canonical_session_from_materialized(&session).unwrap();
         canonical.validate().unwrap();
+        assert_eq!(
+            canonical.queued_prompts[0].kind,
+            CanonicalQueuedCommandKind::SetConfig {
+                key: "model".into(),
+                value: "sonnet".into(),
+            }
+        );
         let restored = materialized_session_from_canonical("session-1", &canonical).unwrap();
         assert_eq!(restored.applied_event_ordinal, 4);
         assert_eq!(restored.transcript[0].position, 2);

@@ -1455,8 +1455,8 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::hel_archive::{
-        CanonicalExecutionState, CanonicalQueuedPrompt, CanonicalSessionState,
-        CanonicalTranscriptItem, GitOutput,
+        CanonicalExecutionState, CanonicalQueuedCommandKind, CanonicalQueuedPrompt,
+        CanonicalSessionState, CanonicalTranscriptItem, GitOutput,
     };
     use crate::hel_targets::CommandOutput;
 
@@ -1956,6 +1956,7 @@ mod tests {
                     }],
                     queued_prompts: vec![CanonicalQueuedPrompt {
                         command_id: "queued-1".into(),
+                        kind: CanonicalQueuedCommandKind::Prompt,
                         content: vec![json!({"type": "text", "text": "next"})],
                         queued_at_ms: 2,
                     }],

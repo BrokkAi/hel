@@ -151,10 +151,39 @@ impl TranscriptItem {
     }
 }
 
+/// What a durable queue entry does when its turn comes.
+///
+/// Serialized without a tag for prompts so entries written before configuration
+/// changes could be queued keep loading unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedCommandKind {
+    #[default]
+    Prompt,
+    SetConfig {
+        key: String,
+        value: String,
+    },
+}
+
+impl QueuedCommandKind {
+    pub fn is_prompt(&self) -> bool {
+        matches!(self, Self::Prompt)
+    }
+}
+
+/// The composer form of a configuration change, used both as the queue entry's
+/// display text and as the text peeled back into the composer for editing.
+pub fn config_command_text(key: &str, value: &str) -> String {
+    format!("/{key} {value}")
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializedQueuedPrompt {
     pub command_id: String,
+    #[serde(default, skip_serializing_if = "QueuedCommandKind::is_prompt")]
+    pub kind: QueuedCommandKind,
     pub content: Vec<serde_json::Value>,
     pub queued_at_ms: i64,
 }
@@ -244,6 +273,14 @@ impl MaterializedSession {
             if !command_ids.insert(prompt.command_id.as_str()) {
                 bail!(
                     "materialized prompt queue contains duplicate command {:?}",
+                    prompt.command_id
+                );
+            }
+            if let QueuedCommandKind::SetConfig { key, value } = &prompt.kind
+                && (key.trim().is_empty() || value.trim().is_empty())
+            {
+                bail!(
+                    "materialized queued configuration change {:?} is incomplete",
                     prompt.command_id
                 );
             }
@@ -1128,6 +1165,7 @@ mod tests {
         }));
         materialized.queued_prompts.push(MaterializedQueuedPrompt {
             command_id: "prompt-2".into(),
+            kind: QueuedCommandKind::Prompt,
             content: Vec::new(),
             queued_at_ms: 500,
         });

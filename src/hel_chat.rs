@@ -33,8 +33,8 @@ use crate::hel_session_manager::{
     ManagedSessionHandle, ManagedSessionView, SessionManagerControl, ViewError, new_command_id,
 };
 use crate::hel_state::{
-    MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, TranscriptBody,
-    TranscriptItem,
+    MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
+    TranscriptBody, TranscriptItem, config_command_text,
 };
 use crate::hel_worker::{
     RELAY_EVENT_GENESIS_DIGEST, RelayCommand, SequencedEvent, WorkerEvent, WorkerPhase,
@@ -78,12 +78,21 @@ pub enum ChatEventOutcome {
 pub enum ChatAction {
     None,
     Prompt(String),
-    RemoveQueuedPrompt { id: String, text: String },
-    SetConfig { key: String, value: String },
+    RemoveQueuedPrompt {
+        id: String,
+        text: String,
+        kind: QueuedCommandKind,
+    },
+    SetConfig {
+        key: String,
+        value: String,
+    },
     Cancel,
     PasteFromClipboard,
     ToggleVoice,
-    SwitchSession { session_id: String },
+    SwitchSession {
+        session_id: String,
+    },
     Back,
     QuitDetach,
 }
@@ -134,6 +143,19 @@ struct Autocomplete {
 struct QueuedPrompt {
     id: String,
     text: String,
+    kind: QueuedCommandKind,
+}
+
+impl QueuedPrompt {
+    /// The label shown above the composer. A queued configuration change is
+    /// marked so it is never mistaken for a prompt waiting to be sent.
+    fn queue_label(&self) -> &'static str {
+        if self.kind.is_prompt() {
+            "queued"
+        } else {
+            "queued config"
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1101,6 +1123,7 @@ impl ChatState {
             .map(|prompt| QueuedPrompt {
                 id: prompt.id.clone(),
                 text: prompt.text.clone(),
+                kind: QueuedCommandKind::Prompt,
             })
             .collect();
         state.latest_seq = state.latest_seq.max(snapshot.latest_seq);
@@ -1166,6 +1189,7 @@ impl ChatState {
                 .map(|prompt| QueuedPrompt {
                     id: prompt.command_id.clone(),
                     text: materialized_content_text(&prompt.content),
+                    kind: prompt.kind.clone(),
                 })
                 .collect();
         }
@@ -1470,6 +1494,7 @@ impl ChatState {
                 .iter()
                 .map(|prompt| MaterializedQueuedPrompt {
                     command_id: prompt.id.clone(),
+                    kind: prompt.kind.clone(),
                     content: vec![serde_json::json!({
                         "type": "text",
                         "text": prompt.text,
@@ -2135,10 +2160,15 @@ impl ChatState {
             return ChatAction::None;
         };
         self.set_input(queued.text.clone());
-        self.set_notice("Editing the most recently queued prompt");
+        self.set_notice(if queued.kind.is_prompt() {
+            "Editing the most recently queued prompt"
+        } else {
+            "Editing the most recently queued configuration change"
+        });
         ChatAction::RemoveQueuedPrompt {
             id: queued.id,
             text: queued.text,
+            kind: queued.kind,
         }
     }
 
@@ -2193,16 +2223,18 @@ impl ChatState {
                     } else {
                         "effort"
                     };
-                    if self.phase != WorkerPhase::Idle {
-                        self.set_notice(format!(
-                            "/{key} is only available while the agent is idle"
-                        ));
-                        return ChatAction::None;
-                    }
                     if args.is_empty() {
                         self.set_notice(format!("usage: /{key} <value>"));
                         return ChatAction::None;
                     }
+                    if matches!(self.phase, WorkerPhase::Closing | WorkerPhase::Closed) {
+                        self.set_notice(
+                            "The worker is closing; this configuration change was not sent",
+                        );
+                        return ChatAction::None;
+                    }
+                    // A busy agent does not refuse the change: it waits in the
+                    // command queue and applies when its turn comes.
                     self.clear_input();
                     ChatAction::SetConfig {
                         key: key.to_owned(),
@@ -2802,6 +2834,7 @@ impl ChatState {
                 self.queued_prompts.push_back(QueuedPrompt {
                     id: prompt.id.clone(),
                     text: prompt.text.clone(),
+                    kind: QueuedCommandKind::Prompt,
                 });
             }
             WorkerEvent::QueuedPromptRemoved { queue_id } => {
@@ -3097,10 +3130,14 @@ fn builtin_command_choices() -> Vec<CommandChoice> {
             "return to the dashboard without stopping the worker",
             None,
         ),
-        ("model", "change the active model while idle", Some("value")),
+        (
+            "model",
+            "change the active model, queued while the agent is busy",
+            Some("value"),
+        ),
         (
             "effort",
-            "change the active reasoning effort while idle",
+            "change the active reasoning effort, queued while the agent is busy",
             Some("value"),
         ),
     ]
@@ -3314,6 +3351,7 @@ enum ChatRemoteOperation {
         command_id: String,
         id: String,
         text: String,
+        kind: QueuedCommandKind,
     },
     SetConfig {
         command_id: String,
@@ -3335,6 +3373,7 @@ enum ChatRemoteResult {
     RemoveQueuedPrompt {
         id: String,
         text: String,
+        kind: QueuedCommandKind,
         result: std::result::Result<(), String>,
     },
     SetConfig {
@@ -3611,6 +3650,7 @@ async fn enqueue_chat_remote_operation(
             command_id,
             id,
             text,
+            kind,
         } => {
             let response = session
                 .enqueue_submit(
@@ -3633,7 +3673,12 @@ async fn enqueue_chat_remote_operation(
                         publish_chat_remote_result(
                             &results,
                             &attached,
-                            ChatRemoteResult::RemoveQueuedPrompt { id, text, result },
+                            ChatRemoteResult::RemoveQueuedPrompt {
+                                id,
+                                text,
+                                kind,
+                                result,
+                            },
                         );
                     });
                 }
@@ -3644,6 +3689,7 @@ async fn enqueue_chat_remote_operation(
                         ChatRemoteResult::RemoveQueuedPrompt {
                             id,
                             text,
+                            kind,
                             result: Err(format!("{error:#}")),
                         },
                     );
@@ -3766,10 +3812,12 @@ fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteResult) {
         ChatRemoteResult::RemoveQueuedPrompt {
             id,
             text,
+            kind,
             result: Err(error),
         } => {
             if !chat.queued_prompts.iter().any(|prompt| prompt.id == id) {
-                chat.queued_prompts.push_back(QueuedPrompt { id, text });
+                chat.queued_prompts
+                    .push_back(QueuedPrompt { id, text, kind });
             }
             chat.set_notice(format!("Queued prompt was not removed: {error}"));
         }
@@ -3781,7 +3829,7 @@ fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteResult) {
             value,
             result: Err(error),
         } => {
-            restore_unsent_input(chat, &format!("/{key} {value}"));
+            restore_unsent_input(chat, &config_command_text(&key, &value));
             chat.set_notice(format!("Configuration was not changed: {error}"));
         }
         ChatRemoteResult::Cancel(Ok(())) => chat.set_notice("Cancellation requested"),
@@ -3801,13 +3849,14 @@ fn queue_chat_remote_operation(
         let operation = error.into_inner();
         match operation {
             ChatRemoteOperation::Prompt { text, .. } => restore_unsent_input(chat, &text),
-            ChatRemoteOperation::RemoveQueuedPrompt { id, text, .. } => {
+            ChatRemoteOperation::RemoveQueuedPrompt { id, text, kind, .. } => {
                 if !chat.queued_prompts.iter().any(|prompt| prompt.id == id) {
-                    chat.queued_prompts.push_back(QueuedPrompt { id, text });
+                    chat.queued_prompts
+                        .push_back(QueuedPrompt { id, text, kind });
                 }
             }
             ChatRemoteOperation::SetConfig { key, value, .. } => {
-                restore_unsent_input(chat, &format!("/{key} {value}"));
+                restore_unsent_input(chat, &config_command_text(&key, &value));
             }
             ChatRemoteOperation::Sync | ChatRemoteOperation::Cancel { .. } => {}
         }
@@ -4469,7 +4518,7 @@ impl ActiveChat {
                     &mut self.state,
                 );
             }
-            ChatAction::RemoveQueuedPrompt { id, text } => {
+            ChatAction::RemoveQueuedPrompt { id, text, kind } => {
                 let Some(command_id) = self.command_id("remove-prompt") else {
                     return ChatEventOutcome::Handled;
                 };
@@ -4480,13 +4529,14 @@ impl ActiveChat {
                         command_id,
                         id,
                         text,
+                        kind,
                     },
                     &mut self.state,
                 );
             }
             ChatAction::SetConfig { key, value } => {
                 let Some(command_id) = self.command_id("set-config") else {
-                    restore_unsent_input(&mut self.state, &format!("/{key} {value}"));
+                    restore_unsent_input(&mut self.state, &config_command_text(&key, &value));
                     return ChatEventOutcome::Handled;
                 };
                 self.state.set_notice("Sending configuration update…");
@@ -4682,7 +4732,8 @@ fn render(frame: &mut Frame, chat: &mut ChatState) {
             Line::from(Span::styled(
                 truncate_to_width(
                     &format!(
-                        "queued {}: {}",
+                        "{} {}: {}",
+                        queued.queue_label(),
                         index + 1,
                         queued_prompt_preview(&queued.text)
                     ),
@@ -5616,6 +5667,7 @@ mod tests {
         QueuedPrompt {
             id: id.into(),
             text: text.into(),
+            kind: QueuedCommandKind::Prompt,
         }
     }
 
@@ -6076,6 +6128,7 @@ mod tests {
             ChatAction::RemoveQueuedPrompt {
                 id: "queued-2".into(),
                 text: "second".into(),
+                kind: QueuedCommandKind::Prompt,
             }
         );
 
@@ -6132,6 +6185,81 @@ mod tests {
             ChatAction::SetConfig {
                 key: "effort".into(),
                 value: "xhigh".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn config_commands_are_queued_while_the_agent_is_busy() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.phase = WorkerPhase::Running;
+
+        chat.input = "/model".into();
+        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
+        assert_eq!(
+            chat.notices.current().as_deref(),
+            Some("usage: /model <value>")
+        );
+
+        chat.input = "/model sonnet".into();
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::SetConfig {
+                key: "model".into(),
+                value: "sonnet".into(),
+            }
+        );
+        assert!(chat.input.is_empty());
+
+        chat.phase = WorkerPhase::Closing;
+        chat.input = "/model sonnet".into();
+        assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
+        assert_eq!(
+            chat.notices.current().as_deref(),
+            Some("The worker is closing; this configuration change was not sent")
+        );
+    }
+
+    #[test]
+    fn a_queued_config_change_peels_back_into_the_composer() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        let mut session = MaterializedSession::empty("1234567890");
+        // The projection only rebuilds when its frontier moved.
+        session.applied_event_ordinal = 5;
+        session.queued_prompts.push(MaterializedQueuedPrompt {
+            command_id: "queued-config".into(),
+            kind: QueuedCommandKind::SetConfig {
+                key: "model".into(),
+                value: "sonnet".into(),
+            },
+            content: vec![serde_json::json!({"type": "text", "text": "/model sonnet"})],
+            queued_at_ms: 10,
+        });
+        chat.apply_materialized(&session, &[], &[]);
+        assert_eq!(chat.queued_prompts.len(), 1);
+        assert_eq!(chat.queued_prompts[0].queue_label(), "queued config");
+
+        assert_eq!(
+            chat.handle_key(ctrl('p')),
+            ChatAction::RemoveQueuedPrompt {
+                id: "queued-config".into(),
+                text: "/model sonnet".into(),
+                kind: QueuedCommandKind::SetConfig {
+                    key: "model".into(),
+                    value: "sonnet".into(),
+                },
+            }
+        );
+        assert_eq!(chat.input, "/model sonnet");
+        assert!(chat.queued_prompts.is_empty());
+
+        // Resubmitting the peeled-back text parses as the same change.
+        chat.phase = WorkerPhase::Running;
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Enter)),
+            ChatAction::SetConfig {
+                key: "model".into(),
+                value: "sonnet".into(),
             }
         );
     }
@@ -8282,6 +8410,7 @@ mod tests {
         };
         session.queued_prompts.push(MaterializedQueuedPrompt {
             command_id: "queued".into(),
+            kind: QueuedCommandKind::Prompt,
             content: vec![serde_json::json!("queued prompt")],
             queued_at_ms: 20,
         });

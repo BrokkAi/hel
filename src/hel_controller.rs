@@ -13,9 +13,9 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 
 use crate::hel_archive::{
-    ArchiveInput, BundleManifest, CanonicalSessionSnapshot, CanonicalTranscriptBody,
-    GitCollectionSpec, GitHistoryMode, SessionManifest, SystemGit, TargetManifest,
-    collect_git_snapshot, verify_archive_streaming, write_archive_atomic,
+    ArchiveInput, BundleManifest, CanonicalQueuedCommandKind, CanonicalSessionSnapshot,
+    CanonicalTranscriptBody, GitCollectionSpec, GitHistoryMode, SessionManifest, SystemGit,
+    TargetManifest, collect_git_snapshot, verify_archive_streaming, write_archive_atomic,
 };
 use crate::hel_checkpoint::{
     CheckpointExportSpec, CheckpointRepositoryCapture, CheckpointRepositorySpec,
@@ -2188,18 +2188,26 @@ impl Controller {
                     .await?;
                 if !discard_queue {
                     for prompt in &canonical_session.queued_prompts {
-                        let content = prompt
-                            .content
-                            .iter()
-                            .cloned()
-                            .map(serde_json::from_value)
-                            .collect::<serde_json::Result<Vec<ContentBlock>>>()?;
-                        relay
-                            .submit(
-                                prompt.command_id.clone(),
-                                RelayCommand::Prompt { prompt: content },
-                            )
-                            .await?;
+                        // A queued configuration change is replayed as itself;
+                        // rebuilding it as a prompt would send `/model x` to
+                        // the agent as text.
+                        let command = match &prompt.kind {
+                            CanonicalQueuedCommandKind::Prompt => RelayCommand::Prompt {
+                                prompt: prompt
+                                    .content
+                                    .iter()
+                                    .cloned()
+                                    .map(serde_json::from_value)
+                                    .collect::<serde_json::Result<Vec<ContentBlock>>>()?,
+                            },
+                            CanonicalQueuedCommandKind::SetConfig { key, value } => {
+                                RelayCommand::SetConfig {
+                                    key: key.clone(),
+                                    value: value.clone(),
+                                }
+                            }
+                        };
+                        relay.submit(prompt.command_id.clone(), command).await?;
                     }
                 }
             }

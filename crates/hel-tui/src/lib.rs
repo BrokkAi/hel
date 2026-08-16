@@ -7757,6 +7757,7 @@ mod tests {
             .queued_prompts
             .push(hel::hel_state::MaterializedQueuedPrompt {
                 command_id: "queued-1".into(),
+                kind: hel::hel_state::QueuedCommandKind::Prompt,
                 content: vec![serde_json::json!({ "type": "text", "text": "next task" })],
                 queued_at_ms: 0,
             });

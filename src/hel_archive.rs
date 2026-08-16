@@ -187,11 +187,34 @@ pub enum CanonicalTranscriptBody {
     },
 }
 
+/// What a queued entry does when its turn comes. Archives written before
+/// configuration changes could be queued carry no `kind`, so it defaults to a
+/// prompt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalQueuedCommandKind {
+    #[default]
+    Prompt,
+    SetConfig {
+        key: String,
+        value: String,
+    },
+}
+
+impl CanonicalQueuedCommandKind {
+    fn is_prompt(&self) -> bool {
+        matches!(self, Self::Prompt)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalQueuedPrompt {
     pub command_id: String,
-    /// ACP prompt content blocks in their JSON representation.
+    #[serde(default, skip_serializing_if = "CanonicalQueuedCommandKind::is_prompt")]
+    pub kind: CanonicalQueuedCommandKind,
+    /// ACP content blocks in their JSON representation. A queued configuration
+    /// change carries the composer text that produced it.
     pub content: Vec<serde_json::Value>,
     pub queued_at_ms: i64,
 }
@@ -1503,6 +1526,13 @@ fn validate_canonical_session(snapshot: &CanonicalSessionSnapshot) -> Result<()>
             "canonical queued prompt '{}' has no content",
             prompt.command_id
         );
+        if let CanonicalQueuedCommandKind::SetConfig { key, value } = &prompt.kind {
+            ensure!(
+                !key.trim().is_empty() && !value.trim().is_empty(),
+                "canonical queued configuration change '{}' is incomplete",
+                prompt.command_id
+            );
+        }
         for (index, content) in prompt.content.iter().enumerate() {
             serde_json::from_value::<agent_client_protocol::schema::v1::ContentBlock>(
                 content.clone(),
@@ -2700,6 +2730,7 @@ mod tests {
                 ],
                 queued_prompts: vec![CanonicalQueuedPrompt {
                     command_id: "prompt-4".into(),
+                    kind: CanonicalQueuedCommandKind::Prompt,
                     content: vec![serde_json::json!({"type": "text", "text": "next"})],
                     queued_at_ms: 104,
                 }],
@@ -3459,6 +3490,50 @@ mod tests {
         let error = write_archive_atomic(&path, &invalid).unwrap_err();
         assert!(format!("{error:#}").contains("has invalid ACP content block 0"));
         assert!(!path.exists());
+
+        invalid = input();
+        invalid.canonical_session.queued_prompts[0].kind = CanonicalQueuedCommandKind::SetConfig {
+            key: "model".into(),
+            value: "  ".into(),
+        };
+        let error = write_archive_atomic(&path, &invalid).unwrap_err();
+        assert!(format!("{error:#}").contains("is incomplete"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn queued_entries_written_before_config_changes_load_as_prompts() {
+        let stored: CanonicalQueuedPrompt = serde_json::from_value(serde_json::json!({
+            "command_id": "queued-1",
+            "content": [{"type": "text", "text": "hello"}],
+            "queued_at_ms": 5,
+        }))
+        .unwrap();
+        assert_eq!(stored.kind, CanonicalQueuedCommandKind::Prompt);
+        // A prompt entry still serializes exactly as it did before.
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap(),
+            serde_json::json!({
+                "command_id": "queued-1",
+                "content": [{"type": "text", "text": "hello"}],
+                "queued_at_ms": 5,
+            })
+        );
+
+        let config = CanonicalQueuedPrompt {
+            command_id: "queued-2".into(),
+            kind: CanonicalQueuedCommandKind::SetConfig {
+                key: "model".into(),
+                value: "sonnet".into(),
+            },
+            content: vec![serde_json::json!({"type": "text", "text": "/model sonnet"})],
+            queued_at_ms: 6,
+        };
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            serde_json::from_value::<CanonicalQueuedPrompt>(encoded).unwrap(),
+            config
+        );
     }
 
     #[test]

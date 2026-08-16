@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::hel_archive::CanonicalQueuedCommandKind;
+
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Serialized bytes of observations allowed in one attach response, well under
 /// `MAX_FRAME_BYTES` to leave room for the envelope.
@@ -293,8 +295,9 @@ pub enum RelayCommand {
 }
 
 impl RelayCommand {
-    fn is_prompt(&self) -> bool {
-        matches!(self, Self::Prompt { .. })
+    /// Whether this command waits its turn in the durable command queue.
+    fn is_queue_entry(&self) -> bool {
+        matches!(self, Self::Prompt { .. } | Self::SetConfig { .. })
     }
 
     fn is_relay_local(&self) -> bool {
@@ -361,11 +364,24 @@ pub struct ActiveRelayPrompt {
     pub started_at_ms: i64,
 }
 
+/// One entry of the durable command queue. Prompts and configuration changes
+/// share the queue so they run in the order the user submitted them.
+///
+/// The payload is untagged so entries written before configuration changes
+/// could be queued still load: they carry a `prompt` field and nothing else.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct StoredQueuedRelayPrompt {
+struct StoredQueuedRelayCommand {
     command_id: String,
-    prompt: Vec<ContentBlock>,
+    #[serde(flatten)]
+    payload: StoredQueuedRelayPayload,
     created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredQueuedRelayPayload {
+    Prompt { prompt: Vec<ContentBlock> },
+    SetConfig { key: String, value: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -550,7 +566,7 @@ struct RelaySnapshot {
     available_commands: Vec<AvailableCommand>,
     config: BTreeMap<String, String>,
     active_prompt: Option<StoredActiveRelayPrompt>,
-    queued_prompts: Vec<StoredQueuedRelayPrompt>,
+    queued_prompts: Vec<StoredQueuedRelayCommand>,
     checkpoint_barrier: Option<String>,
     checkpoint_ready_through: Option<u64>,
     checkpoint_ready_digest: Option<String>,
@@ -722,19 +738,34 @@ impl DurableRelay {
                             queued.command_id
                         );
                     }
-                    let prompt = queued
-                        .content
-                        .into_iter()
-                        .map(serde_json::from_value)
-                        .collect::<serde_json::Result<Vec<ContentBlock>>>()
-                        .with_context(|| {
-                            format!(
-                                "decode ACP content for restored queued command {}",
-                                queued.command_id
-                            )
-                        })?;
-                    let command = RelayCommand::Prompt {
-                        prompt: prompt.clone(),
+                    let payload = match queued.kind {
+                        CanonicalQueuedCommandKind::Prompt => StoredQueuedRelayPayload::Prompt {
+                            prompt: queued
+                                .content
+                                .into_iter()
+                                .map(serde_json::from_value)
+                                .collect::<serde_json::Result<Vec<ContentBlock>>>()
+                                .with_context(|| {
+                                    format!(
+                                        "decode ACP content for restored queued command {}",
+                                        queued.command_id
+                                    )
+                                })?,
+                        },
+                        CanonicalQueuedCommandKind::SetConfig { key, value } => {
+                            StoredQueuedRelayPayload::SetConfig { key, value }
+                        }
+                    };
+                    let command = match &payload {
+                        StoredQueuedRelayPayload::Prompt { prompt } => RelayCommand::Prompt {
+                            prompt: prompt.clone(),
+                        },
+                        StoredQueuedRelayPayload::SetConfig { key, value } => {
+                            RelayCommand::SetConfig {
+                                key: key.clone(),
+                                value: value.clone(),
+                            }
+                        }
                     };
                     snapshot.handled_commands.insert(
                         queued.command_id.clone(),
@@ -751,9 +782,9 @@ impl DurableRelay {
                             state: RelayDispatchState::Queued,
                         },
                     );
-                    snapshot.queued_prompts.push(StoredQueuedRelayPrompt {
+                    snapshot.queued_prompts.push(StoredQueuedRelayCommand {
                         command_id: queued.command_id,
-                        prompt,
+                        payload,
                         created_at_ms: queued.queued_at_ms,
                     });
                 }
@@ -788,9 +819,70 @@ impl DurableRelay {
         if !state_path.exists() || relay.snapshot.latest_ordinal > snapshot_ordinal {
             relay.persist_snapshot()?;
         }
+        relay.adopt_unqueued_queue_commands()?;
         relay.recover_nonterminal_commands()?;
-        relay.promote_next_prompt()?;
+        relay.promote_next_queued_command()?;
         Ok(relay)
+    }
+
+    /// Adopt queueable commands that an earlier relay format accepted outside
+    /// the durable queue. Configuration changes used to dispatch through the
+    /// control path, so a command accepted just before an upgrade would
+    /// otherwise stay accepted forever without ever being promoted.
+    fn adopt_unqueued_queue_commands(&mut self) -> Result<()> {
+        let mut adopted: Vec<(u64, StoredQueuedRelayCommand)> = Vec::new();
+        for (command_id, dispatch) in &self.snapshot.dispatches {
+            if dispatch.state != RelayDispatchState::Queued
+                || !dispatch.command.is_queue_entry()
+                || self
+                    .snapshot
+                    .queued_prompts
+                    .iter()
+                    .any(|queued| queued.command_id == *command_id)
+            {
+                continue;
+            }
+            let Some(handled) = self.snapshot.handled_commands.get(command_id) else {
+                continue;
+            };
+            let payload = match &dispatch.command {
+                RelayCommand::Prompt { prompt } => StoredQueuedRelayPayload::Prompt {
+                    prompt: prompt.clone(),
+                },
+                RelayCommand::SetConfig { key, value } => StoredQueuedRelayPayload::SetConfig {
+                    key: key.clone(),
+                    value: value.clone(),
+                },
+                _ => continue,
+            };
+            adopted.push((
+                handled.accepted_ordinal,
+                StoredQueuedRelayCommand {
+                    command_id: command_id.clone(),
+                    payload,
+                    created_at_ms: now_unix_millis(),
+                },
+            ));
+        }
+        if adopted.is_empty() {
+            return Ok(());
+        }
+        let existing = std::mem::take(&mut self.snapshot.queued_prompts);
+        let mut ordered: Vec<(u64, StoredQueuedRelayCommand)> = existing
+            .into_iter()
+            .map(|queued| {
+                let accepted = self
+                    .snapshot
+                    .handled_commands
+                    .get(&queued.command_id)
+                    .map_or(0, |handled| handled.accepted_ordinal);
+                (accepted, queued)
+            })
+            .collect();
+        ordered.extend(adopted);
+        ordered.sort_by_key(|(accepted, _)| *accepted);
+        self.snapshot.queued_prompts = ordered.into_iter().map(|(_, queued)| queued).collect();
+        self.persist_snapshot()
     }
 
     pub fn operational_state(&self) -> RelayOperationalState {
@@ -1080,6 +1172,16 @@ impl DurableRelay {
                 None,
             )));
         }
+        if let RelayCommand::SetConfig { key, value } = &command
+            && (key.trim().is_empty() || value.trim().is_empty())
+        {
+            return Ok(Err(relay_protocol_error(
+                RelayErrorCode::InvalidRequest,
+                "configuration key and value are required",
+                false,
+                None,
+            )));
+        }
         if let RelayCommand::Cancel = command
             && self.snapshot.active_prompt.is_none()
         {
@@ -1164,7 +1266,7 @@ impl DurableRelay {
         if command.is_relay_local() {
             self.finish_relay_local_command(command_id)?;
         }
-        self.promote_next_prompt()?;
+        self.promote_next_queued_command()?;
         Ok(Ok(RelayResponsePayload::Accepted {
             command_id: command_id.to_owned(),
             ordinal: accepted_ordinal,
@@ -1310,7 +1412,7 @@ impl DurableRelay {
         if !acp_session_configured || maximum == 0 {
             return Ok(Vec::new());
         }
-        self.promote_next_prompt()?;
+        self.promote_next_queued_command()?;
         if self.snapshot.checkpoint_barrier.is_none() {
             if let Some((barrier_id, barrier_ordinal)) = self.next_queued_checkpoint() {
                 let mut earlier_controls = self.queued_controls_before(barrier_ordinal);
@@ -1407,7 +1509,7 @@ impl DurableRelay {
             .filter_map(|(command_id, dispatch)| {
                 if dispatch.state != RelayDispatchState::Queued
                     || !dispatch.command.is_effectful_acp()
-                    || dispatch.command.is_prompt()
+                    || dispatch.command.is_queue_entry()
                 {
                     return None;
                 }
@@ -1416,11 +1518,10 @@ impl DurableRelay {
                     .handled_commands
                     .get(command_id)?
                     .accepted_ordinal;
-                // ACP configuration changes are only valid while the session
-                // is idle. Preserve commands accepted before the active
-                // prompt (they must reach ACP first), but keep later controls
-                // queued until that prompt finishes. Cancel is the one ACP
-                // control that deliberately bypasses a running prompt.
+                // Preserve controls accepted before the active prompt (they
+                // must reach ACP first), but keep later controls queued until
+                // that prompt finishes. Cancel is the one ACP control that
+                // deliberately bypasses a running prompt.
                 if active_prompt_ordinal.is_some_and(|prompt| accepted > prompt)
                     && !matches!(dispatch.command, RelayCommand::Cancel)
                 {
@@ -1497,7 +1598,7 @@ impl DurableRelay {
                 outcome,
             },
         )?;
-        self.promote_next_prompt()?;
+        self.promote_next_queued_command()?;
         Ok(ordinal)
     }
 
@@ -1516,7 +1617,7 @@ impl DurableRelay {
                 message: message.into(),
             },
         )?;
-        self.promote_next_prompt()?;
+        self.promote_next_queued_command()?;
         Ok(ordinal)
     }
 
@@ -1535,7 +1636,7 @@ impl DurableRelay {
                 message: message.into(),
             },
         )?;
-        self.promote_next_prompt()?;
+        self.promote_next_queued_command()?;
         Ok(ordinal)
     }
 
@@ -1596,7 +1697,7 @@ impl DurableRelay {
                     .to_owned(),
             },
         )?;
-        self.promote_next_prompt()?;
+        self.promote_next_queued_command()?;
         Ok(Some(ordinal))
     }
 
@@ -1771,8 +1872,11 @@ impl DurableRelay {
         }
     }
 
-    fn promote_next_prompt(&mut self) -> Result<Option<u64>> {
+    /// Start the head of the durable command queue once the relay is idle.
+    /// Entries run strictly one at a time, in the order they were accepted.
+    fn promote_next_queued_command(&mut self) -> Result<Option<u64>> {
         if self.snapshot.active_prompt.is_some()
+            || self.promoted_config_in_progress()
             || self.snapshot.checkpoint_barrier.is_some()
             || self.snapshot.execution != RelayExecutionState::Idle
             || self.pending_checkpoint_barrier()
@@ -1780,17 +1884,30 @@ impl DurableRelay {
         {
             return Ok(None);
         }
-        let Some(prompt) = self.snapshot.queued_prompts.first().cloned() else {
+        let Some(queued) = self.snapshot.queued_prompts.first().cloned() else {
             return Ok(None);
         };
         let ordinal = self.append_relay_event(
-            Some(&prompt.command_id),
+            Some(&queued.command_id),
             RelayObservation::CommandStarted {
-                command_id: prompt.command_id.clone(),
+                command_id: queued.command_id.clone(),
                 started_at_ms: now_unix_millis(),
             },
         )?;
         Ok(Some(ordinal))
+    }
+
+    /// A promoted configuration change leaves execution idle while it reaches
+    /// ACP, so the queue needs its own guard to stay sequential. Completion,
+    /// rejection, and interruption all promote the next entry.
+    fn promoted_config_in_progress(&self) -> bool {
+        self.snapshot.dispatches.values().any(|dispatch| {
+            matches!(dispatch.command, RelayCommand::SetConfig { .. })
+                && matches!(
+                    dispatch.state,
+                    RelayDispatchState::Pending | RelayDispatchState::InFlight
+                )
+        })
     }
 
     fn pending_checkpoint_barrier(&self) -> bool {
@@ -2396,10 +2513,24 @@ fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent) -> Result
                     state: RelayDispatchState::Queued,
                 },
             );
-            if let RelayCommand::Prompt { prompt } = command {
-                snapshot.queued_prompts.push(StoredQueuedRelayPrompt {
-                    command_id: command_id.clone(),
+            // Prompts and configuration changes share one FIFO queue so they
+            // reach the agent in the order the user submitted them.
+            let payload = match command {
+                RelayCommand::Prompt { prompt } => Some(StoredQueuedRelayPayload::Prompt {
                     prompt: prompt.clone(),
+                }),
+                RelayCommand::SetConfig { key, value } => {
+                    Some(StoredQueuedRelayPayload::SetConfig {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                }
+                _ => None,
+            };
+            if let Some(payload) = payload {
+                snapshot.queued_prompts.push(StoredQueuedRelayCommand {
+                    command_id: command_id.clone(),
+                    payload,
                     created_at_ms: *created_at_ms,
                 });
             }
@@ -2424,13 +2555,28 @@ fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent) -> Result
                         .position(|queued| queued.command_id == *command_id)
                         .ok_or_else(|| anyhow!("started prompt {command_id} was not queued"))?;
                     let queued = snapshot.queued_prompts.remove(index);
+                    let StoredQueuedRelayPayload::Prompt { prompt } = queued.payload else {
+                        bail!("queued command {command_id} is not a prompt");
+                    };
                     snapshot.execution = RelayExecutionState::Running;
                     snapshot.active_prompt = Some(StoredActiveRelayPrompt {
                         command_id: queued.command_id,
-                        prompt: queued.prompt,
+                        prompt,
                         created_at_ms: queued.created_at_ms,
                         started_at_ms: *started_at_ms,
                     });
+                }
+                // A configuration change leaves the queue when it starts, but
+                // the ACP session stays idle: it applies between turns.
+                RelayCommand::SetConfig { .. } => {
+                    let index = snapshot
+                        .queued_prompts
+                        .iter()
+                        .position(|queued| queued.command_id == *command_id)
+                        .ok_or_else(|| {
+                            anyhow!("started configuration change {command_id} was not queued")
+                        })?;
+                    snapshot.queued_prompts.remove(index);
                 }
                 RelayCommand::Close { .. } => snapshot.execution = RelayExecutionState::Closing,
                 RelayCommand::BeginCheckpoint { .. } => {
@@ -2715,8 +2861,8 @@ fn terminalize_removed_prompts(
             .dispatches
             .get_mut(command_id)
             .ok_or_else(|| anyhow!("removed unknown queued command {command_id}"))?;
-        if !dispatch.command.is_prompt() || dispatch.state != RelayDispatchState::Queued {
-            bail!("removed command {command_id} is not a queued prompt");
+        if !dispatch.command.is_queue_entry() || dispatch.state != RelayDispatchState::Queued {
+            bail!("removed command {command_id} is not a queued command");
         }
         dispatch.state = RelayDispatchState::Rejected;
         snapshot
@@ -3152,6 +3298,7 @@ struct RestoredRelaySeed {
 #[derive(Debug)]
 struct RestoredQueuedPrompt {
     command_id: String,
+    kind: CanonicalQueuedCommandKind,
     content: Vec<Value>,
     queued_at_ms: i64,
 }
@@ -3175,6 +3322,7 @@ fn read_restored_relay_seed(root: &Path) -> Result<Option<RestoredRelaySeed>> {
             .into_iter()
             .map(|queued| RestoredQueuedPrompt {
                 command_id: queued.command_id,
+                kind: queued.kind,
                 content: queued.content,
                 queued_at_ms: queued.queued_at_ms,
             })
@@ -3523,6 +3671,33 @@ mod tests {
         RelayCommand::Prompt {
             prompt: vec![ContentBlock::from(text)],
         }
+    }
+
+    fn set_config(key: &str, value: &str) -> RelayCommand {
+        RelayCommand::SetConfig {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    fn queued_command_ids(relay: &DurableRelay) -> Vec<String> {
+        relay
+            .operational_state()
+            .queued_prompts
+            .into_iter()
+            .map(|queued| queued.command_id)
+            .collect()
+    }
+
+    fn finish_prompt(relay: &mut DurableRelay, command_id: &str) {
+        relay
+            .record_command_completed(
+                command_id,
+                RelayCommandOutcome::Prompt {
+                    stop_reason: "end_turn".into(),
+                },
+            )
+            .unwrap();
     }
 
     fn retained_events(relay: &DurableRelay) -> Vec<RelayEvent> {
@@ -4266,10 +4441,7 @@ mod tests {
         submit_relay(
             &mut relay,
             "config-after-prompt",
-            RelayCommand::SetConfig {
-                key: "model".into(),
-                value: "later".into(),
-            },
+            set_config("model", "later"),
         );
         submit_relay(&mut relay, "cancel-after-config", RelayCommand::Cancel);
 
@@ -4299,20 +4471,231 @@ mod tests {
     fn config_accepted_before_a_prompt_keeps_acceptance_order() {
         let temp = tempfile::tempdir().unwrap();
         let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
-        submit_relay(
-            &mut relay,
-            "config-first",
-            RelayCommand::SetConfig {
-                key: "model".into(),
-                value: "first".into(),
-            },
-        );
+        submit_relay(&mut relay, "config-first", set_config("model", "first"));
         submit_relay(&mut relay, "prompt-second", prompt("then run"));
 
+        // Queue entries run one at a time, so the prompt waits for the
+        // configuration change accepted before it.
+        let config = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(config.len(), 1);
+        assert_eq!(config[0].command_id, "config-first");
+        assert!(relay.claim_pending_commands(true).unwrap().is_empty());
+
+        relay
+            .record_command_completed("config-first", RelayCommandOutcome::Configured)
+            .unwrap();
         let claimed = relay.claim_pending_commands(true).unwrap();
-        assert_eq!(claimed.len(), 2);
-        assert_eq!(claimed[0].command_id, "config-first");
-        assert_eq!(claimed[1].command_id, "prompt-second");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].command_id, "prompt-second");
+    }
+
+    #[test]
+    fn config_queued_behind_a_prompt_applies_in_queue_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "prompt-one", prompt("one"));
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "prompt-one"
+        );
+
+        submit_relay(&mut relay, "prompt-two", prompt("two"));
+        submit_relay(&mut relay, "config-third", set_config("model", "sonnet"));
+        submit_relay(&mut relay, "prompt-four", prompt("four"));
+        assert_eq!(
+            queued_command_ids(&relay),
+            ["prompt-two", "config-third", "prompt-four"]
+        );
+        assert!(relay.claim_pending_commands(true).unwrap().is_empty());
+
+        finish_prompt(&mut relay, "prompt-one");
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "prompt-two"
+        );
+        finish_prompt(&mut relay, "prompt-two");
+
+        let config = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(config.len(), 1);
+        assert_eq!(config[0].command_id, "config-third");
+        assert!(matches!(config[0].command, RelayCommand::SetConfig { .. }));
+        // A configuration change applies between turns, so the relay stays
+        // idle and the prompt behind it waits for the change to finish.
+        assert_eq!(
+            relay.operational_state().execution,
+            RelayExecutionState::Idle
+        );
+        assert!(relay.claim_pending_commands(true).unwrap().is_empty());
+
+        relay
+            .record_command_completed("config-third", RelayCommandOutcome::Configured)
+            .unwrap();
+        assert_eq!(
+            relay
+                .operational_state()
+                .config
+                .get("model")
+                .map(String::as_str),
+            Some("sonnet")
+        );
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "prompt-four"
+        );
+    }
+
+    #[test]
+    fn removing_a_queued_config_stops_it_from_dispatching() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "active-prompt", prompt("running"));
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "active-prompt"
+        );
+        submit_relay(&mut relay, "config-queued", set_config("effort", "high"));
+        submit_relay(
+            &mut relay,
+            "remove-config",
+            RelayCommand::RemoveQueuedPrompt {
+                queued_command_id: "config-queued".into(),
+            },
+        );
+
+        assert!(queued_command_ids(&relay).is_empty());
+        assert_eq!(
+            relay.snapshot.dispatches["config-queued"].state,
+            RelayDispatchState::Rejected
+        );
+        assert!(
+            relay.snapshot.handled_commands["config-queued"]
+                .terminal_ordinal
+                .is_some()
+        );
+
+        finish_prompt(&mut relay, "active-prompt");
+        assert!(relay.claim_pending_commands(true).unwrap().is_empty());
+        assert!(relay.operational_state().config.is_empty());
+    }
+
+    #[test]
+    fn clearing_the_queue_drops_queued_configuration_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "active-prompt", prompt("running"));
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "active-prompt"
+        );
+        submit_relay(&mut relay, "queued-prompt", prompt("later"));
+        submit_relay(&mut relay, "queued-config", set_config("model", "later"));
+
+        submit_relay(&mut relay, "clear-queue", RelayCommand::ClearQueuedPrompts);
+        assert!(queued_command_ids(&relay).is_empty());
+
+        finish_prompt(&mut relay, "active-prompt");
+        assert!(relay.claim_pending_commands(true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn restart_redispatches_a_promoted_configuration_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "config-command", set_config("model", "sonnet"));
+        // The change was started but never handed to ACP.
+        assert!(queued_command_ids(&relay).is_empty());
+        drop(relay);
+
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let claimed = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].command_id, "config-command");
+        assert!(matches!(claimed[0].command, RelayCommand::SetConfig { .. }));
+    }
+
+    #[test]
+    fn restart_adopts_a_config_accepted_outside_the_durable_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        // The prompt is started but never handed to ACP, so restarting keeps
+        // it active instead of interrupting it.
+        submit_relay(&mut relay, "active-prompt", prompt("running"));
+        submit_relay(&mut relay, "config-queued", set_config("model", "sonnet"));
+        drop(relay);
+
+        // Rewrite the durable snapshot the way an older relay wrote it: the
+        // configuration change is accepted, but not in the command queue.
+        let state_path = temp.path().join(RELAY_STATE_FILE);
+        let mut state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        state["queued_prompts"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|queued| queued["command_id"] != "config-queued");
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(queued_command_ids(&relay), ["config-queued"]);
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "active-prompt"
+        );
+        finish_prompt(&mut relay, "active-prompt");
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "config-queued"
+        );
+    }
+
+    #[test]
+    fn queue_entries_written_before_config_changes_still_load() {
+        let stored: StoredQueuedRelayCommand = serde_json::from_value(serde_json::json!({
+            "command_id": "queued-1",
+            "prompt": [{"type": "text", "text": "hello"}],
+            "created_at_ms": 7,
+        }))
+        .unwrap();
+        assert!(matches!(
+            stored.payload,
+            StoredQueuedRelayPayload::Prompt { .. }
+        ));
+
+        let config = StoredQueuedRelayCommand {
+            command_id: "queued-2".into(),
+            payload: StoredQueuedRelayPayload::SetConfig {
+                key: "model".into(),
+                value: "sonnet".into(),
+            },
+            created_at_ms: 8,
+        };
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(encoded["key"], "model");
+        assert_eq!(
+            serde_json::from_value::<StoredQueuedRelayCommand>(encoded).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn an_incomplete_configuration_change_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let response = relay.handle(relay_request(
+            "reject-empty-config",
+            RelayRequest::Submit {
+                command_id: "empty-config".into(),
+                command: set_config("model", "  "),
+            },
+        ));
+        assert!(matches!(
+            response.body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::InvalidRequest,
+                    ..
+                }
+            }
+        ));
+        assert!(queued_command_ids(&relay).is_empty());
     }
 
     #[test]
@@ -5211,6 +5594,59 @@ mod tests {
                 .unwrap()[0]
                 .ordinal,
             42
+        );
+    }
+
+    #[test]
+    fn restored_relay_rebuilds_a_queued_configuration_change() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path()
+                .join(crate::hel_checkpoint::RESTORED_CANONICAL_SESSION_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "event_frontier": 41,
+                "event_frontier_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "session": {
+                    "execution": {"state": "idle"},
+                    "last_activity_at_ms": 1234,
+                    "session_title": null,
+                    "configuration": {}
+                },
+                "transcript": [],
+                "queued_prompts": [
+                    {
+                        "command_id": "restored-config",
+                        "kind": {"set_config": {"key": "model", "value": "sonnet"}},
+                        "content": [{"type": "text", "text": "/model sonnet"}],
+                        "queued_at_ms": 1234
+                    },
+                    {
+                        "command_id": "restored-prompt",
+                        "content": [{"type": "text", "text": "continue offline"}],
+                        "queued_at_ms": 1235
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let claimed = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].command_id, "restored-config");
+        assert_eq!(
+            claimed[0].command,
+            set_config("model", "sonnet"),
+            "a restored configuration change must not become a prompt"
+        );
+
+        relay
+            .record_command_completed("restored-config", RelayCommandOutcome::Configured)
+            .unwrap();
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "restored-prompt"
         );
     }
 

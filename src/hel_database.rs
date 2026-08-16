@@ -21,7 +21,7 @@ use crate::hel_state::{
 use crate::hel_targets::AdditionalMount;
 use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryScope {
@@ -316,6 +316,19 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
     }
     ensure_projection_digest_column(connection)?;
     ensure_session_draft_input_column(connection)?;
+    if version < 8 {
+        // Queue entries gained a kind so a configuration change can wait in the
+        // same queue as prompts. Rows written before that are prompts.
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE materialized_queued_prompts
+                 ADD COLUMN kind_json TEXT NOT NULL DEFAULT '\"prompt\"';
+             INSERT INTO schema_migrations(version, applied_at)
+                 VALUES (8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+             PRAGMA user_version = 8;
+             COMMIT;",
+        )?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -819,7 +832,7 @@ fn load_materialized_queued_prompts_from(
 ) -> Result<BTreeMap<String, Vec<MaterializedQueuedPrompt>>> {
     let connection = open(path)?;
     let mut statement = connection.prepare(
-        "SELECT session_id, command_id, content_json, queued_at_ms
+        "SELECT session_id, command_id, kind_json, content_json, queued_at_ms
          FROM materialized_queued_prompts
          ORDER BY session_id, ordinal",
     )?;
@@ -828,20 +841,25 @@ fn load_materialized_queued_prompts_from(
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
         ))
     })?;
     let mut queues = BTreeMap::<String, Vec<MaterializedQueuedPrompt>>::new();
     for row in rows {
-        let (session_id, command_id, content_json, queued_at_ms) = row?;
+        let (session_id, command_id, kind_json, content_json, queued_at_ms) = row?;
         let content = serde_json::from_str(&content_json).with_context(|| {
             format!("parse materialized queued prompt for session {session_id}")
+        })?;
+        let kind = serde_json::from_str(&kind_json).with_context(|| {
+            format!("parse materialized queue entry kind for session {session_id}")
         })?;
         queues
             .entry(session_id)
             .or_default()
             .push(MaterializedQueuedPrompt {
                 command_id,
+                kind,
                 content,
                 queued_at_ms,
             });
@@ -940,7 +958,7 @@ fn load_materialized_session_with(
         .collect::<Result<Vec<_>>>()?;
 
     let mut queue_statement = connection.prepare(
-        "SELECT command_id, content_json, queued_at_ms
+        "SELECT command_id, kind_json, content_json, queued_at_ms
          FROM materialized_queued_prompts
          WHERE session_id = ?1
          ORDER BY ordinal",
@@ -950,15 +968,19 @@ fn load_materialized_session_with(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let queued_prompts = queue_rows
         .into_iter()
-        .map(|(command_id, content_json, queued_at_ms)| {
+        .map(|(command_id, kind_json, content_json, queued_at_ms)| {
             Ok(MaterializedQueuedPrompt {
                 command_id,
+                kind: serde_json::from_str(&kind_json).with_context(|| {
+                    format!("parse materialized queue entry kind for session {session_id}")
+                })?,
                 content: serde_json::from_str(&content_json).with_context(|| {
                     format!("parse materialized queued prompt for session {session_id}")
                 })?,
@@ -1511,12 +1533,13 @@ fn replace_materialized_queue(
     for (ordinal, prompt) in queued_prompts.iter().enumerate() {
         tx.execute(
             "INSERT INTO materialized_queued_prompts(
-                 session_id, ordinal, command_id, content_json, queued_at_ms
-             ) VALUES (?1,?2,?3,?4,?5)",
+                 session_id, ordinal, command_id, kind_json, content_json, queued_at_ms
+             ) VALUES (?1,?2,?3,?4,?5,?6)",
             params![
                 session_id,
                 ordinal as i64,
                 prompt.command_id,
+                serde_json::to_string(&prompt.kind)?,
                 serde_json::to_string(&prompt.content)?,
                 prompt.queued_at_ms,
             ],
@@ -2137,7 +2160,7 @@ impl<'a> ValueRefExt<'a> for rusqlite::types::ValueRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hel_state::{ManagedWorktreeTarget, TranscriptBody};
+    use crate::hel_state::{ManagedWorktreeTarget, QueuedCommandKind, TranscriptBody};
     use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
     use rusqlite::OptionalExtension;
 
@@ -2272,6 +2295,7 @@ mod tests {
             ],
             queued_prompts: vec![MaterializedQueuedPrompt {
                 command_id: "prompt-2".into(),
+                kind: QueuedCommandKind::Prompt,
                 content: vec![serde_json::json!({"type": "text", "text": "then test"})],
                 queued_at_ms: 1_500,
             }],
@@ -2828,9 +2852,58 @@ mod tests {
             ("session_checkpoints", "event_frontier"),
             ("prompt_history", "event_ordinal"),
             ("materialized_sessions", "applied_event_digest"),
+            ("materialized_queued_prompts", "kind_json"),
         ] {
             assert!(table_has_column(&connection, table, column).unwrap());
         }
+    }
+
+    #[test]
+    fn queue_entry_kinds_round_trip_and_default_to_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        save_session_to(&database, &session("session-1", "project-1")).unwrap();
+        let mut materialized = materialized_session("session-1");
+        materialized.queued_prompts.push(MaterializedQueuedPrompt {
+            command_id: "config-1".into(),
+            kind: QueuedCommandKind::SetConfig {
+                key: "model".into(),
+                value: "sonnet".into(),
+            },
+            content: vec![serde_json::json!({"type": "text", "text": "/model sonnet"})],
+            queued_at_ms: 1_600,
+        });
+        save_materialized_session_to(&database, &materialized).unwrap();
+
+        let loaded = load_materialized_session_from(&database, "session-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.queued_prompts, materialized.queued_prompts);
+        assert_eq!(
+            load_materialized_queued_prompts_from(&database).unwrap()["session-1"],
+            materialized.queued_prompts
+        );
+
+        // Rows written before queue entries carried a kind load as prompts.
+        let connection = open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO materialized_queued_prompts(
+                     session_id, ordinal, command_id, content_json, queued_at_ms
+                 ) VALUES ('session-1', 9, 'legacy-1', ?1, 1700)",
+                params![serde_json::json!([{"type": "text", "text": "older"}]).to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let loaded = load_materialized_session_from(&database, "session-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.queued_prompts.last().unwrap().command_id, "legacy-1");
+        assert_eq!(
+            loaded.queued_prompts.last().unwrap().kind,
+            QueuedCommandKind::Prompt
+        );
     }
 
     #[test]
@@ -2916,6 +2989,7 @@ mod tests {
             transcript: vec![TranscriptMutation::Upsert(first_item.clone())],
             queued_prompts: Some(vec![MaterializedQueuedPrompt {
                 command_id: "prompt-2".into(),
+                kind: QueuedCommandKind::Prompt,
                 content: vec![serde_json::json!({"type": "text", "text": "next"})],
                 queued_at_ms: 105,
             }]),
@@ -3178,6 +3252,7 @@ mod tests {
                 last_activity_at_ms: Some(500),
                 queued_prompts: Some(vec![MaterializedQueuedPrompt {
                     command_id: "queued-1".into(),
+                    kind: QueuedCommandKind::Prompt,
                     content: vec![serde_json::json!({"type": "text", "text": "later"})],
                     queued_at_ms: 500,
                 }]),
