@@ -3344,6 +3344,32 @@ async fn open_chat_view(
     ))
 }
 
+/// Makes `session_id` the chat the loop holds. A warm chat for the same
+/// session is left as it is, so showing it costs a draw; any other session is
+/// opened fresh, which drops the previous chat and detaches its proxy.
+async fn hold_chat_session(
+    controller: &Controller,
+    active_chat: &mut Option<hel::hel_chat::ActiveChat>,
+    session_id: &str,
+    sessions: &SessionManagerControl,
+    recovery_observer: &hel::hel_recovery::RecoveryObserver,
+    notices: hel::hel_chat::Notices,
+) -> Result<()> {
+    if active_chat
+        .as_ref()
+        .is_some_and(|chat| chat.session_id() == session_id)
+    {
+        // The warm chat is this session: it has been following the worker off
+        // screen, so showing it is only a redraw.
+        return Ok(());
+    }
+    let chat = open_chat_view(controller, session_id, sessions, recovery_observer, notices).await?;
+    // Only one chat stays warm, so the previous one is dropped here; its
+    // supervisor detaches on drop.
+    *active_chat = Some(chat);
+    Ok(())
+}
+
 /// Records what leaving a chat produced — how far the user has read and the
 /// input they left unsent — and persists both in the background. A missing
 /// session is reported rather than fatal: the session itself is unaffected.
@@ -4205,8 +4231,59 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
         }
+        let quitting = matches!(
+            chat_outcome,
+            hel::hel_chat::ChatEventOutcome::QuitDetach { .. }
+        );
         match chat_outcome {
             hel::hel_chat::ChatEventOutcome::None | hel::hel_chat::ChatEventOutcome::Handled => {}
+            hel::hel_chat::ChatEventOutcome::SwitchSession {
+                session_id,
+                last_seen_event_ordinal,
+            } => {
+                // The session being left is saved exactly as `Back` saves it;
+                // only the view it hands over to differs.
+                let detached = active_chat
+                    .as_ref()
+                    .map(|chat| (chat.session_id().to_owned(), chat.draft().to_owned()));
+                if let Some((detached_id, draft)) = detached {
+                    record_chat_detach_state(
+                        &mut controller,
+                        &mut dashboard,
+                        &detached_id,
+                        last_seen_event_ordinal,
+                        &draft,
+                        &dashboard_io_tx,
+                    );
+                }
+                // Keep the session list on the conversation now on screen, so
+                // returning to it lands where the user left off.
+                dashboard.select_active_session(&session_id);
+                // The view stays on a chat either way: the session that opened,
+                // or the one still here with the notice saying why it did not.
+                match hold_chat_session(
+                    &controller,
+                    &mut active_chat,
+                    &session_id,
+                    &worker_commands_tx,
+                    &recovery_observer,
+                    notices.clone(),
+                )
+                .await
+                {
+                    // The user arrived by walking the list, so the pane keeps
+                    // focus and the next key walks on from here.
+                    Ok(()) => {
+                        if let Some(chat) = active_chat.as_mut() {
+                            chat.focus_conversations();
+                        }
+                    }
+                    Err(error) => {
+                        dashboard.set_notice(format!("Could not open session: {error:#}"));
+                    }
+                }
+                dirty = true;
+            }
             hel::hel_chat::ChatEventOutcome::Back {
                 last_seen_event_ordinal,
             }
@@ -4233,10 +4310,7 @@ async fn run_dashboard() -> Result<()> {
                         &dashboard_io_tx,
                     )
                 });
-                if matches!(
-                    chat_outcome,
-                    hel::hel_chat::ChatEventOutcome::QuitDetach { .. }
-                ) {
+                if quitting {
                     // Quitting leaves this loop for process exit, so the detach
                     // write has to land first. Bounded so a stuck database
                     // cannot hang the quit.
@@ -4485,36 +4559,22 @@ async fn run_dashboard() -> Result<()> {
                 );
             }
             DashboardAction::Open { session_id } => {
-                if active_chat
-                    .as_ref()
-                    .is_some_and(|chat| chat.session_id() == session_id)
+                match hold_chat_session(
+                    &controller,
+                    &mut active_chat,
+                    &session_id,
+                    &worker_commands_tx,
+                    &recovery_observer,
+                    notices.clone(),
+                )
+                .await
                 {
-                    // The warm chat is this session: it has been following the
-                    // worker off screen, so showing it is only a redraw.
-                    view = View::Chat;
-                    dirty = true;
-                } else {
-                    match open_chat_view(
-                        &controller,
-                        &session_id,
-                        &worker_commands_tx,
-                        &recovery_observer,
-                        notices.clone(),
-                    )
-                    .await
-                    {
-                        Ok(chat) => {
-                            // Only one chat stays warm, so the previous one is
-                            // dropped here; its supervisor detaches on drop.
-                            active_chat = Some(chat);
-                            view = View::Chat;
-                            dirty = true;
-                        }
-                        Err(error) => {
-                            dashboard.set_notice(format!("Could not open session: {error:#}"));
-                        }
+                    Ok(()) => view = View::Chat,
+                    Err(error) => {
+                        dashboard.set_notice(format!("Could not open session: {error:#}"));
                     }
                 }
+                dirty = true;
             }
             DashboardAction::ResumeSession {
                 session_id,

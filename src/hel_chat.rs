@@ -17,7 +17,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
@@ -47,17 +47,31 @@ use rendering::{
 
 const MOUSE_SCROLL_ROWS: usize = 3;
 
+/// How many conversations the pane shows at once. The transcript owns the rest
+/// of the screen, so the list stays a window however many sessions are open.
+const CONVERSATIONS_PANE_MAX_ROWS: usize = 7;
+
 /// What one terminal event asked the chat to do.
 ///
 /// `None` means the event only changed local state, which lets the caller keep
-/// draining a paste burst before it redraws. Both exits report the ordinal the
+/// draining a paste burst before it redraws. Every exit reports the ordinal the
 /// user has now seen, which becomes the session's read receipt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatEventOutcome {
     None,
     Handled,
-    Back { last_seen_event_ordinal: u64 },
-    QuitDetach { last_seen_event_ordinal: u64 },
+    Back {
+        last_seen_event_ordinal: u64,
+    },
+    /// The user picked another conversation. The caller saves this session the
+    /// way it saves a `Back` and then opens `session_id`.
+    SwitchSession {
+        session_id: String,
+        last_seen_event_ordinal: u64,
+    },
+    QuitDetach {
+        last_seen_event_ordinal: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +83,7 @@ pub enum ChatAction {
     Cancel,
     PasteFromClipboard,
     ToggleVoice,
+    SwitchSession { session_id: String },
     Back,
     QuitDetach,
 }
@@ -173,13 +188,23 @@ pub struct OtherSessionIdentity {
     pub project: String,
 }
 
-/// What the session header says about one other session.
+/// What the conversations pane says about one other session. The id travels
+/// with the activity so a row the user picks resolves to a session to open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OtherSessionActivity {
+    session_id: String,
     position: usize,
     project: String,
     turn_started_at_epoch_seconds: Option<u64>,
     last_agent_line: Option<String>,
+}
+
+/// Which part of the chat view the keyboard is driving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ChatFocus {
+    #[default]
+    Prompt,
+    Conversations,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -999,6 +1024,14 @@ pub struct ChatState {
     position: usize,
     turn_started_at_epoch_seconds: Option<u64>,
     other_sessions: Vec<OtherSessionActivity>,
+    focus: ChatFocus,
+    /// Where the conversations pane's window starts. `None` centres it on the
+    /// current session; the wheel pins it somewhere else until the keyboard
+    /// moves through the list again.
+    conversations_window_start: Option<usize>,
+    /// The pane's hitbox, recorded each frame so the wheel knows what it is
+    /// over. `None` before the first draw.
+    conversations_area: Option<Rect>,
 }
 
 impl ChatState {
@@ -1055,6 +1088,9 @@ impl ChatState {
             position: 0,
             turn_started_at_epoch_seconds: None,
             other_sessions: Vec::new(),
+            focus: ChatFocus::Prompt,
+            conversations_window_start: None,
+            conversations_area: None,
         };
         state.apply_events(events);
         // Bootstrap replays the full canonical log for transcript projection,
@@ -1488,6 +1524,8 @@ impl ChatState {
         self.render_mode = TranscriptRenderMode::Rich;
         self.notices.clear();
         self.voice_active = false;
+        self.focus = ChatFocus::Prompt;
+        self.conversations_window_start = None;
     }
 
     fn set_input(&mut self, input: String) {
@@ -2264,6 +2302,10 @@ impl ChatState {
             return ChatAction::None;
         }
 
+        if self.focus == ChatFocus::Conversations {
+            return self.handle_conversations_key(code, modifiers);
+        }
+
         if code == KeyCode::Esc {
             return if self.phase == WorkerPhase::Running {
                 ChatAction::Cancel
@@ -2278,11 +2320,7 @@ impl ChatState {
                     return ChatAction::None;
                 }
                 KeyCode::Char('t') => {
-                    self.render_mode = self.render_mode.toggled();
-                    self.notices.set(match self.render_mode {
-                        TranscriptRenderMode::Rich => "Rich transcript rendering enabled",
-                        TranscriptRenderMode::Raw => "Raw transcript source enabled",
-                    });
+                    self.toggle_render_mode();
                     return ChatAction::None;
                 }
                 KeyCode::Char('a') => self.move_to_line_start(true),
@@ -2384,8 +2422,12 @@ impl ChatState {
                 self.delete();
                 ChatAction::None
             }
+            // Tab completes an open popup first; with none open it is the
+            // handle on the conversations pane.
             KeyCode::Tab => {
-                self.accept_autocomplete();
+                if !self.accept_autocomplete() {
+                    self.focus_conversations();
+                }
                 ChatAction::None
             }
             KeyCode::Char(character)
@@ -2453,12 +2495,120 @@ impl ChatState {
         }
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_history_up(MOUSE_SCROLL_ROWS),
-            MouseEventKind::ScrollDown => self.scroll_history_down(MOUSE_SCROLL_ROWS),
+    /// Keys while the conversations pane has focus. The pane owns the arrows
+    /// and the vi keys; the transcript keys keep working from either focus, and
+    /// text keys are dropped rather than leaking into the composer.
+    fn handle_conversations_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> ChatAction {
+        let control = modifiers.contains(KeyModifiers::CONTROL);
+        let plain = !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match code {
+            KeyCode::Char('t') if control => {
+                self.toggle_render_mode();
+                return ChatAction::None;
+            }
+            KeyCode::Home if control => {
+                self.anchor = TranscriptAnchor::Row { entry: 0, row: 0 };
+                return ChatAction::None;
+            }
+            KeyCode::End if control => {
+                self.anchor = TranscriptAnchor::Bottom;
+                return ChatAction::None;
+            }
+            KeyCode::PageUp => {
+                self.scroll_history_up(self.last_viewport_height.max(1));
+                return ChatAction::None;
+            }
+            KeyCode::PageDown => {
+                self.scroll_history_down(self.last_viewport_height.max(1));
+                return ChatAction::None;
+            }
             _ => {}
         }
+        let step = if plain && matches!(code, KeyCode::Up | KeyCode::Char('k'))
+            || control && code == KeyCode::Char('p')
+        {
+            Some(-1)
+        } else if plain && matches!(code, KeyCode::Down | KeyCode::Char('j'))
+            || control && code == KeyCode::Char('n')
+        {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(step) = step {
+            // Walking the list re-centres it, whatever the wheel left behind.
+            self.conversations_window_start = None;
+            // No wrap: the ends of the list stay put.
+            return match self.neighbour_session(step) {
+                Some(session_id) => ChatAction::SwitchSession { session_id },
+                None => ChatAction::None,
+            };
+        }
+        if matches!(code, KeyCode::Tab | KeyCode::Enter | KeyCode::Esc) {
+            self.focus = ChatFocus::Prompt;
+        }
+        ChatAction::None
+    }
+
+    fn focus_conversations(&mut self) {
+        self.focus = ChatFocus::Conversations;
+        self.conversations_window_start = None;
+    }
+
+    fn toggle_render_mode(&mut self) {
+        self.render_mode = self.render_mode.toggled();
+        self.notices.set(match self.render_mode {
+            TranscriptRenderMode::Rich => "Rich transcript rendering enabled",
+            TranscriptRenderMode::Raw => "Raw transcript source enabled",
+        });
+    }
+
+    /// The session `step` rows from the current one in the pane's order.
+    /// `None` at either end of the list, and for a list of one.
+    fn neighbour_session(&self, step: isize) -> Option<String> {
+        let rows = conversation_rows(self);
+        let current = rows.iter().position(|row| row.current)?;
+        let target = current.checked_add_signed(step)?;
+        rows.get(target).map(|row| row.session_id.clone())
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // Hover decides what scrolls; only Tab moves focus.
+        let over_conversations = self
+            .conversations_area
+            .is_some_and(|area| area.contains(Position::new(mouse.column, mouse.row)));
+        match (mouse.kind, over_conversations) {
+            (MouseEventKind::ScrollUp, true) => self.scroll_conversations(-1),
+            (MouseEventKind::ScrollDown, true) => self.scroll_conversations(1),
+            (MouseEventKind::ScrollUp, false) => self.scroll_history_up(MOUSE_SCROLL_ROWS),
+            (MouseEventKind::ScrollDown, false) => self.scroll_history_down(MOUSE_SCROLL_ROWS),
+            _ => {}
+        }
+    }
+
+    /// Moves the conversations window by `rows`, leaving the current session
+    /// where it is. Clamped to the list, so the window cannot run off either
+    /// end.
+    fn scroll_conversations(&mut self, rows: isize) {
+        let entries = conversation_rows(self);
+        let height = self
+            .conversations_area
+            .map_or(0, |area| usize::from(area.height));
+        if height == 0 || entries.len() <= height {
+            return;
+        }
+        let current = entries.iter().position(|entry| entry.current).unwrap_or(0);
+        let start = conversations_window_start(
+            entries.len(),
+            current,
+            height,
+            self.conversations_window_start,
+        );
+        self.conversations_window_start = Some(
+            start
+                .saturating_add_signed(rows)
+                .min(entries.len() - height),
+        );
     }
 
     /// Rows for the current anchor, rendering only the entries the viewport
@@ -2561,7 +2711,9 @@ impl ChatState {
     /// concrete entry and row at the top of the viewport. `None` before the
     /// first draw, when no width is known to wrap against.
     fn resolved_anchor(&mut self) -> Option<TranscriptAnchor> {
-        if self.render_cache.width == 0 {
+        // An empty transcript has no rows to anchor to, and its render cache
+        // has no entry to read.
+        if self.render_cache.width == 0 || self.entries.is_empty() {
             return None;
         }
         Some(match self.anchor {
@@ -3757,9 +3909,11 @@ pub fn turn_band_color(turn_in_flight: bool) -> Color {
 /// glyph for the row the user has selected.
 const CURRENT_SESSION_CARET: &str = "› ";
 
-/// One session's row in the header, whichever session it belongs to.
+/// One session's row in the conversations pane, whichever session it belongs
+/// to.
 #[derive(Debug)]
-struct SessionHeaderEntry {
+struct ConversationRow {
+    session_id: String,
     position: usize,
     current: bool,
     project: String,
@@ -3767,78 +3921,99 @@ struct SessionHeaderEntry {
     last_agent_line: Option<String>,
 }
 
-/// One line per active session, the current one included, in the order the
-/// session list shows them. `max_rows` caps the block: the last row then
-/// counts the sessions it left out.
-fn session_header_lines(
-    chat: &ChatState,
-    now_epoch_seconds: u64,
-    width: usize,
-    max_rows: usize,
-) -> Vec<Line<'static>> {
-    let mut entries = vec![SessionHeaderEntry {
+/// The window the conversations pane draws, and where the current session sits
+/// inside it.
+#[derive(Debug)]
+struct ConversationsPane {
+    lines: Vec<Line<'static>>,
+    /// Row of the current session within the window. `None` once the wheel has
+    /// scrolled it out of view.
+    current_row: Option<usize>,
+}
+
+/// Rows for every active session, the current one included, in the order the
+/// session list shows them.
+fn conversation_rows(chat: &ChatState) -> Vec<ConversationRow> {
+    let mut rows = vec![ConversationRow {
+        session_id: chat.session_id.clone(),
         position: chat.position,
         current: true,
         project: chat.project.clone(),
         turn_started_at_epoch_seconds: chat.turn_started_at_epoch_seconds,
         last_agent_line: chat.last_agent_line(),
     }];
-    entries.extend(
-        chat.other_sessions
-            .iter()
-            .map(|session| SessionHeaderEntry {
-                position: session.position,
-                current: false,
-                project: session.project.clone(),
-                turn_started_at_epoch_seconds: session.turn_started_at_epoch_seconds,
-                last_agent_line: session.last_agent_line.clone(),
-            }),
-    );
-    entries.sort_by_key(|entry| entry.position);
+    rows.extend(chat.other_sessions.iter().map(|session| ConversationRow {
+        session_id: session.session_id.clone(),
+        position: session.position,
+        current: false,
+        project: session.project.clone(),
+        turn_started_at_epoch_seconds: session.turn_started_at_epoch_seconds,
+        last_agent_line: session.last_agent_line.clone(),
+    }));
+    rows.sort_by_key(|row| row.position);
+    rows
+}
 
-    let max_rows = max_rows.max(1);
-    // When the sessions do not fit, the last row counts the rest instead.
-    let shown = if entries.len() > max_rows {
-        max_rows - 1
-    } else {
-        entries.len()
-    };
-    let hidden = entries.len() - shown;
-    let mut lines = entries
-        .iter()
-        .take(shown)
-        .map(|entry| {
-            let caret = if entry.current {
-                CURRENT_SESSION_CARET
-            } else {
-                "  "
-            };
-            let clock = crate::usage_format::format_turn_clock(
-                now_epoch_seconds,
-                entry.turn_started_at_epoch_seconds,
-            );
-            let band = Style::default().fg(turn_band_color(
-                entry.turn_started_at_epoch_seconds.is_some(),
-            ));
-            let last_line = entry.last_agent_line.as_deref().unwrap_or_default().trim();
-            let prefix = if last_line.is_empty() {
-                format!("{caret}{} {clock}", entry.project)
-            } else {
-                format!("{caret}{} {clock} ", entry.project)
-            };
-            let mut spans = vec![Span::styled(prefix, band)];
-            // The tail is agent text, so style it the way the conversation does.
-            spans.extend(agent_text_spans(last_line));
-            truncate_line_to_width(Line::from(spans), width)
-        })
-        .collect::<Vec<_>>();
-    if hidden > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("  +{hidden} more"),
-            Style::default().fg(Color::DarkGray),
-        )));
+/// Where a `height`-row window onto `rows` starts. Without an override the
+/// window centres on the current session; the wheel supplies one. Both are
+/// clamped, so the window never runs past either end of the list.
+fn conversations_window_start(
+    rows: usize,
+    current: usize,
+    height: usize,
+    override_start: Option<usize>,
+) -> usize {
+    let last_start = rows.saturating_sub(height);
+    match override_start {
+        Some(start) => start.min(last_start),
+        None => current.saturating_sub(height / 2).min(last_start),
     }
-    lines
+}
+
+/// The rows the pane shows, at most `max_rows` of them.
+fn conversations_pane(
+    chat: &ChatState,
+    now_epoch_seconds: u64,
+    width: usize,
+    max_rows: usize,
+) -> ConversationsPane {
+    let rows = conversation_rows(chat);
+    let height = max_rows.max(1).min(rows.len());
+    let current = rows.iter().position(|row| row.current).unwrap_or(0);
+    let start =
+        conversations_window_start(rows.len(), current, height, chat.conversations_window_start);
+    ConversationsPane {
+        lines: rows
+            .iter()
+            .skip(start)
+            .take(height)
+            .map(|row| conversation_line(row, now_epoch_seconds, width))
+            .collect(),
+        current_row: current.checked_sub(start).filter(|offset| *offset < height),
+    }
+}
+
+fn conversation_line(row: &ConversationRow, now_epoch_seconds: u64, width: usize) -> Line<'static> {
+    let caret = if row.current {
+        CURRENT_SESSION_CARET
+    } else {
+        "  "
+    };
+    let clock = crate::usage_format::format_turn_clock(
+        now_epoch_seconds,
+        row.turn_started_at_epoch_seconds,
+    );
+    let band = Style::default().fg(turn_band_color(row.turn_started_at_epoch_seconds.is_some()));
+    let last_line = row.last_agent_line.as_deref().unwrap_or_default().trim();
+    let prefix = if last_line.is_empty() {
+        format!("{caret}{} {clock}", row.project)
+    } else {
+        format!("{caret}{} {clock} ", row.project)
+    };
+    let mut spans = vec![Span::styled(prefix, band)];
+    // The tail is agent text, so style it the way the conversation does.
+    spans.extend(agent_text_spans(last_line));
+    truncate_line_to_width(Line::from(spans), width)
 }
 
 fn other_session_activity(
@@ -3846,6 +4021,7 @@ fn other_session_activity(
     session: &MaterializedSession,
 ) -> OtherSessionActivity {
     OtherSessionActivity {
+        session_id: identity.session_id.clone(),
         position: identity.position,
         project: identity.project.clone(),
         turn_started_at_epoch_seconds: turn_started_at_epoch_seconds(session.execution),
@@ -3995,20 +4171,14 @@ fn apply_session_view(state: &mut ChatState, view: Result<ManagedSessionView>) -
     true
 }
 
-/// The user has left the chat. Reports how far they have now read and clears
-/// the interaction state that should not follow them back in.
-fn detach_chat(state: &mut ChatState, quit: bool) -> ChatEventOutcome {
+/// The user has left the chat, whether for the session list, another
+/// conversation, or the shell. Clears the interaction state that should not
+/// follow them back in and reports how far they have now read, which becomes
+/// the session's read receipt.
+fn detach_chat(state: &mut ChatState) -> u64 {
     let last_seen_event_ordinal = state.latest_seq();
     state.reset_interaction();
-    if quit {
-        ChatEventOutcome::QuitDetach {
-            last_seen_event_ordinal,
-        }
-    } else {
-        ChatEventOutcome::Back {
-            last_seen_event_ordinal,
-        }
-    }
+    last_seen_event_ordinal
 }
 
 /// A chat view and every background feed behind it.
@@ -4373,9 +4543,26 @@ impl ActiveChat {
                     spawn_dictation(self.voice_updates_tx.clone(), cancel_rx);
                 }
             }
-            action @ (ChatAction::Back | ChatAction::QuitDetach) => {
+            // Every exit detaches the same way; only the label the caller acts
+            // on differs.
+            ChatAction::Back => {
                 self.cancel_dictation();
-                return detach_chat(&mut self.state, action == ChatAction::QuitDetach);
+                return ChatEventOutcome::Back {
+                    last_seen_event_ordinal: detach_chat(&mut self.state),
+                };
+            }
+            ChatAction::QuitDetach => {
+                self.cancel_dictation();
+                return ChatEventOutcome::QuitDetach {
+                    last_seen_event_ordinal: detach_chat(&mut self.state),
+                };
+            }
+            ChatAction::SwitchSession { session_id } => {
+                self.cancel_dictation();
+                return ChatEventOutcome::SwitchSession {
+                    session_id,
+                    last_seen_event_ordinal: detach_chat(&mut self.state),
+                };
             }
         }
         ChatEventOutcome::Handled
@@ -4387,6 +4574,13 @@ impl ActiveChat {
         if let Some(cancel) = self.voice_cancel.take() {
             let _ = cancel.send(());
         }
+    }
+
+    /// Opens the view with the conversations pane focused. The caller uses this
+    /// when the user arrived by walking the list, so the next key walks on from
+    /// here instead of landing in the composer.
+    pub fn focus_conversations(&mut self) {
+        self.state.focus_conversations();
     }
 
     /// Draws the view. The recovery flag is read here rather than tracked,
@@ -4427,14 +4621,14 @@ impl Drop for ActiveChat {
 
 fn render(frame: &mut Frame, chat: &mut ChatState) {
     let inner = frame.area();
-    // The header never takes more than a third of the screen.
-    let header_lines = session_header_lines(
+    // The pane never takes more than a third of the screen.
+    let pane = conversations_pane(
         chat,
         now_epoch_seconds(),
         usize::from(inner.width),
-        usize::from(inner.height / 3).max(1),
+        usize::from(inner.height / 3).clamp(1, CONVERSATIONS_PANE_MAX_ROWS),
     );
-    let header_rows = header_lines.len() as u16;
+    let pane_rows = pane.lines.len() as u16;
     let visible_queued = chat.queued_prompts.len().min(3) as u16;
     let prompt_width = usize::from(inner.width.saturating_sub(2)).max(1);
     let input_rows = input_visual_rows(&chat.input, prompt_width) as u16;
@@ -4442,19 +4636,36 @@ fn render(frame: &mut Frame, chat: &mut ChatState) {
         .saturating_add(visible_queued)
         .saturating_add(2)
         .max(4);
-    let maximum_prompt_height = inner.height.saturating_sub(6 + header_rows).max(3);
+    let maximum_prompt_height = inner.height.saturating_sub(6 + pane_rows).max(3);
     let prompt_height = desired_prompt_height.min(maximum_prompt_height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(header_rows),
+            Constraint::Length(pane_rows),
             Constraint::Min(5),
             Constraint::Length(prompt_height),
             Constraint::Length(1),
         ])
         .split(inner);
-    let (transcript_area, prompt_area, footer_area) = (chunks[1], chunks[2], chunks[3]);
-    frame.render_widget(Paragraph::new(header_lines), chunks[0]);
+    let (conversations_area, transcript_area, prompt_area, footer_area) =
+        (chunks[0], chunks[1], chunks[2], chunks[3]);
+    chat.conversations_area = Some(conversations_area);
+    frame.render_widget(Paragraph::new(pane.lines), conversations_area);
+    if chat.focus == ChatFocus::Conversations
+        && let Some(row) = pane.current_row
+        && let Some(y) = conversations_area
+            .y
+            .checked_add(row as u16)
+            .filter(|y| *y < conversations_area.bottom())
+    {
+        // A band behind the current row, the way the session list marks its
+        // selection, so the focused pane is obvious. Only the background moves:
+        // each row keeps the colours that say what its session is doing.
+        let buffer = frame.buffer_mut();
+        for x in conversations_area.x..conversations_area.right() {
+            buffer[(x, y)].set_bg(Color::DarkGray);
+        }
+    }
     render_transcript(frame, transcript_area, chat);
     let queued = chat.queued_prompts.len();
     let prompt_title = prompt_title(chat, queued);
@@ -4501,7 +4712,9 @@ fn render(frame: &mut Frame, chat: &mut ChatState) {
             .block(prompt_block),
         prompt_area,
     );
-    if chat.history_search.is_none() {
+    // The cursor belongs to whatever has focus, so the composer only shows one
+    // while the keyboard is driving it.
+    if chat.history_search.is_none() && chat.focus == ChatFocus::Prompt {
         set_input_cursor(
             frame,
             prompt_inner,
@@ -4511,7 +4724,9 @@ fn render(frame: &mut Frame, chat: &mut ChatState) {
             input_scroll,
         );
     }
-    let default_footer = if chat.voice_active {
+    let default_footer = if chat.focus == ChatFocus::Conversations {
+        "j/k or ↑/↓ switch conversation · Enter/Tab prompt · Ctrl-G dashboard"
+    } else if chat.voice_active {
         "Listening… Alt-V stop · Ctrl-G dashboard"
     } else if !chat.queued_prompts.is_empty() {
         "Up/Ctrl-P edit last queued · Enter send/queue · Shift-Enter newline · Ctrl-R history · Esc cancel · Ctrl-G dashboard"
@@ -5374,6 +5589,16 @@ mod tests {
         }
     }
 
+    /// A wheel event over `area`, which is what decides where it scrolls.
+    fn mouse_in(kind: MouseEventKind, area: Rect) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: area.x.saturating_add(1),
+            row: area.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     fn ctrl(character: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
     }
@@ -5481,18 +5706,12 @@ mod tests {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.set_input("half typed thought".into());
 
-        // Both detaches keep the composer intact: the warm chat goes on holding
+        // Detaching keeps the composer intact: the warm chat goes on holding
         // it, and the dashboard reads it here to write it to the session row.
-        assert!(matches!(
-            detach_chat(&mut chat, false),
-            ChatEventOutcome::Back { .. }
-        ));
+        detach_chat(&mut chat);
         assert_eq!(chat.input, "half typed thought");
 
-        assert!(matches!(
-            detach_chat(&mut chat, true),
-            ChatEventOutcome::QuitDetach { .. }
-        ));
+        detach_chat(&mut chat);
         assert_eq!(chat.input, "half typed thought");
     }
 
@@ -5500,7 +5719,7 @@ mod tests {
     fn detaching_an_empty_composer_leaves_an_empty_draft_to_save() {
         let mut chat = ChatState::new(&snapshot(), &[]);
 
-        detach_chat(&mut chat, false);
+        detach_chat(&mut chat);
 
         assert_eq!(chat.input, "");
     }
@@ -5609,22 +5828,12 @@ mod tests {
         apply_session_view(&mut chat, Ok(managed_view(session)));
         chat.queued_prompts.push_back(queued("queued-1", "queued"));
 
-        assert_eq!(
-            detach_chat(&mut chat, false),
-            ChatEventOutcome::Back {
-                last_seen_event_ordinal: 12
-            }
-        );
+        assert_eq!(detach_chat(&mut chat), 12);
         // The transcript stays warm for the next visit; the interaction state
         // that belonged to the visit does not.
         assert_eq!(chat.entries.len(), 1);
         assert!(chat.queued_prompts.is_empty());
-        assert_eq!(
-            detach_chat(&mut chat, true),
-            ChatEventOutcome::QuitDetach {
-                last_seen_event_ordinal: 12
-            }
-        );
+        assert_eq!(detach_chat(&mut chat), 12);
     }
 
     #[test]
@@ -5981,11 +6190,18 @@ mod tests {
         last_agent_line: &str,
     ) -> OtherSessionActivity {
         OtherSessionActivity {
+            session_id: other_session_id(position),
             position,
             project: project.to_owned(),
             turn_started_at_epoch_seconds,
             last_agent_line: (!last_agent_line.is_empty()).then(|| last_agent_line.to_owned()),
         }
+    }
+
+    /// The id `other_session` gives the row at `position`, so a test that walks
+    /// the list knows which session a key landed on.
+    fn other_session_id(position: usize) -> String {
+        format!("session-{position}")
     }
 
     fn header_chat(project: &str, position: usize, others: Vec<OtherSessionActivity>) -> ChatState {
@@ -5996,7 +6212,11 @@ mod tests {
     }
 
     fn header_text(chat: &ChatState, now_epoch_seconds: u64, width: usize) -> Vec<String> {
-        session_header_lines(chat, now_epoch_seconds, width, 10)
+        pane_text(&conversations_pane(chat, now_epoch_seconds, width, 10))
+    }
+
+    fn pane_text(pane: &ConversationsPane) -> Vec<String> {
+        pane.lines
             .iter()
             .map(|line| {
                 line.spans
@@ -6008,7 +6228,8 @@ mod tests {
     }
 
     fn header_colors(chat: &ChatState, now_epoch_seconds: u64) -> Vec<Option<Color>> {
-        session_header_lines(chat, now_epoch_seconds, 80, 10)
+        conversations_pane(chat, now_epoch_seconds, 80, 10)
+            .lines
             .iter()
             .map(|line| line.spans.first().and_then(|span| span.style.fg))
             .collect()
@@ -6053,30 +6274,288 @@ mod tests {
         );
     }
 
-    #[test]
-    fn session_header_counts_the_sessions_that_do_not_fit() {
-        let chat = header_chat(
-            "current",
-            0,
-            (1..5)
-                .map(|position| other_session(position, "other", None, ""))
+    /// A chat among `count` active sessions with the current one at `current`.
+    /// Each project names its position, so a window reads as its own bounds.
+    fn windowed_chat(count: usize, current: usize) -> ChatState {
+        header_chat(
+            &format!("project-{current}"),
+            current,
+            (0..count)
+                .filter(|position| *position != current)
+                .map(|position| other_session(position, &format!("project-{position}"), None, ""))
                 .collect(),
+        )
+    }
+
+    fn window_projects(chat: &ChatState, max_rows: usize) -> Vec<String> {
+        pane_text(&conversations_pane(chat, 0, 80, max_rows))
+            .iter()
+            .map(|line| line.trim_start_matches(['›', ' ']).replace(" [idle]", ""))
+            .collect()
+    }
+
+    #[test]
+    fn conversations_pane_centres_its_window_on_the_current_session() {
+        let chat = windowed_chat(10, 5);
+
+        assert_eq!(
+            window_projects(&chat, 7),
+            [
+                "project-2",
+                "project-3",
+                "project-4",
+                "project-5",
+                "project-6",
+                "project-7",
+                "project-8",
+            ]
+        );
+        // The current session sits in the middle of the window it centres.
+        assert_eq!(conversations_pane(&chat, 0, 80, 7).current_row, Some(3));
+    }
+
+    #[test]
+    fn conversations_pane_clamps_its_window_at_both_ends_of_the_list() {
+        let first = windowed_chat(10, 0);
+        assert_eq!(
+            window_projects(&first, 7),
+            [
+                "project-0",
+                "project-1",
+                "project-2",
+                "project-3",
+                "project-4",
+                "project-5",
+                "project-6",
+            ]
+        );
+        assert_eq!(conversations_pane(&first, 0, 80, 7).current_row, Some(0));
+
+        let last = windowed_chat(10, 9);
+        assert_eq!(
+            window_projects(&last, 7),
+            [
+                "project-3",
+                "project-4",
+                "project-5",
+                "project-6",
+                "project-7",
+                "project-8",
+                "project-9",
+            ]
+        );
+        assert_eq!(conversations_pane(&last, 0, 80, 7).current_row, Some(6));
+    }
+
+    #[test]
+    fn conversations_pane_lists_every_session_when_they_all_fit() {
+        let chat = windowed_chat(3, 1);
+
+        assert_eq!(
+            window_projects(&chat, 7),
+            ["project-0", "project-1", "project-2"]
+        );
+    }
+
+    #[test]
+    fn tab_moves_focus_between_the_prompt_and_the_conversations_pane() {
+        let mut chat = windowed_chat(3, 1);
+
+        assert_eq!(chat.handle_key(key(KeyCode::Tab)), ChatAction::None);
+        assert_eq!(chat.focus, ChatFocus::Conversations);
+
+        assert_eq!(chat.handle_key(key(KeyCode::Tab)), ChatAction::None);
+        assert_eq!(chat.focus, ChatFocus::Prompt);
+    }
+
+    #[test]
+    fn tab_completes_an_open_popup_before_it_reaches_the_conversations_pane() {
+        let mut chat = windowed_chat(3, 1);
+        chat.set_input("/hel".into());
+
+        chat.handle_key(key(KeyCode::Tab));
+
+        assert_eq!(chat.input, "/help ");
+        assert_eq!(chat.focus, ChatFocus::Prompt);
+    }
+
+    #[test]
+    fn the_conversation_list_switches_to_the_neighbouring_session() {
+        let mut chat = windowed_chat(10, 5);
+        chat.focus_conversations();
+
+        for previous in [key(KeyCode::Up), key(KeyCode::Char('k')), ctrl('p')] {
+            assert_eq!(
+                chat.handle_key(previous),
+                ChatAction::SwitchSession {
+                    session_id: other_session_id(4)
+                }
+            );
+        }
+        for next in [key(KeyCode::Down), key(KeyCode::Char('j')), ctrl('n')] {
+            assert_eq!(
+                chat.handle_key(next),
+                ChatAction::SwitchSession {
+                    session_id: other_session_id(6)
+                }
+            );
+        }
+        // The caller makes the switch, so the pane keeps its focus for the
+        // session that opens next.
+        assert_eq!(chat.focus, ChatFocus::Conversations);
+    }
+
+    #[test]
+    fn the_conversation_list_does_not_wrap_at_either_end() {
+        let mut first = windowed_chat(3, 0);
+        first.focus_conversations();
+        assert_eq!(first.handle_key(key(KeyCode::Char('k'))), ChatAction::None);
+        assert_eq!(first.handle_key(key(KeyCode::Up)), ChatAction::None);
+        assert_eq!(first.handle_key(ctrl('p')), ChatAction::None);
+
+        let mut last = windowed_chat(3, 2);
+        last.focus_conversations();
+        assert_eq!(last.handle_key(key(KeyCode::Char('j'))), ChatAction::None);
+        assert_eq!(last.handle_key(key(KeyCode::Down)), ChatAction::None);
+        assert_eq!(last.handle_key(ctrl('n')), ChatAction::None);
+
+        // A list of one has nowhere to go in either direction.
+        let mut alone = windowed_chat(1, 0);
+        alone.focus_conversations();
+        assert_eq!(alone.handle_key(key(KeyCode::Char('j'))), ChatAction::None);
+        assert_eq!(alone.handle_key(key(KeyCode::Char('k'))), ChatAction::None);
+    }
+
+    #[test]
+    fn enter_and_escape_leave_the_conversation_list_for_the_prompt() {
+        for code in [KeyCode::Enter, KeyCode::Esc] {
+            let mut chat = windowed_chat(3, 1);
+            chat.focus_conversations();
+
+            assert_eq!(chat.handle_key(key(code)), ChatAction::None);
+            assert_eq!(chat.focus, ChatFocus::Prompt);
+        }
+    }
+
+    #[test]
+    fn escape_in_the_conversation_list_does_not_cancel_a_running_turn() {
+        let mut chat = windowed_chat(3, 1);
+        chat.phase = WorkerPhase::Running;
+        chat.focus_conversations();
+
+        assert_eq!(chat.handle_key(key(KeyCode::Esc)), ChatAction::None);
+
+        // Back at the prompt, Esc means what it has always meant.
+        assert_eq!(chat.focus, ChatFocus::Prompt);
+        assert_eq!(chat.handle_key(key(KeyCode::Esc)), ChatAction::Cancel);
+    }
+
+    #[test]
+    fn typing_in_the_conversation_list_leaves_the_composer_alone() {
+        let mut chat = windowed_chat(3, 1);
+        chat.set_input("half typed".into());
+        chat.focus_conversations();
+
+        for code in [
+            KeyCode::Char('x'),
+            KeyCode::Char(' '),
+            KeyCode::Backspace,
+            KeyCode::Delete,
+        ] {
+            assert_eq!(chat.handle_key(key(code)), ChatAction::None);
+        }
+
+        assert_eq!(chat.input, "half typed");
+        assert_eq!(chat.focus, ChatFocus::Conversations);
+    }
+
+    #[test]
+    fn the_wheel_moves_the_conversations_window_without_switching_or_taking_focus() {
+        let mut chat = windowed_chat(10, 5);
+        let _ = drawn_transcript(&mut chat, 60, 24);
+        let pane = chat
+            .conversations_area
+            .expect("the pane records its hitbox");
+
+        chat.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane));
+
+        assert_eq!(window_projects(&chat, 7)[0], "project-3");
+        assert_eq!(conversations_pane(&chat, 0, 80, 7).current_row, Some(2));
+        // Hover decides what scrolls, so the wheel leaves focus where Tab put
+        // it, and the current session is still this one.
+        assert_eq!(chat.focus, ChatFocus::Prompt);
+        assert_eq!(chat.session_id, snapshot().session_id);
+
+        // The window stops at the end of the list, and at its start.
+        chat.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane));
+        assert_eq!(window_projects(&chat, 7)[0], "project-3");
+        for _ in 0..5 {
+            chat.handle_mouse(mouse_in(MouseEventKind::ScrollUp, pane));
+        }
+        assert_eq!(window_projects(&chat, 7)[0], "project-0");
+
+        // Below the pane the wheel is the transcript's again.
+        let transcript = Rect::new(0, pane.bottom(), 60, 1);
+        chat.handle_mouse(mouse_in(MouseEventKind::ScrollDown, transcript));
+        assert_eq!(window_projects(&chat, 7)[0], "project-0");
+    }
+
+    #[test]
+    fn walking_the_conversation_list_recentres_a_wheel_scrolled_window() {
+        let mut chat = windowed_chat(10, 5);
+        chat.focus_conversations();
+        let _ = drawn_transcript(&mut chat, 60, 24);
+        let pane = chat
+            .conversations_area
+            .expect("the pane records its hitbox");
+        chat.handle_mouse(mouse_in(MouseEventKind::ScrollUp, pane));
+        assert_eq!(window_projects(&chat, 7)[0], "project-1");
+
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Char('j'))),
+            ChatAction::SwitchSession {
+                session_id: other_session_id(6)
+            }
         );
 
-        let lines = session_header_lines(&chat, 0, 80, 3);
-        let text = lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(text, ["› current [idle]", "  other [idle]", "  +3 more"]);
-        assert_eq!(
-            lines[2].spans.first().and_then(|span| span.style.fg),
-            Some(Color::DarkGray)
+        assert!(chat.conversations_window_start.is_none());
+        assert_eq!(window_projects(&chat, 7)[0], "project-2");
+    }
+
+    #[test]
+    fn a_focused_conversations_pane_bands_its_row_and_leaves_the_cursor_out_of_the_composer() {
+        use ratatui::backend::Backend as _;
+
+        let mut chat = windowed_chat(3, 1);
+        chat.focus_conversations();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).expect("terminal");
+        let banded = |terminal: &Terminal<TestBackend>, y: u16| {
+            let buffer = terminal.backend().buffer();
+            (buffer.area.x..buffer.area.right()).all(|x| buffer[(x, y)].bg == Color::DarkGray)
+        };
+
+        terminal
+            .draw(|frame| render(frame, &mut chat))
+            .expect("draw chat");
+        assert!(banded(&terminal, 1), "the current session's row is banded");
+        assert!(!banded(&terminal, 0));
+        assert!(!banded(&terminal, 2));
+        // Nothing places a cursor while the list has focus, so it stays where
+        // the terminal left it.
+        terminal.backend_mut().assert_cursor_position((0, 0));
+
+        chat.handle_key(key(KeyCode::Enter));
+        terminal
+            .draw(|frame| render(frame, &mut chat))
+            .expect("draw chat");
+        assert!(!banded(&terminal, 1), "an unfocused pane draws no band");
+        let cursor = terminal
+            .backend_mut()
+            .get_cursor_position()
+            .expect("cursor position");
+        assert!(
+            cursor.y > 2,
+            "the prompt's cursor sits in the composer, below the pane"
         );
     }
 
@@ -6088,7 +6567,7 @@ mod tests {
             vec![other_session(1, "other", Some(1_000), "still going")],
         );
 
-        let lines = session_header_lines(&chat, 1_125, 80, 10);
+        let lines = conversations_pane(&chat, 1_125, 80, 10).lines;
         let tail = &lines[1];
         assert_eq!(tail.spans[0].content.as_ref(), "  other 02:05 ");
         assert_eq!(tail.spans[0].style.fg, Some(Color::Yellow));
@@ -6113,7 +6592,9 @@ mod tests {
     #[test]
     fn other_session_activity_reads_the_turn_clock_and_last_agent_line() {
         let identity = OtherSessionIdentity {
-            session_id: "other".into(),
+            // The activity carries the id the pane switches to, so it is the
+            // identity's, not the materialized session's.
+            session_id: other_session_id(3),
             position: 3,
             project: "api-fix".into(),
         };
@@ -7552,6 +8033,8 @@ mod tests {
     fn mouse_wheel_scrolls_chat_history_and_resumes_following_at_bottom() {
         let mut chat = numbered_chat(40);
         let _ = drawn_transcript(&mut chat, 40, 24);
+        // Away from the conversations pane, so the wheel reaches the transcript.
+        let mouse = |kind| mouse_in(kind, Rect::new(0, 10, 40, 1));
 
         chat.handle_mouse(mouse(MouseEventKind::ScrollUp));
         let scrolled = drawn_transcript(&mut chat, 40, 24);
@@ -7561,6 +8044,20 @@ mod tests {
         let rows = drawn_transcript(&mut chat, 40, 24);
         assert!(shows(&rows, "message 39"), "wheel down resumes following");
         assert!(!rows.iter().any(|row| row.contains("End to follow")));
+    }
+
+    #[test]
+    fn the_wheel_over_an_empty_transcript_has_nothing_to_scroll() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        let rows = drawn_transcript(&mut chat, 40, 24);
+
+        chat.handle_mouse(mouse_in(MouseEventKind::ScrollUp, Rect::new(0, 10, 40, 1)));
+        chat.handle_mouse(mouse_in(
+            MouseEventKind::ScrollDown,
+            Rect::new(0, 10, 40, 1),
+        ));
+
+        assert_eq!(drawn_transcript(&mut chat, 40, 24), rows);
     }
 
     #[test]
