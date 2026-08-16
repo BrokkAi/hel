@@ -156,6 +156,9 @@ struct SessionOperationDisplay {
     started_at_epoch_seconds: u64,
     placeholder: Option<SessionRecord>,
     stage: Option<ProvisionStage>,
+    /// When the current `stage` began, so the clock can count that stage's
+    /// progress instead of the whole operation's.
+    stage_started_at_epoch_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -976,6 +979,7 @@ impl DashboardState {
                     .as_secs(),
                 placeholder,
                 stage: None,
+                stage_started_at_epoch_seconds: None,
             },
         );
         self.apply_operation_projection();
@@ -983,10 +987,19 @@ impl DashboardState {
     }
 
     /// Name the launch phase in flight; a finished or unknown operation is
-    /// left alone.
+    /// left alone. Only a stage change resets the per-stage clock, so a
+    /// repeated report of the same stage can't restart its counter.
     pub fn set_session_operation_stage(&mut self, session_id: &str, stage: ProvisionStage) {
-        if let Some(operation) = self.session_operations.get_mut(session_id) {
+        if let Some(operation) = self.session_operations.get_mut(session_id)
+            && operation.stage != Some(stage)
+        {
             operation.stage = Some(stage);
+            operation.stage_started_at_epoch_seconds = Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
         }
     }
 
@@ -4988,13 +5001,16 @@ fn session_values(
     config: &HelConfig,
 ) -> (String, String, String, String, String) {
     let clock = if let Some(operation) = operation {
-        let elapsed = now_epoch_seconds.saturating_sub(operation.started_at_epoch_seconds);
-        let label = match (operation.stage, operation.kind) {
-            (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => {
-                stage.label()
-            }
-            _ => operation.kind.label(),
+        let (label, started_at) = match (operation.stage, operation.kind) {
+            (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => (
+                stage.label(),
+                operation
+                    .stage_started_at_epoch_seconds
+                    .unwrap_or(operation.started_at_epoch_seconds),
+            ),
+            _ => (operation.kind.label(), operation.started_at_epoch_seconds),
         };
+        let elapsed = now_epoch_seconds.saturating_sub(started_at);
         format!("{label} {elapsed}s")
     } else if session.state == SessionState::Provisioning {
         let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
@@ -10729,6 +10745,7 @@ mod tests {
             started_at_epoch_seconds: 1_000,
             placeholder: None,
             stage,
+            stage_started_at_epoch_seconds: stage.map(|_| 1_000),
         }
     }
 
@@ -10770,6 +10787,45 @@ mod tests {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
         dashboard.set_session_operation_stage("missing", ProvisionStage::Booting);
         assert!(dashboard.session_operations.is_empty());
+    }
+
+    #[test]
+    fn stage_clock_counts_from_when_the_stage_began_not_the_operation() {
+        let session = archived_session();
+        let mut operation = operation(
+            SessionOperationKind::Launching,
+            Some(ProvisionStage::Booting),
+        );
+        // The operation started at 1_000 but the stage only began at 1_040;
+        // the clock must count from the stage, not the whole operation.
+        operation.stage_started_at_epoch_seconds = Some(1_040);
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_052, &config());
+        assert_eq!(clock, "Boot 12s");
+    }
+
+    #[test]
+    fn repeating_a_stage_report_does_not_reset_its_clock() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.begin_session_operation(
+            "session-1".into(),
+            SessionOperationKind::Launching,
+            None,
+        );
+        dashboard.set_session_operation_stage("session-1", ProvisionStage::Booting);
+        dashboard
+            .session_operations
+            .get_mut("session-1")
+            .expect("operation")
+            .stage_started_at_epoch_seconds = Some(1_000);
+
+        dashboard.set_session_operation_stage("session-1", ProvisionStage::Booting);
+
+        assert_eq!(
+            dashboard.session_operations["session-1"].stage_started_at_epoch_seconds,
+            Some(1_000)
+        );
     }
 
     #[test]
