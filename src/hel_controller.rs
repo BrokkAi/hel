@@ -7470,9 +7470,13 @@ mod tests {
     const LATCH_RELAY_ROOT: &str = "HEL_TEST_LATCH_RELAY_ROOT";
     const LATCH_RELAY_STARTS: &str = "HEL_TEST_LATCH_RELAY_STARTS";
     const LATCH_RELAY_REJECT_RELEASE: &str = "HEL_TEST_LATCH_REJECT_RELEASE";
+    #[cfg(unix)]
     const LATCH_TEST_CHILD: &str = "HEL_TEST_LATCH_CHILD";
+    #[cfg(unix)]
     const ABANDON_TEST_CHILD: &str = "HEL_TEST_ABANDON_LATCH_CHILD";
+    #[cfg(unix)]
     const RELEASE_TEST_CHILD: &str = "HEL_TEST_RELEASE_LATCH_CHILD";
+    #[cfg(unix)]
     const LEGACY_RELEASE_TEST_CHILD: &str = "HEL_TEST_LEGACY_RELEASE_LATCH_CHILD";
     const LATCH_RELAY_SESSION: &str = "018f9dd2-a3b4-7c8d-9000-0123456789ab";
 

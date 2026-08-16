@@ -1294,6 +1294,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
 
     #[test]
