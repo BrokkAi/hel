@@ -120,13 +120,14 @@ fn normalize_reset_at(value: &str, now: DateTime<FixedOffset>) -> Option<DateTim
     Some(reset)
 }
 
-/// Render a session's current-turn clock, leaving idle sessions blank.
+/// Render a session's current-turn clock. A session with no turn in flight
+/// reads `[idle]` rather than showing an empty cell.
 pub fn format_turn_clock(now_epoch_seconds: u64, current_turn_started_at: Option<u64>) -> String {
     if let Some(started_at) = current_turn_started_at {
         let elapsed = now_epoch_seconds.saturating_sub(started_at);
         return format!("{:02}:{:02}", elapsed / 60, elapsed % 60);
     }
-    String::new()
+    "[idle]".into()
 }
 
 /// Pure formatter split from local-zone discovery for deterministic tests.
@@ -202,8 +203,8 @@ mod tests {
     }
 
     #[test]
-    fn turn_clock_formats_running_periods_and_leaves_idle_blank() {
+    fn turn_clock_formats_running_periods_and_marks_idle_sessions() {
         assert_eq!(format_turn_clock(500, Some(375)), "02:05");
-        assert_eq!(format_turn_clock(5_000, None), "");
+        assert_eq!(format_turn_clock(5_000, None), "[idle]");
     }
 }

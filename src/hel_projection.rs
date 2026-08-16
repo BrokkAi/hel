@@ -20,6 +20,19 @@ use crate::hel_worker::{
     RelayCommand, RelayCommandKind, RelayEvent, RelayObservation, validate_relay_event,
 };
 
+/// A deterministic projection integrity violation. Retrying cannot fix it, so
+/// callers must report it separately from transport failures.
+#[derive(Debug)]
+pub struct ProjectionIntegrityError(pub String);
+
+impl std::fmt::Display for ProjectionIntegrityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProjectionIntegrityError {}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectedRelayEvent {
     pub mutation: MaterializedSessionMutation,
@@ -81,16 +94,18 @@ pub fn apply_committed_projection_event(
                     if existing.position != item.position
                         || existing.created_at_ms != item.created_at_ms
                     {
-                        bail!(
+                        return Err(ProjectionIntegrityError(format!(
                             "transcript item {:?} changed immutable identity fields",
                             item.stable_id
-                        );
+                        ))
+                        .into());
                     }
                     if item.last_changed_at_ms < existing.last_changed_at_ms {
-                        bail!(
+                        return Err(ProjectionIntegrityError(format!(
                             "transcript item {:?} moved its changed timestamp backwards",
                             item.stable_id
-                        );
+                        ))
+                        .into());
                     }
                     if existing
                         .latest_content_event_ordinal
@@ -99,10 +114,11 @@ pub fn apply_committed_projection_event(
                                 .is_none_or(|next| next < existing)
                         })
                     {
-                        bail!(
+                        return Err(ProjectionIntegrityError(format!(
                             "transcript item {:?} moved its latest content ordinal backwards",
                             item.stable_id
-                        );
+                        ))
+                        .into());
                     }
                     // Reuse the item in place when no published snapshot shares
                     // it; otherwise publish a fresh item so snapshots taken
@@ -328,19 +344,41 @@ fn project_session_update(
         SessionUpdate::UserMessageChunk(_) => {}
         SessionUpdate::ToolCall(call) => {
             close_streams(current, mutation, event.recorded_at_ms);
-            upsert(
-                mutation,
-                TranscriptItem {
-                    stable_id: format!("tool:{}", call.tool_call_id),
-                    position: event.ordinal,
-                    latest_content_event_ordinal: None,
-                    created_at_ms: event.recorded_at_ms,
-                    last_changed_at_ms: event.recorded_at_ms,
-                    body: TranscriptBody::Tool {
-                        call: serde_json::to_value(call)?,
+            let stable_id = format!("tool:{}", call.tool_call_id);
+            // Agents re-send a whole `tool_call` for an id they already
+            // reported, both when they revise a call and when a resumed
+            // session replays its history. Merge into the existing item so the
+            // immutable identity fields survive.
+            if let Some(mut item) = current
+                .transcript
+                .iter()
+                .find(|item| item.stable_id == stable_id)
+                .map(|item| TranscriptItem::clone(item))
+            {
+                let TranscriptBody::Tool { call: existing } = &mut item.body else {
+                    bail!(
+                        "ACP tool call {} conflicts with transcript item {stable_id}",
+                        call.tool_call_id
+                    );
+                };
+                *existing = serde_json::to_value(call)?;
+                item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
+                upsert(mutation, item);
+            } else {
+                upsert(
+                    mutation,
+                    TranscriptItem {
+                        stable_id,
+                        position: event.ordinal,
+                        latest_content_event_ordinal: None,
+                        created_at_ms: event.recorded_at_ms,
+                        last_changed_at_ms: event.recorded_at_ms,
+                        body: TranscriptBody::Tool {
+                            call: serde_json::to_value(call)?,
+                        },
                     },
-                },
-            );
+                );
+            }
         }
         SessionUpdate::ToolCallUpdate(update) => {
             close_streams(current, mutation, event.recorded_at_ms);
@@ -974,6 +1012,102 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("before creating it"));
+    }
+
+    #[test]
+    fn resent_tool_call_keeps_identity_and_replaces_the_call_payload() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(ToolCall::new(
+                    "call-1",
+                    "read file",
+                ))),
+            },
+        );
+        let created = TranscriptItem::clone(&session.transcript[0]);
+        assert_eq!(created.position, 1);
+        assert_eq!(created.created_at_ms, 100);
+
+        let resend = event(
+            &session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(
+                    ToolCall::new("call-1", "read file again")
+                        .status(agent_client_protocol::schema::v1::ToolCallStatus::Completed),
+                )),
+            },
+        );
+        let projected = project_relay_event(&session, &resend).unwrap();
+        let TranscriptMutation::Upsert(item) = projected
+            .mutation
+            .transcript
+            .iter()
+            .find(|mutation| {
+                matches!(mutation, TranscriptMutation::Upsert(item) if item.stable_id == "tool:call-1")
+            })
+            .expect("the re-sent tool call upserts its existing item")
+            .clone()
+        else {
+            unreachable!("matched an upsert above");
+        };
+        assert_eq!(item.position, created.position);
+        assert_eq!(item.created_at_ms, created.created_at_ms);
+        assert_eq!(item.last_changed_at_ms, resend.recorded_at_ms);
+        assert_eq!(
+            item.latest_content_event_ordinal,
+            created.latest_content_event_ordinal
+        );
+        let TranscriptBody::Tool { call } = &item.body else {
+            panic!("re-sent tool call stayed a tool item");
+        };
+        assert_eq!(call["title"], json!("read file again"));
+
+        apply_committed_projection_event(&mut session, &resend, projected.mutation)
+            .expect("the merged item passes the projection integrity checks");
+        assert_eq!(session.transcript.len(), 1);
+        assert_eq!(session.transcript[0].position, created.position);
+    }
+
+    #[test]
+    fn tool_call_update_then_resent_tool_call_survives_the_projection() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(ToolCall::new("call-1", "shell"))),
+            },
+        );
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    "call-1",
+                    ToolCallUpdateFields::new()
+                        .status(agent_client_protocol::schema::v1::ToolCallStatus::Completed),
+                ))),
+            },
+        );
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(ToolCall::new(
+                    "call-1",
+                    "shell (retried)",
+                ))),
+            },
+        );
+
+        assert_eq!(session.transcript.len(), 1);
+        let item = &session.transcript[0];
+        assert_eq!(item.position, 1);
+        assert_eq!(item.created_at_ms, 100);
+        assert_eq!(item.last_changed_at_ms, 300);
+        let TranscriptBody::Tool { call } = &item.body else {
+            panic!("the item stayed a tool item");
+        };
+        assert_eq!(call["title"], json!("shell (retried)"));
     }
 
     #[test]

@@ -11,6 +11,7 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::hel_config::{HarnessKind, data_dir};
+use crate::hel_projection::ProjectionIntegrityError;
 use crate::hel_state::{
     CheckpointMetadata, HelState, ManagedWorktree, MaterializedExecutionState,
     MaterializedQueuedPrompt, MaterializedSession, SessionRecord, SessionResourceAllocation,
@@ -1431,25 +1432,28 @@ fn upsert_transcript_item(
         existing
     {
         if position != item.position || created_at_ms != item.created_at_ms {
-            bail!(
+            return Err(ProjectionIntegrityError(format!(
                 "transcript item {:?} changed immutable identity fields",
                 item.stable_id
-            );
+            ))
+            .into());
         }
         if item.last_changed_at_ms < last_changed_at_ms {
-            bail!(
+            return Err(ProjectionIntegrityError(format!(
                 "transcript item {:?} moved its changed timestamp backwards",
                 item.stable_id
-            );
+            ))
+            .into());
         }
         if latest_content_event_ordinal.is_some_and(|existing| {
             item.latest_content_event_ordinal
                 .is_none_or(|next| next < existing)
         }) {
-            bail!(
+            return Err(ProjectionIntegrityError(format!(
                 "transcript item {:?} moved its latest content ordinal backwards",
                 item.stable_id
-            );
+            ))
+            .into());
         }
         tx.execute(
             "UPDATE materialized_transcript_items
