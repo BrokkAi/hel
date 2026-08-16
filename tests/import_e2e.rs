@@ -272,6 +272,119 @@ async fn imported_kimi_session_resumes_natively_async() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "requires a signed-in Grok Build, Podman, and the Hel agent-development image"]
+fn imported_grok_session_resumes_natively() {
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(imported_grok_session_resumes_natively_async())
+        .unwrap();
+}
+
+async fn imported_grok_session_resumes_natively_async() -> anyhow::Result<()> {
+    let grok_home = required_path("GROK_HOME");
+    let native_session_id = std::env::var("HEL_IMPORT_E2E_GROK_SESSION")?;
+    let repository = std::env::var("HEL_IMPORT_E2E_GROK_REPOSITORY")?;
+    let image = std::env::var("HEL_IMPORT_E2E_IMAGE")?;
+    let config = HelConfig {
+        version: CONFIG_VERSION,
+        profiles: BTreeMap::from([(
+            "grok-e2e".into(),
+            HarnessProfile {
+                kind: HarnessKind::Grok,
+                home: grok_home.clone(),
+                executable: None,
+                environment: BTreeMap::new(),
+                context_window_bytes: None,
+            },
+        )]),
+        bundles: BTreeMap::from([(
+            "grok-source".into(),
+            ProjectBundle {
+                primary_repo: "grok-source".into(),
+                repositories: vec![ProjectRepository {
+                    id: "grok-source".into(),
+                    github: Some(repository),
+                    local: None,
+                    destination: "grok-source".into(),
+                    git_ref: None,
+                }],
+            },
+        )]),
+        targets: BTreeMap::from([(
+            "podman".into(),
+            TargetTemplate::LocalPodman {
+                container: ContainerTemplate {
+                    image,
+                    platform: None,
+                    cpus: None,
+                    memory: None,
+                    environment: BTreeMap::new(),
+                },
+            },
+        )]),
+    };
+    config.save()?;
+    HelState::default().save()?;
+
+    let output = Command::new(hel_binary())
+        .args([
+            "import",
+            "grok",
+            "--session",
+            &native_session_id,
+            "--bundle",
+            "grok-source",
+        ])
+        .env("GROK_HOME", &grok_home)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "hel import failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state = HelState::load()?;
+    let (session_id, imported) = state.sessions.iter().next().unwrap();
+    assert_eq!(imported.state, SessionState::Archived);
+    let checkpoint = imported.checkpoint.as_ref().unwrap();
+    let archive = read_archive_verified(&checkpoint.archive_path)?;
+    assert_eq!(
+        archive.manifest.session.native_session_id,
+        imported.native_session_id.clone().unwrap()
+    );
+    let canonical = archive.canonical_session()?;
+
+    let mut controller = Controller::load()?;
+    let materialized = controller
+        .resume_session_with_options(session_id, "grok-e2e", "podman", None, None)
+        .await?;
+    exercise_resumed_session(
+        &controller,
+        session_id,
+        &materialized,
+        ResumeExercise {
+            expected_native_session_id: &archive.manifest.session.native_session_id,
+            archived_frontier: canonical.event_frontier,
+            prompt: "Reply exactly GROK_NATIVE_RESUME_OK.",
+            expected_reply: "GROK_NATIVE_RESUME_OK",
+            attempts: 120,
+            case_sensitive: true,
+        },
+    )
+    .await?;
+    controller.close_session(session_id).await?;
+    let final_state = HelState::load()?;
+    read_archive_verified(
+        &final_state.sessions[session_id]
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .archive_path,
+    )?;
+    Ok(())
+}
+
 struct ResumeExercise<'a> {
     expected_native_session_id: &'a str,
     archived_frontier: u64,

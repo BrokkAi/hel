@@ -40,6 +40,7 @@ pub enum ClaudeSessionSelection {
 
 pub type CodexSessionSelection = ClaudeSessionSelection;
 pub type KimiSessionSelection = ClaudeSessionSelection;
+pub type GrokSessionSelection = ClaudeSessionSelection;
 
 #[derive(Debug, Clone)]
 pub struct LocatedClaudeSession {
@@ -57,6 +58,9 @@ pub enum CodexHistoryMode {
     Legacy,
     Paginated,
 }
+
+/// Grok Build's conversation of record inside a session directory.
+const CHAT_HISTORY: &str = "chat_history.jsonl";
 
 pub const CODEX_LEGACY_IMPORT_ISSUE: &str = "Legacy Codex history cannot be imported. Run codex migrate-rollouts --apply, then reopen \
      this dialog.";
@@ -92,6 +96,9 @@ pub struct LocatedKimiSession {
     pub git_branch: String,
     pub size_bytes: u64,
 }
+
+/// Grok Build keeps one directory per session, like Kimi Code.
+pub type LocatedGrokSession = LocatedKimiSession;
 
 #[derive(Debug, Clone)]
 pub struct SessionScanProgress<T> {
@@ -134,6 +141,7 @@ pub struct ClaudeTranscript {
 
 pub type CodexTranscript = ClaudeTranscript;
 pub type KimiTranscript = ClaudeTranscript;
+pub type GrokTranscript = ClaudeTranscript;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BundleResolution {
@@ -219,6 +227,7 @@ pub struct ImportedClaudeSession {
 
 pub type ImportedCodexSession = ImportedClaudeSession;
 pub type ImportedKimiSession = ImportedClaudeSession;
+pub type ImportedGrokSession = ImportedClaudeSession;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportArchiveProgress {
@@ -285,6 +294,16 @@ pub struct KimiImportRequest<'a> {
     pub archive_directory: &'a Path,
 }
 
+pub struct GrokImportRequest<'a> {
+    pub grok_home: &'a Path,
+    pub source: &'a LocatedGrokSession,
+    pub transcript: &'a GrokTranscript,
+    pub bundle_id: &'a str,
+    pub profile_id: Option<&'a str>,
+    pub title: Option<&'a str>,
+    pub archive_directory: &'a Path,
+}
+
 /// Resolve a harness's configuration home without ever modifying it.
 ///
 /// The environment override wins; otherwise the harness's default directory
@@ -316,6 +335,140 @@ pub fn codex_config_home() -> Result<PathBuf> {
 /// Resolve the Kimi Code configuration home without ever modifying it.
 pub fn kimi_config_home() -> Result<PathBuf> {
     harness_config_home(HarnessKind::Kimi)
+}
+
+/// Resolve the Grok Build configuration home without ever modifying it.
+pub fn grok_config_home() -> Result<PathBuf> {
+    harness_config_home(HarnessKind::Grok)
+}
+
+/// One native session located on disk, normalized across harnesses: the id
+/// `session/load` takes and the file or directory its transcript is read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedNativeSession {
+    pub native_session_id: String,
+    pub source_path: PathBuf,
+}
+
+/// One native session as a picker lists it, normalized across harnesses.
+#[derive(Debug, Clone)]
+pub struct NativeSessionListing {
+    pub native_session_id: String,
+    pub title: String,
+    pub modified_at: SystemTime,
+    pub git_branch: String,
+    pub size_bytes: u64,
+    pub cwd: PathBuf,
+    /// Why this session cannot be imported, when it cannot be.
+    pub unavailable_reason: Option<&'static str>,
+}
+
+/// Locate one native session for any harness.
+pub fn locate_native_session(
+    harness: HarnessKind,
+    home: &Path,
+    selection: &ClaudeSessionSelection,
+) -> Result<LocatedNativeSession> {
+    let (native_session_id, source_path) = match harness {
+        HarnessKind::Codex => {
+            let located = locate_codex_session(home, selection)?;
+            (located.native_session_id, located.jsonl_path)
+        }
+        HarnessKind::Claude => {
+            let located = locate_claude_session(home, selection)?;
+            (located.native_session_id, located.jsonl_path)
+        }
+        HarnessKind::Kimi => {
+            let located = locate_kimi_session(home, selection)?;
+            (located.native_session_id, located.session_path)
+        }
+        HarnessKind::Grok => {
+            let located = locate_grok_session(home, selection)?;
+            (located.native_session_id, located.session_path)
+        }
+    };
+    Ok(LocatedNativeSession {
+        native_session_id,
+        source_path,
+    })
+}
+
+/// Project one native session into the canonical transcript, for any harness.
+pub fn read_native_transcript(
+    harness: HarnessKind,
+    source_path: &Path,
+) -> Result<ClaudeTranscript> {
+    match harness {
+        HarnessKind::Codex => read_codex_transcript(source_path),
+        HarnessKind::Claude => read_claude_transcript(source_path),
+        HarnessKind::Kimi => read_kimi_transcript(source_path),
+        HarnessKind::Grok => read_grok_transcript(source_path),
+    }
+}
+
+/// Scan a harness home newest first, reporting after every candidate.
+pub fn scan_native_sessions(
+    harness: HarnessKind,
+    home: &Path,
+    mut report: impl FnMut(SessionScanProgress<NativeSessionListing>),
+) -> Result<()> {
+    let mut forward = |scanned, total, session| {
+        report(SessionScanProgress {
+            scanned,
+            total,
+            session,
+        });
+    };
+    match harness {
+        HarnessKind::Codex => scan_codex_sessions(home, |progress| {
+            let session = progress.session.map(|session| NativeSessionListing {
+                unavailable_reason: session.history_mode.import_issue(),
+                native_session_id: session.native_session_id,
+                title: session.title,
+                modified_at: session.modified_at,
+                git_branch: session.git_branch,
+                size_bytes: session.size_bytes,
+                cwd: session.cwd,
+            });
+            forward(progress.scanned, progress.total, session);
+        }),
+        HarnessKind::Claude => scan_claude_sessions(home, |progress| {
+            let session = progress.session.map(|session| NativeSessionListing {
+                native_session_id: session.native_session_id,
+                title: session.title,
+                modified_at: session.modified_at,
+                git_branch: session.git_branch,
+                size_bytes: session.size_bytes,
+                cwd: session.cwd,
+                unavailable_reason: None,
+            });
+            forward(progress.scanned, progress.total, session);
+        }),
+        HarnessKind::Kimi => scan_kimi_sessions(home, |progress| {
+            let session = progress.session.map(|session| NativeSessionListing {
+                native_session_id: session.native_session_id,
+                title: session.title,
+                modified_at: session.modified_at,
+                git_branch: session.git_branch,
+                size_bytes: session.size_bytes,
+                cwd: session.cwd,
+                unavailable_reason: None,
+            });
+            forward(progress.scanned, progress.total, session);
+        }),
+        HarnessKind::Grok => scan_grok_sessions(home, |progress| {
+            let session = progress.session.map(|session| NativeSessionListing {
+                native_session_id: session.native_session_id,
+                title: session.title,
+                modified_at: session.modified_at,
+                git_branch: session.git_branch,
+                size_bytes: session.size_bytes,
+                cwd: session.cwd,
+                unavailable_reason: None,
+            });
+            forward(progress.scanned, progress.total, session);
+        }),
+    }
 }
 
 /// Locate a Codex rollout exposed by its native interactive resume picker.
@@ -770,6 +923,216 @@ pub fn scan_kimi_sessions(
         });
     }
     Ok(())
+}
+
+/// Locate a Grok Build session directory. Its name is the session UUID, which
+/// is the native identifier `session/load` takes.
+pub fn locate_grok_session(
+    home: &Path,
+    selection: &GrokSessionSelection,
+) -> Result<LocatedGrokSession> {
+    let candidates = list_grok_sessions(home)?;
+    let sessions = home.join("sessions");
+    match selection {
+        GrokSessionSelection::NativeSessionId(native_session_id) => candidates
+            .into_iter()
+            .find(|candidate| candidate.native_session_id == *native_session_id)
+            .with_context(|| {
+                format!(
+                    "Grok Build session {native_session_id:?} was not found under {}",
+                    sessions.display()
+                )
+            }),
+        GrokSessionSelection::Latest => candidates
+            .into_iter()
+            .next()
+            .context("no Grok Build session directories were found"),
+    }
+}
+
+/// List native Grok Build sessions newest first.
+pub fn list_grok_sessions(home: &Path) -> Result<Vec<LocatedGrokSession>> {
+    let mut sessions = Vec::new();
+    scan_grok_sessions(home, |progress| {
+        if let Some(session) = progress.session {
+            sessions.push(session);
+        }
+    })?;
+    Ok(sessions)
+}
+
+/// Scan native Grok Build sessions newest first, reporting after every
+/// candidate directory.
+pub fn scan_grok_sessions(
+    home: &Path,
+    mut report: impl FnMut(SessionScanProgress<LocatedGrokSession>),
+) -> Result<()> {
+    let sessions = home.join("sessions");
+    ensure!(
+        sessions.is_dir(),
+        "Grok Build sessions directory is missing: {}",
+        sessions.display()
+    );
+    let mut candidates = grok_candidates(&sessions)?;
+    candidates.sort_by(|left, right| {
+        right
+            .modified_at
+            .cmp(&left.modified_at)
+            .then_with(|| right.session_path.cmp(&left.session_path))
+    });
+    let total = candidates.len();
+    report(SessionScanProgress {
+        scanned: 0,
+        total,
+        session: None,
+    });
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let size_bytes = directory_size(&candidate.session_path)?;
+        let session = LocatedGrokSession {
+            title: candidate.title,
+            native_session_id: candidate.native_session_id,
+            session_path: candidate.session_path,
+            modified_at: candidate.modified_at,
+            git_branch: git_branch_or_head(&candidate.cwd),
+            size_bytes,
+            cwd: candidate.cwd,
+        };
+        report(SessionScanProgress {
+            scanned: index + 1,
+            total,
+            session: Some(session),
+        });
+    }
+    Ok(())
+}
+
+/// Walk `sessions/<encoded-cwd>/<session-uuid>`. The sessions root also holds
+/// the shared search index and lock files, which are not sessions.
+fn grok_candidates(sessions: &Path) -> Result<Vec<KimiScanCandidate>> {
+    let mut candidates = Vec::new();
+    for cwd_entry in fs::read_dir(sessions)? {
+        let cwd_directory = cwd_entry?.path();
+        if !cwd_directory.is_dir() {
+            continue;
+        }
+        let decoded_cwd = grok_decode_cwd_dirname(&cwd_directory);
+        for session_entry in fs::read_dir(&cwd_directory)? {
+            let session_entry = session_entry?;
+            let session_path = session_entry.path();
+            let metadata = fs::symlink_metadata(&session_path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                continue;
+            }
+            let Some(native_session_id) = session_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| validate_id("Grok Build session", name).is_ok())
+            else {
+                continue;
+            };
+            let (title, summary_cwd) = grok_listing_metadata(&session_path);
+            let Some(cwd) = summary_cwd.or_else(|| decoded_cwd.clone()) else {
+                continue;
+            };
+            candidates.push(KimiScanCandidate {
+                native_session_id: native_session_id.to_owned(),
+                modified_at: grok_session_modified_at(&session_path, &metadata),
+                title: title.unwrap_or_else(|| native_session_id.to_owned()),
+                cwd,
+                session_path,
+            });
+        }
+    }
+    Ok(candidates)
+}
+
+/// Grok Build's session-directory name is the URL-encoded working directory,
+/// or a `{slug}-{hash}` form for a long path that keeps the real value in a
+/// `.cwd` file. Mirrors `decode_cwd_from_dirname` in grok-build.
+fn grok_decode_cwd_dirname(directory: &Path) -> Option<PathBuf> {
+    let name = directory.file_name()?.to_str()?;
+    if let Some(decoded) = url_decode(name)
+        && decoded.starts_with('/')
+    {
+        return Some(PathBuf::from(decoded));
+    }
+    let recorded = fs::read_to_string(directory.join(".cwd")).ok()?;
+    let recorded = recorded.trim();
+    recorded.starts_with('/').then(|| PathBuf::from(recorded))
+}
+
+/// Percent-decoding for the session-directory name. `None` when the text is
+/// not valid percent-encoded UTF-8, which means it is not a cwd key.
+fn url_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = value.get(index + 1..index + 3)?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// Listing title and cwd from `summary.json`, falling back to the first real
+/// user message for the title. Never fails the whole scan: an unreadable
+/// session is listed with what could be recovered.
+fn grok_listing_metadata(session_path: &Path) -> (Option<String>, Option<PathBuf>) {
+    let summary = fs::read(session_path.join("summary.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let title = summary
+        .get("session_summary")
+        .and_then(Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .map(single_line_title)
+        .or_else(|| grok_first_user_text(session_path).map(|text| single_line_title(&text)));
+    let cwd = summary
+        .pointer("/info/cwd")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|cwd| cwd.is_absolute());
+    (title, cwd)
+}
+
+/// First message a person actually typed, used as a listing title. Bounded so
+/// a long session does not make the scan read a whole transcript per entry.
+fn grok_first_user_text(session_path: &Path) -> Option<String> {
+    use std::io::BufRead;
+
+    const MAX_SCANNED_LINES: usize = 64;
+    let file = fs::File::open(session_path.join(CHAT_HISTORY)).ok()?;
+    for line in std::io::BufReader::new(file)
+        .lines()
+        .take(MAX_SCANNED_LINES)
+    {
+        let record: Value = serde_json::from_str(&line.ok()?).ok()?;
+        if grok_real_user_item(&record) {
+            let text = grok_user_text(&record);
+            if !text.trim().is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+fn grok_session_modified_at(session_path: &Path, metadata: &fs::Metadata) -> SystemTime {
+    let mut modified_at = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    for name in [CHAT_HISTORY, "events.jsonl", "summary.json"] {
+        if let Ok(modified) = fs::metadata(session_path.join(name)).and_then(|file| file.modified())
+        {
+            modified_at = modified_at.max(modified);
+        }
+    }
+    modified_at
 }
 
 fn kimi_indexed_candidates(home: &Path, sessions: &Path) -> Result<Vec<KimiScanCandidate>> {
@@ -1643,6 +2006,215 @@ pub fn read_kimi_transcript(session_path: &Path) -> Result<KimiTranscript> {
     })
 }
 
+/// Project a Grok Build session directory. `chat_history.jsonl` is the
+/// conversation of record: one JSON object per line, internally tagged by
+/// `type`.
+///
+/// * `system` — the rendered system prompt; not conversation.
+/// * `user` — `content` is a list of `{type: "text"|"image", ...}` parts. A
+///   `synthetic_reason` marks a message the runtime injected rather than one a
+///   person typed.
+/// * `assistant` — `content` is the response text, with any `tool_calls` as
+///   `{id, name, arguments}` beside it.
+/// * `reasoning` — an inlined Responses-API reasoning item whose `summary`
+///   holds `{type: "summary_text", text}` parts.
+/// * `tool_result` — `{tool_call_id, content}`.
+///
+/// Compaction rewrites the file in place, so a `compaction_meta` message with
+/// no earlier real prompt means the raw history is already gone.
+pub fn read_grok_transcript(session_path: &Path) -> Result<GrokTranscript> {
+    let summary_path = session_path.join("summary.json");
+    let summary: Value = serde_json::from_slice(&fs::read(&summary_path)?).with_context(|| {
+        format!(
+            "parse Grok Build session summary {}",
+            summary_path.display()
+        )
+    })?;
+    let cwd = summary
+        .pointer("/info/cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| session_path.parent().and_then(grok_decode_cwd_dirname))
+        .context("Grok Build session summary does not declare its cwd")?;
+    ensure!(
+        cwd.is_absolute(),
+        "Grok Build session cwd is not absolute: {}",
+        cwd.display()
+    );
+
+    let history_path = session_path.join(CHAT_HISTORY);
+    let body = fs::read_to_string(&history_path)
+        .with_context(|| format!("read Grok Build chat history {}", history_path.display()))?;
+    let mut events = Vec::new();
+    let mut saw_raw_user = false;
+    for (index, line) in body.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: Value = serde_json::from_str(line).with_context(|| {
+            format!(
+                "parse Grok Build chat history {} line {}",
+                history_path.display(),
+                index + 1
+            )
+        })?;
+        let recorded_at_ms = native_recorded_at_ms(&record);
+        let item_type = record.get("type").and_then(Value::as_str);
+        if record.get("synthetic_reason").and_then(Value::as_str) == Some("compaction_meta") {
+            ensure!(
+                saw_raw_user,
+                "Grok Build session contains a compaction artifact before recoverable raw history"
+            );
+            continue;
+        }
+        match item_type {
+            Some("user") if grok_real_user_item(&record) => {
+                let text = grok_user_text(&record);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                finish_imported_turn(&mut events, None);
+                let request_id = format!("import-{}", events.len() + 1);
+                push_event(
+                    &mut events,
+                    recorded_at_ms,
+                    WorkerEvent::PromptAccepted {
+                        request_id,
+                        text,
+                        attachments: Vec::new(),
+                    },
+                );
+                saw_raw_user = true;
+            }
+            Some("reasoning") => {
+                let thought = record
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("summary_text"))
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .filter(|text| !text.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !thought.is_empty() {
+                    push_grok_chunk(&mut events, recorded_at_ms, "agent_thought_chunk", &thought);
+                }
+            }
+            Some("assistant") => {
+                if let Some(text) = record
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    push_grok_chunk(&mut events, recorded_at_ms, "agent_message_chunk", text);
+                }
+            }
+            _ => {}
+        }
+    }
+    finish_imported_turn(&mut events, None);
+    finalize_import_event_times(&mut events, &history_path)?;
+    let edited_paths = grok_edited_paths(&body)?;
+    Ok(GrokTranscript {
+        cwd,
+        edited_paths,
+        events,
+    })
+}
+
+/// A `user` item a person actually typed. Everything the runtime injects
+/// carries a `synthetic_reason`.
+fn grok_real_user_item(record: &Value) -> bool {
+    record.get("type").and_then(Value::as_str) == Some("user")
+        && record.get("synthetic_reason").is_none()
+}
+
+fn grok_user_text(record: &Value) -> String {
+    record
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn push_grok_chunk(
+    events: &mut Vec<SequencedEvent>,
+    recorded_at_ms: Option<i64>,
+    update: &str,
+    text: &str,
+) {
+    push_event(
+        events,
+        recorded_at_ms,
+        WorkerEvent::Adapter {
+            kind: "session_update".into(),
+            payload: json!({
+                "type": "session_update",
+                "update": {
+                    "sessionUpdate": update,
+                    "content": {"type": "text", "text": text},
+                },
+            }),
+        },
+    );
+}
+
+/// Files `search_replace` — Grok Build's only file-writing tool — was asked to
+/// change, kept only when a matching `tool_result` proves the call ran. A tool
+/// result carries no success flag, so a call that ran and failed is still
+/// counted; over-reporting an edit only widens the set of repositories the
+/// import inspects.
+fn grok_edited_paths(history: &str) -> Result<Vec<PathBuf>> {
+    let mut calls = BTreeMap::<String, PathBuf>::new();
+    let mut completed = BTreeSet::new();
+    for line in history.lines().filter(|line| !line.trim().is_empty()) {
+        let record: Value = serde_json::from_str(line)?;
+        match record.get("type").and_then(Value::as_str) {
+            Some("assistant") => {
+                for call in record
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if call.get("name").and_then(Value::as_str) != Some("search_replace") {
+                        continue;
+                    }
+                    let Some(id) = call.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let arguments = call
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+                        .unwrap_or(Value::Null);
+                    if let Some(path) = arguments.get("file_path").and_then(Value::as_str) {
+                        calls.insert(id.to_owned(), PathBuf::from(path));
+                    }
+                }
+            }
+            Some("tool_result") => {
+                if let Some(id) = record.get("tool_call_id").and_then(Value::as_str) {
+                    completed.insert(id.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(calls
+        .into_iter()
+        .filter(|(id, _)| completed.contains(id))
+        .map(|(_, path)| path)
+        .collect())
+}
+
 fn claude_edited_paths(path: &Path) -> Result<Vec<PathBuf>> {
     let mut files = vec![path.to_path_buf()];
     if let (Some(parent), Some(session_id)) = (
@@ -2353,6 +2925,56 @@ fn import_codex_session_inner(
     )
 }
 
+pub fn import_grok_session(
+    config: &HelConfig,
+    state: &mut HelState,
+    request: GrokImportRequest<'_>,
+) -> Result<ImportedGrokSession> {
+    import_grok_session_inner(config, state, request, None)
+}
+
+pub fn import_grok_session_with_control(
+    config: &HelConfig,
+    state: &mut HelState,
+    request: GrokImportRequest<'_>,
+    control: &ImportControl<'_>,
+) -> Result<ImportedGrokSession> {
+    import_grok_session_inner(config, state, request, Some(control))
+}
+
+fn import_grok_session_inner(
+    config: &HelConfig,
+    state: &mut HelState,
+    request: GrokImportRequest<'_>,
+    control: Option<&ImportControl<'_>>,
+) -> Result<ImportedGrokSession> {
+    let GrokImportRequest {
+        grok_home,
+        source,
+        transcript,
+        bundle_id,
+        profile_id,
+        title,
+        archive_directory,
+    } = request;
+    import_native_session(
+        config,
+        state,
+        NativeImportRequest {
+            harness: HarnessKind::Grok,
+            harness_home: grok_home,
+            native_session_id: &source.native_session_id,
+            source_path: &source.session_path,
+            transcript,
+            bundle_id,
+            profile_id,
+            title,
+            archive_directory,
+        },
+        control,
+    )
+}
+
 pub fn import_kimi_session(
     config: &HelConfig,
     state: &mut HelState,
@@ -2403,16 +3025,27 @@ fn import_kimi_session_inner(
     )
 }
 
-struct NativeImportRequest<'a> {
-    harness: HarnessKind,
-    harness_home: &'a Path,
-    native_session_id: &'a str,
-    source_path: &'a Path,
-    transcript: &'a ClaudeTranscript,
-    bundle_id: &'a str,
-    profile_id: Option<&'a str>,
-    title: Option<&'a str>,
-    archive_directory: &'a Path,
+pub struct NativeImportRequest<'a> {
+    pub harness: HarnessKind,
+    pub harness_home: &'a Path,
+    pub native_session_id: &'a str,
+    pub source_path: &'a Path,
+    pub transcript: &'a ClaudeTranscript,
+    pub bundle_id: &'a str,
+    pub profile_id: Option<&'a str>,
+    pub title: Option<&'a str>,
+    pub archive_directory: &'a Path,
+}
+
+/// Import one already-located, already-parsed native session, for any harness.
+/// The per-harness `import_*_session` wrappers are thin adapters over this.
+pub fn import_native_session_with_control(
+    config: &HelConfig,
+    state: &mut HelState,
+    request: NativeImportRequest<'_>,
+    control: &ImportControl<'_>,
+) -> Result<ImportedClaudeSession> {
+    import_native_session(config, state, request, Some(control))
 }
 
 fn import_native_session(
@@ -3960,6 +4593,225 @@ mod tests {
                 .events
                 .iter()
                 .all(|event| event.recorded_at_ms == Some(expected_fallback))
+        );
+    }
+
+    /// Synthetic `chat_history.jsonl`, modeled on the shape Grok Build writes:
+    /// internally tagged items, user content as typed parts, reasoning
+    /// summaries beside the assistant turn, and `search_replace` tool calls
+    /// paired with their results.
+    fn grok_session(directory: &Path, cwd: &str, history: &str) -> PathBuf {
+        let session = directory.join("sessions/%2Fwork%2Fapp/01a00c3a-553f-71e0-95ab-aa04396d3ad7");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            session.join("summary.json"),
+            json!({
+                "info": {"id": "01a00c3a-553f-71e0-95ab-aa04396d3ad7", "cwd": cwd},
+                "session_summary": "",
+                "num_chat_messages": 4,
+                "current_model_id": "grok-4.6",
+                "grok_home": "/home/me/.grok",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(session.join("chat_history.jsonl"), history).unwrap();
+        session
+    }
+
+    #[test]
+    fn grok_chat_history_projects_prompts_thoughts_and_replies() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = concat!(
+            r#"{"type":"system","content":"You are Grok."}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"<system-reminder>ignore me</system-reminder>"}],"synthetic_reason":"system_reminder"}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"first prompt"}],"prompt_index":0}"#,
+            "\n",
+            r#"{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"thinking it over"}],"encrypted_content":"opaque"}"#,
+            "\n",
+            r#"{"type":"assistant","content":"first reply","model_id":"grok-4.6"}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"follow up"}],"prompt_index":1}"#,
+            "\n",
+            r#"{"type":"assistant","content":"second reply","model_id":"grok-4.6"}"#,
+            "\n",
+        );
+        let session = grok_session(directory.path(), "/work/app", history);
+        let expected_fallback = DateTime::<Utc>::from(
+            fs::metadata(session.join("chat_history.jsonl"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+        )
+        .timestamp_millis();
+
+        let transcript = read_grok_transcript(&session).unwrap();
+
+        assert_eq!(transcript.cwd, PathBuf::from("/work/app"));
+        assert!(matches!(
+            &transcript.events[0].event,
+            WorkerEvent::PromptAccepted { text, .. } if text == "first prompt"
+        ));
+        assert_eq!(
+            agent_text(&transcript.events[1].event).as_deref(),
+            Some("thinking it over")
+        );
+        assert_eq!(
+            agent_text(&transcript.events[2].event).as_deref(),
+            Some("first reply")
+        );
+        assert!(matches!(
+            transcript.events[3].event,
+            WorkerEvent::TurnCompleted
+        ));
+        assert!(matches!(
+            &transcript.events[4].event,
+            WorkerEvent::PromptAccepted { text, .. } if text == "follow up"
+        ));
+        assert_eq!(
+            agent_text(&transcript.events[5].event).as_deref(),
+            Some("second reply")
+        );
+        assert!(matches!(
+            transcript.events[6].event,
+            WorkerEvent::TurnCompleted
+        ));
+        assert_eq!(transcript.events.len(), 7);
+        assert!(
+            transcript
+                .events
+                .iter()
+                .all(|event| event.recorded_at_ms == Some(expected_fallback))
+        );
+    }
+
+    #[test]
+    fn grok_reasoning_and_message_chunks_keep_their_own_update_kinds() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = concat!(
+            r#"{"type":"user","content":[{"type":"text","text":"go"}]}"#,
+            "\n",
+            r#"{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"a"},{"type":"summary_text","text":"b"}]}"#,
+            "\n",
+            r#"{"type":"assistant","content":"done"}"#,
+            "\n",
+        );
+        let session = grok_session(directory.path(), "/work/app", history);
+
+        let transcript = read_grok_transcript(&session).unwrap();
+
+        let update = |index: usize| match &transcript.events[index].event {
+            WorkerEvent::Adapter { payload, .. } => payload
+                .pointer("/update/sessionUpdate")
+                .and_then(Value::as_str)
+                .unwrap()
+                .to_owned(),
+            other => panic!("expected an adapter event, got {other:?}"),
+        };
+        assert_eq!(update(1), "agent_thought_chunk");
+        assert_eq!(
+            agent_text(&transcript.events[1].event).as_deref(),
+            Some("a\nb")
+        );
+        assert_eq!(update(2), "agent_message_chunk");
+    }
+
+    #[test]
+    fn grok_compaction_before_recoverable_history_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = concat!(
+            r#"{"type":"user","content":[{"type":"text","text":"summary of earlier work"}],"synthetic_reason":"compaction_meta"}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"carry on"}]}"#,
+            "\n",
+        );
+        let session = grok_session(directory.path(), "/work/app", history);
+
+        let error = read_grok_transcript(&session).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("compaction artifact before recoverable raw history"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn grok_edited_paths_need_a_completed_search_replace_call() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = concat!(
+            r#"{"type":"user","content":[{"type":"text","text":"edit things"}]}"#,
+            "\n",
+            r#"{"type":"assistant","content":"","tool_calls":[{"id":"call-1","name":"search_replace","arguments":"{\"file_path\":\"/work/app/src/lib.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}"},{"id":"call-2","name":"search_replace","arguments":"{\"file_path\":\"/work/app/never-ran.rs\"}"},{"id":"call-3","name":"read_file","arguments":"{\"file_path\":\"/work/app/README.md\"}"}]}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_call_id":"call-1","content":"ok"}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_call_id":"call-3","content":"ok"}"#,
+            "\n",
+        );
+        let session = grok_session(directory.path(), "/work/app", history);
+
+        let transcript = read_grok_transcript(&session).unwrap();
+
+        // Only the completed write is reported: an unanswered call never ran,
+        // and a read is not an edit.
+        assert_eq!(
+            transcript.edited_paths,
+            [PathBuf::from("/work/app/src/lib.rs")]
+        );
+    }
+
+    #[test]
+    fn grok_scan_lists_sessions_and_skips_the_shared_search_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = concat!(
+            r#"{"type":"user","content":[{"type":"text","text":"the very first thing\nand a second line"}]}"#,
+            "\n",
+        );
+        grok_session(directory.path(), "/work/app", history);
+        let sessions = directory.path().join("sessions");
+        fs::write(sessions.join("session_search.sqlite"), b"index").unwrap();
+        fs::write(
+            sessions.join("%2Fwork%2Fapp").join("summary.json.lock"),
+            b"",
+        )
+        .unwrap();
+
+        let listed = list_grok_sessions(directory.path()).unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].native_session_id,
+            "01a00c3a-553f-71e0-95ab-aa04396d3ad7"
+        );
+        assert_eq!(listed[0].cwd, PathBuf::from("/work/app"));
+        // No stored summary yet, so the first thing the person typed names it,
+        // flattened to a single line.
+        assert_eq!(listed[0].title, "the very first thing and a second line");
+
+        let located = locate_grok_session(directory.path(), &GrokSessionSelection::Latest).unwrap();
+        assert_eq!(located.native_session_id, listed[0].native_session_id);
+    }
+
+    #[test]
+    fn grok_cwd_directory_names_decode_back_to_their_working_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let encoded = directory.path().join("%2Fwork%2Fmy%20app");
+        fs::create_dir_all(&encoded).unwrap();
+        assert_eq!(
+            grok_decode_cwd_dirname(&encoded),
+            Some(PathBuf::from("/work/my app"))
+        );
+
+        // The hash form is not reversible, so the recorded `.cwd` decides.
+        let hashed = directory.path().join("app-0123456789abcdef");
+        fs::create_dir_all(&hashed).unwrap();
+        assert_eq!(grok_decode_cwd_dirname(&hashed), None);
+        fs::write(hashed.join(".cwd"), "/work/a-very-long-path\n").unwrap();
+        assert_eq!(
+            grok_decode_cwd_dirname(&hashed),
+            Some(PathBuf::from("/work/a-very-long-path"))
         );
     }
 

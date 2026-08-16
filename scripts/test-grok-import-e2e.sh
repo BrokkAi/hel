@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Run a genuine Grok Build import/resume cycle on a host with Podman.
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+grok_home=${GROK_HOME:-"$HOME/.grok"}
+test_root=${HEL_IMPORT_E2E_GROK_ROOT:-"${XDG_STATE_HOME:-"$HOME/.local/state"}/hel/import-e2e/grok-native"}
+
+if [[ ! -d "$grok_home" ]]; then
+    echo "Grok Build home does not exist: $grok_home" >&2
+    exit 1
+fi
+
+export GROK_HOME="$grok_home"
+export HEL_IMPORT_E2E_ROOT="$test_root"
+export HEL_IMPORT_E2E_GROK_SESSION="${HEL_IMPORT_E2E_GROK_SESSION:-01a00c3a-553f-71e0-95ab-aa04396d3ad7}"
+export HEL_IMPORT_E2E_GROK_REPOSITORY="${HEL_IMPORT_E2E_GROK_REPOSITORY:-BrokkAi/hel}"
+export HEL_IMPORT_E2E_IMAGE="${HEL_IMPORT_E2E_IMAGE:-localhost/hel/agent-dev:latest}"
+# Keep the test's imported state and archive separate from the user's Hel data.
+export HEL_CONFIG_DIR="$test_root/config/hel"
+export HEL_DATA_DIR="$test_root/data/hel"
+export HEL_WORKER_BINARY="${HEL_WORKER_BINARY:-$repo_root/target/x86_64-unknown-linux-musl/debug/hel}"
+
+mkdir -p "$test_root"
+cd "$repo_root"
+if [[ ! -x "$HEL_WORKER_BINARY" ]]; then
+    cargo build --target x86_64-unknown-linux-musl
+fi
+cargo test --test import_e2e imported_grok_session_resumes_natively -- --ignored --nocapture

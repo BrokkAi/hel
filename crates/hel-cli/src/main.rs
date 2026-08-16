@@ -25,14 +25,15 @@ use hel::hel_credentials::{CredentialSyncCoordinator, CredentialSyncHandle, Cred
 use hel::hel_greeting::{GreetingFacts, RepositoryGreetingFacts};
 use hel::hel_import::{
     BundleResolution, ClaudeImportRequest, ClaudeSessionSelection, CodexImportRequest,
-    CodexSessionSelection, ImportArchiveProgress, ImportControl, KimiImportRequest,
-    KimiSessionSelection, claude_config_home, codex_config_home, configured_bundle_for_local,
-    configured_bundle_for_origin, import_claude_session, import_claude_session_with_control,
-    import_codex_session, import_codex_session_with_control, import_kimi_session,
-    import_kimi_session_with_control, import_safety_issues, kimi_config_home,
-    locate_claude_session, locate_codex_session, locate_kimi_session, read_claude_transcript,
-    read_codex_transcript, read_kimi_transcript, resolve_bundle, scan_claude_sessions,
-    scan_codex_sessions, scan_kimi_sessions, session_edit_targets,
+    CodexSessionSelection, GrokImportRequest, GrokSessionSelection, ImportArchiveProgress,
+    ImportControl, KimiImportRequest, KimiSessionSelection, NativeImportRequest,
+    claude_config_home, codex_config_home, configured_bundle_for_local,
+    configured_bundle_for_origin, grok_config_home, import_claude_session, import_codex_session,
+    import_grok_session, import_kimi_session, import_native_session_with_control,
+    import_safety_issues, kimi_config_home, locate_claude_session, locate_codex_session,
+    locate_grok_session, locate_kimi_session, locate_native_session, read_claude_transcript,
+    read_codex_transcript, read_grok_transcript, read_kimi_transcript, read_native_transcript,
+    resolve_bundle, scan_native_sessions, session_edit_targets,
 };
 use hel::hel_projection::materialized_session_from_canonical;
 use hel::hel_quota::{ProfileQuota, QuotaManager, QuotaRefreshRequest};
@@ -183,6 +184,8 @@ enum ImportCommand {
     Codex(CodexImportArgs),
     /// Import a session created by vanilla Kimi Code.
     Kimi(KimiImportArgs),
+    /// Import a session created by vanilla Grok Build.
+    Grok(GrokImportArgs),
 }
 
 #[derive(Debug, Args)]
@@ -223,6 +226,33 @@ struct KimiImportArgs {
     #[arg(long)]
     session: Option<String>,
     /// Import the most recently modified Kimi session.
+    #[arg(long)]
+    latest: bool,
+    /// Existing configured bundle to associate with the imported session.
+    #[arg(long)]
+    bundle: Option<String>,
+    /// Title displayed in Hel's dashboard.
+    #[arg(long)]
+    title: Option<String>,
+    /// Proceed after acknowledging dirty detected Git roots.
+    #[arg(long = "allow-dirty", visible_alias = "allow-dirty-local")]
+    allow_dirty_local: bool,
+    /// Proceed after acknowledging edited non-Git directories will be omitted.
+    #[arg(long)]
+    allow_omitted_non_git: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("grok-session-selection")
+        .required(true)
+        .args(["session", "latest"])
+))]
+struct GrokImportArgs {
+    /// Native Grok Build session UUID to import.
+    #[arg(long)]
+    session: Option<String>,
+    /// Import the most recently modified Grok Build session.
     #[arg(long)]
     latest: bool,
     /// Existing configured bundle to associate with the imported session.
@@ -814,6 +844,7 @@ fn import(args: ImportArgs) -> Result<()> {
         ImportCommand::Claude(args) => import_claude(args),
         ImportCommand::Codex(args) => import_codex(args),
         ImportCommand::Kimi(args) => import_kimi(args),
+        ImportCommand::Grok(args) => import_grok(args),
     }
 }
 
@@ -960,6 +991,61 @@ fn import_kimi(args: KimiImportArgs) -> Result<()> {
         &mut state,
         KimiImportRequest {
             kimi_home: &kimi_home,
+            source: &source,
+            transcript: &transcript,
+            bundle_id: &bundle_id,
+            profile_id: None,
+            title: args.title.as_deref(),
+            archive_directory: &sessions_dir(),
+        },
+    )?;
+    config.save()?;
+    persist_imported_session(
+        state
+            .sessions
+            .get(&imported.session_id)
+            .context("import did not add its session to controller state")?,
+    )?;
+    println!(
+        "Imported {} as Hel session {} (bundle {}, archive {})",
+        imported.native_session_id,
+        imported.session_id,
+        imported.bundle_id,
+        imported.archive_path.display()
+    );
+    Ok(())
+}
+
+fn import_grok(args: GrokImportArgs) -> Result<()> {
+    let grok_home = grok_config_home()?;
+    let selection = match args.session {
+        Some(session) => GrokSessionSelection::NativeSessionId(session),
+        None => GrokSessionSelection::Latest,
+    };
+    let source = locate_grok_session(&grok_home, &selection)?;
+    println!(
+        "Selected Grok Build session {} at {}",
+        source.native_session_id,
+        source.session_path.display()
+    );
+    let transcript = read_grok_transcript(&source.session_path)?;
+    println!("Original cwd: {}", transcript.cwd.display());
+
+    let mut config = HelConfig::load()?;
+    let mut state = HelState::load()?;
+    state.validate_against_config(&config)?;
+    let targets = session_edit_targets(&transcript, &grok_home)?;
+    let bundle_id =
+        resolve_import_bundle(&mut config, &transcript, &targets, args.bundle.as_deref())?;
+    if !confirm_import_safety(&targets, args.allow_dirty_local, args.allow_omitted_non_git)? {
+        println!("Import cancelled; no Hel files were changed.");
+        return Ok(());
+    }
+    let imported = import_grok_session(
+        &config,
+        &mut state,
+        GrokImportRequest {
+            grok_home: &grok_home,
             source: &source,
             transcript: &transcript,
             bundle_id: &bundle_id,
@@ -4735,57 +4821,21 @@ fn discover_import_profile(
         scan_progress: None,
         error: None,
     };
-    let discovered = match harness_kind {
-        hel::hel_config::HarnessKind::Codex => scan_codex_sessions(&home, |progress| {
-            profile.scan_progress = Some((progress.scanned, progress.total));
-            if let Some(session) = progress.session {
-                let unavailable_reason = session.history_mode.import_issue().map(ToOwned::to_owned);
-                profile.sessions.push(import_session_option(
-                    session.native_session_id,
-                    session.title,
-                    session.modified_at,
-                    session.git_branch,
-                    session.size_bytes,
-                    session.cwd,
-                    unavailable_reason,
-                ));
-            }
-            publish(&profile);
-        }),
-        hel::hel_config::HarnessKind::Claude => scan_claude_sessions(&home, |progress| {
-            profile.scan_progress = Some((progress.scanned, progress.total));
-            if let Some(session) = progress.session {
-                profile.sessions.push(import_session_option(
-                    session.native_session_id,
-                    session.title,
-                    session.modified_at,
-                    session.git_branch,
-                    session.size_bytes,
-                    session.cwd,
-                    None,
-                ));
-            }
-            publish(&profile);
-        }),
-        hel::hel_config::HarnessKind::Kimi => scan_kimi_sessions(&home, |progress| {
-            profile.scan_progress = Some((progress.scanned, progress.total));
-            if let Some(session) = progress.session {
-                profile.sessions.push(import_session_option(
-                    session.native_session_id,
-                    session.title,
-                    session.modified_at,
-                    session.git_branch,
-                    session.size_bytes,
-                    session.cwd,
-                    None,
-                ));
-            }
-            publish(&profile);
-        }),
-        hel::hel_config::HarnessKind::Grok => Err(anyhow::anyhow!(
-            "importing Grok Build sessions is not supported yet"
-        )),
-    };
+    let discovered = scan_native_sessions(harness_kind, &home, |progress| {
+        profile.scan_progress = Some((progress.scanned, progress.total));
+        if let Some(session) = progress.session {
+            profile.sessions.push(import_session_option(
+                session.native_session_id,
+                session.title,
+                session.modified_at,
+                session.git_branch,
+                session.size_bytes,
+                session.cwd,
+                session.unavailable_reason.map(ToOwned::to_owned),
+            ));
+        }
+        publish(&profile);
+    });
     if let Err(error) = discovered {
         profile.error = Some(format!("{error:#}"));
         publish(&profile);
@@ -5033,152 +5083,54 @@ fn import_session_from_profile(
         .get(profile_id)
         .with_context(|| format!("unknown profile {profile_id:?}"))?
         .clone();
-    match profile.kind {
-        hel::hel_config::HarnessKind::Codex => {
-            let source = locate_codex_session(
-                &profile.home,
-                &CodexSessionSelection::NativeSessionId(native_session_id.into()),
-            )?;
-            let transcript = read_codex_transcript(&source.jsonl_path)?;
-            report(2, Some(4), "Native session parsed.", true);
-            let bundle_id = match resolve_background_import_bundle(
-                &mut controller.config,
-                &transcript,
-                &profile.home,
-                safety.accepted,
-            )? {
-                BackgroundBundleResolution::Ready(bundle_id) => bundle_id,
-                BackgroundBundleResolution::NeedsConfirmation(prompt) => {
-                    return Ok(DashboardImportTaskResult::NeedsBundle(prompt));
-                }
-            };
-            let archive_progress = |progress| report_import_archive_progress(progress, &report);
-            let control = ImportControl {
-                cancelled,
-                progress: &archive_progress,
-                include_untracked: safety.include_untracked,
-            };
-            let imported = import_codex_session_with_control(
-                &controller.config,
-                &mut controller.state,
-                CodexImportRequest {
-                    codex_home: &profile.home,
-                    source: &source,
-                    transcript: &transcript,
-                    bundle_id: &bundle_id,
-                    profile_id: Some(profile_id),
-                    title: Some(display_title),
-                    archive_directory: &sessions_dir(),
-                },
-                &control,
-            )?;
-            report(4, Some(4), "Finalizing imported session…", true);
-            Ok(DashboardImportTaskResult::Imported(
-                DashboardImportSuccess {
-                    harness: "Codex",
-                    session_id: imported.session_id,
-                    controller,
-                },
-            ))
+    let source = locate_native_session(
+        profile.kind,
+        &profile.home,
+        &ClaudeSessionSelection::NativeSessionId(native_session_id.into()),
+    )?;
+    let transcript = read_native_transcript(profile.kind, &source.source_path)?;
+    report(2, Some(4), "Native session parsed.", true);
+    let bundle_id = match resolve_background_import_bundle(
+        &mut controller.config,
+        &transcript,
+        &profile.home,
+        safety.accepted,
+    )? {
+        BackgroundBundleResolution::Ready(bundle_id) => bundle_id,
+        BackgroundBundleResolution::NeedsConfirmation(prompt) => {
+            return Ok(DashboardImportTaskResult::NeedsBundle(prompt));
         }
-        hel::hel_config::HarnessKind::Claude => {
-            let source = locate_claude_session(
-                &profile.home,
-                &ClaudeSessionSelection::NativeSessionId(native_session_id.into()),
-            )?;
-            let transcript = read_claude_transcript(&source.jsonl_path)?;
-            report(2, Some(4), "Native session parsed.", true);
-            let bundle_id = match resolve_background_import_bundle(
-                &mut controller.config,
-                &transcript,
-                &profile.home,
-                safety.accepted,
-            )? {
-                BackgroundBundleResolution::Ready(bundle_id) => bundle_id,
-                BackgroundBundleResolution::NeedsConfirmation(prompt) => {
-                    return Ok(DashboardImportTaskResult::NeedsBundle(prompt));
-                }
-            };
-            let archive_progress = |progress| report_import_archive_progress(progress, &report);
-            let control = ImportControl {
-                cancelled,
-                progress: &archive_progress,
-                include_untracked: safety.include_untracked,
-            };
-            let imported = import_claude_session_with_control(
-                &controller.config,
-                &mut controller.state,
-                ClaudeImportRequest {
-                    claude_home: &profile.home,
-                    source: &source,
-                    transcript: &transcript,
-                    bundle_id: &bundle_id,
-                    profile_id: Some(profile_id),
-                    title: Some(display_title),
-                    archive_directory: &sessions_dir(),
-                },
-                &control,
-            )?;
-            report(4, Some(4), "Finalizing imported session…", true);
-            Ok(DashboardImportTaskResult::Imported(
-                DashboardImportSuccess {
-                    harness: "Claude",
-                    session_id: imported.session_id,
-                    controller,
-                },
-            ))
-        }
-        hel::hel_config::HarnessKind::Kimi => {
-            let source = locate_kimi_session(
-                &profile.home,
-                &KimiSessionSelection::NativeSessionId(native_session_id.into()),
-            )?;
-            let transcript = read_kimi_transcript(&source.session_path)?;
-            report(2, Some(4), "Native session parsed.", true);
-            let bundle_id = match resolve_background_import_bundle(
-                &mut controller.config,
-                &transcript,
-                &profile.home,
-                safety.accepted,
-            )? {
-                BackgroundBundleResolution::Ready(bundle_id) => bundle_id,
-                BackgroundBundleResolution::NeedsConfirmation(prompt) => {
-                    return Ok(DashboardImportTaskResult::NeedsBundle(prompt));
-                }
-            };
-            let archive_progress = |progress| report_import_archive_progress(progress, &report);
-            let control = ImportControl {
-                cancelled,
-                progress: &archive_progress,
-                include_untracked: safety.include_untracked,
-            };
-            let imported = import_kimi_session_with_control(
-                &controller.config,
-                &mut controller.state,
-                KimiImportRequest {
-                    kimi_home: &profile.home,
-                    source: &source,
-                    transcript: &transcript,
-                    bundle_id: &bundle_id,
-                    profile_id: Some(profile_id),
-                    title: Some(display_title),
-                    archive_directory: &sessions_dir(),
-                },
-                &control,
-            )?;
-            report(4, Some(4), "Finalizing imported session…", true);
-            Ok(DashboardImportTaskResult::Imported(
-                DashboardImportSuccess {
-                    harness: "Kimi",
-                    session_id: imported.session_id,
-                    controller,
-                },
-            ))
-        }
-        hel::hel_config::HarnessKind::Grok => {
-            bail!("importing Grok Build sessions is not supported yet")
-        }
-    }
+    };
+    let archive_progress = |progress| report_import_archive_progress(progress, &report);
+    let control = ImportControl {
+        cancelled,
+        progress: &archive_progress,
+        include_untracked: safety.include_untracked,
+    };
+    let imported = import_native_session_with_control(
+        &controller.config,
+        &mut controller.state,
+        NativeImportRequest {
+            harness: profile.kind,
+            harness_home: &profile.home,
+            native_session_id: &source.native_session_id,
+            source_path: &source.source_path,
+            transcript: &transcript,
+            bundle_id: &bundle_id,
+            profile_id: Some(profile_id),
+            title: Some(display_title),
+            archive_directory: &sessions_dir(),
+        },
+        &control,
+    )?;
+    report(4, Some(4), "Finalizing imported session…", true);
+    Ok(DashboardImportTaskResult::Imported(
+        DashboardImportSuccess {
+            harness: profile.kind.display_name(),
+            session_id: imported.session_id,
+            controller,
+        },
+    ))
 }
 
 fn short_id(id: &str) -> &str {
