@@ -42,7 +42,7 @@ use hel::hel_server::{
 };
 use hel::hel_session_manager::{
     RelaySessionTarget, SessionManagerControl, SessionManagerUpdate, SessionManagerUpdates,
-    new_command_id, spawn_session_manager,
+    ViewError, new_command_id, spawn_session_manager,
 };
 use hel::hel_setup::{SetupOutcome, github_repository_from_origin, run_setup_dialog};
 use hel::hel_state::{
@@ -2386,12 +2386,25 @@ fn apply_worker_poll_update(
     if apply_worker_record_update(controller, &update, Some(dashboard_io_tx))? {
         dashboard.set_state(controller.state.clone());
     }
-    if let Some(detail) = update.view.error {
-        dashboard.mark_transcript_unavailable(&update.session_id);
-        dashboard.set_notice(format!(
-            "Session {}: relay unreachable: {detail}; collecting worker diagnostics…",
-            &update.session_id[..update.session_id.len().min(8)]
-        ));
+    match update.view.error {
+        Some(ViewError::Unreachable(detail)) => {
+            dashboard.mark_transcript_unavailable(&update.session_id);
+            dashboard.set_notice(format!(
+                "Session {}: relay unreachable: {detail}; collecting worker diagnostics…",
+                &update.session_id[..update.session_id.len().min(8)]
+            ));
+        }
+        Some(ViewError::ProjectionIntegrity(detail)) => {
+            // Deterministic failure: no worker diagnostics, and no
+            // "relay unreachable:" last_error, which reconnect handling
+            // reserves for genuinely unreachable relays.
+            dashboard.mark_transcript_unavailable(&update.session_id);
+            dashboard.set_notice(format!(
+                "Session {}: transcript projection failed: {detail}",
+                &update.session_id[..update.session_id.len().min(8)]
+            ));
+        }
+        None => {}
     }
     Ok(update.view.snapshot.is_some())
 }
@@ -3646,7 +3659,11 @@ async fn run_dashboard() -> Result<()> {
             controller_changed = true;
             let session_id = update.session_id.clone();
             let connected = update.view.connected;
-            let connection_error = update.view.error.clone();
+            // Only unreachable relays drive the worker diagnostics flow.
+            let connection_error = match update.view.error.as_ref() {
+                Some(ViewError::Unreachable(detail)) => Some(detail.clone()),
+                Some(ViewError::ProjectionIntegrity(_)) | None => None,
+            };
             if let Some(snapshot) = update.view.snapshot.as_ref()
                 && let Some(session) = controller.state.sessions.get(&session_id).cloned()
             {
