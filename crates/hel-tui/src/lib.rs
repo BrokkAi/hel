@@ -33,6 +33,8 @@ use hel::hel_targets::{
 const FORCE_CONFIRMATION: &str = "DESTROY";
 const BASELINE_CPUS: u64 = 8;
 const BASELINE_MEMORY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const FLOOR_CPUS: u64 = 2;
+const FLOOR_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const ACTIVE_MESSAGE_LINES: usize = 4;
 const SELECTED_TRANSCRIPT_LINES: usize = 10;
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
@@ -3699,15 +3701,32 @@ fn adjust_resources(
                     let Some((max_cpus, _)) = limits else {
                         return;
                     };
-                    (cpus.saturating_mul(2).min(max_cpus.max(1)), memory_bytes)
+                    (cpus.saturating_add(8).min(max_cpus.max(1)), memory_bytes)
                 }
                 KeyCode::Char('m') => {
                     let Some((_, max_memory)) = limits else {
                         return;
                     };
-                    (cpus, memory_bytes.saturating_mul(2).min(max_memory.max(1)))
+                    (
+                        cpus,
+                        memory_bytes
+                            .saturating_add(memory_bytes / 2)
+                            .min(max_memory.max(1)),
+                    )
                 }
-                KeyCode::Char('-') if cpus > 1 => (cpus / 2, (memory_bytes / 2).max(1)),
+                KeyCode::Char('-') => {
+                    let next_cpus = if cpus > FLOOR_CPUS {
+                        (cpus / 2).max(FLOOR_CPUS)
+                    } else {
+                        cpus
+                    };
+                    let next_memory = if memory_bytes > FLOOR_MEMORY_BYTES {
+                        (memory_bytes / 2).max(FLOOR_MEMORY_BYTES)
+                    } else {
+                        memory_bytes
+                    };
+                    (next_cpus, next_memory)
+                }
                 _ => return,
             };
             *allocation = Some(SessionResourceAllocation::Container {
@@ -5517,7 +5536,7 @@ fn render_new_wizard(
         WizardStep::ProjectDirectory => unreachable!("project directory input was rendered above"),
     };
     let help = if wizard.step == WizardStep::Target {
-        "+ both · c CPU · m memory · - halve · r reset"
+        "+ double · - halve · c +8 CPU · m +50% memory · r reset"
     } else {
         "↑/↓ select · Tab moves focus · Enter activates"
     };
@@ -5911,7 +5930,7 @@ fn render_resume_wizard(
                 })
                 .collect(),
             wizard.target,
-            &["+ both · c CPU · m memory · - halve · r reset"][..],
+            &["+ double · - halve · c +8 CPU · m +50% memory · r reset"][..],
         ),
         WizardStep::Bundle => unreachable!("resume does not select a bundle"),
         WizardStep::Review => unreachable!("review was rendered above"),
@@ -10155,6 +10174,136 @@ mod tests {
             allocation,
             Some(SessionResourceAllocation::Container {
                 cpus: 16,
+                memory_bytes: 48 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_minus_clamps_cpu_at_floor_and_keeps_halving_memory() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 2,
+            memory_bytes: 32 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 2,
+                memory_bytes: 16 * gib,
+            })
+        );
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 2,
+                memory_bytes: 8 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_minus_clamps_memory_at_floor_and_keeps_halving_cpu() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 16,
+            memory_bytes: 8 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 8,
+                memory_bytes: 8 * gib,
+            })
+        );
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 4,
+                memory_bytes: 8 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_minus_is_a_no_op_once_both_are_at_their_floors() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 2,
+            memory_bytes: 8 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 2,
+                memory_bytes: 8 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_minus_leaves_values_already_below_floor_unchanged() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 1,
+            memory_bytes: 4 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 1,
+                memory_bytes: 4 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_c_clamps_at_cpu_ceiling() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 60,
+            memory_bytes: 32 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('c'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 64,
+                memory_bytes: 32 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_m_clamps_at_memory_ceiling() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 8,
+            memory_bytes: 60 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('m'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 8,
                 memory_bytes: 64 * gib,
             })
         );
