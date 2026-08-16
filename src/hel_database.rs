@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use crate::hel_config::{HarnessKind, data_dir};
+use crate::hel_config::data_dir;
 use crate::hel_projection::ProjectionIntegrityError;
 use crate::hel_state::{
     CheckpointMetadata, HelState, ManagedWorktree, MaterializedExecutionState,
@@ -534,7 +534,13 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
         Ok(SessionRecord {
             id: row.get(0)?,
             title: row.get(1)?,
-            harness_kind: parse_harness(&row.get::<_, String>(2)?),
+            harness_kind: row.get::<_, String>(2)?.parse().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::<dyn std::error::Error + Send + Sync>::from(format!("{error:#}")),
+                )
+            })?,
             last_profile: row.get(3)?,
             bundle_id: row.get(4)?,
             project_directory: row.get_ref(16)?.blob_or_null()?.map(blob_to_path),
@@ -1648,7 +1654,7 @@ fn insert_session_scoped(
         params![
             session.id,
             session.title,
-            harness_name(session.harness_kind),
+            session.harness_kind.id(),
             session.last_profile,
             session.target_template_id,
             session_state_name(session.state),
@@ -2049,21 +2055,6 @@ fn migrate_legacy_state_from(legacy: &Path, database: &Path) -> Result<()> {
     Ok(())
 }
 
-fn harness_name(value: HarnessKind) -> &'static str {
-    match value {
-        HarnessKind::Codex => "codex",
-        HarnessKind::Claude => "claude",
-        HarnessKind::Kimi => "kimi",
-    }
-}
-fn parse_harness(value: &str) -> HarnessKind {
-    match value {
-        "codex" => HarnessKind::Codex,
-        "claude" => HarnessKind::Claude,
-        "kimi" => HarnessKind::Kimi,
-        _ => unreachable!(),
-    }
-}
 fn session_state_name(value: SessionState) -> &'static str {
     match value {
         SessionState::Provisioning => "provisioning",
@@ -2137,6 +2128,7 @@ impl<'a> ValueRefExt<'a> for rusqlite::types::ValueRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hel_config::HarnessKind;
     use crate::hel_state::{ManagedWorktreeTarget, TranscriptBody};
     use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
     use rusqlite::OptionalExtension;

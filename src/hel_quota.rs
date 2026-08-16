@@ -274,6 +274,17 @@ async fn refresh_profile(
                     refreshed_at_epoch_seconds,
                 })
         }
+        // Grok Build publishes no quota endpoint Hel can read. Report that as
+        // a plain note rather than an error, so the dashboard does not paint a
+        // failure that no one can fix.
+        HarnessKind::Grok => Ok(ProfileQuota {
+            profile_id: profile_id.clone(),
+            harness,
+            windows: Vec::new(),
+            extra: Some("quota reporting is not available for Grok Build".to_owned()),
+            error: None,
+            refreshed_at_epoch_seconds,
+        }),
     };
     let report = result.unwrap_or_else(|error| ProfileQuota {
         profile_id,
@@ -782,6 +793,29 @@ mod tests {
         };
 
         assert_eq!(report.compact(), "Week 0% left, resets 03:59 Aug 14");
+    }
+
+    #[tokio::test]
+    async fn grok_reports_unsupported_quota_as_a_note_rather_than_an_error() {
+        let (report, _) = refresh_profile(
+            QuotaRefreshRequest {
+                profile_id: "grok".into(),
+                harness: HarnessKind::Grok,
+                source_home: std::path::PathBuf::from("/nonexistent"),
+                environment: BTreeMap::new(),
+                cwd: std::path::PathBuf::from("/"),
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(report.profile_id, "grok");
+        assert_eq!(report.error, None, "an unfixable gap is not a failure");
+        assert!(report.windows.is_empty());
+        assert_eq!(
+            report.compact(),
+            "quota reporting is not available for Grok Build"
+        );
     }
 
     #[test]

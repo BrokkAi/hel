@@ -56,6 +56,10 @@ pub fn credential_fingerprint(bytes: &[u8]) -> String {
 /// * Kimi `~/.kimi-code/credentials/kimi-code.json`: `{ "access_token",
 ///   "refresh_token", "expires_at", "expires_in", "scope", "token_type" }`.
 ///   `expires_at` is a 10-digit number, so epoch seconds.
+/// * Grok `~/.grok/auth.json`: an object keyed by `"<issuer>::<uuid>"`, each
+///   value holding `{ "key", "refresh_token", "expires_at", ... }`.
+///   `expires_at` is an RFC3339 string with nanosecond precision and a `Z`
+///   suffix. A file may hold several grants, so the latest expiry wins.
 ///
 /// Anything unparseable is `None` rather than a guess.
 pub fn credential_freshness(kind: HarnessKind, bytes: &[u8]) -> Option<i64> {
@@ -72,6 +76,16 @@ pub fn credential_freshness(kind: HarnessKind, bytes: &[u8]) -> Option<i64> {
             .get("expires_at")?
             .as_i64()
             .and_then(|seconds| seconds.checked_mul(1000)),
+        HarnessKind::Grok => value
+            .as_object()?
+            .values()
+            .filter_map(|grant| {
+                let expires_at = grant.get("expires_at")?.as_str()?;
+                chrono::DateTime::parse_from_rfc3339(expires_at)
+                    .ok()
+                    .map(|expiry| expiry.timestamp_millis())
+            })
+            .max(),
     }
 }
 
@@ -237,27 +251,30 @@ pub fn events_report_auth_failure(_kind: HarnessKind, events: &[RelayEvent]) -> 
 /// Build the harness's own interactive login command for a profile.
 ///
 /// Verified against the locally installed CLIs with `--help`: `codex login`,
-/// `claude auth login` (there is no bare `claude login`), and `kimi login`.
+/// `claude auth login` (there is no bare `claude login`), `kimi login`, and
+/// `grok login`.
 ///
 /// `profile.executable` overrides the *ACP bridge*, not the harness CLI: for
 /// Codex and Claude it names an adapter binary (`codex-acp`,
-/// `claude-agent-acp`) that has no login command, so only Kimi — whose bridge
-/// is the `kimi` CLI itself, launched as `kimi acp` — honors the override here.
+/// `claude-agent-acp`) that has no login command, so only Kimi and Grok —
+/// whose bridges are the `kimi` and `grok` CLIs themselves — honor the
+/// override here.
 pub fn login_command(profile: &HarnessProfile) -> (String, Vec<String>) {
+    let overridable = |fallback: &str| {
+        profile
+            .executable
+            .as_ref()
+            .map(|executable| executable.to_string_lossy().into_owned())
+            .unwrap_or_else(|| fallback.to_owned())
+    };
     match profile.kind {
         HarnessKind::Codex => ("codex".to_owned(), vec!["login".to_owned()]),
         HarnessKind::Claude => (
             "claude".to_owned(),
             vec!["auth".to_owned(), "login".to_owned()],
         ),
-        HarnessKind::Kimi => (
-            profile
-                .executable
-                .as_ref()
-                .map(|executable| executable.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "kimi".to_owned()),
-            vec!["login".to_owned()],
-        ),
+        HarnessKind::Kimi => (overridable("kimi"), vec!["login".to_owned()]),
+        HarnessKind::Grok => (overridable("grok"), vec!["login".to_owned()]),
     }
 }
 
@@ -748,6 +765,26 @@ mod tests {
         .unwrap()
     }
 
+    fn grok_credentials(expiries: &[&str]) -> Vec<u8> {
+        let grants = expiries
+            .iter()
+            .enumerate()
+            .map(|(index, expires_at)| {
+                (
+                    format!("https://auth.x.ai::grant-{index}"),
+                    serde_json::json!({
+                        "key": "access",
+                        "auth_mode": "oidc",
+                        "refresh_token": "refresh",
+                        "expires_at": expires_at,
+                        "oidc_issuer": "https://auth.x.ai",
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::to_vec(&serde_json::Value::Object(grants)).unwrap()
+    }
+
     fn snapshot(fingerprint: &str, freshness: Option<i64>) -> CredentialSnapshot {
         CredentialSnapshot {
             present: true,
@@ -781,6 +818,62 @@ mod tests {
             credential_freshness(HarnessKind::Kimi, &kimi_credentials(1_755_000_000)),
             Some(1_755_000_000_000)
         );
+    }
+
+    #[test]
+    fn grok_freshness_reads_the_latest_rfc3339_grant_expiry() {
+        assert_eq!(
+            credential_freshness(
+                HarnessKind::Grok,
+                &grok_credentials(&["2026-08-17T02:19:01.724226598Z"])
+            ),
+            Some(1_786_933_141_724)
+        );
+        // A home may hold several grants; the newest expiry decides freshness.
+        assert_eq!(
+            credential_freshness(
+                HarnessKind::Grok,
+                &grok_credentials(&[
+                    "2026-08-17T02:19:01.724226598Z",
+                    "2026-08-17T04:19:01.724226598Z",
+                ])
+            ),
+            Some(1_786_940_341_724)
+        );
+        // Non-UTC offsets normalize to the same instant.
+        assert_eq!(
+            credential_freshness(
+                HarnessKind::Grok,
+                &grok_credentials(&["2026-08-16T22:19:01.724226598-04:00"])
+            ),
+            Some(1_786_933_141_724)
+        );
+    }
+
+    #[test]
+    fn every_harness_reports_freshness_from_its_own_credential_shape() {
+        let fixtures = [
+            (HarnessKind::Claude, claude_credentials(1_755_000_000_000)),
+            (
+                HarnessKind::Codex,
+                codex_credentials("2026-08-05T02:51:00.864587231Z"),
+            ),
+            (HarnessKind::Kimi, kimi_credentials(1_755_000_000)),
+            (
+                HarnessKind::Grok,
+                grok_credentials(&["2026-08-17T02:19:01.724226598Z"]),
+            ),
+        ];
+        for kind in HarnessKind::ALL {
+            let (_, bytes) = fixtures
+                .iter()
+                .find(|(fixture, _)| *fixture == kind)
+                .unwrap_or_else(|| panic!("{kind:?} needs a credential fixture"));
+            assert!(
+                credential_freshness(kind, bytes).is_some(),
+                "{kind:?} freshness"
+            );
+        }
     }
 
     #[test]
@@ -993,10 +1086,14 @@ mod tests {
             login_command(&profile(HarnessKind::Kimi, None)),
             ("kimi".to_owned(), vec!["login".to_owned()])
         );
+        assert_eq!(
+            login_command(&profile(HarnessKind::Grok, None)),
+            ("grok".to_owned(), vec!["login".to_owned()])
+        );
     }
 
     #[test]
-    fn only_the_kimi_executable_override_names_the_harness_cli() {
+    fn only_a_cli_bridge_executable_override_names_the_harness_cli() {
         let profile = |kind: HarnessKind| HarnessProfile {
             kind,
             home: PathBuf::from("/home/user/.config"),
@@ -1009,8 +1106,16 @@ mod tests {
             ("/opt/bin/custom".to_owned(), vec!["login".to_owned()])
         );
         assert_eq!(
+            login_command(&profile(HarnessKind::Grok)),
+            ("/opt/bin/custom".to_owned(), vec!["login".to_owned()])
+        );
+        assert_eq!(
             login_command(&profile(HarnessKind::Codex)).0,
             "codex".to_owned()
+        );
+        assert_eq!(
+            login_command(&profile(HarnessKind::Claude)).0,
+            "claude".to_owned()
         );
     }
 

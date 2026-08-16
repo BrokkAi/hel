@@ -171,7 +171,7 @@ fn harness_discovery_check_from(
             DoctorCheck::fixable(
                 "harness.discovery",
                 "Harness home discovery",
-                "No Codex, Claude Code, or Kimi Code home was found in the default or environment-overridden locations.",
+                "No Codex, Claude Code, Kimi Code, or Grok Build home was found in the default or environment-overridden locations.",
                 "Install and sign in to a supported harness, then run `hel setup`.",
             )
         };
@@ -187,7 +187,7 @@ fn harness_discovery_check_from(
             };
             format!(
                 "{} at {} ({authentication})",
-                harness_label(home.kind),
+                home.kind.display_name(),
                 home.path.display()
             )
         })
@@ -345,7 +345,7 @@ fn harness_checks(config: Option<&HelConfig>) -> Vec<DoctorCheck> {
                     format!("{} does not exist", profile.home.display()),
                     format!(
                         "Create or select the {} home, then set its `home` path in config.toml.",
-                        harness_label(profile.kind)
+                        profile.kind.display_name()
                     ),
                 );
             }
@@ -370,14 +370,6 @@ fn harness_checks(config: Option<&HelConfig>) -> Vec<DoctorCheck> {
         .collect()
 }
 
-fn harness_label(kind: HarnessKind) -> &'static str {
-    match kind {
-        HarnessKind::Codex => "Codex",
-        HarnessKind::Claude => "Claude Code",
-        HarnessKind::Kimi => "Kimi Code",
-    }
-}
-
 fn harness_login_remediation(kind: HarnessKind, home: &std::path::Path) -> String {
     let environment = kind.home_env();
     match kind {
@@ -392,6 +384,7 @@ fn harness_login_remediation(kind: HarnessKind, home: &std::path::Path) -> Strin
             "Run `{environment}={} kimi` and complete the sign-in prompt.",
             home.display()
         ),
+        HarnessKind::Grok => format!("Run `{environment}={} grok login`.", home.display()),
     }
 }
 

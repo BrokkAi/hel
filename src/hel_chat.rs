@@ -27,6 +27,7 @@ use similar::{ChangeTag, TextDiff};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::hel_acp::RuntimeEvent;
+use crate::hel_config::{HarnessKind, PlanModeIds};
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
 use crate::hel_recovery::RecoveryContext;
 use crate::hel_session_manager::{
@@ -66,6 +67,7 @@ pub enum ChatAction {
     Prompt(String),
     RemoveQueuedPrompt { id: String, text: String },
     SetConfig { key: String, value: String },
+    SetSessionMode { mode_id: String },
     Cancel,
     PasteFromClipboard,
     ToggleVoice,
@@ -79,6 +81,7 @@ enum LocalCommand {
     Detach,
     Model,
     Effort,
+    Plan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -975,6 +978,12 @@ pub struct ChatState {
     queued_prompts: VecDeque<QueuedPrompt>,
     recovery_busy: bool,
     goal_prompt_active: bool,
+    /// Harness behind this session, when the profile is still configured. It
+    /// decides whether `/plan` is a Hel shim or a pass-through prompt.
+    harness: Option<HarnessKind>,
+    /// Latest ACP session mode, from `current_mode_update` by way of the
+    /// projection, or set optimistically when Hel asks for a change.
+    current_mode: Option<String>,
     agent_commands: Vec<AvailableCommand>,
     command_choices: Vec<CommandChoice>,
     model_values: Vec<ConfigValueChoice>,
@@ -1023,6 +1032,12 @@ impl ChatState {
                 .active_prompt
                 .as_ref()
                 .is_some_and(|prompt| is_goal_prompt(&prompt.text)),
+            harness: None,
+            current_mode: snapshot
+                .config
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             agent_commands: Vec::new(),
             command_choices: builtin_command_choices(),
             model_values: Vec::new(),
@@ -1127,6 +1142,16 @@ impl ChatState {
                 .collect();
         }
         self.set_config_options(config_options);
+        // `current_mode_update` lands in the projected configuration. Only
+        // overwrite when it is there, so an optimistic toggle survives until
+        // the agent confirms it.
+        if let Some(mode) = session
+            .configuration
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+        {
+            self.current_mode = Some(mode.to_owned());
+        }
         self.agent_commands = available_commands.to_vec();
         self.rebuild_command_choices();
         self.current_model = session
@@ -1169,6 +1194,31 @@ impl ChatState {
 
     pub fn set_history_context(&mut self, bundle_id: impl Into<String>) {
         self.bundle_id = Some(bundle_id.into());
+    }
+
+    /// Names the harness behind this session. `None` when its profile is gone,
+    /// which only costs the harness-specific command shims.
+    pub fn set_harness(&mut self, harness: Option<HarnessKind>) {
+        self.harness = harness;
+        self.rebuild_command_choices();
+    }
+
+    /// Mode ids this session drives `/plan` with, or `None` when the agent
+    /// advertises its own `plan` command or the harness has no plan mode.
+    fn plan_mode_ids(&self) -> Option<PlanModeIds> {
+        if self
+            .agent_commands
+            .iter()
+            .any(|command| command.name == "plan")
+        {
+            return None;
+        }
+        self.harness?.plan_mode_ids()
+    }
+
+    fn plan_mode_active(&self) -> bool {
+        self.plan_mode_ids()
+            .is_some_and(|ids| self.current_mode.as_deref() == Some(ids.on))
     }
 
     /// Names this session in the header and places its line among the other
@@ -1985,6 +2035,14 @@ impl ChatState {
 
     fn rebuild_command_choices(&mut self) {
         let mut commands = builtin_command_choices();
+        if self.plan_mode_ids().is_some() {
+            commands.push(CommandChoice {
+                name: "plan".to_owned(),
+                description: "toggle plan mode".to_owned(),
+                input_hint: Some("on|off".to_owned()),
+                source: CommandSource::Hel,
+            });
+        }
         for command in &self.agent_commands {
             let name = command.name.trim();
             if name.is_empty()
@@ -2142,8 +2200,44 @@ impl ChatState {
                         value: args.to_owned(),
                     }
                 }
+                // Grok Build has plan mode but never advertises a `plan`
+                // command, so Hel drives it over `session/set_mode`. Any other
+                // harness keeps today's pass-through.
+                LocalCommand::Plan => {
+                    let Some(ids) = self.plan_mode_ids() else {
+                        return self.submit_prompt(prompt);
+                    };
+                    let requested = match args.to_ascii_lowercase().as_str() {
+                        "" => !self.plan_mode_active(),
+                        "on" => true,
+                        "off" => false,
+                        _ => {
+                            self.set_notice("usage: /plan [on|off]");
+                            return ChatAction::None;
+                        }
+                    };
+                    if self.phase != WorkerPhase::Idle {
+                        self.set_notice("/plan is only available while the agent is idle");
+                        return ChatAction::None;
+                    }
+                    self.clear_input();
+                    let mode_id = if requested { ids.on } else { ids.off };
+                    self.current_mode = Some(mode_id.to_owned());
+                    self.set_notice(if requested {
+                        "Plan mode on"
+                    } else {
+                        "Plan mode off"
+                    });
+                    ChatAction::SetSessionMode {
+                        mode_id: mode_id.to_owned(),
+                    }
+                }
             };
         }
+        self.submit_prompt(prompt)
+    }
+
+    fn submit_prompt(&mut self, prompt: String) -> ChatAction {
         if matches!(self.phase, WorkerPhase::Closing | WorkerPhase::Closed) {
             self.set_notice("The worker is closing; this prompt was not sent");
             return ChatAction::None;
@@ -2930,6 +3024,7 @@ fn parse_local_command(prompt: &str) -> Option<(LocalCommand, &str)> {
         "detach" => LocalCommand::Detach,
         "model" => LocalCommand::Model,
         "effort" => LocalCommand::Effort,
+        "plan" => LocalCommand::Plan,
         _ => return None,
     };
     Some((command, args))
@@ -3126,6 +3221,10 @@ enum ChatRemoteOperation {
         key: String,
         value: String,
     },
+    SetSessionMode {
+        command_id: String,
+        mode_id: String,
+    },
     Cancel {
         command_id: String,
     },
@@ -3148,6 +3247,10 @@ enum ChatRemoteResult {
         value: String,
         result: std::result::Result<(), String>,
     },
+    SetSessionMode {
+        mode_id: String,
+        result: std::result::Result<(), String>,
+    },
     Cancel(std::result::Result<(), String>),
     WorkerFailed(String),
 }
@@ -3163,6 +3266,9 @@ impl ChatRemoteResult {
                 result: Err(error), ..
             }
             | Self::SetConfig {
+                result: Err(error), ..
+            }
+            | Self::SetSessionMode {
                 result: Err(error), ..
             }
             | Self::Cancel(Err(error))
@@ -3500,6 +3606,47 @@ async fn enqueue_chat_remote_operation(
                 }
             }
         }
+        ChatRemoteOperation::SetSessionMode {
+            command_id,
+            mode_id,
+        } => {
+            let response = session
+                .enqueue_submit(
+                    command_id,
+                    RelayCommand::SetSessionMode {
+                        mode_id: mode_id.clone(),
+                    },
+                )
+                .await;
+            match response {
+                Ok(response) => {
+                    let results = results.clone();
+                    let attached = attached.clone();
+                    pending.spawn(async move {
+                        let result = response
+                            .wait()
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| format!("{error:#}"));
+                        publish_chat_remote_result(
+                            &results,
+                            &attached,
+                            ChatRemoteResult::SetSessionMode { mode_id, result },
+                        );
+                    });
+                }
+                Err(error) => {
+                    publish_chat_remote_result(
+                        results,
+                        attached,
+                        ChatRemoteResult::SetSessionMode {
+                            mode_id,
+                            result: Err(format!("{error:#}")),
+                        },
+                    );
+                }
+            }
+        }
         ChatRemoteOperation::Cancel { command_id } => {
             let response = session
                 .enqueue_submit(command_id, RelayCommand::Cancel)
@@ -3590,6 +3737,18 @@ fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteResult) {
             restore_unsent_input(chat, &format!("/{key} {value}"));
             chat.set_notice(format!("Configuration was not changed: {error}"));
         }
+        ChatRemoteResult::SetSessionMode {
+            result: Ok(()), ..
+        } => chat.set_notice("Session mode update accepted"),
+        ChatRemoteResult::SetSessionMode {
+            mode_id,
+            result: Err(error),
+        } => {
+            // The optimistic toggle never happened, so drop it rather than
+            // leave the status line claiming a mode the agent is not in.
+            chat.current_mode = None;
+            chat.set_notice(format!("Session mode was not changed to {mode_id}: {error}"));
+        }
         ChatRemoteResult::Cancel(Ok(())) => chat.set_notice("Cancellation requested"),
         ChatRemoteResult::Cancel(Err(error)) => {
             chat.set_notice(format!("Cancellation failed: {error}"))
@@ -3615,6 +3774,7 @@ fn queue_chat_remote_operation(
             ChatRemoteOperation::SetConfig { key, value, .. } => {
                 restore_unsent_input(chat, &format!("/{key} {value}"));
             }
+            ChatRemoteOperation::SetSessionMode { .. } => chat.current_mode = None,
             ChatRemoteOperation::Sync | ChatRemoteOperation::Cancel { .. } => {}
         }
         chat.set_notice("The session command queue is full; the command was not sent");
@@ -4007,6 +4167,11 @@ impl ActiveChat {
     /// `notices` is the process-wide notifications bar; it is installed on the
     /// new state before any notice is raised below, so recovery and connection
     /// notices land in the same shared slot the dashboard reads.
+    ///
+    /// `harness` is the kind of the session's configured profile, or `None`
+    /// when that profile is gone. It selects the harness-specific slash
+    /// command shims.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         session: ManagedSessionHandle,
         bundle_id: &str,
@@ -4015,6 +4180,7 @@ impl ActiveChat {
         header: SessionHeaderIdentity,
         draft: String,
         notices: Notices,
+        harness: Option<HarnessKind>,
     ) -> Self {
         let view = session.view();
         let needs_initial_sync = view.snapshot.is_none();
@@ -4035,6 +4201,7 @@ impl ActiveChat {
             },
         );
         state.set_history_context(bundle_id);
+        state.set_harness(harness);
         state.set_header_identity(header.project, header.position);
         state.restore_draft(draft);
         state.notices = notices;
@@ -4283,6 +4450,20 @@ impl ActiveChat {
                         command_id,
                         key,
                         value,
+                    },
+                    &mut self.state,
+                );
+            }
+            ChatAction::SetSessionMode { mode_id } => {
+                let Some(command_id) = self.command_id("set-session-mode") else {
+                    self.state.current_mode = None;
+                    return ChatEventOutcome::Handled;
+                };
+                queue_chat_remote_operation(
+                    self.remote.operations(),
+                    ChatRemoteOperation::SetSessionMode {
+                        command_id,
+                        mode_id,
                     },
                     &mut self.state,
                 );
@@ -6080,6 +6261,147 @@ mod tests {
         );
         // The transcript keeps its own chrome, below the header.
         assert!(row(&terminal, 2).contains("Conversation"));
+    }
+
+    fn grok_chat() -> ChatState {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_harness(Some(HarnessKind::Grok));
+        chat
+    }
+
+    fn advertise(chat: &mut ChatState, seq: u64, names: &[&str]) {
+        chat.apply_session_update(
+            seq,
+            &serde_json::json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": names
+                    .iter()
+                    .map(|name| serde_json::json!({"name": name, "description": "d"}))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+
+    #[test]
+    fn plan_toggles_the_session_mode_for_a_harness_without_a_plan_command() {
+        let mut chat = grok_chat();
+        chat.set_input("/plan".into());
+
+        assert_eq!(
+            chat.submit_input(),
+            ChatAction::SetSessionMode {
+                mode_id: "plan".into()
+            }
+        );
+        assert!(chat.input.is_empty());
+        assert!(chat.notices.current().unwrap().contains("Plan mode on"));
+
+        chat.set_input("/plan".into());
+        assert_eq!(
+            chat.submit_input(),
+            ChatAction::SetSessionMode {
+                mode_id: "default".into()
+            }
+        );
+        assert!(chat.notices.current().unwrap().contains("Plan mode off"));
+    }
+
+    #[test]
+    fn plan_accepts_explicit_on_and_off_arguments() {
+        let mut chat = grok_chat();
+        chat.set_input("/plan off".into());
+        assert_eq!(
+            chat.submit_input(),
+            ChatAction::SetSessionMode {
+                mode_id: "default".into()
+            }
+        );
+
+        chat.set_input("/plan ON".into());
+        assert_eq!(
+            chat.submit_input(),
+            ChatAction::SetSessionMode {
+                mode_id: "plan".into()
+            }
+        );
+
+        chat.set_input("/plan sideways".into());
+        assert_eq!(chat.submit_input(), ChatAction::None);
+        assert!(chat.notices.current().unwrap().contains("usage: /plan"));
+        assert_eq!(chat.input, "/plan sideways", "a misuse keeps the input");
+    }
+
+    #[test]
+    fn plan_falls_back_to_a_prompt_when_the_agent_advertises_its_own_command() {
+        let mut chat = grok_chat();
+        advertise(&mut chat, 1, &["plan"]);
+        chat.set_input("/plan the migration".into());
+
+        assert_eq!(
+            chat.submit_input(),
+            ChatAction::Prompt("/plan the migration".into())
+        );
+    }
+
+    #[test]
+    fn plan_stays_a_prompt_for_a_harness_without_mode_based_planning() {
+        for harness in [None, Some(HarnessKind::Codex), Some(HarnessKind::Claude)] {
+            let mut chat = ChatState::new(&snapshot(), &[]);
+            chat.set_harness(harness);
+            chat.set_input("/plan".into());
+
+            assert_eq!(
+                chat.submit_input(),
+                ChatAction::Prompt("/plan".into()),
+                "{harness:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_is_listed_as_a_hel_command_only_where_it_is_a_shim() {
+        let lists_plan = |chat: &ChatState| {
+            chat.command_choices
+                .iter()
+                .any(|command| command.name == "plan" && command.source == CommandSource::Hel)
+        };
+
+        let mut chat = grok_chat();
+        assert!(lists_plan(&chat));
+
+        // Once the agent advertises `plan`, Hel steps out of the way.
+        advertise(&mut chat, 1, &["plan"]);
+        assert!(!lists_plan(&chat));
+
+        let mut codex = ChatState::new(&snapshot(), &[]);
+        codex.set_harness(Some(HarnessKind::Codex));
+        assert!(!lists_plan(&codex));
+    }
+
+    #[test]
+    fn plan_waits_for_an_idle_agent() {
+        let mut chat = grok_chat();
+        chat.phase = WorkerPhase::Running;
+        chat.set_input("/plan".into());
+
+        assert_eq!(chat.submit_input(), ChatAction::None);
+        assert!(chat.notices.current().unwrap().contains("only available"));
+    }
+
+    #[test]
+    fn a_current_mode_update_corrects_the_locally_tracked_plan_mode() {
+        let mut chat = grok_chat();
+        chat.set_input("/plan".into());
+        chat.submit_input();
+        assert!(chat.plan_mode_active());
+
+        let mut session = MaterializedSession::empty("1234567890");
+        session
+            .configuration
+            .insert("mode".into(), serde_json::Value::String("default".into()));
+        chat.apply_materialized(&session, &[], &[]);
+
+        assert!(!chat.plan_mode_active());
     }
 
     #[test]

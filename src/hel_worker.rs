@@ -267,6 +267,11 @@ pub enum RelayCommand {
         key: String,
         value: String,
     },
+    /// Opaque ACP `session/set_mode` id. Hel uses it for harnesses whose plan
+    /// mode is a session mode rather than an advertised slash command.
+    SetSessionMode {
+        mode_id: String,
+    },
     Cancel,
     Close {
         barrier_command_id: String,
@@ -297,7 +302,11 @@ impl RelayCommand {
     fn is_effectful_acp(&self) -> bool {
         matches!(
             self,
-            Self::Prompt { .. } | Self::SetConfig { .. } | Self::Cancel | Self::Close { .. }
+            Self::Prompt { .. }
+                | Self::SetConfig { .. }
+                | Self::SetSessionMode { .. }
+                | Self::Cancel
+                | Self::Close { .. }
         )
     }
 
@@ -307,6 +316,7 @@ impl RelayCommand {
             Self::RemoveQueuedPrompt { .. } => RelayCommandKind::RemoveQueuedPrompt,
             Self::ClearQueuedPrompts => RelayCommandKind::ClearQueuedPrompts,
             Self::SetConfig { .. } => RelayCommandKind::SetConfig,
+            Self::SetSessionMode { .. } => RelayCommandKind::SetSessionMode,
             Self::Cancel => RelayCommandKind::Cancel,
             Self::Close { .. } => RelayCommandKind::Close,
             Self::BeginCheckpoint { .. } => RelayCommandKind::BeginCheckpoint,
@@ -322,6 +332,7 @@ pub enum RelayCommandKind {
     RemoveQueuedPrompt,
     ClearQueuedPrompts,
     SetConfig,
+    SetSessionMode,
     Cancel,
     Close,
     BeginCheckpoint,
@@ -474,6 +485,7 @@ pub enum RelayObservation {
 pub enum RelayCommandOutcome {
     Prompt { stop_reason: String },
     Configured,
+    SessionModeSet,
     Cancelled,
     Closed,
     QueueChanged { removed_command_ids: Vec<String> },
@@ -2445,6 +2457,9 @@ fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent) -> Result
                 }
                 (RelayCommand::SetConfig { key, value }, RelayCommandOutcome::Configured) => {
                     snapshot.config.insert(key, value);
+                }
+                (RelayCommand::SetSessionMode { mode_id }, RelayCommandOutcome::SessionModeSet) => {
+                    snapshot.config.insert("mode".to_owned(), mode_id);
                 }
                 (RelayCommand::Cancel, RelayCommandOutcome::Cancelled) => {}
                 (RelayCommand::Close { .. }, RelayCommandOutcome::Closed) => {

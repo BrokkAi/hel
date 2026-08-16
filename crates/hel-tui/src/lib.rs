@@ -3585,7 +3585,7 @@ impl DashboardState {
         } else {
             ""
         };
-        format!("{id}  {}  ·  {quota}{danger}", harness_label(harness))
+        format!("{id}  {}  ·  {quota}{danger}", harness.display_name())
     }
 
     fn config_is_empty(&self) -> bool {
@@ -4509,7 +4509,7 @@ fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
             ListItem::new(format!(
                 "{}  {}",
                 profile.profile_id,
-                harness_label(profile.harness_kind)
+                profile.harness_kind.display_name()
             ))
         })
         .collect::<Vec<_>>();
@@ -5359,7 +5359,7 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
         };
         Row::new([
             Cell::from(id.clone()),
-            Cell::from(harness_label(profile.kind)),
+            Cell::from(profile.kind.display_name()),
             Cell::from(weekly),
             Cell::from(five_hour),
             Cell::from(resets),
@@ -6405,14 +6405,6 @@ fn bundle_ids_by_recent_creation<'a>(config: &'a HelConfig, state: &HelState) ->
             .then_with(|| left.cmp(right))
     });
     bundle_ids
-}
-
-fn harness_label(kind: HarnessKind) -> &'static str {
-    match kind {
-        HarnessKind::Codex => "Codex",
-        HarnessKind::Claude => "Claude Code",
-        HarnessKind::Kimi => "Kimi Code",
-    }
 }
 
 fn target_label(target: &TargetTemplate) -> &'static str {

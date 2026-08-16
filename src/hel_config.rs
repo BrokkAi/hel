@@ -20,10 +20,59 @@ pub enum HarnessKind {
     Codex,
     Claude,
     Kimi,
+    Grok,
+}
+
+/// How Hel puts a harness into the unrestricted mode where actions run without
+/// per-action approval. Permission modes are not user-configurable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnrestrictedEnforcement {
+    /// Selected over ACP once the session exists.
+    AcpMode(&'static str),
+    /// Applied to the bridge command line at launch. The harness exposes no
+    /// ACP equivalent, so there is nothing to enforce after the session opens.
+    LaunchFlag {
+        flag: &'static str,
+        label: &'static str,
+    },
+}
+
+impl UnrestrictedEnforcement {
+    /// Name reported to the UI for the mode this session runs in.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AcpMode(mode) => mode,
+            Self::LaunchFlag { label, .. } => label,
+        }
+    }
+
+    /// The ACP mode to select after the session opens, when there is one.
+    pub const fn acp_mode(self) -> Option<&'static str> {
+        match self {
+            Self::AcpMode(mode) => Some(mode),
+            Self::LaunchFlag { .. } => None,
+        }
+    }
+
+    /// The launch flag to add to the bridge command line, when there is one.
+    pub const fn launch_flag(self) -> Option<&'static str> {
+        match self {
+            Self::AcpMode(_) => None,
+            Self::LaunchFlag { flag, .. } => Some(flag),
+        }
+    }
+}
+
+/// Opaque ACP `session/set_mode` ids a harness uses for plan mode when it does
+/// not advertise a `plan` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanModeIds {
+    pub on: &'static str,
+    pub off: &'static str,
 }
 
 impl HarnessKind {
-    pub const ALL: [Self; 3] = [Self::Codex, Self::Claude, Self::Kimi];
+    pub const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::Kimi, Self::Grok];
 
     /// Environment variable used to isolate this harness's configuration.
     pub const fn home_env(self) -> &'static str {
@@ -31,16 +80,88 @@ impl HarnessKind {
             Self::Codex => "CODEX_HOME",
             Self::Claude => "CLAUDE_CONFIG_DIR",
             Self::Kimi => "KIMI_CODE_HOME",
+            Self::Grok => "GROK_HOME",
         }
     }
 
-    /// ACP mode Hel always selects. Permission modes are not user-configurable.
-    pub const fn unrestricted_mode(self) -> &'static str {
+    /// Directory beneath the user's home the harness uses when `home_env` is
+    /// unset. The single source for both setup discovery and import.
+    pub const fn default_home_leaf(self) -> &'static str {
         match self {
-            Self::Codex => "agent-full-access",
-            Self::Claude => "bypassPermissions",
-            Self::Kimi => "auto",
+            Self::Codex => ".codex",
+            Self::Claude => ".claude",
+            Self::Kimi => ".kimi-code",
+            Self::Grok => ".grok",
         }
+    }
+
+    /// Lowercase stable identifier used in config, storage, and the HTTP API.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Kimi => "kimi",
+            Self::Grok => "grok",
+        }
+    }
+
+    /// Product name shown to people.
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+            Self::Kimi => "Kimi Code",
+            Self::Grok => "Grok Build",
+        }
+    }
+
+    /// How Hel forces this harness into its unrestricted mode.
+    pub const fn unrestricted_enforcement(self) -> UnrestrictedEnforcement {
+        match self {
+            Self::Codex => UnrestrictedEnforcement::AcpMode("agent-full-access"),
+            Self::Claude => UnrestrictedEnforcement::AcpMode("bypassPermissions"),
+            Self::Kimi => UnrestrictedEnforcement::AcpMode("auto"),
+            Self::Grok => UnrestrictedEnforcement::LaunchFlag {
+                flag: "--always-approve",
+                label: "always-approve",
+            },
+        }
+    }
+
+    /// Mode ids that drive plan mode for a harness that has plan mode but does
+    /// not advertise a `plan` command. `None` means Hel passes `/plan` through.
+    pub const fn plan_mode_ids(self) -> Option<PlanModeIds> {
+        match self {
+            Self::Grok => Some(PlanModeIds {
+                on: "plan",
+                off: "default",
+            }),
+            Self::Codex | Self::Claude | Self::Kimi => None,
+        }
+    }
+
+    /// Sub-command a `profile.executable` override needs to speak ACP. Codex
+    /// and Claude override an adapter binary that already speaks it.
+    pub fn bridge_override_args(self, unrestricted: bool) -> Vec<&'static str> {
+        let flag = unrestricted
+            .then(|| self.unrestricted_enforcement().launch_flag())
+            .flatten();
+        match self {
+            Self::Codex | Self::Claude => Vec::new(),
+            Self::Kimi => vec!["acp"],
+            Self::Grok => ["agent"].into_iter().chain(flag).chain(["stdio"]).collect(),
+        }
+    }
+}
+
+impl std::str::FromStr for HarnessKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.id() == value)
+            .ok_or_else(|| anyhow!("unknown harness kind {value:?}"))
     }
 }
 
@@ -65,8 +186,8 @@ impl HarnessProfile {
         self.kind.home_env()
     }
 
-    pub fn unrestricted_mode(&self) -> &'static str {
-        self.kind.unrestricted_mode()
+    pub fn unrestricted_enforcement(&self) -> UnrestrictedEnforcement {
+        self.kind.unrestricted_enforcement()
     }
 
     fn validate(&self, id: &str) -> Result<()> {
@@ -669,9 +790,85 @@ mod tests {
         assert_eq!(HarnessKind::Codex.home_env(), "CODEX_HOME");
         assert_eq!(HarnessKind::Claude.home_env(), "CLAUDE_CONFIG_DIR");
         assert_eq!(HarnessKind::Kimi.home_env(), "KIMI_CODE_HOME");
-        assert_eq!(HarnessKind::Codex.unrestricted_mode(), "agent-full-access");
-        assert_eq!(HarnessKind::Claude.unrestricted_mode(), "bypassPermissions");
-        assert_eq!(HarnessKind::Kimi.unrestricted_mode(), "auto");
+        assert_eq!(HarnessKind::Grok.home_env(), "GROK_HOME");
+        assert_eq!(
+            HarnessKind::Codex.unrestricted_enforcement(),
+            UnrestrictedEnforcement::AcpMode("agent-full-access")
+        );
+        assert_eq!(
+            HarnessKind::Claude.unrestricted_enforcement(),
+            UnrestrictedEnforcement::AcpMode("bypassPermissions")
+        );
+        assert_eq!(
+            HarnessKind::Kimi.unrestricted_enforcement(),
+            UnrestrictedEnforcement::AcpMode("auto")
+        );
+        assert_eq!(
+            HarnessKind::Grok.unrestricted_enforcement(),
+            UnrestrictedEnforcement::LaunchFlag {
+                flag: "--always-approve",
+                label: "always-approve",
+            }
+        );
+    }
+
+    #[test]
+    fn harness_unrestricted_enforcement_splits_acp_modes_from_launch_flags() {
+        for kind in [HarnessKind::Codex, HarnessKind::Claude, HarnessKind::Kimi] {
+            let enforcement = kind.unrestricted_enforcement();
+            assert_eq!(enforcement.acp_mode(), Some(enforcement.label()));
+            assert_eq!(enforcement.launch_flag(), None);
+        }
+        let grok = HarnessKind::Grok.unrestricted_enforcement();
+        assert_eq!(grok.acp_mode(), None);
+        assert_eq!(grok.launch_flag(), Some("--always-approve"));
+        assert_eq!(grok.label(), "always-approve");
+    }
+
+    #[test]
+    fn harness_names_and_ids_round_trip() {
+        for kind in HarnessKind::ALL {
+            assert_eq!(kind.id().parse::<HarnessKind>().unwrap(), kind);
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::Value::String(kind.id().to_owned())
+            );
+            assert!(!kind.display_name().is_empty());
+            assert!(kind.default_home_leaf().starts_with('.'));
+        }
+        assert_eq!(HarnessKind::Grok.id(), "grok");
+        assert_eq!(HarnessKind::Grok.display_name(), "Grok Build");
+        assert_eq!(HarnessKind::Grok.default_home_leaf(), ".grok");
+        assert!("nope".parse::<HarnessKind>().is_err());
+    }
+
+    #[test]
+    fn harness_plan_mode_ids_are_grok_only() {
+        assert_eq!(
+            HarnessKind::Grok.plan_mode_ids(),
+            Some(PlanModeIds {
+                on: "plan",
+                off: "default",
+            })
+        );
+        for kind in [HarnessKind::Codex, HarnessKind::Claude, HarnessKind::Kimi] {
+            assert_eq!(kind.plan_mode_ids(), None);
+        }
+    }
+
+    #[test]
+    fn bridge_override_args_carry_the_acp_subcommand_per_harness() {
+        assert!(HarnessKind::Codex.bridge_override_args(true).is_empty());
+        assert!(HarnessKind::Claude.bridge_override_args(true).is_empty());
+        assert_eq!(HarnessKind::Kimi.bridge_override_args(true), ["acp"]);
+        assert_eq!(
+            HarnessKind::Grok.bridge_override_args(false),
+            ["agent", "stdio"]
+        );
+        assert_eq!(
+            HarnessKind::Grok.bridge_override_args(true),
+            ["agent", "--always-approve", "stdio"]
+        );
     }
 
     #[test]

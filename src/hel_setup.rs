@@ -128,11 +128,11 @@ pub fn discover_harness_homes(
 ) -> Vec<DiscoveredHome> {
     let mut candidates = Vec::new();
     if let Some(home) = home {
-        candidates.extend([
-            (HarnessKind::Codex, home.join(".codex")),
-            (HarnessKind::Claude, home.join(".claude")),
-            (HarnessKind::Kimi, home.join(".kimi-code")),
-        ]);
+        candidates.extend(
+            HarnessKind::ALL
+                .into_iter()
+                .map(|kind| (kind, home.join(kind.default_home_leaf()))),
+        );
     }
     candidates.extend(overrides);
 
@@ -158,6 +158,7 @@ pub fn harness_authentication_marker(kind: HarnessKind, home: &Path) -> PathBuf 
         HarnessKind::Codex => "auth.json",
         HarnessKind::Claude => ".credentials.json",
         HarnessKind::Kimi => "credentials/kimi-code.json",
+        HarnessKind::Grok => "auth.json",
     })
 }
 
@@ -285,12 +286,7 @@ fn build_config_with_runtime(
 ) -> HelConfig {
     let mut config = HelConfig::default();
     for home in homes {
-        let base_id = match home.kind {
-            HarnessKind::Codex => "codex",
-            HarnessKind::Claude => "claude",
-            HarnessKind::Kimi => "kimi",
-        };
-        let id = unique_profile_id(&config.profiles, base_id);
+        let id = unique_profile_id(&config.profiles, home.kind.id());
         config.profiles.insert(
             id,
             HarnessProfile {
@@ -446,7 +442,7 @@ fn write_discovered_homes(output: &mut impl Write, homes: &[DiscoveredHome]) -> 
     if homes.is_empty() {
         writeln!(
             output,
-            "  No existing Codex, Claude Code, or Kimi Code homes found."
+            "  No existing Codex, Claude Code, Kimi Code, or Grok Build homes found."
         )?;
     }
     for home in homes {
@@ -458,7 +454,7 @@ fn write_discovered_homes(output: &mut impl Write, homes: &[DiscoveredHome]) -> 
         writeln!(
             output,
             "  {}: {} ({authentication}){}",
-            harness_label(home.kind),
+            home.kind.display_name(),
             home.path.display(),
             if home.kind == HarnessKind::Kimi {
                 " — DANGER: auto mode permits commands without approval on raw localhost"
@@ -633,14 +629,6 @@ fn execute_smoke_command(executor: &impl CommandExecutor, command: &CommandSpec)
     Ok(())
 }
 
-fn harness_label(kind: HarnessKind) -> &'static str {
-    match kind {
-        HarnessKind::Codex => "Codex",
-        HarnessKind::Claude => "Claude Code",
-        HarnessKind::Kimi => "Kimi Code",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -692,21 +680,50 @@ mod tests {
         let home = directory.path().join("home");
         let codex = home.join(".codex");
         let kimi = home.join(".kimi-code");
+        let grok = home.join(".grok");
         let claude = directory.path().join("claude-override");
         fs::create_dir_all(&codex).unwrap();
         fs::create_dir_all(kimi.join("credentials")).unwrap();
+        fs::create_dir_all(&grok).unwrap();
         fs::create_dir_all(&claude).unwrap();
         fs::write(codex.join("auth.json"), "{}").unwrap();
         fs::write(kimi.join("credentials/kimi-code.json"), "{}").unwrap();
+        fs::write(grok.join("auth.json"), "{}").unwrap();
         fs::write(claude.join(".credentials.json"), "{}").unwrap();
 
         let homes = discover_harness_homes(Some(&home), [(HarnessKind::Claude, claude.clone())]);
 
-        assert_eq!(homes.len(), 3);
+        assert_eq!(homes.len(), 4);
         assert!(homes.iter().all(|home| home.authenticated));
         assert!(homes.iter().any(|home| home.path == codex));
         assert!(homes.iter().any(|home| home.path == claude));
         assert!(homes.iter().any(|home| home.path == kimi));
+        assert!(
+            homes
+                .iter()
+                .any(|home| home.path == grok && home.kind == HarnessKind::Grok)
+        );
+    }
+
+    #[test]
+    fn every_harness_has_a_discoverable_default_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().to_path_buf();
+        for kind in HarnessKind::ALL {
+            fs::create_dir_all(home.join(kind.default_home_leaf())).unwrap();
+        }
+
+        let homes = discover_harness_homes(Some(&home), []);
+
+        assert_eq!(homes.len(), HarnessKind::ALL.len());
+        for kind in HarnessKind::ALL {
+            assert!(
+                homes
+                    .iter()
+                    .any(|home| home.kind == kind && !home.authenticated),
+                "{kind:?} default home"
+            );
+        }
     }
 
     #[test]

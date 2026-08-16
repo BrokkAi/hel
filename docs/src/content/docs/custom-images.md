@@ -33,10 +33,12 @@ the container (see [Container targets](/containers/)).
 ## ACP bridges
 
 For each harness, hel first looks for an image-baked bridge binary on
-`PATH`: `codex-acp`, `claude-agent-acp`, or `kimi`. If it doesn't find one, it
-falls back to running the bridge with `npx -y`, pinned to hel's pinned
-fallback versions. That fallback needs `npx`; if it's missing, hel tries to
-install Node using the same package-manager detection it uses for Git.
+`PATH`: `codex-acp`, `claude-agent-acp`, `kimi`, or `grok`. If it doesn't find
+one, Codex and Claude Code fall back to running the bridge with `npx -y`, pinned
+to hel's fallback versions. That fallback needs `npx`; if it's missing, hel
+tries to install Node using the same package-manager detection it uses for Git.
+Kimi Code and Grok Build have no npm bridge: hel runs their official installer
+with `curl` instead, which needs `curl` in the image.
 
 Baking the bridges in, the way the reference image does, avoids that
 per-session install cost and pins the exact bridge version through the image

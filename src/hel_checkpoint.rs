@@ -298,6 +298,17 @@ fn restored_native_relative_path(
             rewritten.extend(components);
             Ok(rewritten)
         }
+        HarnessKind::Grok => {
+            if components.next() != Some(Component::Normal("sessions".as_ref()))
+                || components.next().is_none()
+            {
+                return Ok(relative_path.to_path_buf());
+            }
+            let mut rewritten = PathBuf::from("sessions");
+            rewritten.push(grok_cwd_key(&target_cwd));
+            rewritten.extend(components);
+            Ok(rewritten)
+        }
         HarnessKind::Codex => Ok(relative_path.to_path_buf()),
     }
 }
@@ -321,13 +332,20 @@ fn restored_native_artifact_bytes(
     workspace_root: &Path,
     harness_home: &Path,
 ) -> Result<Vec<u8>> {
-    if harness != HarnessKind::Kimi {
+    if !matches!(harness, HarnessKind::Kimi | HarnessKind::Grok) {
         return Ok(data.to_vec());
     }
     let Some(target_cwd) = target_primary_cwd(primary_repository, repositories, workspace_root)
     else {
         return Ok(data.to_vec());
     };
+    if harness == HarnessKind::Grok {
+        return if is_grok_session_summary(relative_path) {
+            rewrite_grok_session_summary(data, &target_cwd, harness_home)
+        } else {
+            Ok(data.to_vec())
+        };
+    }
     if relative_path == Path::new("workspaces.json") {
         return rewrite_kimi_workspace_registry(data, &target_cwd);
     }
@@ -439,6 +457,127 @@ fn is_kimi_session_state(relative_path: &Path) -> bool {
         && matches!(components.next(), Some(Component::Normal(component)) if component.to_string_lossy().starts_with("session_"))
         && matches!(components.next(), Some(Component::Normal(component)) if component == "state.json")
         && components.next().is_none()
+}
+
+fn is_grok_session_summary(relative_path: &Path) -> bool {
+    grok_session_components(relative_path)
+        .is_some_and(|components| components.file == "summary.json")
+}
+
+/// Grok Build records the session's working directory and home in
+/// `summary.json`; both must follow the restored session to its new workspace.
+fn rewrite_grok_session_summary(
+    data: &[u8],
+    target_cwd: &Path,
+    harness_home: &Path,
+) -> Result<Vec<u8>> {
+    let mut summary: Value =
+        serde_json::from_slice(data).context("parse Grok Build session summary")?;
+    let object = summary
+        .as_object_mut()
+        .context("Grok Build session summary is not a JSON object")?;
+    if object.contains_key("grok_home") {
+        object.insert(
+            "grok_home".into(),
+            Value::String(harness_home.to_string_lossy().into_owned()),
+        );
+    }
+    if let Some(info) = object.get_mut("info").and_then(Value::as_object_mut)
+        && info.contains_key("cwd")
+    {
+        info.insert(
+            "cwd".into(),
+            Value::String(target_cwd.to_string_lossy().into_owned()),
+        );
+    }
+    Ok(serde_json::to_vec(&summary)?)
+}
+
+struct GrokSessionPath<'a> {
+    session: &'a str,
+    file: &'a str,
+}
+
+/// Split `sessions/<cwd-key>/<session-uuid>/<file>` into the parts Hel needs.
+/// Anything with a different shape is not a Grok Build session artifact.
+fn grok_session_components(relative: &Path) -> Option<GrokSessionPath<'_>> {
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(component) => component.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let [root, _cwd_key, session, file] = components.as_slice() else {
+        return None;
+    };
+    (*root == "sessions").then_some(GrokSessionPath { session, file })
+}
+
+/// Runtime state that must not travel in a checkpoint: advisory lock files and
+/// the sessions-wide search index.
+fn grok_session_artifact(relative: &Path, session_id: &str) -> bool {
+    grok_session_components(relative).is_some_and(|components| {
+        components.session == session_id
+            && !components.file.ends_with(".lock")
+            && !components.file.starts_with("session_search.sqlite")
+    })
+}
+
+/// Grok Build's on-disk cwd-key algorithm, replicated from grok-build
+/// `xai-grok-config::paths::encode_cwd_dirname`: URL-encode the working
+/// directory, or fall back to `{slug}-{blake3-hex-16}` when that would exceed
+/// one filesystem name.
+fn grok_cwd_key(cwd: &Path) -> String {
+    /// macOS APFS, Linux ext4, and NTFS all cap a name at 255 bytes.
+    const MAX_DIRNAME_BYTES: usize = 255;
+    const MAX_SLUG_CHARS: usize = 40;
+
+    let cwd = cwd.to_string_lossy();
+    let encoded = url_encode(&cwd);
+    if encoded.len() <= MAX_DIRNAME_BYTES {
+        return encoded;
+    }
+    let digest = blake3::hash(cwd.as_bytes()).to_hex();
+    let leaf = Path::new(cwd.as_ref())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    let slug = grok_slug(leaf, MAX_SLUG_CHARS);
+    let slug = if slug.is_empty() { "workspace" } else { &slug };
+    format!("{slug}-{}", &digest[..16])
+}
+
+/// Percent-encode every byte outside the RFC 3986 unreserved set, matching the
+/// `urlencoding` crate Grok Build uses.
+fn url_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+/// Grok Build's `slugify`: lowercase, non-alphanumerics collapse to a single
+/// dash, trim dashes, truncate to `max_chars`.
+fn grok_slug(input: &str, max_chars: usize) -> String {
+    let mut slug = String::with_capacity(input.len());
+    let mut previous_dash = false;
+    for character in input.to_lowercase().chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            previous_dash = false;
+        } else if !previous_dash {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    slug.trim_matches('-').chars().take(max_chars).collect()
 }
 
 /// Claude Code's on-disk project-key algorithm, captured from local rollouts:
@@ -658,7 +797,7 @@ pub fn collect_native_artifacts(
     let roots: &[&str] = match harness {
         HarnessKind::Codex => &["sessions", "archived_sessions"],
         HarnessKind::Claude => &["projects", "session-env", "file-history"],
-        HarnessKind::Kimi => &["sessions"],
+        HarnessKind::Kimi | HarnessKind::Grok => &["sessions"],
     };
     let mut output = Vec::new();
     for relative in roots {
@@ -869,6 +1008,7 @@ fn collect_native_tree(
         }
         HarnessKind::Claude => inside || name == format!("{session_id}.jsonl"),
         HarnessKind::Kimi => inside && kimi_session_artifact(relative, session_id),
+        HarnessKind::Grok => inside && grok_session_artifact(relative, session_id),
     };
     if !selected || secret_like_path(relative) {
         return Ok(());
@@ -1680,6 +1820,139 @@ mod tests {
             let path = artifact.relative_path.to_string_lossy();
             !path.contains("tasks") && !path.contains(".bak") && !path.contains("logs")
         }));
+    }
+
+    #[test]
+    fn grok_allowlist_collects_one_session_directory_without_runtime_state() {
+        const NATIVE: &str = "01a00c3a-553f-71e0-95ab-aa04396d3ad7";
+        let temp = tempfile::tempdir().unwrap();
+        let session = temp.path().join("sessions/%2Fhome%2Fme%2Fapp").join(NATIVE);
+        fs::create_dir_all(&session).unwrap();
+        for name in [
+            "chat_history.jsonl",
+            "events.jsonl",
+            "prompt_context.json",
+            "summary.json",
+            "system_prompt.txt",
+        ] {
+            fs::write(session.join(name), b"payload").unwrap();
+        }
+        fs::write(session.join("summary.json.lock"), b"").unwrap();
+        let other = temp
+            .path()
+            .join("sessions/%2Fhome%2Fme%2Fapp/01a00c40-55c5-78b0-85c8-ac1b99985fd0");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("summary.json"), b"other").unwrap();
+        fs::write(temp.path().join("sessions/session_search.sqlite"), b"index").unwrap();
+
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Grok, temp.path(), NATIVE, false).unwrap();
+
+        let paths = artifacts
+            .iter()
+            .map(|artifact| artifact.relative_path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                "chat_history.jsonl",
+                "events.jsonl",
+                "prompt_context.json",
+                "summary.json",
+                "system_prompt.txt",
+            ]
+            .map(|name| format!("sessions/%2Fhome%2Fme%2Fapp/{NATIVE}/{name}"))
+        );
+    }
+
+    #[test]
+    fn restore_rewrites_grok_cwd_key_and_session_summary_for_target_workspace() {
+        const NATIVE: &str = "01a00c3a-553f-71e0-95ab-aa04396d3ad7";
+        let repositories = vec![crate::hel_archive::RepositoryManifest {
+            metadata: crate::hel_archive::RepositoryMetadata {
+                id: "app".into(),
+                relative_destination: "app".into(),
+                origin: "owner/app".into(),
+                base_commit: "a".repeat(40),
+                head_commit: "a".repeat(40),
+                branch: Some("main".into()),
+            },
+            committed_bundle_path: "repositories/app/committed.bundle".into(),
+            staged_patch_path: "repositories/app/staged.patch".into(),
+            unstaged_patch_path: "repositories/app/unstaged.patch".into(),
+            untracked_tar_path: "repositories/app/untracked.tar".into(),
+        }];
+        let path = restored_native_relative_path(
+            HarnessKind::Grok,
+            Path::new(&format!(
+                "sessions/%2Fhome%2Fjonathan%2FProjects%2Fapp/{NATIVE}/summary.json"
+            )),
+            "app",
+            &repositories,
+            Path::new("/workspace"),
+        )
+        .unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from(format!("sessions/%2Fworkspace%2Fapp/{NATIVE}/summary.json"))
+        );
+
+        let summary = restored_native_artifact_bytes(
+            HarnessKind::Grok,
+            &path,
+            br#"{"info":{"id":"01a00c3a","cwd":"/home/jonathan/Projects/app"},"grok_home":"/home/jonathan/.grok","num_messages":3}"#,
+            "app",
+            &repositories,
+            Path::new("/workspace"),
+            Path::new("/profiles/imported"),
+        )
+        .unwrap();
+        let summary: Value = serde_json::from_slice(&summary).unwrap();
+        assert_eq!(summary["info"]["cwd"], "/workspace/app");
+        assert_eq!(summary["grok_home"], "/profiles/imported");
+        assert_eq!(summary["num_messages"], 3);
+
+        // Transcript files travel unchanged.
+        let history = restored_native_artifact_bytes(
+            HarnessKind::Grok,
+            Path::new(&format!(
+                "sessions/%2Fworkspace%2Fapp/{NATIVE}/chat_history.jsonl"
+            )),
+            b"{\"role\":\"user\"}\n",
+            "app",
+            &repositories,
+            Path::new("/workspace"),
+            Path::new("/profiles/imported"),
+        )
+        .unwrap();
+        assert_eq!(history, b"{\"role\":\"user\"}\n");
+    }
+
+    #[test]
+    fn grok_cwd_key_url_encodes_short_paths_and_hashes_long_ones() {
+        assert_eq!(
+            grok_cwd_key(Path::new("/home/jonathan")),
+            "%2Fhome%2Fjonathan"
+        );
+        assert_eq!(
+            grok_cwd_key(Path::new("/workspace/app")),
+            "%2Fworkspace%2Fapp"
+        );
+        // Unreserved characters survive; everything else is percent-encoded.
+        assert_eq!(
+            grok_cwd_key(Path::new("/a-b_c.d~e/f g")),
+            "%2Fa-b_c.d~e%2Ff%20g"
+        );
+        let long = Path::new(
+            "/Users/test/\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}\u{4e2d}",
+        );
+        let key = grok_cwd_key(long);
+        assert!(key.len() <= 255);
+        assert!(
+            !key.starts_with("%2F"),
+            "long paths use the hash form: {key}"
+        );
+        assert!(key.starts_with("workspace-"), "unslugifiable leaf: {key}");
     }
 
     #[test]

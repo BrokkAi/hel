@@ -542,6 +542,13 @@ mod unix {
                 relay.record_command_completed(&request_id, RelayCommandOutcome::Configured)?;
                 in_flight.remove(&request_id);
             }
+            RuntimeEvent::SessionModeApplied {
+                request_id,
+                mode_id: _,
+            } => {
+                relay.record_command_completed(&request_id, RelayCommandOutcome::SessionModeSet)?;
+                in_flight.remove(&request_id);
+            }
             RuntimeEvent::CommandRejected {
                 request_id,
                 message,
@@ -655,6 +662,10 @@ mod unix {
                 request_id,
                 key: key.clone(),
                 value: value.clone(),
+            }),
+            RelayCommand::SetSessionMode { mode_id } => Some(CommandRequest::SetSessionMode {
+                request_id,
+                mode_id: mode_id.clone(),
             }),
             RelayCommand::Cancel => Some(CommandRequest::Cancel { request_id }),
             RelayCommand::Close { .. } => Some(CommandRequest::Close { request_id }),
@@ -2175,6 +2186,125 @@ mod relay_tests {
     }
 
     #[tokio::test]
+    async fn set_session_mode_waits_for_idle_then_records_a_durable_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay.clone(),
+            event_rx,
+            wake_rx,
+            command_tx,
+        ));
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+
+        submit(&mut relay.lock().unwrap(), "prompt-1", prompt("running"));
+        wake_tx.try_send(()).unwrap();
+        assert_prompt(command_rx.recv().await.unwrap(), "prompt-1", "running");
+
+        submit(
+            &mut relay.lock().unwrap(),
+            "session-mode-1",
+            RelayCommand::SetSessionMode {
+                mode_id: "plan".into(),
+            },
+        );
+        wake_tx.try_send(()).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), command_rx.recv())
+                .await
+                .is_err(),
+            "the session mode dispatched before the active prompt finished"
+        );
+
+        event_tx
+            .send(RuntimeEvent::PromptFinished {
+                request_id: "prompt-1".into(),
+                stop_reason: "end_turn".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), command_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            CommandRequest::SetSessionMode { request_id, mode_id }
+                if request_id == "session-mode-1" && mode_id == "plan"
+        ));
+        event_tx
+            .send(RuntimeEvent::SessionModeApplied {
+                request_id: "session-mode-1".into(),
+                mode_id: "plan".into(),
+            })
+            .unwrap();
+        wait_for_relay_state(&relay, |state| {
+            state.config.get("mode").map(String::as_str) == Some("plan")
+        })
+        .await;
+
+        event_tx.send(RuntimeEvent::Stopped).unwrap();
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejected_session_mode_change_reports_the_failure_and_leaves_the_mode_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (event_tx, event_rx) = runtime_event_channel();
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let coordinator = tokio::spawn(unix::run_relay_coordinator(
+            relay.clone(),
+            event_rx,
+            wake_rx,
+            command_tx,
+        ));
+        event_tx
+            .send(RuntimeEvent::SessionConfigured {
+                config_options: Vec::new(),
+            })
+            .unwrap();
+
+        submit(
+            &mut relay.lock().unwrap(),
+            "session-mode-1",
+            RelayCommand::SetSessionMode {
+                mode_id: "plan".into(),
+            },
+        );
+        wake_tx.try_send(()).unwrap();
+        assert!(matches!(
+            command_rx.recv().await.unwrap(),
+            CommandRequest::SetSessionMode { request_id, mode_id }
+                if request_id == "session-mode-1" && mode_id == "plan"
+        ));
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "session-mode-1".into(),
+                message: "set session mode to plan: no such mode".into(),
+            })
+            .unwrap();
+        wait_for_relay_state(&relay, |state| !state.config.contains_key("mode")).await;
+
+        event_tx.send(RuntimeEvent::Stopped).unwrap();
+        drop(event_tx);
+        drop(wake_tx);
+        coordinator.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn config_cancel_and_close_commands_have_durable_terminal_outcomes() {
         let temp = tempfile::tempdir().unwrap();
         let relay = Arc::new(Mutex::new(

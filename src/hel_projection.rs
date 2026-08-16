@@ -263,6 +263,7 @@ fn project_observation(
                         .any(|command_id| command_id == &queued.command_id)
                 }),
                 crate::hel_worker::RelayCommandOutcome::Configured
+                | crate::hel_worker::RelayCommandOutcome::SessionModeSet
                 | crate::hel_worker::RelayCommandOutcome::Cancelled
                 | crate::hel_worker::RelayCommandOutcome::CheckpointCompleted => {}
             }

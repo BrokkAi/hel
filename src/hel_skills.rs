@@ -28,12 +28,14 @@ const ARCHIVE_MAGIC: &[u8; 8] = b"HELSKIL1";
 
 /// The harness-home-relative directories Hel keeps in sync for a profile.
 ///
-/// All three harnesses resolve user skills from a `skills/` directory under
-/// their home (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `KIMI_CODE_HOME`), matching
-/// the provisioning allowlist in `stage_profile`.
+/// Every harness resolves user skills from a `skills/` directory under its
+/// home (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `KIMI_CODE_HOME`, `GROK_HOME`),
+/// matching the provisioning allowlist in `stage_profile`.
 pub fn synced_skill_dirs(kind: HarnessKind) -> &'static [&'static str] {
     match kind {
-        HarnessKind::Codex | HarnessKind::Claude | HarnessKind::Kimi => &["skills"],
+        HarnessKind::Codex | HarnessKind::Claude | HarnessKind::Kimi | HarnessKind::Grok => {
+            &["skills"]
+        }
     }
 }
 

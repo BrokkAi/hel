@@ -1386,8 +1386,14 @@ impl Controller {
                 .iter()
                 .map(|resource| resource.destination.clone()),
         );
-        let (bridge_command, bridge_args) =
-            bridge_launch(profile.kind, profile.executable.as_deref());
+        // The flag-enforced harnesses need the unrestricted decision on the
+        // bridge command line, so it is taken before the launch config.
+        let force_unrestricted = force_unrestricted_mode(&backend);
+        let (bridge_command, bridge_args) = bridge_launch(
+            profile.kind,
+            profile.executable.as_deref(),
+            force_unrestricted,
+        );
         let mut environment = profile.environment.clone();
         environment.insert(profile.home_env().into(), target_profile_home.clone());
         let launch = WorkerLaunchConfig {
@@ -1399,7 +1405,7 @@ impl Controller {
             cwd: PathBuf::from(&workspace.0),
             additional_directories,
             native_session_id: session.native_session_id.clone(),
-            force_unrestricted_mode: force_unrestricted_mode(&backend),
+            force_unrestricted_mode: force_unrestricted,
         };
 
         let staging = tempfile::tempdir().context("create worker staging directory")?;
@@ -5596,13 +5602,14 @@ const CLAUDE_AGENT_ACP_FALLBACK_VERSION: &str = "0.68.0";
 fn bridge_launch(
     harness: crate::hel_config::HarnessKind,
     executable: Option<&Path>,
+    unrestricted: bool,
 ) -> (String, Vec<String>) {
     if let Some(executable) = executable {
-        let args = if harness == crate::hel_config::HarnessKind::Kimi {
-            vec!["acp".into()]
-        } else {
-            Vec::new()
-        };
+        let args = harness
+            .bridge_override_args(unrestricted)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         return (executable.to_string_lossy().into_owned(), args);
     }
     match harness {
@@ -5627,6 +5634,20 @@ fn bridge_launch(
                 "if command -v kimi >/dev/null 2>&1; then exec kimi acp; elif [ -x \"$HOME/.kimi-code/bin/kimi\" ]; then exec \"$HOME/.kimi-code/bin/kimi\" acp; elif command -v curl >/dev/null 2>&1; then curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash && exec \"$HOME/.kimi-code/bin/kimi\" acp; else echo 'Hel needs compatible Kimi Code or curl for its official installer' >&2; exit 127; fi".into(),
             ],
         ),
+        crate::hel_config::HarnessKind::Grok => {
+            let acp = crate::hel_config::HarnessKind::Grok
+                .bridge_override_args(unrestricted)
+                .join(" ");
+            (
+                "sh".into(),
+                vec![
+                    "-lc".into(),
+                    format!(
+                        "if command -v grok >/dev/null 2>&1; then exec grok {acp}; elif [ -x \"$GROK_HOME/bin/grok\" ]; then exec \"$GROK_HOME/bin/grok\" {acp}; elif [ -x \"$HOME/.grok/bin/grok\" ]; then exec \"$HOME/.grok/bin/grok\" {acp}; elif command -v curl >/dev/null 2>&1; then curl -fsSL https://x.ai/cli/install.sh | bash && exec \"$HOME/.grok/bin/grok\" {acp}; else echo 'Hel needs compatible Grok Build or curl for its official installer' >&2; exit 127; fi"
+                    ),
+                ],
+            )
+        }
     }
 }
 
@@ -5668,6 +5689,14 @@ fn stage_profile(profile: &crate::hel_config::HarnessProfile, destination: &Path
             "agents",
             "plugins",
         ],
+        crate::hel_config::HarnessKind::Grok => &[
+            "auth.json",
+            "config.toml",
+            "AGENTS.md",
+            "agent_id",
+            "skills",
+            "plugins",
+        ],
     };
     for name in allowlist {
         let from = source.join(name);
@@ -5687,6 +5716,7 @@ fn append_hel_container_environment(
         crate::hel_config::HarnessKind::Codex => "AGENTS.md",
         crate::hel_config::HarnessKind::Claude => "CLAUDE.md",
         crate::hel_config::HarnessKind::Kimi => "SYSTEM.md",
+        crate::hel_config::HarnessKind::Grok => "AGENTS.md",
     };
     let path = destination.join(instructions);
     let separator = match std::fs::read_to_string(&path) {
@@ -7935,10 +7965,11 @@ mod tests {
 
     #[test]
     fn default_bridges_pin_command_capable_adapter_versions() {
-        let (_, codex_arguments) = bridge_launch(crate::hel_config::HarnessKind::Codex, None);
+        let (_, codex_arguments) = bridge_launch(crate::hel_config::HarnessKind::Codex, None, true);
         assert!(codex_arguments[1].contains("@agentclientprotocol/codex-acp@1.1.14"));
 
-        let (_, claude_arguments) = bridge_launch(crate::hel_config::HarnessKind::Claude, None);
+        let (_, claude_arguments) =
+            bridge_launch(crate::hel_config::HarnessKind::Claude, None, true);
         assert!(claude_arguments[1].contains("@agentclientprotocol/claude-agent-acp@0.68.0"));
     }
 
@@ -7965,11 +7996,95 @@ mod tests {
 
     #[test]
     fn kimi_default_bridge_uses_bash_for_the_official_installer() {
-        let (command, arguments) = bridge_launch(crate::hel_config::HarnessKind::Kimi, None);
+        let (command, arguments) = bridge_launch(crate::hel_config::HarnessKind::Kimi, None, true);
         assert_eq!(command, "sh");
         assert_eq!(arguments[0], "-lc");
         assert!(arguments[1].contains("install.sh | bash &&"));
         assert!(arguments[1].contains("$HOME/.kimi-code/bin/kimi"));
+    }
+
+    #[test]
+    fn grok_default_bridge_uses_bash_for_the_official_installer() {
+        let (command, arguments) = bridge_launch(crate::hel_config::HarnessKind::Grok, None, false);
+        assert_eq!(command, "sh");
+        assert_eq!(arguments[0], "-lc");
+        let script = &arguments[1];
+        assert!(script.contains("https://x.ai/cli/install.sh | bash &&"));
+        assert!(script.contains("command -v grok"));
+        assert!(script.contains("[ -x \"$GROK_HOME/bin/grok\" ]"));
+        assert!(script.contains("[ -x \"$HOME/.grok/bin/grok\" ]"));
+        assert!(script.contains("exec grok agent stdio"));
+        assert!(script.contains("exit 127"));
+        assert!(
+            !script.contains("--always-approve"),
+            "a restricted session must not auto-approve: {script}"
+        );
+    }
+
+    #[test]
+    fn grok_default_bridge_adds_the_always_approve_flag_when_unrestricted() {
+        let (_, arguments) = bridge_launch(crate::hel_config::HarnessKind::Grok, None, true);
+        let script = &arguments[1];
+        assert!(script.contains("exec grok agent --always-approve stdio"));
+        assert!(script.contains("exec \"$GROK_HOME/bin/grok\" agent --always-approve stdio"));
+        assert!(script.contains("exec \"$HOME/.grok/bin/grok\" agent --always-approve stdio"));
+    }
+
+    #[test]
+    fn bridge_executable_override_carries_the_acp_subcommand_per_harness() {
+        let executable = std::path::PathBuf::from("/opt/harness");
+        for (kind, expected) in [
+            (crate::hel_config::HarnessKind::Codex, Vec::new()),
+            (crate::hel_config::HarnessKind::Claude, Vec::new()),
+            (crate::hel_config::HarnessKind::Kimi, vec!["acp"]),
+            (
+                crate::hel_config::HarnessKind::Grok,
+                vec!["agent", "--always-approve", "stdio"],
+            ),
+        ] {
+            let (command, arguments) = bridge_launch(kind, Some(&executable), true);
+            assert_eq!(command, "/opt/harness");
+            assert_eq!(arguments, expected, "{kind:?} override arguments");
+        }
+        let (_, restricted) = bridge_launch(
+            crate::hel_config::HarnessKind::Grok,
+            Some(&executable),
+            false,
+        );
+        assert_eq!(restricted, ["agent", "stdio"]);
+    }
+
+    #[test]
+    fn stage_grok_profile_copies_authentication_and_agent_identity() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("auth.json"),
+            "{\"https://auth.x.ai::1\":{}}",
+        )
+        .unwrap();
+        std::fs::write(home.path().join("agent_id"), "stable-agent-id").unwrap();
+        std::fs::write(home.path().join("config.toml"), "model = \"grok-4.6\"\n").unwrap();
+        // Native session storage is checkpointed, never staged.
+        std::fs::create_dir(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/session_search.sqlite"), "x").unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let profile = crate::hel_config::HarnessProfile {
+            kind: crate::hel_config::HarnessKind::Grok,
+            home: home.path().to_path_buf(),
+            executable: None,
+            environment: BTreeMap::new(),
+            context_window_bytes: None,
+        };
+
+        stage_profile(&profile, staged.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(staged.path().join("agent_id")).unwrap(),
+            "stable-agent-id"
+        );
+        assert!(staged.path().join("auth.json").is_file());
+        assert!(staged.path().join("config.toml").is_file());
+        assert!(!staged.path().join("sessions").exists());
     }
 
     #[test]
@@ -8035,6 +8150,7 @@ mod tests {
             (crate::hel_config::HarnessKind::Codex, "AGENTS.md"),
             (crate::hel_config::HarnessKind::Claude, "CLAUDE.md"),
             (crate::hel_config::HarnessKind::Kimi, "SYSTEM.md"),
+            (crate::hel_config::HarnessKind::Grok, "AGENTS.md"),
         ] {
             let home = tempfile::tempdir().unwrap();
             let original = "# Controller instructions\n\nKeep this source unchanged.\n";

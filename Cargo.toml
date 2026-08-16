@@ -28,6 +28,10 @@ axum = "0.8"
 # needs a C toolchain and complicates cross-compilation.
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
+# Grok Build keys long session directories by BLAKE3; Hel has to reproduce that
+# name exactly to restore a checkpoint. `default-features = false` keeps the
+# cross-compiled musl build free of the optional Rayon and SIMD extras.
+blake3 = { version = "1", default-features = false, features = ["std"] }
 # `clock` pulls `iana-time-zone`/`android-tzdata` so `Local` can render reset
 # timestamps in the machine's wall-clock time (DST-correct); `default-features
 # = false` drops the wasm-only bits.

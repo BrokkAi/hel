@@ -48,8 +48,8 @@ podman pull ghcr.io/brokkai/hel/agent-dev:latest
 
 The image includes Rust, Node 24, Git, GitHub CLI, the Codex ACP bridge, and the
 Claude ACP bridge. Hel copies its session relay and the selected harness profile
-into each new container. Kimi Code uses Hel's official on-demand installer
-fallback. The image is multi-arch (`linux/amd64` and `linux/arm64`), so the
+into each new container. Kimi Code and Grok Build use Hel's official on-demand
+installer fallback. The image is multi-arch (`linux/amd64` and `linux/arm64`), so the
 same name works on both architectures, is public, and needs no authentication
 to pull.
 
@@ -84,8 +84,8 @@ To delegate host setup, run `hel setup instructions --platform linux` (or
 
 `hel` opens the session/quota dashboard. On a first run with no configuration,
 it drops into the same plain-stdio setup dialog as `hel setup`. The dialog finds
-local Codex, Claude Code, and Kimi Code homes, reports whether their credentials
-appear present, detects the current GitHub origin, recommends a usable local
+local Codex, Claude Code, Kimi Code, and Grok Build homes, reports whether their
+credentials appear present, detects the current GitHub origin, recommends a local
 container runtime, writes the configuration after confirmation, and smoke-tests
 the selected image. `Ctrl+Q` or Esc detaches; it does not stop the target-side
 session relay or ACP agent. `hel server` explicitly starts the authenticated
@@ -156,6 +156,10 @@ home = "/home/me/.claude-1"
 [profiles.kimi-1]
 kind = "kimi"
 home = "/home/me/.kimi"
+
+[profiles.grok-1]
+kind = "grok"
+home = "/home/me/.grok"
 
 [bundles.hel]
 primary_repo = "hel"

@@ -3257,6 +3257,11 @@ async fn open_chat_view(
             project: record.project_name(&controller.config),
         });
     }
+    let harness = controller
+        .config
+        .profiles
+        .get(&session_record.last_profile)
+        .map(|profile| profile.kind);
     let recovery_context = hel::hel_recovery::RecoveryContext {
         observer: recovery_observer.clone(),
         session: session_record,
@@ -3271,6 +3276,7 @@ async fn open_chat_view(
         header,
         saved_draft,
         notices,
+        harness,
     ))
 }
 
@@ -4776,6 +4782,9 @@ fn discover_import_profile(
             }
             publish(&profile);
         }),
+        hel::hel_config::HarnessKind::Grok => Err(anyhow::anyhow!(
+            "importing Grok Build sessions is not supported yet"
+        )),
     };
     if let Err(error) = discovered {
         profile.error = Some(format!("{error:#}"));
@@ -5165,6 +5174,9 @@ fn import_session_from_profile(
                     controller,
                 },
             ))
+        }
+        hel::hel_config::HarnessKind::Grok => {
+            bail!("importing Grok Build sessions is not supported yet")
         }
     }
 }

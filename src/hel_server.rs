@@ -30,7 +30,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::hel_chat::BrowserTranscript;
-use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate, validate_id};
+use crate::hel_config::{HelConfig, TargetTemplate, validate_id};
 use crate::hel_state::{HelState, SessionState};
 
 const COOKIE_NAME: &str = "hel_viewer_session";
@@ -175,7 +175,7 @@ impl ViewerSnapshot {
             .map(|session| ViewerSession {
                 id: session.id.clone(),
                 title: session.display_title().to_owned(),
-                harness_kind: harness_kind_name(session.harness_kind).into(),
+                harness_kind: session.harness_kind.id().into(),
                 profile_id: session.last_profile.clone(),
                 bundle_id: session.bundle_id.clone(),
                 target_id: session.target_template_id.clone(),
@@ -193,7 +193,7 @@ impl ViewerSnapshot {
             .iter()
             .map(|(id, profile)| ViewerProfile {
                 id: id.clone(),
-                harness_kind: harness_kind_name(profile.kind).into(),
+                harness_kind: profile.kind.id().into(),
                 quota: None,
             })
             .collect();
@@ -889,14 +889,6 @@ fn now_unix() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-const fn harness_kind_name(kind: HarnessKind) -> &'static str {
-    match kind {
-        HarnessKind::Codex => "codex",
-        HarnessKind::Claude => "claude",
-        HarnessKind::Kimi => "kimi",
-    }
-}
-
 const fn session_state_name(state: SessionState) -> &'static str {
     match state {
         SessionState::Provisioning => "provisioning",
@@ -1013,7 +1005,8 @@ mod tests {
     use tower::ServiceExt as _;
 
     use crate::hel_config::{
-        CONFIG_VERSION, ContainerTemplate, HarnessProfile, ProjectBundle, ProjectRepository,
+        CONFIG_VERSION, ContainerTemplate, HarnessKind, HarnessProfile, ProjectBundle,
+        ProjectRepository,
     };
     use crate::hel_state::{STATE_VERSION, SessionRecord};
 

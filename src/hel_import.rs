@@ -285,46 +285,37 @@ pub struct KimiImportRequest<'a> {
     pub archive_directory: &'a Path,
 }
 
-/// Resolve the Claude configuration home without ever modifying it.
-pub fn claude_config_home() -> Result<PathBuf> {
-    let home = std::env::var_os(HarnessKind::Claude.home_env())
+/// Resolve a harness's configuration home without ever modifying it.
+///
+/// The environment override wins; otherwise the harness's default directory
+/// beneath the user's home is used, the same pair `hel setup` discovers.
+pub fn harness_config_home(kind: HarnessKind) -> Result<PathBuf> {
+    let name = kind.display_name();
+    let home = std::env::var_os(kind.home_env())
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
-        .context("cannot determine Claude config home; set CLAUDE_CONFIG_DIR")?;
+        .or_else(|| dirs::home_dir().map(|home| home.join(kind.default_home_leaf())))
+        .with_context(|| format!("cannot determine {name} home; set {}", kind.home_env()))?;
     ensure!(
         home.is_dir(),
-        "Claude config home is not a directory: {}",
+        "{name} home is not a directory: {}",
         home.display()
     );
     Ok(home)
+}
+
+/// Resolve the Claude configuration home without ever modifying it.
+pub fn claude_config_home() -> Result<PathBuf> {
+    harness_config_home(HarnessKind::Claude)
 }
 
 /// Resolve the Codex configuration home without ever modifying it.
 pub fn codex_config_home() -> Result<PathBuf> {
-    let home = std::env::var_os(HarnessKind::Codex.home_env())
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
-        .context("cannot determine Codex home; set CODEX_HOME")?;
-    ensure!(
-        home.is_dir(),
-        "Codex home is not a directory: {}",
-        home.display()
-    );
-    Ok(home)
+    harness_config_home(HarnessKind::Codex)
 }
 
 /// Resolve the Kimi Code configuration home without ever modifying it.
 pub fn kimi_config_home() -> Result<PathBuf> {
-    let home = std::env::var_os(HarnessKind::Kimi.home_env())
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".kimi-code")))
-        .context("cannot determine Kimi Code home; set KIMI_CODE_HOME")?;
-    ensure!(
-        home.is_dir(),
-        "Kimi Code home is not a directory: {}",
-        home.display()
-    );
-    Ok(home)
+    harness_config_home(HarnessKind::Kimi)
 }
 
 /// Locate a Codex rollout exposed by its native interactive resume picker.
@@ -2452,7 +2443,7 @@ fn import_native_session(
         None => harness_session_title(&transcript.events).unwrap_or_else(|| {
             format!(
                 "Imported {} session {native_session_id}",
-                harness_name(harness)
+                harness.display_name()
             )
         }),
     };
@@ -2488,10 +2479,7 @@ fn import_native_session(
             target: TargetManifest {
                 template_id: target_id.clone(),
                 target_kind: "import".into(),
-                details: BTreeMap::from([(
-                    "source".into(),
-                    format!("{}-import", harness_name(harness).to_ascii_lowercase()),
-                )]),
+                details: BTreeMap::from([("source".into(), format!("{}-import", harness.id()))]),
             },
             bundle: BundleManifest {
                 id: bundle_id.to_owned(),
@@ -2549,14 +2537,6 @@ fn import_native_session(
         bundle_id: bundle_id.to_owned(),
         archive_path,
     })
-}
-
-fn harness_name(harness: HarnessKind) -> &'static str {
-    match harness {
-        HarnessKind::Codex => "Codex",
-        HarnessKind::Claude => "Claude",
-        HarnessKind::Kimi => "Kimi",
-    }
 }
 
 fn default_import_target_id(config: &HelConfig) -> String {
@@ -2711,7 +2691,7 @@ fn default_profile(config: &HelConfig, harness: HarnessKind, home: &Path) -> Str
                 .find(|(_, profile)| profile.kind == harness)
         })
         .map(|(id, _)| id.clone())
-        .unwrap_or_else(|| format!("{}-import", harness_name(harness).to_ascii_lowercase()))
+        .unwrap_or_else(|| format!("{}-import", harness.id()))
 }
 
 fn import_profile_id(

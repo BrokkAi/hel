@@ -60,7 +60,8 @@ podman build --pull=always \
 hel setup
 ```
 
-Setup reports the Codex, Claude Code, and Kimi Code homes it found, the
+Setup reports the Codex, Claude Code, Kimi Code, and Grok Build homes it found,
+the
 GitHub origin of the current directory, and which local container runtimes
 are usable. If a usable runtime exists, it prompts you for:
 

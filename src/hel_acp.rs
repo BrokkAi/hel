@@ -25,7 +25,7 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::hel_config::HarnessKind;
+use crate::hel_config::{HarnessKind, UnrestrictedEnforcement};
 
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {
@@ -58,7 +58,8 @@ fn production_compaction_config(harness: HarnessKind) -> Option<ProductionCompac
             effort_option: "effort",
             effort: "high",
         }),
-        HarnessKind::Kimi => None,
+        // Both auto-compact and expose a native `/compact`.
+        HarnessKind::Kimi | HarnessKind::Grok => None,
     }
 }
 
@@ -72,6 +73,12 @@ pub enum CommandRequest {
         request_id: String,
         key: String,
         value: String,
+    },
+    /// Opaque ACP `session/set_mode`. Used for harnesses whose plan mode is a
+    /// session mode rather than an advertised slash command.
+    SetSessionMode {
+        request_id: String,
+        mode_id: String,
     },
     Compact {
         prompt: String,
@@ -132,6 +139,11 @@ pub enum RuntimeEvent {
         /// cannot publish a checkpoint between the two durable observations.
         #[serde(default)]
         config_options: Vec<SessionConfigOption>,
+    },
+    SessionModeApplied {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        request_id: String,
+        mode_id: String,
     },
     CommandRejected {
         request_id: String,
@@ -536,10 +548,13 @@ async fn drive_connection(
             )
         };
 
-    let desired_mode = spec
+    // A launch-flag harness was already put in its unrestricted mode when the
+    // bridge process started; there is nothing to select over ACP, but the
+    // session still reports which mode it runs in.
+    let enforcement = spec
         .force_unrestricted_mode
-        .then(|| spec.harness.unrestricted_mode());
-    if let Some(desired_mode) = desired_mode {
+        .then(|| spec.harness.unrestricted_enforcement());
+    if let Some(desired_mode) = enforcement.and_then(UnrestrictedEnforcement::acp_mode) {
         enforce_unrestricted_mode(
             &connection,
             &session_id,
@@ -555,7 +570,7 @@ async fn drive_connection(
         RuntimeEvent::SessionStarted {
             native_session_id: session_id.to_string(),
             resumed,
-            unrestricted_mode: desired_mode.map(str::to_owned),
+            unrestricted_mode: enforcement.map(|enforcement| enforcement.label().to_owned()),
         },
     )
     .await?;
@@ -717,6 +732,16 @@ async fn drive_connection(
                                 )
                                 .await?;
                             }
+                            Some(CommandRequest::SetSessionMode { request_id, .. }) => {
+                                emit_runtime_event(
+                                    events,
+                                    RuntimeEvent::CommandRejected {
+                                        request_id,
+                                        message: "the session mode can only be changed while the agent is idle".into(),
+                                    },
+                                )
+                                .await?;
+                            }
                             Some(CommandRequest::Compact { response, .. }) => {
                                 let _ = response.send(Err(
                                     "cannot compact while the destination prompt is running".into(),
@@ -758,6 +783,40 @@ async fn drive_connection(
                             RuntimeEvent::CommandRejected {
                                 request_id,
                                 message: format!("{error:#}"),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+            CommandRequest::SetSessionMode {
+                request_id,
+                mode_id,
+            } => {
+                match connection
+                    .send_request(SetSessionModeRequest::new(
+                        session_id.clone(),
+                        mode_id.clone(),
+                    ))
+                    .block_task()
+                    .await
+                {
+                    Ok(_) => {
+                        emit_runtime_event(
+                            events,
+                            RuntimeEvent::SessionModeApplied {
+                                request_id,
+                                mode_id,
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        emit_runtime_event(
+                            events,
+                            RuntimeEvent::CommandRejected {
+                                request_id,
+                                message: format!("set session mode to {mode_id}: {error}"),
                             },
                         )
                         .await?;
@@ -890,11 +949,15 @@ async fn compact_in_scratch_session(
         .await
         .context("create scratch ACP session")?;
     let session_id = created.session_id;
-    if spec.force_unrestricted_mode {
+    if let Some(desired_mode) = spec
+        .force_unrestricted_mode
+        .then(|| spec.harness.unrestricted_enforcement())
+        .and_then(UnrestrictedEnforcement::acp_mode)
+    {
         enforce_unrestricted_mode(
             connection,
             &session_id,
-            spec.harness.unrestricted_mode(),
+            desired_mode,
             created.config_options.as_deref().unwrap_or_default(),
             created.modes.as_ref(),
         )
@@ -1111,6 +1174,7 @@ mod tests {
             })
         );
         assert_eq!(production_compaction_config(HarnessKind::Kimi), None);
+        assert_eq!(production_compaction_config(HarnessKind::Grok), None);
     }
 
     #[test]
