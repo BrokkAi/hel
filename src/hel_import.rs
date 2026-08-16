@@ -156,6 +156,9 @@ pub enum BundleResolution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEditTargets {
     pub git_roots: Vec<PathBuf>,
+    /// Git roots under a temporary directory. They are throwaway workspaces
+    /// rather than project repositories, so the import omits them.
+    pub scratch_git_roots: Vec<PathBuf>,
     pub non_git_dirs: Vec<PathBuf>,
 }
 
@@ -163,6 +166,7 @@ pub struct SessionEditTargets {
 pub struct ImportSafetyIssues {
     pub dirty_git_roots: Vec<(PathBuf, String)>,
     pub omitted_non_git_dirs: Vec<PathBuf>,
+    pub scratch_git_roots: Vec<PathBuf>,
     pub has_untracked_files: bool,
 }
 
@@ -211,6 +215,7 @@ pub fn import_safety_issues(targets: &SessionEditTargets) -> Result<ImportSafety
     Ok(ImportSafetyIssues {
         dirty_git_roots,
         omitted_non_git_dirs: targets.non_git_dirs.clone(),
+        scratch_git_roots: targets.scratch_git_roots.clone(),
         has_untracked_files,
     })
 }
@@ -2443,6 +2448,32 @@ pub fn session_edit_targets(
     transcript: &ClaudeTranscript,
     profile_home: &Path,
 ) -> Result<SessionEditTargets> {
+    session_edit_targets_with_scratch_prefixes(transcript, profile_home, &scratch_prefixes())
+}
+
+/// Directories whose repositories are throwaway workspaces rather than
+/// projects. A session that writes into one of them is still anchored on its
+/// own repository.
+fn scratch_prefixes() -> Vec<PathBuf> {
+    let mut prefixes = Vec::new();
+    let mut remember = |path: PathBuf| {
+        let path = fs::canonicalize(&path).unwrap_or(path);
+        if !prefixes.contains(&path) {
+            prefixes.push(path);
+        }
+    };
+    remember(std::env::temp_dir());
+    for literal in ["/tmp", "/var/tmp", "/dev/shm"] {
+        remember(PathBuf::from(literal));
+    }
+    prefixes
+}
+
+fn session_edit_targets_with_scratch_prefixes(
+    transcript: &ClaudeTranscript,
+    profile_home: &Path,
+    scratch_prefixes: &[PathBuf],
+) -> Result<SessionEditTargets> {
     let profile_home =
         fs::canonicalize(profile_home).unwrap_or_else(|_| profile_home.to_path_buf());
     let mut paths = transcript
@@ -2470,19 +2501,33 @@ pub fn session_edit_targets(
             transcript.cwd.display()
         )
     })?;
-    let mut git_roots = BTreeSet::from([cwd_root]);
+    // The session's own repository is authoritative even when it lives under a
+    // temporary directory.
+    let mut git_roots = BTreeSet::from([cwd_root.clone()]);
+    let mut scratch_git_roots = BTreeSet::new();
     let mut non_git_dirs = BTreeSet::new();
     for path in paths {
         if let Some(root) = git_root_for_path(&path)? {
-            git_roots.insert(root);
+            if root != cwd_root && is_scratch_root(&root, scratch_prefixes) {
+                scratch_git_roots.insert(root);
+            } else {
+                git_roots.insert(root);
+            }
         } else {
             non_git_dirs.insert(edited_directory(&path));
         }
     }
     Ok(SessionEditTargets {
         git_roots: git_roots.into_iter().collect(),
+        scratch_git_roots: scratch_git_roots.into_iter().collect(),
         non_git_dirs: non_git_dirs.into_iter().collect(),
     })
+}
+
+fn is_scratch_root(root: &Path, scratch_prefixes: &[PathBuf]) -> bool {
+    scratch_prefixes
+        .iter()
+        .any(|prefix| root.starts_with(prefix))
 }
 
 fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
@@ -2617,9 +2662,13 @@ pub fn resolve_bundle(
         .map(|root| main_worktree_root(root))
         .collect::<Result<Vec<_>>>()?;
     roots.sort_by_key(|root| root != &cwd_root);
-    let mut seen = BTreeSet::new();
-    roots.retain(|root| seen.insert(root.clone()));
+    // Checkouts and worktrees of one repository share an identity. Keep the
+    // first root per identity so the cwd repository stays primary.
+    let mut used_identities = BTreeSet::new();
     for root in roots {
+        if !used_identities.insert(root_identity(&root)?) {
+            continue;
+        }
         let base = setup_style_id(
             root.file_name()
                 .and_then(|name| name.to_str())
@@ -2793,6 +2842,7 @@ fn import_claude_session_inner(
     let timestamp = timestamp();
     let profile_id = import_profile_id(config, profile_id, HarnessKind::Claude, claude_home)?;
     let target_id = default_import_target_id(config);
+    let raw_project = raw_project_import(config, &targets);
     let archive_path = archive_directory.join(format!("{session_id}.hel.zip"));
     if let Some(control) = control {
         control.report(ImportArchiveProgress::WritingArchive)?;
@@ -2846,9 +2896,9 @@ fn import_claude_session_inner(
             harness_kind: HarnessKind::Claude,
             last_profile: profile_id,
             bundle_id: bundle_id.to_owned(),
-            project_directory: None,
+            project_directory: raw_project.as_ref().map(|(directory, _)| directory.clone()),
             managed_worktree: None,
-            target_template_id: target_id,
+            target_template_id: raw_project.map_or(target_id, |(_, raw_target_id)| raw_target_id),
             resource_allocation: None,
             additional_mounts: Vec::new(),
             state: SessionState::Archived,
@@ -3090,6 +3140,7 @@ fn import_native_session(
     let timestamp = timestamp();
     let profile_id = import_profile_id(config, profile_id, harness, harness_home)?;
     let target_id = default_import_target_id(config);
+    let raw_project = raw_project_import(config, &targets);
     let archive_path = archive_directory.join(format!("{session_id}.hel.zip"));
     if let Some(control) = control {
         control.report(ImportArchiveProgress::WritingArchive)?;
@@ -3143,9 +3194,9 @@ fn import_native_session(
             harness_kind: harness,
             last_profile: profile_id,
             bundle_id: bundle_id.to_owned(),
-            project_directory: None,
+            project_directory: raw_project.as_ref().map(|(directory, _)| directory.clone()),
             managed_worktree: None,
-            target_template_id: target_id,
+            target_template_id: raw_project.map_or(target_id, |(_, raw_target_id)| raw_target_id),
             resource_allocation: None,
             additional_mounts: Vec::new(),
             state: SessionState::Archived,
@@ -3185,6 +3236,36 @@ fn default_import_target_id(config: &HelConfig) -> String {
         .or_else(|| config.targets.keys().next())
         .cloned()
         .unwrap_or_else(|| "import".into())
+}
+
+/// Target that hosts raw project sessions on this machine.
+fn raw_import_target_id(config: &HelConfig) -> Option<String> {
+    let local_bare = |template: &TargetTemplate| matches!(template, TargetTemplate::LocalBare);
+    config
+        .targets
+        .get_key_value("raw-localhost")
+        .filter(|(_, template)| local_bare(template))
+        .map(|(id, _)| id.clone())
+        .or_else(|| {
+            config
+                .targets
+                .iter()
+                .find_map(|(id, template)| local_bare(template).then(|| id.clone()))
+        })
+}
+
+/// A session that only wrote to its own repository can keep working in that
+/// directory, so import it as a raw project session instead of a bundle
+/// session. `session_edit_targets` always records the cwd root, so a single
+/// durable root is that root.
+fn raw_project_import(
+    config: &HelConfig,
+    targets: &SessionEditTargets,
+) -> Option<(PathBuf, String)> {
+    let [cwd_root] = targets.git_roots.as_slice() else {
+        return None;
+    };
+    Some((cwd_root.clone(), raw_import_target_id(config)?))
 }
 
 fn collect_local_repositories(
@@ -3496,7 +3577,7 @@ mod tests {
 
     #[test]
     fn session_targets_include_edited_roots_and_keep_cwd_primary() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = durable_fixture_directory();
         let app = directory.path().join("app");
         let sibling = directory.path().join("sibling");
         initialize_repository(&app, "app");
@@ -3516,6 +3597,67 @@ mod tests {
                 .contains(&fs::canonicalize(sibling).unwrap())
         );
         assert!(targets.non_git_dirs.is_empty());
+        assert!(targets.scratch_git_roots.is_empty());
+    }
+
+    #[test]
+    fn session_targets_omit_repositories_under_temporary_directories() {
+        let scratch_home = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        let sibling = directory.path().join("sibling");
+        let throwaway = scratch_home.path().join("throwaway");
+        initialize_repository(&app, "app");
+        initialize_repository(&sibling, "sibling");
+        initialize_repository(&throwaway, "throwaway");
+        let prefixes = [fs::canonicalize(scratch_home.path()).unwrap()];
+        let transcript = ClaudeTranscript {
+            cwd: app.clone(),
+            edited_paths: vec![sibling.join("src/lib.rs"), throwaway.join("notes.md")],
+            events: Vec::new(),
+        };
+
+        let targets = session_edit_targets_with_scratch_prefixes(
+            &transcript,
+            &directory.path().join("profile"),
+            &prefixes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            targets.git_roots,
+            [
+                fs::canonicalize(&app).unwrap(),
+                fs::canonicalize(&sibling).unwrap()
+            ]
+        );
+        assert_eq!(
+            targets.scratch_git_roots,
+            [fs::canonicalize(&throwaway).unwrap()]
+        );
+    }
+
+    #[test]
+    fn session_targets_keep_a_cwd_repository_under_a_temporary_directory() {
+        let scratch_home = tempfile::tempdir().unwrap();
+        let throwaway = scratch_home.path().join("throwaway");
+        initialize_repository(&throwaway, "throwaway");
+        let prefixes = [fs::canonicalize(scratch_home.path()).unwrap()];
+        let transcript = ClaudeTranscript {
+            cwd: throwaway.clone(),
+            edited_paths: vec![throwaway.join("notes.md")],
+            events: Vec::new(),
+        };
+
+        let targets = session_edit_targets_with_scratch_prefixes(
+            &transcript,
+            &scratch_home.path().join("profile"),
+            &prefixes,
+        )
+        .unwrap();
+
+        assert_eq!(targets.git_roots, [fs::canonicalize(&throwaway).unwrap()]);
+        assert!(targets.scratch_git_roots.is_empty());
     }
 
     #[test]
@@ -3604,6 +3746,7 @@ mod tests {
                 fs::canonicalize(&app).unwrap(),
                 fs::canonicalize(&sibling).unwrap(),
             ],
+            scratch_git_roots: Vec::new(),
             non_git_dirs: Vec::new(),
         };
         let config = HelConfig::default();
@@ -3623,6 +3766,7 @@ mod tests {
         );
         let app_only = SessionEditTargets {
             git_roots: vec![fs::canonicalize(&app).unwrap()],
+            scratch_git_roots: Vec::new(),
             non_git_dirs: Vec::new(),
         };
         assert!(resolve_bundle(&config, &app, &app_only, Some("multi")).is_err());
@@ -3688,6 +3832,7 @@ mod tests {
         let targets = SessionEditTargets {
             git_roots: vec![worktree.clone()],
             non_git_dirs: Vec::new(),
+            scratch_git_roots: Vec::new(),
         };
 
         assert_eq!(
@@ -3706,6 +3851,7 @@ mod tests {
         let targets = SessionEditTargets {
             git_roots: vec![worktree.clone(), app.clone()],
             non_git_dirs: Vec::new(),
+            scratch_git_roots: Vec::new(),
         };
 
         let BundleResolution::Synthesized { id, bundle } =
@@ -3718,6 +3864,77 @@ mod tests {
         assert_eq!(bundle.repositories.len(), 1);
         assert_eq!(bundle.repositories[0].id, "app");
         assert_eq!(bundle.repositories[0].local.as_deref(), Some(app.as_path()));
+    }
+
+    #[test]
+    fn synthesized_bundles_keep_one_repository_per_shared_origin() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        let worktree = directory.path().join("app-review");
+        initialize_repository(&app, "app");
+        initialize_repository(&worktree, "app");
+        let targets = SessionEditTargets {
+            git_roots: vec![
+                fs::canonicalize(&app).unwrap(),
+                fs::canonicalize(&worktree).unwrap(),
+            ],
+            scratch_git_roots: Vec::new(),
+            non_git_dirs: Vec::new(),
+        };
+
+        let BundleResolution::Synthesized { bundle, .. } =
+            resolve_bundle(&HelConfig::default(), &app, &targets, None).unwrap()
+        else {
+            panic!("expected synthesized bundle");
+        };
+
+        assert_eq!(bundle.repositories.len(), 1);
+        assert_eq!(bundle.primary_repo, "app");
+        assert_eq!(
+            bundle.repositories[0].github.as_deref(),
+            Some("example/app")
+        );
+    }
+
+    #[test]
+    fn synthesized_bundles_keep_separate_local_repositories() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        let tools = directory.path().join("tools");
+        for (path, id) in [(&app, "app"), (&tools, "tools")] {
+            initialize_repository(path, id);
+            let output = Command::new("git")
+                .args(["remote", "remove", "origin"])
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        }
+        let targets = SessionEditTargets {
+            git_roots: vec![
+                fs::canonicalize(&app).unwrap(),
+                fs::canonicalize(&tools).unwrap(),
+            ],
+            scratch_git_roots: Vec::new(),
+            non_git_dirs: Vec::new(),
+        };
+
+        let BundleResolution::Synthesized { bundle, .. } =
+            resolve_bundle(&HelConfig::default(), &app, &targets, None).unwrap()
+        else {
+            panic!("expected synthesized bundle");
+        };
+
+        assert_eq!(bundle.repositories.len(), 2);
+        assert_eq!(bundle.primary_repo, "app");
+        assert_eq!(
+            bundle
+                .repositories
+                .iter()
+                .map(|repository| repository.id.as_str())
+                .collect::<Vec<_>>(),
+            ["app", "tools"]
+        );
     }
 
     #[test]
@@ -3778,8 +3995,10 @@ mod tests {
         fs::write(app.join("README.md"), "dirty").unwrap();
         fs::write(app.join("untracked.txt"), "new").unwrap();
         let omitted = directory.path().join("notes");
+        let scratch = directory.path().join("scratch");
         let issues = import_safety_issues(&SessionEditTargets {
             git_roots: vec![app.clone()],
+            scratch_git_roots: vec![scratch.clone()],
             non_git_dirs: vec![omitted.clone()],
         })
         .unwrap();
@@ -3792,6 +4011,7 @@ mod tests {
         );
         assert!(issues.has_untracked_files);
         assert_eq!(issues.omitted_non_git_dirs, [omitted]);
+        assert_eq!(issues.scratch_git_roots, [scratch]);
     }
 
     #[test]
@@ -4146,6 +4366,304 @@ mod tests {
             expected_agent_time
         );
         assert!(state.sessions.contains_key(&imported.session_id));
+    }
+
+    const IMPORT_FIXTURE_SESSION: &str = "019feb6c-5ffc-7c12-ad99-bdeaeb6be79d";
+
+    fn github_bundle(ids: &[&str]) -> ProjectBundle {
+        ProjectBundle {
+            primary_repo: ids[0].to_owned(),
+            repositories: ids
+                .iter()
+                .map(|id| ProjectRepository {
+                    id: (*id).to_owned(),
+                    github: Some(format!("example/{id}")),
+                    local: None,
+                    destination: PathBuf::from(id),
+                    git_ref: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn codex_import_source(
+        codex_home: &Path,
+        cwd: &Path,
+        edited_paths: &[PathBuf],
+    ) -> LocatedCodexSession {
+        let rollout = codex_home
+            .join("sessions/2026/08/14")
+            .join(format!("rollout-{IMPORT_FIXTURE_SESSION}.jsonl"));
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        let mut records = vec![
+            json!({
+                "timestamp": "2026-08-14T12:00:00.000Z",
+                "type": "session_meta",
+                "payload": {"id": IMPORT_FIXTURE_SESSION, "cwd": cwd, "history_mode": "paginated"}
+            }),
+            json!({
+                "timestamp": "2026-08-14T12:00:01.250Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"type": "text", "text": "import this"}]
+                    }
+                }
+            }),
+        ];
+        for path in edited_paths {
+            let mut changes = serde_json::Map::new();
+            changes.insert(path.to_string_lossy().into_owned(), json!({"type": "add"}));
+            records.push(json!({
+                "timestamp": "2026-08-14T12:00:02.500Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "FileChange",
+                        "status": "completed",
+                        "changes": Value::Object(changes)
+                    }
+                }
+            }));
+        }
+        fs::write(
+            &rollout,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let metadata = fs::metadata(&rollout).unwrap();
+        LocatedCodexSession {
+            native_session_id: IMPORT_FIXTURE_SESSION.into(),
+            jsonl_path: rollout,
+            modified_at: metadata.modified().unwrap(),
+            title: "Imported Codex session".into(),
+            cwd: cwd.to_path_buf(),
+            git_branch: "main".into(),
+            size_bytes: metadata.len(),
+            history_mode: CodexHistoryMode::Paginated,
+        }
+    }
+
+    fn import_codex_fixture(
+        config: &HelConfig,
+        state: &mut HelState,
+        source: &LocatedCodexSession,
+        bundle_id: &str,
+        codex_home: &Path,
+        archive_directory: &Path,
+    ) -> ImportedCodexSession {
+        fs::create_dir_all(archive_directory).unwrap();
+        let transcript = read_codex_transcript(&source.jsonl_path).unwrap();
+        import_codex_session(
+            config,
+            state,
+            CodexImportRequest {
+                codex_home,
+                source,
+                transcript: &transcript,
+                bundle_id,
+                profile_id: None,
+                title: None,
+                archive_directory,
+            },
+        )
+        .unwrap()
+    }
+
+    fn import_test_targets(local_bare: bool) -> BTreeMap<String, TargetTemplate> {
+        let mut targets = BTreeMap::from([(
+            "podman".to_owned(),
+            TargetTemplate::LocalPodman {
+                container: container_template(),
+            },
+        )]);
+        if local_bare {
+            targets.insert("raw-localhost".to_owned(), TargetTemplate::LocalBare);
+        }
+        targets
+    }
+
+    /// Durable fixtures must sit outside every temporary directory, because
+    /// import now treats repositories under those as scratch.
+    fn durable_fixture_directory() -> tempfile::TempDir {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/import-fixtures");
+        fs::create_dir_all(&base).unwrap();
+        tempfile::Builder::new()
+            .prefix("durable")
+            .tempdir_in(base)
+            .unwrap()
+    }
+
+    #[test]
+    fn single_repository_import_becomes_a_raw_project_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        initialize_repository(&app, "app");
+        let codex_home = directory.path().join("codex");
+        let source = codex_import_source(&codex_home, &app, &[]);
+        let config = HelConfig {
+            bundles: BTreeMap::from([("app".to_owned(), github_bundle(&["app"]))]),
+            targets: import_test_targets(true),
+            ..HelConfig::default()
+        };
+        let mut state = HelState::default();
+
+        let imported = import_codex_fixture(
+            &config,
+            &mut state,
+            &source,
+            "app",
+            &codex_home,
+            &directory.path().join("archives"),
+        );
+
+        let record = &state.sessions[&imported.session_id];
+        assert_eq!(
+            record.project_directory,
+            Some(fs::canonicalize(&app).unwrap())
+        );
+        assert_eq!(record.target_template_id, "raw-localhost");
+        assert_eq!(record.bundle_id, "app");
+    }
+
+    #[test]
+    fn single_repository_import_without_a_local_bare_target_stays_a_bundle_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        initialize_repository(&app, "app");
+        let codex_home = directory.path().join("codex");
+        let source = codex_import_source(&codex_home, &app, &[]);
+        let config = HelConfig {
+            bundles: BTreeMap::from([("app".to_owned(), github_bundle(&["app"]))]),
+            targets: import_test_targets(false),
+            ..HelConfig::default()
+        };
+        let mut state = HelState::default();
+
+        let imported = import_codex_fixture(
+            &config,
+            &mut state,
+            &source,
+            "app",
+            &codex_home,
+            &directory.path().join("archives"),
+        );
+
+        let record = &state.sessions[&imported.session_id];
+        assert_eq!(record.project_directory, None);
+        assert_eq!(record.target_template_id, "podman");
+    }
+
+    #[test]
+    fn import_of_a_session_with_a_second_repository_stays_a_bundle_session() {
+        let directory = durable_fixture_directory();
+        let app = directory.path().join("app");
+        let tools = directory.path().join("tools");
+        initialize_repository(&app, "app");
+        initialize_repository(&tools, "tools");
+        let codex_home = directory.path().join("codex");
+        let source = codex_import_source(&codex_home, &app, &[tools.join("script.sh")]);
+        let config = HelConfig {
+            bundles: BTreeMap::from([("app".to_owned(), github_bundle(&["app", "tools"]))]),
+            targets: import_test_targets(true),
+            ..HelConfig::default()
+        };
+        let mut state = HelState::default();
+
+        let imported = import_codex_fixture(
+            &config,
+            &mut state,
+            &source,
+            "app",
+            &codex_home,
+            &directory.path().join("archives"),
+        );
+
+        let record = &state.sessions[&imported.session_id];
+        assert_eq!(record.project_directory, None);
+        assert_eq!(record.target_template_id, "podman");
+    }
+
+    #[test]
+    fn single_repository_claude_import_becomes_a_raw_project_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        initialize_repository(&app, "app");
+        let claude_home = directory.path().join("claude");
+        let transcript_path = claude_home
+            .join("projects/-work-app")
+            .join(format!("{IMPORT_FIXTURE_SESSION}.jsonl"));
+        fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript_path,
+            [
+                json!({
+                    "timestamp": "2026-08-14T12:00:00.000Z",
+                    "type": "user",
+                    "cwd": app,
+                    "message": {"content": "import this"}
+                }),
+                json!({
+                    "timestamp": "2026-08-14T12:00:01.000Z",
+                    "type": "assistant",
+                    "message": {
+                        "content": [{"type": "text", "text": "imported"}],
+                        "stop_reason": "end_turn"
+                    }
+                }),
+            ]
+            .map(|record| record.to_string())
+            .join("\n"),
+        )
+        .unwrap();
+        let transcript = read_claude_transcript(&transcript_path).unwrap();
+        let metadata = fs::metadata(&transcript_path).unwrap();
+        let source = LocatedClaudeSession {
+            native_session_id: IMPORT_FIXTURE_SESSION.into(),
+            jsonl_path: transcript_path.clone(),
+            modified_at: metadata.modified().unwrap(),
+            title: "Imported Claude session".into(),
+            cwd: app.clone(),
+            git_branch: "main".into(),
+            size_bytes: metadata.len(),
+        };
+        let config = HelConfig {
+            bundles: BTreeMap::from([("app".to_owned(), github_bundle(&["app"]))]),
+            targets: import_test_targets(true),
+            ..HelConfig::default()
+        };
+        let archive_directory = directory.path().join("archives");
+        fs::create_dir_all(&archive_directory).unwrap();
+        let mut state = HelState::default();
+
+        let imported = import_claude_session(
+            &config,
+            &mut state,
+            ClaudeImportRequest {
+                claude_home: &claude_home,
+                source: &source,
+                transcript: &transcript,
+                bundle_id: "app",
+                profile_id: None,
+                title: None,
+                archive_directory: &archive_directory,
+            },
+        )
+        .unwrap();
+
+        let record = &state.sessions[&imported.session_id];
+        assert_eq!(
+            record.project_directory,
+            Some(fs::canonicalize(&app).unwrap())
+        );
+        assert_eq!(record.target_template_id, "raw-localhost");
     }
 
     #[test]

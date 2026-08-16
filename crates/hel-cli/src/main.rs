@@ -210,7 +210,7 @@ struct CodexImportArgs {
     /// Proceed after acknowledging dirty detected Git roots.
     #[arg(long = "allow-dirty", visible_alias = "allow-dirty-local")]
     allow_dirty_local: bool,
-    /// Proceed after acknowledging edited non-Git directories will be omitted.
+    /// Proceed after acknowledging edited non-Git or scratch directories will be omitted.
     #[arg(long)]
     allow_omitted_non_git: bool,
 }
@@ -237,7 +237,7 @@ struct KimiImportArgs {
     /// Proceed after acknowledging dirty detected Git roots.
     #[arg(long = "allow-dirty", visible_alias = "allow-dirty-local")]
     allow_dirty_local: bool,
-    /// Proceed after acknowledging edited non-Git directories will be omitted.
+    /// Proceed after acknowledging edited non-Git or scratch directories will be omitted.
     #[arg(long)]
     allow_omitted_non_git: bool,
 }
@@ -291,7 +291,7 @@ struct ClaudeImportArgs {
     /// Proceed after acknowledging dirty detected Git roots.
     #[arg(long = "allow-dirty", visible_alias = "allow-dirty-local")]
     allow_dirty_local: bool,
-    /// Proceed after acknowledging edited non-Git directories will be omitted.
+    /// Proceed after acknowledging edited non-Git or scratch directories will be omitted.
     #[arg(long)]
     allow_omitted_non_git: bool,
 }
@@ -1095,7 +1095,8 @@ fn confirm_import_safety(
     let issues = import_safety_issues(targets)?;
     let needs_dirty = !issues.dirty_git_roots.is_empty() && !allow_dirty;
     let needs_omitted = !issues.omitted_non_git_dirs.is_empty() && !allow_omitted_non_git;
-    if !needs_dirty && !needs_omitted {
+    let needs_scratch = !issues.scratch_git_roots.is_empty() && !allow_omitted_non_git;
+    if !needs_dirty && !needs_omitted && !needs_scratch {
         return Ok(true);
     }
     if needs_dirty {
@@ -1110,8 +1111,16 @@ fn confirm_import_safety(
             eprintln!("  {}", directory.display());
         }
     }
+    if needs_scratch {
+        eprintln!(
+            "The session wrote to scratch repositories under temporary directories; they will not be part of the session's workspace on resume:"
+        );
+        for root in &issues.scratch_git_roots {
+            eprintln!("  {}", root.display());
+        }
+    }
     if !io::stdin().is_terminal() {
-        let flags = match (needs_dirty, needs_omitted) {
+        let flags = match (needs_dirty, needs_omitted || needs_scratch) {
             (true, true) => "--allow-dirty and --allow-omitted-non-git",
             (true, false) => "--allow-dirty",
             (false, true) => "--allow-omitted-non-git",
@@ -2991,6 +3000,7 @@ struct DashboardImportSafety {
 struct ImportBundlePrompt {
     dirty_git_roots: Vec<String>,
     omitted_non_git_dirs: Vec<String>,
+    scratch_git_roots: Vec<String>,
     has_untracked_files: bool,
 }
 
@@ -4016,6 +4026,7 @@ async fn run_dashboard() -> Result<()> {
                             dashboard.show_import_bundle_confirmation(
                                 prompt.dirty_git_roots,
                                 prompt.omitted_non_git_dirs,
+                                prompt.scratch_git_roots,
                                 prompt.has_untracked_files,
                             );
                         }
@@ -5185,7 +5196,9 @@ fn resolve_background_import_bundle(
     };
     let issues = import_safety_issues(&targets)?;
     if !safety_accepted
-        && (!issues.dirty_git_roots.is_empty() || !issues.omitted_non_git_dirs.is_empty())
+        && (!issues.dirty_git_roots.is_empty()
+            || !issues.omitted_non_git_dirs.is_empty()
+            || !issues.scratch_git_roots.is_empty())
     {
         return Ok(BackgroundBundleResolution::NeedsConfirmation(
             ImportBundlePrompt {
@@ -5196,6 +5209,11 @@ fn resolve_background_import_bundle(
                     .collect(),
                 omitted_non_git_dirs: issues
                     .omitted_non_git_dirs
+                    .into_iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+                scratch_git_roots: issues
+                    .scratch_git_roots
                     .into_iter()
                     .map(|path| path.display().to_string())
                     .collect(),

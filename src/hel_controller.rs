@@ -2043,6 +2043,13 @@ impl Controller {
             }
             self.validate_project_directory(target_id, project_directory, executor)
                 .context("raw project is unavailable for resume")?;
+        } else if matches!(target_template, TargetTemplate::LocalBare) {
+            // A local bare target has no managed workspace to restore a bundle
+            // into. Fail here, before the record changes, instead of failing
+            // during provisioning and rolling back.
+            bail!(
+                "this session was created from a project bundle; a local bare target only hosts raw project sessions — resume it on a container, SSH, or EC2 target"
+            );
         }
         let resource_allocation =
             resource_allocation.or_else(|| previous.resource_allocation.clone());
@@ -8871,6 +8878,73 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    #[test]
+    fn bundle_sessions_refuse_a_local_bare_resume_before_the_record_changes() {
+        struct UnusedExecutor;
+
+        impl CommandExecutor for UnusedExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                panic!("resume ran {} before rejecting the target", command.program);
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let checkpoint = write_checkpoint_gate_archive(directory.path(), session_id, 3);
+        let mut session = checkpoint_test_session(session_id);
+        session.state = SessionState::Archived;
+        session.checkpoint = Some(checkpoint);
+        let previous = session.clone();
+        let profile_home = directory.path().join("profile");
+        std::fs::create_dir_all(&profile_home).unwrap();
+        let mut config = HelConfig::default();
+        config.profiles.insert(
+            "codex".into(),
+            HarnessProfile {
+                kind: crate::hel_config::HarnessKind::Codex,
+                home: profile_home,
+                executable: None,
+                environment: BTreeMap::new(),
+                context_window_bytes: None,
+            },
+        );
+        config
+            .targets
+            .insert("raw-localhost".into(), TargetTemplate::LocalBare);
+        let mut controller = Controller {
+            config,
+            state: HelState {
+                sessions: BTreeMap::from([(session_id.into(), session)]),
+                ..HelState::default()
+            },
+        };
+
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(controller.resume_session_controlled(
+                session_id,
+                "codex",
+                "raw-localhost",
+                SessionResumeOptions {
+                    additional_mounts: None,
+                    resource_allocation: None,
+                    discard_queue: false,
+                },
+                &UnusedExecutor,
+            ))
+            .unwrap_err();
+
+        let detail = format!("{error:#}");
+        assert!(detail.contains("created from a project bundle"), "{detail}");
+        assert!(
+            detail.contains("resume it on a container, SSH, or EC2 target"),
+            "{detail}"
+        );
+        assert_eq!(controller.state.sessions[session_id], previous);
     }
 
     #[test]
