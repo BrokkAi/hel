@@ -3208,6 +3208,7 @@ async fn open_chat_view(
     session_id: &str,
     sessions: &SessionManagerControl,
     recovery_observer: &hel::hel_recovery::RecoveryObserver,
+    notices: hel::hel_chat::Notices,
 ) -> Result<hel::hel_chat::ActiveChat> {
     let session_record = controller
         .state
@@ -3256,6 +3257,7 @@ async fn open_chat_view(
         sessions.clone(),
         header,
         saved_draft,
+        notices,
     ))
 }
 
@@ -3325,6 +3327,10 @@ async fn run_dashboard() -> Result<()> {
         controller.state.clone(),
         std::collections::BTreeMap::new(),
     );
+    // One notifications bar for the whole process: the dashboard and every
+    // chat view opened below report through the same shared handle.
+    let notices = hel::hel_chat::Notices::default();
+    dashboard.share_notices(notices.clone());
     for (session_id, queued) in projected_queued_prompts(&controller)? {
         dashboard.apply_queued_prompts(&session_id, queued);
     }
@@ -4403,6 +4409,7 @@ async fn run_dashboard() -> Result<()> {
                         &session_id,
                         &worker_commands_tx,
                         &recovery_observer,
+                        notices.clone(),
                     )
                     .await
                     {

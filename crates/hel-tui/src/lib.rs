@@ -18,7 +18,9 @@ use ratatui::widgets::{
 };
 use sha2::{Digest, Sha256};
 
-use hel::hel_chat::{TranscriptSnapshot, materialized_content_text, render_agent_message_tail};
+use hel::hel_chat::{
+    Notices, TranscriptSnapshot, materialized_content_text, render_agent_message_tail,
+};
 use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate};
 use hel::hel_quota::{ProfileQuota, QuotaWindow};
 use hel::hel_state::{
@@ -885,7 +887,7 @@ pub struct DashboardState {
     preview_scroll: usize,
     preview_scroll_session: Option<String>,
     mode: Mode,
-    notice: Option<String>,
+    notices: Notices,
     greeting: String,
 }
 
@@ -911,7 +913,7 @@ impl DashboardState {
             preview_scroll: 0,
             preview_scroll_session: None,
             mode: Mode::Dashboard,
-            notice: None,
+            notices: Notices::default(),
             greeting: "Welcome to Hel".into(),
         };
         dashboard.session_details = dashboard
@@ -1214,20 +1216,27 @@ impl DashboardState {
         self.checkpoint_archive_sizes = sizes;
     }
 
+    /// Installs the process-wide notifications bar, so every view reports
+    /// through one shared slot.
+    pub fn share_notices(&mut self, notices: Notices) {
+        self.notices = notices;
+    }
+
     pub fn set_notice(&mut self, notice: impl Into<String>) {
-        self.notice = Some(notice.into());
+        self.notices.set(notice);
     }
 
     pub fn replace_notice_if(&mut self, expected: &str, replacement: impl Into<String>) -> bool {
-        if self.notice.as_deref() != Some(expected) {
-            return false;
-        }
-        self.notice = Some(replacement.into());
-        true
+        self.notices.replace_if(expected, replacement)
     }
 
     pub fn clear_notice(&mut self) {
-        self.notice = None;
+        self.notices.clear();
+    }
+
+    /// The current shared notice, if any.
+    pub fn notice(&self) -> Option<String> {
+        self.notices.current()
     }
 
     /// Show the recovery choices after a checkpointed close could not finish.
@@ -1375,7 +1384,7 @@ impl DashboardState {
         if is_paste_shortcut(key) {
             match hel::hel_clipboard::read_text() {
                 Ok(text) => self.handle_paste(&text),
-                Err(error) => self.notice = Some(format!("Paste failed: {error:#}")),
+                Err(error) => self.notices.set(format!("Paste failed: {error:#}")),
             }
             return DashboardAction::None;
         }
@@ -1385,7 +1394,7 @@ impl DashboardState {
             return DashboardAction::QuitDetach;
         }
 
-        self.notice = None;
+        self.notices.clear();
         match self.mode.clone() {
             Mode::Dashboard => self.handle_dashboard_key(key),
             Mode::New(wizard) => self.handle_new_key(key.code, wizard),
@@ -1807,7 +1816,7 @@ impl DashboardState {
                 .map(|operation| operation.kind)
         });
         if let Some(operation) = operation {
-            self.notice = Some(format!(
+            self.notices.set(format!(
                 "{} is in progress; press Ctrl+X to cancel it.",
                 operation.label()
             ));
@@ -1844,7 +1853,7 @@ impl DashboardState {
                 DashboardAction::None
             }
             KeyCode::Enter if editor.title.trim().is_empty() => {
-                self.notice = Some("Session name cannot be empty.".into());
+                self.notices.set("Session name cannot be empty.");
                 self.mode = Mode::Rename(editor);
                 DashboardAction::None
             }
@@ -2010,7 +2019,7 @@ impl DashboardState {
                     DashboardAction::None
                 }
                 KeyCode::Enter if wizard.new_bundle_source.trim().is_empty() => {
-                    self.notice = Some("Repository source cannot be empty.".into());
+                    self.notices.set("Repository source cannot be empty.");
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
@@ -2135,7 +2144,7 @@ impl DashboardState {
                 if matches!(target, TargetTemplate::AwsEc2 { .. })
                     && wizard.resource_allocation.is_none()
                 {
-                    self.notice = Some(
+                    self.notices.set(
                         wizard
                             .sizing_error
                             .clone()
@@ -2478,7 +2487,8 @@ impl DashboardState {
             .iter()
             .position(|id| *id == bundle_id)
         else {
-            self.notice = Some(format!("Created bundle {bundle_id:?} was not found."));
+            self.notices
+                .set(format!("Created bundle {bundle_id:?} was not found."));
             return DashboardAction::None;
         };
         wizard.bundle = index;
@@ -2856,7 +2866,7 @@ impl DashboardState {
                     TargetTemplate::AwsEc2 { .. }
                 ) && wizard.resource_allocation.is_none()
                 {
-                    self.notice = Some(
+                    self.notices.set(
                         wizard
                             .sizing_error
                             .clone()
@@ -3374,7 +3384,8 @@ impl DashboardState {
 
     fn begin_new(&mut self) -> DashboardAction {
         if self.config.profiles.is_empty() || self.config.targets.is_empty() {
-            self.notice = Some("Configure at least one profile and target first.".into());
+            self.notices
+                .set("Configure at least one profile and target first.");
             return DashboardAction::None;
         }
         let recent = most_recent_configured_session(&self.config, &self.state);
@@ -3426,15 +3437,18 @@ impl DashboardState {
             return DashboardAction::None;
         };
         if session.state.is_active() && session.state != SessionState::Error {
-            self.notice = Some("This session is active; press Enter to open it.".into());
+            self.notices
+                .set("This session is active; press Enter to open it.");
             return DashboardAction::None;
         }
         if session.checkpoint.is_none() {
-            self.notice = Some("This session has no verified recovery copy to resume.".into());
+            self.notices
+                .set("This session has no verified recovery copy to resume.");
             return DashboardAction::None;
         }
         if self.compatible_profiles(&session.id).is_empty() || self.config.targets.is_empty() {
-            self.notice = Some("Resume needs a profile and a target template.".into());
+            self.notices
+                .set("Resume needs a profile and a target template.");
             return DashboardAction::None;
         }
         let profile = self
@@ -3487,7 +3501,7 @@ impl DashboardState {
             return DashboardAction::None;
         };
         if let Some(operation) = self.session_operations.get(&session.id) {
-            self.notice = Some(format!(
+            self.notices.set(format!(
                 "{} is in progress; press Ctrl+X to cancel it.",
                 operation.kind.label()
             ));
@@ -3497,7 +3511,7 @@ impl DashboardState {
             if session.checkpoint.is_some() {
                 return self.begin_resume();
             } else {
-                self.notice = Some(
+                self.notices.set(
                     session
                         .last_error
                         .clone()
@@ -5440,7 +5454,7 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
                 Style::default().fg(Color::DarkGray),
             ),
             Line::styled(
-                dashboard.notice.as_deref().unwrap_or_default(),
+                dashboard.notices.current().unwrap_or_default(),
                 Style::default().fg(Color::Yellow),
             ),
         ]),
@@ -6976,7 +6990,7 @@ mod tests {
             dashboard.replace_notice_if("Refreshing profile quotas…", "Profile quotas refreshed.")
         );
         assert_eq!(
-            dashboard.notice.as_deref(),
+            dashboard.notice().as_deref(),
             Some("Profile quotas refreshed.")
         );
 
@@ -6985,8 +6999,33 @@ mod tests {
             !dashboard.replace_notice_if("Refreshing profile quotas…", "Profile quotas refreshed.")
         );
         assert_eq!(
-            dashboard.notice.as_deref(),
+            dashboard.notice().as_deref(),
             Some("A later operation failed")
+        );
+    }
+
+    /// The dashboard and every other view (chat, background workers) share
+    /// one notifications bar: a clone installed with `share_notices` sees
+    /// what the dashboard sets, and the dashboard sees what the clone sets.
+    #[test]
+    fn a_shared_notice_is_visible_through_every_clone_of_the_handle() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        let shared = Notices::default();
+        dashboard.share_notices(shared.clone());
+
+        dashboard.set_notice("Background import finished");
+        assert_eq!(
+            shared.current().as_deref(),
+            Some("Background import finished")
+        );
+
+        shared.clear();
+        assert_eq!(dashboard.notice(), None);
+
+        shared.set("Quota refresh finished");
+        assert_eq!(
+            dashboard.notice().as_deref(),
+            Some("Quota refresh finished")
         );
     }
 
@@ -8768,7 +8807,7 @@ mod tests {
                 "{focus_moves} focus moves"
             );
             assert_eq!(
-                dashboard.notice.as_deref(),
+                dashboard.notice().as_deref(),
                 Some("Session name cannot be empty."),
                 "{focus_moves} focus moves"
             );
@@ -9410,7 +9449,7 @@ mod tests {
             DashboardAction::None
         );
         assert_eq!(
-            dashboard.notice.as_deref(),
+            dashboard.notice().as_deref(),
             Some("worker bootstrap failed: upload failed")
         );
     }

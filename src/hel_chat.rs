@@ -986,7 +986,7 @@ pub struct ChatState {
     last_viewport_height: usize,
     render_mode: TranscriptRenderMode,
     render_cache: TranscriptRenderCache,
-    notice: Option<String>,
+    notices: Notices,
     voice_active: bool,
     /// Project name and header position of this session, snapshotted when the
     /// chat opened.
@@ -1042,7 +1042,7 @@ impl ChatState {
             last_viewport_height: 0,
             render_mode: TranscriptRenderMode::Rich,
             render_cache: TranscriptRenderCache::default(),
-            notice: None,
+            notices: Notices::default(),
             voice_active: false,
             project: String::new(),
             position: 0,
@@ -1209,7 +1209,7 @@ impl ChatState {
     fn mark_prompt_submitted(&mut self, prompt: &str) {
         self.phase = WorkerPhase::Running;
         self.goal_prompt_active = is_goal_prompt(prompt);
-        self.notice = None;
+        self.notices.clear();
         // Local echo: start the clock now so the header moves with the send.
         // The next materialized update replaces this with the recorded start.
         self.turn_started_at_epoch_seconds = Some(now_epoch_seconds());
@@ -1444,7 +1444,12 @@ impl ChatState {
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
-        self.notice = Some(sanitize_terminal_text(&notice.into()));
+        self.notices.set(notice);
+    }
+
+    /// The current shared notice, if any.
+    pub fn notice(&self) -> Option<String> {
+        self.notices.current()
     }
 
     pub fn apply_events(&mut self, events: &[SequencedEvent]) {
@@ -1468,7 +1473,7 @@ impl ChatState {
         self.anchor = TranscriptAnchor::Bottom;
         self.last_viewport_height = 0;
         self.render_mode = TranscriptRenderMode::Rich;
-        self.notice = None;
+        self.notices.clear();
         self.voice_active = false;
     }
 
@@ -1806,7 +1811,7 @@ impl ChatState {
                 self.input = original.0;
                 self.input_cursor = original.1;
                 self.history_search = None;
-                self.notice = Some(format!("History unavailable: {error}"));
+                self.notices.set(format!("History unavailable: {error}"));
                 self.update_autocomplete();
             }
         }
@@ -2033,7 +2038,7 @@ impl ChatState {
             .as_ref()
             .and(self.project_history_error.as_ref())
         {
-            self.notice = Some(format!("History unavailable: {error}"));
+            self.notices.set(format!("History unavailable: {error}"));
         }
         if history.is_empty() {
             return;
@@ -2243,13 +2248,10 @@ impl ChatState {
                 }
                 KeyCode::Char('t') => {
                     self.render_mode = self.render_mode.toggled();
-                    self.notice = Some(
-                        match self.render_mode {
-                            TranscriptRenderMode::Rich => "Rich transcript rendering enabled",
-                            TranscriptRenderMode::Raw => "Raw transcript source enabled",
-                        }
-                        .into(),
-                    );
+                    self.notices.set(match self.render_mode {
+                        TranscriptRenderMode::Rich => "Rich transcript rendering enabled",
+                        TranscriptRenderMode::Raw => "Raw transcript source enabled",
+                    });
                     return ChatAction::None;
                 }
                 KeyCode::Char('a') => self.move_to_line_start(true),
@@ -3658,6 +3660,45 @@ fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) {
     }
 }
 
+/// The one-line notifications bar shared by every view. Cloning shares the
+/// same underlying slot; the latest notice wins and a clear in one view
+/// clears it for all.
+#[derive(Debug, Clone, Default)]
+pub struct Notices(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+
+impl Notices {
+    /// Sets the notice, replacing whatever is showing. Sanitizes the text so
+    /// escape sequences or stray carriage returns from background work
+    /// cannot corrupt the footer row.
+    pub fn set(&self, notice: impl Into<String>) {
+        let sanitized = sanitize_terminal_text(&notice.into());
+        *self.0.lock().expect("notices lock poisoned") = Some(sanitized);
+    }
+
+    /// Replaces the notice only if it still reads `expected`, so a
+    /// background task can upgrade its own "in progress" notice to a result
+    /// without clobbering whatever replaced it in the meantime. Returns
+    /// whether the replacement happened.
+    pub fn replace_if(&self, expected: &str, replacement: impl Into<String>) -> bool {
+        let mut current = self.0.lock().expect("notices lock poisoned");
+        if current.as_deref() != Some(expected) {
+            return false;
+        }
+        *current = Some(sanitize_terminal_text(&replacement.into()));
+        true
+    }
+
+    /// Clears the notice everywhere it is shown.
+    pub fn clear(&self) {
+        *self.0.lock().expect("notices lock poisoned") = None;
+    }
+
+    /// The current notice, if any.
+    pub fn current(&self) -> Option<String> {
+        self.0.lock().expect("notices lock poisoned").clone()
+    }
+}
+
 /// Color of an active session's line. The terminal palette's plain yellow
 /// (amber or orange in common palettes) marks a session whose turn is still
 /// running; a session with no turn in flight is waiting on the user and
@@ -3955,6 +3996,10 @@ impl ActiveChat {
     /// `draft` is the unsent input saved when this session was last detached.
     /// Only a fresh view takes it: a warm chat the dashboard kept alive already
     /// holds newer input than the database copy.
+    ///
+    /// `notices` is the process-wide notifications bar; it is installed on the
+    /// new state before any notice is raised below, so recovery and connection
+    /// notices land in the same shared slot the dashboard reads.
     pub fn open(
         session: ManagedSessionHandle,
         bundle_id: &str,
@@ -3962,6 +4007,7 @@ impl ActiveChat {
         control: SessionManagerControl,
         header: SessionHeaderIdentity,
         draft: String,
+        notices: Notices,
     ) -> Self {
         let view = session.view();
         let needs_initial_sync = view.snapshot.is_none();
@@ -3984,6 +4030,7 @@ impl ActiveChat {
         state.set_history_context(bundle_id);
         state.set_header_identity(header.project, header.position);
         state.restore_draft(draft);
+        state.notices = notices;
         let (chat_io_tx, chat_io_rx) = tokio::sync::mpsc::unbounded_channel::<ChatIoUpdate>();
         {
             let updates = chat_io_tx.clone();
@@ -4134,7 +4181,7 @@ impl ActiveChat {
                     Ok(text) => {
                         self.state
                             .set_input(append_dictation(&self.voice_prefix, &text));
-                        self.state.notice = None;
+                        self.state.notices.clear();
                     }
                     Err(error) => self
                         .state
@@ -4422,12 +4469,20 @@ fn render(frame: &mut Frame, chat: &mut ChatState) {
         "Enter send/queue · Shift-Enter newline · Ctrl-R history · Ctrl-T transcript · Esc cancel · Ctrl-G dashboard"
     };
     let search_footer = chat.history_search.as_ref().map(history_search_footer);
+    let notice = chat.notices.current();
     let footer = search_footer
         .as_deref()
-        .or(chat.notice.as_deref())
+        .or(notice.as_deref())
         .unwrap_or(default_footer);
+    // The shared notice bar is yellow wherever it shows; a search prompt or
+    // the default hotkey hints stay the quieter dark gray.
+    let footer_color = if search_footer.is_none() && notice.is_some() {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
     frame.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(footer).style(Style::default().fg(footer_color)),
         footer_area,
     );
     if let Some(search) = chat.history_search.as_ref()
@@ -5348,7 +5403,7 @@ mod tests {
         chat.prompt_history.push("previous".into());
         chat.queued_prompts.push_back(queued("queued-1", "queued"));
         chat.anchor = TranscriptAnchor::Row { entry: 0, row: 4 };
-        chat.notice = Some("temporary".into());
+        chat.set_notice("temporary");
         chat.voice_active = true;
 
         chat.reset_interaction();
@@ -5360,7 +5415,7 @@ mod tests {
         assert!(chat.prompt_history.is_empty());
         assert!(chat.queued_prompts.is_empty());
         assert_eq!(chat.anchor, TranscriptAnchor::Bottom);
-        assert!(chat.notice.is_none());
+        assert!(chat.notice().is_none());
         assert!(!chat.voice_active);
     }
 
@@ -5428,7 +5483,7 @@ mod tests {
 
         assert!(!open);
         assert_eq!(
-            chat.notice.as_deref(),
+            chat.notice().as_deref(),
             Some("connection lost: session manager stopped")
         );
     }
@@ -5569,7 +5624,72 @@ mod tests {
         chat.mark_prompt_submitted("hello");
 
         assert_eq!(chat.phase, WorkerPhase::Running);
-        assert!(chat.notice.is_none());
+        assert!(chat.notice().is_none());
+    }
+
+    #[test]
+    fn notices_set_replace_if_and_clear() {
+        let notices = Notices::default();
+        assert_eq!(notices.current(), None);
+
+        notices.set("first notice");
+        assert_eq!(notices.current().as_deref(), Some("first notice"));
+
+        assert!(!notices.replace_if("wrong expectation", "replaced"));
+        assert_eq!(notices.current().as_deref(), Some("first notice"));
+
+        assert!(notices.replace_if("first notice", "second notice"));
+        assert_eq!(notices.current().as_deref(), Some("second notice"));
+
+        notices.clear();
+        assert_eq!(notices.current(), None);
+    }
+
+    #[test]
+    fn cloned_notices_share_one_slot() {
+        let notices = Notices::default();
+        let clone = notices.clone();
+
+        notices.set("set through the original");
+        assert_eq!(clone.current().as_deref(), Some("set through the original"));
+
+        clone.clear();
+        assert_eq!(notices.current(), None);
+    }
+
+    #[test]
+    fn a_notice_set_through_a_shared_handle_shows_in_the_chat_footer_in_yellow() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        let shared = Notices::default();
+        chat.notices = shared.clone();
+        // Wide enough that the default hint line (over 100 columns) is not
+        // truncated, so the footer text comparisons below are meaningful.
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+
+        // Set from "outside", the way the dashboard's clone of the same handle
+        // would.
+        shared.set("Background import finished");
+        terminal
+            .draw(|frame| render(frame, &mut chat))
+            .expect("draw chat");
+        let buffer = terminal.backend().buffer();
+        let footer_row = buffer.area.bottom() - 1;
+        let footer_text = (buffer.area.x..buffer.area.right())
+            .map(|x| buffer[(x, footer_row)].symbol())
+            .collect::<String>();
+        assert!(footer_text.contains("Background import finished"));
+        assert_eq!(buffer[(buffer.area.x, footer_row)].fg, Color::Yellow);
+
+        shared.clear();
+        terminal
+            .draw(|frame| render(frame, &mut chat))
+            .expect("draw chat");
+        let buffer = terminal.backend().buffer();
+        let footer_text = (buffer.area.x..buffer.area.right())
+            .map(|x| buffer[(x, footer_row)].symbol())
+            .collect::<String>();
+        assert!(footer_text.contains("Ctrl-G dashboard"));
+        assert_eq!(buffer[(buffer.area.x, footer_row)].fg, Color::DarkGray);
     }
 
     #[test]
@@ -6054,7 +6174,7 @@ mod tests {
         chat.input = "/model".into();
 
         assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
-        assert_eq!(chat.notice.as_deref(), Some("usage: /model <value>"));
+        assert_eq!(chat.notice().as_deref(), Some("usage: /model <value>"));
     }
 
     #[test]
@@ -7559,7 +7679,7 @@ mod tests {
 
         assert_eq!(chat.input, "unsent prompt\n\nnew draft");
         assert!(
-            chat.notice
+            chat.notice()
                 .as_deref()
                 .is_some_and(|notice| notice.contains("queue is full"))
         );
