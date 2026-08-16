@@ -36,6 +36,12 @@ pub const RELAY_COMMAND_BYTE_BUDGET: usize = 1024 * 1024;
 pub const RELAY_EVENT_BYTE_BUDGET: usize = 2 * 1024 * 1024;
 /// The public operational state shares an attach frame with a replay page.
 pub const RELAY_STATE_BYTE_BUDGET: usize = 2 * 1024 * 1024;
+/// Headroom left for an event's envelope — ordinals, digests, timestamp and
+/// command id — when clamping an observation to `RELAY_EVENT_BYTE_BUDGET`.
+const RELAY_EVENT_ENVELOPE_RESERVE: usize = 8 * 1024;
+/// Clamping never shortens a string below this. Identifiers, type tags and
+/// paths stay whole; only genuinely large payloads are candidates.
+const RELAY_TRUNCATION_FLOOR: usize = 4 * 1024;
 /// The private snapshot also has a hard ceiling so repeated accepted commands
 /// cannot grow the durable state file without bound between checkpoints.
 const RELAY_SNAPSHOT_BYTE_BUDGET: usize = 16 * 1024 * 1024;
@@ -1742,6 +1748,13 @@ impl DurableRelay {
             .latest_ordinal
             .checked_add(1)
             .ok_or_else(|| anyhow!("relay event ordinal exhausted"))?;
+        // Clamp before digesting so the recorded digest covers what was
+        // actually written, and so recording an observation cannot fail on
+        // size alone.
+        let observation = clamp_observation(
+            observation,
+            RELAY_EVENT_BYTE_BUDGET - RELAY_EVENT_ENVELOPE_RESERVE,
+        )?;
         let event = RelayEvent {
             ordinal,
             previous_digest: self.snapshot.latest_digest.clone(),
@@ -2070,6 +2083,136 @@ fn ensure_byte_budget(size: usize, budget: usize, description: &str) -> Result<(
         bail!("{description} is too large ({size} bytes; maximum {budget})");
     }
     Ok(())
+}
+
+/// One step in a JSON document, used to revisit a located string mutably.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JsonSegment {
+    Key(String),
+    Index(usize),
+}
+
+/// Locate the longest string in a JSON document, with the path to reach it.
+fn longest_string_path(value: &Value) -> Option<(Vec<JsonSegment>, usize)> {
+    fn walk(
+        value: &Value,
+        path: &mut Vec<JsonSegment>,
+        best: &mut Option<(Vec<JsonSegment>, usize)>,
+    ) {
+        match value {
+            Value::String(text) => {
+                if best.as_ref().is_none_or(|(_, length)| text.len() > *length) {
+                    *best = Some((path.clone(), text.len()));
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    path.push(JsonSegment::Index(index));
+                    walk(item, path, best);
+                    path.pop();
+                }
+            }
+            Value::Object(entries) => {
+                for (key, entry) in entries {
+                    path.push(JsonSegment::Key(key.clone()));
+                    walk(entry, path, best);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut best = None;
+    walk(value, &mut Vec::new(), &mut best);
+    best
+}
+
+fn string_at_path<'a>(value: &'a mut Value, path: &[JsonSegment]) -> Option<&'a mut String> {
+    let mut cursor = value;
+    for segment in path {
+        cursor = match (segment, cursor) {
+            (JsonSegment::Key(key), Value::Object(entries)) => entries.get_mut(key)?,
+            (JsonSegment::Index(index), Value::Array(items)) => items.get_mut(*index)?,
+            _ => return None,
+        };
+    }
+    match cursor {
+        Value::String(text) => Some(text),
+        _ => None,
+    }
+}
+
+/// Shorten `text` to at most `keep` bytes and describe what was dropped.
+/// Truncation lands on a character boundary, so the result stays valid UTF-8.
+fn truncate_with_marker(text: &mut String, keep: usize) {
+    let mut end = keep.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = text.len() - end;
+    text.truncate(end);
+    text.push_str(&format!("… [hel truncated {dropped} bytes]"));
+}
+
+/// Fit an observation inside `budget` serialized bytes by shortening its
+/// largest text payloads.
+///
+/// The ACP peer decides what the agent said; the relay only decides how much
+/// of it one durable event can carry. So an oversized payload is recorded in
+/// truncated form rather than rejected — refusing it would strand a live
+/// session over a transport limit it cannot see or control.
+fn clamp_observation(observation: RelayObservation, budget: usize) -> Result<RelayObservation> {
+    let mut value =
+        serde_json::to_value(&observation).context("serialize relay observation for clamping")?;
+    let mut size = serde_json::to_vec(&value)
+        .context("measure relay observation")?
+        .len();
+    if size <= budget {
+        return Ok(observation);
+    }
+    let original = size;
+    while size > budget {
+        let Some((path, length)) = longest_string_path(&value) else {
+            break;
+        };
+        if length <= RELAY_TRUNCATION_FLOOR {
+            break;
+        }
+        let Some(text) = string_at_path(&mut value, &path) else {
+            break;
+        };
+        // Leave room for the marker itself so one pass usually suffices.
+        let keep = length
+            .saturating_sub(size - budget + 64)
+            .max(RELAY_TRUNCATION_FLOOR);
+        truncate_with_marker(text, keep);
+        size = serde_json::to_vec(&value)
+            .context("measure clamped relay observation")?
+            .len();
+    }
+    if size > budget {
+        return Ok(RelayObservation::Warning {
+            message: format!(
+                "dropped an observation that cannot be recorded: {original} bytes exceeds the {budget} byte event budget and its payload is not truncatable"
+            ),
+        });
+    }
+    match serde_json::from_value(value) {
+        Ok(clamped) => {
+            tracing::warn!(
+                original,
+                clamped = size,
+                "truncated an oversized relay observation"
+            );
+            Ok(clamped)
+        }
+        Err(error) => Ok(RelayObservation::Warning {
+            message: format!(
+                "dropped an observation of {original} bytes: it could not be re-read after truncation: {error}"
+            ),
+        }),
+    }
 }
 
 fn persist_relay_snapshot(root: &Path, snapshot: &RelaySnapshot) -> Result<()> {
@@ -3202,6 +3345,7 @@ pub fn serve_relay_json_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::ContentChunk;
 
     const SESSION: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
 
@@ -4328,7 +4472,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_commands_and_events_are_rejected_before_journaling() {
+    fn oversized_commands_are_rejected_before_journaling() {
         let temp = tempfile::tempdir().unwrap();
         let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
         let response = relay.handle(relay_request(
@@ -4348,14 +4492,57 @@ mod tests {
             }
         ));
         assert_eq!(relay.latest_ordinal(), 0);
+    }
 
-        let error = relay
+    #[test]
+    fn oversized_observations_are_truncated_instead_of_failing() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+
+        let ordinal = relay
             .record_observation(RelayObservation::Warning {
                 message: "x".repeat(RELAY_EVENT_BYTE_BUDGET),
             })
-            .unwrap_err();
-        assert!(error.to_string().contains("relay event is too large"));
-        assert_eq!(relay.latest_ordinal(), 0);
+            .expect("an oversized observation is recorded, not rejected");
+        assert_eq!(ordinal, 1);
+        assert_eq!(relay.latest_ordinal(), 1);
+
+        let page = relay
+            .read_events_after(0, RELAY_REPLAY_BYTE_BUDGET)
+            .unwrap();
+        let recorded = &page.events[0];
+        let RelayObservation::Warning { message } = &recorded.observation else {
+            panic!(
+                "expected the truncated warning, found {:?}",
+                recorded.observation
+            );
+        };
+        assert!(
+            message.starts_with("xxxx"),
+            "the head of the payload is kept"
+        );
+        assert!(
+            message.contains("[hel truncated"),
+            "truncation is disclosed"
+        );
+        assert!(serde_json::to_vec(recorded).unwrap().len() <= RELAY_EVENT_BYTE_BUDGET);
+    }
+
+    /// A relay that truncated an event must still be able to reopen the
+    /// journal it wrote — the readback path bounds lines by the same budget.
+    #[test]
+    fn a_truncated_event_can_be_read_back_after_reopening() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        relay
+            .record_session_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                ContentBlock::from("y".repeat(3 * 1024 * 1024)),
+            )))
+            .unwrap();
+        drop(relay);
+
+        let reopened = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(reopened.latest_ordinal(), 1);
     }
 
     #[test]
