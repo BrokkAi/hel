@@ -5027,14 +5027,12 @@ fn session_name(session: &SessionRecord) -> &str {
 }
 
 /// Color of an active session's summary band. The terminal palette's plain
-/// yellow (amber/orange in common palettes) is the default; a session whose
-/// turn has ended with output the user has not read yet switches to the
-/// brighter light yellow until it is opened.
+/// yellow (amber/orange in common palettes) marks a session whose turn is
+/// still running; a session with no turn in flight is waiting on the user
+/// and switches to the brighter light yellow. A session whose detail has
+/// not loaded yet keeps the default.
 fn session_band_color(detail: Option<&SessionDetail>) -> Color {
-    let turn_ended = detail.is_some_and(|detail| {
-        detail.current_turn_started_at.is_none() && detail.unread_agent_messages > 0
-    });
-    if turn_ended {
+    if detail.is_some_and(|detail| detail.current_turn_started_at.is_none()) {
         Color::LightYellow
     } else {
         Color::Yellow
@@ -7855,13 +7853,16 @@ mod tests {
     }
 
     #[test]
-    fn ended_turn_with_unread_output_brightens_the_summary_band() {
+    fn ended_turn_brightens_the_summary_band_even_after_output_is_read() {
         let mut session = archived_session();
         session.state = SessionState::Running;
+        // The detach cursor sits past the only agent message, so nothing is
+        // unread; the band still brightens because no turn is in flight.
+        session.detached_after_event_ordinal = 1;
         let mut dashboard = dashboard_with_session(session);
         dashboard.focus = Focus::Quotas;
         let mut materialized =
-            materialized_session_for("session-1", vec![agent_message(1, "hidden response")]);
+            materialized_session_for("session-1", vec![agent_message(1, "seen response")]);
         materialized.execution = MaterializedExecutionState::Idle;
         dashboard.apply_materialized_session(&materialized);
         let mut terminal = Terminal::new(TestBackend::new(140, 28)).expect("terminal");
@@ -7874,9 +7875,13 @@ mod tests {
                 let row = (buffer.area.x..buffer.area.right())
                     .map(|x| buffer[(x, *y)].symbol())
                     .collect::<String>();
-                row.contains("1 unread") && row.contains("codex-1")
+                row.contains("ACP pretty name")
             })
             .expect("active status row");
+        let status = (buffer.area.x..buffer.area.right())
+            .map(|x| buffer[(x, status_y)].symbol())
+            .collect::<String>();
+        assert!(!status.contains("unread"));
         assert!(
             (buffer.area.x + 1..buffer.area.right() - 1)
                 .filter(|x| summary_text_cell(&buffer[(*x, status_y)]))
