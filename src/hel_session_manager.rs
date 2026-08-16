@@ -781,6 +781,17 @@ async fn run_session_actor(
                     connection = returned.connection;
                     failures = 0;
                     interval.reset();
+                    // A lease syncs the connection it borrowed, so this actor's
+                    // next sync can find nothing left to apply. Publish what the
+                    // returned connection already knows or watchers keep reading
+                    // pre-lease state.
+                    if let Some(returned) = connection.as_ref() {
+                        publish_view(&target.session_id, ManagedSessionView {
+                            snapshot: Some(returned.snapshot()),
+                            connected: true,
+                            error: None,
+                        }, &view_tx, &updates);
+                    }
                     let retiring = *retirement.borrow();
                     while let Some(deferred) = deferred_submits.pop_front() {
                         if retiring {
@@ -1542,6 +1553,8 @@ mod tests {
     const DEFERRED_SUBMIT_TEST_CHILD: &str = "HEL_TEST_DEFERRED_SUBMIT_CHILD";
     #[cfg(unix)]
     const RETIRED_SUBMIT_TEST_CHILD: &str = "HEL_TEST_RETIRED_SUBMIT_CHILD";
+    #[cfg(unix)]
+    const RETURNED_LEASE_VIEW_TEST_CHILD: &str = "HEL_TEST_RETURNED_LEASE_VIEW_CHILD";
     const LEASED_RELAY_SESSION: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
 
     /// Relay server half of the leased-submission tests. It does nothing unless
@@ -1778,6 +1791,54 @@ mod tests {
         assert!(
             ordinal > 0,
             "relay accepted the prompt at ordinal {ordinal}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn returned_lease_publishes_what_it_learned_while_it_held_the_connection() {
+        if std::env::var_os(RETURNED_LEASE_VIEW_TEST_CHILD).is_none() {
+            run_in_isolated_child(
+                RETURNED_LEASE_VIEW_TEST_CHILD,
+                "returned_lease_publishes_what_it_learned_while_it_held_the_connection",
+            );
+            return;
+        }
+        fail_if_the_actor_stalls("a returned lease never republished its session");
+
+        let (actor, lease_id, mut connection) = lease_a_live_actor().await;
+        let mut views = actor._views.clone();
+        // The lease applies these events itself, so the actor's own next sync
+        // has nothing left to catch up on.
+        let ordinal = connection
+            .submit(
+                new_command_id("prompt").unwrap(),
+                RelayCommand::Prompt {
+                    prompt: vec![ContentBlock::Text(TextContent::new("hello"))],
+                },
+            )
+            .await
+            .unwrap();
+        assert!(views.borrow_and_update().snapshot.is_none());
+
+        actor
+            .releases
+            .send(ReturnedConnection {
+                lease_id,
+                connection: Some(connection),
+            })
+            .unwrap();
+
+        views.changed().await.unwrap();
+        let snapshot = views
+            .borrow_and_update()
+            .snapshot
+            .clone()
+            .expect("the returned connection republished its session");
+        assert!(
+            snapshot.materialized.applied_event_ordinal >= ordinal,
+            "published frontier {} is behind the leased submission at {ordinal}",
+            snapshot.materialized.applied_event_ordinal
         );
     }
 
