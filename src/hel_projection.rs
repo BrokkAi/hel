@@ -311,14 +311,18 @@ fn project_session_update(
     update: &SessionUpdate,
     mutation: &mut MaterializedSessionMutation,
 ) -> Result<()> {
+    let running = matches!(
+        mutation.execution.as_ref().unwrap_or(&current.execution),
+        MaterializedExecutionState::Running { .. }
+    );
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             close_stream_kind(current, mutation, false, event.recorded_at_ms);
-            push_stream_chunk(current, mutation, event, true, chunk)?;
+            push_stream_chunk(current, mutation, event, true, running, chunk)?;
         }
         SessionUpdate::AgentThoughtChunk(chunk) => {
             close_stream_kind(current, mutation, true, event.recorded_at_ms);
-            push_stream_chunk(current, mutation, event, false, chunk)?;
+            push_stream_chunk(current, mutation, event, false, running, chunk)?;
         }
         // CommandStarted is the controller's canonical local user message.
         SessionUpdate::UserMessageChunk(_) => {}
@@ -431,6 +435,10 @@ fn push_stream_chunk(
     mutation: &mut MaterializedSessionMutation,
     event: &RelayEvent,
     agent: bool,
+    // ACP permits trailing session updates after a prompt completes or is cancelled. A chunk
+    // recorded while the session is not running is complete by definition, so it must not
+    // (re)open a stream: checkpoint export requires no open streams at an idle barrier.
+    running: bool,
     chunk: &agent_client_protocol::schema::v1::ContentChunk,
 ) -> Result<()> {
     let explicit_id = chunk.message_id.as_ref().map(|id| {
@@ -467,11 +475,11 @@ fn push_stream_chunk(
         match &mut item.body {
             TranscriptBody::Agent { chunks, streaming } if agent => {
                 chunks.push(serde_json::to_value(chunk)?);
-                *streaming = true;
+                *streaming = running;
             }
             TranscriptBody::Thought { chunks, streaming } if !agent => {
                 chunks.push(serde_json::to_value(chunk)?);
-                *streaming = true;
+                *streaming = running;
             }
             _ => bail!(
                 "ACP message ID conflicts with transcript item {}",
@@ -502,12 +510,12 @@ fn push_stream_chunk(
             body: if agent {
                 TranscriptBody::Agent {
                     chunks: vec![serde_json::to_value(chunk)?],
-                    streaming: true,
+                    streaming: running,
                 }
             } else {
                 TranscriptBody::Thought {
                     chunks: vec![serde_json::to_value(chunk)?],
-                    streaming: true,
+                    streaming: running,
                 }
             },
         },
@@ -814,6 +822,87 @@ mod tests {
         );
         assert_eq!(session.transcript[0].latest_content_event_ordinal, Some(2));
         assert_eq!(session.unread_agent_messages_after(2), 0);
+    }
+
+    #[test]
+    fn agent_chunk_while_idle_is_recorded_closed() {
+        let mut session = MaterializedSession::empty("session-1");
+        session.execution = MaterializedExecutionState::Idle;
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::AgentMessageChunk(
+                    agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("trailing"),
+                    ))
+                    .message_id("msg-1"),
+                )),
+            },
+        );
+        let item = session
+            .transcript
+            .iter()
+            .find(|item| item.stable_id == "agent:msg-1")
+            .expect("trailing chunk recorded");
+        assert!(matches!(
+            &item.body,
+            TranscriptBody::Agent { chunks, streaming }
+                if !*streaming
+                    && crate::hel_chat::materialized_chunks_text(chunks) == "trailing"
+        ));
+    }
+
+    #[test]
+    fn thought_chunk_while_idle_is_recorded_closed() {
+        let mut session = MaterializedSession::empty("session-1");
+        session.execution = MaterializedExecutionState::Idle;
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::AgentThoughtChunk(
+                    agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("late thought"),
+                    ))
+                    .message_id("msg-1"),
+                )),
+            },
+        );
+        let item = session
+            .transcript
+            .iter()
+            .find(|item| item.stable_id == "thought:msg-1")
+            .expect("trailing thought recorded");
+        assert!(matches!(
+            &item.body,
+            TranscriptBody::Thought { streaming, .. } if !*streaming
+        ));
+    }
+
+    #[test]
+    fn agent_chunk_while_running_still_streams() {
+        let mut session = MaterializedSession::empty("session-1");
+        session.execution = MaterializedExecutionState::Running { started_at_ms: 1 };
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::AgentMessageChunk(
+                    agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("live"),
+                    ))
+                    .message_id("msg-1"),
+                )),
+            },
+        );
+        let item = session
+            .transcript
+            .iter()
+            .find(|item| item.stable_id == "agent:msg-1")
+            .expect("live chunk recorded");
+        assert!(matches!(
+            &item.body,
+            TranscriptBody::Agent { chunks, streaming }
+                if *streaming && crate::hel_chat::materialized_chunks_text(chunks) == "live"
+        ));
     }
 
     #[test]

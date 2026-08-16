@@ -20,6 +20,24 @@ use crate::hel_worker::{
 
 const RELAY_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Forward a relay proxy's stderr to the log, one line at a time, until the
+/// child closes it. Reporting rather than dropping keeps connect failures
+/// diagnosable now that the controller no longer shares its terminal.
+async fn drain_proxy_stderr(errors: tokio::process::ChildStderr, purpose: String) {
+    let mut lines = BufReader::new(errors).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) if line.trim().is_empty() => continue,
+            Ok(Some(line)) => tracing::warn!(%purpose, %line, "relay proxy stderr"),
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%purpose, %error, "read relay proxy stderr");
+                return;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RelayAttachment {
     pub state: RelayOperationalState,
@@ -100,10 +118,17 @@ impl RelayClient {
             .envs(&spec.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            // Never inherit: the controller owns a TUI alternate screen, so a
+            // child writing to the shared stderr corrupts the display outside
+            // the renderer's buffer. Drain it into the log instead.
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("start session relay proxy for {}", spec.purpose))?;
+        if let Some(errors) = child.stderr.take() {
+            let purpose = spec.purpose.clone();
+            tokio::spawn(drain_proxy_stderr(errors, purpose));
+        }
         let input = child
             .stdin
             .take()

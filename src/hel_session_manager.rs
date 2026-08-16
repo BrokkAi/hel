@@ -22,7 +22,19 @@ use crate::hel_worker_client::{RelayClient, RelayEventPage, RelayRejected};
 
 const SESSION_SYNC_INTERVAL: Duration = Duration::from_millis(150);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
+/// Ceiling for reconnect backoff. A worker that exited stays gone until the
+/// user acts, so retrying it every second only burns process spawns.
+const RECONNECT_BACKOFF_CEILING: Duration = Duration::from_secs(30);
 const UNREACHABLE_FAILURE_THRESHOLD: u32 = 4;
+
+/// Delay before the next reconnect attempt after `failures` consecutive
+/// failures. Doubles from `RECONNECT_INTERVAL` up to the ceiling.
+fn reconnect_delay(failures: u32) -> Duration {
+    let doubling = failures.saturating_sub(1).min(u32::BITS - 1);
+    RECONNECT_INTERVAL
+        .saturating_mul(1_u32 << doubling)
+        .min(RECONNECT_BACKOFF_CEILING)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelaySessionTarget {
@@ -653,7 +665,7 @@ async fn run_session_actor(
                                 error: Some(format!("{error:#}")),
                             }, &view_tx, &updates);
                         }
-                        interval.reset_after(RECONNECT_INTERVAL);
+                        interval.reset_after(reconnect_delay(failures));
                     }
                 }
             }
@@ -1157,6 +1169,15 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_delay_backs_off_and_stops_at_the_ceiling() {
+        assert_eq!(reconnect_delay(1), RECONNECT_INTERVAL);
+        assert_eq!(reconnect_delay(2), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(4), Duration::from_secs(8));
+        assert_eq!(reconnect_delay(6), RECONNECT_BACKOFF_CEILING);
+        assert_eq!(reconnect_delay(u32::MAX), RECONNECT_BACKOFF_CEILING);
+    }
 
     fn target(program: &str) -> RelaySessionTarget {
         RelaySessionTarget {
