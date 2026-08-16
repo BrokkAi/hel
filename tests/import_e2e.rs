@@ -21,6 +21,18 @@ use hel::hel_session_manager::{StandaloneSession, new_command_id};
 use hel::hel_state::{HelState, MaterializedSession, SessionState, TranscriptBody};
 use hel::hel_worker::RelayCommand;
 
+fn hel_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_hel") {
+        return PathBuf::from(path);
+    }
+    let mut path = std::env::current_exe().expect("resolve current test executable");
+    path.pop();
+    if path.file_name().is_some_and(|name| name == "deps") {
+        path.pop();
+    }
+    path.join("hel")
+}
+
 #[test]
 #[ignore = "requires a signed-in Claude, Podman, and the Hel agent-development image"]
 fn imported_claude_session_resumes_natively() {
@@ -97,7 +109,7 @@ async fn imported_claude_session_resumes_natively_async() -> anyhow::Result<()> 
     config.save()?;
     HelState::default().save()?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hel"))
+    let output = Command::new(hel_binary())
         .args(["import", "claude", "--latest", "--bundle", "scratch"])
         .env("CLAUDE_CONFIG_DIR", &config.profiles["claude-e2e"].home)
         .output()?;
@@ -202,7 +214,7 @@ async fn imported_kimi_session_resumes_natively_async() -> anyhow::Result<()> {
     config.save()?;
     HelState::default().save()?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hel"))
+    let output = Command::new(hel_binary())
         .args([
             "import",
             "kimi",
@@ -422,7 +434,7 @@ async fn imported_codex_session_resumes_natively_async() -> anyhow::Result<()> {
     config.save()?;
     HelState::default().save()?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hel"))
+    let output = Command::new(hel_binary())
         .args([
             "import",
             "codex",

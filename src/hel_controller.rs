@@ -1321,7 +1321,9 @@ impl Controller {
         start_worker(executor, &backend, &worker_root)?;
         let reconnect = &hel_targets::reconnect_plan(&backend, session_id)?.commands[0];
         let readiness = async {
-            let mut relay = StandaloneSession::connect_command(reconnect, session_id).await?;
+            let mut relay =
+                connect_started_worker(reconnect, session_id, executor, &backend, &worker_root)
+                    .await?;
             let native_session_id = wait_for_native_session(&mut relay, executor).await?;
             Ok(Some(native_session_id))
         }
@@ -2000,8 +2002,16 @@ impl Controller {
             crate::hel_database::save_materialized_session(&restored_projection)?;
             start_worker(executor, &backend, &worker_root)?;
             let spec = self.reconnect_command(session_id)?;
-            let mut relay = StandaloneSession::connect_command(&spec, session_id).await?;
-            let native_session_id = wait_for_native_session(&mut relay, executor).await?;
+            let readiness = async {
+                let mut relay =
+                    connect_started_worker(&spec, session_id, executor, &backend, &worker_root)
+                        .await?;
+                let native_session_id = wait_for_native_session(&mut relay, executor).await?;
+                Ok::<_, anyhow::Error>((relay, native_session_id))
+            }
+            .await;
+            let (mut relay, native_session_id) = readiness
+                .map_err(|error| worker_probe_diagnosis(executor, &backend, &worker_root, error))?;
             if same_harness {
                 if native_session_id != archive.manifest.session.native_session_id {
                     bail!(
@@ -3153,6 +3163,19 @@ fn canonical_handoff_text(snapshot: &CanonicalSessionSnapshot, maximum_bytes: us
     format!("{PREFIX}{transcript}")
 }
 
+/// A harness such as Codex can spend minutes on its first launch, so the
+/// readiness wait has to outlast a slow harness boot rather than a fast one.
+const NATIVE_SESSION_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
+/// A freshly started worker binds its control socket only after it recovers
+/// durable state, so the first connection attempt is retried for this long.
+const WORKER_STARTUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Delay between connection attempts against a worker that is still starting.
+const WORKER_STARTUP_CONNECT_INTERVAL: Duration = Duration::from_millis(500);
+/// How often a wait loop looks for cancellation while it is idle.
+const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Marker that opens the exit record a dying worker writes to its root.
+const WORKER_EXIT_RECORD_MARKER: &str = "--- worker-exit.json ---";
+
 enum NativeSessionReadiness {
     Waiting,
     Ready(String),
@@ -3180,7 +3203,7 @@ async fn wait_for_native_session(
     relay: &mut impl NativeSessionProbe,
     executor: &impl CommandExecutor,
 ) -> Result<String> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + NATIVE_SESSION_STARTUP_TIMEOUT;
     loop {
         if executor.cancellation_requested() {
             bail!("operation cancelled while waiting for ACP runtime startup");
@@ -3191,10 +3214,12 @@ async fn wait_for_native_session(
             loop {
                 let now = tokio::time::Instant::now();
                 if now >= deadline {
-                    bail!("ACP runtime did not report session startup");
+                    bail!(
+                        "ACP runtime did not report session startup within {}s",
+                        NATIVE_SESSION_STARTUP_TIMEOUT.as_secs()
+                    );
                 }
-                let cancellation_poll =
-                    std::cmp::min(deadline, now + std::time::Duration::from_millis(25));
+                let cancellation_poll = std::cmp::min(deadline, now + CANCELLATION_POLL_INTERVAL);
                 tokio::select! {
                     readiness = &mut readiness => break readiness?,
                     _ = tokio::time::sleep_until(cancellation_poll) => {
@@ -3219,7 +3244,10 @@ async fn wait_for_native_session(
             bail!("operation cancelled while waiting for ACP runtime startup");
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("ACP runtime did not report session startup");
+            bail!(
+                "ACP runtime did not report session startup within {}s",
+                NATIVE_SESSION_STARTUP_TIMEOUT.as_secs()
+            );
         }
         let next_poll = std::cmp::min(
             deadline,
@@ -3230,15 +3258,141 @@ async fn wait_for_native_session(
             if now >= next_poll {
                 break;
             }
-            tokio::time::sleep_until(std::cmp::min(
-                next_poll,
-                now + std::time::Duration::from_millis(25),
-            ))
-            .await;
+            tokio::time::sleep_until(std::cmp::min(next_poll, now + CANCELLATION_POLL_INTERVAL))
+                .await;
             if executor.cancellation_requested() {
                 bail!("operation cancelled while waiting for ACP runtime startup");
             }
         }
+    }
+}
+
+/// One connection attempt against a worker that was started moments ago, plus
+/// a way to notice that the worker already died so the retry loop can stop.
+trait StartingWorkerProbe {
+    type Relay;
+
+    async fn connect(&mut self) -> Result<Self::Relay>;
+
+    /// Diagnostics from a worker that already recorded its exit, or `None`
+    /// while the worker has not reported a death.
+    fn death_report(&self) -> Option<String>;
+}
+
+struct StartingWorkerConnection<'a, E: CommandExecutor> {
+    spec: &'a CommandSpec,
+    session_id: &'a str,
+    executor: &'a E,
+    locator: &'a hel_targets::TargetLocator,
+    worker_root: &'a str,
+}
+
+impl<E: CommandExecutor> StartingWorkerProbe for StartingWorkerConnection<'_, E> {
+    type Relay = StandaloneSession;
+
+    async fn connect(&mut self) -> Result<StandaloneSession> {
+        StandaloneSession::connect_command(self.spec, self.session_id).await
+    }
+
+    fn death_report(&self) -> Option<String> {
+        worker_last_words(self.executor, self.locator, self.worker_root)
+            .filter(|last_words| last_words.contains(WORKER_EXIT_RECORD_MARKER))
+    }
+}
+
+/// Connect to a worker daemon that was just started. The daemon binds its
+/// control socket only after it recovers durable state, so the first attempts
+/// usually fail; retry until the worker accepts, until the worker reports its
+/// own death, or until the startup window closes.
+async fn connect_started_worker(
+    spec: &CommandSpec,
+    session_id: &str,
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    worker_root: &str,
+) -> Result<StandaloneSession> {
+    let mut connection = StartingWorkerConnection {
+        spec,
+        session_id,
+        executor,
+        locator,
+        worker_root,
+    };
+    connect_to_starting_worker(&mut connection, executor).await
+}
+
+async fn connect_to_starting_worker<P: StartingWorkerProbe>(
+    probe: &mut P,
+    executor: &impl CommandExecutor,
+) -> Result<P::Relay> {
+    let deadline = tokio::time::Instant::now() + WORKER_STARTUP_CONNECT_TIMEOUT;
+    let mut last_error: Option<anyhow::Error> = None;
+    loop {
+        if executor.cancellation_requested() {
+            bail!("operation cancelled while connecting to the worker relay");
+        }
+        let attempt = {
+            let attempt = probe.connect();
+            tokio::pin!(attempt);
+            loop {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break None;
+                }
+                let cancellation_poll = std::cmp::min(deadline, now + CANCELLATION_POLL_INTERVAL);
+                tokio::select! {
+                    attempt = &mut attempt => break Some(attempt),
+                    _ = tokio::time::sleep_until(cancellation_poll) => {
+                        if executor.cancellation_requested() {
+                            bail!("operation cancelled while connecting to the worker relay");
+                        }
+                    }
+                }
+            }
+        };
+        let error = match attempt {
+            Some(Ok(relay)) => return Ok(relay),
+            Some(Err(error)) => error,
+            // The attempt was still pending when the window closed.
+            None => break,
+        };
+        // A worker that already wrote its exit record will never accept a
+        // connection, so report the recorded cause instead of waiting it out.
+        if let Some(death_report) = probe.death_report() {
+            return Err(error.context(death_report));
+        }
+        last_error = Some(error);
+        if executor.cancellation_requested() {
+            bail!("operation cancelled while connecting to the worker relay");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let next_attempt = std::cmp::min(
+            deadline,
+            tokio::time::Instant::now() + WORKER_STARTUP_CONNECT_INTERVAL,
+        );
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= next_attempt {
+                break;
+            }
+            tokio::time::sleep_until(std::cmp::min(
+                next_attempt,
+                now + CANCELLATION_POLL_INTERVAL,
+            ))
+            .await;
+            if executor.cancellation_requested() {
+                bail!("operation cancelled while connecting to the worker relay");
+            }
+        }
+    }
+    let waited = WORKER_STARTUP_CONNECT_TIMEOUT.as_secs();
+    match last_error {
+        Some(error) => Err(error.context(format!(
+            "worker relay did not accept a connection in {waited}s"
+        ))),
+        None => bail!("worker relay did not accept a connection in {waited}s"),
     }
 }
 
@@ -5720,14 +5874,51 @@ fn install_worker_files(
             )?;
         }
         hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
-            let upload = format!("~/.cache/hel/uploads/{session_id}");
+            // The worker binary is 10-30 MB and identical across sessions, so
+            // keep it in a content-addressed cache on the remote host and copy
+            // it over the wire only once per unique binary.
+            let digest = worker_binary_digest(worker_binary)?;
+            // Home-relative, not "~/": ssh_command_spec single-quotes every
+            // argument, so a tilde would stay literal in the remote shell
+            // while scp expands it, and the two sides would disagree. Both
+            // ssh commands (cwd is the login home) and scp resolve a relative
+            // path against the remote home.
+            let cache_dir = format!(".cache/hel/workers/{digest}");
+            let cached_worker = format!("{cache_dir}/hel");
+            let cached = matches!(
+                executor.execute(
+                    &ssh_command_spec(ssh, ["test", "-f", &cached_worker])
+                        .purpose("probe cached remote Hel worker"),
+                ),
+                Ok(output) if output.status == 0
+            );
+            if !cached {
+                execute_checked(
+                    executor,
+                    ssh_command_spec(ssh, ["mkdir", "-p", &cache_dir])
+                        .purpose("create remote worker cache"),
+                )?;
+                let partial = format!("{cache_dir}/hel.partial-{session_id}");
+                execute_checked(
+                    executor,
+                    scp_command_spec(ssh, worker_binary, &partial, false)
+                        .purpose("upload remote Podman worker binary"),
+                )?;
+                // Rename within the cache directory so the final path only
+                // ever names a complete upload.
+                execute_checked(
+                    executor,
+                    ssh_command_spec(ssh, ["mv", &partial, &cached_worker])
+                        .purpose("publish cached remote Hel worker"),
+                )?;
+            }
+            let upload = format!(".cache/hel/uploads/{session_id}");
             execute_checked(
                 executor,
                 ssh_command_spec(ssh, ["mkdir", "-p", &upload])
                     .purpose("create remote upload staging"),
             )?;
             for (source, name) in [
-                (worker_binary, "hel"),
                 (launch_config, "launch.json"),
                 (ownership, "ownership.json"),
             ] {
@@ -5755,7 +5946,7 @@ fn install_worker_files(
                 vec![
                     "podman".into(),
                     "cp".into(),
-                    format!("{upload}/hel"),
+                    cached_worker.clone(),
                     format!("{container_id}:{worker_root}/hel"),
                 ],
                 vec![
@@ -5804,6 +5995,17 @@ fn install_worker_files(
         }
     }
     Ok(())
+}
+
+/// Content address for the worker binary, used as the remote cache key.
+fn worker_binary_digest(worker_binary: &Path) -> Result<String> {
+    let bytes = std::fs::read(worker_binary).with_context(|| {
+        format!(
+            "failed to read worker binary {} for cache addressing",
+            worker_binary.display()
+        )
+    })?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6015,8 +6217,9 @@ fn worker_last_words(
     worker_root: &str,
 ) -> Option<String> {
     let script = format!(
-        "if [ -f {root}/worker-exit.json ]; then echo '--- worker-exit.json ---'; cat {root}/worker-exit.json; fi; if [ -f {root}/worker.log ]; then echo '--- worker.log (tail) ---'; tail -n 20 {root}/worker.log; fi",
-        root = worker_root
+        "if [ -f {root}/worker-exit.json ]; then echo '{marker}'; cat {root}/worker-exit.json; fi; if [ -f {root}/worker.log ]; then echo '--- worker.log (tail) ---'; tail -n 20 {root}/worker.log; fi",
+        root = worker_root,
+        marker = WORKER_EXIT_RECORD_MARKER
     );
     let command = match locator {
         hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("sh", ["-c", &script]),
@@ -6293,6 +6496,136 @@ mod tests {
             error
                 .to_string()
                 .contains("operation cancelled while waiting for ACP runtime startup")
+        );
+    }
+
+    /// Scripted stand-in for a worker that is still binding its control
+    /// socket. It fails every connection until `accepts_after_attempts`, and
+    /// reports a recorded death once `death_after_attempts` attempts ran.
+    struct FakeStartingWorker {
+        attempts: usize,
+        accepts_after_attempts: Option<usize>,
+        death_after_attempts: Option<usize>,
+        cancel_on_attempt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    impl FakeStartingWorker {
+        fn never_accepts() -> Self {
+            Self {
+                attempts: 0,
+                accepts_after_attempts: None,
+                death_after_attempts: None,
+                cancel_on_attempt: None,
+            }
+        }
+
+        fn accepting_after(attempts: usize) -> Self {
+            Self {
+                accepts_after_attempts: Some(attempts),
+                ..Self::never_accepts()
+            }
+        }
+    }
+
+    impl StartingWorkerProbe for FakeStartingWorker {
+        type Relay = &'static str;
+
+        async fn connect(&mut self) -> Result<&'static str> {
+            self.attempts += 1;
+            if let Some(cancel) = &self.cancel_on_attempt {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+            match self.accepts_after_attempts {
+                Some(accepts) if self.attempts >= accepts => Ok("relay"),
+                _ => bail!("connect attempt {} refused", self.attempts),
+            }
+        }
+
+        fn death_report(&self) -> Option<String> {
+            let died_after = self.death_after_attempts?;
+            (self.attempts >= died_after).then(|| {
+                format!(
+                    "worker diagnostics:\n{WORKER_EXIT_RECORD_MARKER}\n\
+                     {{\"reason\":\"durable relay open failed\"}}"
+                )
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_connect_retries_until_worker_accepts() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executor = CancellableProcessExecutor::new(cancelled);
+        let mut worker = FakeStartingWorker::accepting_after(4);
+
+        let relay = connect_to_starting_worker(&mut worker, &executor)
+            .await
+            .unwrap();
+
+        assert_eq!(relay, "relay");
+        assert_eq!(worker.attempts, 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_connect_reports_a_worker_that_recorded_its_death() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executor = CancellableProcessExecutor::new(cancelled);
+        let mut worker = FakeStartingWorker {
+            death_after_attempts: Some(1),
+            ..FakeStartingWorker::never_accepts()
+        };
+        let started = tokio::time::Instant::now();
+
+        let error = connect_to_starting_worker(&mut worker, &executor)
+            .await
+            .unwrap_err();
+
+        assert_eq!(worker.attempts, 1);
+        assert!(started.elapsed() < WORKER_STARTUP_CONNECT_INTERVAL);
+        let reported = format!("{error:#}");
+        assert!(reported.contains(WORKER_EXIT_RECORD_MARKER), "{reported}");
+        assert!(reported.contains("connect attempt 1 refused"), "{reported}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_connect_stops_as_soon_as_cancellation_is_observed() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executor = CancellableProcessExecutor::new(cancelled.clone());
+        let mut worker = FakeStartingWorker {
+            cancel_on_attempt: Some(cancelled),
+            ..FakeStartingWorker::never_accepts()
+        };
+
+        let error = connect_to_starting_worker(&mut worker, &executor)
+            .await
+            .unwrap_err();
+
+        assert_eq!(worker.attempts, 1);
+        assert!(
+            error
+                .to_string()
+                .contains("operation cancelled while connecting to the worker relay"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_connect_gives_up_with_the_last_error_after_the_deadline() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executor = CancellableProcessExecutor::new(cancelled);
+        let mut worker = FakeStartingWorker::never_accepts();
+        let started = tokio::time::Instant::now();
+
+        let error = connect_to_starting_worker(&mut worker, &executor)
+            .await
+            .unwrap_err();
+
+        assert!(worker.attempts > 1, "{} attempts", worker.attempts);
+        assert!(started.elapsed() >= WORKER_STARTUP_CONNECT_TIMEOUT);
+        let reported = format!("{error:#}");
+        assert!(
+            reported.contains(&format!("connect attempt {} refused", worker.attempts)),
+            "{reported}"
         );
     }
 
@@ -7362,6 +7695,184 @@ mod tests {
         let streams = executor.streams.borrow();
         assert_eq!(streams.len(), 1);
         assert_eq!(&streams[0][..2], &[0x1f, 0x8b]);
+    }
+
+    struct PodmanInstallExecutor {
+        commands: RefCell<Vec<CommandSpec>>,
+        worker_cached: bool,
+    }
+
+    impl CommandExecutor for PodmanInstallExecutor {
+        fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+            self.commands.borrow_mut().push(command.clone());
+            let probing_cache = command
+                .args
+                .iter()
+                .any(|argument| argument.contains("'test' '-f'"));
+            let status = if probing_cache && !self.worker_cached {
+                1
+            } else {
+                0
+            };
+            Ok(CommandOutput {
+                status,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    struct PodmanInstallFixture {
+        _root: tempfile::TempDir,
+        worker_binary: PathBuf,
+        launch_config: PathBuf,
+        ownership: PathBuf,
+        profile_stage: PathBuf,
+        locator: hel_targets::TargetLocator,
+        digest: String,
+    }
+
+    fn podman_install_fixture() -> PodmanInstallFixture {
+        let root = tempfile::tempdir().unwrap();
+        let worker_binary = root.path().join("hel");
+        std::fs::write(&worker_binary, b"worker-binary-bytes").unwrap();
+        let launch_config = root.path().join("launch.json");
+        std::fs::write(&launch_config, b"{}").unwrap();
+        let ownership = root.path().join("ownership.json");
+        std::fs::write(&ownership, b"{}").unwrap();
+        let profile_stage = root.path().join("profile");
+        std::fs::create_dir_all(&profile_stage).unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"worker-binary-bytes"));
+        PodmanInstallFixture {
+            _root: root,
+            worker_binary,
+            launch_config,
+            ownership,
+            profile_stage,
+            locator: hel_targets::TargetLocator::SshPodman {
+                ssh: SshTarget {
+                    destination: "user@example.test".into(),
+                    ssh_args: Vec::new(),
+                },
+                container_id: "container-1".into(),
+            },
+            digest,
+        }
+    }
+
+    fn run_podman_install(worker_cached: bool) -> (Vec<CommandSpec>, PodmanInstallFixture) {
+        let fixture = podman_install_fixture();
+        let executor = PodmanInstallExecutor {
+            commands: RefCell::new(Vec::new()),
+            worker_cached,
+        };
+        install_worker_files(
+            &executor,
+            &fixture.locator,
+            "0123456789abcdef0123456789abcdef",
+            "/workspace/.hel/worker",
+            "/workspace/.hel/profile",
+            &fixture.worker_binary,
+            &fixture.launch_config,
+            &fixture.ownership,
+            &fixture.profile_stage,
+        )
+        .unwrap();
+        let commands = executor.commands.borrow().clone();
+        (commands, fixture)
+    }
+
+    fn rendered(commands: &[CommandSpec]) -> Vec<String> {
+        commands
+            .iter()
+            .map(|command| format!("{} {}", command.program, command.args.join(" ")))
+            .collect()
+    }
+
+    #[test]
+    fn ssh_podman_install_caches_the_worker_binary_on_a_cache_miss() {
+        let (commands, fixture) = run_podman_install(false);
+        let lines = rendered(&commands);
+        let digest = &fixture.digest;
+        let cache_dir = format!(".cache/hel/workers/{digest}");
+        let session = "0123456789abcdef0123456789abcdef";
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("ssh") && line.contains("'test' '-f'")),
+            "expected a cache probe, got {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains('~')),
+            "remote staging paths must be home-relative: ssh arguments are \
+             single-quoted so a tilde stays literal in the remote shell while \
+             scp expands it, got {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("ssh")
+                && line.contains(&format!("'mkdir' '-p' '{cache_dir}'"))),
+            "expected the cache directory to be created, got {lines:#?}"
+        );
+        let partial = format!("{cache_dir}/hel.partial-{session}");
+        assert!(
+            lines.iter().any(|line| line
+                == &format!(
+                    "scp {} user@example.test:{partial}",
+                    fixture.worker_binary.display()
+                )),
+            "expected the worker to be uploaded to the partial cache path, got {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("ssh")
+                && line.contains(&format!("'mv' '{partial}' '{cache_dir}/hel'"))),
+            "expected an atomic rename into the cache, got {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("'podman' 'cp'")
+                && line.contains(&format!("'{cache_dir}/hel'"))),
+            "expected podman cp to read the cached worker, got {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("scp")
+                && line.ends_with(&format!(
+                    "user@example.test:.cache/hel/uploads/{session}/hel"
+                ))),
+            "the worker must not be staged in the per-session upload directory, got {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn ssh_podman_install_skips_the_worker_upload_on_a_cache_hit() {
+        let (commands, fixture) = run_podman_install(true);
+        let lines = rendered(&commands);
+        let digest = &fixture.digest;
+        let cache_dir = format!(".cache/hel/workers/{digest}");
+        let session = "0123456789abcdef0123456789abcdef";
+
+        assert!(
+            !lines.iter().any(|line| line.starts_with("scp")
+                && line.contains(&fixture.worker_binary.display().to_string())),
+            "a cached worker must not be re-uploaded, got {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("'mv'")),
+            "a cache hit must not rename anything, got {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("'podman' 'cp'")
+                && line.contains(&format!("'{cache_dir}/hel'"))),
+            "expected podman cp to read the cached worker, got {lines:#?}"
+        );
+        for name in ["launch.json", "ownership.json"] {
+            assert!(
+                lines.iter().any(|line| line.starts_with("scp")
+                    && line.ends_with(&format!(
+                        "user@example.test:.cache/hel/uploads/{session}/{name}"
+                    ))),
+                "expected {name} to still be uploaded per session, got {lines:#?}"
+            );
+        }
     }
 
     #[test]

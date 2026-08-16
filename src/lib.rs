@@ -4,7 +4,7 @@ mod claude_usage;
 mod codex_usage;
 pub mod speech;
 pub mod termination;
-mod usage_format;
+pub mod usage_format;
 
 pub mod hel_acp;
 pub mod hel_archive;
@@ -31,7 +31,6 @@ pub mod hel_setup;
 pub mod hel_skills;
 pub mod hel_state;
 pub mod hel_targets;
-pub mod hel_tui;
 pub mod hel_worker;
 pub mod hel_worker_client;
 pub mod hel_worker_protocol;

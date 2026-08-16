@@ -51,8 +51,43 @@ pub fn canonical_repository(path: &Path) -> Result<PathBuf> {
     let root = PathBuf::from(root.trim());
     let root = std::fs::canonicalize(&root)
         .with_context(|| format!("canonicalize local repository {}", root.display()))?;
+    let root = main_worktree_root(&root)?;
     reject_git_lfs(&root)?;
     Ok(root)
+}
+
+/// Map a repository top level to the top level of its main working tree.
+///
+/// A linked worktree created by `git worktree add` reports its own top level,
+/// but Hel treats it as the same repository as the main working tree.
+pub fn main_worktree_root(root: &Path) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("start git in {}", root.display()))?;
+    if !output.status.success() {
+        bail!(
+            "could not read the common Git directory for {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let common = String::from_utf8(output.stdout).context("decode common Git directory")?;
+    let common = PathBuf::from(common.trim());
+    // A bare or otherwise unusual layout has no `.git` parent to fall back to.
+    if common.file_name() != Some(std::ffi::OsStr::new(".git")) {
+        return Ok(root.to_path_buf());
+    }
+    let Some(parent) = common.parent().filter(|parent| parent.is_dir()) else {
+        return Ok(root.to_path_buf());
+    };
+    let parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("canonicalize main worktree {}", parent.display()))?;
+    if parent == root {
+        return Ok(root.to_path_buf());
+    }
+    Ok(parent)
 }
 
 fn reject_git_lfs(repository: &Path) -> Result<()> {
@@ -169,6 +204,35 @@ mod tests {
                 .unwrap()
                 .contains("untracked")
         );
+    }
+
+    #[test]
+    fn canonical_repository_maps_a_linked_worktree_to_its_main_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let main = directory.path().join("main");
+        fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["config", "user.name", "Hel Test"]);
+        git(&main, &["config", "user.email", "hel@example.test"]);
+        fs::write(main.join("tracked"), "clean").unwrap();
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-qm", "base"]);
+        let worktree = directory.path().join("main2");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        let expected = fs::canonicalize(&main).unwrap();
+        assert_eq!(canonical_repository(&main).unwrap(), expected);
+        assert_eq!(canonical_repository(&worktree).unwrap(), expected);
     }
 
     #[test]

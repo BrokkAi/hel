@@ -40,11 +40,6 @@ pub fn latest_completed_turn_ordinal(session: &MaterializedSession) -> Option<u6
         .map(|item| item.position)
 }
 
-struct RecoveryRequest {
-    observation: RecoveryObservation,
-    acknowledged: tokio::sync::oneshot::Sender<()>,
-}
-
 #[derive(Debug, Clone)]
 pub struct RecoveryResult {
     pub session_id: String,
@@ -52,9 +47,23 @@ pub struct RecoveryResult {
     pub outcome: Result<CheckpointArtifact, String>,
 }
 
+/// Reports session activity to the recovery coordinator.
+///
+/// Reporting is a queued hand-off, never a round trip: the caller is often a
+/// UI event loop, and a copy decision must never hold that loop up. The queue
+/// is unbounded so an observation is never dropped, which matters because the
+/// idle observation that ends a turn is the one that makes a copy due. Queue
+/// depth stays small in practice: the coordinator only folds an observation
+/// into per-session policy state and hands the copy itself to another task.
+/// It does pause while it records a failed copy, and the queue is what absorbs
+/// that pause instead of the caller.
+///
+/// A caller that must know no copy can start uses [`RecoveryObserver::reserve`]
+/// rather than the queue: the reservation blocks a copy from starting whether
+/// or not queued observations have been read yet.
 #[derive(Clone)]
 pub struct RecoveryObserver {
-    observations: mpsc::UnboundedSender<RecoveryRequest>,
+    observations: mpsc::UnboundedSender<RecoveryObservation>,
     busy: watch::Receiver<BTreeSet<String>>,
     gate: Arc<RecoveryGate>,
 }
@@ -146,15 +155,13 @@ pub struct RecoveryContext {
 }
 
 impl RecoveryContext {
-    pub async fn observe(&self, materialized: &MaterializedSession) {
-        self.observer
-            .observe(RecoveryObservation {
-                session: self.session.clone(),
-                config: self.config.clone(),
-                latest_completed_turn_ordinal: latest_completed_turn_ordinal(materialized),
-                execution: materialized.execution,
-            })
-            .await;
+    pub fn observe(&self, materialized: &MaterializedSession) {
+        self.observer.observe(RecoveryObservation {
+            session: self.session.clone(),
+            config: self.config.clone(),
+            latest_completed_turn_ordinal: latest_completed_turn_ordinal(materialized),
+            execution: materialized.execution,
+        });
     }
 
     pub fn is_busy(&self) -> bool {
@@ -163,24 +170,21 @@ impl RecoveryContext {
 }
 
 impl RecoveryObserver {
-    pub async fn observe(&self, observation: RecoveryObservation) {
-        let (acknowledged, received) = tokio::sync::oneshot::channel();
-        if self
-            .observations
-            .send(RecoveryRequest {
-                observation,
-                acknowledged,
-            })
-            .is_ok()
-        {
-            let _ = received.await;
-        }
+    /// Queues one observation for the coordinator. Returns as soon as the
+    /// observation is queued; a stopped coordinator makes this a no-op.
+    pub fn observe(&self, observation: RecoveryObservation) {
+        let _ = self.observations.send(observation);
     }
 
     pub fn is_busy(&self, session_id: &str) -> bool {
         self.gate.is_busy(session_id)
     }
 
+    /// Holds off any recovery copy for this session until the returned
+    /// reservation is dropped. This, not the observation queue, is what a
+    /// lifecycle operation relies on: queued observations may still be
+    /// unread, and the coordinator refuses to start a copy for a reserved
+    /// session whenever it reads them.
     pub fn reserve(&self, session_id: &str) -> RecoveryReservation {
         self.gate.reserve(session_id)
     }
@@ -209,7 +213,8 @@ impl Drop for RecoveryCoordinator {
 
 impl RecoveryCoordinator {
     pub fn spawn(session_manager: SessionManagerControl) -> Self {
-        let (observations_tx, mut observations_rx) = mpsc::unbounded_channel::<RecoveryRequest>();
+        let (observations_tx, mut observations_rx) =
+            mpsc::unbounded_channel::<RecoveryObservation>();
         let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<RecoveryResult>();
         let (results_tx, results_rx) = mpsc::unbounded_channel();
         let (busy_tx, busy_rx) = watch::channel(BTreeSet::new());
@@ -221,11 +226,9 @@ impl RecoveryCoordinator {
             let mut policies = BTreeMap::<String, PolicyState>::new();
             loop {
                 tokio::select! {
-                    request = observations_rx.recv() => {
-                        let Some(request) = request else { break };
-                        let RecoveryRequest { observation, acknowledged } = request;
+                    observed = observations_rx.recv() => {
+                        let Some(observation) = observed else { break };
                         if coordinator_cancelled.load(Ordering::Acquire) {
-                            let _ = acknowledged.send(());
                             break;
                         }
                         let session_id = observation.session.id.clone();
@@ -281,7 +284,6 @@ impl RecoveryCoordinator {
                                 let _ = completed_tx.send(result);
                             });
                         }
-                        let _ = acknowledged.send(());
                     }
                     completed = completed_rx.recv() => {
                         let Some(result) = completed else { break };
@@ -328,6 +330,15 @@ impl RecoveryCoordinator {
 
     pub fn try_result(&mut self) -> Option<RecoveryResult> {
         self.results.try_recv().ok()
+    }
+
+    /// Waits for the next finished recovery copy.
+    ///
+    /// Event-driven loops select on this instead of polling; `None` means the
+    /// coordinator task has stopped. Cancel-safe, so a lost `select!` race
+    /// keeps the result queued.
+    pub async fn result(&mut self) -> Option<RecoveryResult> {
+        self.results.recv().await
     }
 }
 
@@ -381,17 +392,97 @@ mod tests {
     fn completed(position: u64) -> MaterializedSession {
         let mut session = MaterializedSession::empty("session-1");
         session.applied_event_ordinal = position;
-        session.transcript.push(crate::hel_state::TranscriptItem {
-            stable_id: format!("user:{position}"),
-            position,
-            latest_content_event_ordinal: None,
-            created_at_ms: 1,
-            last_changed_at_ms: 1,
-            body: TranscriptBody::User {
-                content: vec![serde_json::json!({"type": "text", "text": "go"})],
-            },
-        });
         session
+            .transcript
+            .push(Arc::new(crate::hel_state::TranscriptItem {
+                stable_id: format!("user:{position}"),
+                position,
+                latest_content_event_ordinal: None,
+                created_at_ms: 1,
+                last_changed_at_ms: 1,
+                body: TranscriptBody::User {
+                    content: vec![serde_json::json!({"type": "text", "text": "go"})],
+                },
+            }));
+        session
+    }
+
+    fn session_record(id: &str) -> SessionRecord {
+        SessionRecord {
+            id: id.to_owned(),
+            title: "work".into(),
+            harness_kind: crate::hel_config::HarnessKind::Codex,
+            last_profile: "codex-1".into(),
+            bundle_id: "hel".into(),
+            project_directory: None,
+            managed_worktree: None,
+            target_template_id: "podman".into(),
+            resource_allocation: None,
+            additional_mounts: Vec::new(),
+            state: crate::hel_state::SessionState::Running,
+            target: None,
+            native_session_id: None,
+            acp_session_title: None,
+            session_title_override: None,
+            created_at: "2026-08-09T12:00:00Z".into(),
+            updated_at: "2026-08-09T12:01:00Z".into(),
+            detached_after_event_ordinal: 0,
+            draft_input: String::new(),
+            last_error: None,
+            last_checkpoint_error: None,
+            checkpoint: None,
+        }
+    }
+
+    fn observation(position: u64) -> RecoveryObservation {
+        RecoveryObservation {
+            session: session_record("session-1"),
+            config: HelConfig::default(),
+            latest_completed_turn_ordinal: latest_completed_turn_ordinal(&completed(position)),
+            execution: MaterializedExecutionState::Idle,
+        }
+    }
+
+    /// The dashboard reports activity from its event loop, so observing must
+    /// hand the work off and return. Every observation still has to arrive:
+    /// the last one of a turn is the one that makes a copy due.
+    #[test]
+    fn observing_hands_off_without_waiting_and_keeps_every_observation() {
+        let (observations, mut queued) = mpsc::unbounded_channel();
+        let (busy_tx, busy) = watch::channel(BTreeSet::new());
+        let observer = RecoveryObserver {
+            observations,
+            busy,
+            gate: Arc::new(RecoveryGate::default()),
+        };
+
+        // Nothing is reading the queue, and observing still returns.
+        for position in 1..=64 {
+            observer.observe(observation(position));
+        }
+
+        let received = std::iter::from_fn(|| queued.try_recv().ok())
+            .map(|observation| observation.latest_completed_turn_ordinal)
+            .collect::<Vec<_>>();
+        assert_eq!(received, (1..=64).map(Some).collect::<Vec<_>>());
+        drop(busy_tx);
+    }
+
+    /// A stopped coordinator leaves observing harmless rather than blocking a
+    /// caller that can no longer be answered.
+    #[test]
+    fn observing_a_stopped_coordinator_is_a_no_op() {
+        let (observations, queued) = mpsc::unbounded_channel();
+        let (busy_tx, busy) = watch::channel(BTreeSet::new());
+        let observer = RecoveryObserver {
+            observations,
+            busy,
+            gate: Arc::new(RecoveryGate::default()),
+        };
+        drop(queued);
+
+        observer.observe(observation(1));
+        drop(busy_tx);
     }
 
     #[test]

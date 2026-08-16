@@ -501,6 +501,15 @@ impl CredentialSyncCoordinator {
     pub fn try_result(&mut self) -> Option<CredentialSyncResult> {
         self.results.try_recv().ok()
     }
+
+    /// Waits for the next finished sync.
+    ///
+    /// Event-driven loops select on this instead of polling; `None` means the
+    /// coordinator task has stopped. Cancel-safe, so a lost `select!` race
+    /// keeps the result queued.
+    pub async fn result(&mut self) -> Option<CredentialSyncResult> {
+        self.results.recv().await
+    }
 }
 
 fn profiles_with_targets(targets: &[CredentialSyncTarget]) -> Vec<String> {

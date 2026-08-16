@@ -377,7 +377,7 @@ impl TargetTemplate {
                     || workspace_prefix
                         .components()
                         .any(|part| part == Component::ParentDir)
-                    || matches!(workspace_prefix.to_str(), Some("/" | "." | "~"))
+                    || matches!(workspace_prefix.to_str(), Some("/" | "." | "~" | "~/"))
                 {
                     bail!("target template {id:?} has an unsafe workspace prefix");
                 }

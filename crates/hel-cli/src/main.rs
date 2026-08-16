@@ -54,16 +54,17 @@ use hel::hel_targets::{
     DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage, ProcessExecutor,
     SessionResourceProbe, SessionResourceUsage,
 };
-use hel::hel_tui::{
-    DashboardAction, DashboardState, ImportProfileOption, ImportSessionOption,
-    PreparedMaterializedSessionDetail, SessionOperationKind, render,
-};
 use hel::hel_worker::RelayCommand;
 use hel::hel_worker_runtime::{
     AcpSupervisorSpec, WorkerLaunchConfig, proxy, run_acp_supervisor, run_daemon,
 };
+use hel_tui::{
+    DashboardAction, DashboardState, ImportProfileOption, ImportSessionOption,
+    PreparedMaterializedSessionDetail, SessionOperationKind, render,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use tokio_stream::StreamExt as _;
 
 #[derive(Debug, Parser)]
 #[command(name = "hel", version, about = "ACP session control plane")]
@@ -305,6 +306,11 @@ const RESOURCE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const CAPACITY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const WORKER_DIAGNOSIS_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONCURRENT_PHONE_ACTIONS: usize = 4;
+/// Redraw cadence for displays that move with the wall clock: turn timers,
+/// countdowns, and elapsed times.
+const DASHBOARD_CLOCK_TICK: Duration = Duration::from_secs(1);
+/// Redraw cadence while the import progress dialog is on screen.
+const IMPORT_PROGRESS_TICK: Duration = Duration::from_millis(125);
 const QUOTA_REFRESH_NOTICE: &str = "Refreshing profile quotas…";
 const QUOTA_REFRESHED_NOTICE: &str = "Profile quotas refreshed.";
 
@@ -1160,17 +1166,15 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                     }
                     if let Some(snapshot) = update.view.snapshot {
                         if let Some(session) = controller.state.sessions.get(&update.session_id).cloned() {
-                            recovery_observer
-                                .observe(hel::hel_recovery::RecoveryObservation {
-                                    session,
-                                    config: controller.config.clone(),
-                                    latest_completed_turn_ordinal:
-                                        hel::hel_recovery::latest_completed_turn_ordinal(
-                                            &snapshot.materialized,
-                                        ),
-                                    execution: snapshot.materialized.execution,
-                                })
-                                .await;
+                            recovery_observer.observe(hel::hel_recovery::RecoveryObservation {
+                                session,
+                                config: controller.config.clone(),
+                                latest_completed_turn_ordinal:
+                                    hel::hel_recovery::latest_completed_turn_ordinal(
+                                        &snapshot.materialized,
+                                    ),
+                                execution: snapshot.materialized.execution,
+                            });
                         }
                         conversations.insert(
                             update.session_id.clone(),
@@ -2489,12 +2493,14 @@ fn spawn_worker_record_persistence(
 fn spawn_materialized_session_projection(
     materialized: MaterializedSession,
     detached_after_event_ordinal: u64,
+    previous: hel_tui::MaterializedProjectionCache,
     updates: tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
 ) {
     tokio::task::spawn_blocking(move || {
         let detail = PreparedMaterializedSessionDetail::from_materialized(
             materialized,
             detached_after_event_ordinal,
+            previous,
         );
         let _ = updates.send(DashboardIoUpdate::MaterializedSessionProjection {
             detail: Box::new(detail),
@@ -3174,6 +3180,124 @@ fn git_output(arguments: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Replaces the dashboard's event stream, dropping the old one first.
+///
+/// Once polled, an `EventStream` leaves a reader thread inside crossterm's
+/// internal reader, where it holds the reader lock and consumes terminal input.
+/// Anything else that reads the terminal needs that thread gone first. Building
+/// the replacement takes the same lock, which is why the old stream goes first.
+fn restart_event_stream(events: event::EventStream) -> event::EventStream {
+    drop(events);
+    event::EventStream::new()
+}
+
+/// Which view the one loop is drawing. The chat view is data rather than a
+/// nested loop, so its background feeds stay live while the session list is on
+/// screen and returning to a session is only a redraw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Dashboard,
+    /// Only valid while the loop holds an `ActiveChat`.
+    Chat,
+}
+
+/// Builds a chat view for one session: its identity, the other sessions it
+/// reports activity for, and its recovery context.
+async fn open_chat_view(
+    controller: &Controller,
+    session_id: &str,
+    sessions: &SessionManagerControl,
+    recovery_observer: &hel::hel_recovery::RecoveryObserver,
+) -> Result<hel::hel_chat::ActiveChat> {
+    let session_record = controller
+        .state
+        .sessions
+        .get(session_id)
+        .with_context(|| format!("unknown session {session_id}"))?
+        .clone();
+    let bundle_id = session_record.bundle_id.clone();
+    // Only a fresh view is seeded: a warm chat the loop kept alive holds newer
+    // input than this saved copy.
+    let saved_draft = session_record.draft_input.clone();
+    let other_sessions = controller
+        .state
+        .sessions
+        .values()
+        .filter(|record| record.id != session_id && record.state.is_active())
+        .map(|record| hel::hel_chat::OtherSessionIdentity {
+            session_id: record.id.clone(),
+            display_title: record.display_title().to_owned(),
+            detached_after_event_ordinal: record.detached_after_event_ordinal,
+        })
+        .collect::<Vec<_>>();
+    let recovery_context = hel::hel_recovery::RecoveryContext {
+        observer: recovery_observer.clone(),
+        session: session_record,
+        config: controller.config.clone(),
+    };
+    let managed = sessions.session(session_id.to_owned()).await?;
+    Ok(hel::hel_chat::ActiveChat::open(
+        managed,
+        &bundle_id,
+        Some(recovery_context),
+        sessions.clone(),
+        other_sessions,
+        saved_draft,
+    ))
+}
+
+/// Records what leaving a chat produced — how far the user has read and the
+/// input they left unsent — and persists both in the background. A missing
+/// session is reported rather than fatal: the session itself is unaffected.
+///
+/// The returned handle lets the quit path wait for the write. `None` means
+/// nothing was queued.
+fn record_chat_detach_state(
+    controller: &mut Controller,
+    dashboard: &mut DashboardState,
+    session_id: &str,
+    event_ordinal: u64,
+    draft: &str,
+    updates: &tokio::sync::mpsc::UnboundedSender<DashboardIoUpdate>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Some(session) = controller.state.sessions.get_mut(session_id) else {
+        dashboard.set_notice(format!(
+            "Could not save draft and read status for {}: unknown session",
+            short_id(session_id)
+        ));
+        return None;
+    };
+    session.detached_after_event_ordinal = session.detached_after_event_ordinal.max(event_ordinal);
+    session.draft_input = draft.to_owned();
+    dashboard.set_state(controller.state.clone());
+    dashboard.clear_notice();
+    Some(spawn_detached_session_state_persist(
+        session_id.to_owned(),
+        event_ordinal,
+        draft.to_owned(),
+        updates.clone(),
+    ))
+}
+
+/// Applies one terminal event to the dashboard and reports the work it asks
+/// for. Every event redraws, so events that carry no action still return
+/// `None` rather than being skipped.
+fn dashboard_event_action(dashboard: &mut DashboardState, event: Event) -> DashboardAction {
+    match event {
+        Event::Key(key) => dashboard.handle_key(key),
+        Event::Paste(pasted) => {
+            dashboard.handle_paste(&pasted);
+            DashboardAction::None
+        }
+        Event::Mouse(mouse) => {
+            dashboard.handle_mouse(mouse);
+            DashboardAction::None
+        }
+        // Resize and focus changes only need the redraw.
+        _ => DashboardAction::None,
+    }
+}
+
 async fn run_dashboard() -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         println!("Welcome to Hel");
@@ -3281,24 +3405,225 @@ async fn run_dashboard() -> Result<()> {
     let mut manual_quota_refresh_generation = None;
     let mut checkpoint_archive_targets_seen = std::collections::BTreeMap::new();
     let mut checkpoint_archive_generation = 0_u64;
+    let mut events = event::EventStream::new();
+    // `interval_at` so the first tick is a period away rather than immediate,
+    // and `Delay` so a tick that was gated off does not fire a burst to catch
+    // up when it comes back.
+    let mut clock_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + DASHBOARD_CLOCK_TICK,
+        DASHBOARD_CLOCK_TICK,
+    );
+    clock_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut import_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + IMPORT_PROGRESS_TICK,
+        IMPORT_PROGRESS_TICK,
+    );
+    import_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A closed feed reports `None` for ever, which would leave its arm
+    // permanently ready. Each flag retires its own arm instead.
+    let (mut quota_open, mut sessions_open, mut recovery_open, mut credentials_open) =
+        (true, true, true, true);
+    let (mut resource_open, mut capacity_open, mut aws_options_open, mut import_profiles_open) =
+        (true, true, true, true);
+    let (mut import_tasks_open, mut lifecycle_open, mut dashboard_io_open) = (true, true, true);
+    // The first pass always draws; after that a redraw needs a wakeup, and the
+    // poll targets are recomputed only after the controller may have changed.
+    let mut dirty = true;
+    let mut controller_changed = true;
+    let mut view = View::Dashboard;
+    // At most one chat stays warm: the session opened last. Its feeds keep
+    // running off screen, so reopening it costs a draw rather than a rebuild.
+    let mut active_chat: Option<hel::hel_chat::ActiveChat> = None;
 
     loop {
-        let checkpoint_archive_targets = checkpoint_archive_targets(&controller);
-        if checkpoint_archive_targets != checkpoint_archive_targets_seen {
-            checkpoint_archive_targets_seen = checkpoint_archive_targets.clone();
-            checkpoint_archive_generation = checkpoint_archive_generation.wrapping_add(1).max(1);
-            spawn_checkpoint_archive_size_refresh(
-                checkpoint_archive_generation,
-                checkpoint_archive_targets,
-                dashboard_io_tx.clone(),
-            );
+        if controller_changed {
+            controller_changed = false;
+            let checkpoint_archive_targets = checkpoint_archive_targets(&controller);
+            if checkpoint_archive_targets != checkpoint_archive_targets_seen {
+                checkpoint_archive_targets_seen = checkpoint_archive_targets.clone();
+                checkpoint_archive_generation =
+                    checkpoint_archive_generation.wrapping_add(1).max(1);
+                spawn_checkpoint_archive_size_refresh(
+                    checkpoint_archive_generation,
+                    checkpoint_archive_targets,
+                    dashboard_io_tx.clone(),
+                );
+            }
+            let capacity_targets = controller.deployment_capacity_targets();
+            if *capacity_targets_tx.borrow() != capacity_targets {
+                capacity_targets_tx.send_replace(capacity_targets.clone());
+                dashboard.set_deployment_capacity_targets(capacity_targets);
+                dirty = true;
+            }
         }
-        let capacity_targets = controller.deployment_capacity_targets();
-        if *capacity_targets_tx.borrow() != capacity_targets {
-            capacity_targets_tx.send_replace(capacity_targets.clone());
-            dashboard.set_deployment_capacity_targets(capacity_targets);
+        if dirty {
+            dirty = false;
+            match (view, active_chat.as_mut()) {
+                (View::Chat, Some(chat)) => {
+                    terminal.terminal.draw(|frame| chat.draw(frame))?;
+                }
+                _ => {
+                    terminal
+                        .terminal
+                        .draw(|frame| render(frame, &mut dashboard))?;
+                }
+            }
         }
-        while let Ok(update) = quota_updates_rx.try_recv() {
+        let mut action = DashboardAction::None;
+        let mut chat_outcome = hel::hel_chat::ChatEventOutcome::None;
+        let mut quota_update = None;
+        let mut session_update = None;
+        let mut recovery_result = None;
+        let mut credential_result = None;
+        let mut resource_update = None;
+        let mut capacity_update = None;
+        let mut aws_options = None;
+        let mut import_profile = None;
+        let mut import_task_update = None;
+        let mut lifecycle_update = None;
+        let mut dashboard_io_update = None;
+        // The winning arm takes the message that woke the loop; the drains
+        // below batch whatever is queued behind it, so one wakeup is one draw.
+        tokio::select! {
+            _ = termination.cancelled() => break,
+            event = events.next() => {
+                let Some(event) = event else { break };
+                let mut event = event?;
+                // Key repeats and pastes arrive as several ready events. The
+                // buffered ones are handled before drawing, but the first event
+                // that asks for work ends the batch so that dispatch still
+                // follows input order.
+                loop {
+                    let batched = match (view, active_chat.as_mut()) {
+                        (View::Chat, Some(chat)) => {
+                            chat_outcome = chat.handle_event(event);
+                            matches!(chat_outcome, hel::hel_chat::ChatEventOutcome::None)
+                        }
+                        _ => {
+                            action = dashboard_event_action(&mut dashboard, event);
+                            controller_changed = true;
+                            matches!(action, DashboardAction::None)
+                        }
+                    };
+                    if !batched {
+                        break;
+                    }
+                    // A zero timeout rather than a no-op waker: `EventStream`
+                    // arms its reader thread with the waker it was last polled
+                    // with, so a no-op waker here would swallow the next wakeup.
+                    let Ok(Some(next)) =
+                        tokio::time::timeout(Duration::ZERO, events.next()).await
+                    else {
+                        break;
+                    };
+                    event = next?;
+                }
+                dirty = true;
+            }
+            // The warm chat's own feeds: remote command results, its clipboard
+            // and history I/O, dictation, and the session view. They run
+            // whether or not the chat is on screen, which is what keeps an
+            // off-screen chat current.
+            () = hel::hel_chat::ActiveChat::pump(active_chat.as_mut()) => {
+                dirty |= view == View::Chat;
+            }
+            update = quota_updates_rx.recv(), if quota_open => match update {
+                Some(update) => {
+                    quota_update = Some(update);
+                    dirty = true;
+                }
+                None => quota_open = false,
+            },
+            update = worker_updates_rx.recv(), if sessions_open => match update {
+                Some(update) => {
+                    session_update = Some(update);
+                    dirty = true;
+                }
+                None => sessions_open = false,
+            },
+            result = recovery.result(), if recovery_open => match result {
+                Some(result) => {
+                    recovery_result = Some(result);
+                    dirty = true;
+                }
+                None => recovery_open = false,
+            },
+            result = credential_sync.result(), if credentials_open => match result {
+                Some(result) => {
+                    credential_result = Some(result);
+                    dirty = true;
+                }
+                None => credentials_open = false,
+            },
+            update = resource_updates_rx.recv(), if resource_open => match update {
+                Some(update) => {
+                    resource_update = Some(update);
+                    dirty = true;
+                }
+                None => resource_open = false,
+            },
+            update = capacity_updates_rx.recv(), if capacity_open => match update {
+                Some(update) => {
+                    capacity_update = Some(update);
+                    dirty = true;
+                }
+                None => capacity_open = false,
+            },
+            options = aws_resource_options_rx.recv(), if aws_options_open => match options {
+                Some(options) => {
+                    aws_options = Some(options);
+                    dirty = true;
+                }
+                None => aws_options_open = false,
+            },
+            profile = import_updates_rx.recv(), if import_profiles_open => match profile {
+                Some(profile) => {
+                    import_profile = Some(profile);
+                    dirty = true;
+                }
+                None => import_profiles_open = false,
+            },
+            update = import_task_rx.recv(), if import_tasks_open => match update {
+                Some(update) => {
+                    import_task_update = Some(update);
+                    dirty = true;
+                }
+                None => import_tasks_open = false,
+            },
+            update = lifecycle_updates_rx.recv(), if lifecycle_open => match update {
+                Some(update) => {
+                    lifecycle_update = Some(update);
+                    dirty = true;
+                }
+                None => lifecycle_open = false,
+            },
+            update = dashboard_io_rx.recv(), if dashboard_io_open => match update {
+                Some(update) => {
+                    dashboard_io_update = Some(update);
+                    dirty = true;
+                }
+                None => dashboard_io_open = false,
+            },
+            // Turn clocks, countdowns, and credential-sync backoffs move on
+            // their own, so the dashboard redraws once a second regardless.
+            // The chat has no animation; its only time-driven text is the
+            // checkpoint title, so it redraws only when that flag has moved.
+            _ = clock_tick.tick() => {
+                dirty |= match (view, active_chat.as_ref()) {
+                    (View::Chat, Some(chat)) => chat.recovery_title_is_stale(),
+                    _ => true,
+                };
+            }
+            // The import dialog reports how long a step has stalled; it needs a
+            // faster tick, and only while it is on screen.
+            _ = import_tick.tick(), if active_import.is_some() && view == View::Dashboard => {
+                dirty = true;
+            }
+        }
+        while let Some(update) = quota_update
+            .take()
+            .or_else(|| quota_updates_rx.try_recv().ok())
+        {
             match update {
                 QuotaUpdate::Refreshing { profile_ids } => {
                     dashboard.begin_quota_refresh(profile_ids)
@@ -3314,7 +3639,11 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
         }
-        while let Ok(update) = worker_updates_rx.try_recv() {
+        while let Some(update) = session_update
+            .take()
+            .or_else(|| worker_updates_rx.try_recv().ok())
+        {
+            controller_changed = true;
             let session_id = update.session_id.clone();
             let connected = update.view.connected;
             let connection_error = update.view.error.clone();
@@ -3324,17 +3653,16 @@ async fn run_dashboard() -> Result<()> {
                 if let Some(ordinal) = snapshot.latest_auth_failure_ordinal {
                     auth_failure_syncs.observe(&session_id, &session.last_profile, ordinal);
                 }
-                recovery_observer
-                    .observe(hel::hel_recovery::RecoveryObservation {
-                        session,
-                        config: controller.config.clone(),
-                        latest_completed_turn_ordinal:
-                            hel::hel_recovery::latest_completed_turn_ordinal(
-                                &snapshot.materialized,
-                            ),
-                        execution: snapshot.materialized.execution,
-                    })
-                    .await;
+                // Queued, never awaited: the copy decision belongs to the
+                // coordinator, and the dashboard loop must stay free to draw.
+                recovery_observer.observe(hel::hel_recovery::RecoveryObservation {
+                    session,
+                    config: controller.config.clone(),
+                    latest_completed_turn_ordinal: hel::hel_recovery::latest_completed_turn_ordinal(
+                        &snapshot.materialized,
+                    ),
+                    execution: snapshot.materialized.execution,
+                });
             }
             let materialized = update
                 .view
@@ -3355,9 +3683,11 @@ async fn run_dashboard() -> Result<()> {
                             .sessions
                             .get(&session_id)
                             .map_or(0, |session| session.detached_after_event_ordinal);
+                        let previous = dashboard.take_projection_cache(&session_id);
                         spawn_materialized_session_projection(
                             materialized,
                             detached_after_event_ordinal,
+                            previous,
                             dashboard_io_tx.clone(),
                         );
                     }
@@ -3383,32 +3713,51 @@ async fn run_dashboard() -> Result<()> {
             &credential_sync_handle,
             Instant::now(),
         );
-        while let Some(result) = recovery.try_result() {
+        while let Some(result) = recovery_result.take().or_else(|| recovery.try_result()) {
+            controller_changed = true;
             apply_recovery_result(&mut controller, &mut dashboard, result);
         }
-        while let Some(result) = credential_sync.try_result() {
+        while let Some(result) = credential_result
+            .take()
+            .or_else(|| credential_sync.try_result())
+        {
             if let Some(notice) = credential_sync_notices.notice(&result) {
                 dashboard.set_notice(notice);
             }
         }
-        while let Ok(update) = resource_updates_rx.try_recv() {
+        while let Some(update) = resource_update
+            .take()
+            .or_else(|| resource_updates_rx.try_recv().ok())
+        {
             dashboard.apply_resource_usage(&update.session_id, update.usage);
         }
-        while let Ok(update) = capacity_updates_rx.try_recv() {
+        while let Some(update) = capacity_update
+            .take()
+            .or_else(|| capacity_updates_rx.try_recv().ok())
+        {
             dashboard.apply_deployment_capacity(
                 &update.target_id,
                 update.result,
                 update.sampled_at_epoch_seconds,
             );
         }
-        while let Ok((target_id, result)) = aws_resource_options_rx.try_recv() {
+        while let Some((target_id, result)) = aws_options
+            .take()
+            .or_else(|| aws_resource_options_rx.try_recv().ok())
+        {
             resolving_aws_resource_options.remove(&target_id);
             dashboard.apply_aws_resource_options(&target_id, result);
         }
-        while let Ok((discovery_id, profile)) = import_updates_rx.try_recv() {
+        while let Some((discovery_id, profile)) = import_profile
+            .take()
+            .or_else(|| import_updates_rx.try_recv().ok())
+        {
             dashboard.apply_import_profile(discovery_id, profile);
         }
-        while let Ok(update) = import_task_rx.try_recv() {
+        while let Some(update) = import_task_update
+            .take()
+            .or_else(|| import_task_rx.try_recv().ok())
+        {
             match update {
                 DashboardImportUpdate::Progress {
                     task_id,
@@ -3465,7 +3814,11 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
         }
-        while let Ok(update) = lifecycle_updates_rx.try_recv() {
+        while let Some(update) = lifecycle_update
+            .take()
+            .or_else(|| lifecycle_updates_rx.try_recv().ok())
+        {
+            controller_changed = true;
             let session_id = update.session_id.clone();
             let operation = lifecycle_operations.remove(&session_id);
             dashboard.finish_session_operation(&session_id);
@@ -3474,7 +3827,11 @@ async fn run_dashboard() -> Result<()> {
                 dashboard_io_tx.clone(),
             );
         }
-        while let Ok(update) = dashboard_io_rx.try_recv() {
+        while let Some(update) = dashboard_io_update
+            .take()
+            .or_else(|| dashboard_io_rx.try_recv().ok())
+        {
+            controller_changed = true;
             match update {
                 DashboardIoUpdate::WorkerRecordPersistence {
                     session_id,
@@ -3738,27 +4095,49 @@ async fn run_dashboard() -> Result<()> {
                 }
             }
         }
-        terminal
-            .terminal
-            .draw(|frame| render(frame, &mut dashboard))?;
-        if termination.is_cancelled() {
-            break;
-        }
-        if !event::poll(Duration::from_millis(250))? {
-            continue;
-        }
-        let action = match event::read()? {
-            Event::Key(key) => dashboard.handle_key(key),
-            Event::Paste(pasted) => {
-                dashboard.handle_paste(&pasted);
-                DashboardAction::None
+        match chat_outcome {
+            hel::hel_chat::ChatEventOutcome::None | hel::hel_chat::ChatEventOutcome::Handled => {}
+            hel::hel_chat::ChatEventOutcome::Back {
+                last_seen_event_ordinal,
             }
-            Event::Mouse(mouse) => {
-                dashboard.handle_mouse(mouse);
-                DashboardAction::None
+            | hel::hel_chat::ChatEventOutcome::QuitDetach {
+                last_seen_event_ordinal,
+            } => {
+                // The chat stays warm behind the session list, so its feeds
+                // keep following the worker and reopening it costs a draw.
+                view = View::Dashboard;
+                dirty = true;
+                // The warm chat goes on holding this input in memory, so save
+                // it here: a quit or a crash while it is off screen would
+                // otherwise lose it.
+                let detached = active_chat
+                    .as_ref()
+                    .map(|chat| (chat.session_id().to_owned(), chat.draft().to_owned()));
+                let persist = detached.map(|(session_id, draft)| {
+                    record_chat_detach_state(
+                        &mut controller,
+                        &mut dashboard,
+                        &session_id,
+                        last_seen_event_ordinal,
+                        &draft,
+                        &dashboard_io_tx,
+                    )
+                });
+                if matches!(
+                    chat_outcome,
+                    hel::hel_chat::ChatEventOutcome::QuitDetach { .. }
+                ) {
+                    // Quitting leaves this loop for process exit, so the detach
+                    // write has to land first. Bounded so a stuck database
+                    // cannot hang the quit.
+                    if let Some(persist) = persist.flatten() {
+                        let _ = tokio::time::timeout(DETACH_PERSIST_QUIT_TIMEOUT, persist).await;
+                    }
+                    quit_detached = true;
+                    break;
+                }
             }
-            _ => continue,
-        };
+        }
         match action {
             DashboardAction::None => {}
             DashboardAction::QuitDetach => {
@@ -3772,6 +4151,11 @@ async fn run_dashboard() -> Result<()> {
                 break;
             }
             DashboardAction::OpenConfig => {
+                // The setup dialog reads the terminal itself, and a live event
+                // stream's reader thread consumes terminal input. Retire the
+                // stream first; the replacement reads nothing until it is polled
+                // again at the top of the loop.
+                events = restart_event_stream(events);
                 terminal.suspend()?;
                 let setup_result = run_setup_dialog(&config_path());
                 terminal.resume()?;
@@ -3991,108 +4375,33 @@ async fn run_dashboard() -> Result<()> {
                 );
             }
             DashboardAction::Open { session_id } => {
-                let session_record = controller
-                    .state
-                    .sessions
-                    .get(&session_id)
-                    .with_context(|| format!("unknown session {session_id}"))?
-                    .clone();
-                let bundle_id = session_record.bundle_id.clone();
-                let saved_draft = session_record.draft_input.clone();
-                let other_sessions = controller
-                    .state
-                    .sessions
-                    .values()
-                    .filter(|record| record.id != session_id && record.state.is_active())
-                    .map(|record| hel::hel_chat::OtherSessionIdentity {
-                        session_id: record.id.clone(),
-                        display_title: record.display_title().to_owned(),
-                        detached_after_event_ordinal: record.detached_after_event_ordinal,
-                    })
-                    .collect::<Vec<_>>();
-                let recovery_context = hel::hel_recovery::RecoveryContext {
-                    observer: recovery_observer.clone(),
-                    session: session_record,
-                    config: controller.config.clone(),
-                };
-                let result = async {
-                    let mut managed = worker_commands_tx.session(session_id.clone()).await?;
-                    let exit = hel::hel_chat::run_chat(
-                        &mut terminal.terminal,
-                        &mut managed,
-                        &bundle_id,
-                        Some(recovery_context),
-                        worker_commands_tx.clone(),
-                        other_sessions,
-                        saved_draft,
+                if active_chat
+                    .as_ref()
+                    .is_some_and(|chat| chat.session_id() == session_id)
+                {
+                    // The warm chat is this session: it has been following the
+                    // worker off screen, so showing it is only a redraw.
+                    view = View::Chat;
+                    dirty = true;
+                } else {
+                    match open_chat_view(
+                        &controller,
+                        &session_id,
+                        &worker_commands_tx,
+                        &recovery_observer,
                     )
-                    .await?;
-                    Ok::<_, anyhow::Error>((exit, managed.view()))
-                }
-                .await;
-                match result {
-                    Ok((exit, view)) => {
-                        let (detached_after_event_ordinal, draft, quit_after_detach) = match exit {
-                            hel::hel_chat::ChatExit::Detached {
-                                last_seen_event_ordinal,
-                                draft,
-                            } => (last_seen_event_ordinal, draft, false),
-                            hel::hel_chat::ChatExit::QuitDetached {
-                                last_seen_event_ordinal,
-                                draft,
-                            } => (last_seen_event_ordinal, draft, true),
-                        };
-                        if let Some(snapshot) = view.snapshot {
-                            dashboard.apply_materialized_session(&snapshot.materialized);
+                    .await
+                    {
+                        Ok(chat) => {
+                            // Only one chat stays warm, so the previous one is
+                            // dropped here; its supervisor detaches on drop.
+                            active_chat = Some(chat);
+                            view = View::Chat;
+                            dirty = true;
                         }
-                        while let Some(result) = recovery.try_result() {
-                            apply_recovery_result(&mut controller, &mut dashboard, result);
+                        Err(error) => {
+                            dashboard.set_notice(format!("Could not open session: {error:#}"));
                         }
-                        let read_result = controller
-                            .state
-                            .sessions
-                            .get_mut(&session_id)
-                            .map(|session| {
-                                session.detached_after_event_ordinal = session
-                                    .detached_after_event_ordinal
-                                    .max(detached_after_event_ordinal);
-                                session.draft_input.clone_from(&draft);
-                            })
-                            .with_context(|| format!("unknown session {session_id}"));
-                        dashboard.set_state(controller.state.clone());
-                        let persist = match read_result {
-                            Ok(()) => {
-                                dashboard.clear_notice();
-                                Some(spawn_detached_session_state_persist(
-                                    session_id.clone(),
-                                    detached_after_event_ordinal,
-                                    draft,
-                                    dashboard_io_tx.clone(),
-                                ))
-                            }
-                            Err(error) => {
-                                dashboard.set_notice(format!(
-                                    "Could not save draft and read status for {}: {error:#}",
-                                    short_id(&session_id)
-                                ));
-                                None
-                            }
-                        };
-                        if quit_after_detach {
-                            // Quitting returns from this loop straight to
-                            // process exit, so the detach write has to land
-                            // first. Bounded so a stuck database cannot hang
-                            // the quit.
-                            if let Some(persist) = persist {
-                                let _ = tokio::time::timeout(DETACH_PERSIST_QUIT_TIMEOUT, persist)
-                                    .await;
-                            }
-                            quit_detached = true;
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        dashboard.set_notice(format!("Could not open session: {error:#}"));
                     }
                 }
             }
@@ -5004,6 +5313,33 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dashboard loop batches buffered input and stops at the first event
+    /// that asks for work, so events that only need a redraw must report no
+    /// action and actionable keys must report theirs.
+    #[test]
+    fn only_events_that_ask_for_work_end_an_input_batch() {
+        let mut dashboard = DashboardState::new(
+            HelConfig::default(),
+            HelState::default(),
+            std::collections::BTreeMap::new(),
+        );
+
+        assert!(matches!(
+            dashboard_event_action(&mut dashboard, Event::Resize(80, 24)),
+            DashboardAction::None
+        ));
+        assert!(matches!(
+            dashboard_event_action(
+                &mut dashboard,
+                Event::Key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+            ),
+            DashboardAction::QuitDetach
+        ));
+    }
 
     #[test]
     fn worker_diagnosis_is_coalesced_for_one_unreachable_episode() {

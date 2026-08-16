@@ -4,6 +4,7 @@
 //! Input is reduced to [`DashboardAction`] values for the controller to run.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
@@ -17,14 +18,14 @@ use ratatui::widgets::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::hel_chat::{TranscriptSnapshot, materialized_content_text, render_agent_message_tail};
-use crate::hel_config::{HarnessKind, HelConfig, TargetTemplate};
-use crate::hel_quota::{ProfileQuota, QuotaWindow};
-use crate::hel_state::{
+use hel::hel_chat::{TranscriptSnapshot, materialized_content_text, render_agent_message_tail};
+use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate};
+use hel::hel_quota::{ProfileQuota, QuotaWindow};
+use hel::hel_state::{
     HelState, MaterializedExecutionState, MaterializedSession, SessionRecord,
-    SessionResourceAllocation, SessionState, TranscriptBody,
+    SessionResourceAllocation, SessionState, TranscriptBody, TranscriptItem,
 };
-use crate::hel_targets::{
+use hel::hel_targets::{
     AdditionalMount, DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage,
     SessionResourceUsage, default_mount_destination, path_completion,
 };
@@ -32,6 +33,8 @@ use crate::hel_targets::{
 const FORCE_CONFIRMATION: &str = "DESTROY";
 const BASELINE_CPUS: u64 = 8;
 const BASELINE_MEMORY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const FLOOR_CPUS: u64 = 2;
+const FLOOR_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const ACTIVE_MESSAGE_LINES: usize = 4;
 const SELECTED_TRANSCRIPT_LINES: usize = 10;
 const SESSION_TABLE_CHROME_HEIGHT: u16 = 3;
@@ -605,8 +608,7 @@ fn validate_mount_entry(mounts: &MountWizard) -> Option<String> {
         source: mounts.source.clone().into(),
         destination: mounts.destination.clone().into(),
     };
-    if let Err(error) = crate::hel_targets::validate_additional_mounts(std::slice::from_ref(&mount))
-    {
+    if let Err(error) = hel::hel_targets::validate_additional_mounts(std::slice::from_ref(&mount)) {
         return Some(error.to_string());
     }
     let duplicate = mounts.mounts.iter().enumerate().any(|(index, existing)| {
@@ -663,7 +665,7 @@ struct SessionDetail {
     materialized_applied_event_ordinal: Option<u64>,
     current_turn_started_at: Option<u64>,
     last_activity_at_ms: Option<u64>,
-    last_agent_message: Option<String>,
+    last_agent_message: Option<Arc<str>>,
     /// Latest agent-content ordinals retained so a state-only read-cursor
     /// update can recompute the single unread count exactly.
     agent_message_latest_content_ordinals: Vec<u64>,
@@ -671,7 +673,83 @@ struct SessionDetail {
     resource_usage: Option<SessionResourceUsage>,
     transcript: Option<TranscriptSnapshot>,
     transcript_hydration: TranscriptHydration,
-    queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
+    queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
+    /// What the last projection derived, so the next one only rescans the
+    /// transcript items that changed.
+    projection: MaterializedProjectionCache,
+}
+
+/// Per-item results the previous session projection derived, kept so the next
+/// projection can reuse them.
+///
+/// Transcript items are shared by pointer and copied on write, so the items
+/// two consecutive projections agree on are the ones that are pointer-equal.
+/// Everything before the first difference keeps its cached result, and the
+/// per-item JSON work is spent only on the changed tail.
+#[derive(Debug, Default, Clone)]
+pub struct MaterializedProjectionCache {
+    /// The transcript these results were derived from.
+    transcript: Vec<Arc<TranscriptItem>>,
+    /// Transcript index and latest content ordinal of every agent message that
+    /// has content, in transcript order.
+    agent_messages: Vec<(usize, u64)>,
+    /// Transcript index and text of the last agent message with text.
+    last_agent_message: Option<(usize, Arc<str>)>,
+}
+
+impl MaterializedProjectionCache {
+    /// How many leading items this cache and `transcript` share by pointer.
+    fn unchanged_prefix(&self, transcript: &[Arc<TranscriptItem>]) -> usize {
+        self.transcript
+            .iter()
+            .zip(transcript)
+            .take_while(|(cached, current)| Arc::ptr_eq(cached, current))
+            .count()
+    }
+}
+
+/// The last agent message with text in `transcript[range]`, searched from the
+/// end so it stops at the first one it finds.
+fn last_agent_message_in(
+    transcript: &[Arc<TranscriptItem>],
+    range: std::ops::Range<usize>,
+) -> Option<(usize, Arc<str>)> {
+    let start = range.start;
+    transcript[range]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(offset, item)| {
+            let TranscriptBody::Agent { chunks, .. } = &item.body else {
+                return None;
+            };
+            let text = hel::hel_chat::materialized_chunks_text(chunks);
+            (!text.trim().is_empty()).then(|| (start + offset, Arc::from(text)))
+        })
+}
+
+/// The last agent message with text, scanning the changed tail first and
+/// reusing the previous answer when it still holds.
+///
+/// The previous answer holds when it came from an item inside the unchanged
+/// prefix: nothing after that item had a message, or the previous scan would
+/// have stopped later. "No message at all" holds outright, because the
+/// previous scan covered every item the prefix is made of. Only an answer
+/// that came from an item that changed forces a rescan of the prefix, and
+/// that rescan still stops at the first message it finds.
+fn last_agent_message(
+    transcript: &[Arc<TranscriptItem>],
+    unchanged_prefix: usize,
+    previous: &MaterializedProjectionCache,
+) -> Option<(usize, Arc<str>)> {
+    if let Some(found) = last_agent_message_in(transcript, unchanged_prefix..transcript.len()) {
+        return Some(found);
+    }
+    match &previous.last_agent_message {
+        Some((index, text)) if *index < unchanged_prefix => Some((*index, text.clone())),
+        Some(_) => last_agent_message_in(transcript, 0..unchanged_prefix),
+        None => None,
+    }
 }
 
 pub struct PreparedMaterializedSessionDetail {
@@ -680,17 +758,21 @@ pub struct PreparedMaterializedSessionDetail {
     session_title: Option<String>,
     current_turn_started_at: Option<u64>,
     last_activity_at_ms: Option<u64>,
-    last_agent_message: Option<String>,
+    last_agent_message: Option<Arc<str>>,
     agent_message_latest_content_ordinals: Vec<u64>,
     unread_agent_messages: usize,
     transcript: TranscriptSnapshot,
-    queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
+    queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
+    projection: MaterializedProjectionCache,
 }
 
 impl PreparedMaterializedSessionDetail {
+    /// Projects one session for the dashboard, reusing what `previous`
+    /// derived for the transcript items that did not change.
     pub fn from_materialized(
         session: MaterializedSession,
         detached_after_event_ordinal: u64,
+        previous: MaterializedProjectionCache,
     ) -> Self {
         let current_turn_started_at = match session.execution {
             MaterializedExecutionState::Running { started_at_ms } => {
@@ -700,26 +782,33 @@ impl PreparedMaterializedSessionDetail {
             | MaterializedExecutionState::Closing
             | MaterializedExecutionState::Closed => None,
         };
-        let last_agent_message = session.transcript.iter().rev().find_map(|item| {
-            let TranscriptBody::Agent { chunks, .. } = &item.body else {
-                return None;
-            };
-            let text = crate::hel_chat::materialized_chunks_text(chunks);
-            (!text.trim().is_empty()).then(|| text.clone())
-        });
-        let agent_message_latest_content_ordinals = session
-            .transcript
+        let unchanged_prefix = previous.unchanged_prefix(&session.transcript);
+        let last_agent_message =
+            last_agent_message(&session.transcript, unchanged_prefix, &previous);
+        // Unread counting needs every agent message, so the list is carried
+        // forward and only its changed tail is rebuilt.
+        let mut agent_messages = previous.agent_messages;
+        agent_messages
+            .truncate(agent_messages.partition_point(|(index, _)| *index < unchanged_prefix));
+        for (index, item) in session.transcript.iter().enumerate().skip(unchanged_prefix) {
+            if item.is_nonempty_agent_message()
+                && let Some(ordinal) = item.latest_content_event_ordinal
+            {
+                agent_messages.push((index, ordinal));
+            }
+        }
+        let agent_message_latest_content_ordinals = agent_messages
             .iter()
-            .filter(|item| item.is_nonempty_agent_message())
-            .filter_map(|item| item.latest_content_event_ordinal)
-            .collect();
-        let unread_agent_messages =
-            usize::try_from(session.unread_agent_messages_after(detached_after_event_ordinal))
-                .unwrap_or(usize::MAX);
+            .map(|(_, ordinal)| *ordinal)
+            .collect::<Vec<_>>();
+        let unread_agent_messages = agent_message_latest_content_ordinals
+            .iter()
+            .filter(|ordinal| **ordinal > detached_after_event_ordinal)
+            .count();
         let queued_prompts = session
             .queued_prompts
             .iter()
-            .map(|prompt| crate::hel_worker::QueuedPrompt {
+            .map(|prompt| hel::hel_worker::QueuedPrompt {
                 id: prompt.command_id.clone(),
                 text: materialized_content_text(&prompt.content),
                 attachments: Vec::new(),
@@ -739,11 +828,18 @@ impl PreparedMaterializedSessionDetail {
             session_title,
             current_turn_started_at,
             last_activity_at_ms,
-            last_agent_message,
+            last_agent_message: last_agent_message
+                .as_ref()
+                .map(|(_, text)| Arc::clone(text)),
             agent_message_latest_content_ordinals,
             unread_agent_messages,
             transcript,
             queued_prompts,
+            projection: MaterializedProjectionCache {
+                transcript: session.transcript,
+                agent_messages,
+                last_agent_message,
+            },
         }
     }
 }
@@ -1043,12 +1139,24 @@ impl DashboardState {
             .sessions
             .get(&session.session_id)
             .map_or(0, |record| record.detached_after_event_ordinal);
+        let previous = self.take_projection_cache(&session.session_id);
         self.apply_prepared_materialized_session(
             PreparedMaterializedSessionDetail::from_materialized(
                 session.clone(),
                 detached_after_event_ordinal,
+                previous,
             ),
         );
+    }
+
+    /// Hands the last projection's per-item results to the next projection,
+    /// which runs off the UI task. A projection that never comes back, or one
+    /// that arrives too late to apply, only costs the next one a full rescan.
+    pub fn take_projection_cache(&mut self, session_id: &str) -> MaterializedProjectionCache {
+        self.session_details
+            .get_mut(session_id)
+            .map(|detail| std::mem::take(&mut detail.projection))
+            .unwrap_or_default()
     }
 
     pub fn apply_prepared_materialized_session(
@@ -1075,6 +1183,7 @@ impl DashboardState {
         detail.transcript = Some(prepared.transcript);
         detail.transcript_hydration = TranscriptHydration::Ready;
         detail.queued_prompts = prepared.queued_prompts;
+        detail.projection = prepared.projection;
         if let Some(title) = prepared.session_title.as_ref()
             && let Some(record) = self.state.sessions.get_mut(&prepared.session_id)
         {
@@ -1093,7 +1202,7 @@ impl DashboardState {
     pub fn apply_queued_prompts(
         &mut self,
         session_id: &str,
-        queued_prompts: Vec<crate::hel_worker::QueuedPrompt>,
+        queued_prompts: Vec<hel::hel_worker::QueuedPrompt>,
     ) {
         self.session_details
             .entry(session_id.to_owned())
@@ -1264,7 +1373,7 @@ impl DashboardState {
             return DashboardAction::None;
         }
         if is_paste_shortcut(key) {
-            match crate::hel_clipboard::read_text() {
+            match hel::hel_clipboard::read_text() {
                 Ok(text) => self.handle_paste(&text),
                 Err(error) => self.notice = Some(format!("Paste failed: {error:#}")),
             }
@@ -3761,15 +3870,32 @@ fn adjust_resources(
                     let Some((max_cpus, _)) = limits else {
                         return;
                     };
-                    (cpus.saturating_mul(2).min(max_cpus.max(1)), memory_bytes)
+                    (cpus.saturating_add(8).min(max_cpus.max(1)), memory_bytes)
                 }
                 KeyCode::Char('m') => {
                     let Some((_, max_memory)) = limits else {
                         return;
                     };
-                    (cpus, memory_bytes.saturating_mul(2).min(max_memory.max(1)))
+                    (
+                        cpus,
+                        memory_bytes
+                            .saturating_add(memory_bytes / 2)
+                            .min(max_memory.max(1)),
+                    )
                 }
-                KeyCode::Char('-') if cpus > 1 => (cpus / 2, (memory_bytes / 2).max(1)),
+                KeyCode::Char('-') => {
+                    let next_cpus = if cpus > FLOOR_CPUS {
+                        (cpus / 2).max(FLOOR_CPUS)
+                    } else {
+                        cpus
+                    };
+                    let next_memory = if memory_bytes > FLOOR_MEMORY_BYTES {
+                        (memory_bytes / 2).max(FLOOR_MEMORY_BYTES)
+                    } else {
+                        memory_bytes
+                    };
+                    (next_cpus, next_memory)
+                }
                 _ => return,
             };
             *allocation = Some(SessionResourceAllocation::Container {
@@ -3991,19 +4117,40 @@ fn render_adaptive_dashboard(
     dashboard: &mut DashboardState,
 ) {
     let preview_width = inner.width.saturating_sub(4);
-    // A provisional pass sizes the rows; the authoritative pass below runs once
-    // the pane height, and with it the selected session's line budget, is known.
-    let full_active_previews =
-        prepare_active_previews(dashboard, preview_width, SELECTED_TRANSCRIPT_LINES).previews;
-    let (active_count, archived_count) = {
-        let (active, archived) = partition_sessions(
-            dashboard.state.sessions.values(),
-            &dashboard.session_details,
-            dashboard.session_order,
-        );
-        (active.len(), archived.len())
-    };
-    let active_row_heights = full_active_previews
+    // One ordering for the whole frame: the panes, the previews, and the row
+    // widgets all read this partition.
+    let (active, archived) = partition_sessions(
+        dashboard.state.sessions.values(),
+        &dashboard.session_details,
+        dashboard.session_order,
+    );
+    let (active_count, archived_count) = (active.len(), archived.len());
+    let selected_active = (dashboard.focus == Focus::Active)
+        .then_some(dashboard.session_index)
+        .filter(|index| *index < active_count);
+    // Only the selected preview scrolls; moving the selection snaps the one
+    // left behind back to its live tail.
+    let selected_id = selected_active.map(|index| active[index].id.clone());
+    if dashboard.preview_scroll_session != selected_id {
+        dashboard.preview_scroll_session = selected_id;
+        dashboard.preview_scroll = 0;
+    }
+    // Row heights need the previews, and the selected session's line budget
+    // needs the allocated pane height. Every unselected preview is the same in
+    // both passes, so the transcript tails are walked once here and only the
+    // selected preview is rebuilt below when the pane came up short.
+    let mut active_previews = prepare_active_previews(
+        &active,
+        &mut dashboard.session_details,
+        PreviewRequest {
+            width: preview_width,
+            selected: selected_active,
+            scroll: dashboard.preview_scroll,
+            selected_lines: SELECTED_TRANSCRIPT_LINES,
+        },
+    );
+    let active_row_heights = active_previews
+        .previews
         .iter()
         .map(|preview| preview.len() as u16 + 1)
         .collect::<Vec<_>>();
@@ -4074,15 +4221,33 @@ fn render_adaptive_dashboard(
             .saturating_sub(SESSION_TABLE_CHROME_HEIGHT + 1),
     )
     .min(SELECTED_TRANSCRIPT_LINES);
-    let active_previews = prepare_active_previews(dashboard, preview_width, selected_lines);
+    // The sizing pass gave the selected preview the full line budget; redo just
+    // that row when the allocated pane grants it fewer lines, so its scroll is
+    // clamped against the height it actually renders at.
+    if selected_lines != SELECTED_TRANSCRIPT_LINES
+        && let Some(index) = selected_active
+    {
+        let (preview, applied) = active_transcript_tail(
+            dashboard.session_details.get_mut(&active[index].id),
+            preview_width,
+            selected_lines,
+            dashboard.preview_scroll,
+        );
+        active_previews.previews[index] = preview;
+        active_previews.applied_scroll = applied;
+    }
     dashboard.preview_scroll = active_previews.applied_scroll;
-    render_sessions(
+    if let Some(preview_area) = render_sessions(
         frame,
         panes[0],
         panes[1],
         dashboard,
+        &active,
+        &archived,
         &active_previews.previews,
-    );
+    ) {
+        dashboard.selected_preview_area = Some(preview_area);
+    }
     render_capacity(frame, panes[2], dashboard);
     render_quotas(frame, panes[3], dashboard);
     render_footer(frame, fixed[2], dashboard);
@@ -4129,42 +4294,33 @@ fn active_pane_height(row_heights: &[u16], rows: usize) -> u16 {
         .saturating_add(spacers)
 }
 
+/// What one frame asks of the active previews: the width they wrap to, which
+/// row is selected, how far that row's preview is scrolled, and the line budget
+/// the selected row may use.
+struct PreviewRequest {
+    width: u16,
+    selected: Option<usize>,
+    scroll: usize,
+    selected_lines: usize,
+}
+
 fn prepare_active_previews(
-    dashboard: &mut DashboardState,
-    preview_width: u16,
-    maximum_selected_lines: usize,
+    active: &[&SessionRecord],
+    session_details: &mut BTreeMap<String, SessionDetail>,
+    request: PreviewRequest,
 ) -> ActivePreviews {
-    let active_ids = partition_sessions(
-        dashboard.state.sessions.values(),
-        &dashboard.session_details,
-        dashboard.session_order,
-    )
-    .0
-    .into_iter()
-    .map(|session| session.id.clone())
-    .collect::<Vec<_>>();
-    let selected_active = (dashboard.focus == Focus::Active)
-        .then_some(dashboard.session_index)
-        .filter(|index| *index < active_ids.len());
-    // Only the selected preview scrolls; moving the selection snaps the one
-    // left behind back to its live tail.
-    let selected_id = selected_active.map(|index| active_ids[index].clone());
-    if dashboard.preview_scroll_session != selected_id {
-        dashboard.preview_scroll_session = selected_id;
-        dashboard.preview_scroll = 0;
-    }
-    let mut previews = Vec::with_capacity(active_ids.len());
+    let mut previews = Vec::with_capacity(active.len());
     let mut applied_scroll = 0;
-    for (index, session_id) in active_ids.iter().enumerate() {
-        let selected = selected_active == Some(index);
+    for (index, session) in active.iter().enumerate() {
+        let selected = request.selected == Some(index);
         let (maximum_lines, scroll) = if selected {
-            (maximum_selected_lines, dashboard.preview_scroll)
+            (request.selected_lines, request.scroll)
         } else {
             (ACTIVE_MESSAGE_LINES, 0)
         };
-        let detail = dashboard.session_details.get_mut(session_id);
+        let detail = session_details.get_mut(&session.id);
         let (preview, applied) =
-            active_transcript_tail(detail, preview_width, maximum_lines, scroll);
+            active_transcript_tail(detail, request.width, maximum_lines, scroll);
         if selected {
             applied_scroll = applied;
         }
@@ -4549,18 +4705,17 @@ fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) 
     );
 }
 
+/// Draws the Active and Paused panes and reports the selected session's
+/// preview hitbox, if one was drawn.
 fn render_sessions(
     frame: &mut Frame,
     active_area: Rect,
     archived_area: Rect,
-    dashboard: &mut DashboardState,
+    dashboard: &DashboardState,
+    active: &[&SessionRecord],
+    archived: &[&SessionRecord],
     active_previews: &[Vec<Line<'static>>],
-) {
-    let (active, archived) = partition_sessions(
-        dashboard.state.sessions.values(),
-        &dashboard.session_details,
-        dashboard.session_order,
-    );
+) -> Option<Rect> {
     let now_epoch_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -4605,6 +4760,7 @@ fn render_sessions(
     let active_offset = active_state.offset();
     let mut row_y = active_area.y + SESSION_TABLE_CHROME_HEIGHT;
     let mut visible_sessions = 0;
+    let mut selected_preview_area = None;
     for (index, session) in active.iter().enumerate().skip(active_offset) {
         let preview = &active_previews[index];
         let spacer = u16::from(index > 0);
@@ -4641,7 +4797,7 @@ fn render_sessions(
             let preview_area =
                 Rect::new(active_area.x + 3, detail_y, preview_width, preview_height);
             if selected {
-                dashboard.selected_preview_area = Some(preview_area);
+                selected_preview_area = Some(preview_area);
             }
             frame.render_widget(Paragraph::new(preview.clone()), preview_area);
         }
@@ -4699,6 +4855,7 @@ fn render_sessions(
                 .saturating_sub(SESSION_TABLE_CHROME_HEIGHT),
         ),
     );
+    selected_preview_area
 }
 
 fn render_session_scrollbar(
@@ -4791,7 +4948,7 @@ fn session_values(
         let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
         format!("Launch {}s", now_epoch_seconds.saturating_sub(started_at))
     } else {
-        crate::usage_format::format_turn_clock(
+        hel::usage_format::format_turn_clock(
             now_epoch_seconds,
             detail.and_then(|detail| detail.current_turn_started_at),
         )
@@ -5580,7 +5737,7 @@ fn render_new_wizard(
         WizardStep::ProjectDirectory => unreachable!("project directory input was rendered above"),
     };
     let help = if wizard.step == WizardStep::Target {
-        "+ both · c CPU · m memory · - halve · r reset"
+        "+ double · - halve · c +8 CPU · m +50% memory · r reset"
     } else {
         "↑/↓ select · Tab moves focus · Enter activates"
     };
@@ -5974,7 +6131,7 @@ fn render_resume_wizard(
                 })
                 .collect(),
             wizard.target,
-            &["+ both · c CPU · m memory · - halve · r reset"][..],
+            &["+ double · - halve · c +8 CPU · m +50% memory · r reset"][..],
         ),
         WizardStep::Bundle => unreachable!("resume does not select a bundle"),
         WizardStep::Review => unreachable!("review was rendered above"),
@@ -6441,16 +6598,17 @@ fn refresh_age(now: u64, refreshed: u64) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::hel_config::{
+    use hel::hel_config::{
         CONFIG_VERSION, ContainerTemplate, HarnessProfile, ProjectBundle, ProjectRepository,
         SshConnection,
     };
-    use crate::hel_state::{CheckpointMetadata, STATE_VERSION, TranscriptItem};
+    use hel::hel_state::{CheckpointMetadata, STATE_VERSION, TranscriptItem};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -6976,21 +7134,21 @@ mod tests {
         }
     }
 
-    fn transcript_item(position: u64, body: TranscriptBody) -> TranscriptItem {
+    fn transcript_item(position: u64, body: TranscriptBody) -> Arc<TranscriptItem> {
         let at_ms = i64::try_from(position).unwrap() * 1_000;
         let latest_content_event_ordinal =
             matches!(&body, TranscriptBody::Agent { .. }).then_some(position);
-        TranscriptItem {
+        Arc::new(TranscriptItem {
             stable_id: format!("item-{position}"),
             position,
             latest_content_event_ordinal,
             created_at_ms: at_ms,
             last_changed_at_ms: at_ms,
             body,
-        }
+        })
     }
 
-    fn agent_message(position: u64, text: impl Into<String>) -> TranscriptItem {
+    fn agent_message(position: u64, text: impl Into<String>) -> Arc<TranscriptItem> {
         transcript_item(
             position,
             TranscriptBody::Agent {
@@ -7002,7 +7160,7 @@ mod tests {
         )
     }
 
-    fn thought(position: u64, text: impl Into<String>) -> TranscriptItem {
+    fn thought(position: u64, text: impl Into<String>) -> Arc<TranscriptItem> {
         transcript_item(
             position,
             TranscriptBody::Thought {
@@ -7016,7 +7174,7 @@ mod tests {
 
     fn materialized_session_for(
         session_id: &str,
-        transcript: Vec<TranscriptItem>,
+        transcript: Vec<Arc<TranscriptItem>>,
     ) -> MaterializedSession {
         let frontier = transcript
             .iter()
@@ -7042,7 +7200,7 @@ mod tests {
 
     fn apply_materialized_transcript(
         dashboard: &mut DashboardState,
-        transcript: Vec<TranscriptItem>,
+        transcript: Vec<Arc<TranscriptItem>>,
     ) {
         apply_materialized_transcript_for(dashboard, "session-1", transcript);
     }
@@ -7050,7 +7208,7 @@ mod tests {
     fn apply_materialized_transcript_for(
         dashboard: &mut DashboardState,
         session_id: &str,
-        transcript: Vec<TranscriptItem>,
+        transcript: Vec<Arc<TranscriptItem>>,
     ) {
         dashboard.apply_materialized_session(&materialized_session_for(session_id, transcript));
     }
@@ -7058,7 +7216,7 @@ mod tests {
     /// A conversation of `count` numbered exchanges, so preview scroll
     /// assertions can name the message they expect to see. Agent chunks
     /// coalesce unless separated, so each pairs with its own prompt.
-    fn numbered_conversation(count: u64) -> Vec<TranscriptItem> {
+    fn numbered_conversation(count: u64) -> Vec<Arc<TranscriptItem>> {
         (0..count)
             .flat_map(|index| {
                 [
@@ -7332,7 +7490,7 @@ mod tests {
         assert_eq!(dashboard.selected_session().unwrap().id, "session-b");
 
         let mut second = agent_message(1, "second");
-        second.last_changed_at_ms = 2_000_000_100_000;
+        Arc::make_mut(&mut second).last_changed_at_ms = 2_000_000_100_000;
         apply_materialized_transcript_for(&mut dashboard, "session-b", vec![second]);
         dashboard.handle_key(key(KeyCode::Char('s')));
         assert_eq!(dashboard.session_order, SessionOrder::RecentActivity);
@@ -7343,7 +7501,7 @@ mod tests {
         assert_eq!(dashboard.selected_session().unwrap().id, "session-b");
 
         let mut later_thought = thought(1, "later thought");
-        later_thought.last_changed_at_ms = 2_000_000_200_000;
+        Arc::make_mut(&mut later_thought).last_changed_at_ms = 2_000_000_200_000;
         apply_materialized_transcript_for(&mut dashboard, "session-c", vec![later_thought]);
         assert_eq!(
             ordered_ids(&dashboard),
@@ -7351,7 +7509,7 @@ mod tests {
         );
 
         let mut newest = agent_message(1, "newest");
-        newest.last_changed_at_ms = 2_000_000_300_000;
+        Arc::make_mut(&mut newest).last_changed_at_ms = 2_000_000_300_000;
         apply_materialized_transcript_for(&mut dashboard, "session-a", vec![newest]);
         assert_eq!(
             ordered_ids(&dashboard),
@@ -7384,7 +7542,7 @@ mod tests {
                 }),
             },
         );
-        later_tool.last_changed_at_ms = 2_000_000_400_000;
+        Arc::make_mut(&mut later_tool).last_changed_at_ms = 2_000_000_400_000;
         apply_materialized_transcript_for(&mut dashboard, "session-b", vec![later_tool]);
         assert_eq!(
             ordered_ids(&dashboard),
@@ -7450,7 +7608,7 @@ mod tests {
         let mut initial = materialized_session_for("session-1", vec![agent_message(1, "first ")]);
         initial
             .queued_prompts
-            .push(crate::hel_state::MaterializedQueuedPrompt {
+            .push(hel::hel_state::MaterializedQueuedPrompt {
                 command_id: "queued-1".into(),
                 content: vec![serde_json::json!({ "type": "text", "text": "next task" })],
                 queued_at_ms: 0,
@@ -7470,8 +7628,8 @@ mod tests {
         );
 
         let mut updated = agent_message(1, "first continuation");
-        updated.latest_content_event_ordinal = Some(2);
-        updated.last_changed_at_ms = 2_000;
+        Arc::make_mut(&mut updated).latest_content_event_ordinal = Some(2);
+        Arc::make_mut(&mut updated).last_changed_at_ms = 2_000;
         let mut projection = materialized_session_for("session-1", vec![updated]);
         projection.applied_event_ordinal = 2;
         dashboard.apply_materialized_session(&projection);
@@ -7508,10 +7666,18 @@ mod tests {
         stale.applied_event_ordinal = 1;
 
         assert!(dashboard.apply_prepared_materialized_session(
-            PreparedMaterializedSessionDetail::from_materialized(latest, 0),
+            PreparedMaterializedSessionDetail::from_materialized(
+                latest,
+                0,
+                MaterializedProjectionCache::default(),
+            ),
         ));
         assert!(!dashboard.apply_prepared_materialized_session(
-            PreparedMaterializedSessionDetail::from_materialized(stale, 0),
+            PreparedMaterializedSessionDetail::from_materialized(
+                stale,
+                0,
+                MaterializedProjectionCache::default(),
+            ),
         ));
 
         assert_eq!(
@@ -7519,6 +7685,118 @@ mod tests {
                 .last_agent_message
                 .as_deref(),
             Some("latest")
+        );
+    }
+
+    /// Rewrites one agent message the way the projection does: the item is
+    /// copied, so every other handle in the transcript survives.
+    fn set_agent_text(item: &mut Arc<TranscriptItem>, text: &str, content_ordinal: u64) {
+        let item = Arc::make_mut(item);
+        item.body = TranscriptBody::Agent {
+            chunks: vec![serde_json::json!({
+                "content": {"type": "text", "text": text}
+            })],
+            streaming: false,
+        };
+        item.latest_content_event_ordinal = Some(content_ordinal);
+        item.last_changed_at_ms = i64::try_from(content_ordinal).unwrap() * 1_000;
+    }
+
+    /// The projection reuses per-item results across updates, so every shape
+    /// of transcript change must land where a full rescan would.
+    #[test]
+    fn incremental_projection_matches_a_full_rescan_through_transcript_changes() {
+        let detached_after_event_ordinal = 1;
+        // One transcript, changed the way the projection changes it: items are
+        // appended, and an item that changes is replaced by a copy while the
+        // rest keep their handles.
+        let mut transcript: Vec<Arc<TranscriptItem>> = Vec::new();
+        let mut updates = vec![transcript.clone()];
+        transcript.push(agent_message(1, "first"));
+        transcript.push(thought(2, "thinking"));
+        updates.push(transcript.clone());
+        transcript.push(agent_message(3, "answer"));
+        updates.push(transcript.clone());
+        // More content streams into the tail message.
+        set_agent_text(&mut transcript[2], "answer, at length", 4);
+        updates.push(transcript.clone());
+        // The tail message loses its text, so the previous answer no longer
+        // holds and the earlier items have to decide it.
+        set_agent_text(&mut transcript[2], "   ", 5);
+        updates.push(transcript.clone());
+        // An item inside the unchanged prefix changes.
+        set_agent_text(&mut transcript[0], "first, corrected", 6);
+        updates.push(transcript.clone());
+        // A restore rebuilds every item, sharing no handles.
+        transcript = vec![agent_message(1, "restored"), agent_message(2, "and again")];
+        updates.push(transcript.clone());
+        // A checkpoint restore leaves a shorter transcript.
+        transcript.truncate(1);
+        updates.push(transcript);
+
+        let mut cache = MaterializedProjectionCache::default();
+        for (index, transcript) in updates.into_iter().enumerate() {
+            let session = materialized_session_for("session-1", transcript);
+            let incremental = PreparedMaterializedSessionDetail::from_materialized(
+                session.clone(),
+                detached_after_event_ordinal,
+                cache,
+            );
+            let rescanned = PreparedMaterializedSessionDetail::from_materialized(
+                session,
+                detached_after_event_ordinal,
+                MaterializedProjectionCache::default(),
+            );
+            assert_eq!(
+                incremental.last_agent_message, rescanned.last_agent_message,
+                "last agent message after update {index}"
+            );
+            assert_eq!(
+                incremental.agent_message_latest_content_ordinals,
+                rescanned.agent_message_latest_content_ordinals,
+                "agent ordinals after update {index}"
+            );
+            assert_eq!(
+                incremental.unread_agent_messages, rescanned.unread_agent_messages,
+                "unread count after update {index}"
+            );
+            cache = incremental.projection;
+        }
+    }
+
+    /// Unchanged items keep their handles, so a projection that follows one
+    /// only reads the items that changed.
+    #[test]
+    fn projection_rereads_only_the_changed_tail() {
+        let head = vec![agent_message(1, "first"), thought(2, "thinking")];
+        let mut transcript = head.clone();
+        transcript.push(agent_message(3, "answer"));
+        let first = PreparedMaterializedSessionDetail::from_materialized(
+            materialized_session_for("session-1", transcript.clone()),
+            0,
+            MaterializedProjectionCache::default(),
+        );
+
+        transcript.push(agent_message(4, "and more"));
+        assert_eq!(
+            first.projection.unchanged_prefix(&transcript),
+            3,
+            "appending leaves the earlier items untouched"
+        );
+
+        let mut streamed = transcript.clone();
+        Arc::make_mut(&mut streamed[3]).last_changed_at_ms = 9_000;
+        assert_eq!(
+            first.projection.unchanged_prefix(&streamed),
+            3,
+            "a copy-on-write update only breaks the item it touches"
+        );
+
+        let restored = vec![agent_message(1, "first"), thought(2, "thinking")];
+        assert_eq!(
+            first.projection.unchanged_prefix(&restored),
+            0,
+            "rebuilt items share nothing, so everything is read again"
         );
     }
 
@@ -7705,7 +7983,7 @@ mod tests {
             launch_template: "hel".into(),
             launch_template_version: None,
             ssh_user: "ubuntu".into(),
-            address_source: crate::hel_config::AwsAddressSource::PublicIp,
+            address_source: hel::hel_config::AwsAddressSource::PublicIp,
             identity_file: None,
             ssh_args: Vec::new(),
         };
@@ -8370,7 +8648,7 @@ mod tests {
             launch_template: "hel".into(),
             launch_template_version: None,
             ssh_user: "ubuntu".into(),
-            address_source: crate::hel_config::AwsAddressSource::PublicIp,
+            address_source: hel::hel_config::AwsAddressSource::PublicIp,
             identity_file: None,
             ssh_args: Vec::new(),
         };
@@ -8947,6 +9225,133 @@ mod tests {
         assert_eq!(
             dashboard.preview_scroll, clamped,
             "scrolling past the oldest row is clamped"
+        );
+    }
+
+    /// Active sessions whose previews differ in length, plus paused sessions,
+    /// capacity rows, and quota rows, so every pane contributes to the layout.
+    fn mixed_fleet_dashboard() -> DashboardState {
+        let sessions = (0..4)
+            .map(|index| {
+                let mut session = archived_session();
+                session.id = format!("session-{index}");
+                if index < 2 {
+                    session.state = SessionState::Running;
+                }
+                (session.id.clone(), session)
+            })
+            .collect();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        apply_materialized_transcript_for(&mut dashboard, "session-0", numbered_conversation(14));
+        apply_materialized_transcript_for(&mut dashboard, "session-1", numbered_conversation(1));
+        dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        dashboard
+    }
+
+    /// Pane rectangles, the selected preview hitbox, and the row each session
+    /// summary and preview line lands on. Volatile text (turn clocks, message
+    /// timestamps) is reduced to a tag so the fingerprint is pure geometry.
+    fn layout_fingerprint(terminal: &Terminal<TestBackend>, dashboard: &DashboardState) -> String {
+        let mut lines = Vec::new();
+        for (index, area) in dashboard
+            .pane_areas
+            .expect("dashboard pane hitboxes")
+            .iter()
+            .enumerate()
+        {
+            lines.push(format!(
+                "pane {index}: {},{} {}x{}",
+                area.x, area.y, area.width, area.height
+            ));
+        }
+        let preview = dashboard
+            .selected_preview_area
+            .expect("selected preview hitbox");
+        lines.push(format!(
+            "preview: {},{} {}x{}",
+            preview.x, preview.y, preview.width, preview.height
+        ));
+        let buffer = terminal.backend().buffer();
+        for y in buffer.area.y..buffer.area.bottom() {
+            let text = (buffer.area.x..buffer.area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            let text = text.trim_end();
+            if text.contains("unread") {
+                lines.push(format!("row {y}: session summary"));
+            } else if let Some(start) = text.find("question ").or_else(|| text.find("answer ")) {
+                // Trailing pane border and scrollbar glyphs are not part of the
+                // message text.
+                let message = text[start..].trim_end_matches(['║', '│', '█', '▲', '▼', ' ']);
+                lines.push(format!("row {y}: {message}"));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// Locks the Active pane's layout for a fleet that mixes preview lengths
+    /// with paused, capacity, and quota rows. Both the row-sizing pass and the
+    /// pass that renders previews feed these numbers.
+    #[test]
+    fn dashboard_layout_is_stable_for_a_mixed_fleet() {
+        let mut dashboard = mixed_fleet_dashboard();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw the mixed fleet");
+
+        assert_eq!(
+            layout_fingerprint(&terminal, &dashboard),
+            concat!(
+                "pane 0: 0,1 120x22\n",
+                "pane 1: 0,23 120x5\n",
+                "pane 2: 0,28 120x4\n",
+                "pane 3: 0,32 120x6\n",
+                "preview: 3,4 116x10\n",
+                "row 3: session summary\n",
+                "row 5: answer 11\n",
+                "row 7: question 12\n",
+                "row 9: answer 12\n",
+                "row 11: question 13\n",
+                "row 13: answer 13\n",
+                "row 15: session summary\n",
+                "row 17: question 0\n",
+                "row 19: answer 0",
+            )
+        );
+    }
+
+    /// The same fleet in a terminal too short for the full preview budget, so
+    /// the selected session's line allowance comes from the allocated pane.
+    #[test]
+    fn dashboard_layout_is_stable_when_the_active_pane_is_squeezed() {
+        let mut dashboard = mixed_fleet_dashboard();
+        let mut terminal = Terminal::new(TestBackend::new(120, 26)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw the squeezed fleet");
+
+        assert_eq!(
+            layout_fingerprint(&terminal, &dashboard),
+            concat!(
+                "pane 0: 0,1 120x9\n",
+                "pane 1: 0,10 120x5\n",
+                "pane 2: 0,15 120x4\n",
+                "pane 3: 0,19 120x5\n",
+                "preview: 3,4 116x5\n",
+                "row 3: session summary\n",
+                "row 4: answer 12\n",
+                "row 6: question 13\n",
+                "row 8: answer 13",
+            )
         );
     }
 
@@ -10032,12 +10437,12 @@ mod tests {
         session.project_directory = Some(PathBuf::from(
             "/home/user/Projects/source/.hel/worktrees/session-1",
         ));
-        session.managed_worktree = Some(crate::hel_state::ManagedWorktree {
+        session.managed_worktree = Some(hel::hel_state::ManagedWorktree {
             source_project_directory: PathBuf::from("/home/user/Projects/source"),
             source_repository: PathBuf::from("/home/user/Projects/source"),
             worktree_root: PathBuf::from("/home/user/Projects/source/.hel/worktrees/session-1"),
             branch: "hel/session-1".into(),
-            target: crate::hel_state::ManagedWorktreeTarget::Local,
+            target: hel::hel_state::ManagedWorktreeTarget::Local,
         });
         assert_eq!(session_project(&config, &session), "source");
     }
@@ -10289,6 +10694,136 @@ mod tests {
             allocation,
             Some(SessionResourceAllocation::Container {
                 cpus: 16,
+                memory_bytes: 48 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_minus_clamps_cpu_at_floor_and_keeps_halving_memory() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 2,
+            memory_bytes: 32 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 2,
+                memory_bytes: 16 * gib,
+            })
+        );
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 2,
+                memory_bytes: 8 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_minus_clamps_memory_at_floor_and_keeps_halving_cpu() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 16,
+            memory_bytes: 8 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 8,
+                memory_bytes: 8 * gib,
+            })
+        );
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 4,
+                memory_bytes: 8 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_minus_is_a_no_op_once_both_are_at_their_floors() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 2,
+            memory_bytes: 8 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 2,
+                memory_bytes: 8 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_minus_leaves_values_already_below_floor_unchanged() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 1,
+            memory_bytes: 4 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('-'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 1,
+                memory_bytes: 4 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_c_clamps_at_cpu_ceiling() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 60,
+            memory_bytes: 32 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('c'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 64,
+                memory_bytes: 32 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn container_m_clamps_at_memory_ceiling() {
+        let gib = 1024 * 1024 * 1024;
+        let mut allocation = Some(SessionResourceAllocation::Container {
+            cpus: 8,
+            memory_bytes: 60 * gib,
+        });
+        let limits = Some((64, 64 * gib));
+
+        adjust_resources(&mut allocation, None, limits, KeyCode::Char('m'));
+        assert_eq!(
+            allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 8,
                 memory_bytes: 64 * gib,
             })
         );

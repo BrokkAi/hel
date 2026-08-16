@@ -23,6 +23,7 @@ use crate::hel_checkpoint::{collect_import_native_artifacts, collect_native_arti
 use crate::hel_config::{
     HarnessKind, HelConfig, ProjectBundle, ProjectRepository, TargetTemplate, validate_id,
 };
+use crate::hel_local_git::main_worktree_root;
 use crate::hel_projection::canonical_session_from_materialized;
 use crate::hel_setup::{GithubRepository, github_repository_from_origin};
 use crate::hel_state::{
@@ -1984,8 +1985,10 @@ fn root_identity(root: &Path) -> Result<RepositoryIdentity> {
             github.repository.to_ascii_lowercase(),
         ));
     }
+    // A linked worktree shares the identity of its main working tree.
+    let root = main_worktree_root(root)?;
     Ok(RepositoryIdentity::Local(
-        fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
+        fs::canonicalize(&root).unwrap_or(root),
     ))
 }
 
@@ -2010,6 +2013,9 @@ pub fn resolve_bundle(
     requested_bundle: Option<&str>,
 ) -> Result<BundleResolution> {
     let cwd_root = git_root_for_path(cwd)?.context("session cwd is not in a Git worktree")?;
+    // A linked worktree stands in for its main repository, so bundles are named
+    // after and point at the main working tree.
+    let cwd_root = main_worktree_root(&cwd_root)?;
     let primary_identity = root_identity(&cwd_root)?;
     let detected = targets
         .git_roots
@@ -2042,8 +2048,14 @@ pub fn resolve_bundle(
     let mut used_ids = BTreeSet::new();
     let mut repositories = Vec::new();
     let mut primary_repo = None;
-    let mut roots = targets.git_roots.clone();
+    let mut roots = targets
+        .git_roots
+        .iter()
+        .map(|root| main_worktree_root(root))
+        .collect::<Result<Vec<_>>>()?;
     roots.sort_by_key(|root| root != &cwd_root);
+    let mut seen = BTreeSet::new();
+    roots.retain(|root| seen.insert(root.clone()));
     for root in roots {
         let base = setup_style_id(
             root.file_name()
@@ -3001,6 +3013,98 @@ mod tests {
             non_git_dirs: Vec::new(),
         };
         assert!(resolve_bundle(&config, &app, &app_only, Some("multi")).is_err());
+    }
+
+    /// A repository without a remote takes the `Local` identity, which is the
+    /// case a linked worktree used to split into its own project.
+    fn initialize_local_repository(path: &Path, id: &str) {
+        initialize_repository(path, id);
+        run_git(path, &["remote", "remove", "origin"]);
+    }
+
+    fn run_git(path: &Path, arguments: &[&str]) {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn add_worktree(repository: &Path, worktree: &Path, branch: &str) -> PathBuf {
+        run_git(
+            repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                worktree.to_str().unwrap(),
+            ],
+        );
+        fs::canonicalize(worktree).unwrap()
+    }
+
+    #[test]
+    fn resolve_bundle_matches_an_existing_bundle_from_a_linked_worktree() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        initialize_local_repository(&app, "app");
+        let worktree = add_worktree(&app, &directory.path().join("app2"), "side");
+        let app = fs::canonicalize(&app).unwrap();
+
+        let mut config = HelConfig::default();
+        config.bundles.insert(
+            "app".into(),
+            ProjectBundle {
+                primary_repo: "app".into(),
+                repositories: vec![ProjectRepository {
+                    id: "app".into(),
+                    local: Some(app.clone()),
+                    github: None,
+                    destination: PathBuf::from("app"),
+                    git_ref: None,
+                }],
+            },
+        );
+        let targets = SessionEditTargets {
+            git_roots: vec![worktree.clone()],
+            non_git_dirs: Vec::new(),
+        };
+
+        assert_eq!(
+            resolve_bundle(&config, &worktree, &targets, None).unwrap(),
+            BundleResolution::Existing("app".into())
+        );
+    }
+
+    #[test]
+    fn resolve_bundle_synthesizes_a_worktree_session_as_its_main_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        initialize_local_repository(&app, "app");
+        let worktree = add_worktree(&app, &directory.path().join("app2"), "side");
+        let app = fs::canonicalize(&app).unwrap();
+        let targets = SessionEditTargets {
+            git_roots: vec![worktree.clone(), app.clone()],
+            non_git_dirs: Vec::new(),
+        };
+
+        let BundleResolution::Synthesized { id, bundle } =
+            resolve_bundle(&HelConfig::default(), &worktree, &targets, None).unwrap()
+        else {
+            panic!("expected synthesized bundle");
+        };
+        assert_eq!(id, "app");
+        assert_eq!(bundle.primary_repo, "app");
+        assert_eq!(bundle.repositories.len(), 1);
+        assert_eq!(bundle.repositories[0].id, "app");
+        assert_eq!(bundle.repositories[0].local.as_deref(), Some(app.as_path()));
     }
 
     #[test]
