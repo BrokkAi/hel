@@ -1,6 +1,6 @@
 //! Multiplexed controller-side ownership of durable ACP relay sessions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -177,6 +177,10 @@ pub struct ManagedSessionHandle {
 /// Lifecycle operations use this instead of opening a competing projection
 /// client. Dropping an unreleased lease drops the proxy connection, which in
 /// turn cancels any ordinary relay checkpoint barrier.
+///
+/// Prompt submissions that arrive while the lease is active are not rejected.
+/// The actor queues them and forwards them in arrival order once the lease is
+/// released or dropped.
 pub struct ManagedSessionLease {
     lease_id: Option<u64>,
     connection: Option<StandaloneSession>,
@@ -401,6 +405,14 @@ impl ActorCommand {
 struct ReturnedConnection {
     lease_id: u64,
     connection: Option<StandaloneSession>,
+}
+
+/// A submission that arrived while a lifecycle operation held the connection.
+/// The actor replays these in arrival order once the lease comes back.
+struct DeferredSubmit {
+    command_id: String,
+    command: RelayCommand,
+    reply: oneshot::Sender<std::result::Result<u64, String>>,
 }
 
 #[derive(Debug, Default)]
@@ -636,6 +648,7 @@ async fn run_session_actor(
     let mut connection: Option<StandaloneSession> = None;
     let mut failures = 0_u32;
     let mut lifecycle = ActorLifecycle::default();
+    let mut deferred_submits: VecDeque<DeferredSubmit> = VecDeque::new();
     let mut next_lease_id = 1_u64;
     let mut interval = tokio::time::interval(SESSION_SYNC_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -705,34 +718,26 @@ async fn run_session_actor(
                 match command {
                     ActorCommand::Submit { command_id, command, reply } => {
                         if lifecycle.is_leased() {
-                            let _ = reply.send(Err(
-                                "session is reserved for a lifecycle operation".into(),
-                            ));
+                            // A checkpoint or other lifecycle operation owns the
+                            // connection. Hold the prompt instead of rejecting it
+                            // and deliver it when the lease comes back.
+                            deferred_submits.push_back(DeferredSubmit {
+                                command_id,
+                                command,
+                                reply,
+                            });
                             continue;
                         }
-                        let result = submit_actor_command(
+                        deliver_submit(
                             &target,
                             &mut connection,
-                            &command_id,
-                            &command,
+                            command_id,
+                            command,
+                            reply,
+                            &view_tx,
+                            &updates,
                         )
                         .await;
-                        if let Ok(ordinal) = result.as_ref() {
-                            let snapshot = connection
-                                .as_ref()
-                                .expect("successful submission retained its connection")
-                                .snapshot();
-                            publish_view(&target.session_id, ManagedSessionView {
-                                snapshot: Some(snapshot),
-                                connected: true,
-                                error: None,
-                            }, &view_tx, &updates);
-                            tracing::trace!(%ordinal, %command_id, "relay command accepted");
-                        }
-                        if result.is_err() {
-                            connection = None;
-                        }
-                        let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                     }
                     ActorCommand::Sync { reply } => {
                         if lifecycle.is_leased() {
@@ -797,9 +802,28 @@ async fn run_session_actor(
             returned = releases.recv() => {
                 let Some(returned) = returned else { continue };
                 if lifecycle.return_lease(returned.lease_id) {
+                    // A dropped lease returns no connection; `submit_actor_command`
+                    // reconnects on demand, so the drain needs no special case.
                     connection = returned.connection;
                     failures = 0;
                     interval.reset();
+                    let retiring = *retirement.borrow();
+                    while let Some(deferred) = deferred_submits.pop_front() {
+                        if retiring {
+                            let _ = deferred.reply.send(Err("session target is changing".into()));
+                            continue;
+                        }
+                        deliver_submit(
+                            &target,
+                            &mut connection,
+                            deferred.command_id,
+                            deferred.command,
+                            deferred.reply,
+                            &view_tx,
+                            &updates,
+                        )
+                        .await;
+                    }
                 }
             }
             changed = retirement.changed() => {
@@ -809,6 +833,45 @@ async fn run_session_actor(
             }
         }
     }
+    // No caller may wait forever on a submission this actor will never deliver.
+    for deferred in deferred_submits {
+        let _ = deferred.reply.send(Err("session manager stopped".into()));
+    }
+}
+
+/// Submit one relay command and publish the resulting snapshot. Live and
+/// deferred submissions share this path so both report identical results.
+async fn deliver_submit(
+    target: &RelaySessionTarget,
+    connection: &mut Option<StandaloneSession>,
+    command_id: String,
+    command: RelayCommand,
+    reply: oneshot::Sender<std::result::Result<u64, String>>,
+    view_tx: &watch::Sender<ManagedSessionView>,
+    updates: &CoalescedUpdateSender,
+) {
+    let result = submit_actor_command(target, connection, &command_id, &command).await;
+    if let Ok(ordinal) = result.as_ref() {
+        let snapshot = connection
+            .as_ref()
+            .expect("successful submission retained its connection")
+            .snapshot();
+        publish_view(
+            &target.session_id,
+            ManagedSessionView {
+                snapshot: Some(snapshot),
+                connected: true,
+                error: None,
+            },
+            view_tx,
+            updates,
+        );
+        tracing::trace!(%ordinal, %command_id, "relay command accepted");
+    }
+    if result.is_err() {
+        *connection = None;
+    }
+    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
 }
 
 async fn submit_actor_command(
@@ -1201,6 +1264,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
 
     #[test]
     fn reconnect_delay_backs_off_and_stops_at_the_ceiling() {
@@ -1503,6 +1567,284 @@ mod tests {
             .expect("dashboard feed received the error view");
         assert_eq!(update.session_id, "session-1");
         assert!(!update.view.connected);
+    }
+
+    const LEASED_RELAY_ROOT: &str = "HEL_TEST_LEASED_RELAY_ROOT";
+    #[cfg(unix)]
+    const DEFERRED_SUBMIT_TEST_CHILD: &str = "HEL_TEST_DEFERRED_SUBMIT_CHILD";
+    #[cfg(unix)]
+    const RETIRED_SUBMIT_TEST_CHILD: &str = "HEL_TEST_RETIRED_SUBMIT_CHILD";
+    const LEASED_RELAY_SESSION: &str = "018f9dd2-a3b4-7c8d-9000-123456789abc";
+
+    /// Relay server half of the leased-submission tests. It does nothing unless
+    /// a parent test points it at a relay journal root.
+    #[test]
+    fn leased_relay_child_serves_stdio() {
+        let Some(root) = std::env::var_os(LEASED_RELAY_ROOT) else {
+            return;
+        };
+        // With `--nocapture` libtest writes `test <name> ... ` without a
+        // trailing newline before the body runs. End that line first so it
+        // cannot glue itself onto the first protocol frame.
+        println!();
+        let mut relay = crate::hel_worker::DurableRelay::open(
+            std::path::Path::new(&root),
+            LEASED_RELAY_SESSION,
+            "1.0.0",
+        )
+        .expect("open the test relay journal");
+        crate::hel_worker::serve_relay_json_lines(
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout().lock(),
+            &mut relay,
+        )
+        .expect("serve relay frames until the controller disconnects");
+    }
+
+    #[cfg(unix)]
+    fn exact_test_name(test: &str) -> String {
+        format!(
+            "{}::{test}",
+            module_path!()
+                .strip_prefix("hel::")
+                .unwrap_or(module_path!())
+        )
+    }
+
+    /// HEL_DATA_DIR is process-global, so every test that reaches the
+    /// controller database runs in an exact child with its own data directory.
+    #[cfg(unix)]
+    fn run_in_isolated_child(marker: &str, test: &str) {
+        let directory = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &exact_test_name(test), "--nocapture"])
+            .env(marker, "1")
+            .env("HEL_DATA_DIR", directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated {test} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A deferred submission that is never answered would hang the suite
+    /// instead of failing it, so turn a stall into a hard error.
+    #[cfg(unix)]
+    fn fail_if_the_actor_stalls(reason: &'static str) {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(60));
+            eprintln!("{reason}");
+            std::process::exit(101);
+        });
+    }
+
+    /// A relay target served by this test binary over stdio.
+    #[cfg(unix)]
+    fn leased_relay_target(relay_root: &std::path::Path) -> RelaySessionTarget {
+        // `RelayClient` parses every stdout line as JSON, so libtest's own
+        // progress lines are dropped before they reach the protocol reader.
+        let script = format!(
+            "\"$0\" --exact {} --nocapture | grep --line-buffered '^{{'",
+            exact_test_name("leased_relay_child_serves_stdio")
+        );
+        let mut spec = CommandSpec::new(
+            "sh",
+            [
+                "-c".to_owned(),
+                script,
+                std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+        )
+        .purpose("test leased relay");
+        spec.env.insert(
+            LEASED_RELAY_ROOT.to_owned(),
+            relay_root.to_string_lossy().into_owned(),
+        );
+        RelaySessionTarget {
+            session_id: LEASED_RELAY_SESSION.to_owned(),
+            spec,
+        }
+    }
+
+    /// Register the session the projection writes to. `apply_projection_event`
+    /// rejects events for sessions the controller database does not know.
+    #[cfg(unix)]
+    fn register_leased_relay_session() {
+        crate::hel_database::save_session(&crate::hel_state::SessionRecord {
+            id: LEASED_RELAY_SESSION.into(),
+            title: "leased relay".into(),
+            harness_kind: crate::hel_config::HarnessKind::Codex,
+            last_profile: "codex".into(),
+            bundle_id: "project".into(),
+            project_directory: None,
+            managed_worktree: None,
+            target_template_id: "podman".into(),
+            resource_allocation: None,
+            additional_mounts: Vec::new(),
+            state: crate::hel_state::SessionState::Running,
+            target: None,
+            native_session_id: None,
+            acp_session_title: None,
+            session_title_override: None,
+            created_at: "2026-08-12T00:00:00Z".into(),
+            updated_at: "2026-08-12T00:00:00Z".into(),
+            detached_after_event_ordinal: 0,
+            draft_input: String::new(),
+            last_error: None,
+            last_checkpoint_error: None,
+            checkpoint: None,
+        })
+        .expect("register the test session");
+    }
+
+    #[cfg(unix)]
+    struct LeasedActor {
+        commands: mpsc::Sender<ActorCommand>,
+        releases: mpsc::UnboundedSender<ReturnedConnection>,
+        retirement: watch::Sender<bool>,
+        _views: watch::Receiver<ManagedSessionView>,
+        _updates: SessionManagerUpdates,
+        _relay_root: tempfile::TempDir,
+    }
+
+    /// Start an actor against a live relay and take its connection under lease.
+    #[cfg(unix)]
+    async fn lease_a_live_actor() -> (LeasedActor, u64, StandaloneSession) {
+        register_leased_relay_session();
+        let relay_root = tempfile::tempdir().unwrap();
+        let (commands_tx, commands_rx) = mpsc::channel(4);
+        let (releases_tx, releases_rx) = mpsc::unbounded_channel();
+        let (retirement_tx, retirement_rx) = watch::channel(false);
+        let (view_tx, view_rx) = watch::channel(ManagedSessionView::default());
+        let (updates_tx, updates_rx) = coalesced_update_channel();
+        tokio::spawn(run_session_actor(
+            leased_relay_target(relay_root.path()),
+            commands_rx,
+            releases_rx,
+            retirement_rx,
+            view_tx,
+            updates_tx,
+        ));
+
+        let (reply, response) = oneshot::channel();
+        commands_tx
+            .send(ActorCommand::Lease { reply })
+            .await
+            .unwrap();
+        let (lease_id, connection) = response
+            .await
+            .expect("actor answered the lease request")
+            .expect("actor leased its relay connection");
+        (
+            LeasedActor {
+                commands: commands_tx,
+                releases: releases_tx,
+                retirement: retirement_tx,
+                _views: view_rx,
+                _updates: updates_rx,
+                _relay_root: relay_root,
+            },
+            lease_id,
+            connection,
+        )
+    }
+
+    #[cfg(unix)]
+    async fn submit_a_deferred_prompt(
+        actor: &LeasedActor,
+    ) -> oneshot::Receiver<std::result::Result<u64, String>> {
+        let (reply, mut response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::Submit {
+                command_id: new_command_id("prompt").unwrap(),
+                command: RelayCommand::Prompt {
+                    prompt: vec![ContentBlock::Text(TextContent::new("hello"))],
+                },
+                reply,
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut response)
+                .await
+                .is_err(),
+            "a leased actor must hold the prompt instead of answering it"
+        );
+        response
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prompt_submitted_during_lease_is_delivered_after_release() {
+        if std::env::var_os(DEFERRED_SUBMIT_TEST_CHILD).is_none() {
+            run_in_isolated_child(
+                DEFERRED_SUBMIT_TEST_CHILD,
+                "prompt_submitted_during_lease_is_delivered_after_release",
+            );
+            return;
+        }
+        fail_if_the_actor_stalls("prompt deferred during a lease was never delivered");
+
+        let (actor, lease_id, connection) = lease_a_live_actor().await;
+        let response = submit_a_deferred_prompt(&actor).await;
+
+        actor
+            .releases
+            .send(ReturnedConnection {
+                lease_id,
+                connection: Some(connection),
+            })
+            .unwrap();
+
+        let ordinal = response
+            .await
+            .expect("actor answered the deferred prompt")
+            .expect("deferred prompt reached the relay");
+        assert!(
+            ordinal > 0,
+            "relay accepted the prompt at ordinal {ordinal}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retirement_rejects_prompts_deferred_during_lease() {
+        if std::env::var_os(RETIRED_SUBMIT_TEST_CHILD).is_none() {
+            run_in_isolated_child(
+                RETIRED_SUBMIT_TEST_CHILD,
+                "retirement_rejects_prompts_deferred_during_lease",
+            );
+            return;
+        }
+        fail_if_the_actor_stalls("prompt deferred during a lease was never answered");
+
+        let (actor, lease_id, connection) = lease_a_live_actor().await;
+        let response = submit_a_deferred_prompt(&actor).await;
+
+        actor.retirement.send(true).unwrap();
+        actor
+            .releases
+            .send(ReturnedConnection {
+                lease_id,
+                connection: Some(connection),
+            })
+            .unwrap();
+
+        let error = response
+            .await
+            .expect("actor answered the deferred prompt")
+            .expect_err("a retiring actor must not deliver the prompt");
+        assert!(
+            error.contains("session target is changing"),
+            "unexpected rejection: {error}"
+        );
     }
 
     #[test]
