@@ -6404,7 +6404,13 @@ fn move_index(index: &mut usize, len: usize, delta: isize) {
         *index = 0;
         return;
     }
-    *index = ((*index as isize + delta).rem_euclid(len as isize)) as usize;
+    if delta.is_negative() {
+        *index = index.saturating_sub(delta.unsigned_abs());
+    } else {
+        *index = index
+            .saturating_add(delta as usize)
+            .min(len.saturating_sub(1));
+    }
 }
 
 fn nth_key<T>(map: &BTreeMap<String, T>, index: usize) -> String {
@@ -9108,6 +9114,37 @@ mod tests {
         assert_eq!(dashboard.focus, Focus::Capacity);
         dashboard.handle_key(key(KeyCode::BackTab));
         assert_eq!(dashboard.focus, Focus::Archived);
+    }
+
+    #[test]
+    fn keyboard_selection_stops_at_the_active_panes_ends_instead_of_wrapping() {
+        let sessions = (0..3)
+            .map(|index| {
+                let mut session = archived_session();
+                session.id = format!("session-{index}");
+                session.state = SessionState::Running;
+                (session.id.clone(), session)
+            })
+            .collect();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+
+        assert_eq!(dashboard.session_index, 0);
+        dashboard.handle_key(key(KeyCode::Up));
+        assert_eq!(dashboard.session_index, 0, "Up at the first row stays put");
+
+        dashboard.handle_key(key(KeyCode::Down));
+        dashboard.handle_key(key(KeyCode::Down));
+        assert_eq!(dashboard.session_index, 2);
+        dashboard.handle_key(key(KeyCode::Down));
+        assert_eq!(dashboard.session_index, 2, "Down at the last row stays put");
     }
 
     #[test]
