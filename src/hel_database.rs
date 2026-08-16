@@ -21,7 +21,7 @@ use crate::hel_state::{
 use crate::hel_targets::AdditionalMount;
 use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryScope {
@@ -316,6 +316,11 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
     }
     ensure_projection_digest_column(connection)?;
     ensure_session_draft_input_column(connection)?;
+    // Runs last: it rebuilds `sessions`, so every column the structural guards
+    // above add must already exist to be copied forward.
+    if version < 8 {
+        migrate_grok_harness_kind(connection)?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -473,6 +478,69 @@ fn migrate_destroying_session_state(connection: &Connection) -> Result<()> {
     let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
     if statement.exists([])? {
         bail!("foreign key violation after migrating durable destroying session state");
+    }
+    Ok(())
+}
+
+/// Admit the Grok Build harness. SQLite cannot widen a CHECK constraint in
+/// place, so this repeats the v7 table rebuild with the wider harness list.
+/// Foreign keys are disabled only around the rebuild transaction; every child
+/// continues to reference the replacement table by the same name.
+fn migrate_grok_harness_kind(connection: &Connection) -> Result<()> {
+    connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let migration = connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE sessions_v8 (
+             session_id TEXT PRIMARY KEY REFERENCES session_contexts(session_id),
+             title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+             harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi','grok')),
+             last_profile TEXT NOT NULL,
+             target_template_id TEXT NOT NULL,
+             state TEXT NOT NULL CHECK(state IN (
+                 'provisioning','running','disconnected','checkpointing','closing','destroying',
+                 'archived','lost','error','destroyed-with-data-loss'
+             )),
+             native_session_id TEXT,
+             acp_session_title TEXT CHECK(acp_session_title IS NULL OR length(trim(acp_session_title)) > 0),
+             session_title_override TEXT CHECK(session_title_override IS NULL OR length(trim(session_title_override)) > 0),
+             updated_at TEXT NOT NULL,
+             detached_after_event_ordinal INTEGER NOT NULL DEFAULT 0
+                 CHECK(detached_after_event_ordinal >= 0),
+             last_error TEXT,
+             resource_allocation TEXT,
+             last_checkpoint_error TEXT,
+             project_directory BLOB,
+             managed_worktree TEXT,
+             draft_input TEXT NOT NULL DEFAULT ''
+         ) STRICT;
+         INSERT INTO sessions_v8(
+             session_id, title, harness_kind, last_profile, target_template_id, state,
+             native_session_id, acp_session_title, session_title_override, updated_at,
+             detached_after_event_ordinal, last_error, resource_allocation,
+             last_checkpoint_error, project_directory, managed_worktree, draft_input
+         )
+         SELECT
+             session_id, title, harness_kind, last_profile, target_template_id, state,
+             native_session_id, acp_session_title, session_title_override, updated_at,
+             detached_after_event_ordinal, last_error, resource_allocation,
+             last_checkpoint_error, project_directory, managed_worktree, draft_input
+         FROM sessions;
+         DROP TABLE sessions;
+         ALTER TABLE sessions_v8 RENAME TO sessions;
+         INSERT INTO schema_migrations(version, applied_at)
+             VALUES (8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+         PRAGMA user_version = 8;
+         COMMIT;",
+    );
+    if migration.is_err() {
+        let _ = connection.execute_batch("ROLLBACK;");
+    }
+    let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+    migration.context("migrate sessions table for the Grok Build harness")?;
+    foreign_keys.context("restore foreign key enforcement after schema migration")?;
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    if statement.exists([])? {
+        bail!("foreign key violation after migrating the sessions harness list");
     }
     Ok(())
 }
@@ -2747,6 +2815,234 @@ mod tests {
                 )
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn version_seven_database_widens_the_harness_list_for_grok_without_losing_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(&format!(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE schema_migrations (
+                     version INTEGER PRIMARY KEY CHECK(version > 0),
+                     applied_at TEXT NOT NULL
+                 ) STRICT;
+                 CREATE TABLE session_contexts (
+                     session_id TEXT PRIMARY KEY,
+                     bundle_id TEXT NOT NULL,
+                     created_at TEXT NOT NULL
+                 ) STRICT;
+                 CREATE TABLE sessions (
+                     session_id TEXT PRIMARY KEY REFERENCES session_contexts(session_id),
+                     title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+                     harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi')),
+                     last_profile TEXT NOT NULL,
+                     target_template_id TEXT NOT NULL,
+                     state TEXT NOT NULL CHECK(state IN (
+                         'provisioning','running','disconnected','checkpointing','closing','destroying',
+                         'archived','lost','error','destroyed-with-data-loss'
+                     )),
+                     native_session_id TEXT,
+                     acp_session_title TEXT,
+                     session_title_override TEXT,
+                     updated_at TEXT NOT NULL,
+                     detached_after_event_ordinal INTEGER NOT NULL DEFAULT 0
+                         CHECK(detached_after_event_ordinal >= 0),
+                     last_error TEXT,
+                     resource_allocation TEXT,
+                     last_checkpoint_error TEXT,
+                     project_directory BLOB,
+                     managed_worktree TEXT
+                 ) STRICT;
+                 CREATE TABLE session_targets (
+                     session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+                     kind TEXT NOT NULL CHECK(kind IN ('local-bare','local-podman','apple-container','aws-ec2','ssh-bare','ssh-podman')),
+                     host TEXT,
+                     resource_id TEXT,
+                     address TEXT,
+                     workspace BLOB,
+                     worker_id TEXT
+                 ) STRICT;
+                 CREATE TABLE session_checkpoints (
+                     session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+                     archive_path BLOB NOT NULL,
+                     sha256 TEXT NOT NULL,
+                     created_at TEXT NOT NULL,
+                     event_frontier INTEGER NOT NULL CHECK(event_frontier >= 0)
+                 ) STRICT;
+                 CREATE TABLE prompt_history (
+                     history_id INTEGER PRIMARY KEY,
+                     session_id TEXT NOT NULL REFERENCES session_contexts(session_id),
+                     event_ordinal INTEGER NOT NULL CHECK(event_ordinal >= 0),
+                     submitted_at TEXT NOT NULL,
+                     text TEXT NOT NULL CHECK(length(trim(text)) > 0),
+                     UNIQUE(session_id, event_ordinal)
+                 ) STRICT;
+                 CREATE TABLE materialized_sessions (
+                     session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+                     applied_event_ordinal INTEGER NOT NULL DEFAULT 0
+                         CHECK(applied_event_ordinal >= 0),
+                     applied_event_digest TEXT NOT NULL
+                         DEFAULT '{RELAY_EVENT_GENESIS_DIGEST}'
+                         CHECK(length(applied_event_digest) = 64
+                               AND applied_event_digest NOT GLOB '*[^0-9a-f]*'),
+                     last_activity_at_ms INTEGER,
+                     execution_state TEXT NOT NULL DEFAULT 'idle'
+                         CHECK(execution_state IN ('idle','running','closing','closed')),
+                     running_started_at_ms INTEGER,
+                     session_title TEXT,
+                     configuration_json TEXT NOT NULL DEFAULT '{{}}'
+                 ) STRICT;
+                 CREATE TABLE materialized_transcript_items (
+                     session_id TEXT NOT NULL REFERENCES materialized_sessions(session_id) ON DELETE CASCADE,
+                     stable_id TEXT NOT NULL,
+                     position INTEGER NOT NULL CHECK(position > 0),
+                     latest_content_event_ordinal INTEGER,
+                     created_at_ms INTEGER NOT NULL,
+                     last_changed_at_ms INTEGER NOT NULL,
+                     body_json TEXT NOT NULL,
+                     PRIMARY KEY(session_id, stable_id)
+                 ) STRICT;
+                 CREATE TABLE materialized_queued_prompts (
+                     session_id TEXT NOT NULL REFERENCES materialized_sessions(session_id) ON DELETE CASCADE,
+                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                     command_id TEXT NOT NULL,
+                     content_json TEXT NOT NULL,
+                     queued_at_ms INTEGER NOT NULL,
+                     PRIMARY KEY(session_id, ordinal),
+                     UNIQUE(session_id, command_id)
+                 ) STRICT;
+                 INSERT INTO schema_migrations(version, applied_at)
+                     VALUES (1, 'now'), (2, 'now'), (3, 'now'), (4, 'now'), (5, 'now'),
+                            (6, 'now'), (7, 'now');
+                 INSERT INTO session_contexts VALUES ('session-1', 'project-1', 'now');
+                 INSERT INTO sessions(
+                     session_id, title, harness_kind, last_profile, target_template_id,
+                     state, updated_at, detached_after_event_ordinal, last_error
+                 ) VALUES (
+                     'session-1', 'old session', 'kimi', 'kimi-1', 'podman',
+                     'running', 'now', 12, 'nothing yet'
+                 );
+                 INSERT INTO session_targets(session_id, kind, resource_id)
+                     VALUES ('session-1', 'local-podman', 'container-1');
+                 INSERT INTO materialized_sessions(session_id) VALUES ('session-1');
+                 PRAGMA user_version = 7;",
+            ))
+            .unwrap();
+        drop(connection);
+
+        let connection = open(&database).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        // The existing row survives the rebuild with every column intact.
+        let (title, harness, ordinal, error, draft): (String, String, u64, String, String) =
+            connection
+                .query_row(
+                    "SELECT title, harness_kind, detached_after_event_ordinal, last_error,
+                            draft_input
+                     FROM sessions WHERE session_id = 'session-1'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+        assert_eq!(
+            (
+                title.as_str(),
+                harness.as_str(),
+                ordinal,
+                error.as_str(),
+                draft.as_str()
+            ),
+            ("old session", "kimi", 12, "nothing yet", "")
+        );
+        // Children still resolve through the replacement table.
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT resource_id FROM session_targets WHERE session_id = 'session-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "container-1"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM materialized_sessions WHERE session_id = 'session-1'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        connection
+            .execute_batch(
+                "INSERT INTO session_contexts VALUES ('session-2', 'project-1', 'now');
+                 INSERT INTO sessions(
+                     session_id, title, harness_kind, last_profile, target_template_id,
+                     state, updated_at
+                 ) VALUES (
+                     'session-2', 'grok session', 'grok', 'grok-1', 'podman',
+                     'running', 'now'
+                 );",
+            )
+            .expect("a migrated database must accept a Grok Build session");
+    }
+
+    #[test]
+    fn a_fresh_database_accepts_a_session_for_every_harness_kind() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = open(&directory.path().join("hel.sqlite3")).unwrap();
+
+        for (index, kind) in HarnessKind::ALL.into_iter().enumerate() {
+            let session_id = format!("session-{index}");
+            connection
+                .execute(
+                    "INSERT INTO session_contexts VALUES (?1, 'project-1', 'now')",
+                    params![session_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO sessions(
+                         session_id, title, harness_kind, last_profile, target_template_id,
+                         state, updated_at
+                     ) VALUES (?1, ?2, ?3, 'profile-1', 'podman', 'running', 'now')",
+                    params![session_id, format!("{kind:?} session"), kind.id()],
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "the sessions harness_kind CHECK must admit {:?} ({:?}): {error}",
+                        kind,
+                        kind.id()
+                    )
+                });
+        }
+
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM sessions", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            HarnessKind::ALL.len()
         );
     }
 
