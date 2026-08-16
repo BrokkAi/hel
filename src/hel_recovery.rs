@@ -20,6 +20,12 @@ use crate::hel_targets::CancellableProcessExecutor;
 
 pub const AUTO_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
+/// Upper bound on one background recovery copy. A copy that wedges - a child
+/// that never exits, a remote helper that stops reading - must become a
+/// reported failure rather than block pause and delete for the session
+/// forever.
+const RECOVERY_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 #[derive(Debug, Clone)]
 pub struct RecoveryObservation {
     pub session: SessionRecord,
@@ -45,6 +51,10 @@ pub struct RecoveryResult {
     pub session_id: String,
     pub expected_target: crate::hel_state::TargetLocator,
     pub outcome: Result<CheckpointArtifact, String>,
+    /// The copy was abandoned rather than judged: a lifecycle operation
+    /// preempted it or the coordinator shut down. A copy that ran past its
+    /// deadline is not marked cancelled; it counts as a real failure.
+    pub cancelled: bool,
 }
 
 /// Reports session activity to the recovery coordinator.
@@ -88,7 +98,9 @@ struct RecoveryGate {
 
 #[derive(Default)]
 struct RecoveryGateState {
-    busy: BTreeSet<String>,
+    /// In-flight copies, each with the cancel flag its executor watches, so a
+    /// foreground lifecycle operation can preempt one instead of waiting.
+    busy: BTreeMap<String, Arc<AtomicBool>>,
     reservations: BTreeMap<String, usize>,
 }
 
@@ -113,13 +125,16 @@ impl RecoveryGate {
         }
     }
 
-    fn try_start(&self, session_id: &str) -> bool {
+    /// Claims the session for a copy and returns the cancel flag that copy
+    /// must watch, or `None` when a copy or a reservation already holds it.
+    fn try_start(&self, session_id: &str) -> Option<Arc<AtomicBool>> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.busy.contains(session_id) || state.reservations.contains_key(session_id) {
-            return false;
+        if state.busy.contains_key(session_id) || state.reservations.contains_key(session_id) {
+            return None;
         }
-        state.busy.insert(session_id.to_owned());
-        true
+        let cancelled = Arc::new(AtomicBool::new(false));
+        state.busy.insert(session_id.to_owned(), cancelled.clone());
+        Some(cancelled)
     }
 
     fn finish(&self, session_id: &str) {
@@ -135,7 +150,33 @@ impl RecoveryGate {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .busy
-            .contains(session_id)
+            .contains_key(session_id)
+    }
+
+    /// Asks the in-flight copy for this session, if any, to stop.
+    fn cancel_busy(&self, session_id: &str) {
+        if let Some(cancelled) = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .busy
+            .get(session_id)
+        {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    /// Asks every in-flight copy to stop, used when the coordinator shuts down.
+    fn cancel_all(&self) {
+        for cancelled in self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .busy
+            .values()
+        {
+            cancelled.store(true, Ordering::Release);
+        }
     }
 
     fn busy_sessions(&self) -> BTreeSet<String> {
@@ -143,7 +184,9 @@ impl RecoveryGate {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .busy
-            .clone()
+            .keys()
+            .cloned()
+            .collect()
     }
 }
 
@@ -189,6 +232,13 @@ impl RecoveryObserver {
         self.gate.reserve(session_id)
     }
 
+    /// Asks an in-flight recovery copy for this session to stop. A foreground
+    /// lifecycle operation calls this after reserving so it preempts the copy
+    /// instead of waiting behind it.
+    pub fn cancel_busy(&self, session_id: &str) {
+        self.gate.cancel_busy(session_id);
+    }
+
     pub async fn wait_idle(&self, session_id: &str) {
         let mut busy = self.busy.clone();
         while self.is_busy(session_id) {
@@ -207,7 +257,11 @@ pub struct RecoveryCoordinator {
 
 impl Drop for RecoveryCoordinator {
     fn drop(&mut self) {
+        // Stop the coordinator loop, then cancel every copy already running.
+        // A copy registers its flag with the gate before it starts, so no
+        // in-flight copy can miss this.
         self.cancelled.store(true, Ordering::Release);
+        self.observer.gate.cancel_all();
     }
 }
 
@@ -237,13 +291,13 @@ impl RecoveryCoordinator {
                         policy.observe_completed_turn(observation.latest_completed_turn_ordinal);
                         if policy.due(observation.execution, Utc::now())
                             && let Some(expected_target) = observation.session.target.clone()
-                            && coordinator_gate.try_start(&session_id)
+                            && let Some(copy_cancelled) = coordinator_gate.try_start(&session_id)
                         {
                             policy.last_attempted_turn = Some(policy.latest_completed_turn);
                             busy_tx.send_replace(coordinator_gate.busy_sessions());
                             let completed_tx = completed_tx.clone();
                             let session_manager = session_manager.clone();
-                            let cancelled = coordinator_cancelled.clone();
+                            let cancelled = copy_cancelled.clone();
                             let handle = tokio::runtime::Handle::current();
                             let task_session_id = session_id.clone();
                             tokio::spawn(async move {
@@ -257,7 +311,8 @@ impl RecoveryCoordinator {
                                         config: observation.config,
                                         state,
                                     };
-                                    let executor = CancellableProcessExecutor::new(cancelled);
+                                    let executor = CancellableProcessExecutor::new(cancelled)
+                                        .with_deadline(RECOVERY_CHECKPOINT_TIMEOUT);
                                     handle
                                         .block_on(
                                             controller
@@ -280,6 +335,7 @@ impl RecoveryCoordinator {
                                     session_id,
                                     expected_target,
                                     outcome,
+                                    cancelled: copy_cancelled.load(Ordering::Acquire),
                                 };
                                 let _ = completed_tx.send(result);
                             });
@@ -295,6 +351,15 @@ impl RecoveryCoordinator {
                                 policy.checkpoint = Some(artifact.metadata.clone());
                             }
                             Err(detail) => {
+                                if result.cancelled {
+                                    // A preempted copy says nothing about this
+                                    // turn: it must neither suppress the next
+                                    // attempt nor be recorded as a checkpoint
+                                    // failure against the session.
+                                    policy.last_attempted_turn = None;
+                                    let _ = results_tx.send(result);
+                                    continue;
+                                }
                                 let session_id = result.session_id.clone();
                                 let detail = detail.clone();
                                 let persisted = tokio::task::spawn_blocking(move || {
@@ -490,13 +555,78 @@ mod tests {
         let gate = Arc::new(RecoveryGate::default());
         let reservation = gate.reserve("session-1");
 
-        assert!(!gate.try_start("session-1"));
+        assert!(gate.try_start("session-1").is_none());
 
         drop(reservation);
-        assert!(gate.try_start("session-1"));
+        assert!(gate.try_start("session-1").is_some());
         assert!(gate.is_busy("session-1"));
+        assert!(gate.try_start("session-1").is_none());
         gate.finish("session-1");
         assert!(!gate.is_busy("session-1"));
+    }
+
+    /// A lifecycle operation must be able to preempt the copy that is already
+    /// running, not only block the next one.
+    #[test]
+    fn cancelling_a_busy_session_stops_the_copy_in_flight() {
+        let gate = Arc::new(RecoveryGate::default());
+        let copy_cancelled = gate.try_start("session-1").unwrap();
+        assert!(!copy_cancelled.load(Ordering::Acquire));
+
+        gate.cancel_busy("session-1");
+        assert!(copy_cancelled.load(Ordering::Acquire));
+
+        gate.finish("session-1");
+        assert!(!gate.is_busy("session-1"));
+        // The finished copy's flag is gone, so a later cancellation cannot
+        // reach it and the next copy starts with a fresh flag.
+        gate.cancel_busy("session-1");
+        let next = gate.try_start("session-1").unwrap();
+        assert!(!next.load(Ordering::Acquire));
+    }
+
+    /// Cancelling a session that is not copying, or a session that never
+    /// copied, must be harmless.
+    #[test]
+    fn cancelling_an_idle_session_is_a_no_op() {
+        let gate = Arc::new(RecoveryGate::default());
+        gate.cancel_busy("session-1");
+        assert!(!gate.is_busy("session-1"));
+    }
+
+    /// Coordinator shutdown reaches copies that already started; their flags,
+    /// not the coordinator's, are what their executors watch.
+    #[test]
+    fn coordinator_shutdown_cancels_every_copy_in_flight() {
+        let gate = Arc::new(RecoveryGate::default());
+        let first = gate.try_start("session-1").unwrap();
+        let second = gate.try_start("session-2").unwrap();
+
+        gate.cancel_all();
+
+        assert!(first.load(Ordering::Acquire));
+        assert!(second.load(Ordering::Acquire));
+        assert_eq!(
+            gate.busy_sessions(),
+            ["session-1".to_owned(), "session-2".to_owned()]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// A copy that was preempted never judged the turn, so the next
+    /// observation of that same turn must be allowed to try again.
+    #[test]
+    fn a_preempted_attempt_leaves_the_turn_retryable() {
+        let mut policy = PolicyState {
+            latest_completed_turn: 8,
+            last_attempted_turn: Some(8),
+            ..Default::default()
+        };
+        assert!(!policy.due(MaterializedExecutionState::Idle, Utc::now()));
+
+        policy.last_attempted_turn = None;
+        assert!(policy.due(MaterializedExecutionState::Idle, Utc::now()));
     }
 
     #[tokio::test]

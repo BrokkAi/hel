@@ -2933,7 +2933,12 @@ fn apply_recovery_result(
     result: hel::hel_recovery::RecoveryResult,
 ) {
     let session_id = result.session_id.clone();
-    let failure = result.outcome.as_ref().err().cloned();
+    let failure = if result.cancelled {
+        // A copy the user preempted is not a failure worth reporting.
+        None
+    } else {
+        result.outcome.as_ref().err().cloned()
+    };
     if merge_recovery_result(controller, result) {
         dashboard.set_state(controller.state.clone());
         if let Some(detail) = failure {
@@ -2953,6 +2958,7 @@ fn merge_recovery_result(
         session_id,
         expected_target,
         outcome,
+        cancelled,
     } = result;
     if let Err(error) = controller.reload() {
         tracing::warn!(%session_id, "could not reload a completed recovery checkpoint: {error:#}");
@@ -2973,6 +2979,11 @@ fn merge_recovery_result(
                 );
                 return false;
             }
+        }
+        Err(_) if cancelled => {
+            // A preempted copy was never judged, so it must not leave a
+            // checkpoint error on the session.
+            return false;
         }
         Err(detail) => {
             // record_recovery_failure normally made this durable before the
@@ -4949,6 +4960,10 @@ fn reserve_recovery_or_cancel(
     cancelled: &AtomicBool,
 ) -> Result<hel::hel_recovery::RecoveryReservation> {
     let reservation = observer.reserve(session_id);
+    // The reservation stops the next copy; cancelling preempts the one already
+    // running so a lifecycle operation never queues behind a long or wedged
+    // copy.
+    observer.cancel_busy(session_id);
     while observer.is_busy(session_id) {
         if cancelled.load(Ordering::Acquire) {
             bail!("operation cancelled while waiting for recovery copy");
