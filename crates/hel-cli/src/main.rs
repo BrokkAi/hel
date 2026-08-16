@@ -3221,6 +3221,7 @@ async fn open_chat_view(
     session_id: &str,
     sessions: &SessionManagerControl,
     recovery_observer: &hel::hel_recovery::RecoveryObserver,
+    notices: hel::hel_chat::Notices,
 ) -> Result<hel::hel_chat::ActiveChat> {
     let session_record = controller
         .state
@@ -3232,17 +3233,30 @@ async fn open_chat_view(
     // Only a fresh view is seeded: a warm chat the loop kept alive holds newer
     // input than this saved copy.
     let saved_draft = session_record.draft_input.clone();
-    let other_sessions = controller
+    // The header lists every active session in the order the session list
+    // shows them, so each one keeps the same place in both views.
+    let mut active = controller
         .state
         .sessions
         .values()
-        .filter(|record| record.id != session_id && record.state.is_active())
-        .map(|record| hel::hel_chat::OtherSessionIdentity {
-            session_id: record.id.clone(),
-            display_title: record.display_title().to_owned(),
-            detached_after_event_ordinal: record.detached_after_event_ordinal,
-        })
+        .filter(|record| record.state.is_active())
         .collect::<Vec<_>>();
+    active.sort_by(|left, right| left.compare_by_creation(right));
+    let mut header = hel::hel_chat::SessionHeaderIdentity {
+        project: session_record.project_name(&controller.config),
+        ..hel::hel_chat::SessionHeaderIdentity::default()
+    };
+    for (position, record) in active.into_iter().enumerate() {
+        if record.id == session_id {
+            header.position = position;
+            continue;
+        }
+        header.others.push(hel::hel_chat::OtherSessionIdentity {
+            session_id: record.id.clone(),
+            position,
+            project: record.project_name(&controller.config),
+        });
+    }
     let recovery_context = hel::hel_recovery::RecoveryContext {
         observer: recovery_observer.clone(),
         session: session_record,
@@ -3254,8 +3268,9 @@ async fn open_chat_view(
         &bundle_id,
         Some(recovery_context),
         sessions.clone(),
-        other_sessions,
+        header,
         saved_draft,
+        notices,
     ))
 }
 
@@ -3325,6 +3340,10 @@ async fn run_dashboard() -> Result<()> {
         controller.state.clone(),
         std::collections::BTreeMap::new(),
     );
+    // One notifications bar for the whole process: the dashboard and every
+    // chat view opened below report through the same shared handle.
+    let notices = hel::hel_chat::Notices::default();
+    dashboard.share_notices(notices.clone());
     for (session_id, queued) in projected_queued_prompts(&controller)? {
         dashboard.apply_queued_prompts(&session_id, queued);
     }
@@ -3619,11 +3638,12 @@ async fn run_dashboard() -> Result<()> {
             },
             // Turn clocks, countdowns, and credential-sync backoffs move on
             // their own, so the dashboard redraws once a second regardless.
-            // The chat has no animation; its only time-driven text is the
-            // checkpoint title, so it redraws only when that flag has moved.
+            // The chat redraws only when its own time-driven text has moved:
+            // a running turn clock in the session header, or the checkpoint
+            // title.
             _ = clock_tick.tick() => {
                 dirty |= match (view, active_chat.as_ref()) {
-                    (View::Chat, Some(chat)) => chat.recovery_title_is_stale(),
+                    (View::Chat, Some(chat)) => chat.needs_clock_tick(),
                     _ => true,
                 };
             }
@@ -4406,6 +4426,7 @@ async fn run_dashboard() -> Result<()> {
                         &session_id,
                         &worker_commands_tx,
                         &recovery_observer,
+                        notices.clone(),
                     )
                     .await
                     {

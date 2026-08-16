@@ -545,6 +545,47 @@ impl SessionRecord {
             .unwrap_or(&self.id)
     }
 
+    /// Project this session works in, as the session list and the chat header
+    /// both name it: the source repository of a managed worktree, else the
+    /// project directory, else the bundle's primary repository, else the
+    /// bundle id.
+    pub fn project_name(&self, config: &HelConfig) -> String {
+        if let Some(worktree) = &self.managed_worktree {
+            return path_leaf(&worktree.source_repository);
+        }
+        if let Some(project_directory) = &self.project_directory {
+            return path_leaf(project_directory);
+        }
+        config
+            .bundles
+            .get(&self.bundle_id)
+            .and_then(|bundle| {
+                bundle
+                    .repositories
+                    .iter()
+                    .find(|repository| repository.id == bundle.primary_repo)
+                    .or_else(|| bundle.repositories.first())
+            })
+            .map(|repository| path_leaf(&repository.destination))
+            .unwrap_or_else(|| path_leaf(Path::new(&self.bundle_id)))
+    }
+
+    /// Orders two sessions the way the session list's sequence view does:
+    /// oldest first by creation time, with the id as a stable tiebreak. A
+    /// session whose timestamp does not parse sorts last.
+    pub fn compare_by_creation(&self, other: &Self) -> std::cmp::Ordering {
+        match (
+            created_at_seconds(&self.created_at),
+            created_at_seconds(&other.created_at),
+        ) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| self.id.cmp(&other.id))
+    }
+
     fn validate(&self, map_id: &str) -> Result<()> {
         validate_id("session", &self.id)?;
         if self.id != map_id {
@@ -596,6 +637,20 @@ impl SessionRecord {
         }
         Ok(())
     }
+}
+
+/// Last component of a path, falling back to the whole path when it has none.
+fn path_leaf(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn created_at_seconds(timestamp: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|timestamp| timestamp.timestamp())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -901,6 +956,74 @@ mod tests {
                 },
             )]),
         }
+    }
+
+    fn sample_session() -> SessionRecord {
+        sample_state()
+            .sessions
+            .remove("0123456789abcdef")
+            .expect("sample session")
+    }
+
+    #[test]
+    fn project_name_prefers_a_worktree_source_then_a_project_directory_then_the_bundle() {
+        let mut config = sample_config();
+        config
+            .bundles
+            .get_mut("hel")
+            .expect("bundle")
+            .repositories
+            .push(ProjectRepository {
+                id: "docs".into(),
+                github: Some("BrokkAi/docs".into()),
+                local: None,
+                destination: PathBuf::from("documentation"),
+                git_ref: None,
+            });
+        let mut session = sample_session();
+
+        assert_eq!(session.project_name(&config), "hel");
+
+        session.project_directory = Some(PathBuf::from("/home/test/Projects/raw-project"));
+        assert_eq!(session.project_name(&config), "raw-project");
+
+        session.project_directory = Some(PathBuf::from(
+            "/home/test/Projects/source/.hel/worktrees/0123456789abcdef",
+        ));
+        session.managed_worktree = Some(ManagedWorktree {
+            source_project_directory: PathBuf::from("/home/test/Projects/source"),
+            source_repository: PathBuf::from("/home/test/Projects/source"),
+            worktree_root: PathBuf::from(
+                "/home/test/Projects/source/.hel/worktrees/0123456789abcdef",
+            ),
+            branch: "hel/0123456789abcdef".into(),
+            target: ManagedWorktreeTarget::Local,
+        });
+        assert_eq!(session.project_name(&config), "source");
+    }
+
+    #[test]
+    fn sessions_order_by_creation_time_and_fall_back_to_the_id() {
+        let older = sample_session();
+        let mut newer = sample_session();
+        newer.id = "0000000000000001".into();
+        newer.created_at = "2026-08-09T13:00:00Z".into();
+        let mut unparsable = sample_session();
+        unparsable.id = "0000000000000002".into();
+        unparsable.created_at = "not a timestamp".into();
+        let mut same_time = sample_session();
+        same_time.id = "zzzzzzzzzzzzzzzz".into();
+
+        let mut sessions = [&unparsable, &newer, &same_time, &older];
+        sessions.sort_by(|left, right| left.compare_by_creation(right));
+
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| &session.id)
+                .collect::<Vec<_>>(),
+            [&older.id, &same_time.id, &newer.id, &unparsable.id]
+        );
     }
 
     #[test]
