@@ -362,6 +362,23 @@ enum Confirmation {
     },
 }
 
+/// A confirmation dialog plus the index of its focused button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfirmDialog {
+    confirmation: Confirmation,
+    focus: usize,
+}
+
+impl ConfirmDialog {
+    fn new(confirmation: Confirmation) -> Self {
+        let focus = primary_button(confirmation_buttons(&confirmation));
+        Self {
+            confirmation,
+            focus,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Mode {
     Dashboard,
@@ -371,7 +388,7 @@ enum Mode {
     Import(ImportDialog),
     Importing(ImportProgress),
     ConfirmImportBundle(ImportBundleConfirmation),
-    Confirm(Confirmation),
+    Confirm(ConfirmDialog),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,6 +406,59 @@ struct ImportBundleConfirmation {
     omitted_non_git_dirs: Vec<String>,
     has_untracked_files: bool,
     ignore_untracked: bool,
+    focus: usize,
+}
+
+const IMPORT_BUNDLE_BUTTONS: &[&str] = &["Cancel", "Continue"];
+
+/// Button labels for a confirmation dialog, ordered Cancel first and the primary
+/// action last. Typed-confirmation dialogs have no buttons. This is the single
+/// declaration used by both key handling and rendering.
+fn confirmation_buttons(confirmation: &Confirmation) -> &'static [&'static str] {
+    match confirmation {
+        Confirmation::DirtyLocal { .. } => &["Cancel", "Continue"],
+        Confirmation::Close { .. } => &["Cancel", "Pause"],
+        Confirmation::DeleteArchived { .. } => &["Cancel", "Delete"],
+        Confirmation::CloseFailed { .. } => &["Cancel", "Force destroy", "Retry pause"],
+        Confirmation::ForceDestroy { .. } | Confirmation::DeleteActive { .. } => &[],
+    }
+}
+
+/// Index of the primary (rightmost) button, which is focused when a dialog opens.
+fn primary_button(labels: &[&str]) -> usize {
+    labels.len().saturating_sub(1)
+}
+
+/// What a key press means for a focusable button row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ButtonKey {
+    Focus(usize),
+    Activate(usize),
+    Cancel,
+    Ignored,
+}
+
+fn button_row_key(code: KeyCode, focus: usize, count: usize) -> ButtonKey {
+    match code {
+        KeyCode::Tab | KeyCode::Right => ButtonKey::Focus(cycle_button_focus(focus, count, false)),
+        KeyCode::BackTab | KeyCode::Left => {
+            ButtonKey::Focus(cycle_button_focus(focus, count, true))
+        }
+        KeyCode::Enter => ButtonKey::Activate(focus),
+        KeyCode::Esc => ButtonKey::Cancel,
+        _ => ButtonKey::Ignored,
+    }
+}
+
+fn cycle_button_focus(focus: usize, count: usize, reverse: bool) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    if reverse {
+        focus.min(count - 1).checked_sub(1).unwrap_or(count - 1)
+    } else {
+        (focus + 1) % count
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1021,10 +1091,10 @@ impl DashboardState {
 
     /// Show the recovery choices after a checkpointed close could not finish.
     pub fn show_close_failure(&mut self, session_id: String, error: impl Into<String>) {
-        self.mode = Mode::Confirm(Confirmation::CloseFailed {
+        self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::CloseFailed {
             session_id,
             error: error.into(),
-        });
+        }));
     }
 
     pub fn show_import_dialog(&mut self, discovery_id: u64, profiles: Vec<ImportProfileOption>) {
@@ -1138,6 +1208,7 @@ impl DashboardState {
             omitted_non_git_dirs,
             has_untracked_files,
             ignore_untracked: has_untracked_files,
+            focus: primary_button(IMPORT_BUNDLE_BUTTONS),
         });
     }
 
@@ -1146,10 +1217,10 @@ impl DashboardState {
         action: DashboardAction,
         repositories: Vec<String>,
     ) {
-        self.mode = Mode::Confirm(Confirmation::DirtyLocal {
+        self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DirtyLocal {
             action,
             repositories,
-        });
+        }));
     }
 
     pub fn finish_import(&mut self) {
@@ -1184,26 +1255,10 @@ impl DashboardState {
                 KeyCode::Esc => DashboardAction::CancelImport,
                 _ => DashboardAction::None,
             },
-            Mode::ConfirmImportBundle(mut confirmation) => match key.code {
-                KeyCode::Char(' ') if confirmation.has_untracked_files => {
-                    confirmation.ignore_untracked = !confirmation.ignore_untracked;
-                    self.mode = Mode::ConfirmImportBundle(confirmation);
-                    DashboardAction::None
-                }
-                KeyCode::Char('y') | KeyCode::Enter => DashboardAction::ConfirmImportBundle {
-                    accepted: true,
-                    include_untracked: !confirmation.ignore_untracked,
-                },
-                KeyCode::Char('n') | KeyCode::Esc => DashboardAction::ConfirmImportBundle {
-                    accepted: false,
-                    include_untracked: false,
-                },
-                _ => {
-                    self.mode = Mode::ConfirmImportBundle(confirmation);
-                    DashboardAction::None
-                }
-            },
-            Mode::Confirm(confirmation) => self.handle_confirmation_key(key.code, confirmation),
+            Mode::ConfirmImportBundle(confirmation) => {
+                self.handle_import_bundle_key(key.code, confirmation)
+            }
+            Mode::Confirm(dialog) => self.handle_confirmation_key(key.code, dialog),
         }
     }
 
@@ -1241,8 +1296,11 @@ impl DashboardState {
                 dialog.filter.push_str(&pasted);
                 dialog.session_index = 0;
             }
-            Mode::Confirm(Confirmation::ForceDestroy { typed, .. })
-            | Mode::Confirm(Confirmation::DeleteActive { typed, .. }) => {
+            Mode::Confirm(ConfirmDialog {
+                confirmation:
+                    Confirmation::ForceDestroy { typed, .. } | Confirmation::DeleteActive { typed, .. },
+                ..
+            }) => {
                 let remaining = FORCE_CONFIRMATION.len().saturating_sub(typed.len());
                 typed.extend(
                     pasted
@@ -1381,9 +1439,9 @@ impl DashboardState {
                     return DashboardAction::None;
                 }
                 if let Some(session) = self.selected_session() {
-                    self.mode = Mode::Confirm(Confirmation::Close {
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::Close {
                         session_id: session.id.clone(),
-                    });
+                    }));
                 }
                 DashboardAction::None
             }
@@ -1392,9 +1450,9 @@ impl DashboardState {
                     return DashboardAction::None;
                 }
                 if let Some(session) = self.selected_session() {
-                    self.mode = Mode::Confirm(Confirmation::DeleteArchived {
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteArchived {
                         session_id: session.id.clone(),
-                    });
+                    }));
                 }
                 DashboardAction::None
             }
@@ -1415,10 +1473,10 @@ impl DashboardState {
                     if !has_assistant_messages {
                         return DashboardAction::DeleteActive { session_id };
                     }
-                    self.mode = Mode::Confirm(Confirmation::DeleteActive {
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
                         session_id,
                         typed: String::new(),
-                    });
+                    }));
                 }
                 DashboardAction::None
             }
@@ -2958,81 +3016,113 @@ impl DashboardState {
         action
     }
 
-    fn handle_confirmation_key(
+    fn handle_import_bundle_key(
+        &mut self,
+        code: KeyCode,
+        mut confirmation: ImportBundleConfirmation,
+    ) -> DashboardAction {
+        // The checkbox toggle is independent of which button has focus.
+        if code == KeyCode::Char(' ') && confirmation.has_untracked_files {
+            confirmation.ignore_untracked = !confirmation.ignore_untracked;
+            self.mode = Mode::ConfirmImportBundle(confirmation);
+            return DashboardAction::None;
+        }
+        let cancelled = DashboardAction::ConfirmImportBundle {
+            accepted: false,
+            include_untracked: false,
+        };
+        confirmation.focus =
+            match button_row_key(code, confirmation.focus, IMPORT_BUNDLE_BUTTONS.len()) {
+                ButtonKey::Activate(index) if index == primary_button(IMPORT_BUNDLE_BUTTONS) => {
+                    return DashboardAction::ConfirmImportBundle {
+                        accepted: true,
+                        include_untracked: !confirmation.ignore_untracked,
+                    };
+                }
+                ButtonKey::Activate(_) | ButtonKey::Cancel => return cancelled,
+                ButtonKey::Focus(focus) => focus,
+                ButtonKey::Ignored => confirmation.focus,
+            };
+        self.mode = Mode::ConfirmImportBundle(confirmation);
+        DashboardAction::None
+    }
+
+    fn handle_confirmation_key(&mut self, code: KeyCode, dialog: ConfirmDialog) -> DashboardAction {
+        let ConfirmDialog {
+            confirmation,
+            focus,
+        } = dialog;
+        let buttons = confirmation_buttons(&confirmation);
+        if buttons.is_empty() {
+            return self.handle_typed_confirmation_key(code, confirmation);
+        }
+        let focus = match button_row_key(code, focus, buttons.len()) {
+            ButtonKey::Activate(index) => {
+                return self.activate_confirmation_button(confirmation, index);
+            }
+            ButtonKey::Cancel => {
+                self.cancel_modal();
+                return DashboardAction::None;
+            }
+            ButtonKey::Focus(next) => next,
+            ButtonKey::Ignored => focus,
+        };
+        self.mode = Mode::Confirm(ConfirmDialog {
+            confirmation,
+            focus,
+        });
+        DashboardAction::None
+    }
+
+    /// Runs the button at `index` of `confirmation_buttons`, where index 0 is always Cancel.
+    fn activate_confirmation_button(
+        &mut self,
+        confirmation: Confirmation,
+        index: usize,
+    ) -> DashboardAction {
+        match (confirmation, index) {
+            (Confirmation::DirtyLocal { mut action, .. }, 1) => {
+                if let DashboardAction::CreateSession {
+                    allow_dirty_local, ..
+                } = &mut action
+                {
+                    *allow_dirty_local = true;
+                }
+                self.cancel_modal();
+                action
+            }
+            (Confirmation::Close { session_id }, 1) => {
+                self.cancel_modal();
+                DashboardAction::Close { session_id }
+            }
+            (Confirmation::DeleteArchived { session_id }, 1) => {
+                self.cancel_modal();
+                DashboardAction::DeleteArchived { session_id }
+            }
+            (Confirmation::CloseFailed { session_id, .. }, 1) => {
+                self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
+                    session_id,
+                    typed: String::new(),
+                }));
+                DashboardAction::None
+            }
+            (Confirmation::CloseFailed { session_id, .. }, 2) => {
+                self.cancel_modal();
+                DashboardAction::Close { session_id }
+            }
+            _ => {
+                self.cancel_modal();
+                DashboardAction::None
+            }
+        }
+    }
+
+    fn handle_typed_confirmation_key(
         &mut self,
         code: KeyCode,
         confirmation: Confirmation,
     ) -> DashboardAction {
         match confirmation {
-            Confirmation::DirtyLocal {
-                mut action,
-                repositories,
-            } => match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    if let DashboardAction::CreateSession {
-                        allow_dirty_local, ..
-                    } = &mut action
-                    {
-                        *allow_dirty_local = true;
-                    }
-                    self.cancel_modal();
-                    action
-                }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    self.cancel_modal();
-                    DashboardAction::None
-                }
-                _ => {
-                    self.mode = Mode::Confirm(Confirmation::DirtyLocal {
-                        action,
-                        repositories,
-                    });
-                    DashboardAction::None
-                }
-            },
-            Confirmation::Close { session_id } => match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.cancel_modal();
-                    DashboardAction::Close { session_id }
-                }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    self.cancel_modal();
-                    DashboardAction::None
-                }
-                _ => DashboardAction::None,
-            },
-            Confirmation::DeleteArchived { session_id } => match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.cancel_modal();
-                    DashboardAction::DeleteArchived { session_id }
-                }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    self.cancel_modal();
-                    DashboardAction::None
-                }
-                _ => DashboardAction::None,
-            },
-            Confirmation::CloseFailed { session_id, error } => match code {
-                KeyCode::Char('r') | KeyCode::Char('R') => {
-                    self.cancel_modal();
-                    DashboardAction::Close { session_id }
-                }
-                KeyCode::Char('f') | KeyCode::Char('F') => {
-                    self.mode = Mode::Confirm(Confirmation::ForceDestroy {
-                        session_id,
-                        typed: String::new(),
-                    });
-                    DashboardAction::None
-                }
-                KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => {
-                    self.cancel_modal();
-                    DashboardAction::None
-                }
-                _ => {
-                    self.mode = Mode::Confirm(Confirmation::CloseFailed { session_id, error });
-                    DashboardAction::None
-                }
-            },
             Confirmation::ForceDestroy {
                 session_id,
                 mut typed,
@@ -3043,14 +3133,20 @@ impl DashboardState {
                 }
                 KeyCode::Backspace => {
                     typed.pop();
-                    self.mode = Mode::Confirm(Confirmation::ForceDestroy { session_id, typed });
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
+                        session_id,
+                        typed,
+                    }));
                     DashboardAction::None
                 }
                 KeyCode::Char(c) => {
                     if typed.len() < FORCE_CONFIRMATION.len() {
                         typed.push(c.to_ascii_uppercase());
                     }
-                    self.mode = Mode::Confirm(Confirmation::ForceDestroy { session_id, typed });
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
+                        session_id,
+                        typed,
+                    }));
                     DashboardAction::None
                 }
                 KeyCode::Enter if typed == FORCE_CONFIRMATION => {
@@ -3058,7 +3154,10 @@ impl DashboardState {
                     DashboardAction::ForceDestroy { session_id }
                 }
                 _ => {
-                    self.mode = Mode::Confirm(Confirmation::ForceDestroy { session_id, typed });
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
+                        session_id,
+                        typed,
+                    }));
                     DashboardAction::None
                 }
             },
@@ -3072,14 +3171,20 @@ impl DashboardState {
                 }
                 KeyCode::Backspace => {
                     typed.pop();
-                    self.mode = Mode::Confirm(Confirmation::DeleteActive { session_id, typed });
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
+                        session_id,
+                        typed,
+                    }));
                     DashboardAction::None
                 }
                 KeyCode::Char(c) => {
                     if typed.len() < FORCE_CONFIRMATION.len() {
                         typed.push(c.to_ascii_uppercase());
                     }
-                    self.mode = Mode::Confirm(Confirmation::DeleteActive { session_id, typed });
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
+                        session_id,
+                        typed,
+                    }));
                     DashboardAction::None
                 }
                 KeyCode::Enter if typed == FORCE_CONFIRMATION => {
@@ -3087,10 +3192,18 @@ impl DashboardState {
                     DashboardAction::DeleteActive { session_id }
                 }
                 _ => {
-                    self.mode = Mode::Confirm(Confirmation::DeleteActive { session_id, typed });
+                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
+                        session_id,
+                        typed,
+                    }));
                     DashboardAction::None
                 }
             },
+            // Button dialogs are handled by `handle_confirmation_key`.
+            other => {
+                self.mode = Mode::Confirm(ConfirmDialog::new(other));
+                DashboardAction::None
+            }
         }
     }
 
@@ -3729,7 +3842,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
         Mode::ConfirmImportBundle(confirmation) => {
             render_import_bundle_confirmation(frame, area, confirmation)
         }
-        Mode::Confirm(confirmation) => render_confirmation(frame, area, confirmation),
+        Mode::Confirm(dialog) => render_confirmation(frame, area, dialog),
         Mode::Dashboard => {}
     }
 }
@@ -3927,7 +4040,7 @@ fn render_adaptive_dashboard(
         Mode::ConfirmImportBundle(confirmation) => {
             render_import_bundle_confirmation(frame, frame_area, confirmation)
         }
-        Mode::Confirm(confirmation) => render_confirmation(frame, frame_area, confirmation),
+        Mode::Confirm(dialog) => render_confirmation(frame, frame_area, dialog),
         Mode::Dashboard => {}
     }
 }
@@ -4089,12 +4202,6 @@ fn render_import_bundle_confirmation(
     area: Rect,
     confirmation: &ImportBundleConfirmation,
 ) {
-    let height = (confirmation.dirty_git_roots.len()
-        + confirmation.omitted_non_git_dirs.len()
-        + usize::from(confirmation.has_untracked_files)
-        + 11) as u16;
-    let popup = centered_rect(76, height.clamp(12, 24), area);
-    frame.render_widget(Clear, popup);
     let mut lines = Vec::new();
     if !confirmation.dirty_git_roots.is_empty() {
         lines.push(Line::raw(
@@ -4134,20 +4241,33 @@ fn render_import_bundle_confirmation(
             }),
         );
     }
-    lines.extend([
-        Line::raw(""),
-        Line::raw("Space toggles checkbox · y/Enter continues · n/Esc cancels."),
-    ]);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Import safety warning "),
-            )
-            .wrap(Wrap { trim: true }),
-        popup,
-    );
+    lines.push(Line::raw(""));
+    if confirmation.has_untracked_files {
+        lines.push(Line::raw("Space toggles the checkbox."));
+        lines.push(Line::raw(""));
+    }
+    lines.push(focused_buttons(IMPORT_BUNDLE_BUTTONS, confirmation.focus));
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Import safety warning "),
+        )
+        // `trim: false` keeps the padding inside the leftmost button background.
+        .wrap(Wrap { trim: false });
+    let popup = centered_rect(76, popup_height(&paragraph, 76, 12, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+/// Popup height that keeps every wrapped line of `paragraph` visible, never
+/// shrinking below the dialog's nominal height.
+fn popup_height(paragraph: &Paragraph, width_percent: u16, nominal: u16, area: Rect) -> u16 {
+    let inner_width = centered_rect(width_percent, 1, area)
+        .width
+        .saturating_sub(2);
+    let wrapped = u16::try_from(paragraph.line_count(inner_width)).unwrap_or(u16::MAX);
+    nominal.max(wrapped)
 }
 
 fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
@@ -5165,6 +5285,16 @@ fn action_buttons(buttons: &[(&str, bool)]) -> Line<'static> {
     Line::from(spans).alignment(Alignment::Center)
 }
 
+/// Renders a button row from its label list, highlighting the focused index.
+fn focused_buttons(labels: &[&'static str], focus: usize) -> Line<'static> {
+    let buttons = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| (*label, index == focus))
+        .collect::<Vec<_>>();
+    action_buttons(&buttons)
+}
+
 fn wizard_buttons(focus: WizardFocus, has_back: bool, next_label: &str) -> Line<'static> {
     if has_back {
         action_buttons(&[
@@ -5868,23 +5998,16 @@ fn render_rename_editor(frame: &mut Frame, area: Rect, editor: &RenameEditor) {
     );
 }
 
-fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmation) {
-    let popup = centered_rect(
-        72,
-        match confirmation {
-            Confirmation::DirtyLocal { repositories, .. } => {
-                (repositories.len() as u16 + 8).clamp(10, 18)
-            }
-            Confirmation::CloseFailed { .. } => 12,
-            Confirmation::Close { .. }
-            | Confirmation::ForceDestroy { .. }
-            | Confirmation::DeleteActive { .. }
-            | Confirmation::DeleteArchived { .. } => 9,
-        },
-        area,
-    );
-    frame.render_widget(Clear, popup);
-    let (title, lines) = match confirmation {
+fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &ConfirmDialog) {
+    let confirmation = &dialog.confirmation;
+    // Minimum height per dialog; `popup_height` grows it to fit wrapped content.
+    let nominal = match confirmation {
+        Confirmation::DirtyLocal { .. } => 11,
+        Confirmation::CloseFailed { .. } => 12,
+        Confirmation::Close { .. } | Confirmation::DeleteArchived { .. } => 10,
+        Confirmation::ForceDestroy { .. } | Confirmation::DeleteActive { .. } => 9,
+    };
+    let (title, mut lines) = match confirmation {
         Confirmation::DirtyLocal { repositories, .. } => {
             let mut lines = vec![
                 Line::raw("The initial worker will include these uncommitted changes:"),
@@ -5896,7 +6019,6 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             lines.extend([
                 Line::raw(""),
                 Line::raw("Pushes back to origin are rejected until the local checkout is clean."),
-                Line::raw("Press y/Enter to continue, or n/Esc to cancel."),
             ]);
             (" Local repository has uncommitted changes ", lines)
         }
@@ -5906,7 +6028,6 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
                 Line::raw("Hel will verify a recovery copy before destroying the target."),
-                Line::raw("Press y/Enter to pause, or n/Esc to cancel."),
             ],
         ),
         Confirmation::DeleteArchived { session_id } => (
@@ -5916,7 +6037,6 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
                 Line::raw(""),
                 Line::raw("Hel will permanently delete the recovery archive and session record."),
                 Line::raw("Any Hel-managed worktree and generated branch will also be deleted."),
-                Line::raw("Press y/Enter to delete, or n/Esc to cancel."),
             ],
         ),
         Confirmation::CloseFailed { session_id, error } => (
@@ -5928,8 +6048,6 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
                     format!("Pause failed: {error}"),
                     Style::default().fg(Color::Yellow),
                 ),
-                Line::raw(""),
-                Line::raw("r retry pause · f force destroy · Esc cancel"),
             ],
         ),
         Confirmation::ForceDestroy { session_id, typed } => (
@@ -5952,17 +6070,23 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             ],
         ),
     };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Red))
-                    .title(title),
-            )
-            .wrap(Wrap { trim: true }),
-        popup,
-    );
+    let buttons = confirmation_buttons(confirmation);
+    if !buttons.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(focused_buttons(buttons, dialog.focus));
+    }
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(title),
+        )
+        // `trim: false` keeps the padding inside the leftmost button background.
+        .wrap(Wrap { trim: false });
+    let popup = centered_rect(72, popup_height(&paragraph, 72, nominal, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
 }
 
 fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
@@ -6260,6 +6384,25 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The drawn buffer as one string per row.
+    fn buffer_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        (buffer.area.y..buffer.area.bottom())
+            .map(|y| {
+                (buffer.area.x..buffer.area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Column of `needle` within a drawn row, counted in cells rather than bytes.
+    fn cell_column(line: &str, needle: &str) -> u16 {
+        let byte = line
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle} in {line:?}"));
+        line[..byte].chars().count() as u16
     }
 
     /// A drawn summary cell that holds session text rather than the rule fill.
@@ -7718,7 +7861,10 @@ mod tests {
         assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
         assert!(matches!(
             dashboard.mode,
-            Mode::Confirm(Confirmation::DeleteActive { .. })
+            Mode::Confirm(ConfirmDialog {
+                confirmation: Confirmation::DeleteActive { .. },
+                ..
+            })
         ));
     }
 
@@ -8790,6 +8936,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("[x] Ignore untracked files"));
+        assert!(rendered.contains(" Cancel "));
+        assert!(rendered.contains(" Continue "));
+        assert!(rendered.contains("Space toggles the checkbox."));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::ConfirmImportBundle {
@@ -8812,6 +8961,52 @@ mod tests {
             DashboardAction::ConfirmImportBundle {
                 accepted: true,
                 include_untracked: true,
+            }
+        );
+    }
+
+    #[test]
+    fn import_safety_buttons_toggle_the_checkbox_and_cancel_from_the_cancel_button() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.show_import_bundle_confirmation(
+            vec!["/work/repo — 1 tracked change · 3 untracked paths".into()],
+            Vec::new(),
+            true,
+        );
+
+        // Focus starts on Continue; moving to Cancel does not disturb the checkbox.
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Tab)),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char(' '))),
+            DashboardAction::None
+        );
+        let Mode::ConfirmImportBundle(confirmation) = &dashboard.mode else {
+            panic!("expected import safety confirmation");
+        };
+        assert!(!confirmation.ignore_untracked);
+        assert_eq!(confirmation.focus, 0);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ConfirmImportBundle {
+                accepted: false,
+                include_untracked: false,
+            }
+        );
+
+        dashboard.show_import_bundle_confirmation(Vec::new(), Vec::new(), false);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('y'))),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::ConfirmImportBundle(_)));
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Esc)),
+            DashboardAction::ConfirmImportBundle {
+                accepted: false,
+                include_untracked: false,
             }
         );
     }
@@ -9798,15 +9993,16 @@ mod tests {
         let mut dashboard = dashboard_with_session(session);
         dashboard.handle_key(ctrl_key('p'));
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('y'))),
+            dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::Close {
                 session_id: "session-1".into()
             }
         );
 
+        // "Retry pause" is the primary button, so it is focused when the dialog opens.
         dashboard.show_close_failure("session-1".into(), "archive unavailable");
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('r'))),
+            dashboard.handle_key(key(KeyCode::Enter)),
             DashboardAction::Close {
                 session_id: "session-1".into()
             }
@@ -9817,10 +10013,22 @@ mod tests {
             dashboard.handle_key(key(KeyCode::Char('x'))),
             DashboardAction::None
         );
+        // "Force destroy" sits between Cancel and Retry pause.
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('f'))),
+            dashboard.handle_key(key(KeyCode::Left)),
             DashboardAction::None
         );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert!(matches!(
+            dashboard.mode,
+            Mode::Confirm(ConfirmDialog {
+                confirmation: Confirmation::ForceDestroy { .. },
+                ..
+            })
+        ));
         for character in FORCE_CONFIRMATION.chars() {
             assert_eq!(
                 dashboard.handle_key(key(KeyCode::Char(character))),
@@ -9833,6 +10041,260 @@ mod tests {
                 session_id: "session-1".into()
             }
         );
+    }
+
+    #[test]
+    fn close_failure_cancel_button_closes_the_dialog_without_acting() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.show_close_failure("session-1".into(), "archive unavailable");
+
+        // Tab from the rightmost button (Retry pause) wraps to Cancel.
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Tab)),
+            DashboardAction::None
+        );
+        let Mode::Confirm(dialog) = &dashboard.mode else {
+            panic!("expected close failure dialog");
+        };
+        assert_eq!(dialog.focus, 0);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+    }
+
+    fn running_dashboard_with_pause_dialog() -> DashboardState {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        dashboard.handle_key(ctrl_key('p'));
+        assert!(matches!(
+            dashboard.mode,
+            Mode::Confirm(ConfirmDialog {
+                confirmation: Confirmation::Close { .. },
+                ..
+            })
+        ));
+        dashboard
+    }
+
+    #[test]
+    fn pause_confirmation_focuses_the_primary_button_so_enter_pauses() {
+        let mut dashboard = running_dashboard_with_pause_dialog();
+        let Mode::Confirm(dialog) = &dashboard.mode else {
+            panic!("expected pause confirmation");
+        };
+        assert_eq!(
+            confirmation_buttons(&dialog.confirmation),
+            &["Cancel", "Pause"]
+        );
+        assert_eq!(dialog.focus, 1);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::Close {
+                session_id: "session-1".into()
+            }
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+    }
+
+    #[test]
+    fn pause_confirmation_cycles_focus_and_cancels_from_the_cancel_button() {
+        for cycle_key in [
+            KeyCode::Tab,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::BackTab,
+        ] {
+            let mut dashboard = running_dashboard_with_pause_dialog();
+            assert_eq!(dashboard.handle_key(key(cycle_key)), DashboardAction::None);
+            let Mode::Confirm(dialog) = &dashboard.mode else {
+                panic!("expected pause confirmation to stay open for {cycle_key:?}");
+            };
+            assert_eq!(dialog.focus, 0, "{cycle_key:?}");
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Enter)),
+                DashboardAction::None,
+                "{cycle_key:?}"
+            );
+            assert!(matches!(dashboard.mode, Mode::Dashboard), "{cycle_key:?}");
+        }
+    }
+
+    #[test]
+    fn pause_confirmation_wraps_focus_back_to_the_primary_button() {
+        let mut dashboard = running_dashboard_with_pause_dialog();
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Tab)),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Tab)),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::Close {
+                session_id: "session-1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn pause_confirmation_escape_cancels_from_any_button() {
+        for presses in 0..3 {
+            let mut dashboard = running_dashboard_with_pause_dialog();
+            for _ in 0..presses {
+                dashboard.handle_key(key(KeyCode::Tab));
+            }
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Esc)),
+                DashboardAction::None,
+                "after {presses} focus moves"
+            );
+            assert!(matches!(dashboard.mode, Mode::Dashboard), "{presses}");
+        }
+    }
+
+    #[test]
+    fn pause_confirmation_ignores_the_removed_letter_accelerators() {
+        for accelerator in ['y', 'Y', 'n', 'N'] {
+            let mut dashboard = running_dashboard_with_pause_dialog();
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Char(accelerator))),
+                DashboardAction::None,
+                "{accelerator}"
+            );
+            assert!(
+                matches!(
+                    dashboard.mode,
+                    Mode::Confirm(ConfirmDialog {
+                        confirmation: Confirmation::Close { .. },
+                        ..
+                    })
+                ),
+                "{accelerator}"
+            );
+        }
+    }
+
+    #[test]
+    fn pause_confirmation_renders_cancel_and_pause_buttons_with_pause_focused() {
+        let mut dashboard = running_dashboard_with_pause_dialog();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw pause confirmation");
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        let row = lines
+            .iter()
+            .position(|line| line.contains(" Cancel ") && line.contains(" Pause "))
+            .expect("button row");
+        let button_y = buffer.area.y + row as u16;
+        let cancel_x = buffer.area.x + cell_column(&lines[row], "Cancel");
+        let pause_x = buffer.area.x + cell_column(&lines[row], "Pause");
+        assert_eq!(buffer[(pause_x, button_y)].bg, Color::Cyan);
+        assert_eq!(buffer[(cancel_x, button_y)].bg, Color::DarkGray);
+        // Each label keeps its one-cell padding inside the button background.
+        assert_eq!(buffer[(cancel_x - 1, button_y)].bg, Color::DarkGray);
+        assert_eq!(buffer[(pause_x - 1, button_y)].bg, Color::Cyan);
+        assert!(!lines.iter().any(|line| line.contains("Press y/Enter")));
+    }
+
+    #[test]
+    fn button_confirmations_keep_their_button_row_visible() {
+        let confirmations = [
+            Confirmation::Close {
+                session_id: "session-1".into(),
+            },
+            Confirmation::DeleteArchived {
+                session_id: "session-1".into(),
+            },
+            Confirmation::CloseFailed {
+                session_id: "session-1".into(),
+                error: "archive unavailable".into(),
+            },
+            Confirmation::DirtyLocal {
+                action: DashboardAction::None,
+                repositories: vec!["/work/repo".into(), "/work/other".into()],
+            },
+        ];
+        for confirmation in confirmations {
+            for (width, height) in [(120, 30), (100, 24), (72, 22)] {
+                let mut dashboard = dashboard_with_session(archived_session());
+                dashboard.mode = Mode::Confirm(ConfirmDialog::new(confirmation.clone()));
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width, height)).expect("terminal");
+                terminal
+                    .draw(|frame| render(frame, &mut dashboard))
+                    .expect("draw confirmation");
+                let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+                for label in confirmation_buttons(&confirmation) {
+                    assert!(
+                        rendered.contains(&format!(" {label} ")),
+                        "{confirmation:?} at {width}x{height} hides {label}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delete_archived_confirmation_deletes_from_its_primary_button() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.focus = Focus::Archived;
+        dashboard.handle_key(key(KeyCode::Delete));
+        let Mode::Confirm(dialog) = &dashboard.mode else {
+            panic!("expected delete confirmation");
+        };
+        assert_eq!(
+            confirmation_buttons(&dialog.confirmation),
+            &["Cancel", "Delete"]
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::DeleteArchived {
+                session_id: "session-1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn dirty_local_confirmation_continues_or_cancels_from_its_buttons() {
+        let create = |allow_dirty_local| DashboardAction::CreateSession {
+            profile_id: "codex-1".into(),
+            bundle_id: "hel".into(),
+            project_directory: None,
+            target_template_id: "podman".into(),
+            additional_mounts: Vec::new(),
+            allow_dirty_local,
+            resource_allocation: None,
+        };
+
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.show_dirty_local_confirmation(create(false), vec!["project".into()]);
+        assert_eq!(dashboard.handle_key(key(KeyCode::Enter)), create(true));
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.show_dirty_local_confirmation(create(false), vec!["project".into()]);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('y'))),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Tab)),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
     }
 
     #[test]
