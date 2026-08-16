@@ -3773,7 +3773,6 @@ fn session_header_lines(
         entries.len()
     };
     let hidden = entries.len() - shown;
-    let body_width = width.saturating_sub(CURRENT_SESSION_CARET.chars().count());
     let mut lines = entries
         .iter()
         .take(shown)
@@ -3787,17 +3786,19 @@ fn session_header_lines(
                 now_epoch_seconds,
                 entry.turn_started_at_epoch_seconds,
             );
-            let text = format!(
-                "{} {clock} {}",
-                entry.project,
-                entry.last_agent_line.as_deref().unwrap_or_default()
-            );
-            Line::from(Span::styled(
-                format!("{caret}{}", truncate_to_width(text.trim_end(), body_width)),
-                Style::default().fg(turn_band_color(
-                    entry.turn_started_at_epoch_seconds.is_some(),
-                )),
-            ))
+            let band = Style::default().fg(turn_band_color(
+                entry.turn_started_at_epoch_seconds.is_some(),
+            ));
+            let last_line = entry.last_agent_line.as_deref().unwrap_or_default().trim();
+            let prefix = if last_line.is_empty() {
+                format!("{caret}{} {clock}", entry.project)
+            } else {
+                format!("{caret}{} {clock} ", entry.project)
+            };
+            let mut spans = vec![Span::styled(prefix, band)];
+            // The tail is agent text, so style it the way the conversation does.
+            spans.extend(agent_text_spans(last_line));
+            truncate_line_to_width(Line::from(spans), width)
         })
         .collect::<Vec<_>>();
     if hidden > 0 {
@@ -4891,6 +4892,68 @@ fn config_value_row(choice: &ConfigValueChoice) -> Option<String> {
     Some(format!("{} ({}){description}", choice.name, choice.value))
 }
 
+/// Width used when rendering a one-line agent tail through the markdown
+/// pipeline. Wide enough that no terminal line wraps before truncation.
+const HEADER_TAIL_RENDER_WIDTH: usize = 4096;
+
+/// Style a single line of agent text the way the conversation view does.
+fn agent_text_spans(text: &str) -> Vec<Span<'static>> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let visual = entry_visual(&ChatEntry::plain(0, ChatRole::Agent, text));
+    markdown_lines(
+        text,
+        visual.body_style,
+        visual.header_style,
+        HEADER_TAIL_RENDER_WIDTH,
+    )
+    .into_iter()
+    .next()
+    .map(|logical| logical.line.spans)
+    .unwrap_or_default()
+}
+
+/// Truncate a styled line to `width` characters, keeping each span's style and
+/// marking the cut with `…` in the style of the span it landed in.
+fn truncate_line_to_width(line: Line<'static>, width: usize) -> Line<'static> {
+    let total = line
+        .spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum::<usize>();
+    if total <= width {
+        return line;
+    }
+    let budget = width.saturating_sub(1);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for span in line.spans {
+        if used >= budget {
+            if width > 0 {
+                spans.push(Span::styled("…", span.style));
+            }
+            return Line::from(spans);
+        }
+        let count = span.content.chars().count();
+        if used + count <= budget {
+            used += count;
+            spans.push(span);
+        } else {
+            let kept = span.content.chars().take(budget - used).collect::<String>();
+            let style = span.style;
+            if !kept.is_empty() {
+                spans.push(Span::styled(kept, style));
+            }
+            if width > 0 {
+                spans.push(Span::styled("…", style));
+            }
+            return Line::from(spans);
+        }
+    }
+    Line::from(spans)
+}
+
 fn truncate_to_width(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.to_owned();
@@ -5962,6 +6025,22 @@ mod tests {
             lines[2].spans.first().and_then(|span| span.style.fg),
             Some(Color::DarkGray)
         );
+    }
+
+    #[test]
+    fn session_header_styles_the_last_line_like_agent_text_not_the_band() {
+        let chat = header_chat(
+            "current",
+            0,
+            vec![other_session(1, "other", Some(1_000), "still going")],
+        );
+
+        let lines = session_header_lines(&chat, 1_125, 80, 10);
+        let tail = &lines[1];
+        assert_eq!(tail.spans[0].content.as_ref(), "  other 02:05 ");
+        assert_eq!(tail.spans[0].style.fg, Some(Color::Yellow));
+        assert_eq!(tail.spans[1].content.as_ref(), "still going");
+        assert_eq!(tail.spans[1].style.fg, None);
     }
 
     #[test]
