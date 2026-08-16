@@ -68,7 +68,13 @@ Build's plan session mode as a compatibility shim (`/plan on` and `/plan off`
 set it explicitly). Older or custom adapter executables may expose fewer
 commands. The interactive autocomplete is the source of truth for the active
 session; Hel does not emulate a missing command or expose the adapters' general
-permission modes. While an advertised
+permission modes.
+
+`/model` and `/effort` work for every flavor. Grok Build speaks an older ACP
+dialect that publishes no configuration options and changes both settings
+through one `session/set_model` request, so Hel reads its model catalogue from
+the `initialize` response and translates. Reasoning tiers belong to the selected
+model, so `/effort` offers the tiers that model supports. While an advertised
 `/goal` request is active, the prompt composer title shows `Pursuing goal`.
 
 ## Keyboard basics
