@@ -50,6 +50,26 @@ fn managed_resource_identity_args(kind: ManagedResourceKind, session_id: &str) -
     }
 }
 
+/// The launch phase a command belongs to, reported as launch progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProvisionStage {
+    Provisioning,
+    Booting,
+    Syncing,
+    Starting,
+}
+
+impl ProvisionStage {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Provisioning => "Provision",
+            Self::Booting => "Boot",
+            Self::Syncing => "Sync",
+            Self::Starting => "Start",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSpec {
     pub program: String,
@@ -57,6 +77,8 @@ pub struct CommandSpec {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub purpose: String,
+    #[serde(default)]
+    pub stage: Option<ProvisionStage>,
 }
 
 impl CommandSpec {
@@ -69,11 +91,17 @@ impl CommandSpec {
             args: args.into_iter().map(Into::into).collect(),
             env: BTreeMap::new(),
             purpose: String::new(),
+            stage: None,
         }
     }
 
     pub fn purpose(mut self, purpose: impl Into<String>) -> Self {
         self.purpose = purpose.into();
+        self
+    }
+
+    pub fn stage(mut self, stage: ProvisionStage) -> Self {
+        self.stage = Some(stage);
         self
     }
 }
@@ -569,6 +597,7 @@ impl PodmanHost<'_> {
                 purpose,
             ),
         }
+        .stage(ProvisionStage::Provisioning)
     }
 }
 
@@ -980,7 +1009,8 @@ pub fn provision_plan(
             validate_container_template(container)?;
             commands.push(
                 CommandSpec::new("container", ["system", "status"])
-                    .purpose("check Apple container service"),
+                    .purpose("check Apple container service")
+                    .stage(ProvisionStage::Provisioning),
             );
             commands.push(container_run(
                 "container",
@@ -1030,7 +1060,11 @@ pub fn provision_plan(
                 session_id,
             ));
             args.extend(["--output".to_owned(), "json".to_owned()]);
-            commands.push(CommandSpec::new("aws", args).purpose("launch EC2 session instance"));
+            commands.push(
+                CommandSpec::new("aws", args)
+                    .purpose("launch EC2 session instance")
+                    .stage(ProvisionStage::Provisioning),
+            );
         }
         TargetTemplate::SshBare {
             ssh,
@@ -1040,7 +1074,8 @@ pub fn provision_plan(
             let workspace = workspace_for(template, session_id)?;
             commands.push(
                 ssh_command(ssh, ["mkdir", "-p", &workspace])
-                    .purpose("create SSH session workspace"),
+                    .purpose("create SSH session workspace")
+                    .stage(ProvisionStage::Provisioning),
             );
             commands.extend(install_git_plan(ExecutionBoundary::Ssh(ssh)).commands);
             commands.extend(clone_commands(bundle, &workspace, |args| {
@@ -1058,7 +1093,11 @@ pub fn provision_plan(
                 session_id,
                 additional_mounts,
             )?);
-            commands.push(ssh_command_owned(ssh, run).purpose("start remote Podman container"));
+            commands.push(
+                ssh_command_owned(ssh, run)
+                    .purpose("start remote Podman container")
+                    .stage(ProvisionStage::Provisioning),
+            );
             commands.extend(
                 install_git_plan(ExecutionBoundary::SshPodman {
                     ssh,
@@ -1188,8 +1227,11 @@ pub fn provision_on_locator_plan(
     let TargetLocator::AwsEc2 { ssh, workspace, .. } = locator else {
         bail!("post-launch provisioning is only required for AWS");
     };
-    let mut commands =
-        vec![ssh_command(ssh, ["mkdir", "-p", workspace]).purpose("create EC2 session workspace")];
+    let mut commands = vec![
+        ssh_command(ssh, ["mkdir", "-p", workspace])
+            .purpose("create EC2 session workspace")
+            .stage(ProvisionStage::Syncing),
+    ];
     commands.extend(install_git_plan(ExecutionBoundary::Ssh(ssh)).commands);
     commands.extend(clone_commands(bundle, workspace, |args| {
         ssh_command_owned(ssh, args)
@@ -1236,7 +1278,8 @@ pub fn reconnect_plan(locator: &TargetLocator, session_id: &str) -> Result<Comma
             ],
         ),
     }
-    .purpose("connect to Hel worker");
+    .purpose("connect to Hel worker")
+    .stage(ProvisionStage::Starting);
     Ok(CommandPlan {
         description: format!("reconnect Hel session {session_id}"),
         commands: vec![command],
@@ -1768,7 +1811,8 @@ pub fn install_git_plan(boundary: ExecutionBoundary<'_>) -> CommandPlan {
                 boundary,
                 vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
             )
-            .purpose("install Git"),
+            .purpose("install Git")
+            .stage(ProvisionStage::Syncing),
         ],
     }
 }
@@ -1784,14 +1828,16 @@ fn clone_commands(
             "-p".to_owned(),
             workspace.to_owned(),
         ])
-        .purpose("create bundle workspace"),
+        .purpose("create bundle workspace")
+        .stage(ProvisionStage::Syncing),
     ];
     for repository in &bundle.repositories {
         let destination = format!("{workspace}/{}", repository.destination);
         let Some(url) = &repository.url else {
             commands.push(
                 wrap(vec!["git".into(), "init".into(), "--".into(), destination])
-                    .purpose(format!("initialize {}", repository.destination)),
+                    .purpose(format!("initialize {}", repository.destination))
+                    .stage(ProvisionStage::Syncing),
             );
             continue;
         };
@@ -1802,7 +1848,11 @@ fn clone_commands(
         args.push("--".to_owned());
         args.push(url.clone());
         args.push(destination);
-        commands.push(wrap(args).purpose(format!("clone {}", repository.destination)));
+        commands.push(
+            wrap(args)
+                .purpose(format!("clone {}", repository.destination))
+                .stage(ProvisionStage::Syncing),
+        );
     }
     commands
 }
@@ -1818,7 +1868,8 @@ fn container_run(
         engine,
         container_run_args(engine, template, name, session_id, additional_mounts)?,
     )
-    .purpose("start session container"))
+    .purpose("start session container")
+    .stage(ProvisionStage::Provisioning))
 }
 
 fn container_run_args(
@@ -2661,6 +2712,7 @@ mod tests {
             plan.commands[0],
             CommandSpec::new("container", ["system", "status"])
                 .purpose("check Apple container service")
+                .stage(ProvisionStage::Provisioning)
         );
         assert_eq!(plan.commands[1].program, "container");
         let name = resource_name(SESSION).unwrap();

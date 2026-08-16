@@ -43,7 +43,8 @@ use crate::hel_state::{
 };
 use crate::hel_targets::{
     self, AdditionalMount, AwsTemplate, CancellableProcessExecutor, CommandExecutor, CommandOutput,
-    CommandSpec, ContainerTemplate, ProcessExecutor, ProjectBundleSpec, RepositorySpec, SshTarget,
+    CommandSpec, ContainerTemplate, ProcessExecutor, ProjectBundleSpec, ProvisionStage,
+    RepositorySpec, SshTarget,
 };
 use crate::hel_worker::{RelayCommand, RelayCursor, RelayExecutionState};
 use crate::hel_worker_runtime::{WorkerLaunchConfig, WorkerOwnership};
@@ -1309,6 +1310,7 @@ impl Controller {
         session_id: &str,
         executor: &impl CommandExecutor,
     ) -> Result<Option<String>> {
+        let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
         let (backend, worker_root) = self.prepare_worker_files(session_id, executor)?;
         install_attached_resources(&self.state, session_id, &backend, &worker_root, executor)?;
         self.connect_local_repositories(
@@ -1922,6 +1924,7 @@ impl Controller {
                 ProvisioningFailureDisposition::Preserve,
             )
             .await?;
+            let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
             let (backend, worker_root) = self.prepare_worker_files(session_id, executor)?;
             let harness_home = target_profile_home(&backend, session_id, &profile);
             let workspace_root = if let Some(project_directory) = &previous.project_directory {
@@ -3087,7 +3090,8 @@ fn preflight_target(template: &TargetTemplate, executor: &impl CommandExecutor) 
         }
         TargetTemplate::AppleContainer { .. } => {
             let command = CommandSpec::new("container", ["system", "status"])
-                .purpose("preflight Apple container runtime");
+                .purpose("preflight Apple container runtime")
+                .stage(ProvisionStage::Provisioning);
             let output = executor.execute(&command).map_err(|error| {
                 anyhow::anyhow!(
                     "Apple container preflight failed; run `hel doctor` for actionable prerequisites: {error}"
@@ -5100,7 +5104,8 @@ fn locator_after_provision(
                         instance_id.clone(),
                     ],
                 )
-                .purpose("wait for EC2 session instance to run"),
+                .purpose("wait for EC2 session instance to run")
+                .stage(ProvisionStage::Booting),
             )?;
             let field = match address_source {
                 AwsAddressSource::PublicDns => "PublicDnsName",
@@ -5127,7 +5132,8 @@ fn locator_after_provision(
                         "text".into(),
                     ],
                 )
-                .purpose("resolve EC2 session address"),
+                .purpose("resolve EC2 session address")
+                .stage(ProvisionStage::Booting),
             )?;
             let address = String::from_utf8(address.stdout)
                 .context("AWS address was not UTF-8")?
@@ -5142,7 +5148,9 @@ fn locator_after_provision(
             };
             wait_for_ssh_ready(
                 executor,
-                &ssh_command_spec(&ssh, ["true"]).purpose("wait for EC2 SSH availability"),
+                &ssh_command_spec(&ssh, ["true"])
+                    .purpose("wait for EC2 SSH availability")
+                    .stage(ProvisionStage::Booting),
                 AWS_SSH_READY_TIMEOUT,
                 Instant::now,
                 std::thread::sleep,
@@ -5475,6 +5483,45 @@ fn ensure_git_broker(
             );
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Reports every command an installer issues as one launch stage, so progress
+/// stays accurate without threading the stage through each `CommandSpec`.
+/// A command that already names a stage keeps it.
+struct StagedExecutor<'a, E: CommandExecutor> {
+    inner: &'a E,
+    stage: ProvisionStage,
+}
+
+impl<'a, E: CommandExecutor> StagedExecutor<'a, E> {
+    fn new(inner: &'a E, stage: ProvisionStage) -> Self {
+        Self { inner, stage }
+    }
+
+    fn staged(&self, command: &CommandSpec) -> CommandSpec {
+        if command.stage.is_some() {
+            return command.clone();
+        }
+        command.clone().stage(self.stage)
+    }
+}
+
+impl<E: CommandExecutor> CommandExecutor for StagedExecutor<'_, E> {
+    fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        self.inner.execute(&self.staged(command))
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.inner.cancellation_requested()
+    }
+
+    fn execute_with_stdin(
+        &self,
+        command: &CommandSpec,
+        input: &mut (dyn std::io::Read + Send),
+    ) -> Result<CommandOutput> {
+        self.inner.execute_with_stdin(&self.staged(command), input)
     }
 }
 
