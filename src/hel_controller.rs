@@ -20,7 +20,7 @@ use crate::hel_archive::{
 use crate::hel_checkpoint::{
     CheckpointExportSpec, CheckpointRepositoryCapture, CheckpointRepositorySpec,
     CheckpointRestoreSpec, CheckpointTransfer, RepositoryRestoreSpec, export_command,
-    restore_command,
+    export_stdin_command, restore_command,
 };
 use crate::hel_config::{
     AwsAddressSource, HelConfig, ProjectBundle, SshConnection, TargetTemplate, atomic_write,
@@ -315,11 +315,24 @@ enum LatchExclusivity {
     HoldThroughClose,
 }
 
+/// How a latched checkpoint ends the barrier it opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointCompletion {
+    /// The barrier is still open. Completing it resumes ACP dispatch and
+    /// advances the relay's recovery floor in one durable step; abandoning it
+    /// cancels the barrier and leaves the floor alone.
+    HeldBarrier,
+    /// The worker already resumed dispatch when the export finished. All that
+    /// is left for a durably installed archive is the recovery floor move.
+    ReleasedAfterExport,
+}
+
 struct LatchedCheckpoint {
     artifact: CheckpointArtifact,
     relay: ControllerRelayLease,
     barrier_command_id: String,
     cursor: RelayCursor,
+    completion: CheckpointCompletion,
 }
 
 /// A latched checkpoint owns an open relay barrier, and that barrier freezes
@@ -329,18 +342,26 @@ struct LatchedCheckpoint {
 /// Close is the exception: it holds its lease to the end, so dropping that
 /// lease is what ends its barrier.
 impl LatchedCheckpoint {
-    /// Release the barrier that sealed a durably installed archive.
+    /// Let the relay release the history that this installed archive covers.
     async fn complete(mut self) -> Result<()> {
-        let command_id = new_command_id("checkpoint-complete")?;
-        self.relay
-            .submit(
-                command_id,
+        let (prefix, command) = match self.completion {
+            CheckpointCompletion::HeldBarrier => (
+                "checkpoint-complete",
                 RelayCommand::CompleteCheckpoint {
                     barrier_command_id: self.barrier_command_id.clone(),
                 },
-            )
-            .await
-            .map(|_| ())
+            ),
+            // The worker that accepted the early release also understands the
+            // floor move; they were added together.
+            CheckpointCompletion::ReleasedAfterExport => (
+                "checkpoint-floor",
+                RelayCommand::AdvanceRecoveryFloor {
+                    through: self.cursor.clone(),
+                },
+            ),
+        };
+        let command_id = new_command_id(prefix)?;
+        self.relay.submit(command_id, command).await.map(|_| ())
     }
 
     /// Cancel the barrier of a checkpoint the caller could not install.
@@ -349,6 +370,12 @@ impl LatchedCheckpoint {
     /// stay healthy for the rest of the session, so nothing else would ever
     /// end this barrier.
     async fn abandon(mut self, session_id: &str) {
+        if self.completion == CheckpointCompletion::ReleasedAfterExport {
+            // Dispatch resumed when the export finished, so there is no barrier
+            // left to cancel, and the recovery floor must stay behind an
+            // archive that was never installed. Doing nothing is the exit.
+            return;
+        }
         if let Err(error) = self.relay.cancel_abandoned_barrier().await {
             tracing::warn!(
                 session_id,
@@ -2331,13 +2358,14 @@ impl Controller {
                 }
                 prune_replaced_checkpoint(previous.checkpoint.as_ref(), &artifact.metadata);
                 if let Err(error) = latched.complete().await {
-                    // The actor retries a failed submission over a fresh
-                    // connection, and the worker cancels barriers whose
-                    // submitting connection dropped, so the barrier cannot
-                    // dangle even when this report is the last word on it.
+                    // Only journal retention is at stake. A barrier that is
+                    // still open cannot dangle: the actor retries a failed
+                    // submission over a fresh connection, and the worker
+                    // cancels barriers whose submitting connection dropped.
+                    // The next checkpoint moves the recovery floor again.
                     tracing::warn!(
                         session_id,
-                        "verified checkpoint was saved, but its relay barrier release could not be confirmed: {error:#}"
+                        "verified checkpoint was saved, but the relay could not be told to release the history it covers: {error:#}"
                     );
                 }
                 Ok(artifact.metadata)
@@ -2422,12 +2450,13 @@ impl Controller {
                 .context("persist verified recovery checkpoint before releasing relay history"));
         }
         if let Err(error) = latched.complete().await {
-            // The actor retries a failed submission over a fresh connection,
-            // and the worker cancels barriers whose submitting connection
-            // dropped, so the barrier cannot dangle.
+            // Only journal retention is at stake. A barrier that is still open
+            // cannot dangle: the actor retries a failed submission over a fresh
+            // connection, and the worker cancels barriers whose submitting
+            // connection dropped. The next checkpoint moves the floor again.
             tracing::warn!(
                 session_id,
-                "recovery checkpoint was saved, but its relay barrier release could not be confirmed: {error:#}"
+                "recovery checkpoint was saved, but the relay could not be told to release the history it covers: {error:#}"
             );
         }
         prune_replaced_checkpoint(previous_checkpoint.as_ref(), &artifact.metadata);
@@ -2530,6 +2559,13 @@ impl Controller {
             relay.end_latch();
         }
 
+        // Close must keep ACP dispatch frozen until it seals the relay, so only
+        // an ordinary checkpoint may hand dispatch back at the end of its
+        // export. `completion` also records whether an error path still has a
+        // barrier to cancel.
+        let mut completion = CheckpointCompletion::HeldBarrier;
+        let releases_after_export = exclusivity == LatchExclusivity::ReleaseAfterLatch;
+
         let exported: Result<CheckpointArtifact> = async {
             let worker_root = hel_targets::worker_root(&backend, session_id)?;
             let harness_home = target_profile_home(&backend, session_id, profile);
@@ -2616,14 +2652,8 @@ impl Controller {
                 canonical_session,
                 output_path: target_path(&remote_archive),
             };
-            let staging = tempfile::tempdir().context("create checkpoint staging")?;
-            let local_spec = staging.path().join("checkpoint-spec.json");
-            spec.write(&local_spec)?;
-            upload_checkpoint_spec(executor, &backend, session_id, &local_spec, &remote_spec)?;
-            let exported = execute_checked(
-                executor,
-                export_command(&backend, session_id, &remote_spec)?,
-            )?;
+            let exported =
+                export_target_checkpoint(executor, &backend, session_id, &spec, &remote_spec)?;
             let target_checkpoint: crate::hel_checkpoint::TargetCheckpoint =
                 serde_json::from_slice(&exported.stdout)
                     .context("decode target checkpoint result")?;
@@ -2635,6 +2665,17 @@ impl Controller {
             }
             if target_checkpoint.event_frontier_digest != expected_digest {
                 bail!("target checkpoint event frontier digest changed");
+            }
+
+            // The archive exists, so ACP dispatch no longer has to stay frozen.
+            if releases_after_export {
+                completion = release_checkpoint_after_export(
+                    &mut relay,
+                    session_id,
+                    &barrier_command_id,
+                    &cursor,
+                )
+                .await?;
             }
 
             // Checkpoint archives are immutable once controller metadata points
@@ -2670,14 +2711,19 @@ impl Controller {
             if let Err(error) = validate_transferred() {
                 return Err(remove_uninstalled_checkpoint(&installed_archive, error));
             }
-            let revalidated = relay.sync_snapshot().await.and_then(|snapshot| {
-                validate_checkpoint_barrier_snapshot(&snapshot, &barrier_command_id, &cursor)
-            });
-            if let Err(error) = revalidated {
-                return Err(remove_uninstalled_checkpoint(
-                    &installed_archive,
-                    error.context("checkpoint barrier changed while transferring its archive"),
-                ));
+            // A checkpoint that still holds its barrier proves workspace
+            // consistency here instead. One that already released proved it
+            // before releasing; the sha256 chain covers the transfer itself.
+            if completion == CheckpointCompletion::HeldBarrier {
+                let revalidated = relay.sync_snapshot().await.and_then(|snapshot| {
+                    validate_checkpoint_barrier_snapshot(&snapshot, &barrier_command_id, &cursor)
+                });
+                if let Err(error) = revalidated {
+                    return Err(remove_uninstalled_checkpoint(
+                        &installed_archive,
+                        error.context("checkpoint barrier changed while transferring its archive"),
+                    ));
+                }
             }
             if let Err(error) = transfer
                 .cleanup_plan(&verified)
@@ -2708,8 +2754,11 @@ impl Controller {
                 // The barrier freezes ACP dispatch until it ends. Nothing will
                 // complete it now, and the connection that opened it is back
                 // with the session actor, so cancel it instead of leaving the
-                // harness frozen until that connection happens to drop.
-                if let Err(cancel_error) = relay.cancel_abandoned_barrier().await {
+                // harness frozen until that connection happens to drop. A
+                // barrier released after the export is already gone.
+                if completion == CheckpointCompletion::HeldBarrier
+                    && let Err(cancel_error) = relay.cancel_abandoned_barrier().await
+                {
                     tracing::warn!(
                         session_id,
                         "failed checkpoint could not cancel its relay barrier: {cancel_error:#}"
@@ -2723,6 +2772,7 @@ impl Controller {
             relay,
             barrier_command_id,
             cursor,
+            completion,
         })
     }
 
@@ -3892,6 +3942,98 @@ fn target_profile_home(
             format!(".local/share/hel/profiles/{session_id}")
         }
     }
+}
+
+/// Hand ACP dispatch back as soon as the archive exists on the target.
+///
+/// Proving the barrier first moves the workspace-consistency proof ahead of the
+/// release: the same barrier still holding the same ready cursor means nothing
+/// the harness could write reached the workspace while the archive was built.
+/// The recovery floor stays put, because nothing yet proves the archive reached
+/// the controller's disk.
+///
+/// A worker that does not understand the release keeps its barrier, and the
+/// caller falls back to ending it only after the archive is installed. That is
+/// slower, not wrong, so it is not a checkpoint failure.
+async fn release_checkpoint_after_export(
+    relay: &mut ControllerRelayLease,
+    session_id: &str,
+    barrier_command_id: &str,
+    cursor: &RelayCursor,
+) -> Result<CheckpointCompletion> {
+    relay
+        .sync_snapshot()
+        .await
+        .and_then(|snapshot| {
+            validate_checkpoint_barrier_snapshot(&snapshot, barrier_command_id, cursor)
+        })
+        .context("checkpoint barrier changed while exporting its archive")?;
+    match relay
+        .submit(
+            new_command_id("checkpoint-release")?,
+            RelayCommand::ReleaseCheckpoint {
+                barrier_command_id: barrier_command_id.to_owned(),
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(CheckpointCompletion::ReleasedAfterExport),
+        Err(error) => {
+            tracing::debug!(
+                session_id,
+                "relay kept the checkpoint barrier through the transfer: {error:#}"
+            );
+            Ok(CheckpointCompletion::HeldBarrier)
+        }
+    }
+}
+
+/// Run the target's checkpoint export with the spec streamed over stdin.
+///
+/// Streaming removes a whole `podman cp`/`scp` round trip from the window in
+/// which the relay barrier keeps ACP dispatch frozen.
+fn export_target_checkpoint(
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+    spec: &CheckpointExportSpec,
+    remote_spec: &str,
+) -> Result<CommandOutput> {
+    let streamed = export_stdin_command(locator, session_id)?;
+    let body = serde_json::to_vec(spec).context("serialize checkpoint export spec")?;
+    let output = executor.execute_with_stdin(&streamed, &mut body.as_slice())?;
+    if output.status == 0 {
+        return Ok(output);
+    }
+    let failure = String::from_utf8_lossy(&output.stderr).into_owned();
+    ensure!(
+        export_spec_stdin_unsupported(&failure),
+        "{} failed with status {}: {failure}",
+        streamed.purpose,
+        output.status
+    );
+    tracing::debug!(
+        session_id,
+        "target worker predates streamed checkpoint specs; uploading the spec file instead"
+    );
+    let staging = tempfile::tempdir().context("create checkpoint staging")?;
+    let local_spec = staging.path().join("checkpoint-spec.json");
+    spec.write(&local_spec)?;
+    upload_checkpoint_spec(executor, locator, session_id, &local_spec, remote_spec)?;
+    execute_checked(executor, export_command(locator, session_id, remote_spec)?)
+}
+
+/// Whether an export failure says the target's worker cannot read its spec from
+/// standard input.
+///
+/// A worker built before `--spec -` treats the dash as a file name, so it fails
+/// while reading that file rather than while running the checkpoint. One built
+/// before the flag existed at all fails in argument parsing. Every other
+/// failure is a real checkpoint error and must surface.
+fn export_spec_stdin_unsupported(failure: &str) -> bool {
+    failure.contains("read checkpoint export spec -")
+        || failure.contains("unexpected argument")
+        || failure.contains("invalid value")
 }
 
 fn upload_checkpoint_spec(
@@ -6993,11 +7135,207 @@ mod tests {
         assert!(validate_checkpoint_barrier_snapshot(&snapshot, "checkpoint-1", &cursor).is_err());
     }
 
+    /// Target-side answer of a successful export.
+    fn exported_checkpoint_json() -> Vec<u8> {
+        serde_json::to_vec(&crate::hel_checkpoint::TargetCheckpoint {
+            path: PathBuf::from("/var/lib/hel/workers/session/checkpoint.hel.zip"),
+            sha256: "c".repeat(64),
+            event_frontier: 7,
+            event_frontier_digest: "d".repeat(64),
+        })
+        .unwrap()
+    }
+
+    fn export_spec_fixture() -> CheckpointExportSpec {
+        CheckpointExportSpec {
+            session: crate::hel_archive::SessionManifest {
+                id: LATCH_RELAY_SESSION.into(),
+                title: "streamed spec".into(),
+                harness_kind: crate::hel_config::HarnessKind::Codex,
+                profile_id: "codex".into(),
+                native_session_id: "native-session".into(),
+                created_at: "2026-08-12T00:00:00Z".into(),
+                checkpointed_at: "2026-08-16T00:00:00Z".into(),
+                hel_version: "test".into(),
+                relay_version: "test".into(),
+                adapter_version: "acp-v1".into(),
+            },
+            target: TargetManifest {
+                template_id: "podman".into(),
+                target_kind: "local-podman".into(),
+                details: BTreeMap::new(),
+            },
+            bundle: BundleManifest {
+                id: "project".into(),
+                primary_repository: "app".into(),
+            },
+            relay_root: PathBuf::from("/var/lib/hel/workers/session"),
+            harness_home: PathBuf::from("/var/lib/hel/profiles/codex"),
+            workspace_root: PathBuf::from("/workspace"),
+            repositories: Vec::new(),
+            canonical_session: canonical_session_from_materialized(&MaterializedSession::empty(
+                LATCH_RELAY_SESSION.to_owned(),
+            ))
+            .unwrap(),
+            output_path: PathBuf::from("/var/lib/hel/workers/session/checkpoint.hel.zip"),
+        }
+    }
+
+    /// Answers the streamed export with a scripted status, and every other
+    /// command as a success.
+    struct ExportExecutor {
+        streamed_status: i32,
+        streamed_stderr: String,
+        purposes: RefCell<Vec<String>>,
+        streamed_spec: RefCell<Vec<u8>>,
+    }
+
+    impl ExportExecutor {
+        fn new(streamed_status: i32, streamed_stderr: &str) -> Self {
+            Self {
+                streamed_status,
+                streamed_stderr: streamed_stderr.to_owned(),
+                purposes: RefCell::new(Vec::new()),
+                streamed_spec: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CommandExecutor for ExportExecutor {
+        fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+            self.purposes.borrow_mut().push(command.purpose.clone());
+            Ok(CommandOutput {
+                status: 0,
+                stdout: exported_checkpoint_json(),
+                stderr: Vec::new(),
+            })
+        }
+
+        fn execute_with_stdin(
+            &self,
+            command: &CommandSpec,
+            input: &mut (dyn std::io::Read + Send),
+        ) -> Result<CommandOutput> {
+            self.purposes.borrow_mut().push(command.purpose.clone());
+            input.read_to_end(&mut self.streamed_spec.borrow_mut())?;
+            Ok(CommandOutput {
+                status: self.streamed_status,
+                stdout: if self.streamed_status == 0 {
+                    exported_checkpoint_json()
+                } else {
+                    Vec::new()
+                },
+                stderr: self.streamed_stderr.clone().into_bytes(),
+            })
+        }
+    }
+
+    #[test]
+    fn checkpoint_export_streams_its_spec_instead_of_uploading_it() {
+        let locator = hel_targets::TargetLocator::LocalPodman {
+            container_id: hel_targets::resource_name(LATCH_RELAY_SESSION).unwrap(),
+        };
+        let spec = export_spec_fixture();
+        let executor = ExportExecutor::new(0, "");
+
+        let output = export_target_checkpoint(
+            &executor,
+            &locator,
+            LATCH_RELAY_SESSION,
+            &spec,
+            "/var/lib/hel/workers/session/checkpoint-spec.json",
+        )
+        .unwrap();
+
+        assert_eq!(output.stdout, exported_checkpoint_json());
+        assert_eq!(
+            serde_json::from_slice::<CheckpointExportSpec>(&executor.streamed_spec.borrow())
+                .unwrap(),
+            spec
+        );
+        assert_eq!(
+            executor.purposes.into_inner(),
+            vec!["export target checkpoint".to_owned()]
+        );
+    }
+
+    /// A worker copied into the target before `--spec -` existed reads the dash
+    /// as a file name. The checkpoint has to keep working on it.
+    #[test]
+    fn an_export_that_cannot_read_stdin_falls_back_to_uploading_the_spec() {
+        let locator = hel_targets::TargetLocator::LocalPodman {
+            container_id: hel_targets::resource_name(LATCH_RELAY_SESSION).unwrap(),
+        };
+        let executor = ExportExecutor::new(
+            1,
+            "Error: read checkpoint export spec -\n\nCaused by:\n    \
+             No such file or directory (os error 2)\n",
+        );
+
+        let output = export_target_checkpoint(
+            &executor,
+            &locator,
+            LATCH_RELAY_SESSION,
+            &export_spec_fixture(),
+            "/var/lib/hel/workers/session/checkpoint-spec.json",
+        )
+        .unwrap();
+
+        assert_eq!(output.stdout, exported_checkpoint_json());
+        assert_eq!(
+            executor.purposes.into_inner(),
+            vec![
+                "export target checkpoint".to_owned(),
+                "upload checkpoint specification".to_owned(),
+                "export target checkpoint".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failing_export_is_not_retried_as_an_old_worker() {
+        let locator = hel_targets::TargetLocator::LocalPodman {
+            container_id: hel_targets::resource_name(LATCH_RELAY_SESSION).unwrap(),
+        };
+        let executor = ExportExecutor::new(1, "Error: repository 'app' is missing\n");
+
+        let error = export_target_checkpoint(
+            &executor,
+            &locator,
+            LATCH_RELAY_SESSION,
+            &export_spec_fixture(),
+            "/var/lib/hel/workers/session/checkpoint-spec.json",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("repository 'app' is missing"),
+            "{error:#}"
+        );
+        assert_eq!(
+            executor.purposes.into_inner(),
+            vec!["export target checkpoint".to_owned()]
+        );
+    }
+
     const LATCH_RELAY_ROOT: &str = "HEL_TEST_LATCH_RELAY_ROOT";
     const LATCH_RELAY_STARTS: &str = "HEL_TEST_LATCH_RELAY_STARTS";
+    const LATCH_RELAY_REJECT_RELEASE: &str = "HEL_TEST_LATCH_REJECT_RELEASE";
     const LATCH_TEST_CHILD: &str = "HEL_TEST_LATCH_CHILD";
     const ABANDON_TEST_CHILD: &str = "HEL_TEST_ABANDON_LATCH_CHILD";
+    const RELEASE_TEST_CHILD: &str = "HEL_TEST_RELEASE_LATCH_CHILD";
+    const LEGACY_RELEASE_TEST_CHILD: &str = "HEL_TEST_LEGACY_RELEASE_LATCH_CHILD";
     const LATCH_RELAY_SESSION: &str = "018f9dd2-a3b4-7c8d-9000-0123456789ab";
+
+    /// Whether the scripted relay understands the early checkpoint release.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ReleaseSupport {
+        Supported,
+        /// Answer a release exactly as a worker that predates the command does:
+        /// its `RelayCommand` cannot deserialize the variant at all.
+        Rejected,
+    }
 
     /// Relay server half of the checkpoint latch test.
     ///
@@ -7028,12 +7366,17 @@ mod tests {
         let mut relay =
             crate::hel_worker::DurableRelay::open(Path::new(&root), LATCH_RELAY_SESSION, "1.0.0")
                 .expect("open the test relay journal");
+        let reject_release = std::env::var_os(LATCH_RELAY_REJECT_RELEASE).is_some();
         let mut reader = std::io::stdin().lock();
         let mut writer = std::io::stdout().lock();
         while let Some(request) =
             crate::hel_worker::read_relay_frame(&mut reader).expect("read a relay request")
         {
-            let response = relay.handle(request);
+            let response = if reject_release && requests_checkpoint_release(&request) {
+                unparseable_request_response(&request)
+            } else {
+                relay.handle(request)
+            };
             crate::hel_worker::write_relay_frame(&mut writer, &response)
                 .expect("answer a relay request");
             for claimed in relay
@@ -7049,12 +7392,43 @@ mod tests {
         }
     }
 
+    fn requests_checkpoint_release(request: &crate::hel_worker::RelayRequestEnvelope) -> bool {
+        matches!(
+            &request.request,
+            crate::hel_worker::RelayRequest::Submit {
+                command: RelayCommand::ReleaseCheckpoint { .. },
+                ..
+            }
+        )
+    }
+
+    /// The answer a worker gives for a frame its own protocol cannot decode.
+    /// An older `RelayCommand` has no `release_checkpoint` variant, and the
+    /// enum denies unknown ones, so the request never reaches its relay.
+    fn unparseable_request_response(
+        request: &crate::hel_worker::RelayRequestEnvelope,
+    ) -> crate::hel_worker::RelayResponseEnvelope {
+        crate::hel_worker::RelayResponseEnvelope {
+            request_id: request.request_id.clone(),
+            protocol_version: request.protocol_version,
+            body: crate::hel_worker::RelayResponseBody::Error {
+                error: crate::hel_worker::RelayProtocolError {
+                    code: crate::hel_worker::RelayErrorCode::InvalidRequest,
+                    message: "unknown variant `release_checkpoint`".into(),
+                    retryable: false,
+                    detail: None,
+                },
+            },
+        }
+    }
+
     /// A relay target served by this test binary over stdio. Each start of the
     /// server appends to `starts`, if given.
     #[cfg(unix)]
     fn latch_relay_target(
         relay_root: &Path,
         starts: Option<&Path>,
+        release: ReleaseSupport,
     ) -> crate::hel_session_manager::RelaySessionTarget {
         // `RelayClient` parses every stdout line as JSON, so libtest's own
         // progress lines are dropped before they reach the protocol reader.
@@ -7087,6 +7461,10 @@ mod tests {
                 starts.to_string_lossy().into_owned(),
             );
         }
+        if release == ReleaseSupport::Rejected {
+            spec.env
+                .insert(LATCH_RELAY_REJECT_RELEASE.to_owned(), "1".to_owned());
+        }
         crate::hel_session_manager::RelaySessionTarget {
             session_id: LATCH_RELAY_SESSION.to_owned(),
             spec,
@@ -7099,6 +7477,7 @@ mod tests {
     async fn latch_a_live_checkpoint(
         relay_root: &Path,
         starts: Option<&Path>,
+        release: ReleaseSupport,
     ) -> (
         crate::hel_session_manager::SessionManagerChannels,
         ManagedSessionHandle,
@@ -7112,7 +7491,7 @@ mod tests {
         let channels = crate::hel_session_manager::spawn_session_manager().unwrap();
         channels
             .targets
-            .send(vec![latch_relay_target(relay_root, starts)])
+            .send(vec![latch_relay_target(relay_root, starts, release)])
             .unwrap();
         let handle = channels
             .control
@@ -7199,7 +7578,7 @@ mod tests {
 
         let relay_root = tempfile::tempdir().unwrap();
         let (_channels, handle, mut relay, barrier_command_id, cursor) =
-            latch_a_live_checkpoint(relay_root.path(), None).await;
+            latch_a_live_checkpoint(relay_root.path(), None, ReleaseSupport::Supported).await;
 
         // Latch phase: the projection must be read at the exact ready cursor,
         // so the actor cannot reach the relay at all.
@@ -7233,10 +7612,15 @@ mod tests {
         assert!(snapshot.operational.latest_ordinal > cursor.ordinal);
         validate_checkpoint_barrier_snapshot(&snapshot, &barrier_command_id, &cursor).unwrap();
 
-        latched_checkpoint(relay, barrier_command_id, cursor)
-            .complete()
-            .await
-            .unwrap();
+        latched_checkpoint(
+            relay,
+            barrier_command_id,
+            cursor,
+            CheckpointCompletion::HeldBarrier,
+        )
+        .complete()
+        .await
+        .unwrap();
         handle.sync_now().await.unwrap();
         assert_eq!(
             handle
@@ -7247,6 +7631,194 @@ mod tests {
                 .checkpoint_barrier,
             None
         );
+    }
+
+    /// The archive is complete once the export returns, so the harness stops
+    /// waiting there: the barrier ends, ACP dispatch resumes, and only the
+    /// recovery floor waits for the installed archive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn releasing_a_checkpoint_after_export_defers_only_the_recovery_floor() {
+        // HEL_DATA_DIR is process-global, so run the database-backed half in an
+        // exact child test instead of racing unrelated tests in this process.
+        if std::env::var_os(RELEASE_TEST_CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let test_name = format!(
+                "{}::releasing_a_checkpoint_after_export_defers_only_the_recovery_floor",
+                module_path!()
+                    .strip_prefix("hel::")
+                    .unwrap_or(module_path!())
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(RELEASE_TEST_CHILD, "1")
+                .env("HEL_DATA_DIR", directory.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated checkpoint release test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // A barrier that never releases would hang the suite instead of failing
+        // it, so turn a stall into a hard error.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(120));
+            eprintln!("the exported checkpoint never released its barrier");
+            std::process::exit(101);
+        });
+
+        let relay_root = tempfile::tempdir().unwrap();
+        let (_channels, handle, mut relay, barrier_command_id, cursor) =
+            latch_a_live_checkpoint(relay_root.path(), None, ReleaseSupport::Supported).await;
+        relay.end_latch();
+        wait_until_the_actor_serves_again(&handle).await;
+
+        // The export has just finished. Releasing proves the barrier first and
+        // then hands ACP dispatch back.
+        let completion = release_checkpoint_after_export(
+            &mut relay,
+            LATCH_RELAY_SESSION,
+            &barrier_command_id,
+            &cursor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(completion, CheckpointCompletion::ReleasedAfterExport);
+        let released = relay.sync_snapshot().await.unwrap();
+        assert_eq!(released.operational.checkpoint_barrier, None);
+        assert_eq!(released.operational.checkpoint_ready, None);
+        assert_eq!(
+            released.operational.recovery_floor_ordinal, 0,
+            "an exported archive that is not installed may not release journal history"
+        );
+
+        // The transfer is still running, and the harness is already working
+        // again: a prompt submitted now reaches ACP dispatch.
+        relay
+            .submit(
+                new_command_id("prompt").unwrap(),
+                RelayCommand::Prompt {
+                    prompt: vec![ContentBlock::Text(TextContent::new("during transfer"))],
+                },
+            )
+            .await
+            .unwrap();
+        let mut dispatched = None;
+        for attempt in 0.. {
+            let snapshot = relay.sync_snapshot().await.unwrap();
+            if let Some(active) = snapshot.operational.active_prompt {
+                dispatched = Some(active);
+                break;
+            }
+            assert!(attempt < 200, "a released barrier still froze ACP dispatch");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(dispatched.is_some());
+
+        // The archive is installed, so the relay may finally forget the history
+        // it covers.
+        latched_checkpoint(
+            relay,
+            barrier_command_id,
+            cursor.clone(),
+            CheckpointCompletion::ReleasedAfterExport,
+        )
+        .complete()
+        .await
+        .unwrap();
+        handle.sync_now().await.unwrap();
+        let installed = handle
+            .view()
+            .snapshot
+            .expect("the actor published the advanced recovery floor");
+        assert_eq!(installed.operational.recovery_floor_ordinal, cursor.ordinal);
+        assert_eq!(installed.operational.recovery_floor_digest, cursor.digest);
+    }
+
+    /// A target still running a worker that predates the early release keeps
+    /// its barrier through the transfer and ends it the way it always did.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_worker_that_rejects_the_release_keeps_its_barrier_through_the_transfer() {
+        // HEL_DATA_DIR is process-global, so run the database-backed half in an
+        // exact child test instead of racing unrelated tests in this process.
+        if std::env::var_os(LEGACY_RELEASE_TEST_CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let test_name = format!(
+                "{}::a_worker_that_rejects_the_release_keeps_its_barrier_through_the_transfer",
+                module_path!()
+                    .strip_prefix("hel::")
+                    .unwrap_or(module_path!())
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(LEGACY_RELEASE_TEST_CHILD, "1")
+                .env("HEL_DATA_DIR", directory.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated legacy checkpoint release test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // A rejected release that lost its barrier would hang the suite instead
+        // of failing it, so turn a stall into a hard error.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(120));
+            eprintln!("the rejected release never finished its checkpoint");
+            std::process::exit(101);
+        });
+
+        let relay_root = tempfile::tempdir().unwrap();
+        let start_log = tempfile::tempdir().unwrap();
+        let start_log = start_log.path().join("relay-starts");
+        let (_channels, handle, mut relay, barrier_command_id, cursor) = latch_a_live_checkpoint(
+            relay_root.path(),
+            Some(&start_log),
+            ReleaseSupport::Rejected,
+        )
+        .await;
+        relay.end_latch();
+        wait_until_the_actor_serves_again(&handle).await;
+
+        let completion = release_checkpoint_after_export(
+            &mut relay,
+            LATCH_RELAY_SESSION,
+            &barrier_command_id,
+            &cursor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(completion, CheckpointCompletion::HeldBarrier);
+        // A refused command is a completed round trip, so the connection that
+        // owns the barrier must survive it.
+        assert_eq!(relay_starts(&start_log), 1);
+
+        // Today's ordering carries on: the barrier holds through the transfer,
+        // the post-transfer revalidation still has something to prove, and the
+        // completion both resumes dispatch and advances the recovery floor.
+        let transferring = relay.sync_snapshot().await.unwrap();
+        validate_checkpoint_barrier_snapshot(&transferring, &barrier_command_id, &cursor).unwrap();
+        latched_checkpoint(relay, barrier_command_id, cursor.clone(), completion)
+            .complete()
+            .await
+            .unwrap();
+        handle.sync_now().await.unwrap();
+        let completed = handle
+            .view()
+            .snapshot
+            .expect("the actor published the completed barrier");
+        assert_eq!(completed.operational.checkpoint_barrier, None);
+        assert_eq!(completed.operational.recovery_floor_ordinal, cursor.ordinal);
     }
 
     /// A caller that cannot install a latched archive has to cancel its
@@ -7292,15 +7864,24 @@ mod tests {
         let relay_root = tempfile::tempdir().unwrap();
         let start_log = tempfile::tempdir().unwrap();
         let start_log = start_log.path().join("relay-starts");
-        let (_channels, handle, mut relay, barrier_command_id, cursor) =
-            latch_a_live_checkpoint(relay_root.path(), Some(&start_log)).await;
+        let (_channels, handle, mut relay, barrier_command_id, cursor) = latch_a_live_checkpoint(
+            relay_root.path(),
+            Some(&start_log),
+            ReleaseSupport::Supported,
+        )
+        .await;
         relay.end_latch();
         wait_until_the_actor_serves_again(&handle).await;
         assert_eq!(relay_starts(&start_log), 1);
 
-        latched_checkpoint(relay, barrier_command_id, cursor)
-            .abandon(LATCH_RELAY_SESSION)
-            .await;
+        latched_checkpoint(
+            relay,
+            barrier_command_id,
+            cursor,
+            CheckpointCompletion::HeldBarrier,
+        )
+        .abandon(LATCH_RELAY_SESSION)
+        .await;
 
         // The actor serves again, which proves the reclaimed lease was not
         // leaked, and it is talking to a new relay process, which proves the
@@ -7325,6 +7906,7 @@ mod tests {
         relay: ControllerRelayLease,
         barrier_command_id: String,
         cursor: RelayCursor,
+        completion: CheckpointCompletion,
     ) -> LatchedCheckpoint {
         LatchedCheckpoint {
             artifact: CheckpointArtifact {
@@ -7340,6 +7922,7 @@ mod tests {
             relay,
             barrier_command_id,
             cursor,
+            completion,
         }
     }
 

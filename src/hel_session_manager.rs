@@ -853,10 +853,23 @@ async fn deliver_submit(
         );
         tracing::trace!(%ordinal, %command_id, "relay command accepted");
     }
-    if result.is_err() {
+    if let Err(error) = result.as_ref()
+        && !is_final_rejection(error)
+    {
         *connection = None;
     }
     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+}
+
+/// Whether the relay refused this request outright.
+///
+/// A refusal is a completed round trip, so the connection is healthy. Dropping
+/// it would discard whatever that connection owns on the worker, including a
+/// checkpoint barrier a controller is still holding.
+fn is_final_rejection(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RelayRejected>()
+        .is_some_and(|rejected| !rejected.is_retryable())
 }
 
 async fn submit_actor_command(
@@ -877,6 +890,12 @@ async fn submit_actor_command(
             .await;
         match result {
             Ok(ordinal) => return Ok(ordinal),
+            // A final rejection is a completed round trip: the relay read the
+            // command and refused it, so retrying would only be refused again.
+            // Reconnecting would also cancel any checkpoint barrier this
+            // connection owns, which is how a controller probing for a command
+            // an older worker does not understand would lose it.
+            Err(error) if is_final_rejection(&error) => return Err(error),
             Err(error) => {
                 if first_error.is_none() {
                     first_error = Some(format!("{error:#}"));

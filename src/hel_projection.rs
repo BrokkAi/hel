@@ -248,7 +248,9 @@ fn project_observation(
                 }),
                 crate::hel_worker::RelayCommandOutcome::Configured
                 | crate::hel_worker::RelayCommandOutcome::Cancelled
-                | crate::hel_worker::RelayCommandOutcome::CheckpointCompleted => {}
+                | crate::hel_worker::RelayCommandOutcome::CheckpointCompleted
+                | crate::hel_worker::RelayCommandOutcome::CheckpointReleased
+                | crate::hel_worker::RelayCommandOutcome::RecoveryFloorAdvanced => {}
             }
             if queue != current.queued_prompts {
                 mutation.queued_prompts = Some(queue);

@@ -278,6 +278,18 @@ pub enum RelayCommand {
     CompleteCheckpoint {
         barrier_command_id: String,
     },
+    /// Resume ACP dispatch for a barrier whose archive is exported but not yet
+    /// installed on the controller. The recovery floor deliberately stays put:
+    /// only [`RelayCommand::AdvanceRecoveryFloor`] may release journal history,
+    /// and only once an archive covering that history is durably installed.
+    ReleaseCheckpoint {
+        barrier_command_id: String,
+    },
+    /// Move the recovery floor to a cursor that an installed archive covers.
+    /// Valid with or without an active barrier.
+    AdvanceRecoveryFloor {
+        through: RelayCursor,
+    },
 }
 
 impl RelayCommand {
@@ -291,6 +303,8 @@ impl RelayCommand {
             Self::RemoveQueuedPrompt { .. }
                 | Self::ClearQueuedPrompts
                 | Self::CompleteCheckpoint { .. }
+                | Self::ReleaseCheckpoint { .. }
+                | Self::AdvanceRecoveryFloor { .. }
         )
     }
 
@@ -311,6 +325,8 @@ impl RelayCommand {
             Self::Close { .. } => RelayCommandKind::Close,
             Self::BeginCheckpoint { .. } => RelayCommandKind::BeginCheckpoint,
             Self::CompleteCheckpoint { .. } => RelayCommandKind::CompleteCheckpoint,
+            Self::ReleaseCheckpoint { .. } => RelayCommandKind::ReleaseCheckpoint,
+            Self::AdvanceRecoveryFloor { .. } => RelayCommandKind::AdvanceRecoveryFloor,
         }
     }
 }
@@ -326,6 +342,8 @@ pub enum RelayCommandKind {
     Close,
     BeginCheckpoint,
     CompleteCheckpoint,
+    ReleaseCheckpoint,
+    AdvanceRecoveryFloor,
 }
 
 /// Payload-free queue identity exposed in attach/status responses.
@@ -478,6 +496,8 @@ pub enum RelayCommandOutcome {
     Closed,
     QueueChanged { removed_command_ids: Vec<String> },
     CheckpointCompleted,
+    CheckpointReleased,
+    RecoveryFloorAdvanced,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1084,13 +1104,24 @@ impl DurableRelay {
                 None,
             )));
         }
-        if let RelayCommand::CompleteCheckpoint { barrier_command_id } = &command
+        if let RelayCommand::CompleteCheckpoint { barrier_command_id }
+        | RelayCommand::ReleaseCheckpoint { barrier_command_id } = &command
             && (self.snapshot.checkpoint_barrier.as_deref() != Some(barrier_command_id)
                 || self.snapshot.checkpoint_ready_through.is_none())
         {
             return Ok(Err(relay_protocol_error(
                 RelayErrorCode::InvalidState,
                 "checkpoint barrier is not active",
+                false,
+                None,
+            )));
+        }
+        if let RelayCommand::AdvanceRecoveryFloor { through } = &command
+            && let Some(message) = self.recovery_floor_rejection(through)?
+        {
+            return Ok(Err(relay_protocol_error(
+                RelayErrorCode::InvalidState,
+                message,
                 false,
                 None,
             )));
@@ -1140,6 +1171,43 @@ impl DurableRelay {
         }))
     }
 
+    /// Why a recovery floor move must be refused, or `None` when it is valid.
+    ///
+    /// Journal garbage collection retains history through this ordinal, so a
+    /// cursor off this relay's own event chain would discard events that no
+    /// installed archive covers. The floor therefore only moves forward, only
+    /// within the durable frontier, and only to a matching digest.
+    fn recovery_floor_rejection(&self, through: &RelayCursor) -> Result<Option<String>> {
+        if through.ordinal > self.snapshot.latest_ordinal {
+            return Ok(Some(format!(
+                "recovery floor {} is ahead of the relay frontier {}",
+                through.ordinal, self.snapshot.latest_ordinal
+            )));
+        }
+        if through.ordinal < self.snapshot.recovery_floor_ordinal {
+            return Ok(Some(format!(
+                "recovery floor {} is behind the current floor {}",
+                through.ordinal, self.snapshot.recovery_floor_ordinal
+            )));
+        }
+        if validate_relay_digest(&through.digest, "recovery floor digest").is_err() {
+            return Ok(Some("recovery floor digest is malformed".to_owned()));
+        }
+        let Some(expected) = self.digest_at(through.ordinal)? else {
+            return Ok(Some(format!(
+                "relay digest is unavailable at event {}",
+                through.ordinal
+            )));
+        };
+        if through.digest != expected {
+            return Ok(Some(format!(
+                "recovery floor digest does not match the relay event chain at event {}",
+                through.ordinal
+            )));
+        }
+        Ok(None)
+    }
+
     /// Finish a relay-local command from its durable dispatch record. This is
     /// deliberately restartable: every intermediate mutation is an event, so
     /// reopening the relay can resume after any append without duplicating or
@@ -1160,9 +1228,7 @@ impl DurableRelay {
                 | RelayDispatchState::Rejected
                 | RelayDispatchState::Interrupted
         ) {
-            if dispatch.state == RelayDispatchState::Completed
-                && matches!(command, RelayCommand::CompleteCheckpoint { .. })
-            {
+            if dispatch.state == RelayDispatchState::Completed && releases_history(&command) {
                 // The completion event may be durable even if its following
                 // journal GC reported a transient persistence error.
                 self.garbage_collect_relay_history()?;
@@ -1200,21 +1266,22 @@ impl DurableRelay {
                 .collect(),
             _ => Vec::new(),
         };
-        let completes_checkpoint = matches!(command, RelayCommand::CompleteCheckpoint { .. });
+        let outcome = match &command {
+            RelayCommand::CompleteCheckpoint { .. } => RelayCommandOutcome::CheckpointCompleted,
+            RelayCommand::ReleaseCheckpoint { .. } => RelayCommandOutcome::CheckpointReleased,
+            RelayCommand::AdvanceRecoveryFloor { .. } => RelayCommandOutcome::RecoveryFloorAdvanced,
+            _ => RelayCommandOutcome::QueueChanged {
+                removed_command_ids,
+            },
+        };
         self.append_relay_event(
             Some(command_id),
             RelayObservation::CommandCompleted {
                 command_id: command_id.to_owned(),
-                outcome: if completes_checkpoint {
-                    RelayCommandOutcome::CheckpointCompleted
-                } else {
-                    RelayCommandOutcome::QueueChanged {
-                        removed_command_ids,
-                    }
-                },
+                outcome,
             },
         )?;
-        if completes_checkpoint {
+        if releases_history(&command) {
             self.garbage_collect_relay_history()?;
         }
         Ok(())
@@ -2477,6 +2544,39 @@ fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent) -> Result
                         barrier.terminal_ordinal = Some(event.ordinal);
                     }
                 }
+                (
+                    RelayCommand::ReleaseCheckpoint { barrier_command_id },
+                    RelayCommandOutcome::CheckpointReleased,
+                ) => {
+                    if snapshot.checkpoint_barrier.as_deref() != Some(&barrier_command_id) {
+                        bail!("checkpoint release does not match the active barrier");
+                    }
+                    if snapshot.checkpoint_ready_through.is_none() {
+                        bail!("checkpoint barrier was not ready");
+                    }
+                    // Dispatch resumes, but the recovery floor stays where the
+                    // last installed archive left it: nothing yet proves this
+                    // archive reached the controller's disk.
+                    snapshot.checkpoint_barrier = None;
+                    snapshot.checkpoint_ready_through = None;
+                    snapshot.checkpoint_ready_digest = None;
+                    if let Some(barrier) = snapshot.dispatches.get_mut(&barrier_command_id) {
+                        barrier.state = RelayDispatchState::Completed;
+                    }
+                    if let Some(barrier) = snapshot.handled_commands.get_mut(&barrier_command_id) {
+                        barrier.terminal_ordinal = Some(event.ordinal);
+                    }
+                }
+                (
+                    RelayCommand::AdvanceRecoveryFloor { through },
+                    RelayCommandOutcome::RecoveryFloorAdvanced,
+                ) => {
+                    if through.ordinal < snapshot.recovery_floor_ordinal {
+                        bail!("recovery floor cannot move back");
+                    }
+                    snapshot.recovery_floor_ordinal = through.ordinal;
+                    snapshot.recovery_floor_digest = through.digest;
+                }
                 (RelayCommand::BeginCheckpoint { .. }, _) => {
                     bail!("checkpoint barriers complete through checkpoint-ready")
                 }
@@ -2593,6 +2693,16 @@ fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent) -> Result
     snapshot.latest_ordinal = event.ordinal;
     snapshot.latest_digest = event.digest.clone();
     Ok(())
+}
+
+/// Whether finishing this relay-local command can let journal GC drop history.
+/// Only a recovery-floor move does; releasing a barrier deliberately leaves the
+/// floor where an installed archive left it.
+fn releases_history(command: &RelayCommand) -> bool {
+    matches!(
+        command,
+        RelayCommand::CompleteCheckpoint { .. } | RelayCommand::AdvanceRecoveryFloor { .. }
+    )
 }
 
 fn terminalize_removed_prompts(
@@ -3424,6 +3534,36 @@ mod tests {
             .unwrap()
     }
 
+    fn submit_release(
+        relay: &mut DurableRelay,
+        command_id: &str,
+        barrier_command_id: &str,
+    ) -> RelayResponseEnvelope {
+        relay.handle(relay_request(
+            &format!("request-{command_id}"),
+            RelayRequest::Submit {
+                command_id: command_id.to_owned(),
+                command: RelayCommand::ReleaseCheckpoint {
+                    barrier_command_id: barrier_command_id.to_owned(),
+                },
+            },
+        ))
+    }
+
+    fn submit_floor(
+        relay: &mut DurableRelay,
+        command_id: &str,
+        through: RelayCursor,
+    ) -> RelayResponseEnvelope {
+        relay.handle(relay_request(
+            &format!("request-{command_id}"),
+            RelayRequest::Submit {
+                command_id: command_id.to_owned(),
+                command: RelayCommand::AdvanceRecoveryFloor { through },
+            },
+        ))
+    }
+
     fn ready_checkpoint(relay: &mut DurableRelay, command_id: &str) -> RelayCursor {
         submit_relay(
             relay,
@@ -3790,6 +3930,207 @@ mod tests {
         let next = relay.claim_pending_commands(true).unwrap();
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].command_id, "queued-offline");
+    }
+
+    /// The controller releases dispatch once the archive exists on the target,
+    /// long before that archive is installed. Journal history must stay put
+    /// until an installed archive covers it.
+    #[test]
+    fn releasing_a_checkpoint_resumes_dispatch_without_moving_the_recovery_floor() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let ready = ready_checkpoint(&mut relay, "released-barrier");
+        submit_relay(&mut relay, "queued-during-release", prompt("later"));
+        attach_relay(&mut relay, "attach-release", 0);
+        acknowledge_relay(&mut relay, "ack-release", ready.ordinal);
+        assert!(relay.claim_pending_commands(true).unwrap().is_empty());
+        let floor_before = relay.snapshot.recovery_floor_ordinal;
+        let retained_before = relay.snapshot.retained_through();
+
+        submit_relay(
+            &mut relay,
+            "release-command",
+            RelayCommand::ReleaseCheckpoint {
+                barrier_command_id: "released-barrier".into(),
+            },
+        );
+
+        assert!(relay.operational_state().checkpoint_barrier.is_none());
+        assert!(relay.operational_state().checkpoint_ready.is_none());
+        assert_eq!(relay.snapshot.recovery_floor_ordinal, floor_before);
+        assert_eq!(relay.snapshot.retained_through(), retained_before);
+        let claimed = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].command_id, "queued-during-release");
+        // The released barrier is terminal, so the controller connection that
+        // opened it can drop without cancelling anything.
+        assert!(
+            relay
+                .cancel_checkpoint_barrier_on_disconnect("released-barrier")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn releasing_a_checkpoint_requires_that_exact_ready_barrier() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let missing = submit_release(&mut relay, "release-without-barrier", "no-such-barrier");
+        assert!(matches!(
+            missing.body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::InvalidState,
+                    ..
+                }
+            }
+        ));
+
+        submit_relay(
+            &mut relay,
+            "unready-barrier",
+            RelayCommand::BeginCheckpoint { reason: None },
+        );
+        assert_eq!(relay.claim_pending_commands(true).unwrap().len(), 1);
+        let unready = submit_release(&mut relay, "release-unready", "unready-barrier");
+        assert!(matches!(
+            unready.body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::InvalidState,
+                    ..
+                }
+            }
+        ));
+
+        relay.record_checkpoint_ready("unready-barrier").unwrap();
+        let wrong = submit_release(&mut relay, "release-wrong", "another-barrier");
+        assert!(matches!(
+            wrong.body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::InvalidState,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(
+            relay.operational_state().checkpoint_barrier.as_deref(),
+            Some("unready-barrier")
+        );
+    }
+
+    /// Installing the archive is what earns the journal release, and the
+    /// recovery floor is how the relay records it.
+    #[test]
+    fn advancing_the_recovery_floor_releases_history_only_forward_and_on_chain() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let ready = ready_checkpoint(&mut relay, "installed-barrier");
+        submit_relay(
+            &mut relay,
+            "release-installed",
+            RelayCommand::ReleaseCheckpoint {
+                barrier_command_id: "installed-barrier".into(),
+            },
+        );
+        // Acknowledge past the ready cursor so the recovery floor alone decides
+        // what the relay retains.
+        attach_relay(&mut relay, "attach-floor", 0);
+        let acknowledged = relay.latest_ordinal();
+        acknowledge_relay(&mut relay, "ack-floor", acknowledged);
+        assert_eq!(relay.snapshot.retained_through(), 0);
+
+        let mismatched = submit_floor(
+            &mut relay,
+            "floor-wrong-digest",
+            RelayCursor {
+                ordinal: ready.ordinal,
+                digest: "b".repeat(64),
+            },
+        );
+        assert!(matches!(
+            mismatched.body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::InvalidState,
+                    ..
+                }
+            }
+        ));
+        let beyond_frontier = RelayCursor {
+            ordinal: relay.latest_ordinal() + 1,
+            digest: relay.snapshot.latest_digest.clone(),
+        };
+        let ahead = submit_floor(&mut relay, "floor-ahead", beyond_frontier);
+        assert!(matches!(
+            ahead.body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::InvalidState,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(relay.snapshot.recovery_floor_ordinal, 0);
+
+        submit_relay(
+            &mut relay,
+            "floor-installed",
+            RelayCommand::AdvanceRecoveryFloor {
+                through: ready.clone(),
+            },
+        );
+        assert_eq!(relay.snapshot.recovery_floor_ordinal, ready.ordinal);
+        assert_eq!(relay.snapshot.recovery_floor_digest, ready.digest);
+        assert_eq!(relay.snapshot.retained_through(), ready.ordinal);
+
+        let backwards = submit_floor(
+            &mut relay,
+            "floor-backwards",
+            RelayCursor {
+                ordinal: 0,
+                digest: RELAY_EVENT_GENESIS_DIGEST.to_owned(),
+            },
+        );
+        assert!(matches!(
+            backwards.body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::InvalidState,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(relay.snapshot.recovery_floor_ordinal, ready.ordinal);
+    }
+
+    /// The legacy one-step completion is unchanged: it both resumes dispatch
+    /// and advances the recovery floor.
+    #[test]
+    fn completing_a_checkpoint_still_resumes_dispatch_and_advances_the_floor() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let ready = ready_checkpoint(&mut relay, "completed-barrier");
+        submit_relay(&mut relay, "queued-during-completion", prompt("later"));
+        attach_relay(&mut relay, "attach-completion", 0);
+        acknowledge_relay(&mut relay, "ack-completion", ready.ordinal);
+
+        submit_relay(
+            &mut relay,
+            "complete-command",
+            RelayCommand::CompleteCheckpoint {
+                barrier_command_id: "completed-barrier".into(),
+            },
+        );
+
+        assert!(relay.operational_state().checkpoint_barrier.is_none());
+        assert_eq!(relay.snapshot.recovery_floor_ordinal, ready.ordinal);
+        assert_eq!(relay.snapshot.retained_through(), ready.ordinal);
+        let claimed = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].command_id, "queued-during-completion");
     }
 
     #[test]

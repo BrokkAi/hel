@@ -661,7 +661,9 @@ mod unix {
             RelayCommand::BeginCheckpoint { .. }
             | RelayCommand::RemoveQueuedPrompt { .. }
             | RelayCommand::ClearQueuedPrompts
-            | RelayCommand::CompleteCheckpoint { .. } => None,
+            | RelayCommand::CompleteCheckpoint { .. }
+            | RelayCommand::ReleaseCheckpoint { .. }
+            | RelayCommand::AdvanceRecoveryFloor { .. } => None,
         }
     }
 
@@ -763,7 +765,7 @@ mod unix {
                         Some(CheckpointChange::Begin(command_id)) => {
                             checkpoint_barriers.insert(command_id);
                         }
-                        Some(CheckpointChange::Complete(command_id)) => {
+                        Some(CheckpointChange::Ended(command_id)) => {
                             checkpoint_barriers.remove(&command_id);
                         }
                         None => {}
@@ -946,7 +948,9 @@ mod unix {
 
     enum CheckpointChange {
         Begin(String),
-        Complete(String),
+        /// The barrier no longer belongs to this connection, whether it ended
+        /// through a full completion or an early dispatch release.
+        Ended(String),
     }
 
     fn checkpoint_change(request: &RelayRequest) -> Option<CheckpointChange> {
@@ -961,8 +965,9 @@ mod unix {
             RelayCommand::BeginCheckpoint { .. } => {
                 Some(CheckpointChange::Begin(command_id.clone()))
             }
-            RelayCommand::CompleteCheckpoint { barrier_command_id } => {
-                Some(CheckpointChange::Complete(barrier_command_id.clone()))
+            RelayCommand::CompleteCheckpoint { barrier_command_id }
+            | RelayCommand::ReleaseCheckpoint { barrier_command_id } => {
+                Some(CheckpointChange::Ended(barrier_command_id.clone()))
             }
             _ => None,
         }
@@ -2559,6 +2564,98 @@ mod relay_tests {
         drop(event_tx);
         drop(wake_tx);
         coordinator.await.unwrap().unwrap();
+    }
+
+    /// A checkpoint hands ACP dispatch back as soon as its archive exists, then
+    /// keeps using the same connection for the transfer. When that connection
+    /// finally drops, the released barrier is already terminal: cancelling it
+    /// again would push a spurious interruption into the transcript.
+    #[tokio::test]
+    async fn a_released_checkpoint_barrier_is_not_cancelled_when_its_connection_drops() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(
+            &mut durable,
+            "released-barrier",
+            RelayCommand::BeginCheckpoint {
+                reason: Some("early release".into()),
+            },
+        );
+        submit(
+            &mut durable,
+            "queued-during-transfer",
+            RelayCommand::Prompt {
+                prompt: vec![ContentBlock::Text(TextContent::new("later"))],
+            },
+        );
+        assert_eq!(durable.claim_pending_commands(true).unwrap().len(), 1);
+        durable.record_checkpoint_ready("released-barrier").unwrap();
+        let floor_before = durable.operational_state().recovery_floor_ordinal;
+        let relay = Arc::new(Mutex::new(durable));
+
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let served = tokio::spawn(unix::serve_client(
+            server,
+            relay.clone(),
+            wake_tx,
+            test_credentials(),
+        ));
+        let request = RelayRequestEnvelope {
+            request_id: "release-request".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Submit {
+                command_id: "release-command".into(),
+                command: RelayCommand::ReleaseCheckpoint {
+                    barrier_command_id: "released-barrier".into(),
+                },
+            },
+        };
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        client.write_all(&encoded).await.unwrap();
+        let response = BufReader::new(&mut client)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap();
+        let response: RelayResponseEnvelope = serde_json::from_str(&response).unwrap();
+        assert!(
+            matches!(
+                &response.body,
+                RelayResponseBody::Ok {
+                    payload: RelayResponsePayload::Accepted { command_id, .. }
+                } if command_id == "release-command"
+            ),
+            "relay did not accept the release: {:?}",
+            response.body
+        );
+
+        // Dropping the connection is exactly what the worker treats as the
+        // controller disappearing.
+        drop(client);
+        served.await.unwrap().unwrap();
+
+        let mut relay = relay.lock().unwrap();
+        let state = relay.operational_state();
+        assert!(state.checkpoint_barrier.is_none());
+        assert_eq!(state.recovery_floor_ordinal, floor_before);
+        assert!(
+            !relay
+                .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.observation,
+                    RelayObservation::CommandInterrupted { command_id, .. }
+                        if command_id == "released-barrier"
+                )),
+            "the dropped connection cancelled a barrier it had already released"
+        );
+        let next = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].command_id, "queued-during-transfer");
     }
 
     #[tokio::test]

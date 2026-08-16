@@ -313,6 +313,26 @@ struct PendingPayload<'a> {
 /// the target. Failure leaves an existing destination untouched whenever the
 /// failure occurs before the final same-directory rename.
 pub fn write_archive_atomic(path: &Path, input: &ArchiveInput) -> Result<VerifiedArchiveMetadata> {
+    write_archive_installed(path, input)?;
+    verify_archive_streaming(path)
+        .with_context(|| format!("verify newly written archive {}", path.display()))
+}
+
+/// Writes and installs an archive exactly as [`write_archive_atomic`] does, then
+/// hashes it in one sequential pass instead of structurally re-reading it.
+///
+/// The checkpoint export path uses this: the target just wrote the ZIP from
+/// validated input, and the controller structurally verifies the same bytes
+/// after downloading them. Callers that install an archive nothing else will
+/// verify must keep using [`write_archive_atomic`].
+pub fn write_archive_hashed(path: &Path, input: &ArchiveInput) -> Result<String> {
+    write_archive_installed(path, input)?;
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    digest_reader(&mut file)
+        .with_context(|| format!("hash newly written archive {}", path.display()))
+}
+
+fn write_archive_installed(path: &Path, input: &ArchiveInput) -> Result<()> {
     let (manifest, payloads) = prepare_archive(input)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
@@ -334,9 +354,7 @@ pub fn write_archive_atomic(path: &Path, input: &ArchiveInput) -> Result<Verifie
     sync_directory(parent)?;
     drop(payloads);
     drop(manifest);
-
-    verify_archive_streaming(path)
-        .with_context(|| format!("verify newly written archive {}", path.display()))
+    Ok(())
 }
 
 pub fn checkpoint_for_close(path: &Path, input: &ArchiveInput) -> CloseVerification {
