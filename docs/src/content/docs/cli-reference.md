@@ -86,8 +86,9 @@ model, so `/effort` offers the tiers that model supports. While an advertised
 - Shift+Tab changes the current agent's model and effort.
 - Typing `@` opens workspace file autocomplete; the chosen file is attached to
   the prompt as an ACP resource link.
-- Alt+Up (or Shift+Left) pulls the newest queued prompt back into the composer
-  for editing.
+- Alt+Up (or Shift+Left) pulls the newest queued entry back into the composer
+  for editing. `/model` and `/effort` submitted while the agent is busy join the
+  same queue and apply in turn, so they peel back the same way.
 - F10 toggles help.
 - Esc dismisses autocomplete, clears input, or cancels a permission prompt.
 - Ctrl-C cancels the active turn together with every running subagent; on an

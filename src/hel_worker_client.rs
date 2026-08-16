@@ -82,6 +82,12 @@ impl RelayRejected {
     pub fn is_desynchronized(&self) -> bool {
         self.0.code == RelayErrorCode::Desynchronized
     }
+
+    /// Whether the relay itself said the same request could succeed later.
+    /// Validation rejections say no; transient internal failures say yes.
+    pub fn is_retryable(&self) -> bool {
+        self.0.retryable
+    }
 }
 
 /// Controller-side connection to the durable ACP relay protocol.

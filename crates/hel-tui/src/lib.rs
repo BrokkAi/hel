@@ -29,7 +29,7 @@ use hel::hel_state::{
 };
 use hel::hel_targets::{
     AdditionalMount, DeploymentCapacityKind, DeploymentCapacityTarget, DeploymentCapacityUsage,
-    SessionResourceUsage, default_mount_destination, path_completion,
+    ProvisionStage, SessionResourceUsage, default_mount_destination, path_completion,
 };
 
 const FORCE_CONFIRMATION: &str = "DESTROY";
@@ -155,6 +155,10 @@ struct SessionOperationDisplay {
     kind: SessionOperationKind,
     started_at_epoch_seconds: u64,
     placeholder: Option<SessionRecord>,
+    stage: Option<ProvisionStage>,
+    /// When the current `stage` began, so the clock can count that stage's
+    /// progress instead of the whole operation's.
+    stage_started_at_epoch_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -974,10 +978,29 @@ impl DashboardState {
                     .unwrap_or_default()
                     .as_secs(),
                 placeholder,
+                stage: None,
+                stage_started_at_epoch_seconds: None,
             },
         );
         self.apply_operation_projection();
         self.clamp_selections();
+    }
+
+    /// Name the launch phase in flight; a finished or unknown operation is
+    /// left alone. Only a stage change resets the per-stage clock, so a
+    /// repeated report of the same stage can't restart its counter.
+    pub fn set_session_operation_stage(&mut self, session_id: &str, stage: ProvisionStage) {
+        if let Some(operation) = self.session_operations.get_mut(session_id)
+            && operation.stage != Some(stage)
+        {
+            operation.stage = Some(stage);
+            operation.stage_started_at_epoch_seconds = Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
+        }
     }
 
     pub fn rekey_session_operation(&mut self, previous: &str, session_id: String) {
@@ -4138,6 +4161,17 @@ fn render_adaptive_dashboard(
         dashboard.preview_scroll_session = selected_id;
         dashboard.preview_scroll = 0;
     }
+    // A session mid-launch, mid-resume, or mid-pause has nothing worth
+    // previewing, so its row collapses to just the summary line.
+    let active_collapsed = active
+        .iter()
+        .map(|session| {
+            active_row_collapses_to_summary(
+                dashboard.session_operations.get(&session.id),
+                session.state,
+            )
+        })
+        .collect::<Vec<_>>();
     // Row heights need the previews, and the selected session's line budget
     // needs the allocated pane height. Every unselected preview is the same in
     // both passes, so the transcript tails are walked once here and only the
@@ -4151,6 +4185,7 @@ fn render_adaptive_dashboard(
             scroll: dashboard.preview_scroll,
             selected_lines: SELECTED_TRANSCRIPT_LINES,
         },
+        &active_collapsed,
     );
     let active_row_heights = active_previews
         .previews
@@ -4229,6 +4264,7 @@ fn render_adaptive_dashboard(
     // clamped against the height it actually renders at.
     if selected_lines != SELECTED_TRANSCRIPT_LINES
         && let Some(index) = selected_active
+        && !active_collapsed[index]
     {
         let (preview, applied) = active_transcript_tail(
             dashboard.session_details.get_mut(&active[index].id),
@@ -4297,6 +4333,24 @@ fn active_pane_height(row_heights: &[u16], rows: usize) -> u16 {
         .saturating_add(spacers)
 }
 
+/// A launching, resuming, or pausing session — or one caught mid-provisioning
+/// after an interrupted launch with no operation record — has nothing worth
+/// previewing yet, so its Active row collapses to just the summary line.
+fn active_row_collapses_to_summary(
+    operation: Option<&SessionOperationDisplay>,
+    state: SessionState,
+) -> bool {
+    match operation {
+        Some(operation) => matches!(
+            operation.kind,
+            SessionOperationKind::Launching
+                | SessionOperationKind::Resuming
+                | SessionOperationKind::Pausing
+        ),
+        None => state == SessionState::Provisioning,
+    }
+}
+
 /// What one frame asks of the active previews: the width they wrap to, which
 /// row is selected, how far that row's preview is scrolled, and the line budget
 /// the selected row may use.
@@ -4311,10 +4365,15 @@ fn prepare_active_previews(
     active: &[&SessionRecord],
     session_details: &mut BTreeMap<String, SessionDetail>,
     request: PreviewRequest,
+    collapsed: &[bool],
 ) -> ActivePreviews {
     let mut previews = Vec::with_capacity(active.len());
     let mut applied_scroll = 0;
     for (index, session) in active.iter().enumerate() {
+        if collapsed.get(index).copied().unwrap_or(false) {
+            previews.push(Vec::new());
+            continue;
+        }
         let selected = request.selected == Some(index);
         let (maximum_lines, scroll) = if selected {
             (request.selected_lines, request.scroll)
@@ -4942,11 +5001,17 @@ fn session_values(
     config: &HelConfig,
 ) -> (String, String, String, String, String) {
     let clock = if let Some(operation) = operation {
-        format!(
-            "{} {}s",
-            operation.kind.label(),
-            now_epoch_seconds.saturating_sub(operation.started_at_epoch_seconds)
-        )
+        let (label, started_at) = match (operation.stage, operation.kind) {
+            (Some(stage), SessionOperationKind::Launching | SessionOperationKind::Resuming) => (
+                stage.label(),
+                operation
+                    .stage_started_at_epoch_seconds
+                    .unwrap_or(operation.started_at_epoch_seconds),
+            ),
+            _ => (operation.kind.label(), operation.started_at_epoch_seconds),
+        };
+        let elapsed = now_epoch_seconds.saturating_sub(started_at);
+        format!("{label} {elapsed}s")
     } else if session.state == SessionState::Provisioning {
         let started_at = session_updated_at_epoch_seconds(session).unwrap_or(now_epoch_seconds);
         format!("Launch {}s", now_epoch_seconds.saturating_sub(started_at))
@@ -6339,7 +6404,13 @@ fn move_index(index: &mut usize, len: usize, delta: isize) {
         *index = 0;
         return;
     }
-    *index = ((*index as isize + delta).rem_euclid(len as isize)) as usize;
+    if delta.is_negative() {
+        *index = index.saturating_sub(delta.unsigned_abs());
+    } else {
+        *index = index
+            .saturating_add(delta as usize)
+            .min(len.saturating_sub(1));
+    }
 }
 
 fn nth_key<T>(map: &BTreeMap<String, T>, index: usize) -> String {
@@ -6740,6 +6811,89 @@ mod tests {
             dashboard.session_operations["session-1"].kind,
             SessionOperationKind::Resuming
         );
+    }
+
+    #[test]
+    fn resuming_session_with_a_transcript_collapses_to_its_summary_line() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw with preview");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Rendered answer"));
+
+        dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Resuming, None);
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw collapsed");
+        let collapsed = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(!collapsed.contains("Rendered answer"));
+        assert!(
+            dashboard.selected_preview_area.is_none(),
+            "a collapsed row has no preview to scroll"
+        );
+
+        dashboard.finish_session_operation("session-1");
+        // Finishing the operation only drops its record; the session state
+        // itself flips back to Running through a later relay update, which a
+        // real resume delivers via `spawn_lifecycle_reload` in main.rs.
+        dashboard
+            .state
+            .sessions
+            .get_mut("session-1")
+            .expect("session")
+            .state = SessionState::Running;
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw restored");
+        let restored = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(restored.contains("Rendered answer"));
+    }
+
+    #[test]
+    fn pausing_session_with_a_transcript_collapses_to_its_summary_line() {
+        let mut session = archived_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
+
+        dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Pausing, None);
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw collapsed");
+        let collapsed = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(!collapsed.contains("Rendered answer"));
+
+        dashboard.finish_session_operation("session-1");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw restored");
+        let restored = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(restored.contains("Rendered answer"));
+    }
+
+    #[test]
+    fn provisioning_without_an_operation_record_collapses_to_its_summary_line() {
+        // Interrupted-launch recovery: the session comes back as Provisioning
+        // with no in-flight operation to track it.
+        let mut session = archived_session();
+        session.state = SessionState::Provisioning;
+        let mut dashboard = dashboard_with_session(session);
+        apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
+        assert!(dashboard.session_operations.is_empty());
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw collapsed");
+        let collapsed = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(!collapsed.contains("Rendered answer"));
     }
 
     #[test]
@@ -7595,6 +7749,7 @@ mod tests {
             .queued_prompts
             .push(hel::hel_state::MaterializedQueuedPrompt {
                 command_id: "queued-1".into(),
+                kind: hel::hel_state::QueuedCommandKind::Prompt,
                 content: vec![serde_json::json!({ "type": "text", "text": "next task" })],
                 queued_at_ms: 0,
             });
@@ -8952,6 +9107,37 @@ mod tests {
         assert_eq!(dashboard.focus, Focus::Capacity);
         dashboard.handle_key(key(KeyCode::BackTab));
         assert_eq!(dashboard.focus, Focus::Archived);
+    }
+
+    #[test]
+    fn keyboard_selection_stops_at_the_active_panes_ends_instead_of_wrapping() {
+        let sessions = (0..3)
+            .map(|index| {
+                let mut session = archived_session();
+                session.id = format!("session-{index}");
+                session.state = SessionState::Running;
+                (session.id.clone(), session)
+            })
+            .collect();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+
+        assert_eq!(dashboard.session_index, 0);
+        dashboard.handle_key(key(KeyCode::Up));
+        assert_eq!(dashboard.session_index, 0, "Up at the first row stays put");
+
+        dashboard.handle_key(key(KeyCode::Down));
+        dashboard.handle_key(key(KeyCode::Down));
+        assert_eq!(dashboard.session_index, 2);
+        dashboard.handle_key(key(KeyCode::Down));
+        assert_eq!(dashboard.session_index, 2, "Down at the last row stays put");
     }
 
     #[test]
@@ -10578,6 +10764,98 @@ mod tests {
 
         let (clock, _, _, _, _) = session_values(&session, None, None, 1_012, &config());
         assert_eq!(clock, "Launch 12s");
+    }
+
+    fn operation(
+        kind: SessionOperationKind,
+        stage: Option<ProvisionStage>,
+    ) -> SessionOperationDisplay {
+        SessionOperationDisplay {
+            kind,
+            started_at_epoch_seconds: 1_000,
+            placeholder: None,
+            stage,
+            stage_started_at_epoch_seconds: stage.map(|_| 1_000),
+        }
+    }
+
+    #[test]
+    fn launch_clock_names_the_reported_stage() {
+        let session = archived_session();
+        let operation = operation(
+            SessionOperationKind::Launching,
+            Some(ProvisionStage::Booting),
+        );
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Boot 12s");
+    }
+
+    #[test]
+    fn launch_clock_falls_back_to_the_kind_label_without_a_stage() {
+        let session = archived_session();
+        let operation = operation(SessionOperationKind::Launching, None);
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Launch 12s");
+    }
+
+    #[test]
+    fn a_stage_does_not_rename_a_non_launch_operation() {
+        let session = archived_session();
+        let operation = operation(SessionOperationKind::Pausing, Some(ProvisionStage::Syncing));
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_012, &config());
+        assert_eq!(clock, "Pausing 12s");
+    }
+
+    #[test]
+    fn setting_a_stage_for_an_unknown_session_is_ignored() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.set_session_operation_stage("missing", ProvisionStage::Booting);
+        assert!(dashboard.session_operations.is_empty());
+    }
+
+    #[test]
+    fn stage_clock_counts_from_when_the_stage_began_not_the_operation() {
+        let session = archived_session();
+        let mut operation = operation(
+            SessionOperationKind::Launching,
+            Some(ProvisionStage::Booting),
+        );
+        // The operation started at 1_000 but the stage only began at 1_040;
+        // the clock must count from the stage, not the whole operation.
+        operation.stage_started_at_epoch_seconds = Some(1_040);
+
+        let (clock, _, _, _, _) =
+            session_values(&session, None, Some(&operation), 1_052, &config());
+        assert_eq!(clock, "Boot 12s");
+    }
+
+    #[test]
+    fn repeating_a_stage_report_does_not_reset_its_clock() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.begin_session_operation(
+            "session-1".into(),
+            SessionOperationKind::Launching,
+            None,
+        );
+        dashboard.set_session_operation_stage("session-1", ProvisionStage::Booting);
+        dashboard
+            .session_operations
+            .get_mut("session-1")
+            .expect("operation")
+            .stage_started_at_epoch_seconds = Some(1_000);
+
+        dashboard.set_session_operation_stage("session-1", ProvisionStage::Booting);
+
+        assert_eq!(
+            dashboard.session_operations["session-1"].stage_started_at_epoch_seconds,
+            Some(1_000)
+        );
     }
 
     #[test]

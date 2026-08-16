@@ -672,7 +672,9 @@ mod unix {
             RelayCommand::BeginCheckpoint { .. }
             | RelayCommand::RemoveQueuedPrompt { .. }
             | RelayCommand::ClearQueuedPrompts
-            | RelayCommand::CompleteCheckpoint { .. } => None,
+            | RelayCommand::CompleteCheckpoint { .. }
+            | RelayCommand::ReleaseCheckpoint { .. }
+            | RelayCommand::AdvanceRecoveryFloor { .. } => None,
         }
     }
 
@@ -774,7 +776,7 @@ mod unix {
                         Some(CheckpointChange::Begin(command_id)) => {
                             checkpoint_barriers.insert(command_id);
                         }
-                        Some(CheckpointChange::Complete(command_id)) => {
+                        Some(CheckpointChange::Ended(command_id)) => {
                             checkpoint_barriers.remove(&command_id);
                         }
                         None => {}
@@ -957,7 +959,9 @@ mod unix {
 
     enum CheckpointChange {
         Begin(String),
-        Complete(String),
+        /// The barrier no longer belongs to this connection, whether it ended
+        /// through a full completion or an early dispatch release.
+        Ended(String),
     }
 
     fn checkpoint_change(request: &RelayRequest) -> Option<CheckpointChange> {
@@ -972,8 +976,9 @@ mod unix {
             RelayCommand::BeginCheckpoint { .. } => {
                 Some(CheckpointChange::Begin(command_id.clone()))
             }
-            RelayCommand::CompleteCheckpoint { barrier_command_id } => {
-                Some(CheckpointChange::Complete(barrier_command_id.clone()))
+            RelayCommand::CompleteCheckpoint { barrier_command_id }
+            | RelayCommand::ReleaseCheckpoint { barrier_command_id } => {
+                Some(CheckpointChange::Ended(barrier_command_id.clone()))
             }
             _ => None,
         }
@@ -1957,7 +1962,7 @@ mod relay_tests {
     }
 
     #[tokio::test]
-    async fn same_priority_controls_dispatch_in_acceptance_order() {
+    async fn same_priority_queue_entries_dispatch_in_acceptance_order() {
         let temp = tempfile::tempdir().unwrap();
         let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
         submit(
@@ -1989,27 +1994,40 @@ mod relay_tests {
             })
             .unwrap();
 
-        let first = command_rx.recv().await.unwrap();
-        let second = command_rx.recv().await.unwrap();
+        // Queue entries run one at a time, so the second change reaches ACP
+        // only after the first is terminal.
         assert!(matches!(
-            first,
+            command_rx.recv().await.unwrap(),
             CommandRequest::SetConfig { request_id, .. }
                 if request_id == "z-accepted-first"
         ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), command_rx.recv())
+                .await
+                .is_err(),
+            "the queued change dispatched while an earlier one was in flight"
+        );
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "z-accepted-first".into(),
+                message: "advance the queue".into(),
+            })
+            .unwrap();
         assert!(matches!(
-            second,
+            tokio::time::timeout(std::time::Duration::from_secs(1), command_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
             CommandRequest::SetConfig { request_id, .. }
                 if request_id == "a-accepted-second"
         ));
 
-        for request_id in ["z-accepted-first", "a-accepted-second"] {
-            event_tx
-                .send(RuntimeEvent::CommandRejected {
-                    request_id: request_id.into(),
-                    message: "test shutdown".into(),
-                })
-                .unwrap();
-        }
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "a-accepted-second".into(),
+                message: "test shutdown".into(),
+            })
+            .unwrap();
         event_tx.send(RuntimeEvent::Stopped).unwrap();
         drop(event_tx);
         drop(wake_tx);
@@ -2020,16 +2038,10 @@ mod relay_tests {
     async fn dispatch_batch_does_not_outgrow_the_bounded_acp_command_channel() {
         let temp = tempfile::tempdir().unwrap();
         let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
-        for (command_id, value) in [("config-first", "first"), ("config-second", "second")] {
-            submit(
-                &mut durable,
-                command_id,
-                RelayCommand::SetConfig {
-                    key: "model".into(),
-                    value: value.into(),
-                },
-            );
-        }
+        // A prompt and the cancel that targets it are both claimable at once,
+        // so only the bounded channel limits the durable batch.
+        submit(&mut durable, "prompt-first", prompt("running"));
+        submit(&mut durable, "cancel-second", RelayCommand::Cancel);
         let relay = Arc::new(Mutex::new(durable));
         let (event_tx, event_rx) = runtime_event_channel();
         let (wake_tx, wake_rx) = mpsc::channel(1);
@@ -2043,10 +2055,7 @@ mod relay_tests {
             })
             .unwrap();
 
-        assert!(matches!(
-            command_rx.recv().await.unwrap(),
-            CommandRequest::SetConfig { request_id, .. } if request_id == "config-first"
-        ));
+        assert_prompt(command_rx.recv().await.unwrap(), "prompt-first", "running");
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(25), command_rx.recv(),)
                 .await
@@ -2056,7 +2065,7 @@ mod relay_tests {
 
         event_tx
             .send(RuntimeEvent::CommandRejected {
-                request_id: "config-first".into(),
+                request_id: "prompt-first".into(),
                 message: "advance the bounded batch".into(),
             })
             .unwrap();
@@ -2065,11 +2074,11 @@ mod relay_tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            CommandRequest::SetConfig { request_id, .. } if request_id == "config-second"
+            CommandRequest::Cancel { request_id } if request_id == "cancel-second"
         ));
         event_tx
             .send(RuntimeEvent::CommandRejected {
-                request_id: "config-second".into(),
+                request_id: "cancel-second".into(),
                 message: "test shutdown".into(),
             })
             .unwrap();
@@ -2109,20 +2118,36 @@ mod relay_tests {
             command_rx.recv().await.unwrap(),
             CommandRequest::SetConfig { request_id, .. } if request_id == "config-first"
         ));
+        // The prompt waits for the configuration change accepted before it.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), command_rx.recv())
+                .await
+                .is_err(),
+            "the prompt dispatched before the earlier configuration change finished"
+        );
+        event_tx
+            .send(RuntimeEvent::ConfigApplied {
+                request_id: "config-first".into(),
+                key: "model".into(),
+                value: "before-prompt".into(),
+                config_options: Vec::new(),
+            })
+            .unwrap();
         assert_prompt(
-            command_rx.recv().await.unwrap(),
+            tokio::time::timeout(std::time::Duration::from_secs(1), command_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
             "prompt-second",
             "after config",
         );
 
-        for request_id in ["config-first", "prompt-second"] {
-            event_tx
-                .send(RuntimeEvent::CommandRejected {
-                    request_id: request_id.into(),
-                    message: "test shutdown".into(),
-                })
-                .unwrap();
-        }
+        event_tx
+            .send(RuntimeEvent::CommandRejected {
+                request_id: "prompt-second".into(),
+                message: "test shutdown".into(),
+            })
+            .unwrap();
         event_tx.send(RuntimeEvent::Stopped).unwrap();
         drop(event_tx);
         drop(wake_tx);
@@ -2689,6 +2714,98 @@ mod relay_tests {
         drop(event_tx);
         drop(wake_tx);
         coordinator.await.unwrap().unwrap();
+    }
+
+    /// A checkpoint hands ACP dispatch back as soon as its archive exists, then
+    /// keeps using the same connection for the transfer. When that connection
+    /// finally drops, the released barrier is already terminal: cancelling it
+    /// again would push a spurious interruption into the transcript.
+    #[tokio::test]
+    async fn a_released_checkpoint_barrier_is_not_cancelled_when_its_connection_drops() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(
+            &mut durable,
+            "released-barrier",
+            RelayCommand::BeginCheckpoint {
+                reason: Some("early release".into()),
+            },
+        );
+        submit(
+            &mut durable,
+            "queued-during-transfer",
+            RelayCommand::Prompt {
+                prompt: vec![ContentBlock::Text(TextContent::new("later"))],
+            },
+        );
+        assert_eq!(durable.claim_pending_commands(true).unwrap().len(), 1);
+        durable.record_checkpoint_ready("released-barrier").unwrap();
+        let floor_before = durable.operational_state().recovery_floor_ordinal;
+        let relay = Arc::new(Mutex::new(durable));
+
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let served = tokio::spawn(unix::serve_client(
+            server,
+            relay.clone(),
+            wake_tx,
+            test_credentials(),
+        ));
+        let request = RelayRequestEnvelope {
+            request_id: "release-request".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Submit {
+                command_id: "release-command".into(),
+                command: RelayCommand::ReleaseCheckpoint {
+                    barrier_command_id: "released-barrier".into(),
+                },
+            },
+        };
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        client.write_all(&encoded).await.unwrap();
+        let response = BufReader::new(&mut client)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap();
+        let response: RelayResponseEnvelope = serde_json::from_str(&response).unwrap();
+        assert!(
+            matches!(
+                &response.body,
+                RelayResponseBody::Ok {
+                    payload: RelayResponsePayload::Accepted { command_id, .. }
+                } if command_id == "release-command"
+            ),
+            "relay did not accept the release: {:?}",
+            response.body
+        );
+
+        // Dropping the connection is exactly what the worker treats as the
+        // controller disappearing.
+        drop(client);
+        served.await.unwrap().unwrap();
+
+        let mut relay = relay.lock().unwrap();
+        let state = relay.operational_state();
+        assert!(state.checkpoint_barrier.is_none());
+        assert_eq!(state.recovery_floor_ordinal, floor_before);
+        assert!(
+            !relay
+                .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.observation,
+                    RelayObservation::CommandInterrupted { command_id, .. }
+                        if command_id == "released-barrier"
+                )),
+            "the dropped connection cancelled a barrier it had already released"
+        );
+        let next = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].command_id, "queued-during-transfer");
     }
 
     #[tokio::test]
