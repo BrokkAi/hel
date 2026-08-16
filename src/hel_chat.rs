@@ -971,6 +971,8 @@ pub struct ChatState {
     history_index: Option<usize>,
     history_draft: String,
     kill_buffer: String,
+    /// Set by Ctrl-K so the next Ctrl-K appends instead of replacing.
+    chain_kill: bool,
     preferred_column: Option<usize>,
     history_search: Option<HistorySearch>,
     next_history_search_generation: u64,
@@ -1017,6 +1019,7 @@ impl ChatState {
             history_index: None,
             history_draft: String::new(),
             kill_buffer: String::new(),
+            chain_kill: false,
             preferred_column: None,
             history_search: None,
             next_history_search_generation: 0,
@@ -1720,12 +1723,27 @@ impl ChatState {
         }
     }
 
-    fn kill_to_line_end(&mut self) {
+    /// Kill to the end of the line. A `chained` kill appends to the kill
+    /// buffer, in Emacs order, so a later yank restores the whole block.
+    fn kill_to_line_end(&mut self, chained: bool) {
         let end = self.line_end();
-        if end == self.input_cursor && end < self.input.len() {
-            self.kill_range(end..end + 1);
+        let range = if end == self.input_cursor && end < self.input.len() {
+            end..end + 1
         } else {
-            self.kill_range(self.input_cursor..end);
+            self.input_cursor..end
+        };
+        if range.is_empty() {
+            // Nothing was killed, so leave any chained buffer intact.
+            return;
+        }
+        let previous = if chained {
+            std::mem::take(&mut self.kill_buffer)
+        } else {
+            String::new()
+        };
+        self.kill_range(range);
+        if !previous.is_empty() {
+            self.kill_buffer.insert_str(0, &previous);
         }
     }
 
@@ -2168,6 +2186,8 @@ impl ChatState {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return ChatAction::None;
         }
+        // Any key breaks a Ctrl-K chain; only the Ctrl-K arm sets it again.
+        let chained = std::mem::take(&mut self.chain_kill);
         let (code, modifiers) = normalize_key(key.code, key.modifiers);
 
         if code == KeyCode::Char('v')
@@ -2272,7 +2292,10 @@ impl ChatState {
                 KeyCode::Char('h') => self.backspace(),
                 KeyCode::Char('d') => self.delete(),
                 KeyCode::Char('u') => self.kill_to_line_start(),
-                KeyCode::Char('k') => self.kill_to_line_end(),
+                KeyCode::Char('k') => {
+                    self.kill_to_line_end(chained);
+                    self.chain_kill = true;
+                }
                 KeyCode::Char('w') => {
                     let start = self.previous_word_start();
                     self.kill_range(start..self.input_cursor);
@@ -6484,6 +6507,41 @@ mod tests {
         assert_eq!(chat.input, "alpha betagamma");
         chat.handle_key(ctrl('y'));
         assert_eq!(chat.input, "alpha beta\ngamma");
+    }
+
+    #[test]
+    fn sequential_control_k_accumulates_one_yankable_block() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("line1\nline2".into());
+        chat.handle_key(ctrl('a'));
+        chat.handle_key(ctrl('a'));
+        chat.handle_key(ctrl('k'));
+        chat.handle_key(ctrl('k'));
+        assert_eq!(chat.input, "line2");
+        chat.handle_key(ctrl('y'));
+        assert_eq!(chat.input, "line1\nline2");
+    }
+
+    #[test]
+    fn any_key_between_control_k_presses_restarts_the_kill_buffer() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.set_input("line1\nline2".into());
+        chat.handle_key(ctrl('a'));
+        chat.handle_key(ctrl('a'));
+        chat.handle_key(ctrl('k'));
+        chat.handle_key(key(KeyCode::Right));
+        chat.handle_key(key(KeyCode::Left));
+        chat.handle_key(ctrl('k'));
+        assert_eq!(chat.kill_buffer, "\n");
+
+        chat.set_input("line1\nline2".into());
+        chat.handle_key(ctrl('a'));
+        chat.handle_key(ctrl('a'));
+        chat.handle_key(ctrl('k'));
+        chat.handle_key(key(KeyCode::Char('x')));
+        chat.handle_key(ctrl('a'));
+        chat.handle_key(ctrl('k'));
+        assert_eq!(chat.kill_buffer, "x");
     }
 
     #[test]
