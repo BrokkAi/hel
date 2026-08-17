@@ -1,4 +1,4 @@
-# Releasing Mjolnir
+# Releasing Hel
 
 Releases are maintainer-driven. This is the tagging runbook; see
 [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, runtime invariants,
@@ -6,8 +6,13 @@ tests, and dependency-license maintenance.
 
 ## Versions
 
-The root and voice-worker `Cargo.toml` files must carry the same version, with
-matching workspace entries in `Cargo.lock`. `install.sh`'s `SCRIPT_VERSION` is
+All four published crates must carry the same version, with matching
+workspace entries in `Cargo.lock`: `hel-core` (the root package; it publishes
+under that name because crates.io's `hel` belongs to an unrelated crate, while
+the library keeps the `hel` crate name), `hel-tui`, `hel-cli` (installs the
+`hel` binary), and `hel-voice-worker`. The internal dependency versions in
+`crates/hel-tui/Cargo.toml` and `crates/hel-cli/Cargo.toml` must be bumped to
+match. `install.sh`'s `SCRIPT_VERSION` is
 an independent installer logging revision and is not automatically synchronized
 to product releases.
 
@@ -17,7 +22,8 @@ version bump must regenerate it. CI diffs the checked-in report against a fresh
 
 ## What a tag triggers
 
-A `vX.Y.Z` tag triggers the GitHub release and docs workflows.
+A `vX.Y.Z` tag triggers the GitHub release workflow. The docs workflow is
+manual-only for now; Hel does not publish a docs site yet.
 
 The release workflow opens with a coverage gate and builds nothing until it
 passes. CI's branch and pull request triggers do not match tags, so this is the
@@ -36,9 +42,9 @@ universal macOS archive. Desktop archives contain `mj` and the voice worker;
 Android omits the voice worker. Every archive includes the applicable licenses
 and notices and is published with a SHA-256 sidecar.
 
-Neither registry publish runs off the tag push. Both wait for the release
-workflow to succeed, so the coverage gate and a build failure on any target
-each stop the release before anything reaches crates.io or npm.
+The crates.io publish does not run off the tag push. It waits for the GitHub
+Release to be published, so the coverage gate and a build failure on any
+target each stop the release before anything reaches crates.io.
 
 ## Discord announcement
 
@@ -51,10 +57,12 @@ already-published release.
 
 ## crates.io publishing
 
-`publish.yml` publishes `brokk-mj-voice-worker` and `brokk-mjolnir`. It refuses
-to publish when the tag differs from either crate version, and packages both
-crates ahead of the `crates-io` environment gate so a packaging failure surfaces
-without spending an approval.
+`publish.yml` publishes `hel-core`, `hel-tui`, `hel-cli`, and
+`hel-voice-worker`, in that dependency order. It refuses to publish when the
+tag differs from any crate version, and packages all four crates ahead of the
+`crates-io` environment gate so a packaging failure surfaces without spending
+an approval (`hel-tui` and `hel-cli` package with `--no-verify` because their
+dependencies are not on the registry until the same run publishes them).
 
 Publishing runs automatically once the release workflow succeeds. The automated
 release job explicitly dispatches `publish.yml` after creating the GitHub
@@ -71,20 +79,6 @@ be republished.
 
 To package a tag without publishing, run the workflow manually with `publish`
 off and inspect its `.crate` artifact.
-
-## npm publishing
-
-`publish-npm.yml` packages an existing GitHub Release into `@brokkai/mjolnir`
-and its five platform packages. It verifies the release checksums, then
-publishes every platform package before the root wrapper.
-
-Publishing runs automatically once a GitHub Release is published. Both the
-release event and the release workflow's completion trigger it, and each
-publish step is skipped when that version already exists on the registry, so
-the overlap cannot republish over a shipped version.
-
-To package and smoke-test a tag without publishing, run the workflow manually
-with `publish` off and inspect its tarball artifact and Linux smoke test.
 
 ## Before tagging
 

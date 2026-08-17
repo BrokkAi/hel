@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing Mjolnir release tag to package, in the form vX.Y.Z
+        description: Existing Hel release tag to package, in the form vX.Y.Z
         required: true
         type: string
       publish:
@@ -44,7 +44,7 @@ jobs:
           set -euo pipefail
           tag="${RELEASE_TAG#v}"
           versions="$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "brokk-mjolnir" or .name == "brokk-mj-voice-worker") | [.name, .version] | @tsv')"
+            | jq -r '.packages[] | select(.name == "hel-core" or .name == "hel-tui" or .name == "hel-cli" or .name == "hel-voice-worker") | [.name, .version] | @tsv')"
           test -n "$versions"
           while IFS=$'\t' read -r crate version; do
             if [ "$tag" != "$version" ]; then
@@ -55,8 +55,14 @@ jobs:
 
       - name: Package crates
         run: |
-          cargo package --locked -p brokk-mj-voice-worker
-          cargo package --locked -p brokk-mjolnir
+          # hel-tui and hel-cli depend on workspace crates that are not on the
+          # registry until this same release publishes them, so their packaged
+          # tarballs cannot be verify-built here; the leaf crates still get the
+          # full verification build.
+          cargo package --locked -p hel-core
+          cargo package --locked -p hel-voice-worker
+          cargo package --locked --no-verify -p hel-tui
+          cargo package --locked --no-verify -p hel-cli
 
       - uses: actions/upload-artifact@v7
         with:
@@ -132,7 +138,9 @@ jobs:
                 ;;
             esac
           }
-          for crate in brokk-mj-voice-worker brokk-mjolnir; do
+          # Dependency order: cargo publish waits for each crate to reach the
+          # index before returning, so the next crate in the chain resolves.
+          for crate in hel-core hel-tui hel-cli hel-voice-worker; do
             if already_published "$crate"; then
               echo "$crate $version is already on crates.io, skipping"
               continue

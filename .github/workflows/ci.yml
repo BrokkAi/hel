@@ -43,12 +43,18 @@ jobs:
     - name: Check crate package license files
       run: |
         diff -u LICENSE voice-worker/LICENSE
-        cargo package --locked --allow-dirty --list -p hel > /tmp/hel-package-files.txt
+        cargo package --locked --allow-dirty --list -p hel-core > /tmp/hel-package-files.txt
         cargo package --locked --allow-dirty --list -p hel-voice-worker > /tmp/voice-worker-package-files.txt
         grep -Fx LICENSE /tmp/hel-package-files.txt
         grep -Fx licenses/THIRD_PARTY_LICENSES.html /tmp/hel-package-files.txt
         grep -Fx licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/hel-package-files.txt
         grep -Fx LICENSE /tmp/voice-worker-package-files.txt
+        diff -u LICENSE crates/hel-tui/LICENSE
+        diff -u LICENSE crates/hel-cli/LICENSE
+        cargo package --locked --allow-dirty --list -p hel-tui > /tmp/hel-tui-package-files.txt
+        cargo package --locked --allow-dirty --list -p hel-cli > /tmp/hel-cli-package-files.txt
+        grep -Fx LICENSE /tmp/hel-tui-package-files.txt
+        grep -Fx LICENSE /tmp/hel-cli-package-files.txt
 
   hel:
     strategy:

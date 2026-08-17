@@ -1,10 +1,17 @@
 [package]
-name = "hel"
+name = "hel-core"
 version = "0.2.0"
 edition = "2024"
 description = "Session control plane for ACP coding agents"
 license = "GPL-3.0-only"
+repository = "https://github.com/BrokkAi/hel"
 publish = true
+
+# The crates.io name `hel` belongs to an unrelated crate, so the package
+# publishes as `hel-core` while the library keeps the `hel` crate name that
+# the workspace imports use.
+[lib]
+name = "hel"
 include = [
     "src/**/*.rs",
     "Cargo.toml",
