@@ -1035,58 +1035,6 @@ impl Controller {
         Ok(failure)
     }
 
-    pub fn register_session(
-        &mut self,
-        profile_id: &str,
-        bundle_id: &str,
-        target_id: &str,
-        title: impl Into<String>,
-    ) -> Result<String> {
-        self.register_session_with_mounts(profile_id, bundle_id, target_id, title, Vec::new())
-    }
-
-    pub fn register_session_with_mounts(
-        &mut self,
-        profile_id: &str,
-        bundle_id: &str,
-        target_id: &str,
-        title: impl Into<String>,
-        additional_mounts: Vec<AdditionalMount>,
-    ) -> Result<String> {
-        self.register_session_with_mounts_allow_dirty(
-            profile_id,
-            bundle_id,
-            target_id,
-            title,
-            additional_mounts,
-            false,
-        )
-    }
-
-    pub fn register_session_with_mounts_allow_dirty(
-        &mut self,
-        profile_id: &str,
-        bundle_id: &str,
-        target_id: &str,
-        title: impl Into<String>,
-        additional_mounts: Vec<AdditionalMount>,
-        allow_dirty_local: bool,
-    ) -> Result<String> {
-        self.register_session_with_resources(
-            profile_id,
-            bundle_id,
-            target_id,
-            title,
-            SessionLaunchOptions {
-                additional_mounts,
-                allow_dirty_local,
-                resource_allocation: None,
-                project_directory: None,
-                session_title_override: None,
-            },
-        )
-    }
-
     pub fn register_session_with_resources(
         &mut self,
         profile_id: &str,
@@ -1190,11 +1138,6 @@ impl Controller {
             crate::hel_database::remember_mount_sources(&host, &additional_mounts)?;
         }
         Ok(id)
-    }
-
-    pub async fn provision_session(&mut self, session_id: &str) -> Result<()> {
-        self.provision_session_controlled(session_id, &ProcessExecutor)
-            .await
     }
 
     pub async fn provision_session_controlled(
@@ -1940,34 +1883,6 @@ impl Controller {
     /// target. Cross-harness resume restores Git and canonical history, starts
     /// a fresh native session, and supplies the prior transcript as its first
     /// context turn.
-    pub async fn resume_session(
-        &mut self,
-        session_id: &str,
-        profile_id: &str,
-        target_id: &str,
-    ) -> Result<()> {
-        self.resume_session_with_resources(session_id, profile_id, target_id, None)
-            .await
-    }
-
-    pub async fn resume_session_with_resources(
-        &mut self,
-        session_id: &str,
-        profile_id: &str,
-        target_id: &str,
-        resource_allocation: Option<SessionResourceAllocation>,
-    ) -> Result<()> {
-        self.resume_session_with_options(
-            session_id,
-            profile_id,
-            target_id,
-            None,
-            resource_allocation,
-        )
-        .await
-        .map(|_| ())
-    }
-
     pub async fn resume_session_with_options(
         &mut self,
         session_id: &str,
@@ -1985,25 +1900,6 @@ impl Controller {
             false,
         )
         .await
-    }
-
-    pub async fn resume_session_with_queue_disposition(
-        &mut self,
-        session_id: &str,
-        profile_id: &str,
-        target_id: &str,
-        discard_queue: bool,
-    ) -> Result<()> {
-        self.resume_session_with_options_and_queue_disposition(
-            session_id,
-            profile_id,
-            target_id,
-            None,
-            None,
-            discard_queue,
-        )
-        .await
-        .map(|_| ())
     }
 
     pub async fn resume_session_with_options_and_queue_disposition(
@@ -2537,16 +2433,6 @@ impl Controller {
             .await
     }
 
-    pub async fn checkpoint_session_managed_controlled(
-        &mut self,
-        session_id: &str,
-        executor: &(impl CommandExecutor + Sync),
-        manager: &SessionManagerControl,
-    ) -> Result<CheckpointMetadata> {
-        self.checkpoint_session_controlled_with_manager(session_id, executor, Some(manager))
-            .await
-    }
-
     async fn checkpoint_session_controlled_with_manager(
         &mut self,
         session_id: &str,
@@ -2635,20 +2521,6 @@ impl Controller {
 
     /// Create, verify, and durably install a recovery archive before allowing
     /// the relay to garbage-collect through its event frontier.
-    pub async fn create_recovery_checkpoint(&self, session_id: &str) -> Result<CheckpointArtifact> {
-        self.create_recovery_checkpoint_with_manager(session_id, None, &ProcessExecutor)
-            .await
-    }
-
-    pub async fn create_recovery_checkpoint_managed(
-        &self,
-        session_id: &str,
-        manager: &SessionManagerControl,
-    ) -> Result<CheckpointArtifact> {
-        self.create_recovery_checkpoint_with_manager(session_id, Some(manager), &ProcessExecutor)
-            .await
-    }
-
     pub async fn create_recovery_checkpoint_managed_controlled(
         &self,
         session_id: &str,
