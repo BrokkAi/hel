@@ -3,7 +3,7 @@ import starlight from '@astrojs/starlight';
 import { defineConfig } from 'astro/config';
 import rehypeBasePathLinks from './rehype-base-path-links.mjs';
 
-const site = process.env.PUBLIC_DOCS_SITE ?? 'https://mjolnir.brokk.ai';
+const site = process.env.PUBLIC_DOCS_SITE ?? 'https://brokkai.github.io/hel/';
 const productionBase = process.env.PUBLIC_DOCS_BASE ?? '/';
 const isDev = process.argv.includes('dev');
 const base = isDev ? '/' : productionBase;
@@ -22,8 +22,8 @@ export default defineConfig({
   },
   integrations: [
     starlight({
-      title: 'Mjolnir',
-      description: 'A full-featured frontend for Codex and Claude — pair them as coder and reviewer for adversarial review, with self-hosted remote control, subagents, worktrees, and voice.',
+      title: 'Hel',
+      description: 'A terminal control plane for long-running ACP coding-agent sessions, with local, container, and remote targets.',
       head: [
         { tag: 'link', attrs: { rel: 'preconnect', href: 'https://fonts.googleapis.com' } },
         { tag: 'link', attrs: { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: true } },
@@ -43,7 +43,7 @@ export default defineConfig({
           tag: 'meta',
           attrs: {
             property: 'og:image:alt',
-            content: 'Mjolnir: choose Codex or Claude to code and review, with an ASCII-art hammer.',
+            content: 'Hel: a terminal control plane for Codex, Claude Code, and Kimi Code sessions.',
           },
         },
         { tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
@@ -52,7 +52,7 @@ export default defineConfig({
           tag: 'meta',
           attrs: {
             name: 'twitter:image:alt',
-            content: 'Mjolnir: choose Codex or Claude to code and review, with an ASCII-art hammer.',
+            content: 'Hel: a terminal control plane for Codex, Claude Code, and Kimi Code sessions.',
           },
         },
       ],
@@ -63,62 +63,22 @@ export default defineConfig({
       },
       favicon: '/favicon.svg',
       editLink: {
-        baseUrl: 'https://github.com/BrokkAi/mjolnir/edit/master/docs/',
+        baseUrl: 'https://github.com/BrokkAi/hel/edit/master/docs/',
       },
       social: [
         {
           icon: 'github',
           label: 'GitHub',
-          href: 'https://github.com/BrokkAi/mjolnir',
+          href: 'https://github.com/BrokkAi/hel',
         },
       ],
       sidebar: [
-        {
-          label: 'Get started',
-          items: [
-            { label: 'Teams and adversarial review', slug: 'teams' },
-            { label: 'Install and run', slug: 'install' },
-            { label: 'Start with Codex', slug: 'codex' },
-            { label: 'Start with Claude', slug: 'claude' },
-            { label: '10-minute evaluation', slug: 'evaluate' },
-            { label: 'Data and trust boundaries', slug: 'data-boundaries' },
-          ],
-        },
-        {
-          label: 'Workflows',
-          items: [
-            { label: 'Remote control', slug: 'remote' },
-            { label: 'Voice dictation', slug: 'voice' },
-            { label: 'Subagents', slug: 'subagents' },
-            { label: 'Delegation and adversarial review', slug: 'delegation-review' },
-            { label: 'Permissions and workspace scope', slug: 'permissions' },
-            { label: 'Sessions, worktrees, and resume', slug: 'sessions-worktrees' },
-            { label: 'Headless automation', slug: 'headless' },
-          ],
-        },
         {
           label: 'Containers',
           items: [
             { label: 'Container targets', slug: 'containers' },
             { label: 'Podman for Hel', slug: 'podman' },
             { label: 'Custom container images', slug: 'custom-images' },
-          ],
-        },
-        {
-          label: 'Extend Mjolnir',
-          items: [
-            { label: 'Other agents and models', slug: 'adapters' },
-            { label: 'Configuration', slug: 'configuration' },
-          ],
-        },
-        {
-          label: 'Reference',
-          items: [
-            { label: 'CLI and keyboard', slug: 'cli-reference' },
-            { label: 'Architecture and boundaries', slug: 'overview' },
-            { label: 'Storage and network activity', slug: 'storage-network' },
-            { label: 'License and use cases', slug: 'license-use-cases' },
-            { label: 'Third-party notices', slug: 'third-party-notices' },
           ],
         },
       ],
