@@ -37,7 +37,7 @@ unused-allowed-license = "allow"
 exceptions = [
     # Workspace packages are the GPL-covered project, not generally allowed
     # third-party dependencies.
-    { crate = "hel", allow = ["GPL-3.0-only"] },
+    { crate = "hel-core", allow = ["GPL-3.0-only"] },
     { crate = "hel-cli", allow = ["GPL-3.0-only"] },
     { crate = "hel-tui", allow = ["GPL-3.0-only"] },
     { crate = "hel-voice-worker", allow = ["GPL-3.0-only"] },
