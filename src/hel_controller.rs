@@ -2315,6 +2315,13 @@ impl Controller {
                     .map(|directory| target_path(&directory.to_string_lossy())),
                 discard_queued_prompts: discard_queue || !same_harness,
             };
+            // A bare target keeps the closed session's worker root on the host.
+            // Stop anything still writing there and clear the leftover relay
+            // state, or the restore's seed loses to a stale snapshot whose
+            // frontier no journal can support.
+            if let Some(command) = hel_targets::clear_relay_state_plan(&backend, session_id)? {
+                execute_checked(executor, command)?;
+            }
             let staging = tempfile::tempdir().context("create restore staging")?;
             let local_spec = staging.path().join("restore-spec.json");
             std::fs::write(&local_spec, serde_json::to_vec_pretty(&restore)?)?;
