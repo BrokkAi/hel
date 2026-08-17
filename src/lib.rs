@@ -32,6 +32,7 @@ pub mod hel_setup;
 pub mod hel_skills;
 pub mod hel_state;
 pub mod hel_targets;
+pub mod hel_transcript;
 pub mod hel_worker;
 pub mod hel_worker_client;
 pub mod hel_worker_protocol;

@@ -29,13 +29,15 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::hel_acp::RuntimeEvent;
 use crate::hel_config::{HarnessKind, PlanModeIds};
 use crate::hel_database::{HistoryScope, PromptHistoryEntry};
-use crate::hel_recovery::RecoveryContext;
 use crate::hel_session_manager::{
     ManagedSessionHandle, ManagedSessionView, SessionManagerControl, ViewError, new_command_id,
 };
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
-    TranscriptBody, TranscriptItem, config_command_text,
+    RecoveryContext, TranscriptBody, TranscriptItem, config_command_text,
+};
+use crate::hel_transcript::{
+    ChatEntry, ChatRole, PlanLine, PlanStatus, ToolStatus, TranscriptSource,
 };
 use crate::hel_worker::{
     RELAY_EVENT_GENESIS_DIGEST, RelayCommand, SequencedEvent, WorkerEvent, WorkerPhase,
@@ -234,69 +236,9 @@ enum ChatFocus {
     Conversations,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ChatRole {
-    User,
-    Agent,
-    /// Agent reasoning stream, rendered dimmed.
-    Thought,
-    /// Tool invocation titles.
-    Tool,
-    /// Current agent plan.
-    Plan,
-    System,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ChatEntry {
-    #[serde(default)]
-    start_seq: u64,
-    pub seq: u64,
-    pub role: ChatRole,
-    pub text: String,
-    recorded_at_ms: Option<i64>,
-    revision: u64,
-    message_id: Option<String>,
-    tool_call_id: Option<String>,
-    tool_status: Option<ToolStatus>,
-    tool_content: Vec<String>,
-    tool_diffstats: Vec<String>,
-    tool_locations: Vec<String>,
-    plan: Vec<PlanLine>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    leading_omitted: bool,
-    /// The materialized transcript item this entry was derived from, when it
-    /// came from the controller's projection. Provenance only, so it is
-    /// neither serialized nor part of the entry's value.
-    #[serde(skip)]
-    source: TranscriptSource,
-}
-
-/// Handle on the transcript item an entry was derived from. Unchanged items
-/// keep the same `Arc` from one projection to the next, so a pointer
-/// comparison replaces re-reading the item and re-parsing its JSON.
-///
-/// The handle records where an entry came from, not what it says, so two
-/// entries with equal content are equal whatever they were derived from.
-#[derive(Debug, Clone, Default)]
-struct TranscriptSource(Option<Arc<TranscriptItem>>);
-
-impl TranscriptSource {
-    fn is(&self, item: &Arc<TranscriptItem>) -> bool {
-        self.0
-            .as_ref()
-            .is_some_and(|source| Arc::ptr_eq(source, item))
-    }
-}
-
-impl PartialEq for TranscriptSource {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
-impl Eq for TranscriptSource {}
-
+/// Constructors that need [`sanitize_terminal_text`], which is chat-view
+/// specific and so cannot live with the rest of [`ChatEntry`] in
+/// `hel_transcript`.
 impl ChatEntry {
     fn plain(seq: u64, role: ChatRole, text: impl Into<String>) -> Self {
         Self {
@@ -342,104 +284,6 @@ impl ChatEntry {
             source: TranscriptSource::default(),
         }
     }
-
-    fn plan(seq: u64, plan: Vec<PlanLine>) -> Self {
-        Self {
-            start_seq: seq,
-            seq,
-            role: ChatRole::Plan,
-            text: String::new(),
-            recorded_at_ms: None,
-            revision: 0,
-            message_id: None,
-            tool_call_id: None,
-            tool_status: None,
-            tool_content: Vec::new(),
-            tool_diffstats: Vec::new(),
-            tool_locations: Vec::new(),
-            plan,
-            leading_omitted: false,
-            source: TranscriptSource::default(),
-        }
-    }
-
-    fn touch(&mut self, seq: u64) {
-        self.seq = seq;
-        self.revision = self.revision.wrapping_add(1);
-    }
-
-    #[cfg(test)]
-    fn bounded_for_dashboard(mut self) -> Self {
-        self.bound_dashboard_content();
-        self
-    }
-
-    #[cfg(test)]
-    fn bound_dashboard_content(&mut self) {
-        const TEXT_BYTES: usize = 64 * 1024;
-        const DETAIL_BYTES: usize = 2 * 1024;
-        const DETAIL_COUNT: usize = 8;
-
-        self.leading_omitted |= truncate_string_start(&mut self.text, TEXT_BYTES);
-        for values in [
-            &mut self.tool_content,
-            &mut self.tool_diffstats,
-            &mut self.tool_locations,
-        ] {
-            values.truncate(DETAIL_COUNT);
-            for value in values {
-                truncate_string_start(value, DETAIL_BYTES);
-            }
-        }
-        self.plan.truncate(DETAIL_COUNT);
-        for line in &mut self.plan {
-            truncate_string_start(&mut line.text, DETAIL_BYTES);
-        }
-    }
-
-    fn with_recorded_at(mut self, recorded_at_ms: Option<i64>) -> Self {
-        self.recorded_at_ms = recorded_at_ms;
-        self
-    }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
-#[cfg(test)]
-fn truncate_string_start(value: &mut String, maximum_bytes: usize) -> bool {
-    if value.len() <= maximum_bytes {
-        return false;
-    }
-    let mut start = value.len() - maximum_bytes;
-    while !value.is_char_boundary(start) {
-        start += 1;
-    }
-    value.drain(..start);
-    true
-}
-
-/// The ACP tool states needed to keep a compact tool block visually useful.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum ToolStatus {
-    Pending,
-    Running,
-    Completed,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum PlanStatus {
-    Pending,
-    Running,
-    Completed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct PlanLine {
-    text: String,
-    status: PlanStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -6017,7 +5861,7 @@ mod tests {
         let latest_ordinal = session.applied_event_ordinal;
         let latest_digest = session.applied_event_digest.clone();
         ManagedSessionView {
-            snapshot: Some(crate::hel_session_manager::ManagedSessionSnapshot {
+            snapshot: Some(crate::hel_state::ManagedSessionSnapshot {
                 materialized: session,
                 latest_auth_failure_ordinal: None,
                 operational: crate::hel_worker::RelayOperationalState {

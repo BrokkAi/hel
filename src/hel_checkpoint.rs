@@ -30,7 +30,6 @@ use crate::hel_targets::{
 };
 const MAX_NATIVE_FILE: u64 = 1024 * 1024 * 1024;
 const MAX_NATIVE_TOTAL: u64 = 8 * 1024 * 1024 * 1024;
-pub const RESTORED_CANONICAL_SESSION_FILE: &str = "canonical-session.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -238,7 +237,7 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
 }
 
 pub fn restored_canonical_session_path(relay_root: &Path) -> PathBuf {
-    relay_root.join(RESTORED_CANONICAL_SESSION_FILE)
+    relay_root.join(crate::hel_worker::RESTORED_CANONICAL_SESSION_FILE)
 }
 
 /// Reads the controller-owned projection without restoring target artifacts.

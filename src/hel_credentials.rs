@@ -15,7 +15,7 @@
 //! never enter the durable event stream or a checkpoint archive. Fingerprints
 //! and freshness timestamps are not secret and may appear in logs.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,10 +25,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 
 use crate::hel_config::{HarnessKind, HarnessProfile};
-use crate::hel_setup::harness_authentication_marker;
 use crate::hel_targets::CommandSpec;
 use crate::hel_worker::{RelayEvent, RelayObservation};
-use crate::hel_worker_client::RelayClient;
 
 /// Credential files are small JSON documents. The cap keeps a hostile or
 /// corrupt worker from making the controller buffer an arbitrary payload.
@@ -384,17 +382,17 @@ impl CredentialSyncResult {
 }
 
 #[derive(Debug, Clone)]
-struct SyncTrigger {
-    profile_id: String,
-    session_id: Option<String>,
+pub(crate) struct SyncTrigger {
+    pub(crate) profile_id: String,
+    pub(crate) session_id: Option<String>,
 }
 
 /// Handle the UI loops keep. Publishing targets and asking for an immediate
 /// sync are both non-blocking.
 #[derive(Clone)]
 pub struct CredentialSyncHandle {
-    targets: Arc<watch::Sender<Vec<CredentialSyncTarget>>>,
-    triggers: mpsc::UnboundedSender<SyncTrigger>,
+    pub(crate) targets: Arc<watch::Sender<Vec<CredentialSyncTarget>>>,
+    pub(crate) triggers: mpsc::UnboundedSender<SyncTrigger>,
 }
 
 impl CredentialSyncHandle {
@@ -413,123 +411,7 @@ impl CredentialSyncHandle {
     }
 }
 
-pub struct CredentialSyncCoordinator {
-    handle: CredentialSyncHandle,
-    results: mpsc::UnboundedReceiver<CredentialSyncResult>,
-}
-
-impl CredentialSyncCoordinator {
-    pub fn spawn() -> Self {
-        let (targets_tx, targets_rx) = watch::channel(Vec::new());
-        let (triggers_tx, mut triggers_rx) = mpsc::unbounded_channel::<SyncTrigger>();
-        let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<CredentialSyncResult>();
-        let (results_tx, results_rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(SYNC_INTERVAL);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // A pull rewrites the canonical file, so one profile is never
-            // reconciled twice at once.
-            let mut busy = BTreeSet::<String>::new();
-            let mut queue = VecDeque::<SyncTrigger>::new();
-            loop {
-                tokio::select! {
-                    _ = tick.tick() => {
-                        for profile_id in profiles_with_targets(&targets_rx.borrow()) {
-                            enqueue(&mut queue, SyncTrigger { profile_id, session_id: None });
-                        }
-                    }
-                    trigger = triggers_rx.recv() => {
-                        let Some(trigger) = trigger else { break };
-                        enqueue(&mut queue, trigger);
-                    }
-                    completed = completed_rx.recv() => {
-                        let Some(result) = completed else { break };
-                        busy.remove(&result.profile_id);
-                        if result.triggered_by.is_some()
-                            || result.failure.is_some()
-                            || !result.outcomes.is_empty()
-                        {
-                            let _ = results_tx.send(result);
-                        }
-                    }
-                }
-
-                let mut deferred = VecDeque::new();
-                while let Some(trigger) = queue.pop_front() {
-                    if busy.contains(&trigger.profile_id) {
-                        deferred.push_back(trigger);
-                        continue;
-                    }
-                    let targets: Vec<_> = targets_rx
-                        .borrow()
-                        .iter()
-                        .filter(|target| target.profile_id == trigger.profile_id)
-                        .cloned()
-                        .collect();
-                    if targets.is_empty() {
-                        if trigger.session_id.is_some() {
-                            let _ = results_tx.send(CredentialSyncResult {
-                                profile_id: trigger.profile_id,
-                                triggered_by: trigger.session_id,
-                                failure: None,
-                                outcomes: Vec::new(),
-                            });
-                        }
-                        continue;
-                    }
-                    busy.insert(trigger.profile_id.clone());
-                    let completed_tx = completed_tx.clone();
-                    let handle = tokio::runtime::Handle::current();
-                    // The blocking join is awaited so a panicked reconcile is
-                    // reported and its profile always leaves the busy set.
-                    tokio::spawn(async move {
-                        let joined = tokio::task::spawn_blocking(move || {
-                            handle.block_on(reconcile_profile(&targets))
-                        })
-                        .await;
-                        let (failure, outcomes) = match joined {
-                            Ok(outcomes) => (None, outcomes),
-                            Err(error) => (Some(format!("sync task stopped: {error}")), Vec::new()),
-                        };
-                        let _ = completed_tx.send(CredentialSyncResult {
-                            profile_id: trigger.profile_id,
-                            triggered_by: trigger.session_id,
-                            failure,
-                            outcomes,
-                        });
-                    });
-                }
-                queue = deferred;
-            }
-        });
-        Self {
-            handle: CredentialSyncHandle {
-                targets: Arc::new(targets_tx),
-                triggers: triggers_tx,
-            },
-            results: results_rx,
-        }
-    }
-
-    pub fn handle(&self) -> CredentialSyncHandle {
-        self.handle.clone()
-    }
-
-    pub fn try_result(&mut self) -> Option<CredentialSyncResult> {
-        self.results.try_recv().ok()
-    }
-
-    /// Waits for the next finished sync.
-    ///
-    /// Event-driven loops select on this instead of polling; `None` means the
-    /// coordinator task has stopped. Cancel-safe, so a lost `select!` race
-    /// keeps the result queued.
-    pub async fn result(&mut self) -> Option<CredentialSyncResult> {
-        self.results.recv().await
-    }
-}
-
-fn profiles_with_targets(targets: &[CredentialSyncTarget]) -> Vec<String> {
+pub(crate) fn profiles_with_targets(targets: &[CredentialSyncTarget]) -> Vec<String> {
     let mut profiles = BTreeSet::new();
     for target in targets {
         profiles.insert(target.profile_id.clone());
@@ -537,7 +419,7 @@ fn profiles_with_targets(targets: &[CredentialSyncTarget]) -> Vec<String> {
     profiles.into_iter().collect()
 }
 
-fn enqueue(queue: &mut VecDeque<SyncTrigger>, trigger: SyncTrigger) {
+pub(crate) fn enqueue(queue: &mut VecDeque<SyncTrigger>, trigger: SyncTrigger) {
     if trigger.session_id.is_none()
         && queue
             .iter()
@@ -548,181 +430,10 @@ fn enqueue(queue: &mut VecDeque<SyncTrigger>, trigger: SyncTrigger) {
     queue.push_back(trigger);
 }
 
-/// Reconcile one profile with every live session that runs it.
-///
-/// A pull makes every other session's copy stale by definition, so the pass
-/// runs again once with the new canonical bytes. Two passes are enough: the
-/// second cannot pull anything the first did not already see unless a harness
-/// refreshed mid-cycle, and that lands in the next cycle.
-async fn reconcile_profile(targets: &[CredentialSyncTarget]) -> Vec<CredentialSyncOutcome> {
-    let mut outcomes = BTreeMap::<String, CredentialSyncOutcome>::new();
-    for pass in 0..2 {
-        let mut pulled = false;
-        for target in targets {
-            match reconcile_session(target).await {
-                Ok(actions) if actions.is_empty() => {}
-                Ok(actions) => {
-                    pulled |= actions.contains(&CredentialSyncAction::Pulled);
-                    outcomes.insert(
-                        target.session_id.clone(),
-                        CredentialSyncOutcome {
-                            session_id: target.session_id.clone(),
-                            outcome: Ok(actions),
-                        },
-                    );
-                }
-                Err(error) => {
-                    outcomes.insert(
-                        target.session_id.clone(),
-                        CredentialSyncOutcome {
-                            session_id: target.session_id.clone(),
-                            outcome: Err(format!("{error:#}")),
-                        },
-                    );
-                }
-            }
-        }
-        if !pulled || pass == 1 {
-            break;
-        }
-    }
-    outcomes.into_values().collect()
-}
-
-/// Returns every action taken; an empty list means the copies already agree.
-async fn reconcile_session(target: &CredentialSyncTarget) -> Result<Vec<CredentialSyncAction>> {
-    let canonical_path = harness_authentication_marker(target.harness, &target.profile_home);
-    let (canonical, canonical_bytes) = read_credential_file(target.harness, &canonical_path)?;
-    let canonical_skills = crate::hel_skills::collect_skills(target.harness, &target.profile_home)
-        .with_context(|| {
-            format!(
-                "collect canonical skills for profile {} from {}",
-                target.profile_id,
-                target.profile_home.display()
-            )
-        })?;
-    let mut client = RelayClient::connect(&target.spec, &target.session_id).await?;
-    let result = reconcile_connected(
-        &mut client,
-        target,
-        &canonical_path,
-        &canonical,
-        &canonical_bytes,
-        &canonical_skills,
-    )
-    .await;
-    // Detach even when the exchange failed; the worker and harness keep
-    // running either way. A failed detach only leaks a short-lived proxy, so it
-    // is reported rather than turned into a sync failure.
-    if let Err(error) = client.detach().await {
-        tracing::warn!(
-            session_id = %target.session_id,
-            "could not close the credential sync connection: {error:#}"
-        );
-    }
-    result
-}
-
-async fn reconcile_connected(
-    client: &mut RelayClient,
-    target: &CredentialSyncTarget,
-    canonical_path: &Path,
-    canonical: &CredentialSnapshot,
-    canonical_bytes: &[u8],
-    canonical_skills: &crate::hel_skills::SkillsArchive,
-) -> Result<Vec<CredentialSyncAction>> {
-    let mut actions = Vec::new();
-    let session = client.credential_state().await?;
-    match reconcile(canonical, &session) {
-        SyncAction::None => {
-            if canonical.present
-                && session.present
-                && canonical.fingerprint != session.fingerprint
-                && canonical.freshness_epoch_ms.is_none()
-                && session.freshness_epoch_ms.is_none()
-            {
-                tracing::warn!(
-                    session_id = %target.session_id,
-                    profile_id = %target.profile_id,
-                    "credential copies differ but neither reports a refresh time; leaving both alone"
-                );
-            }
-        }
-        SyncAction::Push => {
-            client.install_credentials(canonical_bytes).await?;
-            actions.push(CredentialSyncAction::Pushed);
-        }
-        SyncAction::Pull => {
-            let bytes = client.read_credentials().await?;
-            validate_credential_payload(&bytes).with_context(|| {
-                format!(
-                    "session {} returned an unusable credential file",
-                    target.session_id
-                )
-            })?;
-            write_credential_file(canonical_path, &bytes).with_context(|| {
-                format!(
-                    "install fresher credentials from session {} for profile {}",
-                    target.session_id, target.profile_id
-                )
-            })?;
-            actions.push(CredentialSyncAction::Pulled);
-        }
-    }
-    if reconcile_skills(client, target, canonical_skills).await? {
-        actions.push(CredentialSyncAction::SkillsPushed);
-    }
-    Ok(actions)
-}
-
-/// Converge the session's synced skills trees onto the canonical archive.
-/// Returns true when a push happened. Workers old enough to predate skills
-/// sync answer the unknown method with `InvalidRequest`; those sessions are
-/// skipped quietly until their target is re-provisioned.
-async fn reconcile_skills(
-    client: &mut RelayClient,
-    target: &CredentialSyncTarget,
-    canonical: &crate::hel_skills::SkillsArchive,
-) -> Result<bool> {
-    let canonical_state = canonical.state();
-    let session = match client.skills_state().await {
-        Ok(state) => state,
-        Err(error) if skills_sync_unsupported(&error) => {
-            tracing::debug!(
-                session_id = %target.session_id,
-                profile_id = %target.profile_id,
-                "worker predates skills sync; skipping until the target is re-provisioned"
-            );
-            return Ok(false);
-        }
-        Err(error) => return Err(error),
-    };
-    if session == canonical_state {
-        return Ok(false);
-    }
-    let installed = client.install_skills(&canonical.encode()).await?;
-    if installed != canonical_state {
-        bail!(
-            "session {} skills fingerprint {} does not match the canonical {} after install",
-            target.session_id,
-            installed.fingerprint,
-            canonical_state.fingerprint
-        );
-    }
-    Ok(true)
-}
-
-fn skills_sync_unsupported(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<crate::hel_worker_client::RelayRejected>()
-        .is_some_and(|rejected| {
-            rejected.0.code == crate::hel_worker::RelayErrorCode::InvalidRequest
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hel_setup::harness_authentication_marker;
 
     fn claude_credentials(expires_at: i64) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({

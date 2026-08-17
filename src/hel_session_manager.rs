@@ -10,13 +10,13 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::hel_archive::verify_archive_streaming;
 use crate::hel_credentials::relay_event_reports_auth_failure;
 use crate::hel_database::{
-    ProjectionApplyOutcome, apply_projection_event, save_materialized_session,
+    ProjectionApplyOutcome, ProjectionIntegrityError, apply_projection_event,
+    save_materialized_session,
 };
 use crate::hel_projection::{
-    ProjectionIntegrityError, apply_committed_projection_event,
-    materialized_session_from_canonical, project_relay_event,
+    apply_committed_projection_event, materialized_session_from_canonical, project_relay_event,
 };
-use crate::hel_state::MaterializedSession;
+use crate::hel_state::{ManagedSessionSnapshot, MaterializedSession};
 use crate::hel_targets::CommandSpec;
 use crate::hel_worker::{RelayCommand, RelayCursor, RelayOperationalState, validate_relay_event};
 use crate::hel_worker_client::{RelayClient, RelayEventPage, RelayRejected};
@@ -41,16 +41,6 @@ fn reconnect_delay(failures: u32) -> Duration {
 pub struct RelaySessionTarget {
     pub session_id: String,
     pub spec: CommandSpec,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ManagedSessionSnapshot {
-    pub materialized: MaterializedSession,
-    pub operational: RelayOperationalState,
-    /// Newest relay event observed by this live actor that reports an
-    /// authentication failure. This is intentionally ephemeral: it avoids
-    /// retaining raw replay pages or rescanning projected history.
-    pub latest_auth_failure_ordinal: Option<u64>,
 }
 
 /// Why a managed session stopped producing fresh views. The kind matters to

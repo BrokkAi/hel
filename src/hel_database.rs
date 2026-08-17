@@ -11,7 +11,6 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::hel_config::data_dir;
-use crate::hel_projection::ProjectionIntegrityError;
 use crate::hel_state::{
     CheckpointMetadata, HelState, ManagedWorktree, MaterializedExecutionState,
     MaterializedQueuedPrompt, MaterializedSession, SessionRecord, SessionResourceAllocation,
@@ -22,6 +21,19 @@ use crate::hel_targets::AdditionalMount;
 use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
 
 const SCHEMA_VERSION: i64 = 9;
+
+/// A deterministic projection integrity violation. Retrying cannot fix it, so
+/// callers must report it separately from transport failures.
+#[derive(Debug)]
+pub struct ProjectionIntegrityError(pub String);
+
+impl std::fmt::Display for ProjectionIntegrityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProjectionIntegrityError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryScope {

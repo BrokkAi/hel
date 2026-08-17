@@ -1,20 +1,19 @@
 //! Background recovery-copy policy and coordination.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
 use tokio::sync::{mpsc, watch};
 
-use crate::hel_config::HelConfig;
 use crate::hel_controller::{CheckpointArtifact, Controller};
 use crate::hel_database::record_recovery_failure;
 use crate::hel_session_manager::SessionManagerControl;
 use crate::hel_state::{
-    CheckpointMetadata, HelState, MaterializedExecutionState, MaterializedSession, SessionRecord,
-    TranscriptBody,
+    CheckpointMetadata, HelState, MaterializedExecutionState, RecoveryGate, RecoveryObservation,
+    RecoveryObserver,
 };
 use crate::hel_targets::CancellableProcessExecutor;
 
@@ -27,26 +26,6 @@ pub const AUTO_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const RECOVERY_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone)]
-pub struct RecoveryObservation {
-    pub session: SessionRecord,
-    pub config: HelConfig,
-    pub latest_completed_turn_ordinal: Option<u64>,
-    pub execution: MaterializedExecutionState,
-}
-
-pub fn latest_completed_turn_ordinal(session: &MaterializedSession) -> Option<u64> {
-    if session.execution != MaterializedExecutionState::Idle {
-        return None;
-    }
-    session
-        .transcript
-        .iter()
-        .rev()
-        .find(|item| matches!(item.body, TranscriptBody::User { .. }))
-        .map(|item| item.position)
-}
-
-#[derive(Debug, Clone)]
 pub struct RecoveryResult {
     pub session_id: String,
     pub expected_target: crate::hel_state::TargetLocator,
@@ -55,198 +34,6 @@ pub struct RecoveryResult {
     /// preempted it or the coordinator shut down. A copy that ran past its
     /// deadline is not marked cancelled; it counts as a real failure.
     pub cancelled: bool,
-}
-
-/// Reports session activity to the recovery coordinator.
-///
-/// Reporting is a queued hand-off, never a round trip: the caller is often a
-/// UI event loop, and a copy decision must never hold that loop up. The queue
-/// is unbounded so an observation is never dropped, which matters because the
-/// idle observation that ends a turn is the one that makes a copy due. Queue
-/// depth stays small in practice: the coordinator only folds an observation
-/// into per-session policy state and hands the copy itself to another task.
-/// It does pause while it records a failed copy, and the queue is what absorbs
-/// that pause instead of the caller.
-///
-/// A caller that must know no copy can start uses [`RecoveryObserver::reserve`]
-/// rather than the queue: the reservation blocks a copy from starting whether
-/// or not queued observations have been read yet.
-#[derive(Clone)]
-pub struct RecoveryObserver {
-    observations: mpsc::UnboundedSender<RecoveryObservation>,
-    busy: watch::Receiver<BTreeSet<String>>,
-    gate: Arc<RecoveryGate>,
-}
-
-/// A per-session reservation held by a foreground lifecycle operation. The
-/// coordinator cannot start another recovery copy until this value is dropped.
-pub struct RecoveryReservation {
-    session_id: String,
-    gate: Arc<RecoveryGate>,
-}
-
-impl Drop for RecoveryReservation {
-    fn drop(&mut self) {
-        self.gate.release(&self.session_id);
-    }
-}
-
-#[derive(Default)]
-struct RecoveryGate {
-    state: Mutex<RecoveryGateState>,
-}
-
-#[derive(Default)]
-struct RecoveryGateState {
-    /// In-flight copies, each with the cancel flag its executor watches, so a
-    /// foreground lifecycle operation can preempt one instead of waiting.
-    busy: BTreeMap<String, Arc<AtomicBool>>,
-    reservations: BTreeMap<String, usize>,
-}
-
-impl RecoveryGate {
-    fn reserve(self: &Arc<Self>, session_id: &str) -> RecoveryReservation {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        *state.reservations.entry(session_id.to_owned()).or_default() += 1;
-        RecoveryReservation {
-            session_id: session_id.to_owned(),
-            gate: self.clone(),
-        }
-    }
-
-    fn release(&self, session_id: &str) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let Some(count) = state.reservations.get_mut(session_id) else {
-            return;
-        };
-        *count -= 1;
-        if *count == 0 {
-            state.reservations.remove(session_id);
-        }
-    }
-
-    /// Claims the session for a copy and returns the cancel flag that copy
-    /// must watch, or `None` when a copy or a reservation already holds it.
-    fn try_start(&self, session_id: &str) -> Option<Arc<AtomicBool>> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.busy.contains_key(session_id) || state.reservations.contains_key(session_id) {
-            return None;
-        }
-        let cancelled = Arc::new(AtomicBool::new(false));
-        state.busy.insert(session_id.to_owned(), cancelled.clone());
-        Some(cancelled)
-    }
-
-    fn finish(&self, session_id: &str) {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .busy
-            .remove(session_id);
-    }
-
-    fn is_busy(&self, session_id: &str) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .busy
-            .contains_key(session_id)
-    }
-
-    /// Asks the in-flight copy for this session, if any, to stop.
-    fn cancel_busy(&self, session_id: &str) {
-        if let Some(cancelled) = self
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .busy
-            .get(session_id)
-        {
-            cancelled.store(true, Ordering::Release);
-        }
-    }
-
-    /// Asks every in-flight copy to stop, used when the coordinator shuts down.
-    fn cancel_all(&self) {
-        for cancelled in self
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .busy
-            .values()
-        {
-            cancelled.store(true, Ordering::Release);
-        }
-    }
-
-    fn busy_sessions(&self) -> BTreeSet<String> {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .busy
-            .keys()
-            .cloned()
-            .collect()
-    }
-}
-
-#[derive(Clone)]
-pub struct RecoveryContext {
-    pub observer: RecoveryObserver,
-    pub session: SessionRecord,
-    pub config: HelConfig,
-}
-
-impl RecoveryContext {
-    pub fn observe(&self, materialized: &MaterializedSession) {
-        self.observer.observe(RecoveryObservation {
-            session: self.session.clone(),
-            config: self.config.clone(),
-            latest_completed_turn_ordinal: latest_completed_turn_ordinal(materialized),
-            execution: materialized.execution,
-        });
-    }
-
-    pub fn is_busy(&self) -> bool {
-        self.observer.is_busy(&self.session.id)
-    }
-}
-
-impl RecoveryObserver {
-    /// Queues one observation for the coordinator. Returns as soon as the
-    /// observation is queued; a stopped coordinator makes this a no-op.
-    pub fn observe(&self, observation: RecoveryObservation) {
-        let _ = self.observations.send(observation);
-    }
-
-    pub fn is_busy(&self, session_id: &str) -> bool {
-        self.gate.is_busy(session_id)
-    }
-
-    /// Holds off any recovery copy for this session until the returned
-    /// reservation is dropped. This, not the observation queue, is what a
-    /// lifecycle operation relies on: queued observations may still be
-    /// unread, and the coordinator refuses to start a copy for a reserved
-    /// session whenever it reads them.
-    pub fn reserve(&self, session_id: &str) -> RecoveryReservation {
-        self.gate.reserve(session_id)
-    }
-
-    /// Asks an in-flight recovery copy for this session to stop. A foreground
-    /// lifecycle operation calls this after reserving so it preempts the copy
-    /// instead of waiting behind it.
-    pub fn cancel_busy(&self, session_id: &str) {
-        self.gate.cancel_busy(session_id);
-    }
-
-    pub async fn wait_idle(&self, session_id: &str) {
-        let mut busy = self.busy.clone();
-        while self.is_busy(session_id) {
-            if busy.changed().await.is_err() {
-                break;
-            }
-        }
-    }
 }
 
 pub struct RecoveryCoordinator {
@@ -453,6 +240,10 @@ impl PolicyState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hel_config::HelConfig;
+    use crate::hel_state::{
+        MaterializedSession, SessionRecord, TranscriptBody, latest_completed_turn_ordinal,
+    };
 
     fn completed(position: u64) -> MaterializedSession {
         let mut session = MaterializedSession::empty("session-1");

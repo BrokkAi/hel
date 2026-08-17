@@ -21,7 +21,7 @@ use hel::hel_config::{HelConfig, ProjectBundle, ProjectRepository, config_path, 
 use hel::hel_controller::{
     Controller, ControllerStoreGuard, SessionLaunchOptions, SessionResumeOptions,
 };
-use hel::hel_credentials::{CredentialSyncCoordinator, CredentialSyncHandle, CredentialSyncTarget};
+use hel::hel_credentials::{CredentialSyncHandle, CredentialSyncTarget};
 use hel::hel_greeting::{GreetingFacts, RepositoryGreetingFacts};
 use hel::hel_import::{
     BundleResolution, ClaudeImportRequest, ClaudeSessionSelection, CodexImportRequest,
@@ -56,6 +56,7 @@ use hel::hel_targets::{
     ProvisionStage, SessionResourceProbe, SessionResourceUsage,
 };
 use hel::hel_worker::RelayCommand;
+use hel::hel_worker_client::CredentialSyncCoordinator;
 use hel::hel_worker_runtime::{
     AcpSupervisorSpec, WorkerLaunchConfig, proxy, run_acp_supervisor, run_daemon,
 };
@@ -1262,11 +1263,11 @@ async fn run_server(args: ServerArgs) -> Result<()> {
                     }
                     if let Some(snapshot) = update.view.snapshot {
                         if let Some(session) = controller.state.sessions.get(&update.session_id).cloned() {
-                            recovery_observer.observe(hel::hel_recovery::RecoveryObservation {
+                            recovery_observer.observe(hel::hel_state::RecoveryObservation {
                                 session,
                                 config: controller.config.clone(),
                                 latest_completed_turn_ordinal:
-                                    hel::hel_recovery::latest_completed_turn_ordinal(
+                                    hel::hel_state::latest_completed_turn_ordinal(
                                         &snapshot.materialized,
                                     ),
                                 execution: snapshot.materialized.execution,
@@ -3125,7 +3126,7 @@ fn interrupted_close_session_ids(controller: &Controller) -> Vec<String> {
 fn spawn_interrupted_close_recovery(
     session_id: String,
     session_manager: SessionManagerControl,
-    recovery_observer: hel::hel_recovery::RecoveryObserver,
+    recovery_observer: hel::hel_state::RecoveryObserver,
     cancelled: Arc<AtomicBool>,
     updates: tokio::sync::mpsc::UnboundedSender<LifecycleUpdate>,
 ) {
@@ -3399,7 +3400,7 @@ async fn open_chat_view(
     controller: &Controller,
     session_id: &str,
     sessions: &SessionManagerControl,
-    recovery_observer: &hel::hel_recovery::RecoveryObserver,
+    recovery_observer: &hel::hel_state::RecoveryObserver,
     notices: hel::hel_chat::Notices,
 ) -> Result<hel::hel_chat::ActiveChat> {
     let session_record = controller
@@ -3441,7 +3442,7 @@ async fn open_chat_view(
         .profiles
         .get(&session_record.last_profile)
         .map(|profile| profile.kind);
-    let recovery_context = hel::hel_recovery::RecoveryContext {
+    let recovery_context = hel::hel_state::RecoveryContext {
         observer: recovery_observer.clone(),
         session: session_record,
         config: controller.config.clone(),
@@ -3467,7 +3468,7 @@ async fn hold_chat_session(
     active_chat: &mut Option<hel::hel_chat::ActiveChat>,
     session_id: &str,
     sessions: &SessionManagerControl,
-    recovery_observer: &hel::hel_recovery::RecoveryObserver,
+    recovery_observer: &hel::hel_state::RecoveryObserver,
     notices: hel::hel_chat::Notices,
 ) -> Result<()> {
     if active_chat
@@ -3903,10 +3904,10 @@ async fn run_dashboard() -> Result<()> {
                 }
                 // Queued, never awaited: the copy decision belongs to the
                 // coordinator, and the dashboard loop must stay free to draw.
-                recovery_observer.observe(hel::hel_recovery::RecoveryObservation {
+                recovery_observer.observe(hel::hel_state::RecoveryObservation {
                     session,
                     config: controller.config.clone(),
-                    latest_completed_turn_ordinal: hel::hel_recovery::latest_completed_turn_ordinal(
+                    latest_completed_turn_ordinal: hel::hel_state::latest_completed_turn_ordinal(
                         &snapshot.materialized,
                     ),
                     execution: snapshot.materialized.execution,
@@ -4956,10 +4957,10 @@ async fn run_dashboard() -> Result<()> {
 }
 
 fn reserve_recovery_or_cancel(
-    observer: &hel::hel_recovery::RecoveryObserver,
+    observer: &hel::hel_state::RecoveryObserver,
     session_id: &str,
     cancelled: &AtomicBool,
-) -> Result<hel::hel_recovery::RecoveryReservation> {
+) -> Result<hel::hel_state::RecoveryReservation> {
     let reservation = observer.reserve(session_id);
     // The reservation stops the next copy; cancelling preempts the one already
     // running so a lifecycle operation never queues behind a long or wedged

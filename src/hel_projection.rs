@@ -12,7 +12,9 @@ use crate::hel_archive::{
     CanonicalSessionSnapshot, CanonicalSessionState, CanonicalTranscriptBody,
     CanonicalTranscriptItem,
 };
-use crate::hel_database::{MaterializedSessionMutation, TranscriptMutation};
+use crate::hel_database::{
+    MaterializedSessionMutation, ProjectionIntegrityError, TranscriptMutation,
+};
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
     TranscriptBody, TranscriptItem, config_command_text, normalize_session_title,
@@ -20,19 +22,6 @@ use crate::hel_state::{
 use crate::hel_worker::{
     RelayCommand, RelayCommandKind, RelayEvent, RelayObservation, validate_relay_event,
 };
-
-/// A deterministic projection integrity violation. Retrying cannot fix it, so
-/// callers must report it separately from transport failures.
-#[derive(Debug)]
-pub struct ProjectionIntegrityError(pub String);
-
-impl std::fmt::Display for ProjectionIntegrityError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ProjectionIntegrityError {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectedRelayEvent {

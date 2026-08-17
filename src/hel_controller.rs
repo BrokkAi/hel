@@ -34,13 +34,13 @@ use crate::hel_projection::{
     canonical_session_from_materialized, materialized_session_from_canonical,
 };
 use crate::hel_session_manager::{
-    ManagedSessionHandle, ManagedSessionLease, ManagedSessionSnapshot, SessionManagerControl,
-    StandaloneSession, new_command_id,
+    ManagedSessionHandle, ManagedSessionLease, SessionManagerControl, StandaloneSession,
+    new_command_id,
 };
 use crate::hel_state::{
-    CheckpointMetadata, HelState, ManagedWorktree, ManagedWorktreeTarget, MaterializedSession,
-    SessionRecord, SessionResourceAllocation, SessionState, TargetLocator, new_session_id,
-    normalize_session_title,
+    CheckpointMetadata, HelState, ManagedSessionSnapshot, ManagedWorktree, ManagedWorktreeTarget,
+    MaterializedSession, SessionRecord, SessionResourceAllocation, SessionState, TargetLocator,
+    new_session_id, normalize_session_title,
 };
 use crate::hel_targets::{
     self, AdditionalMount, AwsTemplate, CancellableProcessExecutor, CommandExecutor, CommandOutput,

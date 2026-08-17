@@ -3340,6 +3340,10 @@ fn truncate_active_relay_journal(journal: &Path, active: &Path) -> Result<()> {
     sync_directory(journal)
 }
 
+/// File name of the controller-owned canonical session projection restored
+/// alongside a checkpoint's target artifacts.
+pub const RESTORED_CANONICAL_SESSION_FILE: &str = "canonical-session.json";
+
 #[derive(Debug)]
 struct RestoredRelaySeed {
     event_frontier: u64,
@@ -3356,7 +3360,7 @@ struct RestoredQueuedPrompt {
 }
 
 fn read_restored_relay_seed(root: &Path) -> Result<Option<RestoredRelaySeed>> {
-    let path = root.join(crate::hel_checkpoint::RESTORED_CANONICAL_SESSION_FILE);
+    let path = root.join(RESTORED_CANONICAL_SESSION_FILE);
     if !path.exists() {
         return Ok(None);
     }
@@ -3446,7 +3450,7 @@ pub struct WorkerSessionSummary {
     pub unread_agent_messages: u64,
     pub agent_text_stream_open: bool,
     pub last_agent_message_id: Option<String>,
-    pub transcript_tail: Vec<crate::hel_chat::ChatEntry>,
+    pub transcript_tail: Vec<crate::hel_transcript::ChatEntry>,
     #[serde(default)]
     pub queued_prompts: Vec<QueuedPrompt>,
 }
@@ -5671,7 +5675,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
             temp.path()
-                .join(crate::hel_checkpoint::RESTORED_CANONICAL_SESSION_FILE),
+                .join(RESTORED_CANONICAL_SESSION_FILE),
             serde_json::to_vec(&serde_json::json!({
                 "event_frontier": 41,
                 "event_frontier_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -5725,7 +5729,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
             temp.path()
-                .join(crate::hel_checkpoint::RESTORED_CANONICAL_SESSION_FILE),
+                .join(RESTORED_CANONICAL_SESSION_FILE),
             serde_json::to_vec(&serde_json::json!({
                 "event_frontier": 41,
                 "event_frontier_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -5777,8 +5781,7 @@ mod tests {
     fn restored_relay_rejects_an_invalid_canonical_frontier() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
-            temp.path()
-                .join(crate::hel_checkpoint::RESTORED_CANONICAL_SESSION_FILE),
+            temp.path().join(RESTORED_CANONICAL_SESSION_FILE),
             br#"{"event_frontier":"forty-one"}"#,
         )
         .unwrap();
