@@ -3617,10 +3617,9 @@ impl DashboardState {
                 .map(ProfileQuota::compact)
                 .unwrap_or_else(|| "refreshing".to_string())
         };
-        let danger = if harness == HarnessKind::Kimi {
-            "  ⚠ DANGER: auto mode allows commands without approval"
-        } else {
-            ""
+        let danger = match harness.bare_target_auto_approval() {
+            Some(mechanism) => format!("  ⚠ DANGER: {mechanism} approves every command"),
+            None => String::new(),
         };
         format!("{id}  {}  ·  {quota}{danger}", harness.display_name())
     }
@@ -5866,15 +5865,22 @@ fn render_review_wizard(
             }
         )));
     }
+    // Not a permission mode Hel picked, but the state the session runs in:
+    // every command is approved, and on raw localhost that is this machine.
     if matches!(target, TargetTemplate::LocalBare)
-        && dashboard
+        && let Some(kind) = dashboard
             .config
             .profiles
             .get(profile_id)
-            .is_some_and(|profile| profile.kind == HarnessKind::Kimi)
+            .map(|profile| profile.kind)
+        && let Some(mechanism) = kind.bare_target_auto_approval()
     {
         lines.push(Line::styled(
-            "⚠ DANGER: Kimi auto mode on raw localhost can modify this machine without approval.",
+            format!(
+                "⚠ DANGER: {} approves every command through {mechanism}. On raw localhost it can \
+                 change this machine without asking.",
+                kind.display_name()
+            ),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
@@ -8337,6 +8343,56 @@ mod tests {
                 resource_allocation: None,
             }
         );
+    }
+
+    /// The review pane names the harness and the mechanism that approves
+    /// everything, so the two ways of arriving there are both visible.
+    #[test]
+    fn raw_localhost_names_the_blanket_approval_mechanism_per_harness() {
+        let review_text = |kind: HarnessKind| {
+            let mut config = config();
+            config.profiles = BTreeMap::from([(
+                "profile".into(),
+                HarnessProfile {
+                    context_window_bytes: None,
+                    kind,
+                    home: PathBuf::from("/profiles/harness"),
+                    executable: None,
+                    environment: BTreeMap::new(),
+                },
+            )]);
+            config.targets = BTreeMap::from([("raw-localhost".into(), TargetTemplate::LocalBare)]);
+            let mut state = HelState::default();
+            state.remember_project_directory("local", std::path::Path::new("/home/me/project"));
+            let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
+            dashboard.handle_key(ctrl_key('n'));
+            let mut terminal = Terminal::new(TestBackend::new(180, 32)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &mut dashboard))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+
+        let grok = review_text(HarnessKind::Grok);
+        assert!(grok.contains("DANGER"), "{grok}");
+        assert!(grok.contains("Grok Build"), "{grok}");
+        assert!(grok.contains("--always-approve launch flag"), "{grok}");
+
+        let kimi = review_text(HarnessKind::Kimi);
+        assert!(kimi.contains("DANGER"), "{kimi}");
+        assert!(kimi.contains("default auto mode"), "{kimi}");
+
+        // Codex and Claude Code ask on a bare target, so there is no warning.
+        for kind in [HarnessKind::Codex, HarnessKind::Claude] {
+            let quiet = review_text(kind);
+            assert!(!quiet.contains("DANGER"), "{kind:?}: {quiet}");
+        }
     }
 
     #[test]

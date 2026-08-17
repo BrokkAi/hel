@@ -10714,12 +10714,11 @@ mod tests {
         assert!(script.contains("command -v grok"));
         assert!(script.contains("[ -x \"$GROK_HOME/bin/grok\" ]"));
         assert!(script.contains("[ -x \"$HOME/.grok/bin/grok\" ]"));
-        assert!(script.contains("exec grok agent stdio"));
         assert!(script.contains("exit 127"));
-        assert!(
-            !script.contains("--always-approve"),
-            "a restricted session must not auto-approve: {script}"
-        );
+        // Grok Build asks by default and Hel answers by cancelling, so the
+        // flag rides along even on a target that does not force unrestricted
+        // mode. Without it a bare session could not write anything.
+        assert!(script.contains("exec grok agent --always-approve stdio"));
     }
 
     #[test]
@@ -10743,16 +10742,15 @@ mod tests {
                 vec!["agent", "--always-approve", "stdio"],
             ),
         ] {
-            let (command, arguments) = bridge_launch(kind, Some(&executable), true);
-            assert_eq!(command, "/opt/harness");
-            assert_eq!(arguments, expected, "{kind:?} override arguments");
+            for unrestricted in [false, true] {
+                let (command, arguments) = bridge_launch(kind, Some(&executable), unrestricted);
+                assert_eq!(command, "/opt/harness");
+                assert_eq!(
+                    arguments, expected,
+                    "{kind:?} override arguments, unrestricted: {unrestricted}"
+                );
+            }
         }
-        let (_, restricted) = bridge_launch(
-            crate::hel_config::HarnessKind::Grok,
-            Some(&executable),
-            false,
-        );
-        assert_eq!(restricted, ["agent", "stdio"]);
     }
 
     #[test]

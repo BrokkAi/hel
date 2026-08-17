@@ -9,7 +9,10 @@ Each session on a container target runs in its own disposable, labeled
 container: local Podman on Linux or WSL2, or Apple's `container` runtime on
 macOS 26 or newer on Apple silicon. On these isolated targets, hel runs the
 selected harness in its unrestricted mode (`agent-full-access`,
-`bypassPermissions`, or `auto`), instead of the raw-localhost approval flow.
+`bypassPermissions`, `auto`, or Grok Build's `--always-approve` launch flag),
+instead of the raw-localhost approval flow. Every one of those approves every
+call. Note that Kimi Code's mode is named `auto` but is not a review policy
+that approves only low-risk calls; see [What "auto" means](/cli-reference/).
 
 Closing a session first writes and verifies a recovery archive, then removes
 that exact container. Nothing about the container persists past the session

@@ -128,6 +128,44 @@ impl HarnessKind {
         }
     }
 
+    /// Whether this harness runs every action without asking, even on a bare
+    /// target where Hel does not force unrestricted mode.
+    ///
+    /// Kimi Code arrives there through its own default `auto` mode. Grok Build
+    /// arrives there because Hel always passes `--always-approve`: its default
+    /// is to ask, and Hel answers a permission request by cancelling, so a
+    /// session without the flag could not write anything at all. Codex and
+    /// Claude Code ask on a bare target, and Hel cancels, which is a usable
+    /// read-only session for them.
+    pub const fn auto_approves_on_bare_targets(self) -> bool {
+        match self {
+            Self::Kimi | Self::Grok => true,
+            Self::Codex | Self::Claude => false,
+        }
+    }
+
+    /// How this harness ends up approving everything, named for the person
+    /// reading a warning about it.
+    pub const fn bare_target_auto_approval(self) -> Option<&'static str> {
+        match self {
+            Self::Kimi => Some("its default auto mode"),
+            Self::Grok => Some("Hel's --always-approve launch flag"),
+            Self::Codex | Self::Claude => None,
+        }
+    }
+
+    /// The launch flag the bridge command line carries, if any.
+    ///
+    /// A harness that auto-approves on bare targets carries its flag on every
+    /// target, because withholding it would not make that harness safer — it
+    /// would only make the session useless.
+    pub const fn launch_flag_for(self, unrestricted: bool) -> Option<&'static str> {
+        match self.unrestricted_enforcement().launch_flag() {
+            Some(flag) if unrestricted || self.auto_approves_on_bare_targets() => Some(flag),
+            _ => None,
+        }
+    }
+
     /// Mode ids that drive plan mode for a harness that has plan mode but does
     /// not advertise a `plan` command. `None` means Hel passes `/plan` through.
     pub const fn plan_mode_ids(self) -> Option<PlanModeIds> {
@@ -143,9 +181,7 @@ impl HarnessKind {
     /// Sub-command a `profile.executable` override needs to speak ACP. Codex
     /// and Claude override an adapter binary that already speaks it.
     pub fn bridge_override_args(self, unrestricted: bool) -> Vec<&'static str> {
-        let flag = unrestricted
-            .then(|| self.unrestricted_enforcement().launch_flag())
-            .flatten();
+        let flag = self.launch_flag_for(unrestricted);
         match self {
             Self::Codex | Self::Claude => Vec::new(),
             Self::Kimi => vec!["acp"],
@@ -858,17 +894,67 @@ mod tests {
 
     #[test]
     fn bridge_override_args_carry_the_acp_subcommand_per_harness() {
-        assert!(HarnessKind::Codex.bridge_override_args(true).is_empty());
-        assert!(HarnessKind::Claude.bridge_override_args(true).is_empty());
-        assert_eq!(HarnessKind::Kimi.bridge_override_args(true), ["acp"]);
+        for unrestricted in [false, true] {
+            assert!(
+                HarnessKind::Codex
+                    .bridge_override_args(unrestricted)
+                    .is_empty()
+            );
+            assert!(
+                HarnessKind::Claude
+                    .bridge_override_args(unrestricted)
+                    .is_empty()
+            );
+            assert_eq!(
+                HarnessKind::Kimi.bridge_override_args(unrestricted),
+                ["acp"]
+            );
+            // Grok Build asks by default and Hel answers by cancelling, so a
+            // session without the flag could not write at all. It carries the
+            // flag on every target, restricted ones included.
+            assert_eq!(
+                HarnessKind::Grok.bridge_override_args(unrestricted),
+                ["agent", "--always-approve", "stdio"],
+                "unrestricted: {unrestricted}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_blanket_approval_harness_carries_its_launch_flag_everywhere() {
+        for unrestricted in [false, true] {
+            assert_eq!(
+                HarnessKind::Grok.launch_flag_for(unrestricted),
+                Some("--always-approve")
+            );
+            // The ACP-mode harnesses have no launch flag to carry.
+            for kind in [HarnessKind::Codex, HarnessKind::Claude, HarnessKind::Kimi] {
+                assert_eq!(kind.launch_flag_for(unrestricted), None, "{kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bare_target_auto_approval_names_the_mechanism_per_harness() {
         assert_eq!(
-            HarnessKind::Grok.bridge_override_args(false),
-            ["agent", "stdio"]
+            HarnessKind::Kimi.bare_target_auto_approval(),
+            Some("its default auto mode")
         );
         assert_eq!(
-            HarnessKind::Grok.bridge_override_args(true),
-            ["agent", "--always-approve", "stdio"]
+            HarnessKind::Grok.bare_target_auto_approval(),
+            Some("Hel's --always-approve launch flag")
         );
+        for kind in [HarnessKind::Codex, HarnessKind::Claude] {
+            assert_eq!(kind.bare_target_auto_approval(), None, "{kind:?}");
+        }
+        // The warning and the flag decision read the same fact.
+        for kind in HarnessKind::ALL {
+            assert_eq!(
+                kind.auto_approves_on_bare_targets(),
+                kind.bare_target_auto_approval().is_some(),
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
