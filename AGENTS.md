@@ -57,6 +57,26 @@ Prefer hand-written test fakes over mocking or dependency-injection frameworks.
 Do not redirect Cargo or other build output into `/tmp`. If sandbox restrictions
 block normal build storage, run the build outside the sandbox.
 
+## Subprocess Rules
+
+Run child processes through the shared subprocess helpers. Do not hand-roll
+`std::process` pipe handling at call sites; a clippy `disallowed_methods`
+entry enforces this for `wait_with_output`, and an explicit scoped `allow`
+with a stated reason is required anywhere raw use really is safe.
+
+Never write a child's full stdin before reading its stdout. Pipes buffer
+64KB; a child that produces output while consuming input blocks on its full
+stdout pipe, stops reading stdin, and deadlocks both processes. Drain output
+concurrently while feeding input (the shared helper does this).
+
+Never delete a process's working files as a substitute for stopping the
+process. Teardown must terminate the owning process group first and remove
+files second; a surviving writer recreates whatever was deleted under it.
+
+When testing code that streams through pipes or bounded buffers, drive it
+with more than 64KB of data so buffer-boundary deadlocks and truncation
+actually show up; toy-sized fixtures prove nothing about this class of bug.
+
 Unit tests are colocated in module-level `#[cfg(test)]` blocks. `crates/hel-cli/tests/` holds the PTY termination test, and `tests/e2e/` holds the shell/expect harness.
 
 ## Coding Style & Naming Conventions
