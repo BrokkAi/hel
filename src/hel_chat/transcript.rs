@@ -14,7 +14,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 
 use crate::hel_state::{MaterializedSession, TranscriptBody, TranscriptItem};
@@ -235,19 +235,44 @@ fn materialized_chat_entries(session: &MaterializedSession) -> Vec<ChatEntry> {
         .collect()
 }
 
+/// How many transcript items a freshly opened chat converts on the caller's
+/// thread. Several screens of scrollback are ready in the first frame, and the
+/// rest of the history is converted off the event loop; a long session has
+/// thousands of items, and converting them all inline costs seconds.
+pub(super) const TAIL_SEED_ITEMS: usize = 256;
+
+/// Entries for the transcript items in `items`, which is a prefix of a
+/// session's transcript. Runs off the event loop, so it takes the items by
+/// slice rather than the session.
+pub(super) fn materialized_prefix_entries(
+    items: &[Arc<TranscriptItem>],
+    frontier: u64,
+) -> Vec<ChatEntry> {
+    items
+        .iter()
+        .map(|item| materialized_chat_entry(item, frontier))
+        .collect()
+}
+
 /// Rebuilds the entry list, keeping the entries whose transcript item did not
 /// change. An unchanged item is the same `Arc` as in the previous projection,
 /// so pointer identity settles reuse without reading a single field. The
 /// field comparison is the fallback for items that were rebuilt with equal
 /// content, which is what a restore from the canonical log produces.
+///
+/// `skip` is the number of leading transcript items that are not converted
+/// yet, so `previous` lines up with `session.transcript[skip..]`. It is zero
+/// for a complete projection.
 pub(super) fn materialized_chat_entries_reusing(
     session: &MaterializedSession,
+    skip: usize,
     previous: Vec<ChatEntry>,
 ) -> Vec<ChatEntry> {
     let mut previous = previous.into_iter();
     session
         .transcript
         .iter()
+        .skip(skip)
         .map(|item| {
             let Some(mut entry) = previous.next() else {
                 return materialized_chat_entry(item, session.applied_event_ordinal);
@@ -308,7 +333,7 @@ fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEnt
             materialized_chunks_text(chunks),
         ),
         TranscriptBody::Tool { call } => {
-            let call = serde_json::from_value::<ToolCall>(call.clone()).ok();
+            let call = ToolCall::deserialize(call).ok();
             let mut entry = ChatEntry::tool(
                 item.position,
                 call.as_ref()
@@ -326,7 +351,7 @@ fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEnt
         }
         TranscriptBody::Plan { plan } => ChatEntry::plan(
             item.position,
-            serde_json::from_value::<Plan>(plan.clone())
+            Plan::deserialize(plan)
                 .map(|plan| plan.entries)
                 .unwrap_or_default()
                 .into_iter()
@@ -363,7 +388,7 @@ pub fn materialized_content_text(content: &[serde_json::Value]) -> String {
 pub fn materialized_chunks_text(chunks: &[serde_json::Value]) -> String {
     chunks
         .iter()
-        .filter_map(|value| serde_json::from_value::<ContentChunk>(value.clone()).ok())
+        .filter_map(|value| ContentChunk::deserialize(value).ok())
         .filter_map(|chunk| content_block_text(&chunk.content))
         .map(|text| sanitize_terminal_text(&text))
         .collect::<Vec<_>>()
@@ -371,7 +396,7 @@ pub fn materialized_chunks_text(chunks: &[serde_json::Value]) -> String {
 }
 
 fn materialized_value_text(value: &serde_json::Value) -> String {
-    if let Ok(block) = serde_json::from_value::<ContentBlock>(value.clone())
+    if let Ok(block) = ContentBlock::deserialize(value)
         && let Some(text) = content_block_text(&block)
     {
         return sanitize_terminal_text(&text);
@@ -591,6 +616,18 @@ impl Default for TranscriptRenderCache {
     }
 }
 
+impl TranscriptRenderCache {
+    /// Drops every cached row. The cache is indexed by entry position, so any
+    /// change that moves entries between positions has to clear it: a cached
+    /// row whose revision happens to match the entry that moved into its slot
+    /// would otherwise be served for the wrong entry. Rows are re-rendered
+    /// lazily, so only the visible window pays for the refill.
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.collapse.clear();
+    }
+}
+
 impl ChatState {
     pub fn transcript_snapshot(&self) -> TranscriptSnapshot {
         TranscriptSnapshot {
@@ -599,6 +636,53 @@ impl ChatState {
             last_compaction_seq: self.last_compaction_seq,
             render_cache: TranscriptRenderCache::default(),
         }
+    }
+
+    /// Drops the cached rows, for a change that moved entries between
+    /// positions rather than editing one in place.
+    pub(super) fn invalidate_render_cache(&mut self) {
+        self.render_cache.clear();
+    }
+
+    /// How many leading transcript items this view has not converted yet. Zero
+    /// once the conversation is complete, which is the normal case.
+    pub(super) fn unconverted_prefix(&self) -> usize {
+        self.unconverted_prefix
+    }
+
+    /// Puts the history built off the event loop in front of the tail this view
+    /// opened with. Reports whether the prefix still fits: the transcript can
+    /// be rewritten by compaction while the conversion runs, and a prefix that
+    /// no longer meets the tail is refused rather than spliced into the wrong
+    /// place.
+    pub(super) fn splice_transcript_prefix(&mut self, mut prefix: Vec<ChatEntry>) -> bool {
+        if self.unconverted_prefix == 0 || prefix.len() != self.unconverted_prefix {
+            return false;
+        }
+        let meets_the_tail = match (prefix.last(), self.entries.first()) {
+            (Some(last), Some(first)) => last.start_seq < first.start_seq,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if !meets_the_tail {
+            return false;
+        }
+        // The prefix was converted against the frontier the view opened at.
+        for entry in &mut prefix {
+            entry.seq = self.latest_seq.max(entry.start_seq);
+        }
+        let shift = prefix.len();
+        let tail = std::mem::replace(&mut self.entries, prefix);
+        self.entries.extend(tail);
+        self.unconverted_prefix = 0;
+        if let TranscriptAnchor::Row { entry, row } = self.anchor {
+            self.anchor = TranscriptAnchor::Row {
+                entry: entry.saturating_add(shift),
+                row,
+            };
+        }
+        self.invalidate_render_cache();
+        true
     }
 
     fn viewport(&mut self, width: u16, height: usize) -> TranscriptViewport {
@@ -1214,6 +1298,315 @@ mod tests {
                 content: vec![serde_json::json!(text)],
             },
         })
+    }
+
+    /// Transcript items for the tail-first tests. Every item carries the same
+    /// timestamps, so entries share a revision and a row cached at one position
+    /// would be served at any other position the cache still believes in.
+    const FIXTURE_MS: i64 = 7;
+
+    fn fixture_item(position: u64, stable_id: String, body: TranscriptBody) -> Arc<TranscriptItem> {
+        Arc::new(TranscriptItem {
+            stable_id,
+            position,
+            latest_content_event_ordinal: None,
+            created_at_ms: FIXTURE_MS,
+            last_changed_at_ms: FIXTURE_MS,
+            body,
+        })
+    }
+
+    fn fixture_user_item(position: u64) -> Arc<TranscriptItem> {
+        fixture_item(
+            position,
+            format!("user:{position}"),
+            TranscriptBody::User {
+                content: vec![serde_json::json!(format!("question {position}"))],
+            },
+        )
+    }
+
+    fn fixture_agent_item(position: u64) -> Arc<TranscriptItem> {
+        fixture_item(
+            position,
+            format!("agent:{position}"),
+            TranscriptBody::Agent {
+                // Multi-kilobyte, so the conversion cost is realistic.
+                chunks: (0..8)
+                    .map(|chunk| {
+                        serde_json::json!({
+                            "content": {
+                                "type": "text",
+                                "text": format!("answer {position}.{chunk} ").repeat(40)
+                            }
+                        })
+                    })
+                    .collect(),
+                streaming: false,
+            },
+        )
+    }
+
+    fn fixture_thought_item(position: u64) -> Arc<TranscriptItem> {
+        fixture_item(
+            position,
+            format!("thought:{position}"),
+            TranscriptBody::Thought {
+                chunks: vec![serde_json::json!({
+                    "content": {"type": "text", "text": format!("thinking about {position}")}
+                })],
+                streaming: false,
+            },
+        )
+    }
+
+    fn fixture_tool_item(position: u64) -> Arc<TranscriptItem> {
+        fixture_item(
+            position,
+            format!("tool:{position}"),
+            TranscriptBody::Tool {
+                call: serde_json::json!({
+                    "toolCallId": format!("call-{position}"),
+                    "title": format!("read file-{position}"),
+                    "status": "completed",
+                    "content": [{
+                        "type": "content",
+                        "content": {"type": "text", "text": "output ".repeat(600)}
+                    }],
+                    "locations": [{"path": format!("src/file-{position}.rs"), "line": 3}]
+                }),
+            },
+        )
+    }
+
+    fn fixture_plan_item(position: u64) -> Arc<TranscriptItem> {
+        fixture_item(
+            position,
+            format!("plan:{position}"),
+            TranscriptBody::Plan {
+                plan: serde_json::json!({
+                    "entries": [{
+                        "content": format!("step {position}"),
+                        "priority": "medium",
+                        "status": "in_progress"
+                    }]
+                }),
+            },
+        )
+    }
+
+    fn fixture_system_item(position: u64) -> Arc<TranscriptItem> {
+        fixture_item(
+            position,
+            format!("system:{position}"),
+            TranscriptBody::System {
+                text: format!("notice {position}"),
+            },
+        )
+    }
+
+    /// A conversation with the mix of bodies a real session carries.
+    fn long_materialized_session(items: u64) -> MaterializedSession {
+        let mut session = MaterializedSession::empty("session-long");
+        session.transcript = (1..=items)
+            .map(|position| match position % 6 {
+                0 => fixture_tool_item(position),
+                1 => fixture_user_item(position),
+                2 => fixture_agent_item(position),
+                3 => fixture_thought_item(position),
+                4 => fixture_plan_item(position),
+                _ => fixture_system_item(position),
+            })
+            .collect();
+        session.applied_event_ordinal = items + 1;
+        session
+    }
+
+    fn entry_texts(entries: &[ChatEntry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.text.as_str()).collect()
+    }
+
+    fn converted_prefix(session: &MaterializedSession, chat: &ChatState) -> Vec<ChatEntry> {
+        materialized_prefix_entries(
+            &session.transcript[..chat.unconverted_prefix()],
+            session.applied_event_ordinal,
+        )
+    }
+
+    #[test]
+    fn materialized_conversion_preserves_each_transcript_body() {
+        let mut session = MaterializedSession::empty("session-bodies");
+        session.applied_event_ordinal = 9;
+        session.transcript = vec![
+            fixture_user_item(1),
+            fixture_agent_item(2),
+            fixture_thought_item(3),
+            fixture_tool_item(4),
+            fixture_plan_item(5),
+            fixture_system_item(6),
+        ];
+
+        let entries = materialized_chat_entries(&session);
+
+        let roles = entries.iter().map(|entry| entry.role).collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            [
+                ChatRole::User,
+                ChatRole::Agent,
+                ChatRole::Thought,
+                ChatRole::Tool,
+                ChatRole::Plan,
+                ChatRole::System,
+            ]
+        );
+        assert_eq!(entries[0].text, "question 1");
+        assert!(entries[1].text.starts_with("answer 2.0 "));
+        assert_eq!(entries[1].text.len(), 8 * 40 * "answer 2.0 ".len());
+        assert_eq!(entries[1].message_id.as_deref(), Some("agent:2"));
+        assert_eq!(entries[2].text, "thinking about 3");
+        assert_eq!(entries[3].text, "read file-4");
+        assert_eq!(entries[3].tool_status, Some(ToolStatus::Completed));
+        assert_eq!(entries[3].tool_call_id.as_deref(), Some("tool:4"));
+        assert_eq!(entries[3].tool_content.len(), 1);
+        assert_eq!(entries[3].tool_locations, ["src/file-4.rs:3"]);
+        assert_eq!(entries[4].plan.len(), 1);
+        assert_eq!(entries[4].plan[0].text, "step 5");
+        assert_eq!(entries[4].plan[0].status, PlanStatus::Running);
+        assert_eq!(entries[5].text, "notice 6");
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.start_seq, index as u64 + 1);
+            assert_eq!(entry.seq, 9);
+            assert_eq!(entry.recorded_at_ms, Some(FIXTURE_MS));
+            assert_eq!(entry.revision, FIXTURE_MS as u64);
+        }
+    }
+
+    #[test]
+    fn opening_a_long_session_converts_only_the_tail() {
+        let items = TAIL_SEED_ITEMS as u64 + 400;
+        let session = long_materialized_session(items);
+
+        let chat = ChatState::from_materialized_tail(&session, &[], &[]);
+
+        assert_eq!(chat.entries.len(), TAIL_SEED_ITEMS);
+        assert_eq!(chat.unconverted_prefix(), 400);
+        let eager = materialized_chat_entries(&session);
+        assert_eq!(chat.entries, eager[400..]);
+    }
+
+    #[test]
+    fn opening_a_short_session_converts_the_whole_transcript() {
+        let session = long_materialized_session(TAIL_SEED_ITEMS as u64);
+
+        let chat = ChatState::from_materialized_tail(&session, &[], &[]);
+
+        assert_eq!(chat.unconverted_prefix(), 0);
+        assert_eq!(chat.entries, materialized_chat_entries(&session));
+    }
+
+    #[test]
+    fn splicing_the_converted_prefix_matches_the_eager_projection() {
+        let session = long_materialized_session(TAIL_SEED_ITEMS as u64 + 500);
+        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
+        let prefix = converted_prefix(&session, &chat);
+
+        assert!(chat.splice_transcript_prefix(prefix));
+
+        assert_eq!(chat.unconverted_prefix(), 0);
+        assert_eq!(chat.entries, materialized_chat_entries(&session));
+    }
+
+    #[test]
+    fn an_update_while_the_prefix_is_pending_keeps_the_tail_and_still_splices() {
+        let mut session = long_materialized_session(TAIL_SEED_ITEMS as u64 + 300);
+        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
+        let prefix = converted_prefix(&session, &chat);
+        let pending = chat.unconverted_prefix();
+
+        let appended = session.transcript.len() as u64 + 1;
+        session.transcript.push(fixture_user_item(appended));
+        session.transcript.push(fixture_agent_item(appended + 1));
+        session.applied_event_ordinal = appended + 2;
+        chat.apply_materialized(&session, &[], &[]);
+
+        assert_eq!(chat.unconverted_prefix(), pending);
+        assert_eq!(chat.entries.len(), session.transcript.len() - pending);
+        assert_eq!(
+            entry_texts(&chat.entries),
+            entry_texts(&materialized_chat_entries(&session)[pending..])
+        );
+
+        assert!(chat.splice_transcript_prefix(prefix));
+        assert_eq!(
+            entry_texts(&chat.entries),
+            entry_texts(&materialized_chat_entries(&session))
+        );
+        assert!(
+            chat.entries
+                .windows(2)
+                .all(|pair| pair[0].start_seq < pair[1].start_seq)
+        );
+    }
+
+    #[test]
+    fn splicing_the_prefix_drops_render_rows_cached_at_the_old_positions() {
+        let session = long_materialized_session(TAIL_SEED_ITEMS as u64 + 120);
+        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
+        let prefix = converted_prefix(&session, &chat);
+        // Fill the cache while the entries still stand for the tail only.
+        chat.anchor = TranscriptAnchor::Row { entry: 0, row: 0 };
+        let tail_top = drawn_transcript(&mut chat, 60, 24);
+        assert!(shows(&tail_top, "question 121"));
+
+        assert!(chat.splice_transcript_prefix(prefix));
+        chat.anchor = TranscriptAnchor::Row { entry: 0, row: 0 };
+        let spliced_top = drawn_transcript(&mut chat, 60, 24);
+
+        let mut eager = ChatState::from_materialized(&session, &[], &[]);
+        eager.anchor = TranscriptAnchor::Row { entry: 0, row: 0 };
+        assert_eq!(spliced_top, drawn_transcript(&mut eager, 60, 24));
+        assert!(shows(&spliced_top, "question 1"));
+        assert!(!shows(&spliced_top, "question 121"));
+    }
+
+    #[test]
+    fn a_prefix_that_no_longer_meets_the_tail_is_refused() {
+        let session = long_materialized_session(TAIL_SEED_ITEMS as u64 + 60);
+        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
+        let pending = chat.unconverted_prefix();
+        // History from a compacted transcript: the right length, but it runs
+        // past the first entry the tail holds.
+        let stale = materialized_prefix_entries(
+            &session.transcript[session.transcript.len() - pending..],
+            session.applied_event_ordinal,
+        );
+
+        assert!(!chat.splice_transcript_prefix(stale));
+
+        assert_eq!(chat.unconverted_prefix(), pending);
+        assert_eq!(chat.entries.len(), TAIL_SEED_ITEMS);
+    }
+
+    #[test]
+    fn compaction_below_the_pending_prefix_reseats_the_tail() {
+        let session = long_materialized_session(TAIL_SEED_ITEMS as u64 + 500);
+        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
+        let prefix = converted_prefix(&session, &chat);
+
+        // Compaction leaves a transcript shorter than the pending prefix.
+        let mut compacted = long_materialized_session(TAIL_SEED_ITEMS as u64 + 100);
+        compacted.applied_event_ordinal = session.applied_event_ordinal + 1;
+        chat.apply_materialized(&compacted, &[], &[]);
+
+        assert_eq!(chat.unconverted_prefix(), 100);
+        assert_eq!(chat.entries.len(), TAIL_SEED_ITEMS);
+        assert_eq!(
+            entry_texts(&chat.entries),
+            entry_texts(&materialized_chat_entries(&compacted)[100..])
+        );
+        // The history built against the old transcript no longer fits.
+        assert!(!chat.splice_transcript_prefix(prefix));
     }
 
     fn shows(rows: &[String], needle: &str) -> bool {

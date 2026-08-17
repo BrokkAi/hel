@@ -54,8 +54,9 @@ use autocomplete::{
 use history::{HistorySearch, HistorySearchRequest};
 use rendering::{TranscriptRenderMode, sanitize_terminal_text};
 use transcript::{
-    TranscriptAnchor, TranscriptRenderCache, content_block_text, materialized_chat_entries_reusing,
-    plan_status, tool_content_details, tool_diffstats, tool_location_details, tool_status,
+    TAIL_SEED_ITEMS, TranscriptAnchor, TranscriptRenderCache, content_block_text,
+    materialized_chat_entries_reusing, plan_status, tool_content_details, tool_diffstats,
+    tool_location_details, tool_status,
 };
 
 pub use active::ActiveChat;
@@ -229,6 +230,10 @@ pub struct ChatState {
     latest_seq: u64,
     last_compaction_seq: u64,
     entries: Vec<ChatEntry>,
+    /// Leading transcript items that are not converted to entries yet, because
+    /// a large session opens on its tail and converts the rest off the event
+    /// loop. Zero whenever the projection is complete.
+    unconverted_prefix: usize,
     input: String,
     input_cursor: usize,
     /// Stored prompts from other sessions in this project, oldest-first.
@@ -293,6 +298,7 @@ impl ChatState {
             latest_seq: 0,
             last_compaction_seq: 0,
             entries: Vec::new(),
+            unconverted_prefix: 0,
             input: String::new(),
             input_cursor: 0,
             project_history: Vec::new(),
@@ -381,6 +387,28 @@ impl ChatState {
         config_options: &[SessionConfigOption],
         available_commands: &[AvailableCommand],
     ) -> Self {
+        Self::from_materialized_with_prefix(session, config_options, available_commands, 0)
+    }
+
+    /// Like `from_materialized`, but a session longer than `TAIL_SEED_ITEMS`
+    /// converts only its tail here. The caller converts the recorded prefix off
+    /// the event loop and hands it back to `splice_transcript_prefix`, so
+    /// opening a long conversation costs the tail rather than the history.
+    pub fn from_materialized_tail(
+        session: &MaterializedSession,
+        config_options: &[SessionConfigOption],
+        available_commands: &[AvailableCommand],
+    ) -> Self {
+        let prefix = session.transcript.len().saturating_sub(TAIL_SEED_ITEMS);
+        Self::from_materialized_with_prefix(session, config_options, available_commands, prefix)
+    }
+
+    fn from_materialized_with_prefix(
+        session: &MaterializedSession,
+        config_options: &[SessionConfigOption],
+        available_commands: &[AvailableCommand],
+        unconverted_prefix: usize,
+    ) -> Self {
         let phase = match session.execution {
             MaterializedExecutionState::Idle => WorkerPhase::Idle,
             MaterializedExecutionState::Running { .. } => WorkerPhase::Running,
@@ -394,6 +422,7 @@ impl ChatState {
         );
         let mut state = Self::new(&snapshot, &[]);
         state.latest_seq = u64::MAX;
+        state.unconverted_prefix = unconverted_prefix;
         state.apply_materialized(session, config_options, available_commands);
         state
     }
@@ -415,8 +444,22 @@ impl ChatState {
         // The controller's projection is authoritative for the turn clock.
         self.turn_started_at_epoch_seconds = turn_started_at_epoch_seconds(session.execution);
         if rebuild_projection {
-            self.entries =
-                materialized_chat_entries_reusing(session, std::mem::take(&mut self.entries));
+            // While a prefix conversion is in flight the entries stand for the
+            // tail only, so the rebuild has to line up with the same tail.
+            // Compaction can shrink the transcript under the recorded prefix;
+            // reseat it on the current tail rather than rebuilding the whole
+            // history here. The pending prefix then fails its alignment check
+            // and is rebuilt off the loop.
+            if self.unconverted_prefix > session.transcript.len() {
+                self.unconverted_prefix = session.transcript.len().saturating_sub(TAIL_SEED_ITEMS);
+                self.entries.clear();
+                self.invalidate_render_cache();
+            }
+            self.entries = materialized_chat_entries_reusing(
+                session,
+                self.unconverted_prefix,
+                std::mem::take(&mut self.entries),
+            );
             self.queued_prompts = session
                 .queued_prompts
                 .iter()

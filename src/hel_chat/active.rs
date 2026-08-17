@@ -2,6 +2,7 @@
 //! open session, and the frame the dashboard draws.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -17,7 +18,10 @@ use crate::hel_database::{HistoryScope, PromptHistoryEntry};
 use crate::hel_session_manager::{
     ManagedSessionHandle, ManagedSessionView, SessionManagerControl, ViewError, new_command_id,
 };
-use crate::hel_state::{MaterializedSession, RecoveryContext, TranscriptBody, config_command_text};
+use crate::hel_state::{
+    MaterializedSession, RecoveryContext, TranscriptBody, TranscriptItem, config_command_text,
+};
+use crate::hel_transcript::ChatEntry;
 use crate::hel_worker::WorkerPhase;
 
 use super::autocomplete::render_autocomplete;
@@ -29,7 +33,8 @@ use super::remote::{
 };
 use super::rendering::{display_width, truncate_line_to_width, truncate_to_width};
 use super::transcript::{
-    TranscriptAnchor, agent_text_spans, materialized_chunks_text, render_transcript,
+    TranscriptAnchor, agent_text_spans, materialized_chunks_text, materialized_prefix_entries,
+    render_transcript,
 };
 use super::{
     ChatAction, ChatEventOutcome, ChatFocus, ChatState, Notices, OtherSessionActivity,
@@ -52,7 +57,19 @@ enum ChatIoUpdate {
     },
     ClipboardText(std::result::Result<String, String>),
     OtherSessions(Vec<OtherSessionActivity>),
+    /// The history a large session did not convert when it opened, built off
+    /// the event loop. `attempt` counts the tries so far, so a transcript that
+    /// keeps changing under the conversion cannot retry for ever.
+    TranscriptPrefix {
+        attempt: u32,
+        result: std::result::Result<Vec<ChatEntry>, String>,
+    },
 }
+
+/// How many times a refused prefix is rebuilt before the view settles for its
+/// tail. Compaction rewriting the history under a pending conversion is rare,
+/// and one rebuild against the current snapshot normally lands.
+const MAX_PREFIX_CONVERSION_ATTEMPTS: u32 = 3;
 
 impl ChatState {
     /// Keys while the conversations pane has focus. The pane owns the arrows
@@ -211,8 +228,74 @@ fn dispatch_history_search_request(
     });
 }
 
-fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) {
+/// The history a tail-first open still owes the view: the transcript items in
+/// front of the loaded tail, and the frontier they are converted against.
+/// Cloning the item vector copies handles, not conversations.
+struct PendingPrefix {
+    items: Vec<Arc<TranscriptItem>>,
+    frontier: u64,
+}
+
+impl PendingPrefix {
+    fn of(session: &MaterializedSession, length: usize) -> Option<Self> {
+        let length = length.min(session.transcript.len());
+        (length > 0).then(|| Self {
+            items: session.transcript[..length].to_vec(),
+            frontier: session.applied_event_ordinal,
+        })
+    }
+}
+
+/// Converts the unloaded history on a blocking thread and reports it back over
+/// the chat's I/O feed, including the failure of the conversion itself.
+fn spawn_transcript_prefix(
+    pending: PendingPrefix,
+    attempt: u32,
+    updates: tokio::sync::mpsc::UnboundedSender<ChatIoUpdate>,
+) {
+    tokio::spawn(async move {
+        let result = match tokio::task::spawn_blocking(move || {
+            materialized_prefix_entries(&pending.items, pending.frontier)
+        })
+        .await
+        {
+            Ok(entries) => Ok(entries),
+            Err(error) => Err(format!("history conversion task failed: {error}")),
+        };
+        let _ = updates.send(ChatIoUpdate::TranscriptPrefix { attempt, result });
+    });
+}
+
+/// Whether applying an update left history that still has to be converted.
+#[derive(Debug, PartialEq, Eq)]
+enum PrefixRebuild {
+    NotNeeded,
+    /// The converted history no longer lines up with the tail, so it has to be
+    /// rebuilt from the session's current snapshot. `attempt` numbers the try.
+    Needed {
+        attempt: u32,
+    },
+}
+
+fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) -> PrefixRebuild {
     match update {
+        ChatIoUpdate::TranscriptPrefix { attempt, result } => match result {
+            Ok(entries) => {
+                if chat.splice_transcript_prefix(entries) {
+                    return PrefixRebuild::NotNeeded;
+                }
+                if attempt >= MAX_PREFIX_CONVERSION_ATTEMPTS {
+                    chat.set_notice(
+                        "Earlier messages could not be loaded; showing the recent history only.",
+                    );
+                    return PrefixRebuild::NotNeeded;
+                }
+                return PrefixRebuild::Needed {
+                    attempt: attempt.saturating_add(1),
+                };
+            }
+            Err(error) => chat.set_notice(format!("Earlier messages failed to load: {error}")),
+        },
         ChatIoUpdate::ProjectHistoryPrefetched(Ok(entries)) => chat.set_project_history(entries),
         ChatIoUpdate::ProjectHistoryPrefetched(Err(error)) => {
             chat.set_project_history_unavailable(error);
@@ -226,6 +309,7 @@ fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) {
         }
         ChatIoUpdate::OtherSessions(sessions) => chat.other_sessions = sessions,
     }
+    PrefixRebuild::NotNeeded
 }
 
 /// Marker on the current session's header line. The session list uses the same
@@ -504,8 +588,10 @@ pub struct ActiveChat {
 
 impl ActiveChat {
     /// Builds the view from the session's current snapshot and starts its
-    /// background feeds. Cheap enough to call from the dashboard loop: every
-    /// slow step is a spawned task.
+    /// background feeds. Cheap enough to call from the dashboard loop: the
+    /// only work done here is converting the tail of the transcript, a bounded
+    /// number of items. Every other step, including converting the history in
+    /// front of that tail, is a spawned task.
     ///
     /// `draft` is the unsent input saved when this session was last detached.
     /// Only a fresh view takes it: a warm chat the dashboard kept alive already
@@ -531,22 +617,27 @@ impl ActiveChat {
     ) -> Self {
         let view = session.view();
         let needs_initial_sync = view.snapshot.is_none();
-        let mut state = view.snapshot.map_or_else(
-            || {
-                ChatState::from_materialized(
-                    &MaterializedSession::empty(session.session_id()),
-                    &[],
-                    &[],
-                )
-            },
-            |snapshot| {
-                ChatState::from_materialized(
-                    &snapshot.materialized,
-                    &snapshot.operational.config_options,
-                    &snapshot.operational.available_commands,
-                )
-            },
-        );
+        // The history a tail-first open leaves behind is converted off the
+        // loop; those entries arrive over the I/O feed and are spliced in front
+        // of the tail.
+        let (mut state, pending_prefix) = {
+            let empty = MaterializedSession::empty(session.session_id());
+            let snapshot = view.snapshot;
+            let materialized = snapshot
+                .as_ref()
+                .map_or(&empty, |snapshot| &snapshot.materialized);
+            let state = ChatState::from_materialized_tail(
+                materialized,
+                snapshot
+                    .as_ref()
+                    .map_or(&[][..], |snapshot| &snapshot.operational.config_options),
+                snapshot
+                    .as_ref()
+                    .map_or(&[][..], |snapshot| &snapshot.operational.available_commands),
+            );
+            let pending = PendingPrefix::of(materialized, state.unconverted_prefix());
+            (state, pending)
+        };
         state.set_history_context(bundle_id);
         state.set_harness(harness);
         state.set_header_identity(header.project, header.position);
@@ -574,6 +665,9 @@ impl ActiveChat {
                 };
                 let _ = updates.send(ChatIoUpdate::ProjectHistoryPrefetched(result));
             });
+        }
+        if let Some(pending) = pending_prefix {
+            spawn_transcript_prefix(pending, 1, chat_io_tx.clone());
         }
         spawn_other_session_poller(control, header.others, chat_io_tx.clone());
         if let Some(detail) = recovery
@@ -685,8 +779,26 @@ impl ActiveChat {
     }
 
     fn apply_io_update(&mut self, update: ChatIoUpdate) {
-        apply_chat_io_update(&mut self.state, update);
+        if let PrefixRebuild::Needed { attempt } = apply_chat_io_update(&mut self.state, update) {
+            self.rebuild_transcript_prefix(attempt);
+        }
         dispatch_history_search_request(&mut self.state, &self.chat_io_tx);
+    }
+
+    /// Restarts the history conversion against the session's current snapshot,
+    /// after the transcript changed under the last one. Only the spawn happens
+    /// here; the conversion itself stays off the event loop.
+    fn rebuild_transcript_prefix(&mut self, attempt: u32) {
+        let view = self.session.view();
+        let Some(snapshot) = view.snapshot else {
+            return;
+        };
+        let Some(pending) =
+            PendingPrefix::of(&snapshot.materialized, self.state.unconverted_prefix())
+        else {
+            return;
+        };
+        spawn_transcript_prefix(pending, attempt, self.chat_io_tx.clone());
     }
 
     fn apply_voice_update(&mut self, update: VoiceUpdate) {
@@ -2101,5 +2213,107 @@ mod tests {
         // The transcript keeps its own chrome, below the header and the
         // pane's now-taller bottom border.
         assert!(row(&terminal, 4).contains("Conversation"));
+    }
+
+    /// A conversation long enough that opening it converts the tail only.
+    fn long_session() -> MaterializedSession {
+        let mut session = MaterializedSession::empty("session-long");
+        session.transcript = (1..=300)
+            .map(|position| {
+                agent_message_item(
+                    &format!("agent:{position}"),
+                    position,
+                    &format!("message {position}"),
+                )
+            })
+            .collect();
+        session.applied_event_ordinal = 301;
+        session
+    }
+
+    #[test]
+    fn the_converted_history_completes_a_chat_opened_on_its_tail() {
+        let session = long_session();
+        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
+        let pending = chat.unconverted_prefix();
+        assert!(pending > 0);
+        let prefix = materialized_prefix_entries(
+            &session.transcript[..pending],
+            session.applied_event_ordinal,
+        );
+
+        let rebuild = apply_chat_io_update(
+            &mut chat,
+            ChatIoUpdate::TranscriptPrefix {
+                attempt: 1,
+                result: Ok(prefix),
+            },
+        );
+
+        assert_eq!(rebuild, PrefixRebuild::NotNeeded);
+        assert_eq!(chat.unconverted_prefix(), 0);
+        assert_eq!(chat.entries.len(), session.transcript.len());
+        assert_eq!(chat.entries[0].text, "message 1");
+        assert_eq!(chat.notice(), None);
+    }
+
+    #[test]
+    fn history_that_no_longer_fits_the_tail_is_rebuilt_and_then_gives_up_with_a_notice() {
+        let session = long_session();
+        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
+        let pending = chat.unconverted_prefix();
+        // History from a transcript compaction rewrote: it overlaps the tail.
+        let stale = materialized_prefix_entries(
+            &session.transcript[session.transcript.len() - pending..],
+            session.applied_event_ordinal,
+        );
+
+        let rebuild = apply_chat_io_update(
+            &mut chat,
+            ChatIoUpdate::TranscriptPrefix {
+                attempt: 1,
+                result: Ok(stale.clone()),
+            },
+        );
+
+        assert_eq!(rebuild, PrefixRebuild::Needed { attempt: 2 });
+        assert_eq!(chat.unconverted_prefix(), pending);
+        assert_eq!(chat.notice(), None);
+
+        let exhausted = apply_chat_io_update(
+            &mut chat,
+            ChatIoUpdate::TranscriptPrefix {
+                attempt: MAX_PREFIX_CONVERSION_ATTEMPTS,
+                result: Ok(stale),
+            },
+        );
+
+        assert_eq!(exhausted, PrefixRebuild::NotNeeded);
+        assert_eq!(chat.unconverted_prefix(), pending);
+        assert!(
+            chat.notice()
+                .is_some_and(|notice| notice.contains("Earlier messages")),
+            "giving up on the history has to be reported"
+        );
+    }
+
+    #[test]
+    fn a_failed_history_conversion_is_reported_instead_of_dropped() {
+        let session = long_session();
+        let mut chat = ChatState::from_materialized_tail(&session, &[], &[]);
+
+        let rebuild = apply_chat_io_update(
+            &mut chat,
+            ChatIoUpdate::TranscriptPrefix {
+                attempt: 1,
+                result: Err("worker panicked".into()),
+            },
+        );
+
+        assert_eq!(rebuild, PrefixRebuild::NotNeeded);
+        assert_eq!(
+            chat.notice().as_deref(),
+            Some("Earlier messages failed to load: worker panicked")
+        );
     }
 }
