@@ -141,6 +141,13 @@ pub struct CheckpointRestoreSpec {
     pub restore_repositories: bool,
     pub restore_native: bool,
     pub discard_queued_prompts: bool,
+    /// Where the primary repository actually sits, when that is not
+    /// `workspace_root` joined with the archived destination. A resume that
+    /// moves a session between representations puts the checkout somewhere the
+    /// archive could not have named, and the restored harness session has to
+    /// point at the real working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_repository_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +201,13 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
     )?;
 
     if spec.restore_native {
+        let target_cwd = spec.primary_repository_root.clone().or_else(|| {
+            target_primary_cwd(
+                &archive.manifest.bundle.primary_repository,
+                &archive.manifest.repositories,
+                &spec.workspace_root,
+            )
+        });
         for descriptor in &archive.manifest.payloads {
             let PayloadRole::NativeArtifact { relative_path } = &descriptor.role else {
                 continue;
@@ -202,17 +216,13 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
             let relative_path = restored_native_relative_path(
                 archive.manifest.session.harness_kind,
                 relative_path,
-                &archive.manifest.bundle.primary_repository,
-                &archive.manifest.repositories,
-                &spec.workspace_root,
+                target_cwd.as_deref(),
             )?;
             let native_data = restored_native_artifact_bytes(
                 archive.manifest.session.harness_kind,
                 &relative_path,
                 native_data,
-                &archive.manifest.bundle.primary_repository,
-                &archive.manifest.repositories,
-                &spec.workspace_root,
+                target_cwd.as_deref(),
                 &spec.harness_home,
             )?;
             validate_relative_path(&relative_path)?;
@@ -253,29 +263,7 @@ fn restore_repositories_from_archive(
 ) -> Result<()> {
     for repository in &archive.manifest.repositories {
         let id = &repository.metadata.id;
-        let snapshot = RepositorySnapshot {
-            metadata: repository.metadata.clone(),
-            committed_bundle: archive
-                .payload_by_role(&PayloadRole::GitBundle {
-                    repository_id: id.clone(),
-                })?
-                .to_vec(),
-            staged_patch: archive
-                .payload_by_role(&PayloadRole::GitStagedPatch {
-                    repository_id: id.clone(),
-                })?
-                .to_vec(),
-            unstaged_patch: archive
-                .payload_by_role(&PayloadRole::GitUnstagedPatch {
-                    repository_id: id.clone(),
-                })?
-                .to_vec(),
-            untracked_tar: archive
-                .payload_by_role(&PayloadRole::GitUntrackedTar {
-                    repository_id: id.clone(),
-                })?
-                .to_vec(),
-        };
+        let snapshot = archived_repository_snapshot(archive, repository)?;
         let path = workspace_root.join(&repository.metadata.relative_destination);
         restore_git_snapshot(git, &path, &snapshot)
             .with_context(|| format!("restore repository {id:?}"))?;
@@ -283,16 +271,71 @@ fn restore_repositories_from_archive(
     Ok(())
 }
 
+fn archived_repository_snapshot(
+    archive: &crate::hel_archive::VerifiedArchive,
+    repository: &crate::hel_archive::RepositoryManifest,
+) -> Result<RepositorySnapshot> {
+    let id = &repository.metadata.id;
+    Ok(RepositorySnapshot {
+        metadata: repository.metadata.clone(),
+        committed_bundle: archive
+            .payload_by_role(&PayloadRole::GitBundle {
+                repository_id: id.clone(),
+            })?
+            .to_vec(),
+        staged_patch: archive
+            .payload_by_role(&PayloadRole::GitStagedPatch {
+                repository_id: id.clone(),
+            })?
+            .to_vec(),
+        unstaged_patch: archive
+            .payload_by_role(&PayloadRole::GitUnstagedPatch {
+                repository_id: id.clone(),
+            })?
+            .to_vec(),
+        untracked_tar: archive
+            .payload_by_role(&PayloadRole::GitUntrackedTar {
+                repository_id: id.clone(),
+            })?
+            .to_vec(),
+    })
+}
+
+/// Restore a checkpoint's only repository into an existing checkout, on a
+/// branch the caller names.
+///
+/// A resume that moves a session out of its workspace restores it into a
+/// worktree of the user's own repository, where the archived branch is usually
+/// already checked out somewhere else and `git checkout -B` would refuse it.
+/// Returns the branch the checkpoint recorded.
+pub fn restore_single_repository_onto_branch(
+    archive_path: &Path,
+    repository_path: &Path,
+    branch: &str,
+    git: &dyn GitCommandRunner,
+) -> Result<Option<String>> {
+    ensure!(repository_path.is_dir(), "restore checkout is missing");
+    let archive = read_archive_verified(archive_path)?;
+    let [repository] = archive.manifest.repositories.as_slice() else {
+        bail!(
+            "this checkpoint holds {} repositories; exactly one can be restored into a checkout",
+            archive.manifest.repositories.len()
+        );
+    };
+    let mut snapshot = archived_repository_snapshot(&archive, repository)?;
+    let archived_branch = snapshot.metadata.branch.replace(branch.to_owned());
+    restore_git_snapshot(git, repository_path, &snapshot)
+        .with_context(|| format!("restore repository {:?}", repository.metadata.id))?;
+    Ok(archived_branch)
+}
+
 /// Native session files use harness-specific working-directory keys. Rewrite
 fn restored_native_relative_path(
     harness: HarnessKind,
     relative_path: &Path,
-    primary_repository: &str,
-    repositories: &[crate::hel_archive::RepositoryManifest],
-    workspace_root: &Path,
+    target_cwd: Option<&Path>,
 ) -> Result<PathBuf> {
-    let Some(target_cwd) = target_primary_cwd(primary_repository, repositories, workspace_root)
-    else {
+    let Some(target_cwd) = target_cwd else {
         return Ok(relative_path.to_path_buf());
     };
     let mut components = relative_path.components();
@@ -304,7 +347,7 @@ fn restored_native_relative_path(
                 return Ok(relative_path.to_path_buf());
             }
             let mut rewritten = PathBuf::from("projects");
-            rewritten.push(claude_project_slug(&target_cwd));
+            rewritten.push(claude_project_slug(target_cwd));
             rewritten.extend(components);
             Ok(rewritten)
         }
@@ -315,7 +358,7 @@ fn restored_native_relative_path(
                 return Ok(relative_path.to_path_buf());
             }
             let mut rewritten = PathBuf::from("sessions");
-            rewritten.push(kimi_workspace_key(&target_cwd));
+            rewritten.push(kimi_workspace_key(target_cwd));
             rewritten.extend(components);
             Ok(rewritten)
         }
@@ -326,7 +369,7 @@ fn restored_native_relative_path(
                 return Ok(relative_path.to_path_buf());
             }
             let mut rewritten = PathBuf::from("sessions");
-            rewritten.push(grok_cwd_key(&target_cwd));
+            rewritten.push(grok_cwd_key(target_cwd));
             rewritten.extend(components);
             Ok(rewritten)
         }
@@ -348,30 +391,27 @@ fn restored_native_artifact_bytes(
     harness: HarnessKind,
     relative_path: &Path,
     data: &[u8],
-    primary_repository: &str,
-    repositories: &[crate::hel_archive::RepositoryManifest],
-    workspace_root: &Path,
+    target_cwd: Option<&Path>,
     harness_home: &Path,
 ) -> Result<Vec<u8>> {
     if !matches!(harness, HarnessKind::Kimi | HarnessKind::Grok) {
         return Ok(data.to_vec());
     }
-    let Some(target_cwd) = target_primary_cwd(primary_repository, repositories, workspace_root)
-    else {
+    let Some(target_cwd) = target_cwd else {
         return Ok(data.to_vec());
     };
     if harness == HarnessKind::Grok {
         return if is_grok_session_summary(relative_path) {
-            rewrite_grok_session_summary(data, &target_cwd, harness_home)
+            rewrite_grok_session_summary(data, target_cwd, harness_home)
         } else {
             Ok(data.to_vec())
         };
     }
     if relative_path == Path::new("workspaces.json") {
-        return rewrite_kimi_workspace_registry(data, &target_cwd);
+        return rewrite_kimi_workspace_registry(data, target_cwd);
     }
     if relative_path == Path::new("session_index.jsonl") {
-        return rewrite_kimi_session_index(data, &target_cwd, harness_home);
+        return rewrite_kimi_session_index(data, target_cwd, harness_home);
     }
     if !is_kimi_session_state(relative_path) {
         return Ok(data.to_vec());
@@ -1916,9 +1956,7 @@ mod tests {
             Path::new(&format!(
                 "sessions/%2Fhome%2Fjonathan%2FProjects%2Fapp/{NATIVE}/summary.json"
             )),
-            "app",
-            &repositories,
-            Path::new("/workspace"),
+            target_primary_cwd("app", &repositories, Path::new("/workspace")).as_deref(),
         )
         .unwrap();
         assert_eq!(
@@ -1930,9 +1968,7 @@ mod tests {
             HarnessKind::Grok,
             &path,
             br#"{"info":{"id":"01a00c3a","cwd":"/home/jonathan/Projects/app"},"grok_home":"/home/jonathan/.grok","num_messages":3}"#,
-            "app",
-            &repositories,
-            Path::new("/workspace"),
+            target_primary_cwd("app", &repositories, Path::new("/workspace")).as_deref(),
             Path::new("/profiles/imported"),
         )
         .unwrap();
@@ -1948,9 +1984,7 @@ mod tests {
                 "sessions/%2Fworkspace%2Fapp/{NATIVE}/chat_history.jsonl"
             )),
             b"{\"role\":\"user\"}\n",
-            "app",
-            &repositories,
-            Path::new("/workspace"),
+            target_primary_cwd("app", &repositories, Path::new("/workspace")).as_deref(),
             Path::new("/profiles/imported"),
         )
         .unwrap();
@@ -2043,9 +2077,7 @@ mod tests {
         let path = restored_native_relative_path(
             HarnessKind::Claude,
             Path::new("projects/-home-me-app/session.jsonl"),
-            "app",
-            &repositories,
-            Path::new("/workspace"),
+            target_primary_cwd("app", &repositories, Path::new("/workspace")).as_deref(),
         )
         .unwrap();
         assert_eq!(path, PathBuf::from("projects/-workspace-app/session.jsonl"));
@@ -2072,9 +2104,7 @@ mod tests {
             Path::new(
                 "sessions/wd_kimi-code_78153cfca00c/session_1b6c3192-2480-48e0-8f49-4b8a1572f5b2/state.json",
             ),
-            "app",
-            &repositories,
-            Path::new("/workspace"),
+            target_primary_cwd("app", &repositories, Path::new("/workspace")).as_deref(),
         )
         .unwrap();
         assert_eq!(
@@ -2087,9 +2117,7 @@ mod tests {
             HarnessKind::Kimi,
             &path,
             br#"{"workDir":"/home/jonathan/Projects/kimi-code","cwd":"/home/jonathan/Projects/kimi-code"}"#,
-            "app",
-            &repositories,
-            Path::new("/workspace"),
+            target_primary_cwd("app", &repositories, Path::new("/workspace")).as_deref(),
             Path::new("/profiles/imported"),
         )
         .unwrap();
@@ -2100,9 +2128,7 @@ mod tests {
             HarnessKind::Kimi,
             Path::new("workspaces.json"),
             br#"{"version":1,"deleted_workspace_ids":[],"workspaces":{"wd_kimi-code_78153cfca00c":{"root":"/home/jonathan/Projects/kimi-code","name":"kimi-code"}}}"#,
-            "app",
-            &repositories,
-            Path::new("/workspace"),
+            target_primary_cwd("app", &repositories, Path::new("/workspace")).as_deref(),
             Path::new("/profiles/imported"),
         )
         .unwrap();
@@ -2121,9 +2147,7 @@ mod tests {
             HarnessKind::Kimi,
             Path::new("session_index.jsonl"),
             br#"{"sessionId":"session_1b6c3192-2480-48e0-8f49-4b8a1572f5b2","workDir":"/home/jonathan/Projects/kimi-code","sessionDir":"/home/jonathan/.kimi-code/sessions/wd_kimi-code_78153cfca00c/session_1b6c3192-2480-48e0-8f49-4b8a1572f5b2"}"#,
-            "app",
-            &repositories,
-            Path::new("/workspace"),
+            target_primary_cwd("app", &repositories, Path::new("/workspace")).as_deref(),
             Path::new("/profiles/imported"),
         )
         .unwrap();
@@ -2240,6 +2264,67 @@ mod tests {
         )
     }
 
+    #[test]
+    fn a_checkout_restore_lands_on_the_branch_the_caller_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, archive_path) = fixture(temp.path());
+        let repository = spec.workspace_root.join("app");
+        fs::write(repository.join("feature.txt"), b"session work").unwrap();
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "-m", "session work"]);
+        fs::write(repository.join("README.md"), b"edited").unwrap();
+        let head = git(&repository, &["rev-parse", "HEAD"]);
+        let archived_branch = git(&repository, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        export_checkpoint(&spec).unwrap();
+
+        let checkout = temp.path().join("worktrees/session");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "hel/session",
+                &checkout.to_string_lossy(),
+                "HEAD~1",
+            ],
+        );
+
+        let restored = restore_single_repository_onto_branch(
+            &archive_path,
+            &checkout,
+            "hel/session",
+            &SystemGit,
+        )
+        .unwrap();
+
+        assert_eq!(restored.as_deref(), Some(archived_branch.as_str()));
+        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            git(&checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "hel/session"
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join("README.md")).unwrap(),
+            "edited",
+            "the session's uncommitted work comes with it"
+        );
+
+        // Restoring onto the archived branch is exactly what the override
+        // avoids: that branch is checked out in the user's own working tree.
+        let error = restore_single_repository_onto_branch(
+            &archive_path,
+            &checkout,
+            &archived_branch,
+            &SystemGit,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("restore committed branch"),
+            "{error:#}"
+        );
+    }
+
     fn copy_archive_with_schema(source: &Path, destination: &Path, schema_version: u32) {
         let source = File::open(source).unwrap();
         let mut archive = zip::ZipArchive::new(source).unwrap();
@@ -2346,6 +2431,7 @@ mod tests {
                 restore_repositories: true,
                 restore_native: true,
                 discard_queued_prompts: false,
+                primary_repository_root: None,
             },
             &SystemGit,
         )
@@ -2711,6 +2797,7 @@ mod tests {
                 restore_repositories: false,
                 restore_native: false,
                 discard_queued_prompts: true,
+                primary_repository_root: None,
             },
             &SystemGit,
         )
@@ -2752,6 +2839,7 @@ mod tests {
                     restore_repositories: true,
                     restore_native: true,
                     discard_queued_prompts: false,
+                    primary_repository_root: None,
                 },
                 &SystemGit,
             )

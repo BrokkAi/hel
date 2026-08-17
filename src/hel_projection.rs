@@ -291,7 +291,8 @@ fn project_observation(
                 | crate::hel_worker::RelayCommandOutcome::Cancelled
                 | crate::hel_worker::RelayCommandOutcome::CheckpointCompleted
                 | crate::hel_worker::RelayCommandOutcome::CheckpointReleased
-                | crate::hel_worker::RelayCommandOutcome::RecoveryFloorAdvanced => {}
+                | crate::hel_worker::RelayCommandOutcome::RecoveryFloorAdvanced
+                | crate::hel_worker::RelayCommandOutcome::NoticeRecorded => {}
             }
             if queue != current.queued_prompts {
                 mutation.queued_prompts = Some(queue);
@@ -335,6 +336,22 @@ fn project_observation(
         RelayObservation::CheckpointReady { .. } => {}
         RelayObservation::Warning { message } => {
             push_system(mutation, event, format!("warning: {message}"));
+        }
+        // Keyed on the command rather than the event ordinal, and skipped once
+        // the line exists: a relay that re-records the same notice after a
+        // persistence retry leaves exactly one line in the conversation.
+        RelayObservation::Notice { message } => {
+            let stable_id = match &event.command_id {
+                Some(command_id) => format!("system:notice:{command_id}"),
+                None => format!("system:{}", event.ordinal),
+            };
+            if !current
+                .transcript
+                .iter()
+                .any(|item| item.stable_id == stable_id)
+            {
+                push_system_with_id(mutation, event, stable_id, message.clone());
+            }
         }
         RelayObservation::Closing => {
             close_streams(current, mutation, event.recorded_at_ms);
@@ -627,10 +644,19 @@ fn push_system(
     event: &RelayEvent,
     text: impl Into<String>,
 ) {
+    push_system_with_id(mutation, event, format!("system:{}", event.ordinal), text);
+}
+
+fn push_system_with_id(
+    mutation: &mut MaterializedSessionMutation,
+    event: &RelayEvent,
+    stable_id: String,
+    text: impl Into<String>,
+) {
     upsert(
         mutation,
         TranscriptItem {
-            stable_id: format!("system:{}", event.ordinal),
+            stable_id,
             position: event.ordinal,
             latest_content_event_ordinal: None,
             created_at_ms: event.recorded_at_ms,

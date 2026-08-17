@@ -2752,7 +2752,7 @@ fn same_github_repository(left: &GithubRepository, right: &GithubRepository) -> 
         && left.repository.eq_ignore_ascii_case(&right.repository)
 }
 
-fn setup_style_id(value: &str) -> String {
+pub(crate) fn setup_style_id(value: &str) -> String {
     let mut id = value
         .chars()
         .filter(|character| {
@@ -2766,7 +2766,7 @@ fn setup_style_id(value: &str) -> String {
     id
 }
 
-fn unique_bundle_id(config: &HelConfig, base: &str) -> String {
+pub(crate) fn unique_bundle_id(config: &HelConfig, base: &str) -> String {
     if !config.bundles.contains_key(base) {
         return base.into();
     }

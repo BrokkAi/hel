@@ -2584,6 +2584,12 @@ impl DashboardState {
         )
     }
 
+    /// Why this session cannot resume on `target_id`, or `None` when it can.
+    fn resume_target_rejection(&self, session_id: &str, target_id: &str) -> Option<String> {
+        let session = self.state.sessions.get(session_id)?;
+        hel::hel_controller::resume_compatibility(session, &self.config, target_id).err()
+    }
+
     fn prepare_resume_target(&self, wizard: &mut ResumeWizard) -> DashboardAction {
         let previous = self
             .state
@@ -2887,6 +2893,11 @@ impl DashboardState {
             }
             WizardStep::Target => {
                 let target_id = nth_key(&self.config.targets, wizard.target);
+                if let Some(reason) = self.resume_target_rejection(&wizard.session_id, &target_id) {
+                    self.notices.set(reason);
+                    self.mode = Mode::Resume(wizard);
+                    return DashboardAction::None;
+                }
                 if matches!(
                     self.config.targets[&target_id],
                     TargetTemplate::AwsEc2 { .. }
@@ -5738,7 +5749,7 @@ fn render_new_wizard(
         );
         return;
     }
-    let (title, choices, selected) = match wizard.step {
+    let (title, choices, selected): (_, Vec<String>, _) = match wizard.step {
         WizardStep::Profile => (
             " New session · 1/4 profile ",
             dashboard
@@ -5795,7 +5806,7 @@ fn render_new_wizard(
         frame,
         area,
         title,
-        choices,
+        choices.into_iter().map(PickerChoice::from).collect(),
         selected,
         &[help],
         PickerNavigation {
@@ -6153,7 +6164,7 @@ fn render_resume_wizard(
                     {
                         choice.insert_str(id.len(), "  (lossy: text-only transcript)");
                     }
-                    choice
+                    PickerChoice::from(choice)
                 })
                 .collect(),
             wizard.profile,
@@ -6177,7 +6188,13 @@ fn render_resume_wizard(
                     } else {
                         String::new()
                     };
-                    format!("{id}  {}{size}", target_label(target))
+                    match dashboard.resume_target_rejection(&wizard.session_id, id) {
+                        Some(reason) => PickerChoice {
+                            text: format!("{id}  {}  · {reason}", target_label(target)),
+                            disabled: true,
+                        },
+                        None => PickerChoice::from(format!("{id}  {}{size}", target_label(target))),
+                    }
                 })
                 .collect(),
             wizard.target,
@@ -6209,11 +6226,28 @@ struct PickerNavigation {
     has_back: bool,
 }
 
+/// One picker row. A disabled row stays in the list so row numbers keep
+/// matching the underlying map order; it is greyed out and refuses Enter.
+#[derive(Debug, Clone)]
+struct PickerChoice {
+    text: String,
+    disabled: bool,
+}
+
+impl From<String> for PickerChoice {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            disabled: false,
+        }
+    }
+}
+
 fn render_picker(
     frame: &mut Frame,
     area: Rect,
     title: &str,
-    choices: Vec<String>,
+    choices: Vec<PickerChoice>,
     selected: usize,
     help: &[&str],
     navigation: PickerNavigation,
@@ -6229,17 +6263,14 @@ fn render_picker(
         .into_iter()
         .enumerate()
         .map(|(index, choice)| {
-            let marker = if index == selected && navigation.focus == WizardFocus::Content {
-                "› "
-            } else {
-                "  "
+            let focused = index == selected && navigation.focus == WizardFocus::Content;
+            let marker = if focused { "› " } else { "  " };
+            let style = match (focused, choice.disabled) {
+                (true, _) => Style::default().bg(Color::DarkGray).fg(Color::White),
+                (false, true) => Style::default().fg(Color::DarkGray),
+                (false, false) => Style::default(),
             };
-            let style = if index == selected && navigation.focus == WizardFocus::Content {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
-            } else {
-                Style::default()
-            };
-            Line::styled(format!("{marker}{choice}"), style)
+            Line::styled(format!("{marker}{}", choice.text), style)
         })
         .chain([Line::raw("")])
         .chain(
@@ -8704,6 +8735,59 @@ mod tests {
             panic!("expected resume wizard");
         };
         assert_eq!(nth_key(&dashboard.config.targets, wizard.target), "podman");
+    }
+
+    #[test]
+    fn resume_refuses_a_target_the_session_cannot_use_and_says_why() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard
+            .config
+            .targets
+            .insert("bare".into(), TargetTemplate::LocalBare);
+
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Up));
+        assert_eq!(
+            nth_key(&dashboard.config.targets, resume_wizard(&dashboard).target),
+            "bare"
+        );
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+
+        assert_eq!(resume_wizard(&dashboard).step, WizardStep::Target);
+        let notice = dashboard.notices.current().unwrap_or_default();
+        assert!(notice.contains("came from GitHub"), "{notice}");
+    }
+
+    #[test]
+    fn resume_marks_an_unusable_target_row_as_disabled() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard
+            .config
+            .targets
+            .insert("bare".into(), TargetTemplate::LocalBare);
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .unwrap();
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+        assert!(rendered.contains("came from GitHub"), "{rendered}");
+    }
+
+    fn resume_wizard(dashboard: &DashboardState) -> &ResumeWizard {
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume wizard");
+        };
+        wizard
     }
 
     #[test]

@@ -389,11 +389,15 @@ impl LatchedCheckpoint {
 
 /// Whether connecting local repositories may also carry the user's current
 /// uncommitted changes into a still-empty target checkout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalBootstrap {
     /// A fresh target starts from `git init`, so seed its branch and dirty
     /// state from the local repository.
     Seed,
+    /// Seed from this checkout instead of the bundle's configured path. A
+    /// resume that moves a raw session into a target carries the session's own
+    /// worktree, not the user's primary checkout.
+    SeedFrom(PathBuf),
     /// Resume restores the session's own dirty state from the checkpoint
     /// archive; seeding the local repository's would collide with it.
     Skip,
@@ -883,6 +887,44 @@ impl Controller {
         }
     }
 
+    /// Resolve the checkout a bundle session is moving into, and check that it
+    /// is free, before the session record names it.
+    fn plan_workspace_to_raw(
+        &self,
+        session: &SessionRecord,
+        target_id: &str,
+        executor: &impl CommandExecutor,
+    ) -> Result<WorkspaceToRawConversion> {
+        let bundle = self
+            .config
+            .bundles
+            .get(&session.bundle_id)
+            .context("session bundle is missing")?;
+        let [repository] = bundle.repositories.as_slice() else {
+            bail!("a checkout holds exactly one repository");
+        };
+        let source = repository
+            .local
+            .as_deref()
+            .context("only a repository already on this machine can become a checkout")?;
+        self.validate_project_directory(target_id, source, executor)
+            .context("this session's repository is unavailable")?;
+        let worktree = ManagedWorktree {
+            source_project_directory: source.to_path_buf(),
+            source_repository: source.to_path_buf(),
+            worktree_root: source.join(".hel").join("worktrees").join(&session.id),
+            branch: format!("hel/{}", session.id),
+            target: managed_worktree_target(
+                self.config
+                    .targets
+                    .get(target_id)
+                    .with_context(|| format!("unknown target template {target_id:?}"))?,
+            )?,
+        };
+        ensure_managed_worktree_available(executor, &worktree)?;
+        Ok(WorkspaceToRawConversion { worktree })
+    }
+
     fn prepare_managed_raw_worktree(
         &mut self,
         session_id: &str,
@@ -933,7 +975,12 @@ impl Controller {
         record.managed_worktree = Some(managed.clone());
         record.updated_at = now();
         self.persist_session_state(session_id)?;
-        create_managed_worktree(executor, &managed, inspection.upstream.as_deref())?;
+        create_managed_worktree(
+            executor,
+            &managed,
+            inspection.upstream.as_deref(),
+            PrimaryCheckoutRequirement::Clean,
+        )?;
         Ok(true)
     }
 
@@ -1748,7 +1795,9 @@ impl Controller {
                 )?,
             )?;
         }
-        if bootstrap == LocalBootstrap::Seed && !missing.is_empty() {
+        if let Some(sources) = seed_sources(&missing, &bootstrap)
+            && !sources.is_empty()
+        {
             bootstrap_local_repositories(
                 executor,
                 backend,
@@ -1756,7 +1805,7 @@ impl Controller {
                 bundle,
                 &workspace_root,
                 worker_root,
-                &missing,
+                &sources,
             )?;
         }
         Ok(())
@@ -2022,35 +2071,27 @@ impl Controller {
             .targets
             .get(target_id)
             .with_context(|| format!("unknown target template {target_id:?}"))?;
-        if let Some(project_directory) = &previous.project_directory {
-            if let Some(worktree) = &previous.managed_worktree {
-                let resume_target = managed_worktree_target(target_template)?;
-                if resume_target != worktree.target {
-                    bail!("managed raw project sessions must resume on their original host");
-                }
-            } else {
-                let previous_template = self
-                    .config
-                    .targets
-                    .get(&previous.target_template_id)
-                    .context("previous bare target template is missing")?;
-                if !is_bare_project_target(target_template)
-                    || matches!(previous_template, TargetTemplate::LocalBare)
-                        != matches!(target_template, TargetTemplate::LocalBare)
-                {
-                    bail!("raw project sessions must resume on the same bare target kind");
-                }
-            }
+        // Decide the representation before the record changes, so an
+        // incompatible target fails here instead of during provisioning.
+        let plan = resume_compatibility(&previous, &self.config, target_id)
+            .map_err(|reason| anyhow::anyhow!("{reason}"))?;
+        if plan == ResumePlan::InPlace
+            && let Some(project_directory) = &previous.project_directory
+        {
             self.validate_project_directory(target_id, project_directory, executor)
                 .context("raw project is unavailable for resume")?;
-        } else if matches!(target_template, TargetTemplate::LocalBare) {
-            // A local bare target has no managed workspace to restore a bundle
-            // into. Fail here, before the record changes, instead of failing
-            // during provisioning and rolling back.
-            bail!(
-                "this session was created from a project bundle; a local bare target only hosts raw project sessions — resume it on a container, SSH, or EC2 target"
-            );
         }
+        let conversion = match plan {
+            ResumePlan::InPlace => None,
+            ResumePlan::RawToWorkspace => Some(ResumeConversion::RawToWorkspace(
+                plan_raw_to_workspace(&previous, &self.config, executor)
+                    .context("prepare the raw checkout for its new target")?,
+            )),
+            ResumePlan::WorkspaceToRaw => Some(ResumeConversion::WorkspaceToRaw(
+                self.plan_workspace_to_raw(&previous, target_id, executor)
+                    .context("prepare a checkout for this session")?,
+            )),
+        };
         let resource_allocation =
             resource_allocation.or_else(|| previous.resource_allocation.clone());
         let additional_mounts =
@@ -2070,6 +2111,64 @@ impl Controller {
                 .execute(executor)
                 .context("clean up target from failed resume")?;
         }
+        let mut resume_notices = Vec::new();
+        if let Some(conversion) = conversion
+            .as_ref()
+            .and_then(ResumeConversion::raw_to_workspace)
+            && let Some(project_directory) = &previous.project_directory
+        {
+            resume_notices.push(match &conversion.retire {
+                Some(worktree) => format!(
+                    "This session moved out of {} and into the {target_id} target. Its branch {} stays in {}.",
+                    project_directory.display(),
+                    worktree.branch,
+                    worktree.source_repository.display()
+                ),
+                None => format!(
+                    "This session moved out of {} and into the {target_id} target.",
+                    project_directory.display()
+                ),
+            });
+        }
+        if let Some(conversion) = conversion
+            .as_ref()
+            .and_then(ResumeConversion::workspace_to_raw)
+        {
+            resume_notices.push(format!(
+                "This session moved out of its {} target and into {}. Its branch {} is now {}.",
+                previous.target_template_id,
+                conversion.worktree.worktree_root.display(),
+                archive
+                    .manifest
+                    .repositories
+                    .first()
+                    .and_then(|repository| repository.metadata.branch.as_deref())
+                    .unwrap_or("a detached head"),
+                conversion.worktree.branch,
+            ));
+        }
+        // The live checkout, not the archive, is the truth for a raw session.
+        // Say so in the conversation when the two disagree; never reconcile.
+        if let Some(project_directory) = &previous.project_directory {
+            match raw_checkout_position(&previous, &self.config, project_directory, executor) {
+                Ok(live) => resume_notices.extend(raw_checkout_divergence_notice(
+                    project_directory,
+                    archive
+                        .manifest
+                        .repositories
+                        .first()
+                        .map(|repository| &repository.metadata),
+                    &live,
+                )),
+                // Informational only: a resume must not fail because Hel could
+                // not read where the checkout stands.
+                Err(error) => tracing::warn!(
+                    session_id,
+                    error = format!("{error:#}"),
+                    "could not read the raw checkout position for a resume notice"
+                ),
+            }
+        }
         let same_harness = profile.kind == archive.manifest.session.harness_kind;
         let canonical_session = archive.canonical_session.clone();
         let context_bytes = profile
@@ -2077,6 +2176,21 @@ impl Controller {
             .unwrap_or(crate::hel_compaction::DEFAULT_CONTEXT_BYTES);
         let portable_session = (!same_harness).then(|| canonical_session.clone());
         let github_token = controller_github_token();
+
+        // The configuration gains the bundle before the record points at it, so
+        // no persisted session ever names a bundle that is not there.
+        if let Some(conversion) = conversion
+            .as_ref()
+            .and_then(ResumeConversion::raw_to_workspace)
+            && let Some(bundle) = &conversion.new_bundle
+        {
+            self.config
+                .bundles
+                .insert(conversion.bundle_id.clone(), bundle.clone());
+            self.config
+                .save()
+                .context("save the bundle for a converted raw session")?;
+        }
 
         let record = self.state.sessions.get_mut(session_id).unwrap();
         record.harness_kind = profile.kind;
@@ -2090,13 +2204,50 @@ impl Controller {
         record.state = SessionState::Provisioning;
         record.updated_at = now();
         record.last_error = None;
+        match &conversion {
+            Some(ResumeConversion::RawToWorkspace(conversion)) => {
+                apply_raw_to_workspace(record, conversion);
+            }
+            Some(ResumeConversion::WorkspaceToRaw(conversion)) => {
+                apply_workspace_to_raw(record, conversion);
+            }
+            None => {}
+        }
+        let resumed_project_directory = record.project_directory.clone();
         if let Some(host) = history_host {
             self.state.remember_mount_sources(&host, &history_mounts);
             crate::hel_database::remember_mount_sources(&host, &history_mounts)?;
         }
+        // The session's prompt history is filed under its bundle, so a
+        // conversion moves the history with it before the record is persisted.
+        if let Some(conversion) = conversion
+            .as_ref()
+            .and_then(ResumeConversion::raw_to_workspace)
+        {
+            crate::hel_database::rebind_session_bundle(session_id, &conversion.bundle_id)?;
+        }
         self.persist_session_state(session_id)?;
 
         let result = async {
+            // The record already names the worktree, so a failure here rolls
+            // back through the same path that cleans up a new session's.
+            if let Some(conversion) =
+                conversion.as_ref().and_then(ResumeConversion::workspace_to_raw)
+            {
+                create_managed_worktree(
+                    executor,
+                    &conversion.worktree,
+                    None,
+                    PrimaryCheckoutRequirement::Any,
+                )?;
+                crate::hel_checkpoint::restore_single_repository_onto_branch(
+                    &checkpoint.archive_path,
+                    &conversion.worktree.worktree_root,
+                    &conversion.worktree.branch,
+                    &SystemGit,
+                )
+                .context("restore this session's checkout")?;
+            }
             self.provision_session_with_failure_disposition(
                 session_id,
                 executor,
@@ -2107,7 +2258,7 @@ impl Controller {
             let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
             let (backend, worker_root) = self.prepare_worker_files(session_id, executor)?;
             let harness_home = target_profile_home(&backend, session_id, &profile);
-            let workspace_root = if let Some(project_directory) = &previous.project_directory {
+            let workspace_root = if let Some(project_directory) = &resumed_project_directory {
                 project_directory
                     .parent()
                     .context("bare project directory has no parent")?
@@ -2150,8 +2301,18 @@ impl Controller {
                 workspace_root: target_path(&workspace_root),
                 relay_root: target_path(&worker_root),
                 harness_home: target_path(&harness_home),
-                restore_repositories: previous.project_directory.is_none(),
+                // A converted session's repository arrives as a seed from its
+                // own checkout, not from the archive's metadata-only capture.
+                restore_repositories: resumed_project_directory.is_none() && conversion.is_none(),
                 restore_native: same_harness,
+                // A conversion puts the checkout somewhere the archive could
+                // not have named, so the restored harness session is pointed at
+                // the real working directory instead of the archived one.
+                primary_repository_root: conversion
+                    .is_some()
+                    .then(|| resumed_project_directory.clone())
+                    .flatten()
+                    .map(|directory| target_path(&directory.to_string_lossy())),
                 discard_queued_prompts: discard_queue || !same_harness,
             };
             let staging = tempfile::tempdir().context("create restore staging")?;
@@ -2175,7 +2336,10 @@ impl Controller {
                 &backend,
                 &worker_root,
                 executor,
-                LocalBootstrap::Seed,
+                match conversion.as_ref().and_then(ResumeConversion::raw_to_workspace) {
+                    Some(conversion) => LocalBootstrap::SeedFrom(conversion.checkout.clone()),
+                    None => LocalBootstrap::Seed,
+                },
             )?;
             let mut restored_projection =
                 materialized_session_from_canonical(session_id, &canonical_session)?;
@@ -2238,6 +2402,44 @@ impl Controller {
                         };
                         relay.submit(prompt.command_id.clone(), command).await?;
                     }
+                }
+            }
+            // Last, and only once the resume has otherwise succeeded: a failure
+            // before this point rolls the record back to a session whose
+            // worktree still has to be there.
+            if let Some(worktree) = conversion
+                .as_ref()
+                .and_then(ResumeConversion::raw_to_workspace)
+                .and_then(|plan| plan.retire.as_ref())
+                && let Err(error) = retire_managed_worktree(executor, worktree)
+            {
+                resume_notices.push(format!(
+                    "Hel could not remove the worktree at {}: {error:#}. Remove it with `git worktree remove --force {}`.",
+                    worktree.worktree_root.display(),
+                    worktree.worktree_root.display()
+                ));
+            }
+            for notice in &resume_notices {
+                let submitted = async {
+                    let command_id = new_command_id("resume-notice")?;
+                    relay
+                        .submit(
+                            command_id,
+                            RelayCommand::RecordNotice {
+                                text: notice.clone(),
+                            },
+                        )
+                        .await
+                }
+                .await;
+                // The conversation line is a courtesy. A relay that refuses it
+                // has not damaged the resume, so report and carry on.
+                if let Err(error) = submitted {
+                    tracing::warn!(
+                        session_id,
+                        error = format!("{error:#}"),
+                        "could not record a resume notice in the conversation"
+                    );
                 }
             }
             self.mark_worker_connected(session_id, Some(native_session_id))?;
@@ -2308,6 +2510,12 @@ impl Controller {
             &original,
             (!cleanup_error.is_empty()).then_some(cleanup_error),
         );
+        // A conversion filed the session's prompt history under its new bundle.
+        // The record went back, so the history goes back with it.
+        if record.bundle_id != current.bundle_id {
+            let bundle_id = record.bundle_id.clone();
+            crate::hel_database::rebind_session_bundle(session_id, &bundle_id)?;
+        }
         self.persist_session_state(session_id)?;
         Ok(failure)
     }
@@ -3305,6 +3513,16 @@ fn apply_failed_resume_rollback(
             let failure = format!(
                 "{original_error}; cleanup of the partial resume target failed: {cleanup_error}"
             );
+            // The target locator stays so the leftover resource can still be
+            // cleaned up, but the session's representation goes back: a resume
+            // that converted the record never moved the checkout it names.
+            current
+                .project_directory
+                .clone_from(&previous.project_directory);
+            current
+                .managed_worktree
+                .clone_from(&previous.managed_worktree);
+            current.bundle_id.clone_from(&previous.bundle_id);
             current.state = SessionState::Error;
             current.updated_at = now();
             current.last_error = Some(format!("resume failed: {failure}"));
@@ -4729,6 +4947,290 @@ fn managed_git_stdout(
     command_stdout(executor.execute(&command)?, purpose)
 }
 
+/// Which checkout each still-empty target repository is seeded from, or `None`
+/// when this connect must not seed at all. A converting resume carries the
+/// session's own checkout; every other seed comes from the bundle's local path.
+fn seed_sources<'a>(
+    missing: &[(&'a crate::hel_config::ProjectRepository, &'a PathBuf)],
+    bootstrap: &'a LocalBootstrap,
+) -> Option<Vec<(&'a crate::hel_config::ProjectRepository, &'a PathBuf)>> {
+    let checkout = match bootstrap {
+        LocalBootstrap::Skip => return None,
+        LocalBootstrap::Seed => None,
+        LocalBootstrap::SeedFrom(checkout) => Some(checkout),
+    };
+    Some(
+        missing
+            .iter()
+            .map(|(repository, source)| (*repository, checkout.unwrap_or(source)))
+            .collect(),
+    )
+}
+
+/// Reshape a raw session's record for the workspace target it is moving into.
+fn apply_raw_to_workspace(record: &mut SessionRecord, conversion: &RawToWorkspaceConversion) {
+    record.project_directory = None;
+    record.managed_worktree = None;
+    record.bundle_id.clone_from(&conversion.bundle_id);
+}
+
+/// A resume that changes how a session is represented, resolved before the
+/// session record or the configuration changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResumeConversion {
+    RawToWorkspace(RawToWorkspaceConversion),
+    WorkspaceToRaw(WorkspaceToRawConversion),
+}
+
+impl ResumeConversion {
+    fn raw_to_workspace(&self) -> Option<&RawToWorkspaceConversion> {
+        match self {
+            Self::RawToWorkspace(conversion) => Some(conversion),
+            Self::WorkspaceToRaw(_) => None,
+        }
+    }
+
+    fn workspace_to_raw(&self) -> Option<&WorkspaceToRawConversion> {
+        match self {
+            Self::WorkspaceToRaw(conversion) => Some(conversion),
+            Self::RawToWorkspace(_) => None,
+        }
+    }
+}
+
+/// Everything a workspace-to-raw resume needs. The worktree does not exist yet:
+/// the record names it first, so a failure cleans it up through the same path
+/// as a new raw session's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceToRawConversion {
+    worktree: ManagedWorktree,
+}
+
+/// Reshape a bundle session's record for the checkout it is moving into. The
+/// bundle stays: it still describes the repository the checkout came from.
+fn apply_workspace_to_raw(record: &mut SessionRecord, conversion: &WorkspaceToRawConversion) {
+    record.project_directory = Some(conversion.worktree.worktree_root.clone());
+    record.managed_worktree = Some(conversion.worktree.clone());
+}
+
+/// Everything a raw-to-workspace resume needs, resolved before the session
+/// record or the configuration changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawToWorkspaceConversion {
+    /// The checkout whose branch, head commit, and dirty state move into the
+    /// target. For a managed session this is the session's own worktree, not
+    /// the user's primary checkout.
+    checkout: PathBuf,
+    /// The repository the Git proxy serves, and the bundle's `local:` path.
+    repository: PathBuf,
+    bundle_id: String,
+    /// Set when the configuration does not already describe this checkout.
+    new_bundle: Option<ProjectBundle>,
+    /// Removed once the target holds the checkout, and only then.
+    retire: Option<ManagedWorktree>,
+}
+
+/// Resolve where a raw session's checkout lives and which bundle will stand in
+/// for it. Reads Git; changes nothing.
+fn plan_raw_to_workspace(
+    session: &SessionRecord,
+    config: &HelConfig,
+    executor: &impl CommandExecutor,
+) -> Result<RawToWorkspaceConversion> {
+    let project_directory = session
+        .project_directory
+        .as_deref()
+        .context("a raw session has no project directory")?;
+    let (checkout, repository, retire) = match &session.managed_worktree {
+        Some(worktree) => (
+            worktree.worktree_root.clone(),
+            worktree.source_repository.clone(),
+            Some(worktree.clone()),
+        ),
+        None => {
+            let inspection =
+                inspect_raw_project(executor, &ManagedWorktreeTarget::Local, project_directory)?;
+            // The checkpoint describes the session's directory as if it were
+            // the repository root, so only a whole checkout can move.
+            ensure!(
+                inspection.source_project_directory == inspection.source_repository,
+                "{} is a subdirectory of its checkout; only a whole checkout can move into a target",
+                project_directory.display()
+            );
+            let repository = canonical_repository(&inspection.source_repository)?;
+            (inspection.source_repository, repository, None)
+        }
+    };
+    ensure!(
+        checkout == project_directory,
+        "{} is a subdirectory of its checkout; only a whole checkout can move into a target",
+        project_directory.display()
+    );
+    // The archive names the session's directory as the repository destination,
+    // and the restored harness session points at that path inside the target.
+    // The bundle has to put the checkout in the same place.
+    let destination = PathBuf::from(
+        project_directory
+            .file_name()
+            .context("a raw project directory cannot be the filesystem root")?,
+    );
+    let (bundle_id, new_bundle) =
+        converted_raw_bundle(config, &session.bundle_id, &repository, &destination);
+    Ok(RawToWorkspaceConversion {
+        checkout,
+        repository,
+        bundle_id,
+        new_bundle,
+        retire,
+    })
+}
+
+/// The bundle a converted raw session references: one the configuration already
+/// has for exactly this checkout, or a new one for the caller to install.
+/// Reusing a match keeps a retried conversion from piling up bundles.
+fn converted_raw_bundle(
+    config: &HelConfig,
+    session_bundle_id: &str,
+    repository: &Path,
+    destination: &Path,
+) -> (String, Option<ProjectBundle>) {
+    let describes_checkout = |bundle: &ProjectBundle| {
+        bundle.repositories.len() == 1
+            && bundle.repositories[0].github.is_none()
+            && bundle.repositories[0].local.as_deref() == Some(repository)
+            && bundle.repositories[0].destination == destination
+    };
+    if config
+        .bundles
+        .get(session_bundle_id)
+        .is_some_and(describes_checkout)
+    {
+        return (session_bundle_id.to_owned(), None);
+    }
+    if let Some((id, _)) = config
+        .bundles
+        .iter()
+        .find(|(_, bundle)| describes_checkout(bundle))
+    {
+        return (id.clone(), None);
+    }
+    let name = repository
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let id = crate::hel_import::unique_bundle_id(config, &crate::hel_import::setup_style_id(&name));
+    let bundle = ProjectBundle {
+        primary_repo: id.clone(),
+        repositories: vec![crate::hel_config::ProjectRepository {
+            id: id.clone(),
+            github: None,
+            local: Some(repository.to_path_buf()),
+            destination: destination.to_path_buf(),
+            git_ref: None,
+        }],
+    };
+    (id, Some(bundle))
+}
+
+/// Where a checkout stands: its head commit and, unless detached, its branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckoutPosition {
+    head_commit: String,
+    branch: Option<String>,
+}
+
+fn read_checkout_position(
+    executor: &impl CommandExecutor,
+    target: &ManagedWorktreeTarget,
+    directory: &Path,
+) -> Result<CheckoutPosition> {
+    let head_commit = managed_git_stdout(
+        executor,
+        target,
+        directory,
+        ["rev-parse", "HEAD"],
+        "resolve checkout head commit",
+    )?;
+    let branch_command = managed_git_command(
+        target,
+        directory,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        "resolve checkout branch",
+    );
+    let branch_output = executor.execute(&branch_command)?;
+    let branch = match branch_output.status {
+        0 => Some(
+            String::from_utf8(branch_output.stdout)
+                .context("checkout branch was not UTF-8")?
+                .trim()
+                .to_owned(),
+        ),
+        // A detached head reports no branch rather than failing.
+        1 | 128 => None,
+        status => bail!(
+            "resolve checkout branch failed with status {status}: {}",
+            String::from_utf8_lossy(&branch_output.stderr).trim()
+        ),
+    };
+    Ok(CheckoutPosition {
+        head_commit,
+        branch,
+    })
+}
+
+/// Read where a raw session's checkout stands right now, on whichever host
+/// owns it.
+fn raw_checkout_position(
+    session: &SessionRecord,
+    config: &HelConfig,
+    project_directory: &Path,
+    executor: &impl CommandExecutor,
+) -> Result<CheckoutPosition> {
+    let target = match &session.managed_worktree {
+        Some(worktree) => worktree.target.clone(),
+        None => {
+            let template = config
+                .targets
+                .get(&session.target_template_id)
+                .context("the bare target this session last used is missing")?;
+            managed_worktree_target(template)?
+        }
+    };
+    read_checkout_position(executor, &target, project_directory)
+}
+
+/// One conversation line for a raw session whose checkout moved on while the
+/// session was paused. `None` when the checkout is where the checkpoint left
+/// it, or when the checkpoint recorded no repository to compare against.
+///
+/// This reports; it never reconciles. The working tree is the truth.
+fn raw_checkout_divergence_notice(
+    directory: &Path,
+    recorded: Option<&crate::hel_archive::RepositoryMetadata>,
+    live: &CheckoutPosition,
+) -> Option<String> {
+    let recorded = recorded?;
+    if recorded.head_commit.is_empty()
+        || (recorded.head_commit == live.head_commit && recorded.branch == live.branch)
+    {
+        return None;
+    }
+    Some(format!(
+        "The working tree at {} moved from {} to {} while this session was paused.",
+        directory.display(),
+        checkout_position_text(&recorded.head_commit, recorded.branch.as_deref()),
+        checkout_position_text(&live.head_commit, live.branch.as_deref()),
+    ))
+}
+
+fn checkout_position_text(head_commit: &str, branch: Option<&str>) -> String {
+    let short = head_commit.get(..12).unwrap_or(head_commit);
+    match branch {
+        Some(branch) => format!("{short} ({branch})"),
+        None => format!("{short} (detached)"),
+    }
+}
+
 fn inspect_raw_project(
     executor: &impl CommandExecutor,
     target: &ManagedWorktreeTarget,
@@ -4910,24 +5412,39 @@ fn path_exists_on_managed_target(
     }
 }
 
+/// Whether a new managed worktree needs the primary checkout to be clean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimaryCheckoutRequirement {
+    /// A new raw session starts from the primary checkout's HEAD, so work that
+    /// is only in its working tree would be silently left behind.
+    Clean,
+    /// A session moving out of its target replaces the worktree's contents from
+    /// its checkpoint, so the primary checkout's own changes are beside the
+    /// point.
+    Any,
+}
+
 fn create_managed_worktree(
     executor: &impl CommandExecutor,
     worktree: &ManagedWorktree,
     upstream: Option<&str>,
+    requirement: PrimaryCheckoutRequirement,
 ) -> Result<()> {
     ensure_managed_worktree_excluded(executor, &worktree.target, &worktree.source_repository)?;
-    let status = managed_git_stdout(
-        executor,
-        &worktree.target,
-        &worktree.source_repository,
-        ["status", "--porcelain=v1", "--untracked-files=all"],
-        "inspect primary checkout changes",
-    )?;
-    if !status.is_empty() {
-        let paths = status.lines().take(20).collect::<Vec<_>>().join("\n  ");
-        bail!(
-            "primary checkout has uncommitted changes; commit or stash them before creating a raw session worktree:\n  {paths}"
-        );
+    if requirement == PrimaryCheckoutRequirement::Clean {
+        let status = managed_git_stdout(
+            executor,
+            &worktree.target,
+            &worktree.source_repository,
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+            "inspect primary checkout changes",
+        )?;
+        if !status.is_empty() {
+            let paths = status.lines().take(20).collect::<Vec<_>>().join("\n  ");
+            bail!(
+                "primary checkout has uncommitted changes; commit or stash them before creating a raw session worktree:\n  {paths}"
+            );
+        }
     }
     let parent = worktree
         .worktree_root
@@ -4999,12 +5516,30 @@ fn ensure_managed_worktree_available(
     }
 }
 
-fn cleanup_managed_worktree(
+/// Remove a managed worktree's checkout and keep its branch.
+///
+/// A session that moved into a target still checkpoints as a delta against
+/// `hel/<session>`, so deleting that branch could let the commits those deltas
+/// depend on be collected. The checkout itself is dirty by design; its dirty
+/// state has already been carried into the target.
+fn retire_managed_worktree(
     executor: &impl CommandExecutor,
     worktree: &ManagedWorktree,
 ) -> Result<()> {
-    if !path_exists_on_managed_target(executor, &worktree.target, &worktree.source_repository)? {
+    if !remove_managed_worktree_checkout(executor, worktree)? {
         return Ok(());
+    }
+    remove_empty_managed_worktree_directories(executor, worktree)
+}
+
+/// Remove the checkout and prune its metadata. Returns whether the repository
+/// is still there to act on at all.
+fn remove_managed_worktree_checkout(
+    executor: &impl CommandExecutor,
+    worktree: &ManagedWorktree,
+) -> Result<bool> {
+    if !path_exists_on_managed_target(executor, &worktree.target, &worktree.source_repository)? {
+        return Ok(false);
     }
     if path_exists_on_managed_target(executor, &worktree.target, &worktree.worktree_root)? {
         execute_checked(
@@ -5031,6 +5566,16 @@ fn cleanup_managed_worktree(
             "prune managed worktree metadata",
         ),
     )?;
+    Ok(true)
+}
+
+fn cleanup_managed_worktree(
+    executor: &impl CommandExecutor,
+    worktree: &ManagedWorktree,
+) -> Result<()> {
+    if !remove_managed_worktree_checkout(executor, worktree)? {
+        return Ok(());
+    }
     let branch_ref = format!("refs/heads/{}", worktree.branch);
     let check = managed_git_command(
         &worktree.target,
@@ -5057,6 +5602,13 @@ fn cleanup_managed_worktree(
             String::from_utf8_lossy(&output.stderr).trim()
         ),
     }
+    remove_empty_managed_worktree_directories(executor, worktree)
+}
+
+fn remove_empty_managed_worktree_directories(
+    executor: &impl CommandExecutor,
+    worktree: &ManagedWorktree,
+) -> Result<()> {
     let worktrees = worktree.source_repository.join(".hel").join("worktrees");
     let hel = worktree.source_repository.join(".hel");
     match &worktree.target {
@@ -5207,6 +5759,121 @@ fn is_bare_project_target(template: &TargetTemplate) -> bool {
         template,
         TargetTemplate::LocalBare | TargetTemplate::SshBare { .. }
     )
+}
+
+/// Why a bundle session cannot resume on a local bare target. A bare target has
+/// no managed workspace to restore the bundle into.
+const BUNDLE_ON_LOCAL_BARE: &str = "this session was created from a project bundle; a local bare target only hosts raw project sessions — resume it on a container, SSH, or EC2 target";
+
+/// What a resume has to do to the session record before it provisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumePlan {
+    /// Keep the session in the representation it already has.
+    InPlace,
+    /// Move a raw checkout session into a workspace target as a bundle session.
+    RawToWorkspace,
+    /// Move a bundle session out of its workspace into a raw local worktree.
+    WorkspaceToRaw,
+}
+
+/// Whether `session` may resume on `target_id`, and what the resume must do to
+/// the session record. The error is shown to the person choosing the target, so
+/// it says where the session is tied down and what to pick instead.
+///
+/// This decides representation only. It performs no I/O, so it can run on every
+/// row of a target picker.
+pub fn resume_compatibility(
+    session: &SessionRecord,
+    config: &HelConfig,
+    target_id: &str,
+) -> Result<ResumePlan, String> {
+    let Some(target) = config.targets.get(target_id) else {
+        return Err(format!("target {target_id} is no longer configured"));
+    };
+    let Some(project_directory) = &session.project_directory else {
+        if matches!(target, TargetTemplate::LocalBare) {
+            return workspace_to_raw_compatibility(session, config);
+        }
+        return Ok(ResumePlan::InPlace);
+    };
+    let directory = project_directory.display();
+    let Some(worktree) = &session.managed_worktree else {
+        let Some(previous) = config.targets.get(&session.target_template_id) else {
+            return Err(
+                "the bare target this session last used is no longer configured".to_owned(),
+            );
+        };
+        if is_bare_project_target(target) {
+            if matches!(previous, TargetTemplate::LocalBare)
+                == matches!(target, TargetTemplate::LocalBare)
+            {
+                return Ok(ResumePlan::InPlace);
+            }
+            return Err(format!(
+                "this session opens {directory} directly on its host; resume it on the same kind of bare target"
+            ));
+        }
+        // Only a checkout on this machine can be carried into a target: the
+        // Git proxy serves controller-side paths.
+        if matches!(previous, TargetTemplate::LocalBare) {
+            return Ok(ResumePlan::RawToWorkspace);
+        }
+        return Err(format!(
+            "this session opens {directory} on an SSH host; resume it on a bare target there"
+        ));
+    };
+    match managed_worktree_target(target) {
+        Ok(resume_target) if resume_target == worktree.target => Ok(ResumePlan::InPlace),
+        Ok(_) => Err(format!(
+            "this session's working tree lives on {}; resume it there",
+            managed_worktree_location(&worktree.target)
+        )),
+        Err(_) if worktree.target != ManagedWorktreeTarget::Local => Err(format!(
+            "this session works directly in {directory} on {}; resume it on a bare target there",
+            managed_worktree_location(&worktree.target)
+        )),
+        // The checkout moves into the target, dirty state and all. Only a whole
+        // checkout can move: the checkpoint describes the session's directory as
+        // if it were the repository root.
+        Err(_) if Some(&worktree.worktree_root) == session.project_directory.as_ref() => {
+            Ok(ResumePlan::RawToWorkspace)
+        }
+        Err(_) => Err(format!(
+            "this session opens {directory}, a subdirectory of its checkout; resume it on a bare target"
+        )),
+    }
+}
+
+/// Whether a bundle session can leave its workspace for a checkout on this
+/// machine. Only a single repository already on this machine can become one.
+fn workspace_to_raw_compatibility(
+    session: &SessionRecord,
+    config: &HelConfig,
+) -> Result<ResumePlan, String> {
+    let Some(bundle) = config.bundles.get(&session.bundle_id) else {
+        return Err(BUNDLE_ON_LOCAL_BARE.to_owned());
+    };
+    let [repository] = bundle.repositories.as_slice() else {
+        return Err(format!(
+            "this session's project has {} repositories; a local bare target holds one checkout — resume it on a container, SSH, or EC2 target",
+            bundle.repositories.len()
+        ));
+    };
+    if repository.local.is_none() {
+        return Err(
+            "this session's project came from GitHub; resume it on a container, SSH, or EC2 target"
+                .to_owned(),
+        );
+    }
+    Ok(ResumePlan::WorkspaceToRaw)
+}
+
+/// Where a managed worktree's checkout physically lives, in words a user reads.
+fn managed_worktree_location(target: &ManagedWorktreeTarget) -> String {
+    match target {
+        ManagedWorktreeTarget::Local => "this machine".to_owned(),
+        ManagedWorktreeTarget::Ssh { destination, .. } => destination.clone(),
+    }
 }
 
 pub(crate) fn backend_ssh(ssh: &SshConnection) -> SshTarget {
@@ -6895,6 +7562,7 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
+    use crate::hel_archive::RepositoryMetadata;
     use crate::hel_config::{
         ContainerTemplate as ConfigContainer, HarnessProfile, ProjectRepository,
     };
@@ -8880,6 +9548,443 @@ mod tests {
         }
     }
 
+    /// Config with one container target, one local bare target, and one SSH
+    /// bare target, which is every shape `resume_compatibility` distinguishes.
+    fn resume_compatibility_config() -> HelConfig {
+        let mut config = HelConfig::default();
+        config.targets.insert(
+            "podman".into(),
+            TargetTemplate::LocalPodman {
+                container: ConfigContainer {
+                    image: "example.invalid/hel-test:latest".into(),
+                    platform: None,
+                    cpus: None,
+                    memory: None,
+                    environment: BTreeMap::new(),
+                },
+            },
+        );
+        config
+            .targets
+            .insert("local-bare".into(), TargetTemplate::LocalBare);
+        config.targets.insert(
+            "ssh-bare".into(),
+            TargetTemplate::SshBare {
+                ssh: SshConnection {
+                    host: "builder".into(),
+                    user: Some("dev".into()),
+                    identity_file: None,
+                    extra_args: Vec::new(),
+                },
+                workspace_prefix: ".local/share/hel/workspaces".into(),
+            },
+        );
+        config
+    }
+
+    fn raw_session_on(target_template_id: &str, directory: &str) -> SessionRecord {
+        let mut session = checkpoint_test_session("0123456789abcdef0123456789abcdef");
+        session.state = SessionState::Archived;
+        session.bundle_id = "remote-project-abcdef".into();
+        session.project_directory = Some(PathBuf::from(directory));
+        session.target_template_id = target_template_id.into();
+        session
+    }
+
+    fn managed_raw_session(target: ManagedWorktreeTarget) -> SessionRecord {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let repository = PathBuf::from("/home/dev/project");
+        let worktree_root = repository.join(".hel").join("worktrees").join(session_id);
+        let mut session = raw_session_on(
+            match target {
+                ManagedWorktreeTarget::Local => "local-bare",
+                ManagedWorktreeTarget::Ssh { .. } => "ssh-bare",
+            },
+            &worktree_root.to_string_lossy(),
+        );
+        session.managed_worktree = Some(ManagedWorktree {
+            source_project_directory: repository.clone(),
+            source_repository: repository,
+            worktree_root,
+            branch: format!("hel/{session_id}"),
+            target,
+        });
+        session
+    }
+
+    fn ssh_worktree_target() -> ManagedWorktreeTarget {
+        managed_worktree_target(&resume_compatibility_config().targets["ssh-bare"]).unwrap()
+    }
+
+    /// Answers the two Git reads that locate a checkout, and nothing else.
+    struct CheckoutPositionExecutor {
+        head_commit: String,
+        branch: Option<String>,
+    }
+
+    impl CommandExecutor for CheckoutPositionExecutor {
+        fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+            let stdout = if command.args.iter().any(|argument| argument == "rev-parse") {
+                self.head_commit.clone()
+            } else if command
+                .args
+                .iter()
+                .any(|argument| argument == "symbolic-ref")
+            {
+                match &self.branch {
+                    Some(branch) => branch.clone(),
+                    None => {
+                        return Ok(CommandOutput {
+                            status: 1,
+                            stdout: Vec::new(),
+                            stderr: Vec::new(),
+                        });
+                    }
+                }
+            } else {
+                panic!("unexpected command {:?}", command.args);
+            };
+            Ok(CommandOutput {
+                status: 0,
+                stdout: format!("{stdout}\n").into_bytes(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn recorded_repository(head_commit: &str, branch: Option<&str>) -> RepositoryMetadata {
+        RepositoryMetadata {
+            id: "project".into(),
+            relative_destination: PathBuf::from("project"),
+            origin: "hel-local:project".into(),
+            base_commit: String::new(),
+            head_commit: head_commit.into(),
+            branch: branch.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_raw_checkout_that_moved_while_paused_gets_a_conversation_line() {
+        let config = resume_compatibility_config();
+        let session = managed_raw_session(ManagedWorktreeTarget::Local);
+        let directory = session.project_directory.clone().unwrap();
+        let executor = CheckoutPositionExecutor {
+            head_commit: "b".repeat(40),
+            branch: Some("hel/0123456789abcdef0123456789abcdef".into()),
+        };
+
+        let live = raw_checkout_position(&session, &config, &directory, &executor).unwrap();
+        let notice = raw_checkout_divergence_notice(
+            &directory,
+            Some(&recorded_repository(&"a".repeat(40), Some("main"))),
+            &live,
+        )
+        .expect("a moved checkout is reported");
+
+        assert!(
+            notice.contains(&directory.display().to_string()),
+            "{notice}"
+        );
+        assert!(notice.contains("aaaaaaaaaaaa (main)"), "{notice}");
+        assert!(
+            notice.contains("bbbbbbbbbbbb (hel/0123456789abcdef0123456789abcdef)"),
+            "{notice}"
+        );
+        assert!(notice.contains("while this session was paused"), "{notice}");
+    }
+
+    #[test]
+    fn a_raw_checkout_that_stayed_put_gets_no_conversation_line() {
+        let config = resume_compatibility_config();
+        let session = managed_raw_session(ManagedWorktreeTarget::Local);
+        let directory = session.project_directory.clone().unwrap();
+        let executor = CheckoutPositionExecutor {
+            head_commit: "a".repeat(40),
+            branch: Some("main".into()),
+        };
+
+        let live = raw_checkout_position(&session, &config, &directory, &executor).unwrap();
+
+        assert_eq!(
+            raw_checkout_divergence_notice(
+                &directory,
+                Some(&recorded_repository(&"a".repeat(40), Some("main"))),
+                &live,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_without_recorded_git_identity_reports_nothing() {
+        let live = CheckoutPosition {
+            head_commit: "b".repeat(40),
+            branch: None,
+        };
+
+        assert_eq!(
+            raw_checkout_divergence_notice(Path::new("/home/dev/project"), None, &live),
+            None
+        );
+        assert_eq!(
+            raw_checkout_divergence_notice(
+                Path::new("/home/dev/project"),
+                Some(&recorded_repository("", None)),
+                &live,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_detached_checkout_is_named_as_detached() {
+        let config = resume_compatibility_config();
+        let session = managed_raw_session(ManagedWorktreeTarget::Local);
+        let directory = session.project_directory.clone().unwrap();
+        let executor = CheckoutPositionExecutor {
+            head_commit: "c".repeat(40),
+            branch: None,
+        };
+
+        let live = raw_checkout_position(&session, &config, &directory, &executor).unwrap();
+        let notice = raw_checkout_divergence_notice(
+            &directory,
+            Some(&recorded_repository(&"a".repeat(40), Some("main"))),
+            &live,
+        )
+        .expect("a moved checkout is reported");
+
+        assert!(notice.contains("cccccccccccc (detached)"), "{notice}");
+    }
+
+    #[test]
+    fn bundle_sessions_resume_on_any_workspace_target() {
+        let config = resume_compatibility_config();
+        let session = checkpoint_test_session("0123456789abcdef0123456789abcdef");
+
+        assert_eq!(
+            resume_compatibility(&session, &config, "podman"),
+            Ok(ResumePlan::InPlace)
+        );
+        assert_eq!(
+            resume_compatibility(&session, &config, "ssh-bare"),
+            Ok(ResumePlan::InPlace)
+        );
+    }
+
+    fn local_bundle(repository: &Path) -> ProjectBundle {
+        ProjectBundle {
+            primary_repo: "project".into(),
+            repositories: vec![ProjectRepository {
+                id: "project".into(),
+                github: None,
+                local: Some(repository.to_path_buf()),
+                destination: PathBuf::from("project"),
+                git_ref: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_single_local_repository_can_become_a_checkout() {
+        let mut config = resume_compatibility_config();
+        let mut session = checkpoint_test_session("0123456789abcdef0123456789abcdef");
+        session.bundle_id = "project".into();
+        config.bundles.insert(
+            "project".into(),
+            local_bundle(Path::new("/home/dev/project")),
+        );
+
+        assert_eq!(
+            resume_compatibility(&session, &config, "local-bare"),
+            Ok(ResumePlan::WorkspaceToRaw)
+        );
+    }
+
+    #[test]
+    fn a_github_project_cannot_become_a_checkout() {
+        let mut config = resume_compatibility_config();
+        let mut session = checkpoint_test_session("0123456789abcdef0123456789abcdef");
+        session.bundle_id = "project".into();
+        let mut bundle = local_bundle(Path::new("/home/dev/project"));
+        bundle.repositories[0].local = None;
+        bundle.repositories[0].github = Some("example/project".into());
+        config.bundles.insert("project".into(), bundle);
+
+        let reason = resume_compatibility(&session, &config, "local-bare").unwrap_err();
+
+        assert!(reason.contains("came from GitHub"), "{reason}");
+        assert!(
+            reason.contains("resume it on a container, SSH, or EC2 target"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_multi_repository_project_cannot_become_a_checkout() {
+        let mut config = resume_compatibility_config();
+        let mut session = checkpoint_test_session("0123456789abcdef0123456789abcdef");
+        session.bundle_id = "project".into();
+        let mut bundle = local_bundle(Path::new("/home/dev/project"));
+        bundle.repositories.push(ProjectRepository {
+            id: "tools".into(),
+            github: None,
+            local: Some(PathBuf::from("/home/dev/tools")),
+            destination: PathBuf::from("tools"),
+            git_ref: None,
+        });
+        config.bundles.insert("project".into(), bundle);
+
+        let reason = resume_compatibility(&session, &config, "local-bare").unwrap_err();
+
+        assert!(reason.contains("2 repositories"), "{reason}");
+        assert!(reason.contains("one checkout"), "{reason}");
+    }
+
+    #[test]
+    fn bundle_sessions_refuse_a_local_bare_target_with_a_reason() {
+        let config = resume_compatibility_config();
+        let session = checkpoint_test_session("0123456789abcdef0123456789abcdef");
+
+        let reason = resume_compatibility(&session, &config, "local-bare").unwrap_err();
+
+        assert!(reason.contains("created from a project bundle"), "{reason}");
+        assert!(
+            reason.contains("resume it on a container, SSH, or EC2 target"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn managed_raw_sessions_resume_on_their_own_worktree_host() {
+        let config = resume_compatibility_config();
+
+        assert_eq!(
+            resume_compatibility(
+                &managed_raw_session(ManagedWorktreeTarget::Local),
+                &config,
+                "local-bare",
+            ),
+            Ok(ResumePlan::InPlace)
+        );
+        assert_eq!(
+            resume_compatibility(
+                &managed_raw_session(ssh_worktree_target()),
+                &config,
+                "ssh-bare",
+            ),
+            Ok(ResumePlan::InPlace)
+        );
+    }
+
+    #[test]
+    fn managed_raw_sessions_refuse_a_bare_target_on_another_host() {
+        let config = resume_compatibility_config();
+
+        let reason = resume_compatibility(
+            &managed_raw_session(ManagedWorktreeTarget::Local),
+            &config,
+            "ssh-bare",
+        )
+        .unwrap_err();
+        assert!(reason.contains("this machine"), "{reason}");
+
+        let reason = resume_compatibility(
+            &managed_raw_session(ssh_worktree_target()),
+            &config,
+            "local-bare",
+        )
+        .unwrap_err();
+        assert!(reason.contains("dev@builder"), "{reason}");
+    }
+
+    #[test]
+    fn a_local_raw_checkout_converts_when_it_resumes_on_a_container() {
+        let config = resume_compatibility_config();
+
+        assert_eq!(
+            resume_compatibility(
+                &managed_raw_session(ManagedWorktreeTarget::Local),
+                &config,
+                "podman",
+            ),
+            Ok(ResumePlan::RawToWorkspace)
+        );
+        assert_eq!(
+            resume_compatibility(
+                &raw_session_on("local-bare", "/home/dev/project"),
+                &config,
+                "podman",
+            ),
+            Ok(ResumePlan::RawToWorkspace)
+        );
+    }
+
+    #[test]
+    fn a_raw_checkout_on_an_ssh_host_cannot_convert() {
+        let config = resume_compatibility_config();
+
+        let reason = resume_compatibility(
+            &managed_raw_session(ssh_worktree_target()),
+            &config,
+            "podman",
+        )
+        .unwrap_err();
+        assert!(reason.contains("works directly in"), "{reason}");
+        assert!(reason.contains("dev@builder"), "{reason}");
+
+        let reason = resume_compatibility(
+            &raw_session_on("ssh-bare", "/srv/project"),
+            &config,
+            "podman",
+        )
+        .unwrap_err();
+        assert!(reason.contains("on an SSH host"), "{reason}");
+    }
+
+    #[test]
+    fn a_session_that_opens_a_subdirectory_of_its_worktree_cannot_convert() {
+        let config = resume_compatibility_config();
+        let mut session = managed_raw_session(ManagedWorktreeTarget::Local);
+        let worktree = session.managed_worktree.as_mut().unwrap();
+        worktree.source_project_directory = worktree.source_repository.join("crate");
+        session.project_directory = Some(worktree.worktree_root.join("crate"));
+
+        let reason = resume_compatibility(&session, &config, "podman").unwrap_err();
+
+        assert!(reason.contains("subdirectory of its checkout"), "{reason}");
+    }
+
+    #[test]
+    fn unmanaged_raw_sessions_require_the_same_bare_target_kind() {
+        let config = resume_compatibility_config();
+        let local = raw_session_on("local-bare", "/home/dev/project");
+        let remote = raw_session_on("ssh-bare", "/srv/project");
+
+        assert_eq!(
+            resume_compatibility(&local, &config, "local-bare"),
+            Ok(ResumePlan::InPlace)
+        );
+        assert_eq!(
+            resume_compatibility(&remote, &config, "ssh-bare"),
+            Ok(ResumePlan::InPlace)
+        );
+        for (session, target) in [(&local, "ssh-bare"), (&remote, "local-bare")] {
+            let reason = resume_compatibility(session, &config, target).unwrap_err();
+            assert!(reason.contains("directly on its host"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn resume_compatibility_names_a_target_that_is_gone() {
+        let config = resume_compatibility_config();
+        let session = checkpoint_test_session("0123456789abcdef0123456789abcdef");
+
+        let reason = resume_compatibility(&session, &config, "retired").unwrap_err();
+
+        assert!(reason.contains("retired"), "{reason}");
+    }
+
     #[test]
     fn bundle_sessions_refuse_a_local_bare_resume_before_the_record_changes() {
         struct UnusedExecutor;
@@ -9144,6 +10249,133 @@ mod tests {
             crate::hel_database::load_materialized_session(session_id).unwrap(),
             Some(expected_projection)
         );
+    }
+
+    const RAW_CONVERSION_TEST_CHILD: &str = "HEL_RAW_CONVERSION_TEST_CHILD";
+
+    #[test]
+    fn a_failed_raw_conversion_keeps_the_bundle_and_leaves_the_worktree_alone() {
+        // HEL_DATA_DIR and HEL_CONFIG_DIR are process-global, so run the half
+        // that writes them in an exact child test.
+        if std::env::var_os(RAW_CONVERSION_TEST_CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let test_name = format!(
+                "{}::a_failed_raw_conversion_keeps_the_bundle_and_leaves_the_worktree_alone",
+                module_path!()
+                    .strip_prefix("hel::")
+                    .unwrap_or(module_path!())
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(RAW_CONVERSION_TEST_CHILD, "1")
+                .env("HEL_DATA_DIR", directory.path().join("data"))
+                .env("HEL_CONFIG_DIR", directory.path().join("config"))
+                .env("GH_TOKEN", "test-token")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated raw conversion test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        /// Real Git, no container runtime. Provisioning fails at preflight,
+        /// after the conversion has already reshaped the record.
+        struct GitWithoutPodmanExecutor;
+
+        impl CommandExecutor for GitWithoutPodmanExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                if command.program == "git" {
+                    return ProcessExecutor.execute(command);
+                }
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: Vec::new(),
+                    stderr: b"podman is temporarily unavailable".to_vec(),
+                })
+            }
+        }
+
+        let data_directory = PathBuf::from(std::env::var_os("HEL_DATA_DIR").unwrap());
+        let archive_directory = data_directory.join("archives");
+        std::fs::create_dir_all(&archive_directory).unwrap();
+        std::fs::create_dir_all(crate::hel_config::config_dir()).unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let checkpoint = write_checkpoint_gate_archive(&archive_directory, session_id, 7);
+
+        let repository = committed_repository();
+        let mut session = managed_worktree_session(repository.path(), session_id);
+        session.checkpoint = Some(checkpoint);
+        let worktree = session.managed_worktree.clone().unwrap();
+        let previous = session.clone();
+
+        let profile_home = data_directory.join("profile");
+        std::fs::create_dir_all(&profile_home).unwrap();
+        let mut config = resume_compatibility_config();
+        config.profiles.insert(
+            "codex".into(),
+            HarnessProfile {
+                kind: crate::hel_config::HarnessKind::Codex,
+                home: profile_home,
+                executable: None,
+                environment: BTreeMap::new(),
+                context_window_bytes: None,
+            },
+        );
+        let mut controller = Controller {
+            config,
+            state: HelState {
+                sessions: BTreeMap::from([(session_id.into(), session)]),
+                ..HelState::default()
+            },
+        };
+        crate::hel_database::save_state(&controller.state).unwrap();
+
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(controller.resume_session_controlled(
+                session_id,
+                "codex",
+                "podman",
+                SessionResumeOptions {
+                    additional_mounts: None,
+                    resource_allocation: None,
+                    discard_queue: false,
+                },
+                &GitWithoutPodmanExecutor,
+            ))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("returned to archived"),
+            "{error:#}"
+        );
+
+        // The bundle stays: it was saved before the record referenced it, and a
+        // retry reuses it instead of adding another.
+        let (_, bundle) = controller
+            .config
+            .bundles
+            .iter()
+            .find(|(_, bundle)| bundle.repositories[0].local.as_deref() == Some(repository.path()))
+            .expect("the conversion added a bundle for the checkout");
+        assert_eq!(
+            bundle.repositories[0].destination,
+            PathBuf::from(session_id)
+        );
+        let saved = crate::hel_config::HelConfig::load().unwrap();
+        assert_eq!(saved.bundles, controller.config.bundles);
+
+        let retained = controller.state.sessions.get(session_id).unwrap();
+        assert_eq!(retained.state, SessionState::Archived);
+        assert_eq!(retained.project_directory, previous.project_directory);
+        assert_eq!(retained.managed_worktree, previous.managed_worktree);
+        assert_eq!(retained.bundle_id, previous.bundle_id);
+        assert!(worktree.worktree_root.is_dir(), "the checkout stays put");
     }
 
     #[test]
@@ -10180,8 +11412,13 @@ mod tests {
             branch: format!("hel/{session_id}"),
             target,
         };
-        create_managed_worktree(&ProcessExecutor, &worktree, inspection.upstream.as_deref())
-            .unwrap();
+        create_managed_worktree(
+            &ProcessExecutor,
+            &worktree,
+            inspection.upstream.as_deref(),
+            PrimaryCheckoutRequirement::Clean,
+        )
+        .unwrap();
         assert!(worktree.worktree_root.join("nested/file.txt").is_file());
         assert_eq!(
             test_git(
@@ -10214,6 +11451,398 @@ mod tests {
         assert!(!output.status.success());
     }
 
+    /// A managed raw session whose worktree really exists in `repository`.
+    fn managed_worktree_session(repository: &Path, session_id: &str) -> SessionRecord {
+        let worktree = ManagedWorktree {
+            source_project_directory: repository.to_path_buf(),
+            source_repository: repository.to_path_buf(),
+            worktree_root: repository.join(".hel/worktrees").join(session_id),
+            branch: format!("hel/{session_id}"),
+            target: ManagedWorktreeTarget::Local,
+        };
+        create_managed_worktree(
+            &ProcessExecutor,
+            &worktree,
+            None,
+            PrimaryCheckoutRequirement::Clean,
+        )
+        .unwrap();
+        let mut session = checkpoint_test_session(session_id);
+        session.state = SessionState::Archived;
+        session.bundle_id = "remote-project-abcdef".into();
+        session.target_template_id = "local-bare".into();
+        session.project_directory = Some(worktree.worktree_root.clone());
+        session.managed_worktree = Some(worktree);
+        session
+    }
+
+    #[test]
+    fn retiring_a_converted_worktree_removes_the_checkout_and_keeps_its_branch() {
+        let repository = committed_repository();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let session = managed_worktree_session(repository.path(), session_id);
+        let worktree = session.managed_worktree.unwrap();
+        // The checkout is dirty by design: its dirty state moved into the target.
+        std::fs::write(worktree.worktree_root.join("dirty.txt"), "session\n").unwrap();
+
+        retire_managed_worktree(&ProcessExecutor, &worktree).unwrap();
+
+        assert!(!worktree.worktree_root.exists());
+        assert!(!repository.path().join(".hel").exists());
+        let branch = Command::new("git")
+            .arg("-C")
+            .arg(repository.path())
+            .args([
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{}", worktree.branch),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            branch.status.success(),
+            "the session branch must survive: later checkpoints are deltas against it"
+        );
+    }
+
+    #[test]
+    fn a_managed_conversion_carries_the_session_worktree_not_the_primary_checkout() {
+        let repository = committed_repository();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let session = managed_worktree_session(repository.path(), session_id);
+        let worktree = session.managed_worktree.clone().unwrap();
+
+        let conversion =
+            plan_raw_to_workspace(&session, &HelConfig::default(), &ProcessExecutor).unwrap();
+
+        assert_eq!(conversion.checkout, worktree.worktree_root);
+        assert_eq!(conversion.repository, repository.path());
+        assert_eq!(conversion.retire, Some(worktree));
+        let bundle = conversion.new_bundle.expect("a bundle is synthesized");
+        assert_eq!(bundle.repositories.len(), 1);
+        assert_eq!(bundle.primary_repo, bundle.repositories[0].id);
+        assert_eq!(
+            bundle.repositories[0].local.as_deref(),
+            Some(repository.path())
+        );
+        assert_eq!(bundle.repositories[0].github, None);
+        // The archive names the session directory as the repository, and the
+        // restored harness session points inside the target at that name.
+        assert_eq!(
+            bundle.repositories[0].destination,
+            PathBuf::from(session_id)
+        );
+    }
+
+    #[test]
+    fn an_unmanaged_conversion_serves_the_main_repository_behind_a_linked_worktree() {
+        let repository = committed_repository();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let linked = managed_worktree_session(repository.path(), session_id);
+        let checkout = linked.managed_worktree.unwrap().worktree_root;
+        let mut session = checkpoint_test_session(session_id);
+        session.state = SessionState::Archived;
+        session.target_template_id = "local-bare".into();
+        session.project_directory = Some(checkout.clone());
+
+        let conversion =
+            plan_raw_to_workspace(&session, &HelConfig::default(), &ProcessExecutor).unwrap();
+
+        assert_eq!(conversion.checkout, checkout.canonicalize().unwrap());
+        assert_eq!(
+            conversion.repository,
+            repository.path().canonicalize().unwrap()
+        );
+        assert_eq!(conversion.retire, None);
+    }
+
+    #[test]
+    fn a_conversion_reuses_a_bundle_that_already_describes_the_checkout() {
+        let repository = PathBuf::from("/home/dev/project");
+        let destination = PathBuf::from("project");
+        let existing = ProjectBundle {
+            primary_repo: "project".into(),
+            repositories: vec![ProjectRepository {
+                id: "project".into(),
+                github: None,
+                local: Some(repository.clone()),
+                destination: destination.clone(),
+                git_ref: None,
+            }],
+        };
+        let mut config = HelConfig::default();
+        config.bundles.insert("existing".into(), existing);
+
+        assert_eq!(
+            converted_raw_bundle(&config, "remote-project-abcdef", &repository, &destination),
+            ("existing".to_owned(), None)
+        );
+
+        // A different destination is a different checkout location inside the
+        // target, so it cannot stand in for this one.
+        let (id, synthesized) = converted_raw_bundle(
+            &config,
+            "remote-project-abcdef",
+            &repository,
+            Path::new("elsewhere"),
+        );
+        assert_ne!(id, "existing");
+        assert_eq!(
+            synthesized.unwrap().repositories[0].destination,
+            PathBuf::from("elsewhere")
+        );
+    }
+
+    #[test]
+    fn a_converted_record_is_a_valid_bundle_session() {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let mut config = resume_compatibility_config();
+        let mut record = managed_raw_session(ManagedWorktreeTarget::Local);
+        record.state = SessionState::Running;
+        record.target_template_id = "podman".into();
+        let conversion = RawToWorkspaceConversion {
+            checkout: record.project_directory.clone().unwrap(),
+            repository: PathBuf::from("/home/dev/project"),
+            bundle_id: "project".into(),
+            new_bundle: Some(ProjectBundle {
+                primary_repo: "project".into(),
+                repositories: vec![ProjectRepository {
+                    id: "project".into(),
+                    github: None,
+                    local: Some(PathBuf::from("/home/dev/project")),
+                    destination: PathBuf::from(session_id),
+                    git_ref: None,
+                }],
+            }),
+            retire: record.managed_worktree.clone(),
+        };
+
+        config.bundles.insert(
+            conversion.bundle_id.clone(),
+            conversion.new_bundle.clone().unwrap(),
+        );
+        config.profiles.insert(
+            record.last_profile.clone(),
+            HarnessProfile {
+                kind: record.harness_kind,
+                home: PathBuf::from("/profiles/codex"),
+                executable: None,
+                environment: BTreeMap::new(),
+                context_window_bytes: None,
+            },
+        );
+        apply_raw_to_workspace(&mut record, &conversion);
+
+        assert_eq!(record.project_directory, None);
+        assert_eq!(record.managed_worktree, None);
+        assert_eq!(record.bundle_id, "project");
+        let state = HelState {
+            sessions: BTreeMap::from([(session_id.into(), record)]),
+            ..HelState::default()
+        };
+        state.validate_against_config(&config).unwrap();
+    }
+
+    #[test]
+    fn a_converting_resume_seeds_from_its_own_checkout() {
+        let repository = ProjectRepository {
+            id: "project".into(),
+            github: None,
+            local: Some(PathBuf::from("/home/dev/project")),
+            destination: PathBuf::from("project"),
+            git_ref: None,
+        };
+        let configured = PathBuf::from("/home/dev/project");
+        let missing = vec![(&repository, &configured)];
+        let checkout = PathBuf::from("/home/dev/project/.hel/worktrees/session");
+
+        assert_eq!(seed_sources(&missing, &LocalBootstrap::Skip), None);
+        assert_eq!(
+            seed_sources(&missing, &LocalBootstrap::Seed)
+                .unwrap()
+                .into_iter()
+                .map(|(_, source)| source.clone())
+                .collect::<Vec<_>>(),
+            vec![configured.clone()]
+        );
+        assert_eq!(
+            seed_sources(&missing, &LocalBootstrap::SeedFrom(checkout.clone()))
+                .unwrap()
+                .into_iter()
+                .map(|(_, source)| source.clone())
+                .collect::<Vec<_>>(),
+            vec![checkout]
+        );
+    }
+
+    #[test]
+    fn a_session_leaving_its_target_claims_a_worktree_of_its_own_repository() {
+        let repository = committed_repository();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let mut session = checkpoint_test_session(session_id);
+        session.state = SessionState::Archived;
+        session.bundle_id = "project".into();
+        let mut config = resume_compatibility_config();
+        config
+            .bundles
+            .insert("project".into(), local_bundle(repository.path()));
+        let controller = Controller {
+            config,
+            state: HelState {
+                sessions: BTreeMap::from([(session_id.into(), session.clone())]),
+                ..HelState::default()
+            },
+        };
+
+        let conversion = controller
+            .plan_workspace_to_raw(&session, "local-bare", &ProcessExecutor)
+            .unwrap();
+
+        assert_eq!(
+            conversion.worktree,
+            ManagedWorktree {
+                source_project_directory: repository.path().to_path_buf(),
+                source_repository: repository.path().to_path_buf(),
+                worktree_root: repository.path().join(".hel/worktrees").join(session_id),
+                branch: format!("hel/{session_id}"),
+                target: ManagedWorktreeTarget::Local,
+            }
+        );
+
+        // The dirty primary checkout is beside the point: the worktree's
+        // contents come from the checkpoint.
+        std::fs::write(repository.path().join("dirty.txt"), "primary\n").unwrap();
+        create_managed_worktree(
+            &ProcessExecutor,
+            &conversion.worktree,
+            None,
+            PrimaryCheckoutRequirement::Any,
+        )
+        .unwrap();
+        assert!(conversion.worktree.worktree_root.is_dir());
+
+        // A second attempt refuses rather than taking over a live worktree.
+        let error = controller
+            .plan_workspace_to_raw(&session, "local-bare", &ProcessExecutor)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("already exists"), "{error:#}");
+    }
+
+    #[test]
+    fn a_session_that_left_its_target_is_a_valid_raw_session() {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let repository = PathBuf::from("/home/dev/project");
+        let mut config = resume_compatibility_config();
+        config
+            .bundles
+            .insert("project".into(), local_bundle(&repository));
+        config.profiles.insert(
+            "codex".into(),
+            HarnessProfile {
+                kind: crate::hel_config::HarnessKind::Codex,
+                home: PathBuf::from("/profiles/codex"),
+                executable: None,
+                environment: BTreeMap::new(),
+                context_window_bytes: None,
+            },
+        );
+        let mut record = checkpoint_test_session(session_id);
+        record.bundle_id = "project".into();
+        record.target_template_id = "local-bare".into();
+        let conversion = WorkspaceToRawConversion {
+            worktree: ManagedWorktree {
+                source_project_directory: repository.clone(),
+                source_repository: repository.clone(),
+                worktree_root: repository.join(".hel/worktrees").join(session_id),
+                branch: format!("hel/{session_id}"),
+                target: ManagedWorktreeTarget::Local,
+            },
+        };
+
+        apply_workspace_to_raw(&mut record, &conversion);
+
+        assert_eq!(
+            record.project_directory.as_deref(),
+            Some(conversion.worktree.worktree_root.as_path())
+        );
+        assert_eq!(record.bundle_id, "project", "the bundle still describes it");
+        let state = HelState {
+            sessions: BTreeMap::from([(session_id.into(), record)]),
+            ..HelState::default()
+        };
+        state.validate_against_config(&config).unwrap();
+    }
+
+    #[test]
+    fn a_failed_departure_returns_the_session_to_its_bundle() {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let repository = PathBuf::from("/home/dev/project");
+        let previous = {
+            let mut record = checkpoint_test_session(session_id);
+            record.state = SessionState::Archived;
+            record.bundle_id = "project".into();
+            record
+        };
+        let mut converted = previous.clone();
+        converted.state = SessionState::Provisioning;
+        apply_workspace_to_raw(
+            &mut converted,
+            &WorkspaceToRawConversion {
+                worktree: ManagedWorktree {
+                    source_project_directory: repository.clone(),
+                    source_repository: repository.clone(),
+                    worktree_root: repository.join(".hel/worktrees").join(session_id),
+                    branch: format!("hel/{session_id}"),
+                    target: ManagedWorktreeTarget::Local,
+                },
+            },
+        );
+
+        apply_failed_resume_rollback(&mut converted, &previous, "podman is unavailable", None);
+
+        assert_eq!(converted.project_directory, None);
+        assert_eq!(converted.managed_worktree, None);
+        assert_eq!(converted.bundle_id, "project");
+    }
+
+    #[test]
+    fn a_failed_conversion_returns_the_session_to_its_checkout() {
+        let previous = managed_raw_session(ManagedWorktreeTarget::Local);
+        let mut converted = previous.clone();
+        converted.state = SessionState::Provisioning;
+        converted.target_template_id = "podman".into();
+        apply_raw_to_workspace(
+            &mut converted,
+            &RawToWorkspaceConversion {
+                checkout: previous.project_directory.clone().unwrap(),
+                repository: PathBuf::from("/home/dev/project"),
+                bundle_id: "project".into(),
+                new_bundle: None,
+                retire: previous.managed_worktree.clone(),
+            },
+        );
+
+        let mut cleaned = converted.clone();
+        apply_failed_resume_rollback(&mut cleaned, &previous, "podman is unavailable", None);
+        assert_eq!(cleaned.project_directory, previous.project_directory);
+        assert_eq!(cleaned.managed_worktree, previous.managed_worktree);
+        assert_eq!(cleaned.bundle_id, previous.bundle_id);
+
+        // Even when the leftover target could not be removed, the record must
+        // describe the checkout it still owns.
+        let mut stranded = converted;
+        apply_failed_resume_rollback(
+            &mut stranded,
+            &previous,
+            "podman is unavailable",
+            Some("podman rm failed".into()),
+        );
+        assert_eq!(stranded.state, SessionState::Error);
+        assert_eq!(stranded.project_directory, previous.project_directory);
+        assert_eq!(stranded.managed_worktree, previous.managed_worktree);
+        assert_eq!(stranded.bundle_id, previous.bundle_id);
+    }
+
     #[test]
     fn cancelled_new_session_cleanup_removes_managed_worktree_and_branch() {
         let repository = committed_repository();
@@ -10225,7 +11854,13 @@ mod tests {
             branch: format!("hel/{session_id}"),
             target: ManagedWorktreeTarget::Local,
         };
-        create_managed_worktree(&ProcessExecutor, &worktree, None).unwrap();
+        create_managed_worktree(
+            &ProcessExecutor,
+            &worktree,
+            None,
+            PrimaryCheckoutRequirement::Clean,
+        )
+        .unwrap();
 
         let mut session = checkpoint_test_session(session_id);
         session.project_directory = Some(worktree.worktree_root.clone());
@@ -10273,7 +11908,13 @@ mod tests {
             branch: format!("hel/{session_id}"),
             target: target.clone(),
         };
-        let error = create_managed_worktree(&ProcessExecutor, &managed, None).unwrap_err();
+        let error = create_managed_worktree(
+            &ProcessExecutor,
+            &managed,
+            None,
+            PrimaryCheckoutRequirement::Clean,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("uncommitted changes"));
         assert!(!managed.worktree_root.exists());
 
