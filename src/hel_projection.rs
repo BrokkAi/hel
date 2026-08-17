@@ -826,25 +826,33 @@ pub fn materialized_session_from_canonical(
         session_title: canonical.session.session_title.clone(),
         configuration: canonical.session.configuration.clone(),
         transcript,
-        queued_prompts: canonical
-            .queued_prompts
-            .iter()
-            .map(|prompt| MaterializedQueuedPrompt {
-                command_id: prompt.command_id.clone(),
-                kind: match &prompt.kind {
-                    CanonicalQueuedCommandKind::Prompt => QueuedCommandKind::Prompt,
-                    CanonicalQueuedCommandKind::SetConfig { key, value } => {
-                        QueuedCommandKind::SetConfig {
-                            key: key.clone(),
-                            value: value.clone(),
-                        }
-                    }
-                },
-                content: prompt.content.clone(),
-                queued_at_ms: prompt.queued_at_ms,
-            })
-            .collect(),
+        queued_prompts: materialized_queued_prompts_from_canonical(&canonical.queued_prompts),
     })
+}
+
+/// Project archived queued commands onto the durable queue shape. Kept apart
+/// from the whole-projection build so a caller that only has to restore the
+/// queue does not have to rebuild the transcript with it.
+pub fn materialized_queued_prompts_from_canonical(
+    queued_prompts: &[CanonicalQueuedPrompt],
+) -> Vec<MaterializedQueuedPrompt> {
+    queued_prompts
+        .iter()
+        .map(|prompt| MaterializedQueuedPrompt {
+            command_id: prompt.command_id.clone(),
+            kind: match &prompt.kind {
+                CanonicalQueuedCommandKind::Prompt => QueuedCommandKind::Prompt,
+                CanonicalQueuedCommandKind::SetConfig { key, value } => {
+                    QueuedCommandKind::SetConfig {
+                        key: key.clone(),
+                        value: value.clone(),
+                    }
+                }
+            },
+            content: prompt.content.clone(),
+            queued_at_ms: prompt.queued_at_ms,
+        })
+        .collect()
 }
 
 #[cfg(test)]

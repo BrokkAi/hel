@@ -5,6 +5,7 @@ use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{ContentBlock, Plan, TextContent, ToolCall};
@@ -2066,11 +2067,18 @@ impl Controller {
             .checkpoint
             .as_ref()
             .context("session has no checkpoint")?;
-        let archive = verify_archive_streaming(&checkpoint.archive_path)?;
-        if archive.archive_sha256 != checkpoint.sha256 || archive.manifest.session.id != session_id
-        {
+        // Take the snapshot out of the verified metadata and share it behind an
+        // `Arc`: on a long session it is tens of megabytes, and resume reads it
+        // from three places that used to hold private copies.
+        let crate::hel_archive::VerifiedArchiveMetadata {
+            manifest: archive_manifest,
+            canonical_session,
+            archive_sha256,
+        } = verify_archive_streaming(&checkpoint.archive_path)?;
+        if archive_sha256 != checkpoint.sha256 || archive_manifest.session.id != session_id {
             bail!("persisted checkpoint verification failed");
         }
+        let canonical_session = Arc::new(canonical_session);
         let profile = self
             .config
             .profiles
@@ -2149,8 +2157,7 @@ impl Controller {
                 "This session moved out of its {} target and into {}. Its branch {} is now {}.",
                 previous.target_template_id,
                 conversion.worktree.worktree_root.display(),
-                archive
-                    .manifest
+                archive_manifest
                     .repositories
                     .first()
                     .and_then(|repository| repository.metadata.branch.as_deref())
@@ -2164,8 +2171,7 @@ impl Controller {
             match raw_checkout_position(&previous, &self.config, project_directory, executor) {
                 Ok(live) => resume_notices.extend(raw_checkout_divergence_notice(
                     project_directory,
-                    archive
-                        .manifest
+                    archive_manifest
                         .repositories
                         .first()
                         .map(|repository| &repository.metadata),
@@ -2180,12 +2186,50 @@ impl Controller {
                 ),
             }
         }
-        let same_harness = profile.kind == archive.manifest.session.harness_kind;
-        let canonical_session = archive.canonical_session.clone();
+        let same_harness = profile.kind == archive_manifest.session.harness_kind;
         let context_bytes = profile
             .context_window_bytes
             .unwrap_or(crate::hel_compaction::DEFAULT_CONTEXT_BYTES);
-        let portable_session = (!same_harness).then(|| canonical_session.clone());
+        let discard_queued_prompts = discard_queue || !same_harness;
+        // When this controller archived the session, its durable projection is
+        // already the archive's content. Reading one row decides that; a read
+        // failure or any mismatch rebuilds as before.
+        let stored_frontier = crate::hel_database::materialized_event_frontier(session_id)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    session_id,
+                    error = format!("{error:#}"),
+                    "could not read the stored projection frontier; rebuilding it from the archive"
+                );
+                None
+            });
+        let rebuild_projection = projection_rebuild_required(
+            stored_frontier
+                .as_ref()
+                .map(|(ordinal, digest)| (*ordinal, digest.as_str())),
+            canonical_session.event_frontier,
+            &canonical_session.event_frontier_digest,
+        );
+        // Both computations are pure functions of the archive and cost seconds
+        // on a long session. Start them now so they run while the target is
+        // being provisioned; their results are awaited where they were
+        // consumed before, and the writes they feed have not moved.
+        //
+        // A resume that fails before a result is needed drops the handle.
+        // `spawn_blocking` work cannot be cancelled, so the computation still
+        // finishes on the blocking pool and its result is discarded; it owns
+        // nothing but its own inputs, so nothing leaks beyond that CPU.
+        let projection_build = rebuild_projection.then(|| {
+            let canonical = Arc::clone(&canonical_session);
+            let session_id = session_id.to_owned();
+            tokio::task::spawn_blocking(move || {
+                materialized_session_from_canonical(session_id, &canonical)
+            })
+        });
+        let handoff_build = (!same_harness).then(|| {
+            let canonical = Arc::clone(&canonical_session);
+            tokio::task::spawn_blocking(move || canonical_handoff_text(&canonical, context_bytes))
+        });
         let github_token = controller_github_token();
 
         // The configuration gains the bundle before the record points at it, so
@@ -2211,7 +2255,7 @@ impl Controller {
         record.additional_mounts = additional_mounts;
         record.target = None;
         record.native_session_id =
-            same_harness.then(|| archive.manifest.session.native_session_id.clone());
+            same_harness.then(|| archive_manifest.session.native_session_id.clone());
         record.state = SessionState::Provisioning;
         record.updated_at = now();
         record.last_error = None;
@@ -2324,7 +2368,7 @@ impl Controller {
                     .then(|| resumed_project_directory.clone())
                     .flatten()
                     .map(|directory| target_path(&directory.to_string_lossy())),
-                discard_queued_prompts: discard_queue || !same_harness,
+                discard_queued_prompts,
             };
             // A bare target keeps the closed session's worker root on the host.
             // Stop anything still writing there and clear the leftover relay
@@ -2359,12 +2403,24 @@ impl Controller {
                     None => LocalBootstrap::Seed,
                 },
             )?;
-            let mut restored_projection =
-                materialized_session_from_canonical(session_id, &canonical_session)?;
-            if discard_queue || !same_harness {
-                restored_projection.queued_prompts.clear();
+            match projection_build {
+                Some(build) => {
+                    let mut restored_projection = build
+                        .await
+                        .context("rebuild the restored projection")?
+                        .context("rebuild the restored projection")?;
+                    if discard_queued_prompts {
+                        restored_projection.queued_prompts.clear();
+                    }
+                    crate::hel_database::save_materialized_session(&restored_projection)?;
+                }
+                // The stored projection already is the archived one. Only the
+                // queue can still need changing.
+                None if discard_queued_prompts => {
+                    crate::hel_database::replace_materialized_queued_prompts(session_id, &[])?;
+                }
+                None => {}
             }
-            crate::hel_database::save_materialized_session(&restored_projection)?;
             start_worker(executor, &backend, &worker_root)?;
             let spec = self.reconnect_command(session_id)?;
             let readiness = async {
@@ -2378,17 +2434,17 @@ impl Controller {
             let (mut relay, native_session_id) = readiness
                 .map_err(|error| worker_probe_diagnosis(executor, &backend, &worker_root, error))?;
             if same_harness {
-                if native_session_id != archive.manifest.session.native_session_id {
+                if native_session_id != archive_manifest.session.native_session_id {
                     bail!(
                         "ACP loaded native session {native_session_id}, expected {}",
-                        archive.manifest.session.native_session_id
+                        archive_manifest.session.native_session_id
                     );
                 }
             } else {
-                let portable = portable_session
-                    .as_ref()
-                    .context("cross-harness resume is missing canonical session")?;
-                let context = canonical_handoff_text(portable, context_bytes);
+                let context = handoff_build
+                    .context("cross-harness resume is missing canonical session")?
+                    .await
+                    .context("compact the cross-harness handoff transcript")?;
                 relay
                     .submit(
                         new_command_id("cross-harness-handoff")?,
@@ -2467,10 +2523,24 @@ impl Controller {
         match result {
             Ok(materialized) => Ok(materialized),
             Err(error) => {
-                if let Ok(previous_projection) =
-                    materialized_session_from_canonical(session_id, &canonical_session)
-                {
-                    let _ = crate::hel_database::save_materialized_session(&previous_projection);
+                // Put back whatever this resume could have written to the
+                // durable projection. Both branches restore archived content,
+                // so they are correct whether or not the write had happened
+                // when the resume failed.
+                if rebuild_projection {
+                    if let Ok(previous_projection) =
+                        materialized_session_from_canonical(session_id, &canonical_session)
+                    {
+                        let _ =
+                            crate::hel_database::save_materialized_session(&previous_projection);
+                    }
+                } else if discard_queued_prompts {
+                    let _ = crate::hel_database::replace_materialized_queued_prompts(
+                        session_id,
+                        &crate::hel_projection::materialized_queued_prompts_from_canonical(
+                            &canonical_session.queued_prompts,
+                        ),
+                    );
                 }
                 Err(self.rollback_failed_resume(session_id, &previous, error, executor)?)
             }
@@ -3623,6 +3693,21 @@ fn preflight_target(template: &TargetTemplate, executor: &impl CommandExecutor) 
         }
         _ => Ok(()),
     }
+}
+
+/// Whether a resume has to rebuild the durable projection from its archive.
+///
+/// The projection is a deterministic fold of the relay event chain, so a stored
+/// projection standing at the archive's frontier *and* carrying the archive's
+/// frontier digest already holds the archived content: same chain, same
+/// ordinal, same result. Anything else - no stored row, a different ordinal, a
+/// different digest, or a frontier that could not be read - rebuilds.
+fn projection_rebuild_required(
+    stored: Option<(u64, &str)>,
+    archive_frontier: u64,
+    archive_frontier_digest: &str,
+) -> bool {
+    stored != Some((archive_frontier, archive_frontier_digest))
 }
 
 fn canonical_handoff_text(snapshot: &CanonicalSessionSnapshot, maximum_bytes: usize) -> String {
@@ -10470,6 +10555,33 @@ mod tests {
             "{detail}"
         );
         assert_eq!(controller.state.sessions[session_id], previous);
+    }
+
+    #[test]
+    fn a_projection_standing_at_the_archived_frontier_is_reused() {
+        let digest = "a".repeat(64);
+        let other = "b".repeat(64);
+
+        assert!(!projection_rebuild_required(
+            Some((82_000, &digest)),
+            82_000,
+            &digest
+        ));
+
+        for stored in [
+            // Same ordinal, different event chain.
+            Some((82_000, other.as_str())),
+            // Behind the archive, and ahead of it.
+            Some((81_999, digest.as_str())),
+            Some((82_001, digest.as_str())),
+            // No projection stored, or none that could be read.
+            None,
+        ] {
+            assert!(
+                projection_rebuild_required(stored, 82_000, &digest),
+                "{stored:?} must not be mistaken for the archived projection"
+            );
+        }
     }
 
     #[test]
