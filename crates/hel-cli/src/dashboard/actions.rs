@@ -211,6 +211,17 @@ pub(crate) async fn apply_dashboard_action(
                 SessionOperationKind::Resuming,
                 true,
             );
+            // The wizard's chosen profile/target become the record's
+            // last_profile/target_template_id as soon as resume starts
+            // (Controller::resume_session_controlled), but this dashboard's
+            // session snapshot won't see that update until the background
+            // operation finishes. Tell the in-flight row where the resume is
+            // going so it doesn't show where the session resumed from.
+            context.dashboard.set_resume_destination(
+                &session_id,
+                profile_id.clone(),
+                target_template_id.clone(),
+            );
             let stage_updates = context.dashboard_io_tx.clone();
             let runtime = tokio::runtime::Handle::current();
             spawn_lifecycle_operation(request, move |controller, cancelled| {

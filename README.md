@@ -11,8 +11,8 @@ Codex, Claude Code, and Kimi Code profiles. A session can run directly in an
 existing local Git project, in a local Podman container, an Apple `container`,
 a disposable EC2 instance, a named SSH machine, or Podman reached through SSH.
 Isolated and remote targets run the selected harness in its unrestricted mode
-(`agent-full-access`, `bypassPermissions`, or `auto`). Raw localhost honors the
-configured harness home and approval settings instead.
+(`agent-full-access`, `bypassPermissions`, `auto`, or `--always-approve`). Raw
+localhost honors the configured harness home and approval settings instead.
 
 ## Status
 
@@ -301,9 +301,11 @@ resume.
 `local-bare` is intentionally different: it runs the ACP bridge in a local Git
 worktree and points `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, or
 `KIMI_CODE_HOME` at the configured profile home directly. Hel does not force an
-unrestricted mode or auto-approve ACP permission requests there. Kimi's normal
-`auto` mode is its no-confirmation mode, so the dashboard displays a prominent
-warning before using Kimi on raw localhost.
+unrestricted mode there, and it cancels ACP permission requests. Two harnesses
+approve everything anyway: Kimi Code through its own default `auto` mode, which
+is a no-confirmation mode rather than a review policy, and Grok Build through
+the `--always-approve` flag Hel always passes it. The dashboard displays a
+prominent warning before using either on raw localhost.
 
 Raw-project checkpoints preserve Hel's materialized session and native harness
 state, but they do not back up the selected worktree. When the selected path

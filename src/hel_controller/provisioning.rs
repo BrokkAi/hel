@@ -355,16 +355,20 @@ impl Controller {
         session_id: &str,
         executor: &impl CommandExecutor,
     ) -> Result<Option<String>> {
-        let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
-        let (backend, worker_root) = self.prepare_worker_files(session_id, executor)?;
-        install_attached_resources(&self.state, session_id, &backend, &worker_root, executor)?;
+        // Installing the worker and connecting its repositories moves data into
+        // the target, so it reports as Sync. Start begins at the daemon launch.
+        let syncing = &StagedExecutor::new(executor, ProvisionStage::Syncing);
+        let (backend, worker_root) = self.worker_placement(session_id)?;
+        self.prepare_worker_files(session_id, &backend, &worker_root, syncing)?;
+        install_attached_resources(&self.state, session_id, &backend, &worker_root, syncing)?;
         self.connect_local_repositories(
             session_id,
             &backend,
             &worker_root,
-            executor,
+            syncing,
             LocalBootstrap::Seed,
         )?;
+        let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
         start_worker(executor, &backend, &worker_root)?;
         let reconnect = &hel_targets::reconnect_plan(&backend, session_id)?.commands[0];
         let readiness = async {

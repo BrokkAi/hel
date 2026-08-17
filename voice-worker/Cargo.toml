@@ -7,6 +7,9 @@ license = "GPL-3.0-only"
 repository = "https://github.com/BrokkAi/mjolnir"
 publish = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "hel-voice-worker"
 path = "src/main.rs"

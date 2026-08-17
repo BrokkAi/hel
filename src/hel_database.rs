@@ -905,6 +905,52 @@ pub fn load_materialized_session(session_id: &str) -> Result<Option<Materialized
     load_materialized_session_from(&database_path(), session_id)
 }
 
+/// Read only the projection's event frontier. Deciding whether a stored
+/// projection already matches an archive costs one row this way, instead of
+/// deserializing every transcript item to compare two integers.
+pub fn materialized_event_frontier(session_id: &str) -> Result<Option<(u64, String)>> {
+    materialized_event_frontier_from(&database_path(), session_id)
+}
+
+fn materialized_event_frontier_from(
+    path: &Path,
+    session_id: &str,
+) -> Result<Option<(u64, String)>> {
+    Ok(open(path)?
+        .query_row(
+            "SELECT applied_event_ordinal, applied_event_digest
+             FROM materialized_sessions WHERE session_id = ?1",
+            [session_id],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?)
+}
+
+/// Replace a session's durable prompt queue without touching its transcript or
+/// event frontier. Resume uses this when it keeps the stored projection but
+/// still has to drop the queue the archive carried.
+pub fn replace_materialized_queued_prompts(
+    session_id: &str,
+    queued_prompts: &[MaterializedQueuedPrompt],
+) -> Result<()> {
+    replace_materialized_queued_prompts_in(&database_path(), session_id, queued_prompts)
+}
+
+fn replace_materialized_queued_prompts_in(
+    path: &Path,
+    session_id: &str,
+    queued_prompts: &[MaterializedQueuedPrompt],
+) -> Result<()> {
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if !session_exists(&tx, session_id)? {
+        bail!("unknown session {session_id}");
+    }
+    replace_materialized_queue(&tx, session_id, queued_prompts)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Load only the durable prompt queues without deserializing transcript rows.
 /// Dashboard startup uses this path so work is proportional to queued prompts,
 /// not to the complete retained conversation history.
@@ -3288,6 +3334,54 @@ mod tests {
 
         assert_eq!(queues.get("session-1"), Some(&expected));
         assert!(load_materialized_session_from(&database, "session-1").is_err());
+    }
+
+    /// Resume compares frontiers to decide whether to rebuild a projection,
+    /// and clears the queue without touching the transcript when it does not.
+    #[test]
+    fn a_queue_replacement_keeps_the_projection_frontier_and_transcript() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        save_session_to(&database, &session("session-1", "project-1")).unwrap();
+        let materialized = materialized_session("session-1");
+        assert!(!materialized.queued_prompts.is_empty());
+        save_materialized_session_to(&database, &materialized).unwrap();
+
+        assert_eq!(
+            materialized_event_frontier_from(&database, "session-1").unwrap(),
+            Some((materialized.applied_event_ordinal, event_digest(7)))
+        );
+        assert_eq!(
+            materialized_event_frontier_from(&database, "unknown").unwrap(),
+            None
+        );
+
+        replace_materialized_queued_prompts_in(&database, "session-1", &[]).unwrap();
+
+        let cleared = load_materialized_session_from(&database, "session-1")
+            .unwrap()
+            .unwrap();
+        assert!(cleared.queued_prompts.is_empty());
+        assert_eq!(cleared.transcript, materialized.transcript);
+        assert_eq!(
+            cleared.applied_event_ordinal,
+            materialized.applied_event_ordinal
+        );
+        assert_eq!(
+            cleared.applied_event_digest,
+            materialized.applied_event_digest
+        );
+
+        replace_materialized_queued_prompts_in(
+            &database,
+            "session-1",
+            &materialized.queued_prompts,
+        )
+        .unwrap();
+        assert_eq!(
+            load_materialized_session_from(&database, "session-1").unwrap(),
+            Some(materialized)
+        );
     }
 
     #[test]

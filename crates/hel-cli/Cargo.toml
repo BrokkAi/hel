@@ -5,6 +5,9 @@ edition = "2024"
 license = "GPL-3.0-only"
 publish = false
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "hel"
 path = "src/main.rs"

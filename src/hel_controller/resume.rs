@@ -1,6 +1,7 @@
 //! Resuming an archived session onto a profile and target.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{ContentBlock, Plan, TextContent, ToolCall};
@@ -111,11 +112,18 @@ impl Controller {
             .checkpoint
             .as_ref()
             .context("session has no checkpoint")?;
-        let archive = verify_archive_streaming(&checkpoint.archive_path)?;
-        if archive.archive_sha256 != checkpoint.sha256 || archive.manifest.session.id != session_id
-        {
+        // Take the snapshot out of the verified metadata and share it behind an
+        // `Arc`: on a long session it is tens of megabytes, and resume reads it
+        // from three places that used to hold private copies.
+        let crate::hel_archive::VerifiedArchiveMetadata {
+            manifest: archive_manifest,
+            canonical_session,
+            archive_sha256,
+        } = verify_archive_streaming(&checkpoint.archive_path)?;
+        if archive_sha256 != checkpoint.sha256 || archive_manifest.session.id != session_id {
             bail!("persisted checkpoint verification failed");
         }
+        let canonical_session = Arc::new(canonical_session);
         let profile = self
             .config
             .profiles
@@ -194,8 +202,7 @@ impl Controller {
                 "This session moved out of its {} target and into {}. Its branch {} is now {}.",
                 previous.target_template_id,
                 conversion.worktree.worktree_root.display(),
-                archive
-                    .manifest
+                archive_manifest
                     .repositories
                     .first()
                     .and_then(|repository| repository.metadata.branch.as_deref())
@@ -209,8 +216,7 @@ impl Controller {
             match raw_checkout_position(&previous, &self.config, project_directory, executor) {
                 Ok(live) => resume_notices.extend(raw_checkout_divergence_notice(
                     project_directory,
-                    archive
-                        .manifest
+                    archive_manifest
                         .repositories
                         .first()
                         .map(|repository| &repository.metadata),
@@ -225,12 +231,50 @@ impl Controller {
                 ),
             }
         }
-        let same_harness = profile.kind == archive.manifest.session.harness_kind;
-        let canonical_session = archive.canonical_session.clone();
+        let same_harness = profile.kind == archive_manifest.session.harness_kind;
         let context_bytes = profile
             .context_window_bytes
             .unwrap_or(crate::hel_compaction::DEFAULT_CONTEXT_BYTES);
-        let portable_session = (!same_harness).then(|| canonical_session.clone());
+        let discard_queued_prompts = discard_queue || !same_harness;
+        // When this controller archived the session, its durable projection is
+        // already the archive's content. Reading one row decides that; a read
+        // failure or any mismatch rebuilds as before.
+        let stored_frontier = crate::hel_database::materialized_event_frontier(session_id)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    session_id,
+                    error = format!("{error:#}"),
+                    "could not read the stored projection frontier; rebuilding it from the archive"
+                );
+                None
+            });
+        let rebuild_projection = projection_rebuild_required(
+            stored_frontier
+                .as_ref()
+                .map(|(ordinal, digest)| (*ordinal, digest.as_str())),
+            canonical_session.event_frontier,
+            &canonical_session.event_frontier_digest,
+        );
+        // Both computations are pure functions of the archive and cost seconds
+        // on a long session. Start them now so they run while the target is
+        // being provisioned; their results are awaited where they were
+        // consumed before, and the writes they feed have not moved.
+        //
+        // A resume that fails before a result is needed drops the handle.
+        // `spawn_blocking` work cannot be cancelled, so the computation still
+        // finishes on the blocking pool and its result is discarded; it owns
+        // nothing but its own inputs, so nothing leaks beyond that CPU.
+        let projection_build = rebuild_projection.then(|| {
+            let canonical = Arc::clone(&canonical_session);
+            let session_id = session_id.to_owned();
+            tokio::task::spawn_blocking(move || {
+                materialized_session_from_canonical(session_id, &canonical)
+            })
+        });
+        let handoff_build = (!same_harness).then(|| {
+            let canonical = Arc::clone(&canonical_session);
+            tokio::task::spawn_blocking(move || canonical_handoff_text(&canonical, context_bytes))
+        });
         let github_token = controller_github_token();
 
         // The configuration gains the bundle before the record points at it, so
@@ -256,7 +300,7 @@ impl Controller {
         record.additional_mounts = additional_mounts;
         record.target = None;
         record.native_session_id =
-            same_harness.then(|| archive.manifest.session.native_session_id.clone());
+            same_harness.then(|| archive_manifest.session.native_session_id.clone());
         record.state = SessionState::Provisioning;
         record.updated_at = now();
         record.last_error = None;
@@ -311,8 +355,10 @@ impl Controller {
                 ProvisioningFailureDisposition::Preserve,
             )
             .await?;
-            let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
-            let (backend, worker_root) = self.prepare_worker_files(session_id, executor)?;
+            // Everything from here to the daemon launch moves data into the
+            // target, so it reports as Sync. Start begins at start_worker.
+            let syncing = &StagedExecutor::new(executor, ProvisionStage::Syncing);
+            let (backend, worker_root) = self.worker_placement(session_id)?;
             let harness_home = target_profile_home(&backend, session_id, &profile);
             let workspace_root = if let Some(project_directory) = &resumed_project_directory {
                 project_directory
@@ -339,17 +385,6 @@ impl Controller {
                 }
                 _ => PathBuf::from(path),
             };
-            // The restore needs the fetched objects: a committed delta bundle
-            // cannot be applied without its prerequisites, and a bundle-free
-            // snapshot checks out a head commit only the proxy can supply. The
-            // archive carries this session's dirty state, so nothing is seeded.
-            self.connect_local_repositories(
-                session_id,
-                &backend,
-                &worker_root,
-                executor,
-                LocalBootstrap::Skip,
-            )?;
             let remote_archive = format!("{worker_root}/restore.hel.zip");
             let remote_spec = format!("{worker_root}/restore-spec.json");
             let restore = CheckpointRestoreSpec {
@@ -369,40 +404,114 @@ impl Controller {
                     .then(|| resumed_project_directory.clone())
                     .flatten()
                     .map(|directory| target_path(&directory.to_string_lossy())),
-                discard_queued_prompts: discard_queue || !same_harness,
+                discard_queued_prompts,
             };
+            // A bare target keeps the closed session's worker root on the host.
+            // Stop anything still writing there and clear the leftover relay
+            // state, or the restore's seed loses to a stale snapshot whose
+            // frontier no journal can support. This runs before the worker
+            // binary is installed: a surviving daemon still holds the old one
+            // open, and the install would land on a running executable.
+            if let Some(command) = hel_targets::clear_relay_state_plan(&backend, session_id)? {
+                execute_checked(syncing, command)?;
+            }
+            // Both lanes below write into the worker root, so it exists first.
+            execute_checked(
+                syncing,
+                hel_targets::command_on_locator(
+                    &backend,
+                    session_id,
+                    vec!["mkdir".into(), "-p".into(), worker_root.clone()],
+                    "create the session worker root",
+                )?,
+            )?;
             let staging = tempfile::tempdir().context("create restore staging")?;
             let local_spec = staging.path().join("restore-spec.json");
             std::fs::write(&local_spec, serde_json::to_vec_pretty(&restore)?)?;
-            upload_checkpoint_spec(
-                executor,
-                &backend,
-                session_id,
-                &checkpoint.archive_path,
-                &remote_archive,
+            // Two independent lanes into the target. The checkpoint transfer
+            // needs nothing from the worker install, and the worker install
+            // and the local Git connection together are the longer of the two,
+            // so overlapping them hides the smaller one entirely.
+            //
+            // The Git connection stays behind the worker install in its own
+            // lane: the target fetches through `ext::<worker root>/hel worker
+            // git-proxy`, so the binary has to be there before a fetch runs.
+            let controller = &*self;
+            let backend_ref = &backend;
+            let worker_root_ref = worker_root.as_str();
+            let local_spec_ref = local_spec.as_path();
+            execute_concurrent_lanes(
+                || {
+                    controller.prepare_worker_files(
+                        session_id,
+                        backend_ref,
+                        worker_root_ref,
+                        syncing,
+                    )?;
+                    // The restore needs the fetched objects: a committed delta
+                    // bundle cannot be applied without its prerequisites, and a
+                    // bundle-free snapshot checks out a head commit only the
+                    // proxy can supply. The archive carries this session's
+                    // dirty state, so nothing is seeded.
+                    controller.connect_local_repositories(
+                        session_id,
+                        backend_ref,
+                        worker_root_ref,
+                        syncing,
+                        LocalBootstrap::Skip,
+                    )
+                },
+                || {
+                    upload_checkpoint_spec(
+                        syncing,
+                        backend_ref,
+                        session_id,
+                        &checkpoint.archive_path,
+                        &remote_archive,
+                    )?;
+                    upload_checkpoint_spec(
+                        syncing,
+                        backend_ref,
+                        session_id,
+                        local_spec_ref,
+                        &remote_spec,
+                    )
+                },
             )?;
-            upload_checkpoint_spec(executor, &backend, session_id, &local_spec, &remote_spec)?;
             execute_checked(
-                executor,
+                syncing,
                 restore_command(&backend, session_id, &remote_spec)?,
             )?;
-            install_attached_resources(&self.state, session_id, &backend, &worker_root, executor)?;
+            install_attached_resources(&self.state, session_id, &backend, &worker_root, syncing)?;
             self.connect_local_repositories(
                 session_id,
                 &backend,
                 &worker_root,
-                executor,
+                syncing,
                 match conversion.as_ref().and_then(ResumeConversion::raw_to_workspace) {
                     Some(conversion) => LocalBootstrap::SeedFrom(conversion.checkout.clone()),
                     None => LocalBootstrap::Seed,
                 },
             )?;
-            let mut restored_projection =
-                materialized_session_from_canonical(session_id, &canonical_session)?;
-            if discard_queue || !same_harness {
-                restored_projection.queued_prompts.clear();
+            match projection_build {
+                Some(build) => {
+                    let mut restored_projection = build
+                        .await
+                        .context("rebuild the restored projection")?
+                        .context("rebuild the restored projection")?;
+                    if discard_queued_prompts {
+                        restored_projection.queued_prompts.clear();
+                    }
+                    crate::hel_database::save_materialized_session(&restored_projection)?;
+                }
+                // The stored projection already is the archived one. Only the
+                // queue can still need changing.
+                None if discard_queued_prompts => {
+                    crate::hel_database::replace_materialized_queued_prompts(session_id, &[])?;
+                }
+                None => {}
             }
-            crate::hel_database::save_materialized_session(&restored_projection)?;
+            let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
             start_worker(executor, &backend, &worker_root)?;
             let spec = self.reconnect_command(session_id)?;
             let readiness = async {
@@ -416,17 +525,17 @@ impl Controller {
             let (mut relay, native_session_id) = readiness
                 .map_err(|error| worker_probe_diagnosis(executor, &backend, &worker_root, error))?;
             if same_harness {
-                if native_session_id != archive.manifest.session.native_session_id {
+                if native_session_id != archive_manifest.session.native_session_id {
                     bail!(
                         "ACP loaded native session {native_session_id}, expected {}",
-                        archive.manifest.session.native_session_id
+                        archive_manifest.session.native_session_id
                     );
                 }
             } else {
-                let portable = portable_session
-                    .as_ref()
-                    .context("cross-harness resume is missing canonical session")?;
-                let context = canonical_handoff_text(portable, context_bytes);
+                let context = handoff_build
+                    .context("cross-harness resume is missing canonical session")?
+                    .await
+                    .context("compact the cross-harness handoff transcript")?;
                 relay
                     .submit(
                         new_command_id("cross-harness-handoff")?,
@@ -505,10 +614,24 @@ impl Controller {
         match result {
             Ok(materialized) => Ok(materialized),
             Err(error) => {
-                if let Ok(previous_projection) =
-                    materialized_session_from_canonical(session_id, &canonical_session)
-                {
-                    let _ = crate::hel_database::save_materialized_session(&previous_projection);
+                // Put back whatever this resume could have written to the
+                // durable projection. Both branches restore archived content,
+                // so they are correct whether or not the write had happened
+                // when the resume failed.
+                if rebuild_projection {
+                    if let Ok(previous_projection) =
+                        materialized_session_from_canonical(session_id, &canonical_session)
+                    {
+                        let _ =
+                            crate::hel_database::save_materialized_session(&previous_projection);
+                    }
+                } else if discard_queued_prompts {
+                    let _ = crate::hel_database::replace_materialized_queued_prompts(
+                        session_id,
+                        &crate::hel_projection::materialized_queued_prompts_from_canonical(
+                            &canonical_session.queued_prompts,
+                        ),
+                    );
                 }
                 Err(self.rollback_failed_resume(session_id, &previous, error, executor)?)
             }
@@ -617,6 +740,53 @@ pub(super) fn apply_failed_resume_rollback(
     }
 }
 
+/// Run two independent sequences of target work at the same time.
+///
+/// [`hel_targets::CommandPlan::execute_concurrent`] overlaps commands inside
+/// one plan. This overlaps two lanes that each interleave target commands with
+/// controller-side work, which a flat plan cannot express. Both lanes share the
+/// caller's executor, so every command keeps the executor's cancellation and
+/// stage reporting.
+///
+/// A failure in the first lane is reported ahead of a failure in the second, so
+/// the error a caller sees never depends on which lane lost the race. Both
+/// lanes always run to completion: neither can be interrupted mid-transfer, and
+/// leaving one running past the return would race the recovery that follows.
+fn execute_concurrent_lanes(
+    first: impl FnOnce() -> Result<()> + Send,
+    second: impl FnOnce() -> Result<()> + Send,
+) -> Result<()> {
+    std::thread::scope(|scope| {
+        // The second lane gets the new thread and the first runs here, so a
+        // panic in the first propagates exactly as it would without the
+        // overlap.
+        let second = scope.spawn(second);
+        let first = first();
+        let second = second.join().unwrap_or_else(|panic| {
+            Err(anyhow::anyhow!(
+                "concurrent target lane panicked: {}",
+                hel_targets::command_thread_panic_message(panic.as_ref())
+            ))
+        });
+        first.and(second)
+    })
+}
+
+/// Whether a resume has to rebuild the durable projection from its archive.
+///
+/// The projection is a deterministic fold of the relay event chain, so a stored
+/// projection standing at the archive's frontier *and* carrying the archive's
+/// frontier digest already holds the archived content: same chain, same
+/// ordinal, same result. Anything else - no stored row, a different ordinal, a
+/// different digest, or a frontier that could not be read - rebuilds.
+fn projection_rebuild_required(
+    stored: Option<(u64, &str)>,
+    archive_frontier: u64,
+    archive_frontier_digest: &str,
+) -> bool {
+    stored != Some((archive_frontier, archive_frontier_digest))
+}
+
 fn canonical_handoff_text(snapshot: &CanonicalSessionSnapshot, maximum_bytes: usize) -> String {
     const PREFIX: &str = "Continue this coding session from the portable transcript below. Preserve the user's intent and the work already completed.\n\n";
     let mut transcript = String::new();
@@ -676,9 +846,11 @@ fn canonical_handoff_text(snapshot: &CanonicalSessionSnapshot, maximum_bytes: us
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::{Barrier, Mutex};
 
     use anyhow::Result;
 
@@ -764,6 +936,178 @@ mod tests {
             "{detail}"
         );
         assert_eq!(controller.state.sessions[session_id], previous);
+    }
+    /// Records what it ran and blocks every command on a barrier sized to
+    /// both lanes, so a run only finishes if the second lane started before
+    /// the first one's command returned.
+    struct BarrierExecutor {
+        seen: Mutex<Vec<String>>,
+        barrier: Barrier,
+    }
+
+    impl CommandExecutor for BarrierExecutor {
+        fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+            self.seen.lock().unwrap().push(command.purpose.clone());
+            self.barrier.wait();
+            Ok(CommandOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn lane_command(purpose: &str) -> CommandSpec {
+        CommandSpec::new("hel", ["worker"]).purpose(purpose)
+    }
+
+    /// Launch progress must not claim "Start" while the target is still
+    /// receiving the worker binary, the checkpoint archive and the restore.
+    /// Everything before the daemon launch reports as Sync; the launch itself
+    /// names its own stage, so a Sync-labelled executor cannot relabel it.
+    #[test]
+    fn start_begins_at_the_worker_launch_not_at_the_transfers_before_it() {
+        struct RecordingExecutor {
+            commands: RefCell<Vec<CommandSpec>>,
+        }
+        impl CommandExecutor for RecordingExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.commands.borrow_mut().push(command.clone());
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let worker_root = format!("/var/lib/hel/workers/{session_id}");
+        let executor = RecordingExecutor {
+            commands: RefCell::new(Vec::new()),
+        };
+        let syncing = StagedExecutor::new(&executor, ProvisionStage::Syncing);
+        let backend = hel_targets::TargetLocator::LocalPodman {
+            container_id: "abcdef0123456789".into(),
+        };
+
+        upload_checkpoint_spec(
+            &syncing,
+            &backend,
+            session_id,
+            Path::new("/archives/session.hel.zip"),
+            &format!("{worker_root}/restore.hel.zip"),
+        )
+        .unwrap();
+        execute_checked(
+            &syncing,
+            restore_command(
+                &backend,
+                session_id,
+                &format!("{worker_root}/restore-spec.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // Deliberately run the launch through the Sync-labelled executor: it
+        // must still report Start.
+        start_worker(&syncing, &backend, &worker_root).unwrap();
+
+        let stages = executor
+            .commands
+            .borrow()
+            .iter()
+            .map(|command| (command.purpose.clone(), command.stage))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            vec![
+                (
+                    "upload checkpoint specification".to_owned(),
+                    Some(ProvisionStage::Syncing)
+                ),
+                (
+                    "restore target checkpoint".to_owned(),
+                    Some(ProvisionStage::Syncing)
+                ),
+                (
+                    "start detached Hel worker".to_owned(),
+                    Some(ProvisionStage::Starting)
+                ),
+            ]
+        );
+    }
+    #[test]
+    fn independent_target_lanes_run_at_the_same_time() {
+        let executor = BarrierExecutor {
+            seen: Mutex::new(Vec::new()),
+            barrier: Barrier::new(2),
+        };
+
+        execute_concurrent_lanes(
+            || execute_checked(&executor, lane_command("install the worker")).map(|_| ()),
+            || execute_checked(&executor, lane_command("upload the checkpoint")).map(|_| ()),
+        )
+        .unwrap();
+
+        let mut seen = executor.seen.into_inner().unwrap();
+        seen.sort();
+        assert_eq!(seen, ["install the worker", "upload the checkpoint"]);
+    }
+    #[test]
+    fn a_lane_failure_is_reported_in_lane_order_and_never_abandons_the_other_lane() {
+        let reached = Mutex::new(Vec::new());
+
+        // The first lane fails slowly and the second immediately, so a
+        // completion-order report could only pick the second.
+        let error = execute_concurrent_lanes(
+            || {
+                std::thread::sleep(Duration::from_millis(50));
+                bail!("worker install failed")
+            },
+            || {
+                reached.lock().unwrap().push("second");
+                bail!("checkpoint upload failed")
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "worker install failed");
+        assert_eq!(
+            *reached.lock().unwrap(),
+            ["second"],
+            "a failing first lane must not cut the second one short"
+        );
+
+        let error =
+            execute_concurrent_lanes(|| Ok(()), || bail!("checkpoint upload failed")).unwrap_err();
+        assert_eq!(error.to_string(), "checkpoint upload failed");
+    }
+    #[test]
+    fn a_projection_standing_at_the_archived_frontier_is_reused() {
+        let digest = "a".repeat(64);
+        let other = "b".repeat(64);
+
+        assert!(!projection_rebuild_required(
+            Some((82_000, &digest)),
+            82_000,
+            &digest
+        ));
+
+        for stored in [
+            // Same ordinal, different event chain.
+            Some((82_000, other.as_str())),
+            // Behind the archive, and ahead of it.
+            Some((81_999, digest.as_str())),
+            Some((82_001, digest.as_str())),
+            // No projection stored, or none that could be read.
+            None,
+        ] {
+            assert!(
+                projection_rebuild_required(stored, 82_000, &digest),
+                "{stored:?} must not be mistaken for the archived projection"
+            );
+        }
     }
     #[test]
     fn failed_resume_rolls_back_only_after_target_cleanup() {

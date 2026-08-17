@@ -1,12 +1,14 @@
 //! Controller-side support for repositories configured with `local` sources.
 
-use std::io::Write;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::sync::{LazyLock, Mutex, PoisonError};
 
 use anyhow::{Context, Result, bail};
 
 use crate::hel_config::ProjectBundle;
+use crate::hel_subprocess::run_with_input;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirtyLocalRepository {
@@ -52,8 +54,45 @@ pub fn canonical_repository(path: &Path) -> Result<PathBuf> {
     let root = std::fs::canonicalize(&root)
         .with_context(|| format!("canonicalize local repository {}", root.display()))?;
     let root = main_worktree_root(&root)?;
-    reject_git_lfs(&root)?;
+    reject_git_lfs_cached(&VETTED_REPOSITORIES, &root, reject_git_lfs)?;
     Ok(root)
+}
+
+/// Canonical roots this process has already found free of Git LFS.
+///
+/// The sweep below reads every tracked path and asks Git for its attributes,
+/// which is proportional to the whole working tree. A session start calls
+/// `canonical_repository` at least twice per local repository, and a resume
+/// more than that, so the same answer was being recomputed repeatedly.
+///
+/// Staleness trade-off: a repository that adopts Git LFS while Hel is running
+/// is not swept again until Hel restarts. Adopting LFS mid-process is rare,
+/// the next start still refuses it, and the alternative is paying a full
+/// working-tree scan on every call.
+static VETTED_REPOSITORIES: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Sweep `root` for Git LFS unless it has already passed. A root is recorded
+/// only after the sweep clears it, so a repository that uses Git LFS is
+/// refused every time it is offered.
+fn reject_git_lfs_cached(
+    vetted: &Mutex<HashSet<PathBuf>>,
+    root: &Path,
+    sweep: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    if vetted
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(root)
+    {
+        return Ok(());
+    }
+    sweep(root)?;
+    vetted
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(root.to_path_buf());
+    Ok(())
 }
 
 /// Map a repository top level to the top level of its main working tree.
@@ -99,21 +138,12 @@ fn reject_git_lfs(repository: &Path) -> Result<()> {
     if !paths.status.success() {
         bail!("could not list tracked files for Git LFS check");
     }
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["check-attr", "-z", "--stdin", "filter"])
-        .current_dir(repository)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("start Git LFS attribute check")?;
-    child
-        .stdin
-        .take()
-        .context("Git attribute stdin is missing")?
-        .write_all(&paths.stdout)?;
-    let output = child
-        .wait_with_output()
-        .context("wait for Git LFS attribute check")?;
+        .current_dir(repository);
+    let output =
+        run_with_input(&mut command, &paths.stdout).context("run Git LFS attribute check")?;
     if !output.status.success() {
         bail!("could not inspect Git LFS attributes");
     }
@@ -233,6 +263,35 @@ mod tests {
         let expected = fs::canonicalize(&main).unwrap();
         assert_eq!(canonical_repository(&main).unwrap(), expected);
         assert_eq!(canonical_repository(&worktree).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_repository_is_swept_for_git_lfs_once_per_process() {
+        let vetted = Mutex::new(HashSet::new());
+        let sweeps = std::cell::Cell::new(0);
+        let sweep = |_: &Path| {
+            sweeps.set(sweeps.get() + 1);
+            Ok(())
+        };
+
+        reject_git_lfs_cached(&vetted, Path::new("/repo"), sweep).unwrap();
+        reject_git_lfs_cached(&vetted, Path::new("/repo"), sweep).unwrap();
+        assert_eq!(sweeps.get(), 1, "a vetted root must not be swept again");
+
+        reject_git_lfs_cached(&vetted, Path::new("/other"), sweep).unwrap();
+        assert_eq!(sweeps.get(), 2, "a new root still has to be swept");
+    }
+
+    /// A refusal must not be cached, or one rejected repository would be
+    /// accepted on every later call.
+    #[test]
+    fn a_repository_that_fails_the_git_lfs_sweep_is_refused_again() {
+        let vetted = Mutex::new(HashSet::new());
+        let sweep = |_: &Path| bail!("uses Git LFS");
+
+        for _ in 0..2 {
+            assert!(reject_git_lfs_cached(&vetted, Path::new("/repo"), sweep).is_err());
+        }
     }
 
     #[test]

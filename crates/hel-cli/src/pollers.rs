@@ -939,6 +939,9 @@ async fn execute_resource_command(command: &CommandSpec) -> Result<CommandOutput
     let child = process
         .spawn()
         .with_context(|| format!("start {} for {}", command.program, command.purpose))?;
+    // stdin is null; nothing writes while output drains, so this cannot hit
+    // the write-then-wait deadlock the disallowed_methods lint guards against.
+    #[allow(clippy::disallowed_methods)]
     let output = child
         .wait_with_output()
         .await

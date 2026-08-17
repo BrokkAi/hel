@@ -8,7 +8,9 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::hel_config::{ProjectBundle, data_dir};
-use crate::hel_targets::{self, CommandExecutor, CommandSpec, ProcessExecutor, SshTarget};
+use crate::hel_targets::{
+    self, CommandExecutor, CommandSpec, ProcessExecutor, ProvisionStage, SshTarget,
+};
 use crate::hel_worker_runtime::{WorkerLaunchConfig, WorkerOwnership};
 
 use super::backend::backend_locator;
@@ -17,11 +19,34 @@ use super::readiness::WORKER_EXIT_RECORD_MARKER;
 use super::{Controller, execute_checked, scp_command_spec, ssh_command_spec, target_profile_home};
 
 impl Controller {
+    /// Where this session's worker lives. This is decided from the session
+    /// record and configuration alone, so a caller can name the worker root
+    /// before anything is installed into it.
+    pub(super) fn worker_placement(
+        &self,
+        session_id: &str,
+    ) -> Result<(hel_targets::TargetLocator, String)> {
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?;
+        let locator = session
+            .target
+            .as_ref()
+            .context("session target is missing")?;
+        let backend = backend_locator(locator, session, &self.config)?;
+        let worker_root = hel_targets::worker_root(&backend, session_id)?;
+        Ok((backend, worker_root))
+    }
+
     pub(super) fn prepare_worker_files(
         &self,
         session_id: &str,
+        backend: &hel_targets::TargetLocator,
+        worker_root: &str,
         executor: &impl CommandExecutor,
-    ) -> Result<(hel_targets::TargetLocator, String)> {
+    ) -> Result<()> {
         let session = self
             .state
             .sessions
@@ -37,18 +62,12 @@ impl Controller {
             .is_none()
             .then(|| self.config.bundles.get(&session.bundle_id))
             .flatten();
-        let locator = session
-            .target
-            .as_ref()
-            .context("session target is missing")?;
-        let backend = backend_locator(locator, session, &self.config)?;
-        let worker_root = hel_targets::worker_root(&backend, session_id)?;
-        let target_profile_home = target_profile_home(&backend, session_id, profile);
+        let target_profile_home = target_profile_home(backend, session_id, profile);
         let workspace = if let Some(project_directory) = &session.project_directory {
             (project_directory.to_string_lossy().into_owned(), Vec::new())
         } else {
             workspace_paths(
-                &backend,
+                backend,
                 bundle.context("session bundle is missing")?,
                 session_id,
             )?
@@ -66,7 +85,7 @@ impl Controller {
         );
         // The flag-enforced harnesses need the unrestricted decision on the
         // bridge command line, so it is taken before the launch config.
-        let force_unrestricted = force_unrestricted_mode(&backend);
+        let force_unrestricted = force_unrestricted_mode(backend);
         let (bridge_command, bridge_args) = bridge_launch(
             profile.kind,
             profile.executable.as_deref(),
@@ -109,21 +128,20 @@ impl Controller {
             );
             result?;
         }
-        let worker_binary = worker_binary_for(&backend, executor)?;
+        let worker_binary = worker_binary_for(backend, executor)?;
 
         install_worker_files(
             executor,
-            &backend,
+            backend,
             session_id,
-            &worker_root,
+            worker_root,
             &target_profile_home,
             &worker_binary,
             &launch_path,
             &ownership_path,
             &profile_stage,
         )?;
-        install_inherited_git_settings(executor, &backend, session_id)?;
-        Ok((backend, worker_root))
+        install_inherited_git_settings(executor, backend, session_id)
     }
 
     /// Collect the dead worker's exit record and log tail for a session whose
@@ -1016,7 +1034,10 @@ pub(super) fn start_worker(
             ],
         ),
     }
-    .purpose("start detached Hel worker");
+    .purpose("start detached Hel worker")
+    // Everything before this moves data into the target and reports as Sync.
+    // Start begins here, with the daemon launch.
+    .stage(ProvisionStage::Starting);
     execute_checked(executor, command)?;
     Ok(())
 }
@@ -1418,12 +1439,11 @@ mod tests {
         assert!(script.contains("command -v grok"));
         assert!(script.contains("[ -x \"$GROK_HOME/bin/grok\" ]"));
         assert!(script.contains("[ -x \"$HOME/.grok/bin/grok\" ]"));
-        assert!(script.contains("exec grok agent stdio"));
         assert!(script.contains("exit 127"));
-        assert!(
-            !script.contains("--always-approve"),
-            "a restricted session must not auto-approve: {script}"
-        );
+        // Grok Build asks by default and Hel answers by cancelling, so the
+        // flag rides along even on a target that does not force unrestricted
+        // mode. Without it a bare session could not write anything.
+        assert!(script.contains("exec grok agent --always-approve stdio"));
     }
     #[test]
     fn grok_default_bridge_adds_the_always_approve_flag_when_unrestricted() {
@@ -1445,16 +1465,15 @@ mod tests {
                 vec!["agent", "--always-approve", "stdio"],
             ),
         ] {
-            let (command, arguments) = bridge_launch(kind, Some(&executable), true);
-            assert_eq!(command, "/opt/harness");
-            assert_eq!(arguments, expected, "{kind:?} override arguments");
+            for unrestricted in [false, true] {
+                let (command, arguments) = bridge_launch(kind, Some(&executable), unrestricted);
+                assert_eq!(command, "/opt/harness");
+                assert_eq!(
+                    arguments, expected,
+                    "{kind:?} override arguments, unrestricted: {unrestricted}"
+                );
+            }
         }
-        let (_, restricted) = bridge_launch(
-            crate::hel_config::HarnessKind::Grok,
-            Some(&executable),
-            false,
-        );
-        assert_eq!(restricted, ["agent", "stdio"]);
     }
     #[test]
     fn stage_grok_profile_copies_authentication_and_agent_identity() {

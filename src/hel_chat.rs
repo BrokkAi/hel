@@ -26,7 +26,9 @@ use agent_client_protocol::schema::v1::{
     PlanEntryStatus, SessionConfigOption, SessionUpdate, TextContent, ToolCall, ToolCallContent,
     ToolCallStatus,
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Color;
 use sha2::{Digest, Sha256};
@@ -1146,7 +1148,7 @@ impl ChatState {
         });
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ChatAction {
         // Hover decides what scrolls; only Tab moves focus.
         let over_conversations = self
             .conversations_area
@@ -1156,8 +1158,12 @@ impl ChatState {
             (MouseEventKind::ScrollDown, true) => self.scroll_conversations(1),
             (MouseEventKind::ScrollUp, false) => self.scroll_history_up(MOUSE_SCROLL_ROWS),
             (MouseEventKind::ScrollDown, false) => self.scroll_history_down(MOUSE_SCROLL_ROWS),
+            (MouseEventKind::Down(MouseButton::Left), true) => {
+                return self.click_conversation_row(mouse);
+            }
             _ => {}
         }
+        ChatAction::None
     }
 
     fn apply_event(&mut self, event: &SequencedEvent) {

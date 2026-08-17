@@ -27,6 +27,14 @@ pub(crate) struct SessionOperationDisplay {
     /// When the current `stage` began, so the clock can count that stage's
     /// progress instead of the whole operation's.
     pub(crate) stage_started_at_epoch_seconds: Option<u64>,
+    /// The (profile, target) a resume is moving the session TO. The
+    /// controller updates the session record's own profile/target as soon as
+    /// a resume starts, but that update lands in a separate, disk-persisted
+    /// `Controller` inside the background task; the dashboard's local
+    /// session snapshot is not refreshed until the operation finishes. This
+    /// field lets the in-flight row show the destination instead of the
+    /// stale snapshot's pre-resume profile/target.
+    pub(crate) resume_destination: Option<(String, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -279,10 +287,26 @@ impl DashboardState {
                 placeholder,
                 stage: None,
                 stage_started_at_epoch_seconds: None,
+                resume_destination: None,
             },
         );
         self.apply_operation_projection();
         self.clamp_selections();
+    }
+
+    /// Record the profile/target a resume is moving `session_id` to, so its
+    /// in-flight "Resuming" row shows the destination rather than the
+    /// session's pre-resume profile/target. A finished or unknown operation
+    /// is left alone.
+    pub fn set_resume_destination(
+        &mut self,
+        session_id: &str,
+        profile_id: String,
+        target_template_id: String,
+    ) {
+        if let Some(operation) = self.session_operations.get_mut(session_id) {
+            operation.resume_destination = Some((profile_id, target_template_id));
+        }
     }
 
     /// Name the launch phase in flight; a finished or unknown operation is
@@ -943,6 +967,25 @@ mod tests {
     fn setting_a_stage_for_an_unknown_session_is_ignored() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
         dashboard.set_session_operation_stage("missing", ProvisionStage::Booting);
+        assert!(dashboard.session_operations.is_empty());
+    }
+
+    #[test]
+    fn set_resume_destination_updates_the_in_flight_operation() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Resuming, None);
+        dashboard.set_resume_destination("session-1", "grok-1".into(), "raw-localhost".into());
+
+        assert_eq!(
+            dashboard.session_operations["session-1"].resume_destination,
+            Some(("grok-1".to_string(), "raw-localhost".to_string()))
+        );
+    }
+
+    #[test]
+    fn set_resume_destination_for_an_unknown_session_is_ignored() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.set_resume_destination("missing", "grok-1".into(), "raw-localhost".into());
         assert!(dashboard.session_operations.is_empty());
     }
 

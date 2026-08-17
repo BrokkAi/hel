@@ -5,7 +5,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 
 use hel::hel_chat::{Notices, TranscriptSnapshot};
@@ -253,6 +255,14 @@ pub struct DashboardState {
     /// Hitbox of the selected session's conversation preview, so the wheel can
     /// scroll that preview instead of moving the selection.
     pub(crate) selected_preview_area: Option<Rect>,
+    /// Row hitboxes for the Active pane, keyed by the row's index into the
+    /// active session list. Each rect spans the summary line and every
+    /// visible preview line beneath it, so a click anywhere on the row
+    /// selects it.
+    pub(crate) active_row_areas: Vec<(usize, Rect)>,
+    /// Row hitboxes for the Archived pane, keyed by the row's index into the
+    /// archived session list. One line per row.
+    pub(crate) archived_row_areas: Vec<(usize, Rect)>,
     /// Rows the selected session's preview sits above its live tail. Only one
     /// preview scrolls at a time; selecting another session snaps this back to
     /// the tail, which is why the owning session is tracked alongside it.
@@ -282,6 +292,8 @@ impl DashboardState {
             pane_areas: None,
             import_sessions_area: None,
             selected_preview_area: None,
+            active_row_areas: Vec::new(),
+            archived_row_areas: Vec::new(),
             preview_scroll: 0,
             preview_scroll_session: None,
             mode: Mode::Dashboard,
@@ -418,6 +430,26 @@ impl DashboardState {
         }
         if !matches!(self.mode, Mode::Dashboard) {
             return;
+        }
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            if let Some(&(index, _)) = self
+                .active_row_areas
+                .iter()
+                .find(|(_, area)| rect_contains(*area, mouse.column, mouse.row))
+            {
+                self.focus = Focus::Active;
+                self.set_selection_for(Focus::Active, index);
+                return;
+            }
+            if let Some(&(index, _)) = self
+                .archived_row_areas
+                .iter()
+                .find(|(_, area)| rect_contains(*area, mouse.column, mouse.row))
+            {
+                self.focus = Focus::Archived;
+                self.set_selection_for(Focus::Archived, index);
+                return;
+            }
         }
         // The selected session's conversation preview scrolls its own history;
         // anywhere else the wheel moves the hovered list's selection.
@@ -670,10 +702,9 @@ impl DashboardState {
                 .map(ProfileQuota::compact)
                 .unwrap_or_else(|| "refreshing".to_string())
         };
-        let danger = if harness == HarnessKind::Kimi {
-            "  ⚠ DANGER: auto mode allows commands without approval"
-        } else {
-            ""
+        let danger = match harness.bare_target_auto_approval() {
+            Some(mechanism) => format!("  ⚠ DANGER: {mechanism} approves every command"),
+            None => String::new(),
         };
         format!("{id}  {}  ·  {quota}{danger}", harness.display_name())
     }
@@ -942,7 +973,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use crossterm::event::{KeyCode, MouseEventKind};
+    use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1466,6 +1497,81 @@ mod tests {
         assert_eq!(dashboard.quota_index, 2);
         assert_eq!(dashboard.session_index, 0);
         assert_eq!(dashboard.focus, Focus::Active);
+    }
+
+    #[test]
+    fn clicking_an_active_rows_tail_line_selects_that_session() {
+        let mut dashboard = dashboard_with_conversations(3);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw active row hitboxes");
+        assert_eq!(dashboard.session_index, 0, "starts on the first session");
+
+        let (_, row) = *dashboard
+            .active_row_areas
+            .iter()
+            .find(|(index, _)| *index == 2)
+            .expect("the third active row has a recorded hitbox");
+        assert!(
+            row.height > 1,
+            "an unselected row still spans its preview lines"
+        );
+        // Click the row's bottom line, i.e. its conversation tail, not the
+        // one-line summary at the top.
+        dashboard.handle_mouse(mouse_at_row(
+            MouseEventKind::Down(MouseButton::Left),
+            row,
+            row.height - 1,
+        ));
+
+        assert_eq!(
+            dashboard.session_index, 2,
+            "clicking the tail line selected the row, not just its summary line"
+        );
+        assert_eq!(dashboard.focus, Focus::Active);
+    }
+
+    #[test]
+    fn clicking_an_archived_row_selects_it_and_focuses_archived() {
+        let sessions = (0..3)
+            .map(|index| {
+                let mut session = archived_session();
+                session.id = format!("session-{index}");
+                (session.id.clone(), session)
+            })
+            .collect();
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState {
+                version: STATE_VERSION,
+                sessions,
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw archived row hitboxes");
+        dashboard.focus = Focus::Active;
+
+        let (_, row) = *dashboard
+            .archived_row_areas
+            .iter()
+            .find(|(index, _)| *index == 1)
+            .expect("the second archived row has a recorded hitbox");
+        dashboard.handle_mouse(mouse_at_row(
+            MouseEventKind::Down(MouseButton::Left),
+            row,
+            0,
+        ));
+
+        assert_eq!(
+            dashboard.session_index, 1,
+            "there are no active sessions, so the archived index is the raw session index"
+        );
+        assert_eq!(dashboard.focus, Focus::Archived);
     }
 
     /// A dashboard with `count` running sessions, each carrying a numbered

@@ -10,10 +10,6 @@ use serde_json::Value;
 
 use crate::hel_transcript::is_false;
 
-/// File name of the controller-owned canonical session projection restored
-/// alongside a checkpoint's target artifacts.
-pub const RESTORED_CANONICAL_SESSION_FILE: &str = "canonical-session.json";
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub name: String,

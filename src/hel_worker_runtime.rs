@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::hel_config::HarnessKind;
 
+pub use crate::hel_worker::WORKER_PID_FILE;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerOwnership {
@@ -118,6 +120,17 @@ mod unix {
         }
     }
 
+    use super::WORKER_PID_FILE;
+
+    /// Record this daemon's PID where session teardown can find it. Teardown
+    /// must stop the daemon before deleting the worker root; without this file
+    /// it can only guess from process command lines.
+    pub(super) fn write_worker_pidfile(root: &std::path::Path, pid: u32) -> Result<()> {
+        let path = root.join(WORKER_PID_FILE);
+        std::fs::write(&path, format!("{pid}\n"))
+            .with_context(|| format!("write worker pidfile {}", path.display()))
+    }
+
     pub async fn run_daemon(root: PathBuf, mut config: WorkerLaunchConfig) -> Result<()> {
         let startup_directory = std::env::current_dir()?;
         let root = super::resolve_relative_worker_root(root, &startup_directory);
@@ -127,10 +140,21 @@ mod unix {
         let credentials = super::credential_endpoint(&config);
         std::fs::create_dir_all(&root)
             .with_context(|| format!("create worker root {}", root.display()))?;
+        let socket = root.join("control.sock");
+        // Refuse a second daemon before touching durable state: opening the
+        // relay recovers the journal in place, so getting that far would
+        // corrupt the files a live worker is still writing.
+        if socket.exists() && UnixStream::connect(&socket).await.is_ok() {
+            bail!("a worker is already running at {}", socket.display());
+        }
         // Validate and recover durable state before publishing a socket. A
         // failed startup must never leave a fresh endpoint that looks live.
         let durable_relay =
             DurableRelay::open(&root, &config.session_id, env!("CARGO_PKG_VERSION"))?;
+        // Startup succeeded far enough to own this root, so claim it. A failed
+        // open leaves any previous pidfile alone rather than pointing teardown
+        // at a process that never took over.
+        write_worker_pidfile(&root, std::process::id())?;
         // Durable state recovered, so any exit record belongs to a previous
         // life of this worker. Leaving it would make the controller read this
         // startup as another death.
@@ -139,13 +163,9 @@ mod unix {
             std::fs::remove_file(&exit_record)
                 .with_context(|| format!("clear stale exit record {}", exit_record.display()))?;
         }
-        let socket = root.join("control.sock");
         if socket.exists() {
-            match UnixStream::connect(&socket).await {
-                Ok(_) => bail!("a worker is already running at {}", socket.display()),
-                Err(_) => std::fs::remove_file(&socket)
-                    .with_context(|| format!("remove stale socket {}", socket.display()))?,
-            }
+            std::fs::remove_file(&socket)
+                .with_context(|| format!("remove stale socket {}", socket.display()))?;
         }
         let listener = UnixListener::bind(&socket)
             .with_context(|| format!("bind worker socket {}", socket.display()))?;
@@ -157,6 +177,9 @@ mod unix {
         }
 
         let relay = Arc::new(Mutex::new(durable_relay));
+        // Client tasks are detached, so a durable failure they cannot recover
+        // from has to travel back here to stop the daemon.
+        let (fatal_tx, mut fatal_rx) = mpsc::channel(1);
         if relay
             .lock()
             .expect("relay state lock poisoned")
@@ -169,7 +192,15 @@ mod unix {
             // up and complete its checkpoint, but never reopen the ACP session.
             let (dispatch_wake_tx, dispatch_wake_rx) = mpsc::channel(1);
             drop(dispatch_wake_rx);
-            return serve_terminal_relay(listener, relay, dispatch_wake_tx, credentials).await;
+            return serve_terminal_relay(
+                listener,
+                relay,
+                dispatch_wake_tx,
+                credentials,
+                fatal_tx,
+                fatal_rx,
+            )
+            .await;
         }
 
         let resume_session =
@@ -217,16 +248,29 @@ mod unix {
                     let client_relay = relay.clone();
                     let client_dispatch_wake = dispatch_wake_tx.clone();
                     let client_credentials = credentials.clone();
+                    let client_fatal = fatal_tx.clone();
                     tokio::spawn(async move {
                         if let Err(error) = serve_client(
                             stream,
                             client_relay,
                             client_dispatch_wake,
                             client_credentials,
+                            client_fatal,
                         ).await {
                             tracing::warn!(%error, "relay proxy client disconnected");
                         }
                     });
+                }
+                fatal = fatal_rx.recv() => {
+                    let error = fatal
+                        .unwrap_or_else(|| anyhow::anyhow!("relay failure report was lost"));
+                    event_task.abort();
+                    drop(acp_commands_tx);
+                    return abort_peer_and_return(
+                        &mut acp_task,
+                        error,
+                        "relay durable state became unwritable",
+                    ).await;
                 }
                 result = &mut event_task => {
                     match result {
@@ -280,7 +324,15 @@ mod unix {
         if let Err(error) = &acp_result {
             tracing::warn!(%error, "ACP runtime failed after the relay closed");
         }
-        serve_terminal_relay(listener, relay, dispatch_wake_tx, credentials).await
+        serve_terminal_relay(
+            listener,
+            relay,
+            dispatch_wake_tx,
+            credentials,
+            fatal_tx,
+            fatal_rx,
+        )
+        .await
     }
 
     pub(super) async fn abort_peer_and_return<T>(
@@ -298,21 +350,31 @@ mod unix {
         relay: Arc<Mutex<DurableRelay>>,
         dispatch_wake: mpsc::Sender<()>,
         credentials: std::result::Result<CredentialEndpoint, String>,
+        fatal: mpsc::Sender<anyhow::Error>,
+        mut fatal_reports: mpsc::Receiver<anyhow::Error>,
     ) -> Result<()> {
         loop {
-            let (stream, _) = listener
-                .accept()
-                .await
-                .context("accept closed relay proxy")?;
+            let stream = tokio::select! {
+                accepted = listener.accept() => {
+                    accepted.context("accept closed relay proxy")?.0
+                }
+                report = fatal_reports.recv() => {
+                    return Err(report
+                        .unwrap_or_else(|| anyhow::anyhow!("relay failure report was lost"))
+                        .context("relay durable state became unwritable"));
+                }
+            };
             let client_relay = relay.clone();
             let client_dispatch_wake = dispatch_wake.clone();
             let client_credentials = credentials.clone();
+            let client_fatal = fatal.clone();
             tokio::spawn(async move {
                 if let Err(error) = serve_client(
                     stream,
                     client_relay,
                     client_dispatch_wake,
                     client_credentials,
+                    client_fatal,
                 )
                 .await
                 {
@@ -724,12 +786,36 @@ mod unix {
         }
     }
 
+    /// A durable write can only fail permanently because the worker root is
+    /// gone: session teardown removed it under this daemon. Nothing served
+    /// afterwards could ever be persisted, so the daemon has to stop.
+    pub(super) fn worker_root_was_removed(
+        body: &RelayResponseBody,
+        root: &std::path::Path,
+    ) -> bool {
+        matches!(
+            body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::Internal,
+                    ..
+                }
+            }
+        ) && !root.is_dir()
+    }
+
     pub(super) async fn serve_client(
         stream: UnixStream,
         relay: Arc<Mutex<DurableRelay>>,
         dispatch_wake: mpsc::Sender<()>,
         credentials: std::result::Result<CredentialEndpoint, String>,
+        fatal: mpsc::Sender<anyhow::Error>,
     ) -> Result<()> {
+        let relay_root = relay
+            .lock()
+            .expect("relay state lock poisoned")
+            .root()
+            .to_path_buf();
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         let mut checkpoint_barriers = BTreeSet::new();
@@ -766,6 +852,13 @@ mod unix {
                     .lock()
                     .expect("relay state lock poisoned")
                     .handle(envelope);
+                if worker_root_was_removed(&response.body, &relay_root) {
+                    // One report is enough; the daemon is already winding down.
+                    let _ = fatal.try_send(anyhow::anyhow!(
+                        "worker root {} was removed while the relay was serving",
+                        relay_root.display()
+                    ));
+                }
                 let accepted = matches!(
                     &response.body,
                     RelayResponseBody::Ok {
@@ -797,13 +890,20 @@ mod unix {
 
         let cleanup_result =
             release_checkpoint_barriers(&relay, &dispatch_wake, checkpoint_barriers);
-        match (serving_result, cleanup_result) {
+        let outcome = match (serving_result, cleanup_result) {
             (Ok(()), cleanup_result) => cleanup_result,
             (Err(error), Ok(())) => Err(error),
             (Err(error), Err(cleanup_error)) => Err(error.context(format!(
                 "also failed to release checkpoint barriers: {cleanup_error:#}"
             ))),
+        };
+        if outcome.is_err() && !relay_root.is_dir() {
+            let _ = fatal.try_send(anyhow::anyhow!(
+                "worker root {} was removed while the relay was serving",
+                relay_root.display()
+            ));
         }
+        outcome
     }
 
     /// Serve a credential or skills request against this relay's own harness
@@ -1202,7 +1302,24 @@ mod unix {
             libc::kill(-pid, signal);
         }
     }
+
+    /// Make this process lead its own session, so session teardown can stop
+    /// the whole worker tree with a single process-group signal. Failing means
+    /// the process already leads its group, which is the state we wanted.
+    ///
+    /// Only the real daemon entry point may call this: it detaches the caller
+    /// from its controlling terminal.
+    pub fn lead_process_group() {
+        // SAFETY: setsid takes no arguments and changes only this process's
+        // own session and process-group membership.
+        unsafe {
+            libc::setsid();
+        }
+    }
 }
+
+#[cfg(not(unix))]
+pub fn lead_process_group() {}
 
 /// Where this relay's harness keeps its home, resolved solely from the launch
 /// config. Credential and skills requests carry no path, so a caller cannot
@@ -1255,7 +1372,7 @@ fn resolve_relative_worker_root(root: PathBuf, base: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-pub use unix::{proxy, run_acp_supervisor, run_daemon};
+pub use unix::{lead_process_group, proxy, run_acp_supervisor, run_daemon};
 
 #[cfg(not(unix))]
 pub async fn run_daemon(
@@ -1309,6 +1426,12 @@ mod relay_tests {
     fn runtime_event_channel() -> (TestRuntimeEventSender, mpsc::Receiver<RuntimeEvent>) {
         let (sender, receiver) = mpsc::channel(unix::ACP_EVENT_CHANNEL_CAPACITY);
         (TestRuntimeEventSender(sender), receiver)
+    }
+
+    /// Channel a served client uses to report that durable state became
+    /// unwritable. Most fixtures only need somewhere for that report to go.
+    fn fatal_reports() -> (mpsc::Sender<anyhow::Error>, mpsc::Receiver<anyhow::Error>) {
+        mpsc::channel(1)
     }
 
     fn launch_config(profile_home: &str) -> WorkerLaunchConfig {
@@ -1466,6 +1589,7 @@ mod relay_tests {
             relay.clone(),
             wake_tx,
             Ok(endpoint),
+            fatal_reports().0,
         ));
         let (reader, mut writer) = client.into_split();
         let mut lines = BufReader::new(reader).lines();
@@ -1553,7 +1677,13 @@ mod relay_tests {
         let replacement = codex_credentials("2026-08-06T02:51:00Z");
         let (wake_tx, _wake_rx) = mpsc::channel(1);
         let (server, client) = tokio::net::UnixStream::pair().unwrap();
-        let server_task = tokio::spawn(unix::serve_client(server, relay, wake_tx, Ok(endpoint)));
+        let server_task = tokio::spawn(unix::serve_client(
+            server,
+            relay,
+            wake_tx,
+            Ok(endpoint),
+            fatal_reports().0,
+        ));
         let (reader, mut writer) = client.into_split();
         let mut lines = BufReader::new(reader).lines();
 
@@ -2751,6 +2881,7 @@ mod relay_tests {
             relay.clone(),
             wake_tx,
             test_credentials(),
+            fatal_reports().0,
         ));
         let request = RelayRequestEnvelope {
             request_id: "release-request".into(),
@@ -3032,6 +3163,75 @@ mod relay_tests {
         coordinator.await.unwrap().unwrap();
     }
 
+    /// A served request that cannot be persisted because teardown removed the
+    /// worker root has to stop the daemon; answering on from memory would keep
+    /// a closed session apparently alive.
+    #[tokio::test]
+    async fn a_removed_worker_root_reports_a_fatal_failure_to_the_daemon() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("worker-root");
+        let mut durable = DurableRelay::open(&root, SESSION_ID, "1.0.0").unwrap();
+        durable
+            .record_observation(RelayObservation::Warning {
+                message: "before teardown".into(),
+            })
+            .unwrap();
+        let through = durable.latest_ordinal();
+        let digest = durable.latest_digest().to_owned();
+        let relay = Arc::new(Mutex::new(durable));
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let (fatal_tx, mut fatal_rx) = fatal_reports();
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let served = tokio::spawn(unix::serve_client(
+            server,
+            relay.clone(),
+            wake_tx,
+            test_credentials(),
+            fatal_tx,
+        ));
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let request = RelayRequestEnvelope {
+            request_id: "acknowledge-after-teardown".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Acknowledge {
+                through_ordinal: through,
+                through_digest: digest,
+            },
+        };
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+        let response: crate::hel_worker::RelayResponseEnvelope =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(
+                response.body,
+                RelayResponseBody::Error {
+                    error: RelayProtocolError {
+                        code: RelayErrorCode::Internal,
+                        ..
+                    }
+                }
+            ),
+            "{:?}",
+            response.body
+        );
+
+        let report = fatal_rx.recv().await.expect("the daemon must be told");
+        assert!(format!("{report:#}").contains("was removed"), "{report:#}");
+        assert!(
+            !root.exists(),
+            "serving a request recreated the worker root"
+        );
+
+        drop(writer);
+        drop(lines);
+        served.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn client_disconnect_releases_checkpoint_and_runs_queued_prompt() {
         let temp = tempfile::tempdir().unwrap();
@@ -3058,6 +3258,7 @@ mod relay_tests {
             relay.clone(),
             wake_tx.clone(),
             test_credentials(),
+            fatal_reports().0,
         ));
         let (reader, mut writer) = client.into_split();
         let mut lines = BufReader::new(reader).lines();
@@ -3172,6 +3373,7 @@ mod relay_tests {
             relay,
             wake_tx,
             test_credentials(),
+            fatal_reports().0,
         ));
         let (reader, mut writer) = client.into_split();
         let mut lines = BufReader::new(reader).lines();
@@ -3243,6 +3445,7 @@ mod relay_tests {
             relay.clone(),
             wake_tx.clone(),
             test_credentials(),
+            fatal_reports().0,
         ));
         let (reader, mut writer) = client.into_split();
         let mut lines = BufReader::new(reader).lines();
@@ -3344,6 +3547,7 @@ mod relay_tests {
             relay,
             wake_tx.clone(),
             test_credentials(),
+            fatal_reports().0,
         ));
         let (reader, mut writer) = client.into_split();
         let request = RelayRequestEnvelope {
@@ -3448,11 +3652,14 @@ mod relay_tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let (wake_tx, wake_rx) = mpsc::channel(1);
         drop(wake_rx);
+        let (fatal_tx, fatal_rx) = fatal_reports();
         let terminal = tokio::spawn(unix::serve_terminal_relay(
             listener,
             relay.clone(),
             wake_tx,
             test_credentials(),
+            fatal_tx,
+            fatal_rx,
         ));
         let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
         let (reader, mut writer) = stream.into_split();
@@ -3591,10 +3798,82 @@ mod relay_tests {
         assert_eq!(state.execution, RelayExecutionState::Closed);
         assert_eq!(state.latest_ordinal, closed_frontier);
         assert!(!root.join("acp-supervisor.json").exists());
+        // Session teardown reads this file to stop the daemon before it
+        // deletes the root out from under it.
+        assert_eq!(
+            std::fs::read_to_string(root.join(WORKER_PID_FILE))
+                .unwrap()
+                .trim(),
+            std::process::id().to_string()
+        );
 
         writer.shutdown().await.unwrap();
         daemon.abort();
         assert!(daemon.await.unwrap_err().is_cancelled());
+    }
+
+    /// Opening the relay recovers its journal in place, so a second daemon has
+    /// to detect the live one before it can rewrite files the first is using.
+    #[tokio::test]
+    async fn a_live_worker_stops_a_second_daemon_before_it_touches_durable_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_owned();
+        let mut relay = DurableRelay::open(&root, SESSION_ID, "1.0.0").unwrap();
+        relay
+            .record_observation(RelayObservation::Warning {
+                message: "recorded by the live worker".into(),
+            })
+            .unwrap();
+        drop(relay);
+
+        // A torn tail is exactly what a startup recovery would rewrite.
+        let journal = root
+            .join(crate::hel_worker::RELAY_JOURNAL_DIR)
+            .join("active.jsonl");
+        let mut torn = std::fs::read(&journal).unwrap();
+        torn.extend_from_slice(b"{\"ordinal\":2,\"truncated\"");
+        std::fs::write(&journal, &torn).unwrap();
+        let exit_record = root.join("worker-exit.json");
+        std::fs::write(&exit_record, b"{\"reason\":\"earlier life\"}").unwrap();
+        let _live = tokio::net::UnixListener::bind(root.join("control.sock")).unwrap();
+
+        let error = unix::run_daemon(root.clone(), launch_config("/profile"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("a worker is already running"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&journal).unwrap(),
+            torn,
+            "the second daemon recovered a live worker's journal"
+        );
+        assert!(
+            exit_record.exists(),
+            "the live worker's exit record was cleared"
+        );
+        assert!(
+            !root.join(WORKER_PID_FILE).exists(),
+            "the second daemon claimed a root it does not own"
+        );
+    }
+
+    /// Teardown needs the PID of the daemon that owns the root right now, not
+    /// of one that died earlier.
+    #[test]
+    fn the_worker_pidfile_replaces_a_previous_daemons_claim() {
+        let temp = tempfile::tempdir().unwrap();
+        let pidfile = temp.path().join(WORKER_PID_FILE);
+        std::fs::write(&pidfile, "999999999\n").unwrap();
+
+        unix::write_worker_pidfile(temp.path(), std::process::id()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&pidfile).unwrap().trim(),
+            std::process::id().to_string()
+        );
     }
 
     #[tokio::test]

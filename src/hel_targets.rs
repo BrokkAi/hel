@@ -297,8 +297,21 @@ pub trait CommandExecutor {
 
 pub struct ProcessExecutor;
 
+/// One debug line per finished target command, so a slow launch or resume
+/// phase can be attributed from logs instead of re-profiled by hand.
+fn trace_command_duration(command: &CommandSpec, started: Instant, status: i32) {
+    tracing::debug!(
+        purpose = command.purpose.as_str(),
+        program = command.program.as_str(),
+        status,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "target command finished"
+    );
+}
+
 impl CommandExecutor for ProcessExecutor {
     fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        let started = Instant::now();
         let output = Command::new(&command.program)
             .args(&command.args)
             .envs(&command.env)
@@ -306,6 +319,7 @@ impl CommandExecutor for ProcessExecutor {
             .output()
             .with_context(|| format!("run {} for {}", command.program, command.purpose))?;
         let status = output.status.code().unwrap_or(-1);
+        trace_command_duration(command, started, status);
         Ok(CommandOutput {
             status,
             stdout: output.stdout,
@@ -340,6 +354,7 @@ fn stream_command_with_stdin(
     input: &mut (dyn Read + Send),
     is_cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<CommandOutput> {
+    let started = Instant::now();
     if is_cancelled() {
         bail!("operation cancelled");
     }
@@ -433,8 +448,10 @@ fn stream_command_with_stdin(
         // it. A successful child must not hide an input error.
         input_result?;
     }
+    let status = status.code().unwrap_or(-1);
+    trace_command_duration(command, started, status);
     Ok(CommandOutput {
-        status: status.code().unwrap_or(-1),
+        status,
         stdout,
         stderr,
     })
@@ -512,6 +529,7 @@ impl CommandExecutor for CancellableProcessExecutor {
     }
 
     fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        let started = Instant::now();
         self.check_cancelled()?;
         let mut child = cancellable_command(command)
             .stdin(Stdio::null())
@@ -550,8 +568,10 @@ impl CommandExecutor for CancellableProcessExecutor {
         let stderr = stderr_reader
             .join()
             .map_err(|_| anyhow::anyhow!("command stderr reader panicked"))??;
+        let status = status.code().unwrap_or(-1);
+        trace_command_duration(command, started, status);
         Ok(CommandOutput {
-            status: status.code().unwrap_or(-1),
+            status,
             stdout,
             stderr,
         })
@@ -885,7 +905,7 @@ fn checked_command_output(command: &CommandSpec, output: CommandOutput) -> Resul
 }
 
 /// Describe a spawned command thread's panic payload for error context.
-fn command_thread_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn command_thread_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_owned()
     } else if let Some(message) = payload.downcast_ref::<String>() {
@@ -1738,14 +1758,126 @@ pub fn worker_root(locator: &TargetLocator, session_id: &str) -> Result<String> 
     })
 }
 
+/// POSIX shell that stops the detached worker daemon rooted at `worker_root`.
+///
+/// A bare target's daemon is an ordinary host process that outlives the
+/// controller's connection, so removing its root is not enough: the daemon
+/// would keep writing and recreate what teardown just deleted. The match
+/// pattern is assembled at run time, so the script's own command line never
+/// contains it and the search cannot select the shell running it. `worker
+/// proxy` command lines cannot match either.
+///
+/// The daemon leads its own process group, so the signal goes to the group
+/// first to take the agent down with it. Shells disagree about how to write a
+/// negative PID (`dash` rejects `--`), hence the two forms before the
+/// single-process fallback for daemons predating the group leadership.
+fn stop_worker_daemon_script(worker_root: &str) -> String {
+    format!(
+        r#"hel_root={root}
+hel_match="worker run --root $hel_root"
+hel_ps() {{
+    ps -ww "$@" 2>/dev/null || ps "$@" 2>/dev/null
+}}
+hel_signal() {{
+    kill -"$1" -- "-$2" 2>/dev/null && return 0
+    kill -"$1" "-$2" 2>/dev/null && return 0
+    kill -"$1" "$2" 2>/dev/null
+}}
+hel_stop() {{
+    hel_signal TERM "$1" || return 0
+    hel_waited=0
+    while [ "$hel_waited" -lt 2 ]; do
+        kill -0 "$1" 2>/dev/null || return 0
+        sleep 1
+        hel_waited=$((hel_waited + 1))
+    done
+    kill -0 "$1" 2>/dev/null || return 0
+    hel_signal KILL "$1" || true
+}}
+hel_is_worker() {{
+    hel_args=$(hel_ps -o args= -p "$1") || return 1
+    case "$hel_args" in
+        *"$hel_match"*) return 0 ;;
+    esac
+    return 1
+}}
+if [ -f "$hel_root/{pid_file}" ]; then
+    hel_pid=$(cat "$hel_root/{pid_file}" 2>/dev/null)
+    case "$hel_pid" in
+        '' | *[!0-9]*) hel_pid= ;;
+    esac
+    if [ -n "$hel_pid" ] && hel_is_worker "$hel_pid"; then
+        hel_stop "$hel_pid"
+    fi
+fi
+hel_ps -eo pid=,args= | while read -r hel_pid hel_args; do
+    case "$hel_pid" in
+        '' | *[!0-9]*) continue ;;
+    esac
+    case "$hel_args" in
+        *"$hel_match"*) hel_stop "$hel_pid" ;;
+    esac
+done"#,
+        root = posix_quote(worker_root),
+        pid_file = crate::hel_worker::WORKER_PID_FILE,
+    )
+}
+
+/// Stop a leaked worker and delete the durable relay state under its root.
+///
+/// A resume seeds fresh relay state into the same root a closed session used.
+/// Leftover state wins over that seed at startup, so it has to go, and
+/// whatever might still be writing it has to go first. Container and instance
+/// targets are rebuilt from scratch on resume, so they need nothing here.
+pub fn clear_relay_state_plan(
+    locator: &TargetLocator,
+    session_id: &str,
+) -> Result<Option<CommandSpec>> {
+    verify_locator(locator, session_id)?;
+    let session_worker_root = worker_root(locator, session_id)?;
+    let script = format!(
+        "{}\nrm -rf -- {} {}\n",
+        stop_worker_daemon_script(&session_worker_root),
+        posix_quote(&format!(
+            "{session_worker_root}/{}",
+            crate::hel_worker::RELAY_STATE_FILE
+        )),
+        posix_quote(&format!(
+            "{session_worker_root}/{}",
+            crate::hel_worker::RELAY_JOURNAL_DIR
+        )),
+    );
+    Ok(match locator {
+        TargetLocator::LocalBare { .. } => Some(
+            CommandSpec::new("sh", ["-c", script.as_str()])
+                .purpose("stop a leaked local Hel worker and clear its relay state"),
+        ),
+        TargetLocator::SshBare { ssh, .. } => Some(
+            ssh_command(ssh, ["sh", "-c", script.as_str()])
+                .purpose("stop a leaked remote Hel worker and clear its relay state"),
+        ),
+        TargetLocator::LocalPodman { .. }
+        | TargetLocator::AppleContainer { .. }
+        | TargetLocator::SshPodman { .. }
+        | TargetLocator::AwsEc2 { .. } => None,
+    })
+}
+
 pub fn close_plan(locator: &TargetLocator, session_id: &str) -> Result<CommandPlan> {
     verify_locator(locator, session_id)?;
     let session_worker_root = worker_root(locator, session_id)?;
     let session_profile_home = format!(".local/share/hel/profiles/{session_id}");
     let command = match locator {
         TargetLocator::LocalBare { .. } => {
-            CommandSpec::new("rm", ["-rf", "--", session_worker_root.as_str()])
-                .purpose("remove exact local Hel worker state")
+            // The daemon dies before its root does: a survivor's next durable
+            // write would recreate the directory this command removes.
+            let script = format!(
+                "{}\nrm -rf -- {}\n",
+                stop_worker_daemon_script(&session_worker_root),
+                posix_quote(&session_worker_root),
+            );
+            CommandSpec::new("sh", ["-c", script.as_str()])
+                .purpose("stop the local Hel worker and remove exact local Hel worker state")
         }
         TargetLocator::LocalPodman { container_id } => {
             CommandSpec::new("podman", ["rm", "--force", "--ignore", container_id])
@@ -1778,18 +1910,20 @@ pub fn close_plan(locator: &TargetLocator, session_id: &str) -> Result<CommandPl
             )
             .purpose("terminate exact EC2 session instance")
         }
-        TargetLocator::SshBare { ssh, workspace } => ssh_command(
-            ssh,
-            [
-                "rm",
-                "-rf",
-                "--",
-                workspace,
-                &session_worker_root,
-                &session_profile_home,
-            ],
-        )
-        .purpose("remove exact SSH session workspace and runtime state"),
+        TargetLocator::SshBare { ssh, workspace } => {
+            // Same ordering constraint as the local bare target: stop the
+            // daemon before deleting the root it keeps writing to.
+            let script = format!(
+                "{}\nrm -rf -- {} {} {}\n",
+                stop_worker_daemon_script(&session_worker_root),
+                posix_quote(workspace),
+                posix_quote(&session_worker_root),
+                posix_quote(&session_profile_home),
+            );
+            ssh_command(ssh, ["sh", "-c", script.as_str()]).purpose(
+                "stop the remote Hel worker and remove exact SSH session workspace and runtime state",
+            )
+        }
         TargetLocator::SshPodman { ssh, container_id } => {
             ssh_command(ssh, ["podman", "rm", "--force", "--ignore", container_id])
                 .purpose("remove exact remote Podman session container")
@@ -3345,8 +3479,103 @@ mod tests {
             ["worker", "proxy", "--root", worker_root.as_str()]
         );
         let close = close_plan(&locator, SESSION).unwrap();
-        assert_eq!(close.commands[0].program, "rm");
-        assert_eq!(close.commands[0].args, ["-rf", "--", worker_root.as_str()]);
+        assert_eq!(close.commands[0].program, "sh");
+        assert_eq!(close.commands[0].args[0], "-c");
+        let script = &close.commands[0].args[1];
+        assert!(script.contains(&format!("hel_root='{worker_root}'")));
+        assert!(script.ends_with(&format!("rm -rf -- '{worker_root}'\n")));
+    }
+
+    /// A leaked daemon that survives teardown recreates the root it is asked
+    /// to forget, so the kill has to be part of the same cleanup command.
+    #[test]
+    fn bare_cleanup_stops_the_recorded_worker_before_removing_its_root() {
+        let worker_root = format!("/var/lib/hel/workers/{SESSION}");
+        let local = close_plan(
+            &TargetLocator::LocalBare {
+                worker_root: worker_root.clone(),
+            },
+            SESSION,
+        )
+        .unwrap();
+        let remote = close_plan(
+            &TargetLocator::SshBare {
+                ssh: ssh(),
+                workspace: format!(".local/share/hel/workspaces/{SESSION}"),
+            },
+            SESSION,
+        )
+        .unwrap();
+
+        for script in [
+            local.commands[0].args[1].clone(),
+            remote.commands[0].args.last().unwrap().clone(),
+        ] {
+            let kill = script
+                .find("hel_signal TERM")
+                .expect("cleanup signals the worker");
+            let remove = script.find("rm -rf").expect("cleanup removes the root");
+            assert!(kill < remove, "the worker must die before its root does");
+            // The pidfile is the identity check; a reused PID running
+            // something else must survive.
+            assert!(script.contains("worker.pid"));
+            assert!(script.contains(r#"hel_match="worker run --root $hel_root""#));
+            assert!(script.contains("hel_is_worker"));
+            assert!(script.contains("hel_signal KILL"));
+            assert!(!script.contains("pkill"));
+        }
+        assert!(
+            remote.commands[0]
+                .args
+                .last()
+                .unwrap()
+                .contains(&format!(".local/share/hel/workers/{SESSION}")),
+        );
+    }
+
+    /// Resume reuses a bare target's worker root, so anything left writing
+    /// there and any stale relay state has to go before the restore seeds it.
+    #[test]
+    fn resume_cleanup_clears_relay_state_only_for_reused_bare_roots() {
+        let local = clear_relay_state_plan(
+            &TargetLocator::LocalBare {
+                worker_root: format!("/var/lib/hel/workers/{SESSION}"),
+            },
+            SESSION,
+        )
+        .unwrap()
+        .expect("raw localhost reuses its worker root");
+        let script = &local.args[1];
+        assert!(script.contains("hel_signal TERM"));
+        assert!(script.contains(&format!(
+            "rm -rf -- '/var/lib/hel/workers/{SESSION}/relay-state.json' \
+             '/var/lib/hel/workers/{SESSION}/relay-journal'"
+        )));
+
+        let remote = clear_relay_state_plan(
+            &TargetLocator::SshBare {
+                ssh: ssh(),
+                workspace: format!(".local/share/hel/workspaces/{SESSION}"),
+            },
+            SESSION,
+        )
+        .unwrap()
+        .expect("an SSH host reuses its worker root");
+        assert!(remote.args.last().unwrap().contains(&format!(
+            ".local/share/hel/workers/{SESSION}/relay-state.json"
+        )));
+
+        // Containers and instances are rebuilt from nothing on resume.
+        assert!(
+            clear_relay_state_plan(
+                &TargetLocator::LocalPodman {
+                    container_id: resource_name(SESSION).unwrap(),
+                },
+                SESSION,
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]

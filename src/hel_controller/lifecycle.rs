@@ -11,8 +11,8 @@ use crate::hel_worker::{RelayCommand, RelayExecutionState};
 
 use super::backend::backend_locator;
 use super::checkpoint::{
-    LatchExclusivity, prune_replaced_checkpoint, verify_installed_checkpoint_gate,
-    wait_for_relay_closed,
+    CheckpointExportPolicy, LatchExclusivity, prune_replaced_checkpoint,
+    verify_installed_checkpoint_gate, wait_for_relay_closed,
 };
 use super::worktree::cleanup_managed_worktree;
 use super::{Controller, now, persist_session_record_transition_or_restore};
@@ -75,6 +75,7 @@ impl Controller {
                 executor,
                 manager,
                 LatchExclusivity::HoldThroughClose,
+                CheckpointExportPolicy::ReuseUnchangedArchive,
             )
             .await
         {

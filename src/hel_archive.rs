@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use rayon::prelude::*;
@@ -122,6 +122,18 @@ impl CanonicalSessionSnapshot {
     pub fn validate(&self) -> Result<()> {
         validate_canonical_session(self)
     }
+
+    /// Whether two snapshots carry the same session content.
+    ///
+    /// The event frontier and its digest are deliberately ignored: relay
+    /// bookkeeping advances them without changing what the session contains.
+    /// `last_activity_at_ms` is a watermark of the same kind.
+    pub fn content_matches(&self, other: &Self) -> bool {
+        self.transcript == other.transcript
+            && self.queued_prompts == other.queued_prompts
+            && self.session.without_activity_watermark()
+                == other.session.without_activity_watermark()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +144,18 @@ pub struct CanonicalSessionState {
     pub last_activity_at_ms: Option<i64>,
     pub session_title: Option<String>,
     pub configuration: BTreeMap<String, serde_json::Value>,
+}
+
+impl CanonicalSessionState {
+    /// The same state with its volatile activity watermark cleared, so two
+    /// states can be compared on content alone. Cloning keeps every other
+    /// field in the comparison, including fields added later.
+    fn without_activity_watermark(&self) -> Self {
+        Self {
+            last_activity_at_ms: None,
+            ..self.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1740,23 +1764,10 @@ pub struct SystemGit;
 
 impl GitCommandRunner for SystemGit {
     fn run(&self, repository: &Path, command: &GitCommand) -> Result<GitOutput> {
-        let mut child = Command::new("git")
-            .args(&command.arguments)
-            .current_dir(repository)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("start git in {}", repository.display()))?;
-        if !command.stdin.is_empty() {
-            child
-                .stdin
-                .take()
-                .expect("piped Git stdin")
-                .write_all(&command.stdin)
-                .context("write Git stdin")?;
-        }
-        let output = child.wait_with_output().context("wait for Git")?;
+        let mut process = Command::new("git");
+        process.args(&command.arguments).current_dir(repository);
+        let output = crate::hel_subprocess::run_with_input(&mut process, &command.stdin)
+            .with_context(|| format!("run git in {}", repository.display()))?;
         Ok(GitOutput {
             status: output.status.code().unwrap_or(-1),
             stdout: output.stdout,
@@ -3385,6 +3396,57 @@ mod tests {
         let mut metadata = serde_json::to_value(repository("repo").metadata).unwrap();
         metadata.as_object_mut().unwrap().remove("base_commit");
         assert!(serde_json::from_value::<RepositoryMetadata>(metadata).is_err());
+    }
+
+    #[test]
+    fn content_matching_ignores_the_frontier_and_the_activity_watermark() {
+        let archived = input().canonical_session;
+        let mut latched = archived.clone();
+        // Checkpoint bookkeeping alone moves the frontier and the watermark.
+        latched.event_frontier += 6;
+        latched.event_frontier_digest = "b".repeat(64);
+        latched.session.last_activity_at_ms = Some(9_999);
+
+        assert!(archived.content_matches(&latched));
+        assert!(latched.content_matches(&archived));
+    }
+
+    #[test]
+    fn content_matching_rejects_new_transcript_queue_or_title_content() {
+        let archived = input().canonical_session;
+
+        let mut extra_transcript = archived.clone();
+        extra_transcript.transcript.push(CanonicalTranscriptItem {
+            stable_id: "user-3".into(),
+            position: 3,
+            latest_content_event_ordinal: None,
+            created_at_ms: 105,
+            last_changed_at_ms: 105,
+            body: CanonicalTranscriptBody::User {
+                content: vec![serde_json::json!({"type": "text", "text": "again"})],
+            },
+        });
+        assert!(!archived.content_matches(&extra_transcript));
+
+        let mut extra_prompt = archived.clone();
+        extra_prompt.queued_prompts.push(CanonicalQueuedPrompt {
+            command_id: "prompt-5".into(),
+            kind: CanonicalQueuedCommandKind::Prompt,
+            content: vec![serde_json::json!({"type": "text", "text": "later"})],
+            queued_at_ms: 105,
+        });
+        assert!(!archived.content_matches(&extra_prompt));
+
+        let mut retitled = archived.clone();
+        retitled.session.session_title = Some("Reforge Hel".into());
+        assert!(!archived.content_matches(&retitled));
+
+        let mut reconfigured = archived.clone();
+        reconfigured
+            .session
+            .configuration
+            .insert("reasoning_effort".into(), serde_json::json!("low"));
+        assert!(!archived.content_matches(&reconfigured));
     }
 
     #[test]

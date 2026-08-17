@@ -42,6 +42,8 @@ const DASHBOARD_FIXED_HEIGHT: u16 = 3;
 pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     dashboard.pane_areas = None;
     dashboard.selected_preview_area = None;
+    dashboard.active_row_areas.clear();
+    dashboard.archived_row_areas.clear();
     let area = frame.area();
     if area.width < MINIMUM_TERMINAL_WIDTH {
         render_terminal_too_small(
@@ -311,7 +313,7 @@ fn render_adaptive_dashboard(
         active_previews.applied_scroll = applied;
     }
     dashboard.preview_scroll = active_previews.applied_scroll;
-    if let Some(preview_area) = render_sessions(
+    let rendered_rows = render_sessions(
         frame,
         panes[0],
         panes[1],
@@ -319,9 +321,10 @@ fn render_adaptive_dashboard(
         &active,
         &archived,
         &active_previews.previews,
-    ) {
-        dashboard.selected_preview_area = Some(preview_area);
-    }
+    );
+    dashboard.selected_preview_area = rendered_rows.selected_preview_area;
+    dashboard.active_row_areas = rendered_rows.active_row_areas;
+    dashboard.archived_row_areas = rendered_rows.archived_row_areas;
     render_capacity(frame, panes[2], dashboard);
     render_quotas(frame, panes[3], dashboard);
     render_footer(frame, fixed[2], dashboard);
@@ -491,8 +494,17 @@ fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) 
     );
 }
 
+/// Session-row rendering results that the caller folds back into the
+/// dashboard's mouse hitboxes once the borrow of `active`/`archived` (which
+/// alias `dashboard.state.sessions`) has ended.
+struct SessionRowsRendered {
+    selected_preview_area: Option<Rect>,
+    active_row_areas: Vec<(usize, Rect)>,
+    archived_row_areas: Vec<(usize, Rect)>,
+}
+
 /// Draws the Active and Paused panes and reports the selected session's
-/// preview hitbox, if one was drawn.
+/// preview hitbox and the per-row mouse hitboxes.
 fn render_sessions(
     frame: &mut Frame,
     active_area: Rect,
@@ -501,7 +513,7 @@ fn render_sessions(
     active: &[&SessionRecord],
     archived: &[&SessionRecord],
     active_previews: &[Vec<Line<'static>>],
-) -> Option<Rect> {
+) -> SessionRowsRendered {
     let now_epoch_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -547,6 +559,7 @@ fn render_sessions(
     let mut row_y = active_area.y + SESSION_TABLE_CHROME_HEIGHT;
     let mut visible_sessions = 0;
     let mut selected_preview_area = None;
+    let mut active_row_areas = Vec::new();
     for (index, session) in active.iter().enumerate().skip(active_offset) {
         let preview = &active_previews[index];
         let spacer = u16::from(index > 0);
@@ -587,6 +600,15 @@ fn render_sessions(
             }
             frame.render_widget(Paragraph::new(preview.clone()), preview_area);
         }
+        let row_rect = Rect::new(
+            active_area.x.saturating_add(1),
+            info_y,
+            active_area.width.saturating_sub(2),
+            detail_y
+                .saturating_sub(info_y)
+                .saturating_add(preview_height),
+        );
+        active_row_areas.push((index, row_rect));
         row_y = row_y.saturating_add(preview.len() as u16 + 1 + spacer);
     }
     render_session_scrollbar(
@@ -630,6 +652,20 @@ fn render_sessions(
             .filter(|index| *index < archived.len()),
     );
     frame.render_stateful_widget(archived_table, archived_area, &mut archived_state);
+    let archived_offset = archived_state.offset();
+    let mut archived_row_areas = Vec::new();
+    for (row, index) in (archived_area.y + SESSION_TABLE_CHROME_HEIGHT
+        ..archived_area.bottom().saturating_sub(1))
+        .zip(archived_offset..archived.len())
+    {
+        let row_rect = Rect::new(
+            archived_area.x.saturating_add(1),
+            row,
+            archived_area.width.saturating_sub(2),
+            1,
+        );
+        archived_row_areas.push((index, row_rect));
+    }
     render_session_scrollbar(
         frame,
         archived_area,
@@ -641,7 +677,11 @@ fn render_sessions(
                 .saturating_sub(SESSION_TABLE_CHROME_HEIGHT),
         ),
     );
-    selected_preview_area
+    SessionRowsRendered {
+        selected_preview_area,
+        active_row_areas,
+        archived_row_areas,
+    }
 }
 
 pub(crate) fn render_session_scrollbar(
@@ -737,10 +777,21 @@ fn session_values(
             detail.and_then(|detail| detail.current_turn_started_at),
         )
     };
+    // An in-flight resume already told the controller its destination; show
+    // that instead of the session record, which the dashboard won't refresh
+    // until the operation finishes (see `SessionOperationDisplay::resume_destination`).
+    let (profile_id, target_template_id) = operation
+        .and_then(|operation| operation.resume_destination.clone())
+        .unwrap_or_else(|| {
+            (
+                session.last_profile.clone(),
+                session.target_template_id.clone(),
+            )
+        });
     (
         clock,
-        session.last_profile.clone(),
-        session.target_template_id.clone(),
+        profile_id,
+        target_template_id,
         session.project_name(config),
         session_name(session).to_string(),
     )
@@ -2385,6 +2436,37 @@ mod tests {
         let (clock, _, _, _, _) =
             session_values(&session, None, Some(&operation), 1_012, &config());
         assert_eq!(clock, "Pausing 12s");
+    }
+
+    #[test]
+    fn resuming_row_shows_the_destination_profile_and_target_not_the_stale_record() {
+        // The controller updates the session's own last_profile/target as
+        // soon as a resume starts, but the dashboard's local session
+        // snapshot only refreshes once the operation finishes. The in-flight
+        // row must show where the resume is going, not where it came from.
+        let session = archived_session();
+        assert_eq!(session.last_profile, "codex-1");
+        assert_eq!(session.target_template_id, "podman");
+        let mut resuming = operation(SessionOperationKind::Resuming, None);
+        resuming.resume_destination = Some(("grok-1".into(), "raw-localhost".into()));
+
+        let (_, profile_id, target_template_id, _, _) =
+            session_values(&session, None, Some(&resuming), 1_012, &config());
+
+        assert_eq!(profile_id, "grok-1");
+        assert_eq!(target_template_id, "raw-localhost");
+    }
+
+    #[test]
+    fn without_a_resume_destination_the_row_falls_back_to_the_session_record() {
+        let session = archived_session();
+        let resuming = operation(SessionOperationKind::Resuming, None);
+
+        let (_, profile_id, target_template_id, _, _) =
+            session_values(&session, None, Some(&resuming), 1_012, &config());
+
+        assert_eq!(profile_id, session.last_profile);
+        assert_eq!(target_template_id, session.target_template_id);
     }
 
     #[test]

@@ -72,6 +72,18 @@ pub(crate) fn mouse_in(kind: MouseEventKind, area: Rect) -> MouseEvent {
     }
 }
 
+/// Like `mouse_in`, but clicks a specific row within `area` instead of
+/// always the top-left cell, so tests can hit tail lines further down a
+/// multi-line hitbox.
+pub(crate) fn mouse_at_row(kind: MouseEventKind, area: Rect, row_offset: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column: area.x.saturating_add(1),
+        row: area.y.saturating_add(row_offset),
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
 pub(crate) fn config() -> HelConfig {
     HelConfig {
         version: CONFIG_VERSION,
@@ -325,5 +337,6 @@ pub(crate) fn operation(
         placeholder: None,
         stage,
         stage_started_at_epoch_seconds: stage.map(|_| 1_000),
+        resume_destination: None,
     }
 }

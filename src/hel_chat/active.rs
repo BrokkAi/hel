@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
@@ -126,6 +126,41 @@ impl ChatState {
         let current = rows.iter().position(|row| row.current)?;
         let target = current.checked_add_signed(step)?;
         rows.get(target).map(|row| row.session_id.clone())
+    }
+
+    /// A left click inside the conversations pane switches to the clicked
+    /// session, mirroring keyboard selection. Focus is left alone, the same
+    /// as the wheel: only Tab moves focus.
+    pub(super) fn click_conversation_row(&mut self, mouse: MouseEvent) -> ChatAction {
+        let Some(area) = self.conversations_area else {
+            return ChatAction::None;
+        };
+        let height = usize::from(area.height);
+        if height == 0 {
+            return ChatAction::None;
+        }
+        let rows = conversation_rows(self);
+        let current = rows.iter().position(|row| row.current).unwrap_or(0);
+        let start = conversations_window_start(
+            rows.len(),
+            current,
+            height,
+            self.conversations_window_start,
+        );
+        let clicked = usize::from(mouse.row.saturating_sub(area.y));
+        if clicked >= height {
+            return ChatAction::None;
+        }
+        let Some(row) = rows.get(start + clicked) else {
+            return ChatAction::None;
+        };
+        if row.current {
+            return ChatAction::None;
+        }
+        self.conversations_window_start = None;
+        ChatAction::SwitchSession {
+            session_id: row.session_id.clone(),
+        }
     }
 
     /// Moves the conversations window by `rows`, leaving the current session
@@ -689,10 +724,7 @@ impl ActiveChat {
                 self.state.handle_paste(&pasted);
                 ChatAction::None
             }
-            Event::Mouse(mouse) => {
-                self.state.handle_mouse(mouse);
-                ChatAction::None
-            }
+            Event::Mouse(mouse) => self.state.handle_mouse(mouse),
             // Resize and focus changes only need the redraw.
             _ => ChatAction::None,
         };
@@ -1141,14 +1173,14 @@ fn append_dictation(prefix: &str, transcript: &str) -> String {
 mod tests {
     use super::*;
     use crate::hel_chat::test_support::{
-        agent_message_item, agent_transcript_item, ctrl, drawn_transcript, key, mouse_in, queued,
-        snapshot,
+        agent_message_item, agent_transcript_item, ctrl, drawn_transcript, key, mouse_at_row,
+        mouse_in, queued, snapshot,
     };
     use crate::hel_state::MaterializedExecutionState;
     use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
     use crate::hel_worker::{SequencedEvent, WorkerEvent};
     use agent_client_protocol::schema::v1::{SessionConfigOption, SessionConfigOptionCategory};
-    use crossterm::event::{MouseEvent, MouseEventKind};
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
@@ -1740,6 +1772,65 @@ mod tests {
         let transcript = Rect::new(0, pane.bottom(), 60, 1);
         chat.handle_mouse(mouse_in(MouseEventKind::ScrollDown, transcript));
         assert_eq!(window_projects(&chat, 7)[0], "project-0");
+    }
+
+    #[test]
+    fn clicking_a_conversation_line_switches_to_it_and_resets_the_window() {
+        let mut chat = windowed_chat(10, 5);
+        let _ = drawn_transcript(&mut chat, 60, 24);
+        let pane = chat
+            .conversations_area
+            .expect("the pane records its hitbox");
+        // Centred on session 5, the window shows project-2..project-8, so row
+        // 0 is project-2 (session id "session-2").
+        assert_eq!(window_projects(&chat, 7)[0], "project-2");
+
+        // Scroll the window first, so a successful click has to reset it.
+        chat.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane));
+        assert!(chat.conversations_window_start.is_some());
+
+        let action = chat.handle_mouse(mouse_at_row(
+            MouseEventKind::Down(MouseButton::Left),
+            pane,
+            0,
+        ));
+
+        assert_eq!(
+            action,
+            ChatAction::SwitchSession {
+                session_id: other_session_id(3)
+            },
+            "row 0 after the scroll is project-3 (session-3)"
+        );
+        assert!(
+            chat.conversations_window_start.is_none(),
+            "a click resets the window like keyboard selection does"
+        );
+        assert_eq!(
+            chat.focus,
+            ChatFocus::Prompt,
+            "a click selects without taking focus, same as the wheel"
+        );
+    }
+
+    #[test]
+    fn clicking_the_current_conversation_line_is_a_no_op() {
+        let mut chat = windowed_chat(10, 5);
+        let _ = drawn_transcript(&mut chat, 60, 24);
+        let pane = chat
+            .conversations_area
+            .expect("the pane records its hitbox");
+        // The current session (position 5) sits at window row 3.
+        assert_eq!(conversations_pane(&chat, 0, 80, 7).current_row, Some(3));
+
+        let action = chat.handle_mouse(mouse_at_row(
+            MouseEventKind::Down(MouseButton::Left),
+            pane,
+            3,
+        ));
+
+        assert_eq!(action, ChatAction::None);
+        assert_eq!(chat.focus, ChatFocus::Prompt);
     }
 
     #[test]

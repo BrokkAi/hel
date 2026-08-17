@@ -18,6 +18,7 @@ mod protocol;
 mod snapshot;
 mod types;
 
+pub use journal::{RestoredRelaySeed, restored_relay_seed_path};
 pub use protocol::{
     RelayErrorCode, RelayErrorDetail, RelayProtocolError, RelayRequest, RelayRequestEnvelope,
     RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload, RelayVersionRange,
@@ -30,8 +31,8 @@ pub use snapshot::{
     RelayOperationalState, relay_event_digest, validate_relay_event,
 };
 pub use types::{
-    ActivePrompt, Attachment, QueuedPrompt, RESTORED_CANONICAL_SESSION_FILE, SequencedEvent,
-    WorkerEvent, WorkerPhase, WorkerSessionSummary, WorkerSnapshot,
+    ActivePrompt, Attachment, QueuedPrompt, SequencedEvent, WorkerEvent, WorkerPhase,
+    WorkerSessionSummary, WorkerSnapshot,
 };
 
 use std::collections::VecDeque;
@@ -86,8 +87,18 @@ pub const RELAY_MIN_PROTOCOL_VERSION: u32 = RELAY_PROTOCOL_VERSION;
 pub const RELAY_EVENT_GENESIS_DIGEST: &str = crate::hel_archive::EVENT_FRONTIER_GENESIS_DIGEST;
 const RELAY_EVENT_DIGEST_DOMAIN: &[u8] = b"hel-relay-event-v1\0";
 const RELAY_STATE_VERSION: u32 = 1;
-const RELAY_STATE_FILE: &str = "relay-state.json";
-const RELAY_JOURNAL_DIR: &str = "relay-journal";
+/// The relay snapshot inside a worker root. Teardown and restore name it from
+/// here rather than repeating the literal.
+pub const RELAY_STATE_FILE: &str = "relay-state.json";
+/// The relay's durable event journal inside a worker root.
+pub const RELAY_JOURNAL_DIR: &str = "relay-journal";
+/// The seed a checkpoint restore leaves in a worker root for the relay that
+/// opens next. It carries only what a fresh relay cannot derive on its own.
+pub const RESTORED_RELAY_SEED_FILE: &str = "relay-seed.json";
+/// File in which a running worker daemon records its own PID, inside its
+/// worker root. Session teardown reads it to stop that daemon before the root
+/// it writes to is removed.
+pub const WORKER_PID_FILE: &str = "worker.pid";
 const RELAY_ACTIVE_SEGMENT: &str = "active.jsonl";
 const RELAY_SEGMENT_BYTE_LIMIT: u64 = 1024 * 1024;
 const RELAY_HOT_EVENT_CAPACITY: usize = 32;
@@ -312,6 +323,11 @@ impl DurableRelay {
 
     pub fn operational_state(&self) -> RelayOperationalState {
         self.snapshot.operational_state()
+    }
+
+    /// The directory holding this relay's durable state.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn latest_ordinal(&self) -> u64 {

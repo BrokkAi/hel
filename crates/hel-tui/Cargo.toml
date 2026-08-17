@@ -5,6 +5,9 @@ edition = "2024"
 license = "GPL-3.0-only"
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 hel = { path = "../.." }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

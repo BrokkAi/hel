@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
@@ -30,6 +31,10 @@ use crate::hel_targets::{
 };
 const MAX_NATIVE_FILE: u64 = 1024 * 1024 * 1024;
 const MAX_NATIVE_TOTAL: u64 = 8 * 1024 * 1024 * 1024;
+/// Clock-skew slack subtracted from a Codex session's own creation time before
+/// it is used as an mtime floor for content probes.
+const CODEX_PROBE_FLOOR_SLACK_MS: i64 = 48 * 3600 * 1000;
+const CODEX_SCAN_CACHE_FILE: &str = "codex-scan-cache.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -180,13 +185,33 @@ pub fn restore_from_spec_file(path: &Path) -> Result<()> {
 
 pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunner) -> Result<()> {
     ensure!(spec.workspace_root.is_dir(), "restore workspace is missing");
+    // A restore seeds a relay that has no durable state yet. Existing state
+    // means either a leaked worker still writing here or an unfinished
+    // teardown, and the seed would be ignored in favour of the stale
+    // snapshot, leaving a frontier no journal can support.
+    let existing_relay_state = spec.relay_root.join(crate::hel_worker::RELAY_STATE_FILE);
+    ensure!(
+        !existing_relay_state.exists(),
+        "relay state already present in {}; a previous worker may still be running, \
+         refusing to restore over it",
+        spec.relay_root.display()
+    );
     let archive = read_archive_verified(&spec.archive_path)?;
     // Deserialize and validate the schema-2 canonical projection before any
     // repository, relay, or native-session state can be mutated.
-    let mut canonical_session = archive.canonical_session()?;
+    let canonical_session = archive.canonical_session()?;
+    // The relay that opens next needs the frontier it continues from and the
+    // commands still queued, and nothing else. The transcript stays in the
+    // archive; the controller already holds it as the durable projection.
+    let mut seed = crate::hel_worker::RestoredRelaySeed {
+        event_frontier: canonical_session.event_frontier,
+        event_frontier_digest: canonical_session.event_frontier_digest,
+        queued_prompts: canonical_session.queued_prompts,
+    };
     if spec.discard_queued_prompts {
-        canonical_session.queued_prompts.clear();
+        seed.queued_prompts.clear();
     }
+    seed.validate()?;
     if spec.restore_repositories {
         restore_repositories_from_archive(&archive, &spec.workspace_root, git)?;
     }
@@ -194,8 +219,8 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
     fs::create_dir_all(&spec.relay_root)?;
     crate::hel_worker::clear_native_session_identity(&spec.relay_root)?;
     write_private_file(
-        &restored_canonical_session_path(&spec.relay_root),
-        &serde_json::to_vec_pretty(&canonical_session)?,
+        &crate::hel_worker::restored_relay_seed_path(&spec.relay_root),
+        &serde_json::to_vec(&seed)?,
         0o600,
     )?;
 
@@ -234,10 +259,6 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
         }
     }
     Ok(())
-}
-
-pub fn restored_canonical_session_path(relay_root: &Path) -> PathBuf {
-    relay_root.join(crate::hel_worker::RESTORED_CANONICAL_SESSION_FILE)
 }
 
 /// Reads the controller-owned projection without restoring target artifacts.
@@ -704,12 +725,7 @@ pub fn export_checkpoint_with_git(
     // harness artifacts yet; requiring them would make an unused session
     // impossible to close cleanly.
     let prompted = canonical_session_contains_prompt(&spec.canonical_session);
-    let native_artifacts = collect_native_artifacts(
-        spec.session.harness_kind,
-        &spec.harness_home,
-        &spec.session.native_session_id,
-        !prompted,
-    )?;
+    let native_artifacts = collect_export_native_artifacts(spec, !prompted)?;
     // Indexed parallel iteration preserves the spec order, which in turn keeps
     // the manifest and ZIP entry order deterministic.
     let repositories = spec
@@ -776,6 +792,36 @@ pub fn export_checkpoint_with_git(
         event_frontier,
         event_frontier_digest,
     })
+}
+
+/// Codex exports carry the relay-root scan cache so that a long-lived session
+/// probes each unrelated rollout at most once.
+fn collect_export_native_artifacts(
+    spec: &CheckpointExportSpec,
+    allow_empty: bool,
+) -> Result<Vec<NativeArtifact>> {
+    let session_id = &spec.session.native_session_id;
+    if spec.session.harness_kind != HarnessKind::Codex {
+        return collect_native_artifacts(
+            spec.session.harness_kind,
+            &spec.harness_home,
+            session_id,
+            allow_empty,
+        );
+    }
+    let mut cache = load_codex_scan_cache(&spec.relay_root, session_id);
+    let known = cache.not_ours.len();
+    let artifacts = collect_native_artifacts_cached(
+        HarnessKind::Codex,
+        &spec.harness_home,
+        session_id,
+        allow_empty,
+        Some(&mut cache),
+    )?;
+    if cache.not_ours.len() != known {
+        save_codex_scan_cache(&spec.relay_root, &cache)?;
+    }
+    Ok(artifacts)
 }
 
 /// A session delta is measured against every origin ref, so a repository that
@@ -850,11 +896,93 @@ fn canonical_session_contains_prompt(snapshot: &CanonicalSessionSnapshot) -> boo
         .any(|item| matches!(&item.body, CanonicalTranscriptBody::User { .. }))
 }
 
+/// Rollouts whose `session_meta` header named a different session. Codex
+/// writes that header once, when it creates the file, so a negative verdict
+/// never turns positive and is safe to remember across exports.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodexScanCache {
+    session_id: String,
+    not_ours: BTreeSet<PathBuf>,
+}
+
+impl CodexScanCache {
+    fn empty(session_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_owned(),
+            not_ours: BTreeSet::new(),
+        }
+    }
+}
+
+/// Everything that lets the Codex walk skip a content probe.
+#[derive(Default)]
+struct CodexProbeContext<'a> {
+    /// Rollouts modified before this unix-ms instant cannot belong to the
+    /// session, so they are never opened. `None` disables the gate.
+    floor_ms: Option<i64>,
+    cache: Option<&'a mut CodexScanCache>,
+}
+
+/// A missing, unreadable, corrupt, or foreign-session cache is not an error:
+/// the cache only ever saves work, so falling back to an empty one is correct.
+fn load_codex_scan_cache(relay_root: &Path, session_id: &str) -> CodexScanCache {
+    fs::read(relay_root.join(CODEX_SCAN_CACHE_FILE))
+        .ok()
+        .and_then(|body| serde_json::from_slice::<CodexScanCache>(&body).ok())
+        .filter(|cache| cache.session_id == session_id)
+        .unwrap_or_else(|| CodexScanCache::empty(session_id))
+}
+
+fn save_codex_scan_cache(relay_root: &Path, cache: &CodexScanCache) -> Result<()> {
+    let path = relay_root.join(CODEX_SCAN_CACHE_FILE);
+    write_private_file(&path, &serde_json::to_vec(cache)?, 0o600)
+        .with_context(|| format!("write Codex scan cache {}", path.display()))
+}
+
+/// Codex native session IDs are UUIDv7, whose leading 48 bits hold the
+/// session's creation time in unix milliseconds.
+fn uuid_v7_timestamp_ms(id: &str) -> Option<i64> {
+    let groups = id.split('-').collect::<Vec<_>>();
+    let [first, second, third, _, _] = groups.as_slice() else {
+        return None;
+    };
+    let shaped = groups.iter().zip([8, 4, 4, 4, 12]).all(|(group, width)| {
+        group.len() == width
+            && group
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    });
+    if !shaped || !third.starts_with('7') {
+        return None;
+    }
+    i64::from_str_radix(&format!("{first}{second}"), 16).ok()
+}
+
+fn unix_millis(time: SystemTime) -> Option<i64> {
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(since_epoch) => i64::try_from(since_epoch.as_millis()).ok(),
+        Err(before_epoch) => i64::try_from(before_epoch.duration().as_millis())
+            .ok()
+            .map(|millis| -millis),
+    }
+}
+
 pub fn collect_native_artifacts(
     harness: HarnessKind,
     home: &Path,
     session_id: &str,
     allow_empty: bool,
+) -> Result<Vec<NativeArtifact>> {
+    collect_native_artifacts_cached(harness, home, session_id, allow_empty, None)
+}
+
+fn collect_native_artifacts_cached(
+    harness: HarnessKind,
+    home: &Path,
+    session_id: &str,
+    allow_empty: bool,
+    cache: Option<&mut CodexScanCache>,
 ) -> Result<Vec<NativeArtifact>> {
     validate_component(session_id, "native session ID")?;
     let roots: &[&str] = match harness {
@@ -862,11 +990,27 @@ pub fn collect_native_artifacts(
         HarnessKind::Claude => &["projects", "session-env", "file-history"],
         HarnessKind::Kimi | HarnessKind::Grok => &["sessions"],
     };
+    let mut probe = match harness {
+        HarnessKind::Codex => CodexProbeContext {
+            floor_ms: uuid_v7_timestamp_ms(session_id)
+                .map(|created_ms| created_ms - CODEX_PROBE_FLOOR_SLACK_MS),
+            cache,
+        },
+        _ => CodexProbeContext::default(),
+    };
     let mut output = Vec::new();
     for relative in roots {
         let root = home.join(relative);
         if root.is_dir() {
-            collect_native_tree(harness, home, &root, session_id, false, &mut output)?;
+            collect_native_tree(
+                harness,
+                home,
+                &root,
+                session_id,
+                false,
+                &mut probe,
+                &mut output,
+            )?;
         }
     }
     if harness == HarnessKind::Kimi && !output.is_empty() {
@@ -1039,6 +1183,7 @@ fn collect_native_tree(
     path: &Path,
     session_id: &str,
     inside_session: bool,
+    probe: &mut CodexProbeContext<'_>,
     output: &mut Vec<NativeArtifact>,
 ) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
@@ -1053,7 +1198,15 @@ fn collect_native_tree(
         });
     if metadata.is_dir() {
         for entry in fs::read_dir(path)? {
-            collect_native_tree(harness, home, &entry?.path(), session_id, inside, output)?;
+            collect_native_tree(
+                harness,
+                home,
+                &entry?.path(),
+                session_id,
+                inside,
+                probe,
+                output,
+            )?;
         }
         return Ok(());
     }
@@ -1067,7 +1220,8 @@ fn collect_native_tree(
         HarnessKind::Codex => {
             (name.contains(session_id)
                 && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst")))
-                || (name.ends_with(".jsonl") && codex_rollout_has_session_id(path, session_id))
+                || (name.ends_with(".jsonl")
+                    && codex_probe_selects(probe, path, relative, &metadata, session_id))
         }
         HarnessKind::Claude => inside || name == format!("{session_id}.jsonl"),
         HarnessKind::Kimi => inside && kimi_session_artifact(relative, session_id),
@@ -1109,6 +1263,44 @@ fn kimi_session_artifact(relative: &Path, session_id: &str) -> bool {
         )
 }
 
+/// Content-probe fallback for continuation rollouts, whose filename carries a
+/// different file UUID than the session they belong to. Opening every rollout
+/// costs gigabytes of reads on a busy `~/.codex`, so two gates come first.
+///
+/// The mtime floor is filesystem truth: rollout filenames encode ambiguous
+/// local time, historical rollouts are never rewritten, and hel's own restore
+/// rewrites the files it installs with a fresh mtime. A rollout last modified
+/// before the session was created cannot mention that session.
+fn codex_probe_selects(
+    probe: &mut CodexProbeContext<'_>,
+    path: &Path,
+    relative: &Path,
+    metadata: &fs::Metadata,
+    session_id: &str,
+) -> bool {
+    // An unreadable mtime or a non-UUIDv7 session ID fails open into the probe.
+    if let Some(floor_ms) = probe.floor_ms
+        && let Ok(modified) = metadata.modified()
+        && unix_millis(modified).is_some_and(|modified_ms| modified_ms < floor_ms)
+    {
+        return false;
+    }
+    if probe
+        .cache
+        .as_ref()
+        .is_some_and(|cache| cache.not_ours.contains(relative))
+    {
+        return false;
+    }
+    if codex_rollout_has_session_id(path, session_id) {
+        return true;
+    }
+    if let Some(cache) = probe.cache.as_mut() {
+        cache.not_ours.insert(relative.to_path_buf());
+    }
+    false
+}
+
 fn codex_rollout_has_session_id(path: &Path, session_id: &str) -> bool {
     let Ok(file) = File::open(path) else {
         return false;
@@ -1126,13 +1318,13 @@ fn codex_rollout_has_session_id(path: &Path, session_id: &str) -> bool {
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             return false;
         };
-        if record.get("type").and_then(Value::as_str) == Some("session_meta")
-            && record
+        // A rollout carries exactly one `session_meta` header, so the first one
+        // settles the question without parsing the rest of the file.
+        if record.get("type").and_then(Value::as_str) == Some("session_meta") {
+            return record
                 .pointer("/payload/session_id")
                 .and_then(Value::as_str)
-                == Some(session_id)
-        {
-            return true;
+                == Some(session_id);
         }
     }
     false
@@ -1794,6 +1986,179 @@ mod tests {
         assert_eq!(
             artifacts[0].relative_path,
             PathBuf::from("sessions/2026/08/10/rollout-renamed.jsonl")
+        );
+    }
+
+    /// Unix milliseconds encoded in `NATIVE`, a UUIDv7.
+    const NATIVE_CREATED_MS: i64 = 0x0190_aabb_ccdd;
+    const OTHER_NATIVE: &str = "0190aabb-ccdd-7eef-9000-ffffffffffff";
+
+    fn write_rollout(path: &Path, session_id: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{session_id}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn set_modified_ms(path: &Path, millis: i64) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(millis as u64))
+            .unwrap();
+    }
+
+    #[test]
+    fn uuid_v7_timestamp_decodes_only_version_seven_uuids() {
+        assert_eq!(uuid_v7_timestamp_ms(NATIVE), Some(NATIVE_CREATED_MS));
+        assert_eq!(uuid_v7_timestamp_ms(SESSION), Some(0x018f_9dd2_a3b4));
+        assert_eq!(
+            uuid_v7_timestamp_ms("0190aabb-ccdd-4eef-9000-abcdef012345"),
+            None
+        );
+        for malformed in [
+            "",
+            "not-a-uuid",
+            "0190aabb-ccdd-7eef-9000-abcdef01234",
+            "0190aabb-ccdd-7eef-9000-abcdef012345-extra",
+            "0190AABB-CCDD-7EEF-9000-ABCDEF012345",
+            "0190aabbccdd7eef9000abcdef012345",
+            "0190aabg-ccdd-7eef-9000-abcdef012345",
+        ] {
+            assert_eq!(uuid_v7_timestamp_ms(malformed), None, "{malformed}");
+        }
+    }
+
+    #[test]
+    fn codex_content_probe_skips_rollouts_older_than_the_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let rollout = temp.path().join("sessions/2026/08/10/rollout-fork.jsonl");
+        write_rollout(&rollout, NATIVE);
+
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Codex, temp.path(), NATIVE, false).unwrap();
+        assert_eq!(artifacts.len(), 1);
+
+        // Three days before the session's own UUIDv7 creation time, so past the
+        // 48 hour skew slack the floor allows.
+        set_modified_ms(&rollout, NATIVE_CREATED_MS - 72 * 3600 * 1000);
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Codex, temp.path(), NATIVE, true).unwrap();
+        assert!(artifacts.is_empty());
+    }
+
+    #[test]
+    fn codex_name_matched_rollout_is_collected_whatever_its_mtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let rollout = temp
+            .path()
+            .join("sessions/2026/08/10")
+            .join(format!("rollout-{NATIVE}.jsonl"));
+        write_rollout(&rollout, OTHER_NATIVE);
+        set_modified_ms(&rollout, 1_000_000_000_000);
+
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Codex, temp.path(), NATIVE, false).unwrap();
+        assert_eq!(artifacts.len(), 1);
+    }
+
+    #[test]
+    fn codex_scan_cache_makes_a_negative_probe_verdict_permanent() {
+        let temp = tempfile::tempdir().unwrap();
+        let foreign = temp
+            .path()
+            .join("sessions/2026/08/10/rollout-foreign.jsonl");
+        write_rollout(&foreign, OTHER_NATIVE);
+        let mut cache = CodexScanCache::empty(NATIVE);
+
+        let artifacts = collect_native_artifacts_cached(
+            HarnessKind::Codex,
+            temp.path(),
+            NATIVE,
+            true,
+            Some(&mut cache),
+        )
+        .unwrap();
+        assert!(artifacts.is_empty());
+        assert!(
+            cache
+                .not_ours
+                .contains(Path::new("sessions/2026/08/10/rollout-foreign.jsonl"))
+        );
+
+        write_rollout(&foreign, NATIVE);
+        let later = temp.path().join("sessions/2026/08/10/rollout-later.jsonl");
+        write_rollout(&later, NATIVE);
+        let artifacts = collect_native_artifacts_cached(
+            HarnessKind::Codex,
+            temp.path(),
+            NATIVE,
+            true,
+            Some(&mut cache),
+        )
+        .unwrap();
+        assert_eq!(
+            artifacts
+                .iter()
+                .map(|artifact| artifact.relative_path.clone())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("sessions/2026/08/10/rollout-later.jsonl")]
+        );
+    }
+
+    #[test]
+    fn codex_probe_stops_at_the_first_session_meta_header() {
+        let temp = tempfile::tempdir().unwrap();
+        let rollout = temp.path().join("sessions/2026/08/10/rollout-fork.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(
+            &rollout,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{OTHER_NATIVE}\"}}}}\n\
+                 {{\"type\":\"event_msg\"}}\n\
+                 {{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{NATIVE}\"}}}}\n\
+                 {{malformed\n"
+            ),
+        )
+        .unwrap();
+
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Codex, temp.path(), NATIVE, true).unwrap();
+        assert!(artifacts.is_empty());
+    }
+
+    #[test]
+    fn codex_export_rebuilds_a_corrupt_scan_cache_and_records_verdicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        let cache_path = spec.relay_root.join(CODEX_SCAN_CACHE_FILE);
+        fs::write(&cache_path, b"{not json").unwrap();
+        write_rollout(
+            &spec
+                .harness_home
+                .join("sessions/2026/08/09/rollout-x.jsonl"),
+            OTHER_NATIVE,
+        );
+
+        export_checkpoint(&spec).unwrap();
+
+        let cache: CodexScanCache =
+            serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(cache.session_id, NATIVE);
+        assert_eq!(
+            cache.not_ours,
+            BTreeSet::from([PathBuf::from("sessions/2026/08/09/rollout-x.jsonl")])
+        );
+        assert_eq!(
+            load_codex_scan_cache(&spec.relay_root, OTHER_NATIVE)
+                .not_ours
+                .len(),
+            0
         );
     }
 
@@ -2781,13 +3146,113 @@ mod tests {
         );
     }
 
+    fn restore_into(
+        temp: &Path,
+        spec: &CheckpointExportSpec,
+        discard_queued_prompts: bool,
+    ) -> PathBuf {
+        let relay_root = temp.join(format!("restored-relay-{discard_queued_prompts}"));
+        restore_checkpoint(
+            &CheckpointRestoreSpec {
+                archive_path: spec.output_path.clone(),
+                workspace_root: spec.workspace_root.clone(),
+                relay_root: relay_root.clone(),
+                harness_home: temp.join("restored-harness"),
+                restore_repositories: false,
+                restore_native: false,
+                discard_queued_prompts,
+                primary_repository_root: None,
+            },
+            &SystemGit,
+        )
+        .unwrap();
+        relay_root
+    }
+
+    fn restored_seed(relay_root: &Path) -> crate::hel_worker::RestoredRelaySeed {
+        serde_json::from_slice(
+            &fs::read(crate::hel_worker::restored_relay_seed_path(relay_root)).unwrap(),
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn restore_seeds_materialized_session_and_can_discard_queued_prompts() {
+    fn restore_seeds_the_relay_frontier_and_can_discard_queued_prompts() {
         let temp = tempfile::tempdir().unwrap();
         let (spec, _) = fixture(temp.path());
         export_checkpoint(&spec).unwrap();
-        let relay_root = temp.path().join("restored-relay");
-        restore_checkpoint(
+
+        let kept = restored_seed(&restore_into(temp.path(), &spec, false));
+        assert_eq!(kept.event_frontier, spec.canonical_session.event_frontier);
+        assert_eq!(
+            kept.event_frontier_digest,
+            spec.canonical_session.event_frontier_digest
+        );
+        assert_eq!(kept.queued_prompts, spec.canonical_session.queued_prompts);
+
+        let relay_root = restore_into(temp.path(), &spec, true);
+        let discarded = restored_seed(&relay_root);
+        assert_eq!(
+            discarded.event_frontier,
+            spec.canonical_session.event_frontier
+        );
+        assert!(discarded.queued_prompts.is_empty());
+        assert!(!relay_root.join("events.jsonl").exists());
+    }
+
+    /// The relay seed must stay proportional to the queue, never to the
+    /// conversation: a long session used to write its whole transcript into the
+    /// target's relay root for three fields nobody else read.
+    #[test]
+    fn the_relay_seed_does_not_grow_with_the_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut spec, _) = fixture(temp.path());
+        let item = spec.canonical_session.transcript[0].clone();
+        spec.canonical_session.transcript = (1..=20_000_u64)
+            .map(|position| CanonicalTranscriptItem {
+                stable_id: format!("user-{position}"),
+                position,
+                body: CanonicalTranscriptBody::User {
+                    content: vec![json!({"type": "text", "text": "x".repeat(256)})],
+                },
+                ..item.clone()
+            })
+            .collect();
+        spec.canonical_session.event_frontier = 20_000;
+        export_checkpoint(&spec).unwrap();
+
+        let relay_root = restore_into(temp.path(), &spec, false);
+        let seed = fs::metadata(crate::hel_worker::restored_relay_seed_path(&relay_root))
+            .unwrap()
+            .len();
+
+        assert!(
+            seed < 4096,
+            "the relay seed embedded the transcript: {seed} bytes"
+        );
+        assert_eq!(
+            restored_seed(&relay_root).queued_prompts,
+            spec.canonical_session.queued_prompts
+        );
+    }
+
+    /// A restore seeds a relay that has none of its own state yet. Existing
+    /// state means the previous worker was never fully torn down, and the seed
+    /// would silently lose to it.
+    #[test]
+    fn restore_refuses_a_relay_root_that_already_holds_relay_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        export_checkpoint(&spec).unwrap();
+        let relay_root = temp.path().join("occupied-relay");
+        fs::create_dir_all(&relay_root).unwrap();
+        fs::write(
+            relay_root.join(crate::hel_worker::RELAY_STATE_FILE),
+            b"{\"format_version\":1}",
+        )
+        .unwrap();
+
+        let error = restore_checkpoint(
             &CheckpointRestoreSpec {
                 archive_path: spec.output_path.clone(),
                 workspace_root: spec.workspace_root.clone(),
@@ -2795,24 +3260,18 @@ mod tests {
                 harness_home: temp.path().join("restored-harness"),
                 restore_repositories: false,
                 restore_native: false,
-                discard_queued_prompts: true,
+                discard_queued_prompts: false,
                 primary_repository_root: None,
             },
             &SystemGit,
         )
-        .unwrap();
+        .unwrap_err();
 
-        let restored: CanonicalSessionSnapshot = serde_json::from_slice(
-            &fs::read(restored_canonical_session_path(&relay_root)).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            restored.event_frontier,
-            spec.canonical_session.event_frontier
+        assert!(
+            format!("{error:#}").contains("relay state already present"),
+            "{error:#}"
         );
-        assert_eq!(restored.transcript, spec.canonical_session.transcript);
-        assert!(restored.queued_prompts.is_empty());
-        assert!(!relay_root.join("events.jsonl").exists());
+        assert!(!crate::hel_worker::restored_relay_seed_path(&relay_root).exists());
     }
 
     #[test]

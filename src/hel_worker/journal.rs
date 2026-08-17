@@ -13,21 +13,21 @@ use anyhow::{Context, Result, anyhow, bail};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 
 use crate::clock::epoch_millis;
-use crate::hel_archive::CanonicalQueuedCommandKind;
+use crate::hel_archive::CanonicalQueuedPrompt;
 
 use super::snapshot::{
     RelayCommand, RelayDispatchState, RelayEvent, RelayObservation, RelaySnapshot,
     apply_relay_event, clamp_observation, ensure_byte_budget, ensure_serialized_budget,
-    relay_event_digest, validate_relay_event,
+    relay_event_digest, validate_relay_digest, validate_relay_event,
 };
-use super::types::RESTORED_CANONICAL_SESSION_FILE;
 use super::{
     DurableRelay, RELAY_ACTIVE_SEGMENT, RELAY_EVENT_BYTE_BUDGET, RELAY_EVENT_ENVELOPE_RESERVE,
-    RELAY_HOT_EVENT_CAPACITY, RELAY_JOURNAL_DIR, RELAY_SEGMENT_BYTE_LIMIT,
-    RELAY_SNAPSHOT_BYTE_BUDGET, RELAY_STATE_BYTE_BUDGET, RELAY_STATE_FILE,
+    RELAY_EVENT_GENESIS_DIGEST, RELAY_HOT_EVENT_CAPACITY, RELAY_JOURNAL_DIR,
+    RELAY_SEGMENT_BYTE_LIMIT, RELAY_SNAPSHOT_BYTE_BUDGET, RELAY_STATE_BYTE_BUDGET,
+    RELAY_STATE_FILE, RESTORED_RELAY_SEED_FILE,
 };
 
 #[derive(Debug, Clone)]
@@ -43,10 +43,14 @@ pub(crate) struct RelayJournalSpan {
     pub(crate) after_ordinal: u64,
 }
 
+/// Persist the snapshot without ever recreating the worker root. Session
+/// teardown deletes that directory while this daemon may still be alive, and a
+/// recreated root holding only a snapshot cannot be reopened: its frontier
+/// would run ahead of a journal that no longer exists.
 pub(crate) fn persist_relay_snapshot(root: &Path, snapshot: &RelaySnapshot) -> Result<()> {
     let body = serde_json::to_vec_pretty(snapshot)?;
     ensure_byte_budget(body.len(), RELAY_SNAPSHOT_BYTE_BUDGET, "relay snapshot")?;
-    crate::hel_config::atomic_write(&root.join(RELAY_STATE_FILE), &body)
+    crate::hel_config::atomic_write_existing(&root.join(RELAY_STATE_FILE), &body)
 }
 
 pub(crate) fn open_relay_journal(
@@ -426,46 +430,53 @@ fn truncate_active_relay_journal(journal: &Path, active: &Path) -> Result<()> {
     sync_directory(journal)
 }
 
-#[derive(Debug)]
-pub(crate) struct RestoredRelaySeed {
-    pub(crate) event_frontier: u64,
-    pub(crate) event_frontier_digest: String,
-    pub(crate) queued_prompts: Vec<RestoredQueuedPrompt>,
+/// What a restored relay needs from the checkpoint it continues.
+///
+/// A restore used to leave the whole canonical session here, but the relay only
+/// ever read three fields from it. On a large session the unread transcript was
+/// tens of megabytes written on the target and parsed again at worker start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoredRelaySeed {
+    pub event_frontier: u64,
+    pub event_frontier_digest: String,
+    /// Commands the archived session still had queued, already filtered by the
+    /// restore spec's queue disposition.
+    #[serde(default)]
+    pub queued_prompts: Vec<CanonicalQueuedPrompt>,
 }
 
-#[derive(Debug)]
-pub(crate) struct RestoredQueuedPrompt {
-    pub(crate) command_id: String,
-    pub(crate) kind: CanonicalQueuedCommandKind,
-    pub(crate) content: Vec<Value>,
-    pub(crate) queued_at_ms: i64,
+impl RestoredRelaySeed {
+    /// The same frontier checks a canonical session snapshot carries, so a
+    /// malformed seed is refused before it can become relay state.
+    pub fn validate(&self) -> Result<()> {
+        validate_relay_digest(
+            &self.event_frontier_digest,
+            "restored relay event frontier digest",
+        )?;
+        if (self.event_frontier == 0) != (self.event_frontier_digest == RELAY_EVENT_GENESIS_DIGEST)
+        {
+            bail!("restored relay event frontier and genesis digest disagree");
+        }
+        Ok(())
+    }
+}
+
+pub fn restored_relay_seed_path(relay_root: &Path) -> PathBuf {
+    relay_root.join(RESTORED_RELAY_SEED_FILE)
 }
 
 pub(crate) fn read_restored_relay_seed(root: &Path) -> Result<Option<RestoredRelaySeed>> {
-    let path = root.join(RESTORED_CANONICAL_SESSION_FILE);
+    let path = restored_relay_seed_path(root);
     if !path.exists() {
         return Ok(None);
     }
     let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    let canonical: crate::hel_archive::CanonicalSessionSnapshot =
+    let seed: RestoredRelaySeed =
         serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
-    canonical
-        .validate()
+    seed.validate()
         .with_context(|| format!("validate {}", path.display()))?;
-    Ok(Some(RestoredRelaySeed {
-        event_frontier: canonical.event_frontier,
-        event_frontier_digest: canonical.event_frontier_digest,
-        queued_prompts: canonical
-            .queued_prompts
-            .into_iter()
-            .map(|queued| RestoredQueuedPrompt {
-                command_id: queued.command_id,
-                kind: queued.kind,
-                content: queued.content,
-                queued_at_ms: queued.queued_at_ms,
-            })
-            .collect(),
-    }))
+    Ok(Some(seed))
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -810,6 +821,7 @@ impl DurableRelay {
 #[cfg(test)]
 mod tests {
     use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, SessionUpdate};
+    use serde_json::Value;
 
     use super::*;
     use crate::hel_worker::test_support::*;
@@ -1636,18 +1648,10 @@ mod tests {
     fn restored_relay_continues_after_canonical_event_frontier() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
-            temp.path()
-                .join(RESTORED_CANONICAL_SESSION_FILE),
+            restored_relay_seed_path(temp.path()),
             serde_json::to_vec(&serde_json::json!({
                 "event_frontier": 41,
                 "event_frontier_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "session": {
-                    "execution": {"state": "idle"},
-                    "last_activity_at_ms": 1234,
-                    "session_title": null,
-                    "configuration": {}
-                },
-                "transcript": [],
                 "queued_prompts": [{
                     "command_id": "restored-command",
                     "content": [{"type": "text", "text": "continue offline"}],
@@ -1690,18 +1694,10 @@ mod tests {
     fn restored_relay_rebuilds_a_queued_configuration_change() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
-            temp.path()
-                .join(RESTORED_CANONICAL_SESSION_FILE),
+            restored_relay_seed_path(temp.path()),
             serde_json::to_vec(&serde_json::json!({
                 "event_frontier": 41,
                 "event_frontier_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "session": {
-                    "execution": {"state": "idle"},
-                    "last_activity_at_ms": 1234,
-                    "session_title": null,
-                    "configuration": {}
-                },
-                "transcript": [],
                 "queued_prompts": [
                     {
                         "command_id": "restored-config",
@@ -1739,18 +1735,80 @@ mod tests {
         );
     }
 
+    /// Session teardown deletes the worker root while its daemon may still be
+    /// alive. A durable write that recreated the root would leave a snapshot
+    /// with no journal behind it, and no later resume could reopen that.
+    #[test]
+    fn relay_writes_fail_instead_of_recreating_a_deleted_worker_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("worker-root");
+        let mut relay = DurableRelay::open(&root, SESSION, "1.0.0").unwrap();
+        relay
+            .record_observation(RelayObservation::Warning {
+                message: "before teardown".into(),
+            })
+            .unwrap();
+        let through = relay.latest_ordinal();
+        let digest = relay.latest_digest().to_owned();
+        fs::remove_dir_all(&root).unwrap();
+
+        // Acknowledging writes the snapshot and nothing else, so this is the
+        // path that used to recreate the root behind teardown's back.
+        let acknowledged = relay.handle(relay_request(
+            "acknowledge-after-teardown",
+            RelayRequest::Acknowledge {
+                through_ordinal: through,
+                through_digest: digest,
+            },
+        ));
+        assert!(
+            matches!(
+                acknowledged.body,
+                RelayResponseBody::Error {
+                    error: RelayProtocolError {
+                        code: RelayErrorCode::Internal,
+                        ..
+                    }
+                }
+            ),
+            "acknowledging into a removed root must fail: {:?}",
+            acknowledged.body
+        );
+        assert!(!root.exists(), "the snapshot write resurrected the root");
+
+        assert!(
+            relay
+                .record_observation(RelayObservation::Warning {
+                    message: "after teardown".into(),
+                })
+                .is_err()
+        );
+        assert!(!root.exists(), "the journal append resurrected the root");
+    }
+
     #[test]
     fn restored_relay_rejects_an_invalid_canonical_frontier() {
-        let temp = tempfile::tempdir().unwrap();
-        fs::write(
-            temp.path().join(RESTORED_CANONICAL_SESSION_FILE),
-            br#"{"event_frontier":"forty-one"}"#,
-        )
-        .unwrap();
-        let error = DurableRelay::open(temp.path(), SESSION, "1.0.0")
-            .err()
-            .expect("invalid frontier should fail");
-        assert!(error.to_string().contains("canonical-session.json"));
-        assert!(!temp.path().join(RELAY_STATE_FILE).exists());
+        for seed in [
+            // Unparseable frontier.
+            br#"{"event_frontier":"forty-one"}"#.to_vec(),
+            // Well-formed JSON whose digest is not a relay event digest.
+            br#"{"event_frontier":41,"event_frontier_digest":"nope"}"#.to_vec(),
+            // A non-genesis frontier claiming the genesis digest.
+            format!(
+                r#"{{"event_frontier":41,"event_frontier_digest":"{RELAY_EVENT_GENESIS_DIGEST}"}}"#
+            )
+            .into_bytes(),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(restored_relay_seed_path(temp.path()), &seed).unwrap();
+            let error = DurableRelay::open(temp.path(), SESSION, "1.0.0")
+                .err()
+                .expect("invalid frontier should fail");
+            assert!(
+                error.to_string().contains(RESTORED_RELAY_SEED_FILE),
+                "{error:#}"
+            );
+            assert!(!temp.path().join(RELAY_STATE_FILE).exists());
+        }
     }
 }
