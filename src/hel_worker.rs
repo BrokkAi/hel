@@ -297,6 +297,12 @@ pub enum RelayCommand {
     AdvanceRecoveryFloor {
         through: RelayCursor,
     },
+    /// Put a controller-authored line into the conversation. The agent never
+    /// sees it: it explains something Hel did to the session, such as moving
+    /// its checkout, to the person reading the transcript.
+    RecordNotice {
+        text: String,
+    },
 }
 
 impl RelayCommand {
@@ -313,6 +319,7 @@ impl RelayCommand {
                 | Self::CompleteCheckpoint { .. }
                 | Self::ReleaseCheckpoint { .. }
                 | Self::AdvanceRecoveryFloor { .. }
+                | Self::RecordNotice { .. }
         )
     }
 
@@ -340,6 +347,7 @@ impl RelayCommand {
             Self::CompleteCheckpoint { .. } => RelayCommandKind::CompleteCheckpoint,
             Self::ReleaseCheckpoint { .. } => RelayCommandKind::ReleaseCheckpoint,
             Self::AdvanceRecoveryFloor { .. } => RelayCommandKind::AdvanceRecoveryFloor,
+            Self::RecordNotice { .. } => RelayCommandKind::RecordNotice,
         }
     }
 }
@@ -358,6 +366,7 @@ pub enum RelayCommandKind {
     CompleteCheckpoint,
     ReleaseCheckpoint,
     AdvanceRecoveryFloor,
+    RecordNotice,
 }
 
 /// Payload-free queue identity exposed in attach/status responses.
@@ -510,6 +519,11 @@ pub enum RelayObservation {
     Warning {
         message: String,
     },
+    /// A controller-authored conversation line. Unlike a warning it reports
+    /// something Hel did on purpose, so it reaches the transcript unadorned.
+    Notice {
+        message: String,
+    },
     Closing,
     Closed,
 }
@@ -526,6 +540,7 @@ pub enum RelayCommandOutcome {
     CheckpointCompleted,
     CheckpointReleased,
     RecoveryFloorAdvanced,
+    NoticeRecorded,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1194,6 +1209,16 @@ impl DurableRelay {
                 None,
             )));
         }
+        if let RelayCommand::RecordNotice { text } = &command
+            && text.trim().is_empty()
+        {
+            return Ok(Err(relay_protocol_error(
+                RelayErrorCode::InvalidRequest,
+                "notice text is required",
+                false,
+                None,
+            )));
+        }
         if let RelayCommand::Cancel = command
             && self.snapshot.active_prompt.is_none()
         {
@@ -1336,20 +1361,28 @@ impl DurableRelay {
             bail!("command {command_id} is not relay-local");
         }
         let command = dispatch.command.clone();
+        let state = dispatch.state;
         if matches!(
-            dispatch.state,
+            state,
             RelayDispatchState::Completed
                 | RelayDispatchState::Rejected
                 | RelayDispatchState::Interrupted
         ) {
-            if dispatch.state == RelayDispatchState::Completed && releases_history(&command) {
+            if state == RelayDispatchState::Completed && releases_history(&command) {
                 // The completion event may be durable even if its following
                 // journal GC reported a transient persistence error.
                 self.garbage_collect_relay_history()?;
             }
             return Ok(());
         }
-        if dispatch.state == RelayDispatchState::Queued {
+        // Recorded before the command starts, and unguarded by dispatch state:
+        // a retry that repeats this append is harmless because the projection
+        // keys the transcript line on this command, not on the event ordinal.
+        if let RelayCommand::RecordNotice { text } = &command {
+            let message = text.clone();
+            self.append_relay_event(Some(command_id), RelayObservation::Notice { message })?;
+        }
+        if state == RelayDispatchState::Queued {
             self.append_relay_event(
                 Some(command_id),
                 RelayObservation::CommandStarted {
@@ -1384,6 +1417,7 @@ impl DurableRelay {
             RelayCommand::CompleteCheckpoint { .. } => RelayCommandOutcome::CheckpointCompleted,
             RelayCommand::ReleaseCheckpoint { .. } => RelayCommandOutcome::CheckpointReleased,
             RelayCommand::AdvanceRecoveryFloor { .. } => RelayCommandOutcome::RecoveryFloorAdvanced,
+            RelayCommand::RecordNotice { .. } => RelayCommandOutcome::NoticeRecorded,
             _ => RelayCommandOutcome::QueueChanged {
                 removed_command_ids,
             },
@@ -2738,6 +2772,7 @@ fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent) -> Result
                     snapshot.recovery_floor_ordinal = through.ordinal;
                     snapshot.recovery_floor_digest = through.digest;
                 }
+                (RelayCommand::RecordNotice { .. }, RelayCommandOutcome::NoticeRecorded) => {}
                 (RelayCommand::BeginCheckpoint { .. }, _) => {
                     bail!("checkpoint barriers complete through checkpoint-ready")
                 }
@@ -2849,7 +2884,9 @@ fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent) -> Result
             }
             _ => {}
         },
-        RelayObservation::PermissionAutoApproved { .. } | RelayObservation::Warning { .. } => {}
+        RelayObservation::PermissionAutoApproved { .. }
+        | RelayObservation::Warning { .. }
+        | RelayObservation::Notice { .. } => {}
     }
     snapshot.latest_ordinal = event.ordinal;
     snapshot.latest_digest = event.digest.clone();
@@ -4425,6 +4462,77 @@ mod tests {
         let later = relay.claim_pending_commands(true).unwrap();
         assert_eq!(later.len(), 1);
         assert_eq!(later[0].command_id, "config-after");
+    }
+
+    #[test]
+    fn a_recorded_notice_becomes_one_verbatim_system_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let text = "This session moved from /home/dev/project into a container.";
+
+        submit_relay(
+            &mut relay,
+            "resume-notice-1",
+            RelayCommand::RecordNotice { text: text.into() },
+        );
+
+        // A notice never reaches ACP: it completes inside the relay.
+        assert!(relay.claim_pending_commands(true).unwrap().is_empty());
+        let mut session = crate::hel_state::MaterializedSession::empty(SESSION);
+        for event in relay.events_after(0, RELAY_EVENT_GENESIS_DIGEST).unwrap() {
+            let projected = crate::hel_projection::project_relay_event(&session, &event).unwrap();
+            crate::hel_projection::apply_committed_projection_event(
+                &mut session,
+                &event,
+                projected.mutation,
+            )
+            .unwrap();
+        }
+
+        let notices = session
+            .transcript
+            .iter()
+            .filter_map(|item| match &item.body {
+                crate::hel_state::TranscriptBody::System { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(notices, vec![text.to_owned()]);
+    }
+
+    #[test]
+    fn a_repeated_notice_append_still_leaves_one_conversation_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let text = "The working tree moved while this session was paused.";
+        submit_relay(
+            &mut relay,
+            "resume-notice-1",
+            RelayCommand::RecordNotice { text: text.into() },
+        );
+        // Stand in for a retry that re-appended the notice after a transient
+        // persistence failure reported a durable append as unfinished.
+        relay
+            .append_relay_event(
+                Some("resume-notice-1"),
+                RelayObservation::Notice {
+                    message: text.into(),
+                },
+            )
+            .unwrap();
+
+        let mut session = crate::hel_state::MaterializedSession::empty(SESSION);
+        for event in relay.events_after(0, RELAY_EVENT_GENESIS_DIGEST).unwrap() {
+            let projected = crate::hel_projection::project_relay_event(&session, &event).unwrap();
+            crate::hel_projection::apply_committed_projection_event(
+                &mut session,
+                &event,
+                projected.mutation,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(session.transcript.len(), 1);
     }
 
     #[test]

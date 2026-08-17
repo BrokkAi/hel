@@ -2051,6 +2051,29 @@ impl Controller {
                 .execute(executor)
                 .context("clean up target from failed resume")?;
         }
+        // The live checkout, not the archive, is the truth for a raw session.
+        // Say so in the conversation when the two disagree; never reconcile.
+        let mut resume_notices = Vec::new();
+        if let Some(project_directory) = &previous.project_directory {
+            match raw_checkout_position(&previous, &self.config, project_directory, executor) {
+                Ok(live) => resume_notices.extend(raw_checkout_divergence_notice(
+                    project_directory,
+                    archive
+                        .manifest
+                        .repositories
+                        .first()
+                        .map(|repository| &repository.metadata),
+                    &live,
+                )),
+                // Informational only: a resume must not fail because Hel could
+                // not read where the checkout stands.
+                Err(error) => tracing::warn!(
+                    session_id,
+                    error = format!("{error:#}"),
+                    "could not read the raw checkout position for a resume notice"
+                ),
+            }
+        }
         let same_harness = profile.kind == archive.manifest.session.harness_kind;
         let canonical_session = archive.canonical_session.clone();
         let context_bytes = profile
@@ -2219,6 +2242,29 @@ impl Controller {
                         };
                         relay.submit(prompt.command_id.clone(), command).await?;
                     }
+                }
+            }
+            for notice in &resume_notices {
+                let submitted = async {
+                    let command_id = new_command_id("resume-notice")?;
+                    relay
+                        .submit(
+                            command_id,
+                            RelayCommand::RecordNotice {
+                                text: notice.clone(),
+                            },
+                        )
+                        .await
+                }
+                .await;
+                // The conversation line is a courtesy. A relay that refuses it
+                // has not damaged the resume, so report and carry on.
+                if let Err(error) = submitted {
+                    tracing::warn!(
+                        session_id,
+                        error = format!("{error:#}"),
+                        "could not record a resume notice in the conversation"
+                    );
                 }
             }
             self.mark_worker_connected(session_id, Some(native_session_id))?;
@@ -4710,6 +4756,105 @@ fn managed_git_stdout(
     command_stdout(executor.execute(&command)?, purpose)
 }
 
+/// Where a checkout stands: its head commit and, unless detached, its branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckoutPosition {
+    head_commit: String,
+    branch: Option<String>,
+}
+
+fn read_checkout_position(
+    executor: &impl CommandExecutor,
+    target: &ManagedWorktreeTarget,
+    directory: &Path,
+) -> Result<CheckoutPosition> {
+    let head_commit = managed_git_stdout(
+        executor,
+        target,
+        directory,
+        ["rev-parse", "HEAD"],
+        "resolve checkout head commit",
+    )?;
+    let branch_command = managed_git_command(
+        target,
+        directory,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        "resolve checkout branch",
+    );
+    let branch_output = executor.execute(&branch_command)?;
+    let branch = match branch_output.status {
+        0 => Some(
+            String::from_utf8(branch_output.stdout)
+                .context("checkout branch was not UTF-8")?
+                .trim()
+                .to_owned(),
+        ),
+        // A detached head reports no branch rather than failing.
+        1 | 128 => None,
+        status => bail!(
+            "resolve checkout branch failed with status {status}: {}",
+            String::from_utf8_lossy(&branch_output.stderr).trim()
+        ),
+    };
+    Ok(CheckoutPosition {
+        head_commit,
+        branch,
+    })
+}
+
+/// Read where a raw session's checkout stands right now, on whichever host
+/// owns it.
+fn raw_checkout_position(
+    session: &SessionRecord,
+    config: &HelConfig,
+    project_directory: &Path,
+    executor: &impl CommandExecutor,
+) -> Result<CheckoutPosition> {
+    let target = match &session.managed_worktree {
+        Some(worktree) => worktree.target.clone(),
+        None => {
+            let template = config
+                .targets
+                .get(&session.target_template_id)
+                .context("the bare target this session last used is missing")?;
+            managed_worktree_target(template)?
+        }
+    };
+    read_checkout_position(executor, &target, project_directory)
+}
+
+/// One conversation line for a raw session whose checkout moved on while the
+/// session was paused. `None` when the checkout is where the checkpoint left
+/// it, or when the checkpoint recorded no repository to compare against.
+///
+/// This reports; it never reconciles. The working tree is the truth.
+fn raw_checkout_divergence_notice(
+    directory: &Path,
+    recorded: Option<&crate::hel_archive::RepositoryMetadata>,
+    live: &CheckoutPosition,
+) -> Option<String> {
+    let recorded = recorded?;
+    if recorded.head_commit.is_empty()
+        || (recorded.head_commit == live.head_commit && recorded.branch == live.branch)
+    {
+        return None;
+    }
+    Some(format!(
+        "The working tree at {} moved from {} to {} while this session was paused.",
+        directory.display(),
+        checkout_position_text(&recorded.head_commit, recorded.branch.as_deref()),
+        checkout_position_text(&live.head_commit, live.branch.as_deref()),
+    ))
+}
+
+fn checkout_position_text(head_commit: &str, branch: Option<&str>) -> String {
+    let short = head_commit.get(..12).unwrap_or(head_commit);
+    match branch {
+        Some(branch) => format!("{short} ({branch})"),
+        None => format!("{short} (detached)"),
+    }
+}
+
 fn inspect_raw_project(
     executor: &impl CommandExecutor,
     target: &ManagedWorktreeTarget,
@@ -6949,6 +7094,7 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
+    use crate::hel_archive::RepositoryMetadata;
     use crate::hel_config::{
         ContainerTemplate as ConfigContainer, HarnessProfile, ProjectRepository,
     };
@@ -9000,6 +9146,147 @@ mod tests {
 
     fn ssh_worktree_target() -> ManagedWorktreeTarget {
         managed_worktree_target(&resume_compatibility_config().targets["ssh-bare"]).unwrap()
+    }
+
+    /// Answers the two Git reads that locate a checkout, and nothing else.
+    struct CheckoutPositionExecutor {
+        head_commit: String,
+        branch: Option<String>,
+    }
+
+    impl CommandExecutor for CheckoutPositionExecutor {
+        fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+            let stdout = if command.args.iter().any(|argument| argument == "rev-parse") {
+                self.head_commit.clone()
+            } else if command
+                .args
+                .iter()
+                .any(|argument| argument == "symbolic-ref")
+            {
+                match &self.branch {
+                    Some(branch) => branch.clone(),
+                    None => {
+                        return Ok(CommandOutput {
+                            status: 1,
+                            stdout: Vec::new(),
+                            stderr: Vec::new(),
+                        });
+                    }
+                }
+            } else {
+                panic!("unexpected command {:?}", command.args);
+            };
+            Ok(CommandOutput {
+                status: 0,
+                stdout: format!("{stdout}\n").into_bytes(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn recorded_repository(head_commit: &str, branch: Option<&str>) -> RepositoryMetadata {
+        RepositoryMetadata {
+            id: "project".into(),
+            relative_destination: PathBuf::from("project"),
+            origin: "hel-local:project".into(),
+            base_commit: String::new(),
+            head_commit: head_commit.into(),
+            branch: branch.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_raw_checkout_that_moved_while_paused_gets_a_conversation_line() {
+        let config = resume_compatibility_config();
+        let session = managed_raw_session(ManagedWorktreeTarget::Local);
+        let directory = session.project_directory.clone().unwrap();
+        let executor = CheckoutPositionExecutor {
+            head_commit: "b".repeat(40),
+            branch: Some("hel/0123456789abcdef0123456789abcdef".into()),
+        };
+
+        let live = raw_checkout_position(&session, &config, &directory, &executor).unwrap();
+        let notice = raw_checkout_divergence_notice(
+            &directory,
+            Some(&recorded_repository(&"a".repeat(40), Some("main"))),
+            &live,
+        )
+        .expect("a moved checkout is reported");
+
+        assert!(
+            notice.contains(&directory.display().to_string()),
+            "{notice}"
+        );
+        assert!(notice.contains("aaaaaaaaaaaa (main)"), "{notice}");
+        assert!(
+            notice.contains("bbbbbbbbbbbb (hel/0123456789abcdef0123456789abcdef)"),
+            "{notice}"
+        );
+        assert!(notice.contains("while this session was paused"), "{notice}");
+    }
+
+    #[test]
+    fn a_raw_checkout_that_stayed_put_gets_no_conversation_line() {
+        let config = resume_compatibility_config();
+        let session = managed_raw_session(ManagedWorktreeTarget::Local);
+        let directory = session.project_directory.clone().unwrap();
+        let executor = CheckoutPositionExecutor {
+            head_commit: "a".repeat(40),
+            branch: Some("main".into()),
+        };
+
+        let live = raw_checkout_position(&session, &config, &directory, &executor).unwrap();
+
+        assert_eq!(
+            raw_checkout_divergence_notice(
+                &directory,
+                Some(&recorded_repository(&"a".repeat(40), Some("main"))),
+                &live,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_without_recorded_git_identity_reports_nothing() {
+        let live = CheckoutPosition {
+            head_commit: "b".repeat(40),
+            branch: None,
+        };
+
+        assert_eq!(
+            raw_checkout_divergence_notice(Path::new("/home/dev/project"), None, &live),
+            None
+        );
+        assert_eq!(
+            raw_checkout_divergence_notice(
+                Path::new("/home/dev/project"),
+                Some(&recorded_repository("", None)),
+                &live,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_detached_checkout_is_named_as_detached() {
+        let config = resume_compatibility_config();
+        let session = managed_raw_session(ManagedWorktreeTarget::Local);
+        let directory = session.project_directory.clone().unwrap();
+        let executor = CheckoutPositionExecutor {
+            head_commit: "c".repeat(40),
+            branch: None,
+        };
+
+        let live = raw_checkout_position(&session, &config, &directory, &executor).unwrap();
+        let notice = raw_checkout_divergence_notice(
+            &directory,
+            Some(&recorded_repository(&"a".repeat(40), Some("main"))),
+            &live,
+        )
+        .expect("a moved checkout is reported");
+
+        assert!(notice.contains("cccccccccccc (detached)"), "{notice}");
     }
 
     #[test]

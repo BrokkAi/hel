@@ -674,7 +674,8 @@ mod unix {
             | RelayCommand::ClearQueuedPrompts
             | RelayCommand::CompleteCheckpoint { .. }
             | RelayCommand::ReleaseCheckpoint { .. }
-            | RelayCommand::AdvanceRecoveryFloor { .. } => None,
+            | RelayCommand::AdvanceRecoveryFloor { .. }
+            | RelayCommand::RecordNotice { .. } => None,
         }
     }
 
