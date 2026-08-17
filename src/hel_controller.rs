@@ -1529,17 +1529,20 @@ impl Controller {
         session_id: &str,
         executor: &impl CommandExecutor,
     ) -> Result<Option<String>> {
-        let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
+        // Installing the worker and connecting its repositories moves data into
+        // the target, so it reports as Sync. Start begins at the daemon launch.
+        let syncing = &StagedExecutor::new(executor, ProvisionStage::Syncing);
         let (backend, worker_root) = self.worker_placement(session_id)?;
-        self.prepare_worker_files(session_id, &backend, &worker_root, executor)?;
-        install_attached_resources(&self.state, session_id, &backend, &worker_root, executor)?;
+        self.prepare_worker_files(session_id, &backend, &worker_root, syncing)?;
+        install_attached_resources(&self.state, session_id, &backend, &worker_root, syncing)?;
         self.connect_local_repositories(
             session_id,
             &backend,
             &worker_root,
-            executor,
+            syncing,
             LocalBootstrap::Seed,
         )?;
+        let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
         start_worker(executor, &backend, &worker_root)?;
         let reconnect = &hel_targets::reconnect_plan(&backend, session_id)?.commands[0];
         let readiness = async {
@@ -2324,7 +2327,9 @@ impl Controller {
                 ProvisioningFailureDisposition::Preserve,
             )
             .await?;
-            let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
+            // Everything from here to the daemon launch moves data into the
+            // target, so it reports as Sync. Start begins at start_worker.
+            let syncing = &StagedExecutor::new(executor, ProvisionStage::Syncing);
             let (backend, worker_root) = self.worker_placement(session_id)?;
             let harness_home = target_profile_home(&backend, session_id, &profile);
             let workspace_root = if let Some(project_directory) = &resumed_project_directory {
@@ -2380,11 +2385,11 @@ impl Controller {
             // binary is installed: a surviving daemon still holds the old one
             // open, and the install would land on a running executable.
             if let Some(command) = hel_targets::clear_relay_state_plan(&backend, session_id)? {
-                execute_checked(executor, command)?;
+                execute_checked(syncing, command)?;
             }
             // Both lanes below write into the worker root, so it exists first.
             execute_checked(
-                executor,
+                syncing,
                 hel_targets::command_on_locator(
                     &backend,
                     session_id,
@@ -2413,7 +2418,7 @@ impl Controller {
                         session_id,
                         backend_ref,
                         worker_root_ref,
-                        executor,
+                        syncing,
                     )?;
                     // The restore needs the fetched objects: a committed delta
                     // bundle cannot be applied without its prerequisites, and a
@@ -2424,20 +2429,20 @@ impl Controller {
                         session_id,
                         backend_ref,
                         worker_root_ref,
-                        executor,
+                        syncing,
                         LocalBootstrap::Skip,
                     )
                 },
                 || {
                     upload_checkpoint_spec(
-                        executor,
+                        syncing,
                         backend_ref,
                         session_id,
                         &checkpoint.archive_path,
                         &remote_archive,
                     )?;
                     upload_checkpoint_spec(
-                        executor,
+                        syncing,
                         backend_ref,
                         session_id,
                         local_spec_ref,
@@ -2446,15 +2451,15 @@ impl Controller {
                 },
             )?;
             execute_checked(
-                executor,
+                syncing,
                 restore_command(&backend, session_id, &remote_spec)?,
             )?;
-            install_attached_resources(&self.state, session_id, &backend, &worker_root, executor)?;
+            install_attached_resources(&self.state, session_id, &backend, &worker_root, syncing)?;
             self.connect_local_repositories(
                 session_id,
                 &backend,
                 &worker_root,
-                executor,
+                syncing,
                 match conversion.as_ref().and_then(ResumeConversion::raw_to_workspace) {
                     Some(conversion) => LocalBootstrap::SeedFrom(conversion.checkout.clone()),
                     None => LocalBootstrap::Seed,
@@ -2478,6 +2483,7 @@ impl Controller {
                 }
                 None => {}
             }
+            let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
             start_worker(executor, &backend, &worker_root)?;
             let spec = self.reconnect_command(session_id)?;
             let readiness = async {
@@ -7521,7 +7527,10 @@ fn start_worker(
             ],
         ),
     }
-    .purpose("start detached Hel worker");
+    .purpose("start detached Hel worker")
+    // Everything before this moves data into the target and reports as Sync.
+    // Start begins here, with the daemon launch.
+    .stage(ProvisionStage::Starting);
     execute_checked(executor, command)?;
     Ok(())
 }
@@ -10669,6 +10678,83 @@ mod tests {
 
     fn lane_command(purpose: &str) -> CommandSpec {
         CommandSpec::new("hel", ["worker"]).purpose(purpose)
+    }
+
+    /// Launch progress must not claim "Start" while the target is still
+    /// receiving the worker binary, the checkpoint archive and the restore.
+    /// Everything before the daemon launch reports as Sync; the launch itself
+    /// names its own stage, so a Sync-labelled executor cannot relabel it.
+    #[test]
+    fn start_begins_at_the_worker_launch_not_at_the_transfers_before_it() {
+        struct RecordingExecutor {
+            commands: RefCell<Vec<CommandSpec>>,
+        }
+        impl CommandExecutor for RecordingExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.commands.borrow_mut().push(command.clone());
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let worker_root = format!("/var/lib/hel/workers/{session_id}");
+        let executor = RecordingExecutor {
+            commands: RefCell::new(Vec::new()),
+        };
+        let syncing = StagedExecutor::new(&executor, ProvisionStage::Syncing);
+        let backend = hel_targets::TargetLocator::LocalPodman {
+            container_id: "abcdef0123456789".into(),
+        };
+
+        upload_checkpoint_spec(
+            &syncing,
+            &backend,
+            session_id,
+            Path::new("/archives/session.hel.zip"),
+            &format!("{worker_root}/restore.hel.zip"),
+        )
+        .unwrap();
+        execute_checked(
+            &syncing,
+            restore_command(
+                &backend,
+                session_id,
+                &format!("{worker_root}/restore-spec.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // Deliberately run the launch through the Sync-labelled executor: it
+        // must still report Start.
+        start_worker(&syncing, &backend, &worker_root).unwrap();
+
+        let stages = executor
+            .commands
+            .borrow()
+            .iter()
+            .map(|command| (command.purpose.clone(), command.stage))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            vec![
+                (
+                    "upload checkpoint specification".to_owned(),
+                    Some(ProvisionStage::Syncing)
+                ),
+                (
+                    "restore target checkpoint".to_owned(),
+                    Some(ProvisionStage::Syncing)
+                ),
+                (
+                    "start detached Hel worker".to_owned(),
+                    Some(ProvisionStage::Starting)
+                ),
+            ]
+        );
     }
 
     #[test]
