@@ -25,6 +25,9 @@ pub struct GreetingFacts {
     pub remote_active: bool,
     pub remote_turn_active: bool,
     pub low_quota: bool,
+    /// Profile that is under 10% quota remaining while another profile is
+    /// over 50%. Compute it with [`token_earner`].
+    pub token_earner: Option<String>,
     pub high_context_usage: bool,
     pub repository: Option<RepositoryGreetingFacts>,
     pub latest_build_passed: Option<bool>,
@@ -52,6 +55,24 @@ struct Greeting {
 struct Clock {
     hour: u32,
     weekday: Weekday,
+}
+
+/// The profile working hardest for its keep: one under 10% quota remaining
+/// while another sits above 50%. `None` unless both extremes exist.
+pub fn token_earner<'a>(quotas: impl IntoIterator<Item = (&'a str, u8)> + Clone) -> Option<String> {
+    let rested = quotas
+        .clone()
+        .into_iter()
+        .any(|(_, remaining_percent)| remaining_percent > 50);
+    rested
+        .then(|| {
+            quotas
+                .into_iter()
+                .filter(|(_, remaining_percent)| *remaining_percent < 10)
+                .min_by_key(|(_, remaining_percent)| *remaining_percent)
+                .map(|(profile_id, _)| profile_id.to_owned())
+        })
+        .flatten()
 }
 
 pub fn select(facts: &GreetingFacts, seed: u64) -> String {
@@ -103,6 +124,10 @@ fn expand(template: &str, facts: &GreetingFacts) -> String {
         .replace(
             "$profile_name",
             facts.active_turn_profile.as_deref().unwrap_or("An agent"),
+        )
+        .replace(
+            "$token_earner",
+            facts.token_earner.as_deref().unwrap_or("An agent"),
         )
 }
 
@@ -199,6 +224,9 @@ fn long_night(facts: &GreetingFacts, clock: &Clock) -> bool {
 fn low_quota(facts: &GreetingFacts, _: &Clock) -> bool {
     facts.low_quota
 }
+fn earning_tokens(facts: &GreetingFacts, _: &Clock) -> bool {
+    facts.profile_count > 1 && facts.token_earner.is_some()
+}
 
 const fn greeting(
     text: &'static str,
@@ -212,7 +240,7 @@ const fn greeting(
     }
 }
 
-const GREETINGS: [Greeting; 43] = [
+const GREETINGS: [Greeting; 45] = [
     greeting("Welcome to Hel, $firstname", Group::Always, yes),
     greeting(
         "Abandon boilerplate, all ye who enter here",
@@ -230,7 +258,6 @@ const GREETINGS: [Greeting; 43] = [
         yes,
     ),
     greeting("One prompt closer to done", Group::Always, yes),
-    greeting("Good code goes to Hel and back", Group::Always, yes),
     greeting(
         "It's a good night to write code, $firstname",
         Group::Time,
@@ -288,9 +315,14 @@ const GREETINGS: [Greeting; 43] = [
         active_turn,
     ),
     greeting(
-        "$profile_name gazes into the diff, and the diff gazes back",
+        "$profile_name gazes into the diff",
         Group::State,
         active_turn,
+    ),
+    greeting(
+        "The timelines have split, $firstname",
+        Group::Repository,
+        diverged,
     ),
     greeting(
         "The road to Hel is paved with good intentions",
@@ -345,6 +377,11 @@ const GREETINGS: [Greeting; 43] = [
         raw_localhost,
     ),
     greeting(
+        "The agent walks among us, $firstname",
+        Group::Target,
+        raw_localhost,
+    ),
+    greeting(
         "There's a remote agent at the other end of the wire",
         Group::Target,
         remote,
@@ -364,6 +401,11 @@ const GREETINGS: [Greeting; 43] = [
         Group::Usage,
         low_quota,
     ),
+    greeting(
+        "$token_earner is earning its tokens",
+        Group::Usage,
+        earning_tokens,
+    ),
 ];
 
 #[cfg(test)]
@@ -371,8 +413,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_forty_three_unpunctuated_greetings_and_required_first_entry() {
-        assert_eq!(GREETINGS.len(), 43);
+    fn catalog_has_forty_five_unpunctuated_greetings_and_required_first_entry() {
+        assert_eq!(GREETINGS.len(), 45);
         assert_eq!(GREETINGS[0].text, "Welcome to Hel, $firstname");
         assert!(
             GREETINGS
@@ -407,5 +449,45 @@ mod tests {
             select_at(&facts, clock, 0),
             "Mind the quota, Ada. Even Hel has limits"
         );
+    }
+
+    #[test]
+    fn token_earner_needs_one_profile_under_ten_and_another_over_fifty() {
+        assert_eq!(
+            token_earner([("codex", 4u8), ("claude", 80u8)]),
+            Some("codex".to_owned())
+        );
+        // The most-drained profile wins when several are under 10%.
+        assert_eq!(
+            token_earner([("codex", 4u8), ("kimi", 2u8), ("claude", 80u8)]),
+            Some("kimi".to_owned())
+        );
+        assert_eq!(token_earner([("codex", 4u8), ("claude", 40u8)]), None);
+        assert_eq!(token_earner([("codex", 30u8), ("claude", 80u8)]), None);
+        assert_eq!(token_earner([]), None);
+    }
+
+    #[test]
+    fn the_token_earner_greeting_needs_multiple_profiles_and_names_the_drained_one() {
+        let clock = Clock {
+            hour: 14,
+            weekday: Weekday::Tue,
+        };
+        let facts = GreetingFacts {
+            profile_count: 2,
+            token_earner: Some("codex-work".into()),
+            ..GreetingFacts::default()
+        };
+        assert_eq!(
+            select_at(&facts, clock, 0),
+            "codex-work is earning its tokens"
+        );
+
+        let single_profile = GreetingFacts {
+            profile_count: 1,
+            token_earner: Some("codex-work".into()),
+            ..GreetingFacts::default()
+        };
+        assert!(!earning_tokens(&single_profile, &clock));
     }
 }
