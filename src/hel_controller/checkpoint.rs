@@ -1232,9 +1232,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs::OpenOptions;
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
     use std::process::Command;
+    #[cfg(unix)]
     use std::time::Duration;
 
+    #[cfg(unix)]
     use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
     use anyhow::Result;
 
@@ -1242,18 +1245,23 @@ mod tests {
         BundleManifest, CanonicalTranscriptBody, CanonicalTranscriptItem, TargetManifest,
     };
     use crate::hel_checkpoint::CheckpointExportSpec;
+    #[cfg(unix)]
     use crate::hel_config::{
         HarnessProfile, HelConfig, ProjectBundle, ProjectRepository, TargetTemplate,
     };
     use crate::hel_controller::test_support::{
         checkpoint_test_session, write_checkpoint_gate_archive,
     };
-    use crate::hel_controller::{now, restore_session_after_persistence_failure};
+    #[cfg(unix)]
+    use crate::hel_controller::now;
+    use crate::hel_controller::restore_session_after_persistence_failure;
     use crate::hel_projection::canonical_session_from_materialized;
+    #[cfg(unix)]
     use crate::hel_session_manager::{ManagedSessionHandle, new_command_id};
+    #[cfg(unix)]
+    use crate::hel_state::TargetLocator;
     use crate::hel_state::{
         CheckpointMetadata, HelState, ManagedSessionSnapshot, MaterializedSession, SessionState,
-        TargetLocator,
     };
     use crate::hel_targets::{self, CommandExecutor, CommandOutput, CommandSpec};
     use crate::hel_worker::{RelayCommand, RelayCursor, RelayExecutionState};
