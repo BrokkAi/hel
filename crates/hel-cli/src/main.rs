@@ -1800,6 +1800,7 @@ fn quota_refresh_profiles(controller: &Controller) -> Vec<QuotaRefreshRequest> {
                 profile_id: id.clone(),
                 harness: profile.kind,
                 source_home: profile.home.clone(),
+                executable: profile.executable.clone(),
                 environment,
                 cwd: cwd.clone(),
             }

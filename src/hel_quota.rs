@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::claude_usage;
 use crate::codex_usage::{self, CodexUsageClient, CodexUsageStatus};
+use crate::grok_usage;
 use crate::hel_config::HarnessKind;
 
 #[derive(Debug, Clone)]
@@ -17,6 +18,9 @@ pub struct QuotaRefreshRequest {
     pub profile_id: String,
     pub harness: HarnessKind,
     pub source_home: std::path::PathBuf,
+    /// Harness CLI override from the profile, for the backends that shell out
+    /// to the CLI itself rather than to an adapter.
+    pub executable: Option<std::path::PathBuf>,
     pub environment: BTreeMap<String, String>,
     pub cwd: std::path::PathBuf,
 }
@@ -100,10 +104,12 @@ impl ProfileQuota {
     }
 }
 
+/// The dashboard's long-window column. A harness billed monthly rather than
+/// weekly belongs in the same column; the label itself names the real period.
 fn is_weekly_quota_window(label: &str) -> bool {
     matches!(
         label.to_ascii_lowercase().as_str(),
-        "week" | "weekly" | "7d"
+        "week" | "weekly" | "7d" | "month" | "monthly"
     )
 }
 
@@ -195,6 +201,7 @@ async fn refresh_profile(
         profile_id,
         harness,
         source_home,
+        executable,
         environment,
         cwd,
     } = request;
@@ -274,17 +281,32 @@ async fn refresh_profile(
                     refreshed_at_epoch_seconds,
                 })
         }
-        // Grok Build publishes no quota endpoint Hel can read. Report that as
-        // a plain note rather than an error, so the dashboard does not paint a
-        // failure that no one can fix.
-        HarnessKind::Grok => Ok(ProfileQuota {
-            profile_id: profile_id.clone(),
-            harness,
-            windows: Vec::new(),
-            extra: Some("quota reporting is not available for Grok Build".to_owned()),
-            error: None,
-            refreshed_at_epoch_seconds,
-        }),
+        // Grok Build publishes no HTTP quota endpoint. Its own usage view polls
+        // an ACP billing extension, and so does Hel.
+        HarnessKind::Grok => {
+            grok_usage::query(executable, source_home.clone(), cwd, environment)
+                .await
+                .map(|report| ProfileQuota {
+                    profile_id: profile_id.clone(),
+                    harness,
+                    windows: vec![QuotaWindow {
+                        label: report.period_label.clone(),
+                        remaining_percent: Some(report.remaining_percent()),
+                        // Grok Build reports a share of the allowance, not the
+                        // credit amounts behind it.
+                        used: None,
+                        limit: None,
+                        resets: report
+                            .resets_at
+                            .and_then(crate::usage_format::format_reset_local_seconds),
+                        resets_at_epoch_seconds: report.resets_at,
+                    }],
+                    extra: report.subscription_tier,
+                    error: None,
+                    refreshed_at_epoch_seconds,
+                })
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+        }
     };
     let report = result.unwrap_or_else(|error| ProfileQuota {
         profile_id,
@@ -795,27 +817,89 @@ mod tests {
         assert_eq!(report.compact(), "Week 0% left, resets 03:59 Aug 14");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn grok_reports_unsupported_quota_as_a_note_rather_than_an_error() {
+    async fn a_grok_profile_reports_its_billing_period_as_one_quota_window() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("grok");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *initialize*) printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\\n' ;;\n    *billing*) printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"config\":{\"creditUsagePercent\":25.0,\"currentPeriod\":{\"type\":\"USAGE_PERIOD_TYPE_WEEKLY\",\"end\":\"2026-08-18T05:22:07+00:00\"}},\"subscription_tier\":\"X Premium+\"}}\\n' ;;\n  esac\ndone\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
         let (report, _) = refresh_profile(
             QuotaRefreshRequest {
                 profile_id: "grok".into(),
                 harness: HarnessKind::Grok,
-                source_home: std::path::PathBuf::from("/nonexistent"),
+                source_home: directory.path().to_path_buf(),
+                executable: Some(executable),
                 environment: BTreeMap::new(),
-                cwd: std::path::PathBuf::from("/"),
+                cwd: directory.path().to_path_buf(),
             },
             None,
         )
         .await;
 
-        assert_eq!(report.profile_id, "grok");
-        assert_eq!(report.error, None, "an unfixable gap is not a failure");
+        assert_eq!(report.error, None, "{:?}", report.error);
+        // One long window and no short one: Grok Build has no 5-hour budget.
+        assert_eq!(report.windows.len(), 1);
+        assert_eq!(report.weekly_window().unwrap().remaining_percent, Some(75));
+        assert_eq!(report.five_hour_window(), None);
+        assert_eq!(report.extra.as_deref(), Some("X Premium+"));
+        assert!(report.compact().starts_with("Week 75% left, resets "));
+        assert!(report.compact().ends_with("X Premium+"));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_grok_reports_the_failure_instead_of_a_zero_reading() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let (report, _) = refresh_profile(
+            QuotaRefreshRequest {
+                profile_id: "grok".into(),
+                harness: HarnessKind::Grok,
+                source_home: directory.path().to_path_buf(),
+                executable: Some(directory.path().join("no-such-grok")),
+                environment: BTreeMap::new(),
+                cwd: directory.path().to_path_buf(),
+            },
+            None,
+        )
+        .await;
+
         assert!(report.windows.is_empty());
         assert_eq!(
-            report.compact(),
-            "quota reporting is not available for Grok Build"
+            report.error.as_deref(),
+            Some("Grok Build executable not found")
         );
+    }
+
+    #[test]
+    fn a_monthly_window_shares_the_long_window_column_with_a_weekly_one() {
+        for label in ["Week", "Month"] {
+            let report = ProfileQuota {
+                profile_id: "grok".into(),
+                harness: HarnessKind::Grok,
+                windows: vec![QuotaWindow {
+                    label: label.into(),
+                    remaining_percent: Some(60),
+                    used: None,
+                    limit: None,
+                    resets: None,
+                    resets_at_epoch_seconds: None,
+                }],
+                extra: None,
+                error: None,
+                refreshed_at_epoch_seconds: 0,
+            };
+
+            assert!(report.weekly_window().is_some(), "{label}");
+            assert_eq!(report.compact(), format!("{label} 60% left"));
+        }
     }
 
     #[test]

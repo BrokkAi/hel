@@ -2,6 +2,7 @@
 
 mod claude_usage;
 mod codex_usage;
+mod grok_usage;
 pub mod speech;
 pub mod termination;
 pub mod usage_format;
