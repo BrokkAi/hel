@@ -1249,12 +1249,12 @@ mod tests {
     use crate::hel_config::{
         HarnessProfile, HelConfig, ProjectBundle, ProjectRepository, TargetTemplate,
     };
-    use crate::hel_controller::test_support::{
-        checkpoint_test_session, write_checkpoint_gate_archive,
-    };
     #[cfg(unix)]
     use crate::hel_controller::now;
     use crate::hel_controller::restore_session_after_persistence_failure;
+    use crate::hel_controller::test_support::{
+        checkpoint_test_session, write_checkpoint_gate_archive,
+    };
     use crate::hel_projection::canonical_session_from_materialized;
     #[cfg(unix)]
     use crate::hel_session_manager::{ManagedSessionHandle, new_command_id};
