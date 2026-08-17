@@ -1385,7 +1385,10 @@ mod tests {
 
     #[test]
     fn resume_action_refuses_a_target_the_session_cannot_use() {
-        let (config, state) = sample_config_state();
+        let (mut config, state) = sample_config_state();
+        // A project that only exists on GitHub cannot become a checkout on this
+        // machine, so the bare target stays out of reach for its sessions.
+        config.bundles.get_mut("hel").unwrap().repositories[0].local = None;
         let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
         assert_eq!(
             snapshot.sessions[0].incompatible_resume_targets,

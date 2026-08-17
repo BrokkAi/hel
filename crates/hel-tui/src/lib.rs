@@ -8760,7 +8760,7 @@ mod tests {
 
         assert_eq!(resume_wizard(&dashboard).step, WizardStep::Target);
         let notice = dashboard.notices.current().unwrap_or_default();
-        assert!(notice.contains("created from a project bundle"), "{notice}");
+        assert!(notice.contains("came from GitHub"), "{notice}");
     }
 
     #[test]
@@ -8780,10 +8780,7 @@ mod tests {
             .unwrap();
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
 
-        assert!(
-            rendered.contains("created from a project bundle"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("came from GitHub"), "{rendered}");
     }
 
     fn resume_wizard(dashboard: &DashboardState) -> &ResumeWizard {
