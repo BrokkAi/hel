@@ -59,14 +59,14 @@ jobs:
 
       - name: Package crates
         run: |
-          # hel-tui and hel-cli depend on workspace crates that are not on the
-          # registry until this same release publishes them, so their packaged
-          # tarballs cannot be verify-built here; the leaf crates still get the
-          # full verification build.
+          # Only crates without in-workspace registry dependencies can be
+          # packaged before publishing: cargo package requires a dependency to
+          # exist in the index even with --no-verify, and hel-core is not there
+          # until this same release publishes it. hel-tui and hel-cli are
+          # packaged (and verify-built) by cargo publish itself, which runs in
+          # dependency order after hel-core is live.
           cargo package --locked -p hel-core
           cargo package --locked -p hel-voice-worker
-          cargo package --locked --no-verify -p hel-tui
-          cargo package --locked --no-verify -p hel-cli
 
       - uses: actions/upload-artifact@v7
         with:
