@@ -317,6 +317,17 @@ enum LatchExclusivity {
     HoldThroughClose,
 }
 
+/// Whether a latched checkpoint must export a fresh archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointExportPolicy {
+    /// Always export, transfer, and install a new archive.
+    Always,
+    /// Keep the installed archive when the latched projection holds the same
+    /// session content. Relay bookkeeping (the checkpoint commands themselves)
+    /// always moves the event frontier, so only content can decide this.
+    ReuseUnchangedArchive,
+}
+
 /// How a latched checkpoint ends the barrier it opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointCompletion {
@@ -2589,6 +2600,7 @@ impl Controller {
                 executor,
                 manager,
                 LatchExclusivity::ReleaseAfterLatch,
+                CheckpointExportPolicy::Always,
             )
             .await
         {
@@ -2685,6 +2697,7 @@ impl Controller {
                 executor,
                 manager,
                 LatchExclusivity::ReleaseAfterLatch,
+                CheckpointExportPolicy::Always,
             )
             .await?;
         let artifact = latched.artifact.clone();
@@ -2724,6 +2737,7 @@ impl Controller {
         executor: &(impl CommandExecutor + Sync),
         manager: Option<&SessionManagerControl>,
         exclusivity: LatchExclusivity,
+        export_policy: CheckpointExportPolicy,
     ) -> Result<LatchedCheckpoint> {
         let session = self
             .state
@@ -2812,6 +2826,29 @@ impl Controller {
         // and submitting while the slow phase runs.
         if exclusivity == LatchExclusivity::ReleaseAfterLatch {
             relay.end_latch();
+        }
+
+        // Reuse before exporting: verifying an installed archive costs far less
+        // than exporting and transferring an identical one. A reused archive's
+        // frontier trails the cursor its caller seals by the checkpoint's own
+        // bookkeeping events, and only by those; resume rolls the controller's
+        // projection back to the archived record.
+        if export_policy == CheckpointExportPolicy::ReuseUnchangedArchive
+            && let Some(artifact) = reusable_installed_checkpoint(
+                session_id,
+                session.checkpoint.as_ref(),
+                &native_session_id,
+                cursor.ordinal,
+                &canonical_session,
+            )
+        {
+            return Ok(LatchedCheckpoint {
+                artifact,
+                relay,
+                barrier_command_id,
+                cursor,
+                completion: CheckpointCompletion::HeldBarrier,
+            });
         }
 
         // Close must keep ACP dispatch frozen until it seals the relay, so only
@@ -3088,6 +3125,7 @@ impl Controller {
                 executor,
                 manager,
                 LatchExclusivity::HoldThroughClose,
+                CheckpointExportPolicy::ReuseUnchangedArchive,
             )
             .await
         {
@@ -7432,6 +7470,74 @@ fn apply_close_checkpoint_started(record: &mut SessionRecord, updated_at: String
     record.last_checkpoint_error = None;
 }
 
+/// The artifact a latched checkpoint may keep instead of exporting a new one,
+/// or `None` when a full export has to run.
+///
+/// Every relay command is journalled, checkpoint plumbing included, so the
+/// event frontier always moves between two checkpoints. Session content is
+/// what decides whether the installed archive still represents the session.
+/// Every reason to decline is reported; none of them fails the checkpoint.
+fn reusable_installed_checkpoint(
+    session_id: &str,
+    installed: Option<&CheckpointMetadata>,
+    native_session_id: &str,
+    latched_ordinal: u64,
+    latched_session: &CanonicalSessionSnapshot,
+) -> Option<CheckpointArtifact> {
+    let installed = installed?;
+    if installed.event_frontier > latched_ordinal {
+        tracing::warn!(
+            session_id,
+            installed_frontier = installed.event_frontier,
+            latched_ordinal,
+            "installed checkpoint is ahead of the latched cursor; exporting a fresh archive"
+        );
+        return None;
+    }
+    let verified = match verify_archive_streaming(&installed.archive_path) {
+        Ok(verified) => verified,
+        Err(error) => {
+            tracing::warn!(
+                session_id,
+                path = %installed.archive_path.display(),
+                "installed checkpoint could not be verified for reuse: {error:#}"
+            );
+            return None;
+        }
+    };
+    if verified.archive_sha256 != installed.sha256
+        || verified.manifest.session.id != session_id
+        || verified.canonical_session.event_frontier != installed.event_frontier
+    {
+        tracing::warn!(
+            session_id,
+            path = %installed.archive_path.display(),
+            "installed checkpoint no longer matches its controller metadata; exporting a fresh archive"
+        );
+        return None;
+    }
+    if !verified.canonical_session.content_matches(latched_session) {
+        tracing::info!(
+            session_id,
+            archive_frontier = verified.canonical_session.event_frontier,
+            latched_ordinal,
+            "session content changed since the installed checkpoint; exporting a fresh archive"
+        );
+        return None;
+    }
+    tracing::info!(
+        session_id,
+        archive_frontier = verified.canonical_session.event_frontier,
+        latched_ordinal,
+        "reusing the installed checkpoint archive; only relay bookkeeping moved"
+    );
+    Some(CheckpointArtifact {
+        metadata: installed.clone(),
+        native_session_id: native_session_id.to_owned(),
+        event_frontier_digest: verified.canonical_session.event_frontier_digest,
+    })
+}
+
 fn verify_installed_checkpoint_gate(
     session_id: &str,
     checkpoint: &CheckpointMetadata,
@@ -7574,7 +7680,7 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
-    use crate::hel_archive::RepositoryMetadata;
+    use crate::hel_archive::{CanonicalTranscriptItem, RepositoryMetadata};
     use crate::hel_config::{
         ContainerTemplate as ConfigContainer, HarnessProfile, ProjectRepository,
     };
@@ -8195,6 +8301,8 @@ mod tests {
     const RELEASE_TEST_CHILD: &str = "HEL_TEST_RELEASE_LATCH_CHILD";
     #[cfg(unix)]
     const LEGACY_RELEASE_TEST_CHILD: &str = "HEL_TEST_LEGACY_RELEASE_LATCH_CHILD";
+    #[cfg(unix)]
+    const REUSE_TEST_CHILD: &str = "HEL_TEST_REUSE_LATCH_CHILD";
     const LATCH_RELAY_SESSION: &str = "018f9dd2-a3b4-7c8d-9000-0123456789ab";
 
     /// Whether the scripted relay understands the early checkpoint release.
@@ -8759,6 +8867,224 @@ mod tests {
         // back alive.
         wait_until_the_actor_serves_again(&handle).await;
         assert_eq!(relay_starts(&start_log), 2);
+    }
+
+    /// The close policy, end to end against a live relay: a latch that finds
+    /// its own content already archived issues no export or transfer command
+    /// and keeps the installed archive, while the next latch after real
+    /// session content goes back through the full export.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_close_latch_reuses_an_unchanged_archive_and_exports_after_new_content() {
+        // HEL_DATA_DIR is process-global, so run the database-backed half in an
+        // exact child test instead of racing unrelated tests in this process.
+        if std::env::var_os(REUSE_TEST_CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let test_name = format!(
+                "{}::a_close_latch_reuses_an_unchanged_archive_and_exports_after_new_content",
+                module_path!()
+                    .strip_prefix("hel::")
+                    .unwrap_or(module_path!())
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(REUSE_TEST_CHILD, "1")
+                .env("HEL_DATA_DIR", directory.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated checkpoint reuse test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // A latch that never returns would hang the suite instead of failing
+        // it, so turn a stall into a hard error.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(120));
+            eprintln!("the reuse checkpoint never finished its latch");
+            std::process::exit(101);
+        });
+
+        #[derive(Default)]
+        struct RecordingExecutor {
+            purposes: std::sync::Mutex<Vec<String>>,
+        }
+
+        impl RecordingExecutor {
+            fn refused(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.purposes.lock().unwrap().push(command.purpose.clone());
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: Vec::new(),
+                    stderr: b"no target is provisioned for this test".to_vec(),
+                })
+            }
+
+            fn purposes(&self) -> Vec<String> {
+                self.purposes.lock().unwrap().clone()
+            }
+        }
+
+        impl CommandExecutor for RecordingExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.refused(command)
+            }
+
+            fn execute_with_stdin(
+                &self,
+                command: &CommandSpec,
+                _input: &mut (dyn std::io::Read + Send),
+            ) -> Result<CommandOutput> {
+                self.refused(command)
+            }
+        }
+
+        let data_directory = PathBuf::from(std::env::var_os("HEL_DATA_DIR").unwrap());
+        let relay_root = data_directory.join("relay");
+        let profile_home = data_directory.join("profile");
+        let archive_directory = data_directory.join("archives");
+        for directory in [&relay_root, &profile_home, &archive_directory] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        // A frontier of 1 is behind every barrier this relay can latch.
+        let checkpoint = write_checkpoint_gate_archive(&archive_directory, LATCH_RELAY_SESSION, 1);
+
+        let mut session = checkpoint_test_session(LATCH_RELAY_SESSION);
+        session.target_template_id = "local".into();
+        session.target = Some(TargetLocator::LocalBare {
+            worker_root: data_directory.join("workers").join(LATCH_RELAY_SESSION),
+        });
+        session.checkpoint = Some(checkpoint.clone());
+        crate::hel_database::save_session(&session).unwrap();
+
+        let mut config = HelConfig::default();
+        config.profiles.insert(
+            "codex".into(),
+            HarnessProfile {
+                kind: crate::hel_config::HarnessKind::Codex,
+                home: profile_home,
+                executable: None,
+                environment: BTreeMap::new(),
+                context_window_bytes: None,
+            },
+        );
+        config
+            .targets
+            .insert("local".into(), TargetTemplate::LocalBare);
+        config.bundles.insert(
+            "project".into(),
+            ProjectBundle {
+                primary_repo: "project".into(),
+                repositories: vec![ProjectRepository {
+                    id: "project".into(),
+                    github: Some("example/project".into()),
+                    local: None,
+                    destination: "project".into(),
+                    git_ref: None,
+                }],
+            },
+        );
+        let controller = Controller {
+            config,
+            state: HelState {
+                sessions: BTreeMap::from([(LATCH_RELAY_SESSION.into(), session)]),
+                ..HelState::default()
+            },
+        };
+
+        let channels = crate::hel_session_manager::spawn_session_manager().unwrap();
+        channels
+            .targets
+            .send(vec![latch_relay_target(
+                &relay_root,
+                None,
+                ReleaseSupport::Supported,
+            )])
+            .unwrap();
+        let handle = channels
+            .control
+            .wait_for_session(LATCH_RELAY_SESSION, Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let executor = RecordingExecutor::default();
+        let latched = controller
+            .checkpoint_session_latched(
+                LATCH_RELAY_SESSION,
+                &executor,
+                Some(&channels.control),
+                LatchExclusivity::HoldThroughClose,
+                CheckpointExportPolicy::ReuseUnchangedArchive,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            executor.purposes().is_empty(),
+            "an unchanged session exported an archive anyway: {:?}",
+            executor.purposes()
+        );
+        assert_eq!(latched.artifact.metadata, checkpoint);
+        assert!(checkpoint.archive_path.exists());
+        // The cursor close seals is ahead of the reused archive by this
+        // checkpoint's own bookkeeping.
+        assert!(latched.cursor.ordinal > checkpoint.event_frontier);
+        let cursor = latched.cursor.clone();
+        latched.complete().await.unwrap();
+        wait_until_the_actor_serves_again(&handle).await;
+
+        // Real session content, and the same policy has to export again.
+        handle
+            .submit(
+                new_command_id("resume-notice").unwrap(),
+                RelayCommand::RecordNotice {
+                    text: "the session changed".into(),
+                },
+            )
+            .await
+            .unwrap();
+        for attempt in 0.. {
+            handle.sync_now().await.unwrap();
+            let materialized = handle.view().snapshot.map(|snapshot| snapshot.materialized);
+            if materialized.is_some_and(|materialized| {
+                materialized.applied_event_ordinal > cursor.ordinal
+                    && !materialized.transcript.is_empty()
+            }) {
+                break;
+            }
+            assert!(attempt < 200, "the notice never reached the projection");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let changed = controller
+            .checkpoint_session_latched(
+                LATCH_RELAY_SESSION,
+                &executor,
+                Some(&channels.control),
+                LatchExclusivity::HoldThroughClose,
+                CheckpointExportPolicy::ReuseUnchangedArchive,
+            )
+            .await;
+        let Err(error) = changed else {
+            panic!("a changed session reused its installed archive");
+        };
+
+        assert!(
+            executor
+                .purposes()
+                .contains(&"export target checkpoint".to_owned()),
+            "a changed session skipped its export: {:?}",
+            executor.purposes()
+        );
+        assert!(
+            format!("{error:#}").contains("no target is provisioned for this test"),
+            "{error:#}"
+        );
+        assert!(checkpoint.archive_path.exists());
     }
 
     #[cfg(unix)]
@@ -9448,6 +9774,88 @@ mod tests {
             )
             .contains("re-open installed checkpoint")
         );
+    }
+
+    #[test]
+    fn an_installed_archive_is_reused_when_only_relay_bookkeeping_moved() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let checkpoint = write_checkpoint_gate_archive(directory.path(), session_id, 7);
+        let archived = verify_archive_streaming(&checkpoint.archive_path)
+            .unwrap()
+            .canonical_session;
+
+        // What a checkpoint taken seconds later latches on an idle session:
+        // the frontier and the activity watermark moved, the content did not.
+        let mut latched = archived.clone();
+        latched.event_frontier += 6;
+        latched.event_frontier_digest = "b".repeat(64);
+        latched.session.last_activity_at_ms = Some(9_999);
+
+        let artifact = reusable_installed_checkpoint(
+            session_id,
+            Some(&checkpoint),
+            "native-session",
+            latched.event_frontier,
+            &latched,
+        )
+        .expect("an unchanged session reuses its installed archive");
+
+        assert_eq!(artifact.metadata, checkpoint);
+        assert_eq!(artifact.native_session_id, "native-session");
+        assert_eq!(
+            artifact.event_frontier_digest,
+            archived.event_frontier_digest
+        );
+        // The reused archive is still the gate close destroys through.
+        verify_checkpoint_artifact(session_id, &artifact).unwrap();
+        verify_installed_checkpoint_gate(session_id, &artifact.metadata).unwrap();
+    }
+
+    #[test]
+    fn archive_reuse_falls_back_to_a_full_export_for_anything_but_bookkeeping() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let checkpoint = write_checkpoint_gate_archive(directory.path(), session_id, 7);
+        let archived = verify_archive_streaming(&checkpoint.archive_path)
+            .unwrap()
+            .canonical_session;
+        let mut latched = archived.clone();
+        latched.event_frontier += 6;
+        let reuse = |installed: Option<&CheckpointMetadata>,
+                     ordinal: u64,
+                     session: &CanonicalSessionSnapshot| {
+            reusable_installed_checkpoint(session_id, installed, "native-session", ordinal, session)
+        };
+
+        assert!(reuse(None, latched.event_frontier, &latched).is_none());
+
+        let mut with_new_content = latched.clone();
+        with_new_content.transcript.push(CanonicalTranscriptItem {
+            stable_id: "system:notice:notice-1".into(),
+            position: latched.event_frontier,
+            latest_content_event_ordinal: None,
+            created_at_ms: 2_000,
+            last_changed_at_ms: 2_000,
+            body: CanonicalTranscriptBody::System {
+                text: "resumed".into(),
+            },
+        });
+        assert!(reuse(Some(&checkpoint), latched.event_frontier, &with_new_content).is_none());
+
+        // An archive the latch has not reached yet cannot describe the session.
+        assert!(reuse(Some(&checkpoint), checkpoint.event_frontier - 1, &latched).is_none());
+
+        let mut wrong_sha = checkpoint.clone();
+        wrong_sha.sha256 = "b".repeat(64);
+        assert!(reuse(Some(&wrong_sha), latched.event_frontier, &latched).is_none());
+
+        let another_session =
+            write_checkpoint_gate_archive(directory.path(), "1123456789abcdef0123456789abcdef", 7);
+        assert!(reuse(Some(&another_session), latched.event_frontier, &latched).is_none());
+
+        std::fs::write(&checkpoint.archive_path, b"not an archive any more").unwrap();
+        assert!(reuse(Some(&checkpoint), latched.event_frontier, &latched).is_none());
     }
 
     #[test]
@@ -10726,12 +11134,11 @@ mod tests {
         assert!(script.contains("command -v grok"));
         assert!(script.contains("[ -x \"$GROK_HOME/bin/grok\" ]"));
         assert!(script.contains("[ -x \"$HOME/.grok/bin/grok\" ]"));
-        assert!(script.contains("exec grok agent stdio"));
         assert!(script.contains("exit 127"));
-        assert!(
-            !script.contains("--always-approve"),
-            "a restricted session must not auto-approve: {script}"
-        );
+        // Grok Build asks by default and Hel answers by cancelling, so the
+        // flag rides along even on a target that does not force unrestricted
+        // mode. Without it a bare session could not write anything.
+        assert!(script.contains("exec grok agent --always-approve stdio"));
     }
 
     #[test]
@@ -10755,16 +11162,15 @@ mod tests {
                 vec!["agent", "--always-approve", "stdio"],
             ),
         ] {
-            let (command, arguments) = bridge_launch(kind, Some(&executable), true);
-            assert_eq!(command, "/opt/harness");
-            assert_eq!(arguments, expected, "{kind:?} override arguments");
+            for unrestricted in [false, true] {
+                let (command, arguments) = bridge_launch(kind, Some(&executable), unrestricted);
+                assert_eq!(command, "/opt/harness");
+                assert_eq!(
+                    arguments, expected,
+                    "{kind:?} override arguments, unrestricted: {unrestricted}"
+                );
+            }
         }
-        let (_, restricted) = bridge_launch(
-            crate::hel_config::HarnessKind::Grok,
-            Some(&executable),
-            false,
-        );
-        assert_eq!(restricted, ["agent", "stdio"]);
     }
 
     #[test]

@@ -301,6 +301,11 @@ fn is_exit_plan_mode_method(method: &str) -> bool {
 /// restricted target declines, so plan mode stays active and the person
 /// decides. `feedback` belongs with `cancelled` only, and Hel has none to
 /// give — nobody has read the plan yet.
+///
+/// The asymmetry with tool permissions on a bare target is deliberate. Grok
+/// Build always launches with `--always-approve`, so its writes never ask; but
+/// leaving plan mode is a decision about the plan, not a tool permission, so it
+/// stays with the person until the target itself is disposable.
 fn exit_plan_mode_outcome(auto_approve: bool) -> &'static str {
     if auto_approve {
         "approved"
@@ -889,7 +894,16 @@ async fn drive_connection(
         RuntimeEvent::SessionStarted {
             native_session_id: session_id.to_string(),
             resumed,
-            unrestricted_mode: enforcement.map(|enforcement| enforcement.label().to_owned()),
+            // A launch flag Hel passes on every target is genuinely on even
+            // when the target did not force unrestricted mode, so the session
+            // reports the mode it really runs in rather than nothing.
+            unrestricted_mode: enforcement
+                .or_else(|| {
+                    spec.harness
+                        .launch_flag_for(spec.force_unrestricted_mode)
+                        .map(|_| spec.harness.unrestricted_enforcement())
+                })
+                .map(|enforcement| enforcement.label().to_owned()),
         },
     )
     .await?;
