@@ -1530,7 +1530,8 @@ impl Controller {
         executor: &impl CommandExecutor,
     ) -> Result<Option<String>> {
         let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
-        let (backend, worker_root) = self.prepare_worker_files(session_id, executor)?;
+        let (backend, worker_root) = self.worker_placement(session_id)?;
+        self.prepare_worker_files(session_id, &backend, &worker_root, executor)?;
         install_attached_resources(&self.state, session_id, &backend, &worker_root, executor)?;
         self.connect_local_repositories(
             session_id,
@@ -1560,11 +1561,31 @@ impl Controller {
         }
     }
 
+    /// Where this session's worker lives. This is decided from the session
+    /// record and configuration alone, so a caller can name the worker root
+    /// before anything is installed into it.
+    fn worker_placement(&self, session_id: &str) -> Result<(hel_targets::TargetLocator, String)> {
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?;
+        let locator = session
+            .target
+            .as_ref()
+            .context("session target is missing")?;
+        let backend = backend_locator(locator, session, &self.config)?;
+        let worker_root = hel_targets::worker_root(&backend, session_id)?;
+        Ok((backend, worker_root))
+    }
+
     fn prepare_worker_files(
         &self,
         session_id: &str,
+        backend: &hel_targets::TargetLocator,
+        worker_root: &str,
         executor: &impl CommandExecutor,
-    ) -> Result<(hel_targets::TargetLocator, String)> {
+    ) -> Result<()> {
         let session = self
             .state
             .sessions
@@ -1580,18 +1601,12 @@ impl Controller {
             .is_none()
             .then(|| self.config.bundles.get(&session.bundle_id))
             .flatten();
-        let locator = session
-            .target
-            .as_ref()
-            .context("session target is missing")?;
-        let backend = backend_locator(locator, session, &self.config)?;
-        let worker_root = hel_targets::worker_root(&backend, session_id)?;
-        let target_profile_home = target_profile_home(&backend, session_id, profile);
+        let target_profile_home = target_profile_home(backend, session_id, profile);
         let workspace = if let Some(project_directory) = &session.project_directory {
             (project_directory.to_string_lossy().into_owned(), Vec::new())
         } else {
             workspace_paths(
-                &backend,
+                backend,
                 bundle.context("session bundle is missing")?,
                 session_id,
             )?
@@ -1609,7 +1624,7 @@ impl Controller {
         );
         // The flag-enforced harnesses need the unrestricted decision on the
         // bridge command line, so it is taken before the launch config.
-        let force_unrestricted = force_unrestricted_mode(&backend);
+        let force_unrestricted = force_unrestricted_mode(backend);
         let (bridge_command, bridge_args) = bridge_launch(
             profile.kind,
             profile.executable.as_deref(),
@@ -1652,21 +1667,20 @@ impl Controller {
             );
             result?;
         }
-        let worker_binary = worker_binary_for(&backend, executor)?;
+        let worker_binary = worker_binary_for(backend, executor)?;
 
         install_worker_files(
             executor,
-            &backend,
+            backend,
             session_id,
-            &worker_root,
+            worker_root,
             &target_profile_home,
             &worker_binary,
             &launch_path,
             &ownership_path,
             &profile_stage,
         )?;
-        install_inherited_git_settings(executor, &backend, session_id)?;
-        Ok((backend, worker_root))
+        install_inherited_git_settings(executor, backend, session_id)
     }
 
     /// Point the target's checkouts at the `hel-local` Git proxy and fetch the
@@ -2311,7 +2325,7 @@ impl Controller {
             )
             .await?;
             let executor = &StagedExecutor::new(executor, ProvisionStage::Starting);
-            let (backend, worker_root) = self.prepare_worker_files(session_id, executor)?;
+            let (backend, worker_root) = self.worker_placement(session_id)?;
             let harness_home = target_profile_home(&backend, session_id, &profile);
             let workspace_root = if let Some(project_directory) = &resumed_project_directory {
                 project_directory
@@ -2338,17 +2352,6 @@ impl Controller {
                 }
                 _ => PathBuf::from(path),
             };
-            // The restore needs the fetched objects: a committed delta bundle
-            // cannot be applied without its prerequisites, and a bundle-free
-            // snapshot checks out a head commit only the proxy can supply. The
-            // archive carries this session's dirty state, so nothing is seeded.
-            self.connect_local_repositories(
-                session_id,
-                &backend,
-                &worker_root,
-                executor,
-                LocalBootstrap::Skip,
-            )?;
             let remote_archive = format!("{worker_root}/restore.hel.zip");
             let remote_spec = format!("{worker_root}/restore-spec.json");
             let restore = CheckpointRestoreSpec {
@@ -2373,21 +2376,75 @@ impl Controller {
             // A bare target keeps the closed session's worker root on the host.
             // Stop anything still writing there and clear the leftover relay
             // state, or the restore's seed loses to a stale snapshot whose
-            // frontier no journal can support.
+            // frontier no journal can support. This runs before the worker
+            // binary is installed: a surviving daemon still holds the old one
+            // open, and the install would land on a running executable.
             if let Some(command) = hel_targets::clear_relay_state_plan(&backend, session_id)? {
                 execute_checked(executor, command)?;
             }
+            // Both lanes below write into the worker root, so it exists first.
+            execute_checked(
+                executor,
+                hel_targets::command_on_locator(
+                    &backend,
+                    session_id,
+                    vec!["mkdir".into(), "-p".into(), worker_root.clone()],
+                    "create the session worker root",
+                )?,
+            )?;
             let staging = tempfile::tempdir().context("create restore staging")?;
             let local_spec = staging.path().join("restore-spec.json");
             std::fs::write(&local_spec, serde_json::to_vec_pretty(&restore)?)?;
-            upload_checkpoint_spec(
-                executor,
-                &backend,
-                session_id,
-                &checkpoint.archive_path,
-                &remote_archive,
+            // Two independent lanes into the target. The checkpoint transfer
+            // needs nothing from the worker install, and the worker install
+            // and the local Git connection together are the longer of the two,
+            // so overlapping them hides the smaller one entirely.
+            //
+            // The Git connection stays behind the worker install in its own
+            // lane: the target fetches through `ext::<worker root>/hel worker
+            // git-proxy`, so the binary has to be there before a fetch runs.
+            let controller = &*self;
+            let backend_ref = &backend;
+            let worker_root_ref = worker_root.as_str();
+            let local_spec_ref = local_spec.as_path();
+            execute_concurrent_lanes(
+                || {
+                    controller.prepare_worker_files(
+                        session_id,
+                        backend_ref,
+                        worker_root_ref,
+                        executor,
+                    )?;
+                    // The restore needs the fetched objects: a committed delta
+                    // bundle cannot be applied without its prerequisites, and a
+                    // bundle-free snapshot checks out a head commit only the
+                    // proxy can supply. The archive carries this session's
+                    // dirty state, so nothing is seeded.
+                    controller.connect_local_repositories(
+                        session_id,
+                        backend_ref,
+                        worker_root_ref,
+                        executor,
+                        LocalBootstrap::Skip,
+                    )
+                },
+                || {
+                    upload_checkpoint_spec(
+                        executor,
+                        backend_ref,
+                        session_id,
+                        &checkpoint.archive_path,
+                        &remote_archive,
+                    )?;
+                    upload_checkpoint_spec(
+                        executor,
+                        backend_ref,
+                        session_id,
+                        local_spec_ref,
+                        &remote_spec,
+                    )
+                },
             )?;
-            upload_checkpoint_spec(executor, &backend, session_id, &local_spec, &remote_spec)?;
             execute_checked(
                 executor,
                 restore_command(&backend, session_id, &remote_spec)?,
@@ -3693,6 +3750,38 @@ fn preflight_target(template: &TargetTemplate, executor: &impl CommandExecutor) 
         }
         _ => Ok(()),
     }
+}
+
+/// Run two independent sequences of target work at the same time.
+///
+/// [`hel_targets::CommandPlan::execute_concurrent`] overlaps commands inside
+/// one plan. This overlaps two lanes that each interleave target commands with
+/// controller-side work, which a flat plan cannot express. Both lanes share the
+/// caller's executor, so every command keeps the executor's cancellation and
+/// stage reporting.
+///
+/// A failure in the first lane is reported ahead of a failure in the second, so
+/// the error a caller sees never depends on which lane lost the race. Both
+/// lanes always run to completion: neither can be interrupted mid-transfer, and
+/// leaving one running past the return would race the recovery that follows.
+fn execute_concurrent_lanes(
+    first: impl FnOnce() -> Result<()> + Send,
+    second: impl FnOnce() -> Result<()> + Send,
+) -> Result<()> {
+    std::thread::scope(|scope| {
+        // The second lane gets the new thread and the first runs here, so a
+        // panic in the first propagates exactly as it would without the
+        // overlap.
+        let second = scope.spawn(second);
+        let first = first();
+        let second = second.join().unwrap_or_else(|panic| {
+            Err(anyhow::anyhow!(
+                "concurrent target lane panicked: {}",
+                hel_targets::command_thread_panic_message(panic.as_ref())
+            ))
+        });
+        first.and(second)
+    })
 }
 
 /// Whether a resume has to rebuild the durable projection from its archive.
@@ -7763,6 +7852,7 @@ fn prune_replaced_checkpoint(previous: Option<&CheckpointMetadata>, current: &Ch
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::sync::{Barrier, Mutex};
 
     use super::*;
     use crate::hel_archive::{CanonicalTranscriptItem, RepositoryMetadata};
@@ -10555,6 +10645,78 @@ mod tests {
             "{detail}"
         );
         assert_eq!(controller.state.sessions[session_id], previous);
+    }
+
+    /// Records what it ran and blocks every command on a barrier sized to
+    /// both lanes, so a run only finishes if the second lane started before
+    /// the first one's command returned.
+    struct BarrierExecutor {
+        seen: Mutex<Vec<String>>,
+        barrier: Barrier,
+    }
+
+    impl CommandExecutor for BarrierExecutor {
+        fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+            self.seen.lock().unwrap().push(command.purpose.clone());
+            self.barrier.wait();
+            Ok(CommandOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn lane_command(purpose: &str) -> CommandSpec {
+        CommandSpec::new("hel", ["worker"]).purpose(purpose)
+    }
+
+    #[test]
+    fn independent_target_lanes_run_at_the_same_time() {
+        let executor = BarrierExecutor {
+            seen: Mutex::new(Vec::new()),
+            barrier: Barrier::new(2),
+        };
+
+        execute_concurrent_lanes(
+            || execute_checked(&executor, lane_command("install the worker")).map(|_| ()),
+            || execute_checked(&executor, lane_command("upload the checkpoint")).map(|_| ()),
+        )
+        .unwrap();
+
+        let mut seen = executor.seen.into_inner().unwrap();
+        seen.sort();
+        assert_eq!(seen, ["install the worker", "upload the checkpoint"]);
+    }
+
+    #[test]
+    fn a_lane_failure_is_reported_in_lane_order_and_never_abandons_the_other_lane() {
+        let reached = Mutex::new(Vec::new());
+
+        // The first lane fails slowly and the second immediately, so a
+        // completion-order report could only pick the second.
+        let error = execute_concurrent_lanes(
+            || {
+                std::thread::sleep(Duration::from_millis(50));
+                bail!("worker install failed")
+            },
+            || {
+                reached.lock().unwrap().push("second");
+                bail!("checkpoint upload failed")
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "worker install failed");
+        assert_eq!(
+            *reached.lock().unwrap(),
+            ["second"],
+            "a failing first lane must not cut the second one short"
+        );
+
+        let error =
+            execute_concurrent_lanes(|| Ok(()), || bail!("checkpoint upload failed")).unwrap_err();
+        assert_eq!(error.to_string(), "checkpoint upload failed");
     }
 
     #[test]

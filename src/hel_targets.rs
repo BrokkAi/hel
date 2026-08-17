@@ -885,7 +885,7 @@ fn checked_command_output(command: &CommandSpec, output: CommandOutput) -> Resul
 }
 
 /// Describe a spawned command thread's panic payload for error context.
-fn command_thread_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn command_thread_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_owned()
     } else if let Some(message) = payload.downcast_ref::<String>() {
