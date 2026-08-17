@@ -4,19 +4,32 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
 use crate::hel_config::{
-    ContainerTemplate, HarnessKind, HarnessProfile, HelConfig, ProjectBundle, ProjectRepository,
-    TargetTemplate,
+    AwsAddressSource, ContainerTemplate, HarnessKind, HarnessProfile, HelConfig, ProjectBundle,
+    ProjectRepository, TargetTemplate,
+};
+use crate::hel_doctor::{
+    CheckStatus, DoctorOptions, all_ready, apple_container_daemon_check, current_apple_platform,
+    local_podman_runtime_check, render_human, run_with_config_path,
 };
 use crate::hel_targets::{
-    CommandExecutor, CommandOutput, CommandSpec, ContainerTemplate as RuntimeContainerTemplate,
-    ProcessExecutor, TargetTemplate as RuntimeTargetTemplate, setup_smoke_plan,
-    verify_local_podman,
+    CancellableProcessExecutor, CommandExecutor, CommandSpec,
+    ContainerTemplate as RuntimeContainerTemplate, ProcessExecutor,
+    TargetTemplate as RuntimeTargetTemplate, setup_smoke_plan,
 };
+
+/// AWS credential detection must never stall an interactive first run, so the
+/// probe commands share a bounded deadline.
+const AWS_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The user every Hel launch template image boots with; see
+/// scripts/update-runson-launch-template.sh.
+const DEFAULT_AWS_SSH_USER: &str = "ubuntu";
+const AWS_TARGET_ID: &str = "aws";
 
 // Published from containers/Containerfile.agent-dev by
 // .github/workflows/publish-agent-dev-image.yml. It already carries Node, Rust,
@@ -78,6 +91,27 @@ pub struct RuntimeProbe {
     pub kind: RuntimeKind,
     pub usable: bool,
     pub detail: String,
+    /// The fix `hel doctor` would print for this runtime, carried through so
+    /// setup never invents its own remediation wording.
+    pub remediation: Option<String>,
+}
+
+/// An AWS identity that `aws sts get-caller-identity` confirmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwsAccount {
+    pub account: String,
+    pub arn: String,
+    /// The CLI's configured default region, when it has one.
+    pub region: Option<String>,
+}
+
+/// The answers that become a `[targets.aws]` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwsTargetInput {
+    pub launch_template: String,
+    pub region: String,
+    pub ssh_user: String,
+    pub identity_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +119,9 @@ pub struct SetupDiscovery {
     pub homes: Vec<DiscoveredHome>,
     pub repository: Option<GithubRepository>,
     pub runtimes: Vec<RuntimeProbe>,
+    /// `None` when this host has no working AWS CLI credentials, in which case
+    /// setup never offers an AWS target.
+    pub aws: Option<AwsAccount>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +156,7 @@ pub fn discover_current(executor: &impl CommandExecutor) -> SetupDiscovery {
         homes,
         repository: discover_github_repository(&cwd),
         runtimes: probe_local_runtimes(executor, cfg!(target_os = "macos")),
+        aws: detect_aws(&CancellableProcessExecutor::with_timeout(AWS_PROBE_TIMEOUT)),
     }
 }
 
@@ -202,65 +240,65 @@ fn discover_github_repository(cwd: &Path) -> Option<GithubRepository> {
     github_repository_from_origin(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Probe the container runtimes setup can configure, reusing the doctor checks
+/// so an unavailable runtime carries doctor's detail and remediation.
 pub fn probe_local_runtimes(executor: &impl CommandExecutor, is_macos: bool) -> Vec<RuntimeProbe> {
-    let mut probes = vec![probe_podman_runtime(executor)];
+    let mut probes = vec![runtime_probe_from_check(
+        RuntimeKind::Podman,
+        local_podman_runtime_check(executor),
+    )];
     if is_macos {
-        probes.push(probe_runtime(
-            executor,
+        probes.push(runtime_probe_from_check(
             RuntimeKind::AppleContainer,
-            CommandSpec::new("container", ["system", "status"])
-                .purpose("check Apple container runtime"),
+            apple_container_daemon_check(executor),
         ));
     }
     probes
 }
 
-fn probe_podman_runtime(executor: &impl CommandExecutor) -> RuntimeProbe {
-    match verify_local_podman(executor) {
-        Ok(preflight) => RuntimeProbe {
-            kind: RuntimeKind::Podman,
-            usable: true,
-            detail: format!("Podman {} with a valid rootless UID map", preflight.version),
-        },
-        Err(error) => RuntimeProbe {
-            kind: RuntimeKind::Podman,
-            usable: false,
-            detail: format!("{error:#}"),
-        },
-    }
-}
-
-fn probe_runtime(
-    executor: &impl CommandExecutor,
+fn runtime_probe_from_check(
     kind: RuntimeKind,
-    command: CommandSpec,
+    check: crate::hel_doctor::DoctorCheck,
 ) -> RuntimeProbe {
-    match executor.execute(&command) {
-        Ok(output) if output.status == 0 => RuntimeProbe {
-            kind,
-            usable: true,
-            detail: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-        },
-        Ok(output) => RuntimeProbe {
-            kind,
-            usable: false,
-            detail: command_failure_detail(&output),
-        },
-        Err(error) => RuntimeProbe {
-            kind,
-            usable: false,
-            detail: error.to_string(),
-        },
+    RuntimeProbe {
+        kind,
+        usable: check.status == CheckStatus::Ready,
+        detail: check.detail,
+        remediation: check.remediation,
     }
 }
 
-fn command_failure_detail(output: &CommandOutput) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    if stderr.is_empty() {
-        format!("command exited with status {}", output.status)
-    } else {
-        stderr
+/// Detect a usable AWS CLI identity on this host.
+///
+/// Returns `None` whenever the CLI is missing or its credentials do not work,
+/// so setup can skip the AWS step instead of prompting for a target that could
+/// never launch.
+pub fn detect_aws(executor: &impl CommandExecutor) -> Option<AwsAccount> {
+    let identity = CommandSpec::new("aws", ["sts", "get-caller-identity", "--output", "json"])
+        .purpose("detect AWS credentials");
+    let output = executor.execute(&identity).ok()?;
+    if output.status != 0 {
+        return None;
     }
+    let identity: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let account = identity.get("Account")?.as_str()?.to_owned();
+    let arn = identity.get("Arn")?.as_str()?.to_owned();
+    Some(AwsAccount {
+        account,
+        arn,
+        region: configured_aws_region(executor),
+    })
+}
+
+fn configured_aws_region(executor: &impl CommandExecutor) -> Option<String> {
+    let command = CommandSpec::new("aws", ["configure", "get", "region"])
+        .purpose("read the default AWS region");
+    let output = executor.execute(&command).ok()?;
+    if output.status != 0 {
+        return None;
+    }
+    let region = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!region.is_empty()).then_some(region)
 }
 
 pub fn recommended_runtime(runtimes: &[RuntimeProbe]) -> Option<RuntimeKind> {
@@ -276,13 +314,14 @@ pub fn build_config(
     runtime: RuntimeKind,
     image: &str,
 ) -> HelConfig {
-    build_config_with_runtime(homes, repository, Some((runtime, image)))
+    build_config_with_runtime(homes, repository, Some((runtime, image)), None)
 }
 
 fn build_config_with_runtime(
     homes: &[DiscoveredHome],
     repository: Option<&GithubRepository>,
     runtime: Option<(RuntimeKind, &str)>,
+    aws: Option<&AwsTargetInput>,
 ) -> HelConfig {
     let mut config = HelConfig::default();
     for home in homes {
@@ -336,6 +375,21 @@ fn build_config_with_runtime(
             ),
         };
         config.targets.insert(target_id.to_owned(), target);
+    }
+    if let Some(aws) = aws {
+        config.targets.insert(
+            AWS_TARGET_ID.to_owned(),
+            TargetTemplate::AwsEc2 {
+                aws_profile: None,
+                region: aws.region.clone(),
+                launch_template: aws.launch_template.clone(),
+                launch_template_version: None,
+                ssh_user: aws.ssh_user.clone(),
+                address_source: AwsAddressSource::default(),
+                identity_file: aws.identity_file.clone(),
+                ssh_args: vec![],
+            },
+        );
     }
     config
 }
@@ -401,12 +455,14 @@ pub fn run_setup_dialog_with(
         )?;
         None
     };
+    let aws = prompt_aws_target(input, output, discovery.aws.as_ref())?;
     let config = build_config_with_runtime(
         &discovery.homes,
         discovery.repository.as_ref(),
         runtime
             .as_ref()
             .map(|(runtime, image)| (*runtime, image.as_str())),
+        aws.as_ref(),
     );
     config.validate()?;
 
@@ -429,6 +485,7 @@ pub fn run_setup_dialog_with(
         let smoke_target = smoke_target(runtime, &image);
         run_smoke_test(output, &smoke_target, executor)?;
     }
+    write_doctor_report(output, config_path, executor)?;
     writeln!(
         output,
         "Advanced users can edit TOML for extra profiles, virtual monorepos, SSH, and AWS."
@@ -500,9 +557,109 @@ fn write_runtimes(output: &mut impl Write, runtimes: &[RuntimeProbe]) -> Result<
                 runtime.detail
             )?;
         }
+        if let Some(remediation) = &runtime.remediation {
+            writeln!(output, "    remediation: {remediation}")?;
+        }
     }
     if let Some(runtime) = recommended_runtime(runtimes) {
         writeln!(output, "Recommended runtime: {}", runtime.label())?;
+    }
+    Ok(())
+}
+
+/// Offer an AWS EC2 target, but only when this host already has working AWS
+/// credentials. Without them the step prints one line and asks nothing.
+fn prompt_aws_target(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    account: Option<&AwsAccount>,
+) -> Result<Option<AwsTargetInput>> {
+    let Some(account) = account else {
+        writeln!(
+            output,
+            "AWS: no working `aws` CLI credentials found; skipping the AWS target."
+        )?;
+        return Ok(None);
+    };
+    writeln!(
+        output,
+        "AWS: credentials are valid for account {} ({}).",
+        account.account, account.arn
+    )?;
+    let answer = prompt(input, output, "Add an AWS EC2 target? [y/N]: ")?;
+    if !matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Ok(None);
+    }
+
+    let launch_template = prompt(input, output, "Launch template name: ")?;
+    if launch_template.is_empty() {
+        writeln!(
+            output,
+            "A launch template name is required; skipping the AWS target."
+        )?;
+        return Ok(None);
+    }
+
+    let region_label = match &account.region {
+        Some(region) => format!("Region [{region}]: "),
+        None => "Region: ".to_owned(),
+    };
+    let region = prompt(input, output, &region_label)?;
+    let region = if region.is_empty() {
+        match &account.region {
+            Some(region) => region.clone(),
+            None => {
+                writeln!(output, "A region is required; skipping the AWS target.")?;
+                return Ok(None);
+            }
+        }
+    } else {
+        region
+    };
+
+    let ssh_user = prompt(
+        input,
+        output,
+        &format!("SSH user [{DEFAULT_AWS_SSH_USER}]: "),
+    )?;
+    let ssh_user = if ssh_user.is_empty() {
+        DEFAULT_AWS_SSH_USER.to_owned()
+    } else {
+        ssh_user
+    };
+    let identity_file = prompt(input, output, "SSH identity file (optional): ")?;
+
+    Ok(Some(AwsTargetInput {
+        launch_template,
+        region,
+        ssh_user,
+        identity_file: (!identity_file.is_empty()).then(|| PathBuf::from(identity_file)),
+    }))
+}
+
+/// End setup with the same report `hel doctor` prints, so the user gets one
+/// ready/fixable summary with remediations instead of two different signals.
+fn write_doctor_report(
+    output: &mut impl Write,
+    config_path: &Path,
+    executor: &impl CommandExecutor,
+) -> Result<()> {
+    writeln!(output)?;
+    writeln!(output, "Running `hel doctor` checks on the new config...")?;
+    let checks = run_with_config_path(
+        config_path,
+        executor,
+        current_apple_platform(executor),
+        DoctorOptions { smoke: false },
+    );
+    render_human(&checks, output)?;
+    if all_ready(&checks) {
+        writeln!(output, "Every check is ready.")?;
+    } else {
+        writeln!(
+            output,
+            "Apply the remediations above, then rerun `hel doctor`."
+        )?;
     }
     Ok(())
 }
@@ -575,6 +732,17 @@ fn write_summary(
         };
         writeln!(output, "  {} target using {image}", runtime.label())?;
     }
+    if let Some(TargetTemplate::AwsEc2 {
+        launch_template,
+        region,
+        ..
+    }) = config.targets.get(AWS_TARGET_ID)
+    {
+        writeln!(
+            output,
+            "  AWS EC2 target using launch template {launch_template} in {region}"
+        )?;
+    }
     if config_path.exists() {
         writeln!(output, "  This replaces the existing configuration file.")?;
     }
@@ -636,6 +804,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::hel_targets::CommandOutput;
 
     struct FakeExecutor {
         commands: RefCell<Vec<CommandSpec>>,
@@ -668,10 +837,50 @@ mod tests {
         outputs: RefCell<Vec<CommandOutput>>,
     }
 
+    impl RuntimeProbeExecutor {
+        fn new(outputs: impl IntoIterator<Item = CommandOutput>) -> Self {
+            Self {
+                commands: RefCell::new(vec![]),
+                outputs: RefCell::new(outputs.into_iter().collect()),
+            }
+        }
+    }
+
     impl CommandExecutor for RuntimeProbeExecutor {
         fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
             self.commands.borrow_mut().push(command.clone());
+            if self.outputs.borrow().is_empty() {
+                bail!("no canned output for {}", command.program);
+            }
             Ok(self.outputs.borrow_mut().remove(0))
+        }
+    }
+
+    fn ok(stdout: &[u8]) -> CommandOutput {
+        CommandOutput {
+            status: 0,
+            stdout: stdout.to_vec(),
+            stderr: vec![],
+        }
+    }
+
+    fn failed(stderr: &[u8]) -> CommandOutput {
+        CommandOutput {
+            status: 1,
+            stdout: vec![],
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    const CALLER_IDENTITY: &[u8] =
+        br#"{"UserId":"AIDA","Account":"123456789012","Arn":"arn:aws:iam::123456789012:user/dev"}"#;
+
+    fn discovery_without_runtimes() -> SetupDiscovery {
+        SetupDiscovery {
+            homes: vec![],
+            repository: None,
+            runtimes: vec![],
+            aws: None,
         }
     }
 
@@ -795,31 +1004,13 @@ mod tests {
 
     #[test]
     fn runtime_probe_requires_podman_rootless_preflight_and_checks_apple_on_macos() {
-        let executor = RuntimeProbeExecutor {
-            commands: RefCell::new(vec![]),
-            outputs: RefCell::new(vec![
-                CommandOutput {
-                    status: 0,
-                    stdout: b"podman version 5.4.2\n".to_vec(),
-                    stderr: vec![],
-                },
-                CommandOutput {
-                    status: 0,
-                    stdout: b"true\n".to_vec(),
-                    stderr: vec![],
-                },
-                CommandOutput {
-                    status: 0,
-                    stdout: b"0 1000 1\n1 100000 65536\n".to_vec(),
-                    stderr: vec![],
-                },
-                CommandOutput {
-                    status: 0,
-                    stdout: b"available".to_vec(),
-                    stderr: vec![],
-                },
-            ]),
-        };
+        let executor = RuntimeProbeExecutor::new([
+            ok(b"podman version 5.4.2\n"),
+            ok(b"true\n"),
+            ok(b"0 1000 1\n1 100000 65536\n"),
+            ok(b"container version 1\n"),
+            ok(b"running\n"),
+        ]);
         let runtimes = probe_local_runtimes(&executor, true);
 
         assert_eq!(runtimes.len(), 2);
@@ -835,6 +1026,126 @@ mod tests {
             ["unshare", "cat", "/proc/self/uid_map"]
         );
         assert_eq!(executor.commands.borrow()[3].program, "container");
+        assert!(runtimes.iter().all(|runtime| runtime.usable));
+    }
+
+    #[test]
+    fn unusable_podman_carries_the_doctor_remediation_into_the_runtime_list() {
+        let executor = RuntimeProbeExecutor::new([ok(b"podman version 3.4.7\n")]);
+
+        let runtimes = probe_local_runtimes(&executor, false);
+
+        assert_eq!(runtimes.len(), 1);
+        assert!(!runtimes[0].usable);
+        let remediation = runtimes[0].remediation.as_deref().unwrap();
+        assert!(remediation.contains("Upgrade Podman"), "{remediation}");
+
+        let mut output = Vec::new();
+        write_runtimes(&mut output, &runtimes).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Podman: unavailable"), "{output}");
+        assert!(output.contains("remediation: Upgrade Podman"), "{output}");
+    }
+
+    #[test]
+    fn aws_is_detected_only_when_the_caller_identity_call_succeeds() {
+        let missing = RuntimeProbeExecutor::new([]);
+        assert_eq!(detect_aws(&missing), None);
+
+        let denied = RuntimeProbeExecutor::new([failed(b"ExpiredToken")]);
+        assert_eq!(detect_aws(&denied), None);
+
+        let working = RuntimeProbeExecutor::new([ok(CALLER_IDENTITY), ok(b"us-east-1\n")]);
+        assert_eq!(
+            detect_aws(&working),
+            Some(AwsAccount {
+                account: "123456789012".into(),
+                arn: "arn:aws:iam::123456789012:user/dev".into(),
+                region: Some("us-east-1".into()),
+            })
+        );
+        assert_eq!(working.commands.borrow()[0].args[0], "sts");
+        assert_eq!(
+            working.commands.borrow()[1].args,
+            ["configure", "get", "region"]
+        );
+    }
+
+    #[test]
+    fn aws_detection_without_a_configured_region_leaves_the_region_unset() {
+        let executor = RuntimeProbeExecutor::new([ok(CALLER_IDENTITY), failed(b"")]);
+
+        assert_eq!(detect_aws(&executor).unwrap().region, None);
+    }
+
+    #[test]
+    fn the_aws_step_asks_nothing_when_no_aws_credentials_were_detected() {
+        let mut input = b"".as_slice();
+        let mut output = Vec::new();
+
+        let aws = prompt_aws_target(&mut input, &mut output, None).unwrap();
+
+        assert_eq!(aws, None);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("skipping the AWS target"), "{output}");
+        assert!(!output.contains("[y/N]"), "{output}");
+    }
+
+    #[test]
+    fn the_aws_step_defaults_region_and_ssh_user_when_the_answers_are_blank() {
+        let account = AwsAccount {
+            account: "123456789012".into(),
+            arn: "arn:aws:iam::123456789012:user/dev".into(),
+            region: Some("us-east-1".into()),
+        };
+        let mut input = b"y\nhel-runson\n\n\n\n".as_slice();
+        let mut output = Vec::new();
+
+        let aws = prompt_aws_target(&mut input, &mut output, Some(&account))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            aws,
+            AwsTargetInput {
+                launch_template: "hel-runson".into(),
+                region: "us-east-1".into(),
+                ssh_user: DEFAULT_AWS_SSH_USER.into(),
+                identity_file: None,
+            }
+        );
+        let config = build_config_with_runtime(&[], None, None, Some(&aws));
+        let TargetTemplate::AwsEc2 {
+            region,
+            launch_template,
+            ssh_user,
+            ..
+        } = &config.targets[AWS_TARGET_ID]
+        else {
+            panic!("setup must write an aws-ec2 target");
+        };
+        assert_eq!(region, "us-east-1");
+        assert_eq!(launch_template, "hel-runson");
+        assert_eq!(ssh_user, DEFAULT_AWS_SSH_USER);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn declining_the_aws_step_writes_no_aws_target() {
+        let account = AwsAccount {
+            account: "123456789012".into(),
+            arn: "arn:aws:iam::123456789012:user/dev".into(),
+            region: None,
+        };
+        let mut input = b"\n".as_slice();
+        let mut output = Vec::new();
+
+        assert_eq!(
+            prompt_aws_target(&mut input, &mut output, Some(&account)).unwrap(),
+            None
+        );
+        let config = build_config_with_runtime(&[], None, None, None);
+        assert!(!config.targets.contains_key(AWS_TARGET_ID));
     }
 
     #[test]
@@ -876,7 +1187,9 @@ mod tests {
                 kind: RuntimeKind::Podman,
                 usable: true,
                 detail: "podman version 5".into(),
+                remediation: None,
             }],
+            aws: None,
         };
         let executor = FakeExecutor::succeeds();
         let mut input = b"\n\ny\n".as_slice();
@@ -888,11 +1201,55 @@ mod tests {
             SetupOutcome::Written
         );
         assert!(config_path.exists());
-        assert_eq!(executor.commands.borrow().len(), 3);
+        let smoke = executor.commands.borrow()[..3]
+            .iter()
+            .map(|command| command.args[0].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(smoke, ["run", "exec", "rm"]);
         assert!(
             String::from_utf8(output)
                 .unwrap()
                 .ends_with("Press n to start your first session.\n")
+        );
+    }
+
+    #[test]
+    fn setup_finishes_with_the_standard_doctor_report_for_the_config_it_wrote() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let discovery = SetupDiscovery {
+            homes: vec![DiscoveredHome {
+                kind: HarnessKind::Codex,
+                path: directory.path().join("missing-codex-home"),
+                authenticated: false,
+            }],
+            ..discovery_without_runtimes()
+        };
+        let executor = FakeExecutor::succeeds();
+        let mut input = b"y\n".as_slice();
+        let mut output = Vec::new();
+
+        run_setup_dialog_with(&mut input, &mut output, &config_path, &discovery, &executor)
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        // The report is doctor's own rendering: a status-prefixed line per
+        // check, plus the remediation doctor would print for the missing home.
+        assert!(
+            output.contains(&format!(
+                "ready Hel configuration: {} is valid",
+                config_path.display()
+            )),
+            "{output}"
+        );
+        assert!(output.contains("fixable Harness profile codex"), "{output}");
+        assert!(
+            output.contains("  remediation: Create or select the Codex home"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Apply the remediations above, then rerun `hel doctor`."),
+            "{output}"
         );
     }
 
@@ -911,7 +1268,9 @@ mod tests {
                 kind: RuntimeKind::Podman,
                 usable: false,
                 detail: "not installed".into(),
+                remediation: Some("Install Podman.".into()),
             }],
+            aws: None,
         };
         let executor = FakeExecutor::succeeds();
         let mut input = b"y\n".as_slice();
@@ -927,7 +1286,15 @@ mod tests {
             config.targets["raw-localhost"],
             TargetTemplate::LocalBare
         ));
-        assert!(executor.commands.borrow().is_empty());
+        // No smoke test runs without a runtime; the trailing commands belong to
+        // the doctor report.
+        assert!(
+            executor
+                .commands
+                .borrow()
+                .iter()
+                .all(|command| command.program != "podman" || command.args[0] != "run")
+        );
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("DANGER"));
         assert!(output.contains("its default auto mode approves every command"));

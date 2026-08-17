@@ -1,6 +1,7 @@
 //! Actionable host and configuration prerequisite checks.
 
 use std::io::Write;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -129,11 +130,26 @@ pub fn run_with(
     apple_platform: ApplePlatform,
     options: DoctorOptions,
 ) -> Vec<DoctorCheck> {
-    let (config, mut checks) = configuration_checks();
+    run_with_config_path(&config_path(), executor, apple_platform, options)
+}
+
+/// The same checks as [`run_with`], against an explicit configuration file.
+///
+/// `hel setup` uses this to report on the configuration it just wrote, so a
+/// first run ends with exactly the summary and remediations `hel doctor`
+/// would print.
+pub fn run_with_config_path(
+    config_path: &Path,
+    executor: &impl CommandExecutor,
+    apple_platform: ApplePlatform,
+    options: DoctorOptions,
+) -> Vec<DoctorCheck> {
+    let (config, mut checks) = configuration_checks(config_path);
     checks.push(harness_discovery_check(config.as_ref()));
     checks.extend(harness_checks(config.as_ref()));
     checks.extend(podman_checks(config.as_ref(), executor, options.smoke));
     checks.extend(ssh_podman_checks(config.as_ref(), executor, options.smoke));
+    checks.extend(aws_checks(config.as_ref(), executor));
     checks.extend(worker_binary_checks(config.as_ref()));
     checks.push(apple_container_check(
         &apple_platform,
@@ -266,8 +282,7 @@ Podman prerequisites. Resolve every `fixable` status before starting a session."
     }
 }
 
-fn configuration_checks() -> (Option<HelConfig>, Vec<DoctorCheck>) {
-    let path = config_path();
+fn configuration_checks(path: &Path) -> (Option<HelConfig>, Vec<DoctorCheck>) {
     if !path.exists() {
         return (
             None,
@@ -279,7 +294,7 @@ fn configuration_checks() -> (Option<HelConfig>, Vec<DoctorCheck>) {
             )],
         );
     }
-    match HelConfig::load_from(&path) {
+    match HelConfig::load_from(path) {
         Ok(config) => {
             let mut checks = vec![DoctorCheck::ready(
                 "config",
@@ -421,6 +436,16 @@ fn podman_check(config: Option<&HelConfig>, executor: &impl CommandExecutor) -> 
             "No local-podman target is configured.",
         );
     }
+    local_podman_runtime_check(executor)
+}
+
+/// Probe the local rootless Podman prerequisites and phrase the result as a
+/// doctor check.
+///
+/// This is the single source of truth for Podman availability wording and
+/// remediation. `hel setup` calls it directly so its runtime list reports the
+/// same detail and fix that `hel doctor` would.
+pub fn local_podman_runtime_check(executor: &impl CommandExecutor) -> DoctorCheck {
     match verify_local_podman(executor) {
         Ok(preflight) => DoctorCheck::ready(
             "runtime.podman",
@@ -649,6 +674,159 @@ fn podman_remediation_match(detail: &str) -> Option<&'static str> {
     }
 }
 
+const AWS_CLI_INSTALL_URL: &str =
+    "https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html";
+
+/// One check per `aws-ec2` target: the AWS CLI, its credentials, and the
+/// configured launch template.
+fn aws_checks(config: Option<&HelConfig>, executor: &impl CommandExecutor) -> Vec<DoctorCheck> {
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    config
+        .targets
+        .iter()
+        .filter_map(|(id, target)| match target {
+            TargetTemplate::AwsEc2 {
+                aws_profile,
+                region,
+                launch_template,
+                ..
+            } => Some(aws_target_check(
+                id,
+                aws_profile.as_deref(),
+                region,
+                launch_template,
+                executor,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The profile and region every AWS probe carries, applied exactly the way
+/// provisioning applies them in `hel_targets`.
+fn aws_global_args<'a>(profile: Option<&'a str>, region: &'a str) -> Vec<String> {
+    vec![
+        "--profile".to_owned(),
+        profile.unwrap_or("default").to_owned(),
+        "--region".to_owned(),
+        region.to_owned(),
+    ]
+}
+
+fn aws_target_check(
+    id: &str,
+    profile: Option<&str>,
+    region: &str,
+    launch_template: &str,
+    executor: &impl CommandExecutor,
+) -> DoctorCheck {
+    let check_id = format!("runtime.aws-ec2.{id}");
+    let title = format!("AWS EC2 target {id}");
+    let profile_label = profile.unwrap_or("default");
+
+    let version = CommandSpec::new("aws", ["--version"]).purpose("check AWS CLI installation");
+    match executor.execute(&version) {
+        Err(error) => {
+            return DoctorCheck::fixable(
+                check_id,
+                title,
+                format!("The `aws` command is not available: {error}"),
+                format!("Install the AWS CLI and put `aws` on PATH: {AWS_CLI_INSTALL_URL}"),
+            );
+        }
+        Ok(output) if output.status != 0 => {
+            return DoctorCheck::fixable(
+                check_id,
+                title,
+                format!(
+                    "`aws --version` failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                format!("Reinstall the AWS CLI: {AWS_CLI_INSTALL_URL}"),
+            );
+        }
+        Ok(_) => {}
+    }
+
+    let mut identity_args = aws_global_args(profile, region);
+    identity_args.extend(["sts".to_owned(), "get-caller-identity".to_owned()]);
+    identity_args.extend(["--output".to_owned(), "json".to_owned()]);
+    let identity =
+        CommandSpec::new("aws", identity_args).purpose("check AWS credentials for a doctor target");
+    match executor.execute(&identity) {
+        Err(error) => {
+            return DoctorCheck::fixable(
+                check_id,
+                title,
+                format!("Could not run `aws sts get-caller-identity`: {error}"),
+                format!(
+                    "Configure credentials with `aws configure --profile {profile_label}`, or sign in with `aws sso login --profile {profile_label}`."
+                ),
+            );
+        }
+        Ok(output) if output.status != 0 => {
+            return DoctorCheck::fixable(
+                check_id,
+                title,
+                format!(
+                    "AWS credentials for profile {profile_label} are not usable: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                format!(
+                    "Configure credentials with `aws configure --profile {profile_label}`, or sign in with `aws sso login --profile {profile_label}`."
+                ),
+            );
+        }
+        Ok(_) => {}
+    }
+
+    // Launch templates are addressed by id when they carry the `lt-` prefix
+    // and by name otherwise, the same split provisioning uses.
+    let by_id = launch_template.starts_with("lt-");
+    let mut template_args = aws_global_args(profile, region);
+    template_args.extend(["ec2".to_owned(), "describe-launch-templates".to_owned()]);
+    template_args.extend([
+        if by_id {
+            "--launch-template-ids".to_owned()
+        } else {
+            "--launch-template-names".to_owned()
+        },
+        launch_template.to_owned(),
+    ]);
+    template_args.extend(["--output".to_owned(), "json".to_owned()]);
+    let template =
+        CommandSpec::new("aws", template_args).purpose("check the configured AWS launch template");
+    let template_remediation = format!(
+        "Create the launch template in {region}, or point this target at an existing one; `aws --profile {profile_label} --region {region} ec2 describe-launch-templates` lists them."
+    );
+    match executor.execute(&template) {
+        Err(error) => DoctorCheck::fixable(
+            check_id,
+            title,
+            format!("Could not query launch template {launch_template}: {error}"),
+            template_remediation,
+        ),
+        Ok(output) if output.status != 0 => DoctorCheck::fixable(
+            check_id,
+            title,
+            format!(
+                "Launch template {launch_template} was not found in {region}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            template_remediation,
+        ),
+        Ok(_) => DoctorCheck::ready(
+            check_id,
+            title,
+            format!(
+                "The AWS CLI is installed, profile {profile_label} has valid credentials, and launch template {launch_template} exists in {region}."
+            ),
+        ),
+    }
+}
+
 fn worker_binary_checks(config: Option<&HelConfig>) -> Vec<DoctorCheck> {
     let Some(config) = config else {
         return vec![DoctorCheck::fixable(
@@ -794,54 +972,9 @@ pub fn apple_container_check(
         ApplePlatform::Macos { .. } => {}
     }
 
-    let installed =
-        CommandSpec::new("container", ["--version"]).purpose("check Apple container installation");
-    match executor.execute(&installed) {
-        Err(error) => {
-            return DoctorCheck::fixable(
-                "runtime.apple-container",
-                "Apple container runtime",
-                format!("The `container` command is not available: {error}"),
-                format!("Install the official signed package: {APPLE_CONTAINER_INSTALL_URL}"),
-            );
-        }
-        Ok(output) if output.status != 0 => {
-            return DoctorCheck::fixable(
-                "runtime.apple-container",
-                "Apple container runtime",
-                format!(
-                    "The installed `container --version` command failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-                format!("Reinstall the official signed package: {APPLE_CONTAINER_INSTALL_URL}"),
-            );
-        }
-        Ok(_) => {}
-    }
-
-    let status =
-        CommandSpec::new("container", ["system", "status"]).purpose("check Apple container daemon");
-    match executor.execute(&status) {
-        Ok(output) if output.status == 0 => {}
-        Ok(output) => {
-            return DoctorCheck::fixable(
-                "runtime.apple-container",
-                "Apple container runtime",
-                format!(
-                    "The Apple container daemon is stopped: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-                "Run `container system start`.",
-            );
-        }
-        Err(error) => {
-            return DoctorCheck::fixable(
-                "runtime.apple-container",
-                "Apple container runtime",
-                format!("Could not query the Apple container daemon: {error}"),
-                "Run `container system start`.",
-            );
-        }
+    let daemon = apple_container_daemon_check(executor);
+    if daemon.status != CheckStatus::Ready {
+        return daemon;
     }
 
     if !smoke {
@@ -872,7 +1005,65 @@ pub fn apple_container_check(
     }
 }
 
-fn current_apple_platform(executor: &impl CommandExecutor) -> ApplePlatform {
+/// Probe that the Apple `container` command is installed and its daemon is
+/// running, phrased as a doctor check.
+///
+/// Split out of [`apple_container_check`] so `hel setup` can reuse the same
+/// probes and remediation text without also demanding the opt-in smoke test.
+/// The caller is responsible for platform gating.
+pub fn apple_container_daemon_check(executor: &impl CommandExecutor) -> DoctorCheck {
+    let installed =
+        CommandSpec::new("container", ["--version"]).purpose("check Apple container installation");
+    match executor.execute(&installed) {
+        Err(error) => {
+            return DoctorCheck::fixable(
+                "runtime.apple-container",
+                "Apple container runtime",
+                format!("The `container` command is not available: {error}"),
+                format!("Install the official signed package: {APPLE_CONTAINER_INSTALL_URL}"),
+            );
+        }
+        Ok(output) if output.status != 0 => {
+            return DoctorCheck::fixable(
+                "runtime.apple-container",
+                "Apple container runtime",
+                format!(
+                    "The installed `container --version` command failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                format!("Reinstall the official signed package: {APPLE_CONTAINER_INSTALL_URL}"),
+            );
+        }
+        Ok(_) => {}
+    }
+
+    let status =
+        CommandSpec::new("container", ["system", "status"]).purpose("check Apple container daemon");
+    match executor.execute(&status) {
+        Ok(output) if output.status == 0 => DoctorCheck::ready(
+            "runtime.apple-container",
+            "Apple container runtime",
+            "Installed, and the Apple container daemon is running.",
+        ),
+        Ok(output) => DoctorCheck::fixable(
+            "runtime.apple-container",
+            "Apple container runtime",
+            format!(
+                "The Apple container daemon is stopped: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            "Run `container system start`.",
+        ),
+        Err(error) => DoctorCheck::fixable(
+            "runtime.apple-container",
+            "Apple container runtime",
+            format!("Could not query the Apple container daemon: {error}"),
+            "Run `container system start`.",
+        ),
+    }
+}
+
+pub fn current_apple_platform(executor: &impl CommandExecutor) -> ApplePlatform {
     if cfg!(target_os = "linux") {
         return ApplePlatform::Linux;
     }
@@ -1459,6 +1650,136 @@ mod tests {
         );
         assert_eq!(check.status, CheckStatus::Unsupported);
         assert_eq!(check.detail, "macOS only");
+    }
+
+    fn aws_target(launch_template: &str) -> TargetTemplate {
+        TargetTemplate::AwsEc2 {
+            aws_profile: Some("hel".into()),
+            region: "us-east-1".into(),
+            launch_template: launch_template.to_owned(),
+            launch_template_version: None,
+            ssh_user: "ubuntu".into(),
+            address_source: crate::hel_config::AwsAddressSource::default(),
+            identity_file: None,
+            ssh_args: vec![],
+        }
+    }
+
+    #[test]
+    fn aws_check_is_ready_after_the_cli_credential_and_launch_template_probes() {
+        let executor = FakeExecutor::new([
+            Ok(output(b"aws-cli/2.17.0\n")),
+            Ok(output(b"{\"Account\":\"123456789012\"}\n")),
+            Ok(output(b"{\"LaunchTemplates\":[{}]}\n")),
+        ]);
+        let config = config_with([("aws", aws_target("hel-runson"))]);
+
+        let checks = aws_checks(Some(&config), &executor);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].id, "runtime.aws-ec2.aws");
+        assert_eq!(checks[0].status, CheckStatus::Ready);
+        let commands = executor.commands.borrow();
+        assert!(commands.iter().all(|command| command.program == "aws"));
+        // Profile and region are applied exactly as provisioning applies them.
+        assert_eq!(
+            commands[2].args,
+            vec![
+                "--profile",
+                "hel",
+                "--region",
+                "us-east-1",
+                "ec2",
+                "describe-launch-templates",
+                "--launch-template-names",
+                "hel-runson",
+                "--output",
+                "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn aws_check_is_fixable_with_an_install_remediation_without_the_cli() {
+        let executor = FakeExecutor::new([Err(anyhow!("No such file or directory"))]);
+
+        let check = aws_target_check("aws", None, "us-east-1", "hel-runson", &executor);
+
+        assert_eq!(check.status, CheckStatus::Fixable);
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains(AWS_CLI_INSTALL_URL)
+        );
+        assert_eq!(executor.commands.borrow().len(), 1);
+    }
+
+    #[test]
+    fn aws_check_is_fixable_with_a_sign_in_remediation_for_expired_credentials() {
+        let executor = FakeExecutor::new([
+            Ok(output(b"aws-cli/2.17.0\n")),
+            Ok(failed(b"ExpiredToken: the security token has expired")),
+        ]);
+
+        let check = aws_target_check("aws", Some("hel"), "us-east-1", "hel-runson", &executor);
+
+        assert_eq!(check.status, CheckStatus::Fixable);
+        assert!(check.detail.contains("ExpiredToken"));
+        assert_eq!(
+            check.remediation.as_deref(),
+            Some(
+                "Configure credentials with `aws configure --profile hel`, or sign in with `aws sso login --profile hel`."
+            )
+        );
+    }
+
+    #[test]
+    fn aws_check_is_fixable_when_the_launch_template_is_missing() {
+        let executor = FakeExecutor::new([
+            Ok(output(b"aws-cli/2.17.0\n")),
+            Ok(output(b"{\"Account\":\"123456789012\"}\n")),
+            Ok(failed(b"InvalidLaunchTemplateName.NotFoundException")),
+        ]);
+
+        let check = aws_target_check("aws", Some("hel"), "us-east-1", "lt-0123456789", &executor);
+
+        assert_eq!(check.status, CheckStatus::Fixable);
+        assert!(check.detail.contains("was not found in us-east-1"));
+        // An `lt-` value is a template id, not a name.
+        assert_eq!(
+            executor.commands.borrow()[2].args[6],
+            "--launch-template-ids"
+        );
+    }
+
+    #[test]
+    fn aws_checks_are_skipped_for_configs_without_an_aws_target() {
+        let executor = FakeExecutor::new([]);
+        let config = config_with([(
+            "podman",
+            TargetTemplate::LocalPodman {
+                container: container("ubuntu:24.04"),
+            },
+        )]);
+
+        assert!(aws_checks(Some(&config), &executor).is_empty());
+        assert!(aws_checks(None, &executor).is_empty());
+        assert!(executor.commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn apple_container_daemon_check_is_ready_once_the_daemon_answers() {
+        let executor = FakeExecutor::new([
+            Ok(output(b"container version 1\n")),
+            Ok(output(b"running\n")),
+        ]);
+
+        let check = apple_container_daemon_check(&executor);
+
+        assert_eq!(check.status, CheckStatus::Ready);
+        assert_eq!(executor.commands.borrow().len(), 2);
     }
 
     #[test]
