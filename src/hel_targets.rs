@@ -297,8 +297,21 @@ pub trait CommandExecutor {
 
 pub struct ProcessExecutor;
 
+/// One debug line per finished target command, so a slow launch or resume
+/// phase can be attributed from logs instead of re-profiled by hand.
+fn trace_command_duration(command: &CommandSpec, started: Instant, status: i32) {
+    tracing::debug!(
+        purpose = command.purpose.as_str(),
+        program = command.program.as_str(),
+        status,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "target command finished"
+    );
+}
+
 impl CommandExecutor for ProcessExecutor {
     fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        let started = Instant::now();
         let output = Command::new(&command.program)
             .args(&command.args)
             .envs(&command.env)
@@ -306,6 +319,7 @@ impl CommandExecutor for ProcessExecutor {
             .output()
             .with_context(|| format!("run {} for {}", command.program, command.purpose))?;
         let status = output.status.code().unwrap_or(-1);
+        trace_command_duration(command, started, status);
         Ok(CommandOutput {
             status,
             stdout: output.stdout,
@@ -340,6 +354,7 @@ fn stream_command_with_stdin(
     input: &mut (dyn Read + Send),
     is_cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<CommandOutput> {
+    let started = Instant::now();
     if is_cancelled() {
         bail!("operation cancelled");
     }
@@ -433,8 +448,10 @@ fn stream_command_with_stdin(
         // it. A successful child must not hide an input error.
         input_result?;
     }
+    let status = status.code().unwrap_or(-1);
+    trace_command_duration(command, started, status);
     Ok(CommandOutput {
-        status: status.code().unwrap_or(-1),
+        status,
         stdout,
         stderr,
     })
@@ -512,6 +529,7 @@ impl CommandExecutor for CancellableProcessExecutor {
     }
 
     fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        let started = Instant::now();
         self.check_cancelled()?;
         let mut child = cancellable_command(command)
             .stdin(Stdio::null())
@@ -550,8 +568,10 @@ impl CommandExecutor for CancellableProcessExecutor {
         let stderr = stderr_reader
             .join()
             .map_err(|_| anyhow::anyhow!("command stderr reader panicked"))??;
+        let status = status.code().unwrap_or(-1);
+        trace_command_duration(command, started, status);
         Ok(CommandOutput {
-            status: status.code().unwrap_or(-1),
+            status,
             stdout,
             stderr,
         })
