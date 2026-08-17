@@ -512,6 +512,28 @@ impl TargetTemplate {
     }
 }
 
+/// Whether `template` hosts a raw project checkout directly on its machine,
+/// with no managed workspace. Bare targets take a project directory instead
+/// of a bundle.
+pub fn is_bare_project_target(template: &TargetTemplate) -> bool {
+    matches!(
+        template,
+        TargetTemplate::LocalBare | TargetTemplate::SshBare { .. }
+    )
+}
+
+/// The host name that prompt-history mounts on `template` should be filed
+/// under, or `None` if the target does not support attached mounts.
+pub fn mount_history_host(template: &TargetTemplate) -> Option<&str> {
+    match template {
+        TargetTemplate::LocalPodman { .. }
+        | TargetTemplate::AppleContainer { .. }
+        | TargetTemplate::AwsEc2 { .. } => Some("local"),
+        TargetTemplate::SshPodman { ssh, .. } => Some(&ssh.host),
+        TargetTemplate::LocalBare | TargetTemplate::SshBare { .. } => None,
+    }
+}
+
 fn validate_environment(owner: &str, environment: &BTreeMap<String, String>) -> Result<()> {
     if environment
         .keys()

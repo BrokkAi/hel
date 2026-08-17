@@ -15,6 +15,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde_json::Value;
 
+use crate::clock::epoch_millis;
 use crate::hel_archive::CanonicalQueuedCommandKind;
 
 use super::snapshot::{
@@ -26,7 +27,7 @@ use super::types::RESTORED_CANONICAL_SESSION_FILE;
 use super::{
     DurableRelay, RELAY_ACTIVE_SEGMENT, RELAY_EVENT_BYTE_BUDGET, RELAY_EVENT_ENVELOPE_RESERVE,
     RELAY_HOT_EVENT_CAPACITY, RELAY_JOURNAL_DIR, RELAY_SEGMENT_BYTE_LIMIT,
-    RELAY_SNAPSHOT_BYTE_BUDGET, RELAY_STATE_BYTE_BUDGET, RELAY_STATE_FILE, now_unix_millis,
+    RELAY_SNAPSHOT_BYTE_BUDGET, RELAY_STATE_BYTE_BUDGET, RELAY_STATE_FILE,
 };
 
 #[derive(Debug, Clone)]
@@ -504,7 +505,7 @@ impl DurableRelay {
             ordinal,
             previous_digest: self.snapshot.latest_digest.clone(),
             digest: String::new(),
-            recorded_at_ms: now_unix_millis(),
+            recorded_at_ms: epoch_millis(),
             command_id: command_id.map(str::to_owned),
             observation,
         };
@@ -832,7 +833,7 @@ mod tests {
                     command: RelayCommand::RemoveQueuedPrompt {
                         queued_command_id: "queued-prompt".into(),
                     },
-                    created_at_ms: now_unix_millis(),
+                    created_at_ms: epoch_millis(),
                 },
             )
             .unwrap();
@@ -863,7 +864,7 @@ mod tests {
                 RelayObservation::CommandQueued {
                     command_id: "clear-after-crash".into(),
                     command: RelayCommand::ClearQueuedPrompts,
-                    created_at_ms: now_unix_millis(),
+                    created_at_ms: epoch_millis(),
                 },
             )
             .unwrap();
@@ -895,7 +896,7 @@ mod tests {
                     command: RelayCommand::CompleteCheckpoint {
                         barrier_command_id: "barrier-command".into(),
                     },
-                    created_at_ms: now_unix_millis(),
+                    created_at_ms: epoch_millis(),
                 },
             )
             .unwrap();
@@ -1157,7 +1158,7 @@ mod tests {
             ordinal: 1,
             previous_digest: RELAY_EVENT_GENESIS_DIGEST.to_owned(),
             digest: String::new(),
-            recorded_at_ms: now_unix_millis(),
+            recorded_at_ms: epoch_millis(),
             command_id: None,
             observation: RelayObservation::Warning {
                 message: "after journal fsync".into(),

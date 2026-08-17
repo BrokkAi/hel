@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::hel_config::{HelConfig, ProjectBundle, TargetTemplate};
+use crate::hel_config::{HelConfig, ProjectBundle, TargetTemplate, is_bare_project_target};
 use crate::hel_local_git::canonical_repository;
 use crate::hel_state::{ManagedWorktree, ManagedWorktreeTarget, SessionRecord};
 use crate::hel_targets::{
@@ -961,13 +961,6 @@ fn remove_empty_managed_worktree_directories(
         }
     }
     Ok(())
-}
-
-pub(super) fn is_bare_project_target(template: &TargetTemplate) -> bool {
-    matches!(
-        template,
-        TargetTemplate::LocalBare | TargetTemplate::SshBare { .. }
-    )
 }
 
 /// Why a bundle session cannot resume on a local bare target. A bare target has

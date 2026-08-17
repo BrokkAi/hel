@@ -11,6 +11,7 @@ use crate::hel_archive::{
     verify_archive_streaming,
 };
 use crate::hel_checkpoint::{CheckpointRestoreSpec, restore_command};
+use crate::hel_config::mount_history_host;
 use crate::hel_projection::materialized_session_from_canonical;
 use crate::hel_session_manager::new_command_id;
 use crate::hel_state::{
@@ -22,9 +23,7 @@ use crate::hel_targets::{
 };
 use crate::hel_worker::RelayCommand;
 
-use super::backend::{
-    backend_locator, controller_github_token, mount_history_host, validate_resource_allocation,
-};
+use super::backend::{backend_locator, controller_github_token, validate_resource_allocation};
 use super::checkpoint::upload_checkpoint_spec;
 use super::provisioning::{
     LocalBootstrap, ProvisioningFailureDisposition, StagedExecutor, install_attached_resources,
@@ -272,8 +271,8 @@ impl Controller {
         }
         let resumed_project_directory = record.project_directory.clone();
         if let Some(host) = history_host {
-            self.state.remember_mount_sources(&host, &history_mounts);
-            crate::hel_database::remember_mount_sources(&host, &history_mounts)?;
+            self.state.remember_mount_sources(host, &history_mounts);
+            crate::hel_database::remember_mount_sources(host, &history_mounts)?;
         }
         // The session's prompt history is filed under its bundle, so a
         // conversion moves the history with it before the record is persisted.

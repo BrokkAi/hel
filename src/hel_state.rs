@@ -683,6 +683,22 @@ impl SessionResourceAllocation {
     }
 }
 
+/// The CPU count an allocation grants, regardless of target kind.
+pub fn allocation_cpus(allocation: &SessionResourceAllocation) -> u64 {
+    match allocation {
+        SessionResourceAllocation::Container { cpus, .. } => *cpus,
+        SessionResourceAllocation::AwsEc2 { vcpus, .. } => *vcpus,
+    }
+}
+
+/// The memory, in bytes, an allocation grants, regardless of target kind.
+pub fn allocation_memory(allocation: &SessionResourceAllocation) -> u64 {
+    match allocation {
+        SessionResourceAllocation::Container { memory_bytes, .. }
+        | SessionResourceAllocation::AwsEc2 { memory_bytes, .. } => *memory_bytes,
+    }
+}
+
 impl TargetLocator {
     fn validate(&self, session_id: &str) -> Result<()> {
         match self {

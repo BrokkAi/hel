@@ -10,9 +10,10 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use hel::clock::epoch_seconds;
 use hel::hel_config::HelConfig;
 use hel::hel_controller::Controller;
 use hel::hel_credentials::{CredentialSyncHandle, CredentialSyncTarget};
@@ -823,7 +824,7 @@ fn schedule_capacity_samples(
                 .send(CapacityPollUpdate {
                     target_id: target.id,
                     result,
-                    sampled_at_epoch_seconds: current_epoch_seconds(),
+                    sampled_at_epoch_seconds: epoch_seconds(),
                 })
                 .await;
         });
@@ -965,13 +966,6 @@ pub(crate) fn spawn_dashboard_worker_poller() -> Result<(
 )> {
     let channels = spawn_session_manager()?;
     Ok((channels.targets, channels.updates, channels.control))
-}
-
-fn current_epoch_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 pub(crate) fn apply_worker_poll_update(

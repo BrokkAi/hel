@@ -20,7 +20,6 @@ mod test_support;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
     AvailableCommand, ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority,
@@ -32,6 +31,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::Color;
 use sha2::{Digest, Sha256};
 
+use crate::clock::epoch_seconds;
 use crate::hel_acp::RuntimeEvent;
 use crate::hel_config::{HarnessKind, PlanModeIds};
 use crate::hel_state::{
@@ -531,7 +531,7 @@ impl ChatState {
         self.notices.clear();
         // Local echo: start the clock now so the header moves with the send.
         // The next materialized update replaces this with the recorded start.
-        self.turn_started_at_epoch_seconds = Some(now_epoch_seconds());
+        self.turn_started_at_epoch_seconds = Some(epoch_seconds());
     }
 
     /// Starts the header clock for a turn the event log just reported. An
@@ -541,7 +541,7 @@ impl ChatState {
         self.turn_started_at_epoch_seconds = recorded_at_ms
             .and_then(|recorded_at_ms| u64::try_from(recorded_at_ms).ok())
             .map(|recorded_at_ms| recorded_at_ms / 1_000)
-            .or_else(|| Some(now_epoch_seconds()));
+            .or_else(|| Some(epoch_seconds()));
     }
 
     fn pursuing_goal(&self) -> bool {
@@ -1504,13 +1504,6 @@ fn turn_started_at_epoch_seconds(execution: MaterializedExecutionState) -> Optio
         | MaterializedExecutionState::Closing
         | MaterializedExecutionState::Closed => None,
     }
-}
-
-fn now_epoch_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 /// Last line of a message that has any text on it, trimmed. `None` means the

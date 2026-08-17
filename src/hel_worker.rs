@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 use agent_client_protocol::schema::v1::{ContentBlock, SessionUpdate};
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::clock::epoch_millis;
 use crate::hel_archive::CanonicalQueuedCommandKind;
 use journal::{
     RelayJournalSpan, open_relay_journal, persist_relay_snapshot, read_restored_relay_seed,
@@ -284,7 +285,7 @@ impl DurableRelay {
                 StoredQueuedRelayCommand {
                     command_id: command_id.clone(),
                     payload,
-                    created_at_ms: now_unix_millis(),
+                    created_at_ms: epoch_millis(),
                 },
             ));
         }
@@ -682,7 +683,7 @@ impl DurableRelay {
             }
         }
 
-        let created_at_ms = now_unix_millis();
+        let created_at_ms = epoch_millis();
         let accepted_ordinal = self.append_relay_event(
             Some(command_id),
             RelayObservation::CommandQueued {
@@ -779,7 +780,7 @@ impl DurableRelay {
                 Some(command_id),
                 RelayObservation::CommandStarted {
                     command_id: command_id.to_owned(),
-                    started_at_ms: now_unix_millis(),
+                    started_at_ms: epoch_millis(),
                 },
             )?;
         }
@@ -862,7 +863,7 @@ impl DurableRelay {
                         Some(&barrier_id),
                         RelayObservation::CommandStarted {
                             command_id: barrier_id.clone(),
-                            started_at_ms: now_unix_millis(),
+                            started_at_ms: epoch_millis(),
                         },
                     )?;
                 }
@@ -926,7 +927,7 @@ impl DurableRelay {
                 Some(&command_id),
                 RelayObservation::CommandStarted {
                     command_id: command_id.clone(),
-                    started_at_ms: now_unix_millis(),
+                    started_at_ms: epoch_millis(),
                 },
             )?;
         }
@@ -1329,7 +1330,7 @@ impl DurableRelay {
             Some(&queued.command_id),
             RelayObservation::CommandStarted {
                 command_id: queued.command_id.clone(),
-                started_at_ms: now_unix_millis(),
+                started_at_ms: epoch_millis(),
             },
         )?;
         Ok(Some(ordinal))
@@ -1365,13 +1366,6 @@ struct RelayEventPage {
     events: Vec<RelayEvent>,
     through_ordinal: u64,
     through_digest: String,
-}
-
-fn now_unix_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or(0)
 }
 
 pub(crate) fn clear_native_session_identity(root: &Path) -> Result<()> {

@@ -10,8 +10,13 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use sha2::{Digest, Sha256};
 
-use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate};
-use hel::hel_state::{HelState, SessionRecord, SessionResourceAllocation, SessionState};
+use hel::hel_config::{
+    HarnessKind, HelConfig, TargetTemplate, is_bare_project_target, mount_history_host,
+};
+use hel::hel_state::{
+    HelState, SessionRecord, SessionResourceAllocation, SessionState, allocation_cpus,
+    allocation_memory,
+};
 use hel::hel_targets::{AdditionalMount, default_mount_destination, path_completion};
 
 use crate::widgets::{action_buttons, centered_rect, format_resource_bytes};
@@ -308,20 +313,6 @@ fn apply_aws_options(
             *allocation = None;
             *sizing_error = Some(error);
         }
-    }
-}
-
-fn allocation_cpus(allocation: &SessionResourceAllocation) -> u64 {
-    match allocation {
-        SessionResourceAllocation::Container { cpus, .. } => *cpus,
-        SessionResourceAllocation::AwsEc2 { vcpus, .. } => *vcpus,
-    }
-}
-
-fn allocation_memory(allocation: &SessionResourceAllocation) -> u64 {
-    match allocation {
-        SessionResourceAllocation::Container { memory_bytes, .. }
-        | SessionResourceAllocation::AwsEc2 { memory_bytes, .. } => *memory_bytes,
     }
 }
 
@@ -1219,13 +1210,6 @@ fn target_label(target: &TargetTemplate) -> &'static str {
     }
 }
 
-fn is_bare_project_target(target: &TargetTemplate) -> bool {
-    matches!(
-        target,
-        TargetTemplate::LocalBare | TargetTemplate::SshBare { .. }
-    )
-}
-
 fn resource_allocation_label(
     allocation: Option<&SessionResourceAllocation>,
     error: Option<&str>,
@@ -1247,17 +1231,6 @@ fn resource_allocation_label(
     match error {
         Some(error) => format!("{allocation} · {error}"),
         None => allocation,
-    }
-}
-
-fn mount_history_host(target: &TargetTemplate) -> Option<&str> {
-    match target {
-        TargetTemplate::LocalBare => None,
-        TargetTemplate::LocalPodman { .. }
-        | TargetTemplate::AppleContainer { .. }
-        | TargetTemplate::AwsEc2 { .. } => Some("local"),
-        TargetTemplate::SshPodman { ssh, .. } => Some(&ssh.host),
-        TargetTemplate::SshBare { .. } => None,
     }
 }
 

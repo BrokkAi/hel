@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::hel_transcript::is_false;
+
 /// File name of the controller-owned canonical session projection restored
 /// alongside a checkpoint's target artifacts.
 pub const RESTORED_CANONICAL_SESSION_FILE: &str = "canonical-session.json";
@@ -143,8 +145,4 @@ pub enum WorkerEvent {
         kind: String,
         payload: Value,
     },
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }

@@ -33,9 +33,11 @@ use super::transcript::{
 };
 use super::{
     ChatAction, ChatEventOutcome, ChatFocus, ChatState, Notices, OtherSessionActivity,
-    OtherSessionIdentity, SessionHeaderIdentity, last_nonempty_line, now_epoch_seconds,
-    queued_prompt_preview, turn_band_color, turn_started_at_epoch_seconds,
+    OtherSessionIdentity, SessionHeaderIdentity, last_nonempty_line, queued_prompt_preview,
+    turn_band_color, turn_started_at_epoch_seconds,
 };
+
+use crate::clock::epoch_seconds;
 
 /// How many conversations the pane shows at once. The transcript owns the rest
 /// of the screen, so the list stays a window however many sessions are open.
@@ -905,7 +907,7 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
     let pane_width = usize::from(inner.width.saturating_sub(2)).max(1);
     let pane = conversations_pane(
         chat,
-        now_epoch_seconds(),
+        epoch_seconds(),
         pane_width,
         usize::from(inner.height / 3).clamp(1, CONVERSATIONS_PANE_MAX_ROWS),
     );

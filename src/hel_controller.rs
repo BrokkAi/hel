@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 
-use crate::hel_config::{HelConfig, SshConnection, TargetTemplate, data_dir};
+use crate::hel_config::{
+    HelConfig, SshConnection, TargetTemplate, data_dir, is_bare_project_target, mount_history_host,
+};
 use crate::hel_database::advance_detached_after_event_ordinal;
 use crate::hel_local_git::dirty_local_repositories;
 use crate::hel_state::{
@@ -29,9 +31,8 @@ use crate::hel_targets::{
     self, AdditionalMount, CommandExecutor, CommandOutput, CommandSpec, SshTarget,
 };
 
-use backend::{mount_history_host, validate_resource_allocation};
+use backend::validate_resource_allocation;
 use provisioning::apply_failed_new_session_rollback;
-use worktree::is_bare_project_target;
 
 pub use checkpoint::{CheckpointArtifact, reconcile_managed_checkpoint_archives};
 pub use recovery_scan::{RecoveryCandidate, RecoveryScan};
@@ -340,11 +341,11 @@ impl Controller {
         };
         self.state.sessions.insert(id.clone(), record);
         if let Some(host) = mount_history_host(template) {
-            self.state.remember_mount_sources(&host, &additional_mounts);
+            self.state.remember_mount_sources(host, &additional_mounts);
         }
         self.persist_session_state(&id)?;
         if let Some(host) = mount_history_host(template) {
-            crate::hel_database::remember_mount_sources(&host, &additional_mounts)?;
+            crate::hel_database::remember_mount_sources(host, &additional_mounts)?;
         }
         Ok(id)
     }

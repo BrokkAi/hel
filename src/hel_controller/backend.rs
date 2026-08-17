@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::hel_config::{AwsAddressSource, HelConfig, ProjectBundle, TargetTemplate, data_dir};
-use crate::hel_state::{SessionRecord, SessionResourceAllocation, TargetLocator};
+use crate::hel_state::{SessionRecord, SessionResourceAllocation, TargetLocator, allocation_cpus};
 use crate::hel_targets::{
     self, AwsTemplate, CommandExecutor, CommandOutput, CommandSpec, ContainerTemplate,
     ProjectBundleSpec, ProvisionStage, RepositorySpec, SshTarget,
@@ -124,8 +124,8 @@ impl Controller {
                 })
             })
             .collect::<Vec<_>>();
-        options.sort_by_key(allocation_vcpus);
-        if !options.iter().any(|option| allocation_vcpus(option) == 8) {
+        options.sort_by_key(allocation_cpus);
+        if !options.iter().any(|option| allocation_cpus(option) == 8) {
             bail!("EC2 family {family:?} has no exact 8-vCPU baseline size");
         }
         Ok(options)
@@ -235,13 +235,6 @@ impl Controller {
         }));
         targets.sort_by(|left, right| left.id.cmp(&right.id));
         targets
-    }
-}
-
-fn allocation_vcpus(allocation: &SessionResourceAllocation) -> u64 {
-    match allocation {
-        SessionResourceAllocation::Container { cpus, .. } => *cpus,
-        SessionResourceAllocation::AwsEc2 { vcpus, .. } => *vcpus,
     }
 }
 
@@ -421,16 +414,6 @@ pub(super) fn use_github_https_urls(bundle: &mut hel_targets::ProjectBundleSpec)
             "https://github.com/{}/{}.git",
             github.owner, github.repository
         ));
-    }
-}
-
-pub(super) fn mount_history_host(template: &TargetTemplate) -> Option<String> {
-    match template {
-        TargetTemplate::LocalPodman { .. }
-        | TargetTemplate::AppleContainer { .. }
-        | TargetTemplate::AwsEc2 { .. } => Some("local".into()),
-        TargetTemplate::SshPodman { ssh, .. } => Some(ssh.host.clone()),
-        TargetTemplate::LocalBare | TargetTemplate::SshBare { .. } => None,
     }
 }
 
@@ -1107,7 +1090,7 @@ mod tests {
             .resolve_aws_resource_options("aws", &executor)
             .unwrap();
         assert_eq!(
-            options.iter().map(allocation_vcpus).collect::<Vec<_>>(),
+            options.iter().map(allocation_cpus).collect::<Vec<_>>(),
             [8, 16]
         );
     }
