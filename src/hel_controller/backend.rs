@@ -307,17 +307,38 @@ fn github_url(source: &str) -> String {
     }
 }
 
+/// Per-session container size overrides. They win over both the target
+/// template's values and any recorded resource allocation, and they are read
+/// only while a container is being created.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ContainerOverrides<'a> {
+    pub cpus: Option<&'a str>,
+    pub memory: Option<&'a str>,
+}
+
+impl<'a> ContainerOverrides<'a> {
+    pub(super) fn for_session(session: &'a SessionRecord) -> Self {
+        Self {
+            cpus: session.container_cpus.as_deref(),
+            memory: session.container_memory.as_deref(),
+        }
+    }
+}
+
 pub(super) fn backend_target(
     template: &TargetTemplate,
     allocation: Option<&SessionResourceAllocation>,
+    overrides: ContainerOverrides<'_>,
 ) -> Result<hel_targets::TargetTemplate> {
     Ok(match template {
         TargetTemplate::LocalBare => hel_targets::TargetTemplate::LocalBare,
-        TargetTemplate::LocalPodman { container } => {
-            hel_targets::TargetTemplate::LocalPodman(backend_container(container, allocation))
-        }
+        TargetTemplate::LocalPodman { container } => hel_targets::TargetTemplate::LocalPodman(
+            backend_container(container, allocation, overrides),
+        ),
         TargetTemplate::AppleContainer { container } => {
-            hel_targets::TargetTemplate::AppleContainer(backend_container(container, allocation))
+            hel_targets::TargetTemplate::AppleContainer(backend_container(
+                container, allocation, overrides,
+            ))
         }
         TargetTemplate::AwsEc2 {
             aws_profile,
@@ -354,7 +375,7 @@ pub(super) fn backend_target(
         },
         TargetTemplate::SshPodman { ssh, container } => hel_targets::TargetTemplate::SshPodman {
             ssh: backend_ssh(ssh),
-            container: backend_container(container, allocation),
+            container: backend_container(container, allocation, overrides),
         },
     })
 }
@@ -420,21 +441,26 @@ pub(super) fn use_github_https_urls(bundle: &mut hel_targets::ProjectBundleSpec)
 fn backend_container(
     container: &crate::hel_config::ContainerTemplate,
     allocation: Option<&SessionResourceAllocation>,
+    overrides: ContainerOverrides<'_>,
 ) -> ContainerTemplate {
     let mut extra_run_args = Vec::new();
     if let Some(platform) = &container.platform {
         extra_run_args.push(format!("--platform={platform}"));
     }
-    if let Some(SessionResourceAllocation::Container { cpus, memory_bytes }) = allocation {
+    let (cpus, memory) = match allocation {
+        Some(SessionResourceAllocation::Container { cpus, memory_bytes }) => {
+            (Some(cpus.to_string()), Some(memory_bytes.to_string()))
+        }
+        _ => (container.cpus.clone(), container.memory.clone()),
+    };
+    // The session's own overrides are the last word on size.
+    let cpus = overrides.cpus.map(str::to_owned).or(cpus);
+    let memory = overrides.memory.map(str::to_owned).or(memory);
+    if let Some(cpus) = cpus {
         extra_run_args.push(format!("--cpus={cpus}"));
-        extra_run_args.push(format!("--memory={memory_bytes}"));
-    } else {
-        if let Some(cpus) = &container.cpus {
-            extra_run_args.push(format!("--cpus={cpus}"));
-        }
-        if let Some(memory) = &container.memory {
-            extra_run_args.push(format!("--memory={memory}"));
-        }
+    }
+    if let Some(memory) = memory {
+        extra_run_args.push(format!("--memory={memory}"));
     }
     for (key, value) in &container.environment {
         extra_run_args.extend(["--env".to_string(), format!("{key}={value}")]);
@@ -908,6 +934,8 @@ mod tests {
         std::fs::write(source.path().join("many/files/two"), b"two").unwrap();
         let session_id = "0123456789abcdef0123456789abcdef";
         let record = SessionRecord {
+            container_cpus: None,
+            container_memory: None,
             id: session_id.into(),
             title: "AWS resources".into(),
             harness_kind: crate::hel_config::HarnessKind::Codex,
@@ -1007,12 +1035,47 @@ mod tests {
             },
         };
         let hel_targets::TargetTemplate::LocalPodman(container) =
-            backend_target(&template, None).unwrap()
+            backend_target(&template, None, ContainerOverrides::default()).unwrap()
         else {
             unreachable!()
         };
         assert!(container.extra_run_args.contains(&"--cpus=4".into()));
         assert!(container.extra_run_args.contains(&"A=b c".into()));
+    }
+    #[test]
+    fn session_size_overrides_beat_the_target_template_and_its_allocation() {
+        let template = TargetTemplate::LocalPodman {
+            container: ConfigContainer {
+                image: "dev:1".into(),
+                platform: None,
+                cpus: Some("4".into()),
+                memory: Some("8g".into()),
+                environment: std::collections::BTreeMap::new(),
+            },
+        };
+        let mut session =
+            crate::hel_controller::test_support::checkpoint_test_session("session-size");
+        session.container_cpus = Some("2".into());
+        session.container_memory = Some("3g".into());
+        session.resource_allocation = Some(SessionResourceAllocation::Container {
+            cpus: 16,
+            memory_bytes: 64_000_000_000,
+        });
+        let hel_targets::TargetTemplate::LocalPodman(container) = backend_target(
+            &template,
+            session.resource_allocation.as_ref(),
+            ContainerOverrides::for_session(&session),
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        assert!(container.extra_run_args.contains(&"--cpus=2".into()));
+        assert!(container.extra_run_args.contains(&"--memory=3g".into()));
+        assert!(!container.extra_run_args.iter().any(|argument| {
+            argument.starts_with("--cpus=4")
+                || argument.starts_with("--cpus=16")
+                || argument.starts_with("--memory=8g")
+        }));
     }
     #[test]
     fn github_token_is_injected_only_into_managed_containers() {

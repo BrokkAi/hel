@@ -10,7 +10,7 @@ use crate::hel_state::{SessionRecord, SessionState, TargetLocator};
 use crate::hel_targets::{self, CommandExecutor, CommandOutput, CommandSpec, SshTarget};
 use crate::hel_worker_runtime::WorkerOwnership;
 
-use super::backend::{backend_locator, backend_target};
+use super::backend::{ContainerOverrides, backend_locator, backend_target};
 use super::readiness::wait_for_native_session;
 use super::{Controller, backend_ssh, now, ssh_args_with_identity};
 
@@ -106,6 +106,8 @@ impl Controller {
             .with_context(|| format!("unknown bundle {bundle_id:?}"))?;
         let now = now();
         let record = SessionRecord {
+            container_cpus: None,
+            container_memory: None,
             id: session_id.to_owned(),
             title: format!("Recovered {}", &session_id[..session_id.len().min(8)]),
             harness_kind: profile.kind,
@@ -292,7 +294,8 @@ fn scan_target_workers(
                     let path = std::str::from_utf8(line).ok()?.trim();
                     let session_id = Path::new(path).parent()?.file_name()?.to_str()?;
                     hel_targets::resource_name(session_id).ok()?;
-                    let backend = backend_target(template, None).ok()?;
+                    let backend =
+                        backend_target(template, None, ContainerOverrides::default()).ok()?;
                     let workspace = hel_targets::workspace_for(&backend, session_id).ok()?;
                     Some(RecoveryCandidate {
                         session_id: session_id.to_owned(),

@@ -22,8 +22,9 @@ use crate::hel_targets::{
 };
 
 use super::backend::{
-    absolute_target_path, backend_bundle, backend_locator, backend_target, controller_github_token,
-    inject_github_token, locator_after_provision, preflight_target, use_github_https_urls,
+    ContainerOverrides, absolute_target_path, backend_bundle, backend_locator, backend_target,
+    controller_github_token, inject_github_token, locator_after_provision, preflight_target,
+    use_github_https_urls,
 };
 use super::checkpoint::upload_checkpoint_spec;
 use super::readiness::{connect_started_worker, wait_for_native_session};
@@ -221,7 +222,11 @@ impl Controller {
                     );
                 }
             }
-            let mut target = backend_target(template, session.resource_allocation.as_ref())?;
+            let mut target = backend_target(
+                template,
+                session.resource_allocation.as_ref(),
+                ContainerOverrides::for_session(&session),
+            )?;
             let runtime_mounts = if matches!(target, hel_targets::TargetTemplate::AwsEc2(_)) {
                 &[][..]
             } else {
@@ -1164,6 +1169,8 @@ mod tests {
     fn failed_new_session_provisioning_discards_provisional_record() {
         let session_id = "0123456789abcdef0123456789abcdef";
         let record = SessionRecord {
+            container_cpus: None,
+            container_memory: None,
             id: session_id.into(),
             title: "new session".into(),
             harness_kind: crate::hel_config::HarnessKind::Codex,
@@ -1203,6 +1210,8 @@ mod tests {
     fn failed_new_worker_start_discards_session_only_after_target_cleanup() {
         let session_id = "0123456789abcdef0123456789abcdef";
         let mut session = SessionRecord {
+            container_cpus: None,
+            container_memory: None,
             id: session_id.into(),
             title: "new session".into(),
             harness_kind: crate::hel_config::HarnessKind::Kimi,

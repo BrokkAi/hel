@@ -316,6 +316,8 @@ impl Controller {
         let id = new_session_id()?;
         let now = now();
         let record = SessionRecord {
+            container_cpus: None,
+            container_memory: None,
             id: id.clone(),
             title: title.into(),
             harness_kind: profile.kind,
@@ -366,6 +368,61 @@ impl Controller {
         record.session_title_override = Some(title.clone());
         record.updated_at = updated_at;
         Ok(title)
+    }
+
+    /// Record the per-session container size overrides and attached
+    /// directories. Nothing is applied to a running container: the values are
+    /// read the next time the session's container is created.
+    pub fn update_session_container_settings(
+        &mut self,
+        session_id: &str,
+        cpus: Option<String>,
+        memory: Option<String>,
+        additional_mounts: Vec<hel_targets::AdditionalMount>,
+        mount_history: Vec<std::path::PathBuf>,
+    ) -> Result<()> {
+        ensure!(
+            self.state.sessions.contains_key(session_id),
+            "unknown session {session_id}"
+        );
+        let cpus = cpus.filter(|value| !value.trim().is_empty());
+        let memory = memory.filter(|value| !value.trim().is_empty());
+        let updated_at = now();
+        crate::hel_database::set_session_container_settings(
+            session_id,
+            cpus.as_deref(),
+            memory.as_deref(),
+            &additional_mounts,
+            &updated_at,
+        )?;
+        if let Some(host) = self
+            .config
+            .targets
+            .get(
+                &self.state.sessions[session_id]
+                    .target_template_id
+                    .to_owned(),
+            )
+            .and_then(crate::hel_config::mount_history_host)
+        {
+            let host = host.to_owned();
+            // The dialog owns the suggestion list, so forgetting a directory
+            // there has to survive the mounts being remembered right after.
+            crate::hel_database::replace_mount_history(&host, &mount_history)?;
+            crate::hel_database::remember_mount_sources(&host, &additional_mounts)?;
+            self.state.mount_history.insert(host.clone(), mount_history);
+            self.state.remember_mount_sources(&host, &additional_mounts);
+        }
+        let record = self
+            .state
+            .sessions
+            .get_mut(session_id)
+            .expect("session was checked before updating its container settings");
+        record.container_cpus = cpus;
+        record.container_memory = memory;
+        record.additional_mounts = additional_mounts;
+        record.updated_at = updated_at;
+        Ok(())
     }
 
     pub fn mark_session_detached_after(

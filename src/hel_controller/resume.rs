@@ -1084,6 +1084,8 @@ mod tests {
     #[test]
     fn failed_resume_rolls_back_only_after_target_cleanup() {
         let previous = SessionRecord {
+            container_cpus: None,
+            container_memory: None,
             id: "0123456789abcdef0123456789abcdef".into(),
             title: "imported session".into(),
             harness_kind: crate::hel_config::HarnessKind::Codex,

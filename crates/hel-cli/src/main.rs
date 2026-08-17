@@ -791,6 +791,8 @@ mod tests {
         state.sessions.insert(
             session_id.into(),
             SessionRecord {
+                container_cpus: None,
+                container_memory: None,
                 id: session_id.into(),
                 title: "paused".into(),
                 harness_kind: hel::hel_config::HarnessKind::Codex,

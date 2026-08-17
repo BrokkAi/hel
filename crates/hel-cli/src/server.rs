@@ -753,6 +753,8 @@ mod tests {
     fn started_phone_session_is_visible_and_mapped_before_provisioning() {
         let session_id = "0123456789abcdef0123456789abcdef";
         let session = SessionRecord {
+            container_cpus: None,
+            container_memory: None,
             id: session_id.into(),
             title: "Phone launch".into(),
             harness_kind: hel::hel_config::HarnessKind::Codex,

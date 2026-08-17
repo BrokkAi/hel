@@ -1080,6 +1080,8 @@ mod tests {
             sessions: BTreeMap::from([(
                 "session-1".into(),
                 SessionRecord {
+                    container_cpus: None,
+                    container_memory: None,
                     id: "session-1".into(),
                     title: "Build Hel".into(),
                     harness_kind: HarnessKind::Codex,

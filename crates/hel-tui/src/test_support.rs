@@ -149,6 +149,8 @@ pub(crate) fn config() -> HelConfig {
 
 pub(crate) fn archived_session() -> SessionRecord {
     SessionRecord {
+        container_cpus: None,
+        container_memory: None,
         id: "session-1".into(),
         title: "Raise the dead".into(),
         harness_kind: HarnessKind::Codex,

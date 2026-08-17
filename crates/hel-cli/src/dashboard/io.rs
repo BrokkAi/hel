@@ -52,6 +52,10 @@ pub(crate) enum DashboardIoUpdate {
         title: String,
         result: std::result::Result<String, String>,
     },
+    ContainerSettings {
+        session_id: String,
+        result: std::result::Result<(), String>,
+    },
     DetachedSessionState {
         session_id: String,
         result: std::result::Result<(), String>,
@@ -241,6 +245,35 @@ pub(crate) fn spawn_dashboard_rename(
             title,
             result,
         },
+    );
+}
+
+/// What the container editor asks the controller to persist.
+pub(crate) struct ContainerSettingsRequest {
+    pub(crate) session_id: String,
+    pub(crate) cpus: Option<String>,
+    pub(crate) memory: Option<String>,
+    pub(crate) additional_mounts: Vec<hel::hel_targets::AdditionalMount>,
+    pub(crate) mount_history: Vec<std::path::PathBuf>,
+}
+
+pub(crate) fn spawn_dashboard_container_settings(
+    request: ContainerSettingsRequest,
+    updates: UnboundedSender<DashboardIoUpdate>,
+) {
+    let session_id = request.session_id.clone();
+    spawn_io(
+        updates,
+        move || {
+            Controller::load()?.update_session_container_settings(
+                &request.session_id,
+                request.cpus,
+                request.memory,
+                request.additional_mounts,
+                request.mount_history,
+            )
+        },
+        move |result| DashboardIoUpdate::ContainerSettings { session_id, result },
     );
 }
 
@@ -595,6 +628,30 @@ impl DashboardContext {
                     self.dashboard
                         .set_notice(format!("Rename failed for {title}: {error}"));
                 }
+            },
+            DashboardIoUpdate::ContainerSettings { session_id, result } => match result {
+                Ok(()) => {
+                    // Reload so the saved mounts, overrides, and mount history
+                    // all come back from one durable read.
+                    match Controller::load() {
+                        Ok(controller) => {
+                            self.controller = controller;
+                            self.dashboard.set_state(self.controller.state.clone());
+                            self.dashboard.set_notice(format!(
+                                "Container settings saved for {}; applies when it is next recreated.",
+                                short_id(&session_id)
+                            ));
+                        }
+                        Err(error) => self.dashboard.set_notice(format!(
+                            "Container settings saved for {}, but reloading state failed: {error:#}",
+                            short_id(&session_id)
+                        )),
+                    }
+                }
+                Err(error) => self.dashboard.set_notice(format!(
+                    "Container settings failed for {}: {error}",
+                    short_id(&session_id)
+                )),
             },
             DashboardIoUpdate::DetachedSessionState { session_id, result } => {
                 if let Err(error) = result {

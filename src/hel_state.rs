@@ -690,6 +690,14 @@ pub struct SessionRecord {
     pub resource_allocation: Option<SessionResourceAllocation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_mounts: Vec<AdditionalMount>,
+    /// Per-session container CPU limit that overrides the target template's
+    /// value. It is applied the next time the container is created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_cpus: Option<String>,
+    /// Per-session container memory limit that overrides the target
+    /// template's value. It is applied the next time the container is created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_memory: Option<String>,
     pub state: SessionState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<TargetLocator>,
@@ -1052,6 +1060,8 @@ mod tests {
 
     fn sample_state() -> HelState {
         let session = SessionRecord {
+            container_cpus: None,
+            container_memory: None,
             id: "0123456789abcdef".into(),
             title: "Build Hel".into(),
             harness_kind: HarnessKind::Codex,
@@ -1141,6 +1151,28 @@ mod tests {
             .sessions
             .remove("0123456789abcdef")
             .expect("sample session")
+    }
+
+    #[test]
+    fn session_records_written_before_container_overrides_still_load() {
+        let session = sample_session();
+        let mut json = serde_json::to_value(&session).expect("serialize session");
+        let object = json.as_object_mut().expect("session object");
+        assert!(object.remove("container_cpus").is_none());
+        assert!(object.remove("container_memory").is_none());
+
+        let loaded: SessionRecord = serde_json::from_value(json).expect("load older session");
+        assert_eq!(loaded.container_cpus, None);
+        assert_eq!(loaded.container_memory, None);
+        assert_eq!(loaded, session);
+
+        let mut edited = session.clone();
+        edited.container_cpus = Some("4".into());
+        edited.container_memory = Some("8g".into());
+        let round_tripped: SessionRecord =
+            serde_json::from_str(&serde_json::to_string(&edited).expect("serialize"))
+                .expect("reload edited session");
+        assert_eq!(round_tripped, edited);
     }
 
     #[test]

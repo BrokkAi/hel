@@ -19,8 +19,9 @@ use hel::hel_state::{SessionRecord, SessionState};
 use hel::hel_targets::DeploymentCapacityKind;
 
 use crate::dialogs::{
-    import_sessions_pane, render_confirmation, render_import_bundle_confirmation,
-    render_import_dialog, render_import_progress, render_rename_editor,
+    import_sessions_pane, render_confirmation, render_container_editor,
+    render_import_bundle_confirmation, render_import_dialog, render_import_progress,
+    render_rename_editor,
 };
 use crate::ingest::{SessionDetail, SessionOperationDisplay, TranscriptHydration};
 use crate::widgets::{focus_border, format_resource_bytes};
@@ -83,6 +84,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
         Mode::Resume(wizard) => render_resume_wizard(frame, area, dashboard, wizard),
         Mode::Rename(editor) => render_rename_editor(frame, area, editor),
         Mode::Import(dialog) => render_import_dialog(frame, area, dialog),
+        Mode::EditContainer(editor) => render_container_editor(frame, area, editor),
         Mode::Importing(progress) => render_import_progress(frame, area, progress),
         Mode::ConfirmImportBundle(confirmation) => {
             render_import_bundle_confirmation(frame, area, confirmation)
@@ -334,6 +336,7 @@ fn render_adaptive_dashboard(
         Mode::Resume(wizard) => render_resume_wizard(frame, frame_area, dashboard, wizard),
         Mode::Rename(editor) => render_rename_editor(frame, frame_area, editor),
         Mode::Import(dialog) => render_import_dialog(frame, frame_area, dialog),
+        Mode::EditContainer(editor) => render_container_editor(frame, frame_area, editor),
         Mode::Importing(progress) => render_import_progress(frame, frame_area, progress),
         Mode::ConfirmImportBundle(confirmation) => {
             render_import_bundle_confirmation(frame, frame_area, confirmation)
@@ -1249,21 +1252,20 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     };
     let actions = match dashboard.focus {
         Focus::Active => {
-            "[N]ew · impor[T] · [R]ename · [P]ause · [D]elete · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · impor[T] · [R]ename · [E]dit container · [S]ort · [P]ause · [D]elete · [U]pdate quotas · [Q]uit · Tab pane"
         }
         Focus::Archived => {
-            "[N]ew · impor[T] · [R]ename · [D]elete permanently · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · impor[T] · [R]ename · [S]ort · [D]elete permanently · [U]pdate quotas · [Q]uit · Tab pane"
         }
-        Focus::Capacity => "[N]ew · impor[T] · [U]pdate quotas · [Q]uit · Tab pane",
-        Focus::Quotas => "[N]ew · impor[T] · [R]efresh · [U]pdate quotas · [Q]uit · Tab pane",
+        Focus::Capacity => "[N]ew · impor[T] · [S]ort · [U]pdate quotas · [Q]uit · Tab pane",
+        Focus::Quotas => {
+            "[N]ew · impor[T] · [R]efresh · [S]ort · [U]pdate quotas · [Q]uit · Tab pane"
+        }
     };
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
-                format!(
-                    "s sort: {} · {accelerator} for: {actions}",
-                    dashboard.session_order.label()
-                ),
+                format!("{accelerator} for: {actions}"),
                 Style::default().fg(Color::DarkGray),
             ),
             Line::styled(
@@ -1623,7 +1625,11 @@ mod tests {
         } else {
             "Ctrl"
         };
-        assert!(line(buffer.area.bottom() - 2).contains(&format!("{accelerator} for: [N]ew")));
+        let hotkeys = line(buffer.area.bottom() - 2);
+        assert!(hotkeys.contains(&format!("{accelerator} for: [N]ew")));
+        // Sort is a Ctrl command now, so no order is displayed permanently.
+        assert!(hotkeys.contains("[S]ort"));
+        assert!(!hotkeys.contains("sort: "));
         assert!(line(buffer.area.bottom() - 1).contains("Transient dashboard message"));
     }
 

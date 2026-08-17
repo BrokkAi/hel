@@ -265,6 +265,8 @@ mod tests {
 
     fn session_record(id: &str) -> SessionRecord {
         SessionRecord {
+            container_cpus: None,
+            container_memory: None,
             id: id.to_owned(),
             title: "work".into(),
             harness_kind: crate::hel_config::HarnessKind::Codex,

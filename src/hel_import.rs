@@ -2891,6 +2891,8 @@ fn import_claude_session_inner(
     state.sessions.insert(
         session_id.clone(),
         SessionRecord {
+            container_cpus: None,
+            container_memory: None,
             id: session_id.clone(),
             title,
             harness_kind: HarnessKind::Claude,
@@ -3189,6 +3191,8 @@ fn import_native_session(
     state.sessions.insert(
         session_id.clone(),
         SessionRecord {
+            container_cpus: None,
+            container_memory: None,
             id: session_id.clone(),
             title,
             harness_kind: harness,

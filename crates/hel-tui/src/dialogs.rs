@@ -9,7 +9,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use hel::hel_config::HarnessKind;
+use std::path::PathBuf;
+
+use hel::hel_config::{HarnessKind, mount_history_host};
+use hel::hel_targets::{AdditionalMount, default_mount_destination, validate_additional_mounts};
 
 use crate::render::render_session_scrollbar;
 use crate::widgets::{
@@ -532,6 +535,263 @@ pub(crate) fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &Impor
     }
 }
 
+/// Editable per-session container provisioning inputs: the size overrides and
+/// the attached host directories. Nothing here is written to config.toml.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContainerEditor {
+    pub(crate) session_id: String,
+    pub(crate) cpus: String,
+    pub(crate) memory: String,
+    pub(crate) mounts: Vec<AdditionalMount>,
+    /// Remembered mount sources for this session's host, offered as
+    /// suggestions and editable so a stale directory can be forgotten.
+    pub(crate) suggestions: Vec<PathBuf>,
+    pub(crate) source: String,
+    pub(crate) destination: String,
+    pub(crate) focus: ContainerEditFocus,
+    pub(crate) mount_index: usize,
+    pub(crate) suggestion_index: usize,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContainerEditFocus {
+    Cpus,
+    Memory,
+    Source,
+    Destination,
+    Mounts,
+    Suggestions,
+    Cancel,
+    Save,
+}
+
+const CONTAINER_EDIT_BUTTONS: &[&str] = &["Cancel", "Save"];
+
+/// One line, so the dialog never implies a live resize.
+pub(crate) const CONTAINER_EDIT_SCOPE: &str = "Applies when the container is next recreated.";
+
+impl ContainerEditor {
+    /// Focus order, skipping the lists that have nothing to select.
+    fn focus_order(&self) -> Vec<ContainerEditFocus> {
+        let mut order = vec![
+            ContainerEditFocus::Cpus,
+            ContainerEditFocus::Memory,
+            ContainerEditFocus::Source,
+            ContainerEditFocus::Destination,
+        ];
+        if !self.mounts.is_empty() {
+            order.push(ContainerEditFocus::Mounts);
+        }
+        if !self.suggestions.is_empty() {
+            order.push(ContainerEditFocus::Suggestions);
+        }
+        order.extend([ContainerEditFocus::Cancel, ContainerEditFocus::Save]);
+        order
+    }
+
+    fn field_mut(&mut self) -> Option<&mut String> {
+        match self.focus {
+            ContainerEditFocus::Cpus => Some(&mut self.cpus),
+            ContainerEditFocus::Memory => Some(&mut self.memory),
+            ContainerEditFocus::Source => Some(&mut self.source),
+            ContainerEditFocus::Destination => Some(&mut self.destination),
+            ContainerEditFocus::Mounts
+            | ContainerEditFocus::Suggestions
+            | ContainerEditFocus::Cancel
+            | ContainerEditFocus::Save => None,
+        }
+    }
+
+    fn button_index(&self) -> usize {
+        match self.focus {
+            ContainerEditFocus::Cancel => 0,
+            _ => 1,
+        }
+    }
+
+    /// Add the typed mount, filling in a default destination. Returns the
+    /// reason it was rejected, if it was.
+    fn add_mount(&mut self) -> Option<String> {
+        let source = PathBuf::from(self.source.trim());
+        if source.as_os_str().is_empty() {
+            return Some("Enter a host directory to attach.".into());
+        }
+        let destination = if self.destination.trim().is_empty() {
+            default_mount_destination(&source, &self.mounts)
+        } else {
+            PathBuf::from(self.destination.trim())
+        };
+        let mount = AdditionalMount {
+            source,
+            destination,
+        };
+        let mut mounts = self.mounts.clone();
+        mounts.push(mount);
+        if let Err(error) = validate_additional_mounts(&mounts) {
+            return Some(error.to_string());
+        }
+        self.mounts = mounts;
+        self.source.clear();
+        self.destination.clear();
+        self.mount_index = self.mounts.len() - 1;
+        None
+    }
+
+    fn take_suggestion(&mut self) {
+        let Some(source) = self.suggestions.get(self.suggestion_index) else {
+            return;
+        };
+        self.source = source.to_string_lossy().into_owned();
+        self.destination = default_mount_destination(source, &self.mounts)
+            .to_string_lossy()
+            .into_owned();
+        self.focus = ContainerEditFocus::Source;
+    }
+
+    fn remove_selected(&mut self) {
+        match self.focus {
+            ContainerEditFocus::Mounts if !self.mounts.is_empty() => {
+                self.mounts.remove(self.mount_index);
+                self.mount_index = self.mount_index.min(self.mounts.len().saturating_sub(1));
+                if self.mounts.is_empty() {
+                    self.focus = ContainerEditFocus::Source;
+                }
+            }
+            ContainerEditFocus::Suggestions if !self.suggestions.is_empty() => {
+                self.suggestions.remove(self.suggestion_index);
+                self.suggestion_index = self
+                    .suggestion_index
+                    .min(self.suggestions.len().saturating_sub(1));
+                if self.suggestions.is_empty() {
+                    self.focus = ContainerEditFocus::Source;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn save(&self) -> Result<DashboardAction, String> {
+        validate_additional_mounts(&self.mounts).map_err(|error| error.to_string())?;
+        let value = |text: &str| {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        };
+        Ok(DashboardAction::SaveContainerSettings {
+            session_id: self.session_id.clone(),
+            cpus: value(&self.cpus),
+            memory: value(&self.memory),
+            additional_mounts: self.mounts.clone(),
+            mount_history: self.suggestions.clone(),
+        })
+    }
+}
+
+pub(crate) fn render_container_editor(frame: &mut Frame, area: Rect, editor: &ContainerEditor) {
+    let field = |label: &str, value: &str, focused: bool| {
+        let style = if focused {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        Line::from(vec![
+            ratatui::text::Span::raw(format!("{label}: ")),
+            ratatui::text::Span::styled(format!("{value} "), style),
+        ])
+    };
+    let mut lines = vec![
+        Line::raw(format!("Session: {}", editor.session_id)),
+        Line::styled(CONTAINER_EDIT_SCOPE, Style::default().fg(Color::DarkGray)),
+        Line::raw(""),
+        field(
+            "CPUs",
+            &editor.cpus,
+            editor.focus == ContainerEditFocus::Cpus,
+        ),
+        field(
+            "Memory",
+            &editor.memory,
+            editor.focus == ContainerEditFocus::Memory,
+        ),
+        Line::styled(
+            "Empty keeps the target's value.",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::raw(""),
+        Line::raw("Attached directories"),
+    ];
+    if editor.mounts.is_empty() {
+        lines.push(Line::styled("  none", Style::default().fg(Color::DarkGray)));
+    }
+    for (index, mount) in editor.mounts.iter().enumerate() {
+        let selected = editor.focus == ContainerEditFocus::Mounts && index == editor.mount_index;
+        lines.push(Line::styled(
+            format!(
+                "{} {} -> {}",
+                if selected { "›" } else { " " },
+                mount.source.display(),
+                mount.destination.display()
+            ),
+            if selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default()
+            },
+        ));
+    }
+    lines.extend([
+        Line::raw(""),
+        field(
+            "Attach host directory",
+            &editor.source,
+            editor.focus == ContainerEditFocus::Source,
+        ),
+        field(
+            "Container destination",
+            &editor.destination,
+            editor.focus == ContainerEditFocus::Destination,
+        ),
+    ]);
+    if !editor.suggestions.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::raw("Remembered directories"));
+        for (index, source) in editor.suggestions.iter().enumerate() {
+            let selected =
+                editor.focus == ContainerEditFocus::Suggestions && index == editor.suggestion_index;
+            lines.push(Line::styled(
+                format!("{} {}", if selected { "›" } else { " " }, source.display()),
+                if selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default()
+                },
+            ));
+        }
+    }
+    if let Some(error) = &editor.error {
+        lines.push(Line::styled(
+            error.clone(),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    lines.extend([
+        Line::raw(""),
+        Line::styled(
+            "Enter attaches or takes the selected row · d forgets it · Tab moves",
+            Style::default().fg(Color::DarkGray),
+        ),
+        focused_buttons(CONTAINER_EDIT_BUTTONS, editor.button_index()),
+    ]);
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Edit container size and mounts "),
+    );
+    let popup = centered_rect(70, popup_height(&paragraph, 70, 18, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
 pub(crate) fn render_rename_editor(frame: &mut Frame, area: Rect, editor: &RenameEditor) {
     let paragraph = Paragraph::new(vec![
         Line::raw(format!("Session: {}", editor.session_id)),
@@ -658,6 +918,143 @@ pub(crate) fn import_sessions_pane(area: Rect) -> Rect {
 }
 
 impl DashboardState {
+    /// Open the container editor for the selected session, if that session
+    /// runs on a container-backed target.
+    pub(crate) fn begin_container_edit(&mut self) {
+        let Some(session) = self.selected_container_session() else {
+            self.notices
+                .set("Container size and mounts apply to container targets only.");
+            return;
+        };
+        let suggestions = self
+            .config
+            .targets
+            .get(&session.target_template_id)
+            .and_then(mount_history_host)
+            .and_then(|host| self.state.mount_history.get(host))
+            .cloned()
+            .unwrap_or_default();
+        self.mode = Mode::EditContainer(ContainerEditor {
+            session_id: session.id.clone(),
+            cpus: session.container_cpus.clone().unwrap_or_default(),
+            memory: session.container_memory.clone().unwrap_or_default(),
+            mounts: session.additional_mounts.clone(),
+            suggestions,
+            source: String::new(),
+            destination: String::new(),
+            focus: ContainerEditFocus::Cpus,
+            mount_index: 0,
+            suggestion_index: 0,
+            error: None,
+        });
+    }
+
+    pub(crate) fn handle_container_edit_key(
+        &mut self,
+        code: KeyCode,
+        mut editor: ContainerEditor,
+    ) -> DashboardAction {
+        let action = match code {
+            KeyCode::Esc => {
+                self.cancel_modal();
+                return DashboardAction::None;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                editor.focus = cycle_control(
+                    editor.focus,
+                    &editor.focus_order(),
+                    code == KeyCode::BackTab,
+                );
+                DashboardAction::None
+            }
+            KeyCode::Up | KeyCode::Down => {
+                let reverse = code == KeyCode::Up;
+                match editor.focus {
+                    ContainerEditFocus::Mounts => move_index(
+                        &mut editor.mount_index,
+                        editor.mounts.len(),
+                        if reverse { -1 } else { 1 },
+                    ),
+                    ContainerEditFocus::Suggestions => move_index(
+                        &mut editor.suggestion_index,
+                        editor.suggestions.len(),
+                        if reverse { -1 } else { 1 },
+                    ),
+                    _ => {
+                        editor.focus = cycle_control(editor.focus, &editor.focus_order(), reverse);
+                    }
+                }
+                DashboardAction::None
+            }
+            KeyCode::Left | KeyCode::Right
+                if matches!(
+                    editor.focus,
+                    ContainerEditFocus::Cancel | ContainerEditFocus::Save
+                ) =>
+            {
+                editor.focus = if editor.focus == ContainerEditFocus::Cancel {
+                    ContainerEditFocus::Save
+                } else {
+                    ContainerEditFocus::Cancel
+                };
+                DashboardAction::None
+            }
+            KeyCode::Enter if editor.focus == ContainerEditFocus::Cancel => {
+                self.cancel_modal();
+                return DashboardAction::None;
+            }
+            KeyCode::Enter if editor.focus == ContainerEditFocus::Suggestions => {
+                editor.take_suggestion();
+                editor.error = None;
+                DashboardAction::None
+            }
+            KeyCode::Enter
+                if matches!(
+                    editor.focus,
+                    ContainerEditFocus::Source | ContainerEditFocus::Destination
+                ) =>
+            {
+                editor.error = editor.add_mount();
+                DashboardAction::None
+            }
+            KeyCode::Enter => match editor.save() {
+                Ok(action) => {
+                    self.cancel_modal();
+                    return action;
+                }
+                Err(error) => {
+                    editor.error = Some(error);
+                    DashboardAction::None
+                }
+            },
+            KeyCode::Delete | KeyCode::Char('d')
+                if matches!(
+                    editor.focus,
+                    ContainerEditFocus::Mounts | ContainerEditFocus::Suggestions
+                ) =>
+            {
+                editor.remove_selected();
+                DashboardAction::None
+            }
+            KeyCode::Backspace => {
+                if let Some(field) = editor.field_mut() {
+                    field.pop();
+                }
+                DashboardAction::None
+            }
+            KeyCode::Char(character) => {
+                if let Some(field) = editor.field_mut() {
+                    field.push(character);
+                    editor.error = None;
+                }
+                DashboardAction::None
+            }
+            _ => DashboardAction::None,
+        };
+        self.mode = Mode::EditContainer(editor);
+        action
+    }
+
     /// Show the recovery choices after a checkpointed close could not finish.
     pub fn show_close_failure(&mut self, session_id: String, error: impl Into<String>) {
         self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::CloseFailed {
@@ -1252,6 +1649,132 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn dashboard_with_container_session() -> DashboardState {
+        let mut session = archived_session();
+        session.additional_mounts = vec![AdditionalMount {
+            source: PathBuf::from("/srv/data"),
+            destination: PathBuf::from("/mnt/data"),
+        }];
+        let mut dashboard = dashboard_with_session(session);
+        dashboard
+            .state
+            .mount_history
+            .insert("local".into(), vec![PathBuf::from("/srv/models")]);
+        dashboard
+    }
+
+    fn container_editor(dashboard: &DashboardState) -> &ContainerEditor {
+        let Mode::EditContainer(editor) = &dashboard.mode else {
+            panic!("expected the container editor");
+        };
+        editor
+    }
+
+    #[test]
+    fn ctrl_e_opens_the_container_editor_only_once_setup_is_done() {
+        let mut empty = DashboardState::new(
+            hel::hel_config::HelConfig {
+                version: hel::hel_config::CONFIG_VERSION,
+                profiles: Default::default(),
+                bundles: Default::default(),
+                targets: Default::default(),
+            },
+            hel::hel_state::HelState::default(),
+            Default::default(),
+        );
+        assert_eq!(empty.handle_key(ctrl_key('e')), DashboardAction::OpenConfig);
+        assert!(matches!(empty.mode, Mode::Dashboard));
+
+        let mut dashboard = dashboard_with_container_session();
+        assert_eq!(dashboard.handle_key(ctrl_key('e')), DashboardAction::None);
+        let editor = container_editor(&dashboard);
+        assert_eq!(editor.session_id, "session-1");
+        assert_eq!(editor.mounts.len(), 1);
+        assert_eq!(editor.suggestions, vec![PathBuf::from("/srv/models")]);
+    }
+
+    #[test]
+    fn container_editor_saves_edited_size_mounts_and_remembered_sources() {
+        let mut dashboard = dashboard_with_container_session();
+        dashboard.handle_key(ctrl_key('e'));
+        for character in "4".chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+        dashboard.handle_key(key(KeyCode::Tab));
+        for character in "6g".chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(
+            container_editor(&dashboard).focus,
+            ContainerEditFocus::Memory
+        );
+
+        // Take the remembered directory as the next mount.
+        while container_editor(&dashboard).focus != ContainerEditFocus::Suggestions {
+            dashboard.handle_key(key(KeyCode::Tab));
+        }
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert_eq!(container_editor(&dashboard).source, "/srv/models");
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            container_editor(&dashboard).mounts,
+            vec![
+                AdditionalMount {
+                    source: PathBuf::from("/srv/data"),
+                    destination: PathBuf::from("/mnt/data"),
+                },
+                AdditionalMount {
+                    source: PathBuf::from("/srv/models"),
+                    destination: PathBuf::from("/mnt/models"),
+                },
+            ]
+        );
+
+        // Forget the remembered directory, then drop the original mount.
+        while container_editor(&dashboard).focus != ContainerEditFocus::Suggestions {
+            dashboard.handle_key(key(KeyCode::Tab));
+        }
+        dashboard.handle_key(key(KeyCode::Char('d')));
+        assert!(container_editor(&dashboard).suggestions.is_empty());
+        while container_editor(&dashboard).focus != ContainerEditFocus::Mounts {
+            dashboard.handle_key(key(KeyCode::Tab));
+        }
+        dashboard.handle_key(key(KeyCode::Up));
+        assert_eq!(container_editor(&dashboard).mount_index, 0);
+        dashboard.handle_key(key(KeyCode::Char('d')));
+
+        while container_editor(&dashboard).focus != ContainerEditFocus::Save {
+            dashboard.handle_key(key(KeyCode::Tab));
+        }
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::SaveContainerSettings {
+                session_id: "session-1".into(),
+                cpus: Some("4".into()),
+                memory: Some("6g".into()),
+                additional_mounts: vec![AdditionalMount {
+                    source: PathBuf::from("/srv/models"),
+                    destination: PathBuf::from("/mnt/models"),
+                }],
+                mount_history: Vec::new(),
+            }
+        );
+        assert!(matches!(dashboard.mode, Mode::Dashboard));
+    }
+
+    #[test]
+    fn container_editor_says_when_the_change_takes_effect() {
+        let mut dashboard = dashboard_with_container_session();
+        dashboard.handle_key(ctrl_key('e'));
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut dashboard))
+            .expect("draw editor");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Applies when the container is next recreated"));
+        assert!(rendered.contains("/srv/data"));
     }
 
     #[test]

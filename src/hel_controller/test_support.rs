@@ -22,6 +22,8 @@ use super::worktree::{
 
 pub(super) fn checkpoint_test_session(session_id: &str) -> SessionRecord {
     SessionRecord {
+        container_cpus: None,
+        container_memory: None,
         id: session_id.into(),
         title: "checkpoint transition".into(),
         harness_kind: crate::hel_config::HarnessKind::Codex,

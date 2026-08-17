@@ -14,9 +14,9 @@ use hel::hel_targets::{CancellableProcessExecutor, ProcessExecutor};
 use hel_tui::{DashboardAction, SessionOperationKind};
 
 use crate::dashboard::io::{
-    DashboardIoUpdate, LifecycleOperationRequest, StageReportingExecutor, config_only_controller,
-    spawn_create_bundle, spawn_dashboard_create_session, spawn_dashboard_rename, spawn_io,
-    spawn_lifecycle_operation,
+    ContainerSettingsRequest, DashboardIoUpdate, LifecycleOperationRequest, StageReportingExecutor,
+    config_only_controller, spawn_create_bundle, spawn_dashboard_container_settings,
+    spawn_dashboard_create_session, spawn_dashboard_rename, spawn_io, spawn_lifecycle_operation,
 };
 use crate::dashboard::{DashboardContext, QUOTA_REFRESH_NOTICE, View, resume_progress_notice};
 use crate::import::{DashboardImportSafety, PendingDashboardImport};
@@ -107,6 +107,27 @@ pub(crate) async fn apply_dashboard_action(
         DashboardAction::RenameSession { session_id, title } => {
             context.dashboard.set_notice("Renaming session…");
             spawn_dashboard_rename(session_id, title, context.dashboard_io_tx.clone());
+        }
+        DashboardAction::SaveContainerSettings {
+            session_id,
+            cpus,
+            memory,
+            additional_mounts,
+            mount_history,
+        } => {
+            context
+                .dashboard
+                .set_notice("Saving container size and mounts…");
+            spawn_dashboard_container_settings(
+                ContainerSettingsRequest {
+                    session_id,
+                    cpus,
+                    memory,
+                    additional_mounts,
+                    mount_history,
+                },
+                context.dashboard_io_tx.clone(),
+            );
         }
         DashboardAction::CompleteMountSource {
             target_template_id,

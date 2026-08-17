@@ -346,6 +346,8 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
     if version < 9 {
         migrate_grok_harness_kind(connection)?;
     }
+    // Added after the v9 rebuild so the rebuild never has to copy them.
+    ensure_session_container_override_columns(connection)?;
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -371,6 +373,21 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> Resul
             |row| row.get(0),
         )
         .map_err(Into::into)
+}
+
+/// Per-session container size overrides. They are additive columns, so
+/// databases written before the dashboard could edit them open unchanged.
+fn ensure_session_container_override_columns(connection: &Connection) -> Result<()> {
+    for column in ["container_cpus", "container_memory"] {
+        if !table_has_column(connection, "sessions", column)? {
+            connection.execute_batch(&format!(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE sessions ADD COLUMN {column} TEXT;
+                 COMMIT;"
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_managed_worktree_column(connection: &Connection) -> Result<()> {
@@ -619,12 +636,14 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
                 s.session_title_override, c.created_at, s.updated_at,
                 s.detached_after_event_ordinal, s.last_error, s.resource_allocation,
                 s.last_checkpoint_error, s.project_directory, s.managed_worktree,
-                s.draft_input
+                s.draft_input, s.container_cpus, s.container_memory
          FROM sessions s JOIN session_contexts c USING(session_id)
          ORDER BY s.session_id",
     )?;
     let rows = statement.query_map([], |row| {
         Ok(SessionRecord {
+            container_cpus: row.get(19)?,
+            container_memory: row.get(20)?,
             id: row.get(0)?,
             title: row.get(1)?,
             harness_kind: row.get::<_, String>(2)?.parse().map_err(|error| {
@@ -732,6 +751,69 @@ pub fn recover_interrupted_checkpointing_sessions(updated_at: &str) -> Result<us
 /// SessionRecord over independently committed checkpoint or relay metadata.
 pub fn set_session_title_override(session_id: &str, title: &str, updated_at: &str) -> Result<()> {
     set_session_title_override_to(&database_path(), session_id, title, updated_at)
+}
+
+/// Change only the per-session container provisioning inputs: the size
+/// overrides and the attached directories. Everything else the session row
+/// owns is left to its own writer.
+pub fn set_session_container_settings(
+    session_id: &str,
+    cpus: Option<&str>,
+    memory: Option<&str>,
+    mounts: &[AdditionalMount],
+    updated_at: &str,
+) -> Result<()> {
+    set_session_container_settings_to(
+        &database_path(),
+        session_id,
+        cpus,
+        memory,
+        mounts,
+        updated_at,
+    )
+}
+
+fn set_session_container_settings_to(
+    path: &Path,
+    session_id: &str,
+    cpus: Option<&str>,
+    memory: Option<&str>,
+    mounts: &[AdditionalMount],
+    updated_at: &str,
+) -> Result<()> {
+    if updated_at.trim().is_empty() {
+        bail!("session update timestamp is empty");
+    }
+    crate::hel_targets::validate_additional_mounts(mounts)?;
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        "UPDATE sessions
+         SET container_cpus = ?2, container_memory = ?3, updated_at = ?4
+         WHERE session_id = ?1",
+        params![session_id, cpus, memory, updated_at],
+    )?;
+    if changed != 1 {
+        bail!("unknown session {session_id}");
+    }
+    tx.execute(
+        "DELETE FROM session_mounts WHERE session_id = ?1",
+        [session_id],
+    )?;
+    for (ordinal, mount) in mounts.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO session_mounts(session_id, ordinal, source, destination)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                session_id,
+                ordinal as i64,
+                path_to_blob(&mount.source),
+                path_to_blob(&mount.destination)
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn set_session_title_override_to(
@@ -1365,6 +1447,36 @@ pub fn remember_mount_sources(host: &str, mounts: &[AdditionalMount]) -> Result<
     )
 }
 
+/// Replace one host's remembered mount sources with exactly this list, so the
+/// dashboard can forget a directory the user no longer wants suggested.
+pub fn replace_mount_history(host: &str, sources: &[PathBuf]) -> Result<()> {
+    replace_mount_history_in(&database_path(), host, sources)
+}
+
+fn replace_mount_history_in(path: &Path, host: &str, sources: &[PathBuf]) -> Result<()> {
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    write_mount_history(&tx, host, sources)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn write_mount_history(tx: &Transaction<'_>, host: &str, sources: &[PathBuf]) -> Result<()> {
+    tx.execute("DELETE FROM mount_history WHERE host = ?1", [host])?;
+    let mut written = Vec::new();
+    for source in sources.iter().take(20) {
+        if written.contains(source) {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO mount_history(host, source, ordinal) VALUES (?1, ?2, ?3)",
+            params![host, path_to_blob(source), written.len() as i64],
+        )?;
+        written.push(source.clone());
+    }
+    Ok(())
+}
+
 pub fn remember_project_directory(host: &str, directory: &Path) -> Result<()> {
     remember_sources(
         &database_path(),
@@ -1393,13 +1505,7 @@ fn remember_sources(
         sources.insert(0, source.clone());
     }
     sources.truncate(20);
-    tx.execute("DELETE FROM mount_history WHERE host = ?1", [host])?;
-    for (ordinal, source) in sources.iter().enumerate() {
-        tx.execute(
-            "INSERT INTO mount_history(host, source, ordinal) VALUES (?1, ?2, ?3)",
-            params![host, path_to_blob(source), ordinal as i64],
-        )?;
-    }
+    write_mount_history(&tx, host, &sources)?;
     tx.commit()?;
     Ok(())
 }
@@ -1751,7 +1857,9 @@ fn insert_session_scoped(
              resource_allocation = excluded.resource_allocation,
              last_checkpoint_error = excluded.last_checkpoint_error,
              project_directory = excluded.project_directory,
-             managed_worktree = excluded.managed_worktree"
+             managed_worktree = excluded.managed_worktree,
+             container_cpus = excluded.container_cpus,
+             container_memory = excluded.container_memory"
         }
         SessionWriteScope::Lifecycle => {
             "title = excluded.title,
@@ -1794,8 +1902,9 @@ fn insert_session_scoped(
              session_id, title, harness_kind, last_profile, target_template_id, state,
              native_session_id, acp_session_title, session_title_override, updated_at,
              detached_after_event_ordinal, last_error, resource_allocation,
-             last_checkpoint_error, project_directory, managed_worktree
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             last_checkpoint_error, project_directory, managed_worktree,
+             container_cpus, container_memory
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
          ON CONFLICT(session_id) DO UPDATE SET {update_fields}"
     );
     tx.execute(
@@ -1828,6 +1937,8 @@ fn insert_session_scoped(
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?,
+            session.container_cpus,
+            session.container_memory,
         ],
     )?;
     tx.execute(
@@ -2315,6 +2426,8 @@ mod tests {
 
     fn session(id: &str, bundle: &str) -> SessionRecord {
         SessionRecord {
+            container_cpus: None,
+            container_memory: None,
             id: id.into(),
             title: "test session".into(),
             harness_kind: HarnessKind::Codex,
@@ -2490,6 +2603,45 @@ mod tests {
                 .optional()
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn container_settings_write_overrides_mounts_and_remembered_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        let record = session("session-1", "project-1");
+        save_session_to(&database, &record).unwrap();
+
+        set_session_container_settings_to(
+            &database,
+            "session-1",
+            Some("6"),
+            Some("12g"),
+            &[AdditionalMount {
+                source: PathBuf::from("/host/models"),
+                destination: PathBuf::from("/mnt/models"),
+            }],
+            "2026-08-13T00:00:00Z",
+        )
+        .unwrap();
+        replace_mount_history_in(&database, "local", &[PathBuf::from("/host/models")]).unwrap();
+
+        let loaded = load_state_from(&database).unwrap();
+        let session = &loaded.sessions["session-1"];
+        assert_eq!(session.container_cpus.as_deref(), Some("6"));
+        assert_eq!(session.container_memory.as_deref(), Some("12g"));
+        assert_eq!(
+            session.additional_mounts,
+            vec![AdditionalMount {
+                source: PathBuf::from("/host/models"),
+                destination: PathBuf::from("/mnt/models"),
+            }]
+        );
+        assert_eq!(session.updated_at, "2026-08-13T00:00:00Z");
+        assert_eq!(
+            loaded.mount_history["local"],
+            vec![PathBuf::from("/host/models")]
         );
     }
 

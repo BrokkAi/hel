@@ -1715,6 +1715,8 @@ mod tests {
     #[cfg(unix)]
     fn register_leased_relay_session() {
         crate::hel_database::save_session(&crate::hel_state::SessionRecord {
+            container_cpus: None,
+            container_memory: None,
             id: LEASED_RELAY_SESSION.into(),
             title: "leased relay".into(),
             harness_kind: crate::hel_config::HarnessKind::Codex,

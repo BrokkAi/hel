@@ -12,14 +12,14 @@ use crossterm::event::{
 use ratatui::layout::Rect;
 
 use hel::hel_chat::{Notices, TranscriptSnapshot};
-use hel::hel_config::{HarnessKind, HelConfig};
+use hel::hel_config::{HarnessKind, HelConfig, TargetTemplate as HelTargetTemplate};
 use hel::hel_quota::ProfileQuota;
 use hel::hel_state::{HelState, SessionRecord, SessionResourceAllocation, SessionState};
 use hel::hel_targets::AdditionalMount;
 
 use crate::dialogs::{
-    ConfirmDialog, Confirmation, FORCE_CONFIRMATION, ImportBundleConfirmation, ImportDialog,
-    ImportFocus, ImportProgress, RenameEditor, RenameFocus,
+    ConfirmDialog, Confirmation, ContainerEditor, FORCE_CONFIRMATION, ImportBundleConfirmation,
+    ImportDialog, ImportFocus, ImportProgress, RenameEditor, RenameFocus,
 };
 use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay, TranscriptHydration};
 use crate::wizards::{MountFocus, NewWizard, ResumeWizard, WizardStep};
@@ -122,6 +122,15 @@ pub enum DashboardAction {
         include_untracked: bool,
     },
     OpenConfig,
+    /// Per-session container provisioning inputs, taking effect the next time
+    /// the container is created.
+    SaveContainerSettings {
+        session_id: String,
+        cpus: Option<String>,
+        memory: Option<String>,
+        additional_mounts: Vec<AdditionalMount>,
+        mount_history: Vec<std::path::PathBuf>,
+    },
     QuitDetach,
 }
 
@@ -190,6 +199,7 @@ pub(crate) enum Mode {
     Resume(ResumeWizard),
     Rename(RenameEditor),
     Import(ImportDialog),
+    EditContainer(ContainerEditor),
     Importing(ImportProgress),
     ConfirmImportBundle(ImportBundleConfirmation),
     Confirm(ConfirmDialog),
@@ -355,6 +365,7 @@ impl DashboardState {
             Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
             Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
             Mode::Import(dialog) => self.handle_import_key(key, dialog),
+            Mode::EditContainer(editor) => self.handle_container_edit_key(key.code, editor),
             // The only control is the Cancel button, so Enter presses it too.
             Mode::Importing(_) => match key.code {
                 KeyCode::Esc | KeyCode::Enter => DashboardAction::CancelImport,
@@ -552,8 +563,9 @@ impl DashboardState {
                 self.set_selection(len.saturating_sub(1));
                 DashboardAction::None
             }
-            (KeyCode::Char('s'), false) => {
+            (KeyCode::Char('s'), true) => {
                 self.cycle_session_order();
+                self.set_notice(format!("Sort by {}", self.session_order.label()));
                 DashboardAction::None
             }
             (KeyCode::Char('n'), true) => self.begin_new(),
@@ -581,7 +593,14 @@ impl DashboardState {
                 }
             }
             (KeyCode::Char('u'), true) => DashboardAction::RefreshQuotas,
+            // Setup and the container editor never both apply: setup only
+            // opens while the config is empty, and an empty config has no
+            // sessions to select.
             (KeyCode::Char('e'), true) if self.config_is_empty() => DashboardAction::OpenConfig,
+            (KeyCode::Char('e'), true) if matches!(self.focus, Focus::Active | Focus::Archived) => {
+                self.begin_container_edit();
+                DashboardAction::None
+            }
             (KeyCode::Char('p'), true) if self.focus == Focus::Active => {
                 if self.reject_selected_operation() {
                     return DashboardAction::None;
@@ -739,6 +758,18 @@ impl DashboardState {
             None => String::new(),
         };
         format!("{id}  {}  ·  {quota}{danger}", harness.display_name())
+    }
+
+    /// The selected session, if its target template creates a container.
+    pub(crate) fn selected_container_session(&self) -> Option<&SessionRecord> {
+        let session = self.selected_session()?;
+        matches!(
+            self.config.targets.get(&session.target_template_id)?,
+            HelTargetTemplate::LocalPodman { .. }
+                | HelTargetTemplate::AppleContainer { .. }
+                | HelTargetTemplate::SshPodman { .. }
+        )
+        .then_some(session)
     }
 
     pub(crate) fn config_is_empty(&self) -> bool {
@@ -1339,7 +1370,15 @@ mod tests {
         Arc::make_mut(&mut second).last_changed_at_ms = 2_000_000_100_000;
         apply_materialized_transcript_for(&mut dashboard, "session-b", vec![second]);
         dashboard.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(dashboard.session_order, SessionOrder::Sequence);
+        assert_eq!(dashboard.notices.current(), None);
+
+        dashboard.handle_key(ctrl_key('s'));
         assert_eq!(dashboard.session_order, SessionOrder::RecentActivity);
+        assert_eq!(
+            dashboard.notices.current().as_deref(),
+            Some("Sort by recent activity")
+        );
         assert_eq!(
             ordered_ids(&dashboard),
             ["session-b", "session-a", "session-c"]
@@ -1362,7 +1401,7 @@ mod tests {
             ["session-a", "session-c", "session-b"]
         );
 
-        dashboard.handle_key(key(KeyCode::Char('s')));
+        dashboard.handle_key(ctrl_key('s'));
         assert_eq!(dashboard.session_order, SessionOrder::Profile);
         assert_eq!(
             ordered_ids(&dashboard),
@@ -1370,7 +1409,7 @@ mod tests {
         );
         assert_eq!(dashboard.selected_session().unwrap().id, "session-a");
 
-        dashboard.handle_key(key(KeyCode::Char('s')));
+        dashboard.handle_key(ctrl_key('s'));
         assert_eq!(dashboard.session_order, SessionOrder::Sequence);
         assert_eq!(
             ordered_ids(&dashboard),
