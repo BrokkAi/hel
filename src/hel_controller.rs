@@ -5041,17 +5041,27 @@ fn plan_raw_to_workspace(
         .project_directory
         .as_deref()
         .context("a raw session has no project directory")?;
+    // The checkpoint describes the session's directory as if it were the
+    // repository root, so only a whole checkout can move. Each branch checks
+    // this against paths from one domain: the record's own paths for a managed
+    // worktree, Git's canonical paths for an inspected checkout — the record
+    // may reach the same checkout through a symlink (macOS temp directories).
     let (checkout, repository, retire) = match &session.managed_worktree {
-        Some(worktree) => (
-            worktree.worktree_root.clone(),
-            worktree.source_repository.clone(),
-            Some(worktree.clone()),
-        ),
+        Some(worktree) => {
+            ensure!(
+                worktree.worktree_root == project_directory,
+                "{} is a subdirectory of its checkout; only a whole checkout can move into a target",
+                project_directory.display()
+            );
+            (
+                worktree.worktree_root.clone(),
+                worktree.source_repository.clone(),
+                Some(worktree.clone()),
+            )
+        }
         None => {
             let inspection =
                 inspect_raw_project(executor, &ManagedWorktreeTarget::Local, project_directory)?;
-            // The checkpoint describes the session's directory as if it were
-            // the repository root, so only a whole checkout can move.
             ensure!(
                 inspection.source_project_directory == inspection.source_repository,
                 "{} is a subdirectory of its checkout; only a whole checkout can move into a target",
@@ -5061,11 +5071,6 @@ fn plan_raw_to_workspace(
             (inspection.source_repository, repository, None)
         }
     };
-    ensure!(
-        checkout == project_directory,
-        "{} is a subdirectory of its checkout; only a whole checkout can move into a target",
-        project_directory.display()
-    );
     // The archive names the session's directory as the repository destination,
     // and the restored harness session points at that path inside the target.
     // The bundle has to put the checkout in the same place.
@@ -11544,6 +11549,36 @@ mod tests {
         session.state = SessionState::Archived;
         session.target_template_id = "local-bare".into();
         session.project_directory = Some(checkout.clone());
+
+        let conversion =
+            plan_raw_to_workspace(&session, &HelConfig::default(), &ProcessExecutor).unwrap();
+
+        assert_eq!(conversion.checkout, checkout.canonicalize().unwrap());
+        assert_eq!(
+            conversion.repository,
+            repository.path().canonicalize().unwrap()
+        );
+        assert_eq!(conversion.retire, None);
+    }
+
+    /// The recorded project directory may reach the checkout through a
+    /// symlink, as the system temp directory does on macOS. Git reports
+    /// canonical paths, so the whole-checkout rule must not compare across
+    /// the two domains.
+    #[cfg(unix)]
+    #[test]
+    fn an_unmanaged_conversion_accepts_a_checkout_reached_through_a_symlink() {
+        let repository = committed_repository();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let linked = managed_worktree_session(repository.path(), session_id);
+        let checkout = linked.managed_worktree.unwrap().worktree_root;
+        let alias = tempfile::tempdir().unwrap();
+        let symlink = alias.path().join("checkout");
+        std::os::unix::fs::symlink(&checkout, &symlink).unwrap();
+        let mut session = checkpoint_test_session(session_id);
+        session.state = SessionState::Archived;
+        session.target_template_id = "local-bare".into();
+        session.project_directory = Some(symlink);
 
         let conversion =
             plan_raw_to_workspace(&session, &HelConfig::default(), &ProcessExecutor).unwrap();
