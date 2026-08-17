@@ -725,11 +725,43 @@ fn is_github_source(source: &str) -> bool {
 
 /// Replace `path` without exposing a partially-written configuration/state file.
 pub(crate) fn atomic_write(path: &Path, body: &[u8]) -> Result<()> {
+    atomic_write_with_parent(path, body, ParentDirectory::Create)
+}
+
+/// Replace `path` only while its directory still exists.
+///
+/// Worker state lives inside a directory that session teardown deletes out
+/// from under the running daemon. Recreating it here would resurrect a closed
+/// session's relay state, so a vanished parent must be an error instead.
+pub(crate) fn atomic_write_existing(path: &Path, body: &[u8]) -> Result<()> {
+    atomic_write_with_parent(path, body, ParentDirectory::Require)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParentDirectory {
+    Create,
+    Require,
+}
+
+fn atomic_write_with_parent(
+    path: &Path,
+    body: &[u8],
+    parent_directory: ParentDirectory,
+) -> Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    match parent_directory {
+        ParentDirectory::Create => {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        ParentDirectory::Require => {
+            if !parent.is_dir() {
+                bail!("directory {} is missing", parent.display());
+            }
+        }
+    }
 
     let mut random = [0u8; 8];
     getrandom::fill(&mut random)

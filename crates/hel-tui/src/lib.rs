@@ -2066,7 +2066,6 @@ impl DashboardState {
             };
         }
         if wizard.step == WizardStep::Target
-            && wizard.focus == WizardFocus::Content
             && matches!(
                 code,
                 KeyCode::Char('+')
@@ -2807,7 +2806,6 @@ impl DashboardState {
         }
         let profiles = self.compatible_profiles(&wizard.session_id);
         if wizard.step == WizardStep::Target
-            && wizard.focus == WizardFocus::Content
             && matches!(
                 code,
                 KeyCode::Char('+')
@@ -11063,6 +11061,113 @@ mod tests {
             session_values(&archived_session(), None, None, 0, &config);
         assert_eq!(target, "podman");
         assert_eq!(project, "hel");
+    }
+
+    #[test]
+    fn resume_target_step_minus_halves_container_size_through_the_key_path() {
+        let mut config = config();
+        // Mirror the real config: an EC2 target that sorts before podman.
+        config.targets.insert(
+            "aws-runson".into(),
+            TargetTemplate::AwsEc2 {
+                aws_profile: None,
+                region: "us-east-1".into(),
+                launch_template: "lt-123".into(),
+                launch_template_version: None,
+                ssh_user: "ubuntu".into(),
+                address_source: Default::default(),
+                identity_file: None,
+                ssh_args: Vec::new(),
+            },
+        );
+        let mut dashboard = DashboardState::new(
+            config,
+            HelState {
+                version: STATE_VERSION,
+                sessions: BTreeMap::from([("session-1".into(), archived_session())]),
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+
+        dashboard.begin_resume();
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume wizard, got {:?}", dashboard.mode);
+        };
+        assert_eq!(wizard.step, WizardStep::Profile);
+
+        // 1/3 -> 2/3 target step; podman is the session's target.
+        dashboard.handle_key(key(KeyCode::Enter));
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume wizard on target step");
+        };
+        assert_eq!(wizard.step, WizardStep::Target);
+        assert_eq!(
+            nth_key(&dashboard.config.targets, wizard.target),
+            "podman".to_string()
+        );
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(
+            wizard.resource_allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 8,
+                memory_bytes: 32 * gib,
+            })
+        );
+
+        dashboard.handle_key(key(KeyCode::Char('-')));
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume wizard after '-'");
+        };
+        assert_eq!(
+            wizard.resource_allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 4,
+                memory_bytes: 16 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn new_target_step_minus_halves_container_size_when_focus_is_off_content() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.handle_key(ctrl_key('n'));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new wizard, got {:?}", dashboard.mode);
+        };
+        assert_eq!(wizard.step, WizardStep::Profile);
+
+        dashboard.handle_key(key(KeyCode::Enter));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new wizard on target step");
+        };
+        assert_eq!(wizard.step, WizardStep::Target);
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(
+            wizard.resource_allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 8,
+                memory_bytes: 32 * gib,
+            })
+        );
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new wizard after tab");
+        };
+        assert_ne!(wizard.focus, WizardFocus::Content);
+
+        dashboard.handle_key(key(KeyCode::Char('-')));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new wizard after '-'");
+        };
+        assert_eq!(
+            wizard.resource_allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 4,
+                memory_bytes: 16 * gib,
+            })
+        );
     }
 
     #[test]
