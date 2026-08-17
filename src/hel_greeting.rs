@@ -212,7 +212,7 @@ const fn greeting(
     }
 }
 
-const GREETINGS: [Greeting; 48] = [
+const GREETINGS: [Greeting; 43] = [
     greeting("Welcome to Hel, $firstname", Group::Always, yes),
     greeting(
         "Abandon boilerplate, all ye who enter here",
@@ -223,7 +223,6 @@ const GREETINGS: [Greeting; 48] = [
     greeting("To Hel with boilerplate", Group::Always, yes),
     greeting("Here be daemons", Group::Always, yes),
     greeting("Let's raise a little Hel, $firstname", Group::Always, yes),
-    greeting("Hel hath no fury like a linter ignored", Group::Always, yes),
     greeting("The devil is in the diff", Group::Always, yes),
     greeting(
         "The code won't write itself, but the agents might",
@@ -231,7 +230,6 @@ const GREETINGS: [Greeting; 48] = [
         yes,
     ),
     greeting("One prompt closer to done", Group::Always, yes),
-    greeting("Prompt boldly, commit carefully", Group::Always, yes),
     greeting("Good code goes to Hel and back", Group::Always, yes),
     greeting(
         "It's a good night to write code, $firstname",
@@ -295,11 +293,6 @@ const GREETINGS: [Greeting; 48] = [
         active_turn,
     ),
     greeting(
-        "$profile_name is running with scissors",
-        Group::State,
-        active_turn,
-    ),
-    greeting(
         "The road to Hel is paved with good intentions",
         Group::Repository,
         clean,
@@ -347,17 +340,7 @@ const GREETINGS: [Greeting; 48] = [
         behind,
     ),
     greeting(
-        "Your branch has chosen violence",
-        Group::Repository,
-        diverged,
-    ),
-    greeting(
         "The portal to localhost is open",
-        Group::Target,
-        raw_localhost,
-    ),
-    greeting(
-        "No containers, no borders, no mercy",
         Group::Target,
         raw_localhost,
     ),
@@ -388,8 +371,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_forty_eight_unpunctuated_greetings_and_required_first_entry() {
-        assert_eq!(GREETINGS.len(), 48);
+    fn catalog_has_forty_three_unpunctuated_greetings_and_required_first_entry() {
+        assert_eq!(GREETINGS.len(), 43);
         assert_eq!(GREETINGS[0].text, "Welcome to Hel, $firstname");
         assert!(
             GREETINGS
