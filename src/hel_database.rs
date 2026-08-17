@@ -1983,6 +1983,33 @@ fn load_checkpoints(connection: &Connection, state: &mut HelState) -> Result<()>
     Ok(())
 }
 
+/// Re-associate a session with another project bundle.
+///
+/// A session's bundle is otherwise fixed, because prompt history is grouped by
+/// it. Resume calls this when it converts a session between its raw and bundle
+/// representations: the project is the same, so its history follows it, and
+/// only the name Hel files it under changes.
+pub fn rebind_session_bundle(session_id: &str, bundle_id: &str) -> Result<()> {
+    rebind_session_bundle_to(&database_path(), session_id, bundle_id)
+}
+
+fn rebind_session_bundle_to(path: &Path, session_id: &str, bundle_id: &str) -> Result<()> {
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        "UPDATE session_contexts SET bundle_id = ?2 WHERE session_id = ?1",
+        params![session_id, bundle_id],
+    )?;
+    if changed == 0 {
+        tx.execute(
+            "INSERT INTO session_contexts(session_id, bundle_id, created_at) VALUES (?1, ?2, ?3)",
+            params![session_id, bundle_id, Utc::now().to_rfc3339()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn record_prompt(
     session_id: &str,
     bundle_id: &str,
@@ -3691,6 +3718,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(all[0].session_id, "session-3");
+    }
+
+    #[test]
+    fn rebinding_a_session_moves_its_prompt_history_to_the_new_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        record_prompt_to(
+            &database,
+            "session-1",
+            "project-1",
+            1,
+            Some("2026-08-12T00:00:00Z"),
+            "fix parser",
+        )
+        .unwrap();
+
+        rebind_session_bundle_to(&database, "session-1", "project-2").unwrap();
+
+        assert!(
+            search_prompts_from(
+                &database,
+                "session-1",
+                "project-1",
+                HistoryScope::Project,
+                "fix"
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            search_prompts_from(
+                &database,
+                "session-1",
+                "project-2",
+                HistoryScope::Project,
+                "fix"
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        // Recording under the new bundle now succeeds where it would have been
+        // refused as a bundle mismatch.
+        record_prompt_to(
+            &database,
+            "session-1",
+            "project-2",
+            2,
+            Some("2026-08-12T00:01:00Z"),
+            "fix renderer",
+        )
+        .unwrap();
     }
 
     #[test]
