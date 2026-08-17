@@ -65,13 +65,13 @@ image = "ghcr.io/brokkai/hel/agent-dev:latest"
 
 ## Verifying a target
 
-`hel doctor` includes a dedicated check per `ssh-podman` target: it runs the
-same Podman probes as a local target, over SSH, before you launch a session
-(`src/hel_doctor.rs`). Coverage for `ssh-bare` depends on what `hel doctor`
-checks at the time you're reading this — run `hel doctor --json` and read its
-output for the current state, rather than assuming a specific check exists.
+`hel doctor` includes a dedicated check per SSH target of either kind. It
+first probes connectivity with `ssh -o BatchMode=yes <host> true`, and its
+failure messages include the exact command to fix the common causes
+(`ssh-copy-id` for key auth, `ssh-keyscan` for an untrusted host key). For
+`ssh-podman` it then runs the same Podman probes as a local target, over SSH.
 
-Regardless of what `hel doctor` covers, you can always sanity-check
+You can also always sanity-check
 reachability by hand before relying on a target:
 
 ```console

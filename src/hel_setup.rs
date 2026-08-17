@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::hel_config::{
     AwsAddressSource, ContainerTemplate, HarnessKind, HarnessProfile, HelConfig, ProjectBundle,
-    ProjectRepository, TargetTemplate,
+    ProjectRepository, SshConnection, TargetTemplate,
 };
 use crate::hel_doctor::{
     CheckStatus, DoctorOptions, all_ready, apple_container_daemon_check, current_apple_platform,
@@ -114,6 +114,21 @@ pub struct AwsTargetInput {
     pub identity_file: Option<PathBuf>,
 }
 
+/// Which kind of SSH target the user chose in the SSH step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SshTargetKind {
+    Bare,
+    Podman { image: String },
+}
+
+/// The answers that become a `[targets.<name>]` SSH entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTargetInput {
+    pub name: String,
+    pub host: String,
+    pub kind: SshTargetKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupDiscovery {
     pub homes: Vec<DiscoveredHome>,
@@ -122,6 +137,9 @@ pub struct SetupDiscovery {
     /// `None` when this host has no working AWS CLI credentials, in which case
     /// setup never offers an AWS target.
     pub aws: Option<AwsAccount>,
+    /// Concrete `Host` aliases read from `~/.ssh/config`; empty when the file
+    /// is absent or only defines wildcard blocks.
+    pub ssh_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,7 +175,55 @@ pub fn discover_current(executor: &impl CommandExecutor) -> SetupDiscovery {
         repository: discover_github_repository(&cwd),
         runtimes: probe_local_runtimes(executor, cfg!(target_os = "macos")),
         aws: detect_aws(&CancellableProcessExecutor::with_timeout(AWS_PROBE_TIMEOUT)),
+        ssh_hosts: discover_ssh_hosts(home.as_deref()),
     }
+}
+
+/// Read the concrete `Host` aliases from `~/.ssh/config`.
+///
+/// This is a pure read: setup never runs `ssh` while discovering. `Include`
+/// directives are deliberately not followed, because resolving them correctly
+/// means reimplementing OpenSSH's glob and relative-path rules; aliases that
+/// live in an included file simply are not offered, and the user can still
+/// type a host by hand.
+pub fn discover_ssh_hosts(home: Option<&Path>) -> Vec<String> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(home.join(".ssh").join("config")) else {
+        return Vec::new();
+    };
+    ssh_config_aliases(&contents)
+}
+
+/// Extract the usable `Host` aliases from SSH config text.
+///
+/// Pattern entries (`*`, `?`, `!`) are skipped: they configure other hosts
+/// rather than naming one Hel could connect to.
+pub fn ssh_config_aliases(contents: &str) -> Vec<String> {
+    let mut aliases: Vec<String> = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((keyword, rest)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if !keyword.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        for alias in rest.split_whitespace() {
+            let alias = alias.trim_matches('"');
+            if alias.is_empty() || alias.contains(['*', '?', '!']) {
+                continue;
+            }
+            if !aliases.iter().any(|existing| existing == alias) {
+                aliases.push(alias.to_owned());
+            }
+        }
+    }
+    aliases
 }
 
 pub fn discover_harness_homes(
@@ -314,7 +380,7 @@ pub fn build_config(
     runtime: RuntimeKind,
     image: &str,
 ) -> HelConfig {
-    build_config_with_runtime(homes, repository, Some((runtime, image)), None)
+    build_config_with_runtime(homes, repository, Some((runtime, image)), None, None)
 }
 
 fn build_config_with_runtime(
@@ -322,6 +388,7 @@ fn build_config_with_runtime(
     repository: Option<&GithubRepository>,
     runtime: Option<(RuntimeKind, &str)>,
     aws: Option<&AwsTargetInput>,
+    ssh: Option<&SshTargetInput>,
 ) -> HelConfig {
     let mut config = HelConfig::default();
     for home in homes {
@@ -391,7 +458,39 @@ fn build_config_with_runtime(
             },
         );
     }
+    if let Some(ssh) = ssh {
+        // Leave user and identity file unset: the SSH config alias already
+        // carries whatever the user configured for this host.
+        let connection = SshConnection {
+            host: ssh.host.clone(),
+            user: None,
+            identity_file: None,
+            extra_args: vec![],
+        };
+        let target = match &ssh.kind {
+            SshTargetKind::Bare => TargetTemplate::SshBare {
+                ssh: connection,
+                workspace_prefix: default_ssh_workspace_prefix(),
+            },
+            SshTargetKind::Podman { image } => TargetTemplate::SshPodman {
+                ssh: connection,
+                container: ContainerTemplate {
+                    image: image.clone(),
+                    platform: None,
+                    cpus: None,
+                    memory: None,
+                    environment: BTreeMap::new(),
+                },
+            },
+        };
+        config.targets.insert(ssh.name.clone(), target);
+    }
     config
+}
+
+/// The same default `serde` applies to a hand-written `ssh-bare` target.
+fn default_ssh_workspace_prefix() -> PathBuf {
+    PathBuf::from(".local/share/hel/workspaces")
 }
 
 fn unique_profile_id(profiles: &BTreeMap<String, HarnessProfile>, base_id: &str) -> String {
@@ -456,6 +555,7 @@ pub fn run_setup_dialog_with(
         None
     };
     let aws = prompt_aws_target(input, output, discovery.aws.as_ref())?;
+    let ssh = prompt_ssh_target(input, output, &discovery.ssh_hosts)?;
     let config = build_config_with_runtime(
         &discovery.homes,
         discovery.repository.as_ref(),
@@ -463,6 +563,7 @@ pub fn run_setup_dialog_with(
             .as_ref()
             .map(|(runtime, image)| (*runtime, image.as_str())),
         aws.as_ref(),
+        ssh.as_ref(),
     );
     config.validate()?;
 
@@ -637,6 +738,69 @@ fn prompt_aws_target(
     }))
 }
 
+/// Offer an SSH target built from the aliases in `~/.ssh/config`.
+///
+/// With no aliases the step prints one line and asks nothing, the same way the
+/// AWS step reports skipping.
+fn prompt_ssh_target(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    aliases: &[String],
+) -> Result<Option<SshTargetInput>> {
+    if aliases.is_empty() {
+        writeln!(
+            output,
+            "SSH: no host aliases found in ~/.ssh/config; skipping the SSH target."
+        )?;
+        return Ok(None);
+    }
+    writeln!(output, "SSH: hosts found in ~/.ssh/config:")?;
+    for (index, alias) in aliases.iter().enumerate() {
+        writeln!(output, "  {}) {alias}", index + 1)?;
+    }
+    let answer = prompt(input, output, "Add an SSH target? [y/N]: ")?;
+    if !matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Ok(None);
+    }
+
+    let choice = prompt(
+        input,
+        output,
+        &format!("Host number 1-{} or a host name: ", aliases.len()),
+    )?;
+    let host = match choice.parse::<usize>() {
+        Ok(index) if (1..=aliases.len()).contains(&index) => aliases[index - 1].clone(),
+        _ if !choice.is_empty() => choice,
+        _ => {
+            writeln!(output, "A host is required; skipping the SSH target.")?;
+            return Ok(None);
+        }
+    };
+
+    let kind = prompt(input, output, "Run agents in Podman on that host? [Y/n]: ")?;
+    let kind = if matches!(kind.to_ascii_lowercase().as_str(), "n" | "no") {
+        SshTargetKind::Bare
+    } else {
+        let image = prompt(
+            input,
+            output,
+            &format!("Container image [{DEFAULT_IMAGE}]: "),
+        )?;
+        SshTargetKind::Podman {
+            image: if image.is_empty() {
+                DEFAULT_IMAGE.to_owned()
+            } else {
+                image
+            },
+        }
+    };
+
+    let name = prompt(input, output, &format!("Target name [{host}]: "))?;
+    let name = if name.is_empty() { host.clone() } else { name };
+
+    Ok(Some(SshTargetInput { name, host, kind }))
+}
+
 /// End setup with the same report `hel doctor` prints, so the user gets one
 /// ready/fixable summary with remediations instead of two different signals.
 fn write_doctor_report(
@@ -742,6 +906,21 @@ fn write_summary(
             output,
             "  AWS EC2 target using launch template {launch_template} in {region}"
         )?;
+    }
+    for (id, target) in &config.targets {
+        match target {
+            TargetTemplate::SshBare { ssh, .. } => {
+                writeln!(output, "  SSH target {id} on {} (no container)", ssh.host)?;
+            }
+            TargetTemplate::SshPodman { ssh, container } => {
+                writeln!(
+                    output,
+                    "  SSH target {id} on {} using Podman image {}",
+                    ssh.host, container.image
+                )?;
+            }
+            _ => {}
+        }
     }
     if config_path.exists() {
         writeln!(output, "  This replaces the existing configuration file.")?;
@@ -881,6 +1060,7 @@ mod tests {
             repository: None,
             runtimes: vec![],
             aws: None,
+            ssh_hosts: vec![],
         }
     }
 
@@ -1114,7 +1294,7 @@ mod tests {
                 identity_file: None,
             }
         );
-        let config = build_config_with_runtime(&[], None, None, Some(&aws));
+        let config = build_config_with_runtime(&[], None, None, Some(&aws), None);
         let TargetTemplate::AwsEc2 {
             region,
             launch_template,
@@ -1127,6 +1307,143 @@ mod tests {
         assert_eq!(region, "us-east-1");
         assert_eq!(launch_template, "hel-runson");
         assert_eq!(ssh_user, DEFAULT_AWS_SSH_USER);
+        config.validate().unwrap();
+    }
+
+    const SSH_CONFIG_FIXTURE: &str = r#"
+# Personal hosts
+Host *
+    ServerAliveInterval 60
+
+Host builder build.example.com
+    HostName build.example.com
+    User dev
+
+Host bastion
+  HostName 10.0.0.1
+  IdentityFile ~/.ssh/id_ed25519
+
+Host prod-*
+    User deploy
+
+Host !staging *.internal
+    User deploy
+
+Host builder
+    Compression yes
+"#;
+
+    #[test]
+    fn ssh_config_parsing_keeps_concrete_aliases_and_drops_pattern_blocks() {
+        let aliases = ssh_config_aliases(SSH_CONFIG_FIXTURE);
+
+        assert_eq!(
+            aliases,
+            vec!["builder", "build.example.com", "bastion"],
+            "wildcard, negated, and duplicate entries must not appear"
+        );
+    }
+
+    #[test]
+    fn ssh_config_parsing_returns_nothing_for_a_config_of_only_wildcards() {
+        assert!(
+            ssh_config_aliases(
+                "Host *
+  User dev
+"
+            )
+            .is_empty()
+        );
+        assert!(ssh_config_aliases("").is_empty());
+    }
+
+    #[test]
+    fn the_ssh_step_asks_nothing_when_the_ssh_config_has_no_aliases() {
+        let mut input = b"".as_slice();
+        let mut output = Vec::new();
+
+        assert_eq!(
+            prompt_ssh_target(&mut input, &mut output, &[]).unwrap(),
+            None
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("skipping the SSH target"), "{output}");
+        assert!(!output.contains("[y/N]"), "{output}");
+    }
+
+    #[test]
+    fn declining_the_ssh_step_writes_no_ssh_target() {
+        let aliases = vec!["builder".to_owned()];
+        let mut input = b"\n".as_slice();
+        let mut output = Vec::new();
+
+        assert_eq!(
+            prompt_ssh_target(&mut input, &mut output, &aliases).unwrap(),
+            None
+        );
+        let config = build_config_with_runtime(&[], None, None, None, None);
+        assert!(!config.targets.values().any(|target| matches!(
+            target,
+            TargetTemplate::SshBare { .. } | TargetTemplate::SshPodman { .. }
+        )));
+    }
+
+    #[test]
+    fn accepting_the_ssh_step_writes_an_ssh_podman_target_with_the_default_image() {
+        let aliases = vec!["builder".to_owned(), "bastion".to_owned()];
+        // yes, host 1, podman (default), default image, default name.
+        let mut input = b"y\n1\n\n\n\n".as_slice();
+        let mut output = Vec::new();
+
+        let ssh = prompt_ssh_target(&mut input, &mut output, &aliases)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            ssh,
+            SshTargetInput {
+                name: "builder".into(),
+                host: "builder".into(),
+                kind: SshTargetKind::Podman {
+                    image: DEFAULT_IMAGE.into()
+                },
+            }
+        );
+        let config = build_config_with_runtime(&[], None, None, None, Some(&ssh));
+        let TargetTemplate::SshPodman { ssh, container } = &config.targets["builder"] else {
+            panic!("setup must write an ssh-podman target");
+        };
+        assert_eq!(ssh.host, "builder");
+        assert_eq!(ssh.user, None);
+        assert_eq!(ssh.identity_file, None);
+        assert_eq!(container.image, DEFAULT_IMAGE);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn accepting_the_ssh_step_writes_an_ssh_bare_target_under_a_chosen_name() {
+        let aliases = vec!["builder".to_owned()];
+        // yes, typed host, no podman, custom target name.
+        let mut input = b"y\nother.example.com\nn\nremote\n".as_slice();
+        let mut output = Vec::new();
+
+        let ssh = prompt_ssh_target(&mut input, &mut output, &aliases)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            ssh,
+            SshTargetInput {
+                name: "remote".into(),
+                host: "other.example.com".into(),
+                kind: SshTargetKind::Bare,
+            }
+        );
+        let config = build_config_with_runtime(&[], None, None, None, Some(&ssh));
+        let TargetTemplate::SshBare { ssh, .. } = &config.targets["remote"] else {
+            panic!("setup must write an ssh-bare target");
+        };
+        assert_eq!(ssh.host, "other.example.com");
         config.validate().unwrap();
     }
 
@@ -1144,7 +1461,7 @@ mod tests {
             prompt_aws_target(&mut input, &mut output, Some(&account)).unwrap(),
             None
         );
-        let config = build_config_with_runtime(&[], None, None, None);
+        let config = build_config_with_runtime(&[], None, None, None, None);
         assert!(!config.targets.contains_key(AWS_TARGET_ID));
     }
 
@@ -1190,6 +1507,7 @@ mod tests {
                 remediation: None,
             }],
             aws: None,
+            ssh_hosts: vec![],
         };
         let executor = FakeExecutor::succeeds();
         let mut input = b"\n\ny\n".as_slice();
@@ -1271,6 +1589,7 @@ mod tests {
                 remediation: Some("Install Podman.".into()),
             }],
             aws: None,
+            ssh_hosts: vec![],
         };
         let executor = FakeExecutor::succeeds();
         let mut input = b"y\n".as_slice();

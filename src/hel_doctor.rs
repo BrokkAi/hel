@@ -17,7 +17,7 @@ use crate::hel_setup::{
 use crate::hel_targets::{
     CommandExecutor, CommandSpec, ContainerTemplate as RuntimeContainerTemplate, ProcessExecutor,
     SshTarget as RuntimeSshTarget, TargetTemplate as RuntimeTargetTemplate, run_setup_smoke_test,
-    verify_local_podman, verify_ssh_podman,
+    ssh_connectivity_probe, verify_local_podman, verify_ssh_podman,
 };
 
 // Only the image for the Apple container smoke test when the config has no
@@ -148,6 +148,7 @@ pub fn run_with_config_path(
     checks.push(harness_discovery_check(config.as_ref()));
     checks.extend(harness_checks(config.as_ref()));
     checks.extend(podman_checks(config.as_ref(), executor, options.smoke));
+    checks.extend(ssh_bare_checks(config.as_ref(), executor));
     checks.extend(ssh_podman_checks(config.as_ref(), executor, options.smoke));
     checks.extend(aws_checks(config.as_ref(), executor));
     checks.extend(worker_binary_checks(config.as_ref()));
@@ -550,6 +551,128 @@ fn missing_image_remediation(image: &str) -> String {
     )
 }
 
+/// The outcome of the shared SSH connectivity probe.
+///
+/// Both SSH-backed checks run this first: an unreachable host makes every
+/// later probe fail with a misleading message.
+enum SshConnectivity {
+    Reachable,
+    Failed { detail: String, remediation: String },
+}
+
+/// Probe `ssh <destination> true` and map any failure to a copy-paste fix.
+///
+/// Hel never generates keys, runs `ssh-copy-id`, or accepts a host key on the
+/// user's behalf; it only says exactly which command would fix the failure.
+fn ssh_connectivity(ssh: &RuntimeSshTarget, executor: &impl CommandExecutor) -> SshConnectivity {
+    let destination = &ssh.destination;
+    let command = ssh_connectivity_probe(ssh);
+    match executor.execute(&command) {
+        Err(error) => SshConnectivity::Failed {
+            detail: format!("Could not run `ssh {destination} true`: {error}"),
+            remediation: SSH_MISSING_REMEDIATION.to_owned(),
+        },
+        Ok(output) if output.status != 0 => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            SshConnectivity::Failed {
+                detail: format!("`ssh {destination} true` failed: {stderr}"),
+                remediation: ssh_failure_remediation(&stderr, ssh),
+            }
+        }
+        Ok(_) => SshConnectivity::Reachable,
+    }
+}
+
+const SSH_MISSING_REMEDIATION: &str = "Install an OpenSSH client and put `ssh` on PATH: `sudo apt update && sudo apt install -y openssh-client` (Debian/Ubuntu) or `sudo dnf install -y openssh-clients` (Fedora).";
+
+/// Map `ssh -o BatchMode=yes` stderr to the command that fixes it.
+fn ssh_failure_remediation(stderr: &str, ssh: &RuntimeSshTarget) -> String {
+    let destination = &ssh.destination;
+    if stderr.contains("Host key verification failed")
+        || stderr.contains("No ECDSA host key is known")
+        || stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
+    {
+        let host = ssh_host_only(destination);
+        return format!(
+            "Add the host key with `ssh-keyscan -H {host} >> ~/.ssh/known_hosts`. Verify the fingerprint out of band before trusting it; if the key changed, remove the stale entry with `ssh-keygen -R {host}` first."
+        );
+    }
+    if stderr.contains("Permission denied")
+        || stderr.contains("Too many authentication failures")
+        || stderr.contains("no matching host key")
+        || stderr.contains("Authentication failed")
+    {
+        return match ssh_identity_file(ssh) {
+            Some(identity) => format!(
+                "Install your public key on the host with `ssh-copy-id -i {identity}.pub {destination}`."
+            ),
+            None => {
+                format!("Install your public key on the host with `ssh-copy-id {destination}`.")
+            }
+        };
+    }
+    if stderr.contains("ssh: command not found") || stderr.contains("No such file or directory") {
+        return SSH_MISSING_REMEDIATION.to_owned();
+    }
+    format!("Run `ssh {destination} true` by hand and resolve the error it reports: {stderr}")
+}
+
+/// The host part of an OpenSSH destination, without any `user@` prefix.
+fn ssh_host_only(destination: &str) -> &str {
+    destination
+        .rsplit_once('@')
+        .map_or(destination, |(_, host)| host)
+}
+
+/// The identity file provisioning passes, recovered from the built ssh args.
+fn ssh_identity_file(ssh: &RuntimeSshTarget) -> Option<&str> {
+    let position = ssh.ssh_args.iter().position(|arg| arg == "-i")?;
+    ssh.ssh_args.get(position + 1).map(String::as_str)
+}
+
+/// One check per `ssh-bare` target: can Hel reach the host noninteractively?
+fn ssh_bare_checks(
+    config: Option<&HelConfig>,
+    executor: &impl CommandExecutor,
+) -> Vec<DoctorCheck> {
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    config
+        .targets
+        .iter()
+        .filter_map(|(id, target)| match target {
+            TargetTemplate::SshBare { ssh, .. } => {
+                Some(ssh_bare_check(id, &backend_ssh(ssh), executor))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn ssh_bare_check(
+    id: &str,
+    ssh: &RuntimeSshTarget,
+    executor: &impl CommandExecutor,
+) -> DoctorCheck {
+    let check_id = format!("runtime.ssh-bare.{id}");
+    let title = format!("SSH access for target {id}");
+    match ssh_connectivity(ssh, executor) {
+        SshConnectivity::Reachable => DoctorCheck::ready(
+            check_id,
+            title,
+            format!(
+                "`ssh {} true` succeeds noninteractively from this host.",
+                ssh.destination
+            ),
+        ),
+        SshConnectivity::Failed {
+            detail,
+            remediation,
+        } => DoctorCheck::fixable(check_id, title, detail, remediation),
+    }
+}
+
 /// One check per `ssh-podman` target: the same Podman probes, run over SSH.
 fn ssh_podman_checks(
     config: Option<&HelConfig>,
@@ -585,6 +708,15 @@ fn ssh_podman_check(
     let check_id = format!("runtime.ssh-podman.{id}");
     let title = format!("Remote Podman for target {id}");
     let destination = &ssh.destination;
+    // Connectivity first: a remote Podman probe on an unreachable host reports
+    // a Podman problem the user does not have.
+    if let SshConnectivity::Failed {
+        detail,
+        remediation,
+    } = ssh_connectivity(ssh, executor)
+    {
+        return DoctorCheck::fixable(check_id, title, detail, remediation);
+    }
     let preflight = match verify_ssh_podman(ssh, executor) {
         Ok(preflight) => preflight,
         Err(error) => {
@@ -1089,6 +1221,7 @@ pub fn current_apple_platform(executor: &impl CommandExecutor) -> ApplePlatform 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::path::PathBuf;
 
     use anyhow::anyhow;
 
@@ -1133,6 +1266,16 @@ mod tests {
     }
 
     /// The three host probes `verify_local_podman`/`verify_ssh_podman` run.
+    /// Prefix canned responses with a successful SSH connectivity probe, which
+    /// every SSH-backed check now runs first.
+    fn reachable_then(
+        responses: impl IntoIterator<Item = Result<CommandOutput>>,
+    ) -> Vec<Result<CommandOutput>> {
+        let mut all = vec![Ok(output(b""))];
+        all.extend(responses);
+        all
+    }
+
     fn passing_podman_probes() -> Vec<Result<CommandOutput>> {
         vec![
             Ok(output(b"podman version 5.4.2\n")),
@@ -1226,7 +1369,7 @@ mod tests {
 
     #[test]
     fn podman_check_is_fixable_with_an_upgrade_remediation_for_an_old_runtime() {
-        let executor = FakeExecutor::new([Ok(output(b"podman version 3.4.7\n"))]);
+        let executor = FakeExecutor::new(reachable_then([Ok(output(b"podman version 3.4.7\n"))]));
         let config = config_with([(
             "podman",
             TargetTemplate::LocalPodman {
@@ -1303,7 +1446,7 @@ mod tests {
 
     #[test]
     fn image_checks_are_skipped_when_the_host_podman_preflight_fails() {
-        let executor = FakeExecutor::new([Ok(output(b"podman version 3.4.7\n"))]);
+        let executor = FakeExecutor::new(reachable_then([Ok(output(b"podman version 3.4.7\n"))]));
         let config = config_with([(
             "podman",
             TargetTemplate::LocalPodman {
@@ -1357,7 +1500,7 @@ mod tests {
 
     #[test]
     fn ssh_podman_check_is_ready_after_ssh_wrapped_probes_without_smoke() {
-        let executor = FakeExecutor::new(passing_podman_probes());
+        let executor = FakeExecutor::new(reachable_then(passing_podman_probes()));
 
         let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, false);
 
@@ -1367,8 +1510,9 @@ mod tests {
         assert!(check.detail.contains("Remote rootless Podman 5.4.2"));
         assert!(check.detail.contains("dev@example.test"));
         let commands = executor.commands.borrow();
-        assert_eq!(commands.len(), 3);
-        for command in commands.iter() {
+        assert_eq!(commands.len(), 4);
+        assert_eq!(commands[0].args.last().unwrap(), "'true'");
+        for command in commands.iter().skip(1) {
             assert_eq!(command.program, "ssh");
             assert!(command.args.contains(&"dev@example.test".to_owned()));
             assert!(command.args.last().unwrap().starts_with("'podman'"));
@@ -1377,7 +1521,7 @@ mod tests {
 
     #[test]
     fn ssh_podman_check_failure_scopes_the_remediation_to_the_remote_host() {
-        let executor = FakeExecutor::new([Ok(output(b"podman version 3.4.7\n"))]);
+        let executor = FakeExecutor::new(reachable_then([Ok(output(b"podman version 3.4.7\n"))]));
 
         let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, false);
 
@@ -1393,19 +1537,20 @@ mod tests {
     }
 
     #[test]
-    fn ssh_podman_check_unreachable_host_recommends_verifying_ssh() {
-        let executor =
-            FakeExecutor::new([Err(anyhow!("ssh: connect to host example.test: timeout"))]);
+    fn ssh_podman_check_reports_the_shared_ssh_remediation_before_probing_podman() {
+        let executor = FakeExecutor::new([Ok(failed(
+            b"dev@example.test: Permission denied (publickey).",
+        ))]);
 
         let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, false);
 
         assert_eq!(check.status, CheckStatus::Fixable);
         assert_eq!(
             check.remediation.as_deref(),
-            Some(
-                "Verify `ssh dev@example.test` succeeds noninteractively from this host, then install rootless Podman 4 or newer there (see docs/PODMAN.md)."
-            )
+            Some("Install your public key on the host with `ssh-copy-id dev@example.test`.")
         );
+        // The remote Podman probes never ran: the host is not reachable.
+        assert_eq!(executor.commands.borrow().len(), 1);
     }
 
     #[test]
@@ -1416,20 +1561,20 @@ mod tests {
             Ok(output(b"ok\n")),
             Ok(output(b"removed\n")),
         ]);
-        let executor = FakeExecutor::new(responses);
+        let executor = FakeExecutor::new(reachable_then(responses));
 
         let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, true);
 
         assert_eq!(check.status, CheckStatus::Ready);
         let commands = executor.commands.borrow();
-        assert_eq!(commands.len(), 6);
-        for command in commands.iter().skip(3) {
+        assert_eq!(commands.len(), 7);
+        for command in commands.iter().skip(4) {
             assert_eq!(command.program, "ssh");
             assert!(command.args.contains(&"dev@example.test".to_owned()));
         }
-        assert!(commands[3].args.last().unwrap().contains("'run' '--init'"));
-        assert!(commands[4].args.last().unwrap().ends_with("'true'"));
-        assert!(commands[5].args.last().unwrap().contains("'rm' '--force'"));
+        assert!(commands[4].args.last().unwrap().contains("'run' '--init'"));
+        assert!(commands[5].args.last().unwrap().ends_with("'true'"));
+        assert!(commands[6].args.last().unwrap().contains("'rm' '--force'"));
     }
 
     #[test]
@@ -1437,6 +1582,117 @@ mod tests {
         let executor = FakeExecutor::new([]);
 
         assert!(ssh_podman_checks(None, &executor, false).is_empty());
+        assert!(executor.commands.borrow().is_empty());
+    }
+
+    fn ssh_bare_config() -> HelConfig {
+        config_with([(
+            "builder",
+            TargetTemplate::SshBare {
+                ssh: crate::hel_config::SshConnection {
+                    host: "example.test".into(),
+                    user: Some("dev".into()),
+                    identity_file: Some(PathBuf::from("/home/dev/.ssh/id_ed25519")),
+                    extra_args: vec![],
+                },
+                workspace_prefix: PathBuf::from(".local/share/hel/workspaces"),
+            },
+        )])
+    }
+
+    #[test]
+    fn ssh_bare_check_is_ready_when_the_batch_mode_probe_succeeds() {
+        let executor = FakeExecutor::new([Ok(output(b""))]);
+
+        let checks = ssh_bare_checks(Some(&ssh_bare_config()), &executor);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].id, "runtime.ssh-bare.builder");
+        assert_eq!(checks[0].status, CheckStatus::Ready);
+        let command = &executor.commands.borrow()[0];
+        assert_eq!(command.program, "ssh");
+        assert_eq!(
+            command.args[..4],
+            ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]
+        );
+        assert!(command.args.contains(&"dev@example.test".to_owned()));
+        assert_eq!(command.args.last().unwrap(), "'true'");
+    }
+
+    #[test]
+    fn ssh_bare_check_permission_denied_recommends_ssh_copy_id_with_the_identity() {
+        let executor = FakeExecutor::new([Ok(failed(
+            b"dev@example.test: Permission denied (publickey).",
+        ))]);
+
+        let checks = ssh_bare_checks(Some(&ssh_bare_config()), &executor);
+
+        assert_eq!(checks[0].status, CheckStatus::Fixable);
+        assert_eq!(
+            checks[0].remediation.as_deref(),
+            Some(
+                "Install your public key on the host with `ssh-copy-id -i /home/dev/.ssh/id_ed25519.pub dev@example.test`."
+            )
+        );
+    }
+
+    #[test]
+    fn ssh_bare_check_host_key_failure_recommends_keyscan_with_a_fingerprint_caution() {
+        let executor = FakeExecutor::new([Ok(failed(
+            b"Host key verification failed.\nNo ECDSA host key is known for example.test",
+        ))]);
+
+        let checks = ssh_bare_checks(Some(&ssh_bare_config()), &executor);
+
+        assert_eq!(checks[0].status, CheckStatus::Fixable);
+        let remediation = checks[0].remediation.as_deref().unwrap();
+        assert!(
+            remediation.contains("ssh-keyscan -H example.test >> ~/.ssh/known_hosts"),
+            "{remediation}"
+        );
+        assert!(
+            remediation.contains("Verify the fingerprint"),
+            "{remediation}"
+        );
+    }
+
+    #[test]
+    fn ssh_bare_check_without_an_ssh_client_recommends_installing_openssh() {
+        let executor = FakeExecutor::new([Err(anyhow!("No such file or directory (os error 2)"))]);
+
+        let checks = ssh_bare_checks(Some(&ssh_bare_config()), &executor);
+
+        assert_eq!(checks[0].status, CheckStatus::Fixable);
+        assert_eq!(
+            checks[0].remediation.as_deref(),
+            Some(SSH_MISSING_REMEDIATION)
+        );
+    }
+
+    #[test]
+    fn ssh_bare_check_falls_back_to_quoting_an_unrecognized_ssh_failure() {
+        let executor = FakeExecutor::new([Ok(failed(
+            b"ssh: connect to host example.test port 22: Connection timed out",
+        ))]);
+
+        let checks = ssh_bare_checks(Some(&ssh_bare_config()), &executor);
+
+        let remediation = checks[0].remediation.as_deref().unwrap();
+        assert!(
+            remediation.contains("Connection timed out"),
+            "{remediation}"
+        );
+        assert!(
+            remediation.contains("Run `ssh dev@example.test true` by hand"),
+            "{remediation}"
+        );
+    }
+
+    #[test]
+    fn ssh_bare_checks_are_skipped_without_a_valid_config() {
+        let executor = FakeExecutor::new([]);
+
+        assert!(ssh_bare_checks(None, &executor).is_empty());
         assert!(executor.commands.borrow().is_empty());
     }
 
