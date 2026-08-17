@@ -77,6 +77,26 @@ the `initialize` response and translates. Reasoning tiers belong to the selected
 model, so `/effort` offers the tiers that model supports. While an advertised
 `/goal` request is active, the prompt composer title shows `Pursuing goal`.
 
+## What "auto" means
+
+In most agent CLIs, an "auto" permission mode means a review policy decides
+each call: low-risk calls are approved automatically, and the rest still ask.
+
+Kimi Code's `auto` mode is not that. It approves every call, so it does the
+same thing as the modes other harnesses call bypass or YOLO. Grok Build's
+`--always-approve` flag is also blanket approval, and its name says so.
+
+That matters on a raw-localhost target, where Hel runs the harness against
+your own machine and does not force an unrestricted mode. Codex and Claude Code
+ask there, and Hel answers by cancelling. Kimi Code approves everything through
+its own default `auto` mode. Grok Build approves everything because Hel always
+passes `--always-approve`: its default is to ask, and a session whose requests
+are all cancelled cannot write at all. The dashboard warns before you start
+either of those two on raw localhost, and names which mechanism applies.
+
+Leaving plan mode is the one approval Hel still routes to you on a bare target,
+whatever the harness. It is a decision about a plan, not a tool permission.
+
 ## Keyboard basics
 
 - Enter sends a prompt or accepts the selected action.

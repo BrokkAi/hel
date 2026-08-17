@@ -2066,7 +2066,6 @@ impl DashboardState {
             };
         }
         if wizard.step == WizardStep::Target
-            && wizard.focus == WizardFocus::Content
             && matches!(
                 code,
                 KeyCode::Char('+')
@@ -2807,7 +2806,6 @@ impl DashboardState {
         }
         let profiles = self.compatible_profiles(&wizard.session_id);
         if wizard.step == WizardStep::Target
-            && wizard.focus == WizardFocus::Content
             && matches!(
                 code,
                 KeyCode::Char('+')
@@ -3617,10 +3615,9 @@ impl DashboardState {
                 .map(ProfileQuota::compact)
                 .unwrap_or_else(|| "refreshing".to_string())
         };
-        let danger = if harness == HarnessKind::Kimi {
-            "  ⚠ DANGER: auto mode allows commands without approval"
-        } else {
-            ""
+        let danger = match harness.bare_target_auto_approval() {
+            Some(mechanism) => format!("  ⚠ DANGER: {mechanism} approves every command"),
+            None => String::new(),
         };
         format!("{id}  {}  ·  {quota}{danger}", harness.display_name())
     }
@@ -5866,15 +5863,22 @@ fn render_review_wizard(
             }
         )));
     }
+    // Not a permission mode Hel picked, but the state the session runs in:
+    // every command is approved, and on raw localhost that is this machine.
     if matches!(target, TargetTemplate::LocalBare)
-        && dashboard
+        && let Some(kind) = dashboard
             .config
             .profiles
             .get(profile_id)
-            .is_some_and(|profile| profile.kind == HarnessKind::Kimi)
+            .map(|profile| profile.kind)
+        && let Some(mechanism) = kind.bare_target_auto_approval()
     {
         lines.push(Line::styled(
-            "⚠ DANGER: Kimi auto mode on raw localhost can modify this machine without approval.",
+            format!(
+                "⚠ DANGER: {} approves every command through {mechanism}. On raw localhost it can \
+                 change this machine without asking.",
+                kind.display_name()
+            ),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
@@ -8337,6 +8341,56 @@ mod tests {
                 resource_allocation: None,
             }
         );
+    }
+
+    /// The review pane names the harness and the mechanism that approves
+    /// everything, so the two ways of arriving there are both visible.
+    #[test]
+    fn raw_localhost_names_the_blanket_approval_mechanism_per_harness() {
+        let review_text = |kind: HarnessKind| {
+            let mut config = config();
+            config.profiles = BTreeMap::from([(
+                "profile".into(),
+                HarnessProfile {
+                    context_window_bytes: None,
+                    kind,
+                    home: PathBuf::from("/profiles/harness"),
+                    executable: None,
+                    environment: BTreeMap::new(),
+                },
+            )]);
+            config.targets = BTreeMap::from([("raw-localhost".into(), TargetTemplate::LocalBare)]);
+            let mut state = HelState::default();
+            state.remember_project_directory("local", std::path::Path::new("/home/me/project"));
+            let mut dashboard = DashboardState::new(config, state, BTreeMap::new());
+            dashboard.handle_key(ctrl_key('n'));
+            let mut terminal = Terminal::new(TestBackend::new(180, 32)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &mut dashboard))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+
+        let grok = review_text(HarnessKind::Grok);
+        assert!(grok.contains("DANGER"), "{grok}");
+        assert!(grok.contains("Grok Build"), "{grok}");
+        assert!(grok.contains("--always-approve launch flag"), "{grok}");
+
+        let kimi = review_text(HarnessKind::Kimi);
+        assert!(kimi.contains("DANGER"), "{kimi}");
+        assert!(kimi.contains("default auto mode"), "{kimi}");
+
+        // Codex and Claude Code ask on a bare target, so there is no warning.
+        for kind in [HarnessKind::Codex, HarnessKind::Claude] {
+            let quiet = review_text(kind);
+            assert!(!quiet.contains("DANGER"), "{kind:?}: {quiet}");
+        }
     }
 
     #[test]
@@ -11007,6 +11061,113 @@ mod tests {
             session_values(&archived_session(), None, None, 0, &config);
         assert_eq!(target, "podman");
         assert_eq!(project, "hel");
+    }
+
+    #[test]
+    fn resume_target_step_minus_halves_container_size_through_the_key_path() {
+        let mut config = config();
+        // Mirror the real config: an EC2 target that sorts before podman.
+        config.targets.insert(
+            "aws-runson".into(),
+            TargetTemplate::AwsEc2 {
+                aws_profile: None,
+                region: "us-east-1".into(),
+                launch_template: "lt-123".into(),
+                launch_template_version: None,
+                ssh_user: "ubuntu".into(),
+                address_source: Default::default(),
+                identity_file: None,
+                ssh_args: Vec::new(),
+            },
+        );
+        let mut dashboard = DashboardState::new(
+            config,
+            HelState {
+                version: STATE_VERSION,
+                sessions: BTreeMap::from([("session-1".into(), archived_session())]),
+                mount_history: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+        );
+
+        dashboard.begin_resume();
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume wizard, got {:?}", dashboard.mode);
+        };
+        assert_eq!(wizard.step, WizardStep::Profile);
+
+        // 1/3 -> 2/3 target step; podman is the session's target.
+        dashboard.handle_key(key(KeyCode::Enter));
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume wizard on target step");
+        };
+        assert_eq!(wizard.step, WizardStep::Target);
+        assert_eq!(
+            nth_key(&dashboard.config.targets, wizard.target),
+            "podman".to_string()
+        );
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(
+            wizard.resource_allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 8,
+                memory_bytes: 32 * gib,
+            })
+        );
+
+        dashboard.handle_key(key(KeyCode::Char('-')));
+        let Mode::Resume(wizard) = &dashboard.mode else {
+            panic!("expected resume wizard after '-'");
+        };
+        assert_eq!(
+            wizard.resource_allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 4,
+                memory_bytes: 16 * gib,
+            })
+        );
+    }
+
+    #[test]
+    fn new_target_step_minus_halves_container_size_when_focus_is_off_content() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.handle_key(ctrl_key('n'));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new wizard, got {:?}", dashboard.mode);
+        };
+        assert_eq!(wizard.step, WizardStep::Profile);
+
+        dashboard.handle_key(key(KeyCode::Enter));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new wizard on target step");
+        };
+        assert_eq!(wizard.step, WizardStep::Target);
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(
+            wizard.resource_allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 8,
+                memory_bytes: 32 * gib,
+            })
+        );
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new wizard after tab");
+        };
+        assert_ne!(wizard.focus, WizardFocus::Content);
+
+        dashboard.handle_key(key(KeyCode::Char('-')));
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected new wizard after '-'");
+        };
+        assert_eq!(
+            wizard.resource_allocation,
+            Some(SessionResourceAllocation::Container {
+                cpus: 4,
+                memory_bytes: 16 * gib,
+            })
+        );
     }
 
     #[test]

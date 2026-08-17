@@ -55,8 +55,11 @@ pub const RELAY_MIN_PROTOCOL_VERSION: u32 = RELAY_PROTOCOL_VERSION;
 pub const RELAY_EVENT_GENESIS_DIGEST: &str = crate::hel_archive::EVENT_FRONTIER_GENESIS_DIGEST;
 const RELAY_EVENT_DIGEST_DOMAIN: &[u8] = b"hel-relay-event-v1\0";
 const RELAY_STATE_VERSION: u32 = 1;
-const RELAY_STATE_FILE: &str = "relay-state.json";
-const RELAY_JOURNAL_DIR: &str = "relay-journal";
+/// The relay snapshot inside a worker root. Teardown and restore name it from
+/// here rather than repeating the literal.
+pub const RELAY_STATE_FILE: &str = "relay-state.json";
+/// The relay's durable event journal inside a worker root.
+pub const RELAY_JOURNAL_DIR: &str = "relay-journal";
 const RELAY_ACTIVE_SEGMENT: &str = "active.jsonl";
 const RELAY_SEGMENT_BYTE_LIMIT: u64 = 1024 * 1024;
 const RELAY_HOT_EVENT_CAPACITY: usize = 32;
@@ -914,6 +917,11 @@ impl DurableRelay {
 
     pub fn operational_state(&self) -> RelayOperationalState {
         self.snapshot.operational_state()
+    }
+
+    /// The directory holding this relay's durable state.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn latest_ordinal(&self) -> u64 {
@@ -2445,10 +2453,14 @@ fn clamp_observation(observation: RelayObservation, budget: usize) -> Result<Rel
     }
 }
 
+/// Persist the snapshot without ever recreating the worker root. Session
+/// teardown deletes that directory while this daemon may still be alive, and a
+/// recreated root holding only a snapshot cannot be reopened: its frontier
+/// would run ahead of a journal that no longer exists.
 fn persist_relay_snapshot(root: &Path, snapshot: &RelaySnapshot) -> Result<()> {
     let body = serde_json::to_vec_pretty(snapshot)?;
     ensure_byte_budget(body.len(), RELAY_SNAPSHOT_BYTE_BUDGET, "relay snapshot")?;
-    crate::hel_config::atomic_write(&root.join(RELAY_STATE_FILE), &body)
+    crate::hel_config::atomic_write_existing(&root.join(RELAY_STATE_FILE), &body)
 }
 
 #[derive(Serialize)]
@@ -5771,6 +5783,57 @@ mod tests {
             relay.claim_pending_commands(true).unwrap()[0].command_id,
             "restored-prompt"
         );
+    }
+
+    /// Session teardown deletes the worker root while its daemon may still be
+    /// alive. A durable write that recreated the root would leave a snapshot
+    /// with no journal behind it, and no later resume could reopen that.
+    #[test]
+    fn relay_writes_fail_instead_of_recreating_a_deleted_worker_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("worker-root");
+        let mut relay = DurableRelay::open(&root, SESSION, "1.0.0").unwrap();
+        relay
+            .record_observation(RelayObservation::Warning {
+                message: "before teardown".into(),
+            })
+            .unwrap();
+        let through = relay.latest_ordinal();
+        let digest = relay.latest_digest().to_owned();
+        fs::remove_dir_all(&root).unwrap();
+
+        // Acknowledging writes the snapshot and nothing else, so this is the
+        // path that used to recreate the root behind teardown's back.
+        let acknowledged = relay.handle(relay_request(
+            "acknowledge-after-teardown",
+            RelayRequest::Acknowledge {
+                through_ordinal: through,
+                through_digest: digest,
+            },
+        ));
+        assert!(
+            matches!(
+                acknowledged.body,
+                RelayResponseBody::Error {
+                    error: RelayProtocolError {
+                        code: RelayErrorCode::Internal,
+                        ..
+                    }
+                }
+            ),
+            "acknowledging into a removed root must fail: {:?}",
+            acknowledged.body
+        );
+        assert!(!root.exists(), "the snapshot write resurrected the root");
+
+        assert!(
+            relay
+                .record_observation(RelayObservation::Warning {
+                    message: "after teardown".into(),
+                })
+                .is_err()
+        );
+        assert!(!root.exists(), "the journal append resurrected the root");
     }
 
     #[test]

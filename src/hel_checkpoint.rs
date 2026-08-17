@@ -186,6 +186,17 @@ pub fn restore_from_spec_file(path: &Path) -> Result<()> {
 
 pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunner) -> Result<()> {
     ensure!(spec.workspace_root.is_dir(), "restore workspace is missing");
+    // A restore seeds a relay that has no durable state yet. Existing state
+    // means either a leaked worker still writing here or an unfinished
+    // teardown, and the seed would be ignored in favour of the stale
+    // snapshot, leaving a frontier no journal can support.
+    let existing_relay_state = spec.relay_root.join(crate::hel_worker::RELAY_STATE_FILE);
+    ensure!(
+        !existing_relay_state.exists(),
+        "relay state already present in {}; a previous worker may still be running, \
+         refusing to restore over it",
+        spec.relay_root.display()
+    );
     let archive = read_archive_verified(&spec.archive_path)?;
     // Deserialize and validate the schema-2 canonical projection before any
     // repository, relay, or native-session state can be mutated.
@@ -3163,6 +3174,44 @@ mod tests {
         assert_eq!(restored.transcript, spec.canonical_session.transcript);
         assert!(restored.queued_prompts.is_empty());
         assert!(!relay_root.join("events.jsonl").exists());
+    }
+
+    /// A restore seeds a relay that has none of its own state yet. Existing
+    /// state means the previous worker was never fully torn down, and the seed
+    /// would silently lose to it.
+    #[test]
+    fn restore_refuses_a_relay_root_that_already_holds_relay_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        export_checkpoint(&spec).unwrap();
+        let relay_root = temp.path().join("occupied-relay");
+        fs::create_dir_all(&relay_root).unwrap();
+        fs::write(
+            relay_root.join(crate::hel_worker::RELAY_STATE_FILE),
+            b"{\"format_version\":1}",
+        )
+        .unwrap();
+
+        let error = restore_checkpoint(
+            &CheckpointRestoreSpec {
+                archive_path: spec.output_path.clone(),
+                workspace_root: spec.workspace_root.clone(),
+                relay_root: relay_root.clone(),
+                harness_home: temp.path().join("restored-harness"),
+                restore_repositories: false,
+                restore_native: false,
+                discard_queued_prompts: false,
+                primary_repository_root: None,
+            },
+            &SystemGit,
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("relay state already present"),
+            "{error:#}"
+        );
+        assert!(!restored_canonical_session_path(&relay_root).exists());
     }
 
     #[test]

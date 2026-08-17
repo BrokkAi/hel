@@ -57,7 +57,8 @@ use hel::hel_targets::{
 };
 use hel::hel_worker::RelayCommand;
 use hel::hel_worker_runtime::{
-    AcpSupervisorSpec, WorkerLaunchConfig, proxy, run_acp_supervisor, run_daemon,
+    AcpSupervisorSpec, WorkerLaunchConfig, lead_process_group, proxy, run_acp_supervisor,
+    run_daemon,
 };
 use hel_tui::{
     DashboardAction, DashboardState, ImportProfileOption, ImportSessionOption,
@@ -594,6 +595,11 @@ enum WorkerCommand {
 /// stdout/stderr go to worker.log; this file is the structured summary read
 /// by `Controller` diagnosis when a worker becomes unreachable.
 fn write_worker_exit_record(root: &std::path::Path, reason: &str) {
+    // Session teardown removes the worker root; recreating it here would
+    // resurrect a closed session's state directory.
+    if !root.is_dir() {
+        return;
+    }
     let record = serde_json::json!({
         "reason": reason,
         "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -643,6 +649,7 @@ async fn main() -> Result<()> {
         Some(Command::Server(args)) => run_server(args).await,
         Some(Command::Worker(args)) => match args.command {
             WorkerCommand::Run { root, config } => {
+                lead_process_group();
                 install_worker_last_words(&root);
                 let result = run_daemon(root.clone(), WorkerLaunchConfig::read(&config)?).await;
                 if let Err(error) = &result {
