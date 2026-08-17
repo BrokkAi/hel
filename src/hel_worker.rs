@@ -137,6 +137,13 @@ pub enum RelayRequest {
     InstallSkills {
         data: String,
     },
+    /// Run a prompt in a disposable ACP session and return its text. The
+    /// runtime answers this on the connection: a scratch prompt is not session
+    /// history, so it never reaches the durable relay, its journal, or its
+    /// command ledger.
+    Compact {
+        prompt: String,
+    },
 }
 
 impl RelayRequest {
@@ -152,6 +159,7 @@ impl RelayRequest {
             Self::InstallCredentials { .. } => "install_credentials",
             Self::SkillsState => "skills_state",
             Self::InstallSkills { .. } => "install_skills",
+            Self::Compact { .. } => "compact",
         }
     }
 }
@@ -221,6 +229,10 @@ pub enum RelayResponsePayload {
     SkillsState {
         present: bool,
         fingerprint: String,
+    },
+    /// Agent text from a disposable ACP compaction session.
+    Compacted {
+        text: String,
     },
 }
 
@@ -1060,6 +1072,14 @@ impl DurableRelay {
                 return Ok(relay_error(
                     RelayErrorCode::InvalidState,
                     "credential and skills requests must be handled by the live relay transport",
+                    false,
+                    None,
+                ));
+            }
+            RelayRequest::Compact { .. } => {
+                return Ok(relay_error(
+                    RelayErrorCode::InvalidState,
+                    "compaction requests must be handled by the live relay transport",
                     false,
                     None,
                 ));

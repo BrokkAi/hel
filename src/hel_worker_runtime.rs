@@ -252,12 +252,14 @@ mod unix {
                     let client_dispatch_wake = dispatch_wake_tx.clone();
                     let client_credentials = credentials.clone();
                     let client_fatal = fatal_tx.clone();
+                    let client_commands = acp_commands_tx.clone();
                     tokio::spawn(async move {
                         if let Err(error) = serve_client(
                             stream,
                             client_relay,
                             client_dispatch_wake,
                             client_credentials,
+                            Some(client_commands),
                             client_fatal,
                         ).await {
                             tracing::warn!(%error, "relay proxy client disconnected");
@@ -372,11 +374,14 @@ mod unix {
             let client_credentials = credentials.clone();
             let client_fatal = fatal.clone();
             tokio::spawn(async move {
+                // A sealed session has no ACP runtime left, so compaction
+                // cannot be served here.
                 if let Err(error) = serve_client(
                     stream,
                     client_relay,
                     client_dispatch_wake,
                     client_credentials,
+                    None,
                     client_fatal,
                 )
                 .await
@@ -807,11 +812,14 @@ mod unix {
         ) && !root.is_dir()
     }
 
+    /// `commands` is the ACP coordinator's command channel, or `None` once the
+    /// session is sealed and no ACP runtime is left to serve scratch prompts.
     pub(super) async fn serve_client(
         stream: UnixStream,
         relay: Arc<Mutex<DurableRelay>>,
         dispatch_wake: mpsc::Sender<()>,
         credentials: std::result::Result<CredentialEndpoint, String>,
+        commands: Option<mpsc::Sender<CommandRequest>>,
         fatal: mpsc::Sender<anyhow::Error>,
     ) -> Result<()> {
         let relay_root = relay
@@ -846,6 +854,16 @@ mod unix {
                     // They never reach DurableRelay, its journal, or its
                     // command ledger.
                     let response = credential_response(envelope, &credentials).await;
+                    write_response(&mut writer, &response).await?;
+                    continue;
+                }
+                if let RelayRequest::Compact { .. } = &envelope.request {
+                    // A scratch compaction prompt is not session history, so
+                    // it never reaches DurableRelay, its journal, or its
+                    // command ledger. Awaiting the model turn stalls only this
+                    // connection; the controller drives it as a single
+                    // sequential RPC.
+                    let response = compaction_response(envelope, commands.as_ref()).await;
                     write_response(&mut writer, &response).await?;
                     continue;
                 }
@@ -907,6 +925,88 @@ mod unix {
             ));
         }
         outcome
+    }
+
+    /// Run a compaction prompt in a disposable ACP session on the connection.
+    /// A compaction failure is never retryable: the transcript that produced
+    /// it does not change between attempts.
+    async fn compaction_response(
+        envelope: RelayRequestEnvelope,
+        commands: Option<&mpsc::Sender<CommandRequest>>,
+    ) -> RelayResponseEnvelope {
+        if envelope.protocol_version != RELAY_PROTOCOL_VERSION {
+            return RelayResponseEnvelope {
+                request_id: envelope.request_id,
+                protocol_version: envelope.protocol_version,
+                body: RelayResponseBody::Error {
+                    error: RelayProtocolError {
+                        code: RelayErrorCode::IncompatibleProtocol,
+                        message: format!(
+                            "request uses protocol {}, relay requires protocol {RELAY_PROTOCOL_VERSION}",
+                            envelope.protocol_version
+                        ),
+                        retryable: false,
+                        detail: None,
+                    },
+                },
+            };
+        }
+        let RelayRequest::Compact { prompt } = envelope.request else {
+            unreachable!("compaction_response only serves compact requests");
+        };
+        let body = if prompt.trim().is_empty() {
+            compaction_error(RelayErrorCode::InvalidRequest, "compaction prompt is empty")
+        } else {
+            match commands {
+                None => compaction_error(
+                    RelayErrorCode::InvalidState,
+                    "session is closed; no ACP runtime can compact",
+                ),
+                Some(commands) => {
+                    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                    match commands
+                        .send(CommandRequest::Compact {
+                            prompt,
+                            response: response_tx,
+                        })
+                        .await
+                    {
+                        Ok(()) => match response_rx.await {
+                            Ok(Ok(text)) => RelayResponseBody::Ok {
+                                payload: RelayResponsePayload::Compacted { text },
+                            },
+                            Ok(Err(message)) => {
+                                compaction_error(RelayErrorCode::InvalidState, &message)
+                            }
+                            Err(_) => compaction_error(
+                                RelayErrorCode::Internal,
+                                "ACP runtime stopped before it compacted",
+                            ),
+                        },
+                        Err(_) => compaction_error(
+                            RelayErrorCode::Internal,
+                            "ACP runtime stopped before accepting the compaction prompt",
+                        ),
+                    }
+                }
+            }
+        };
+        RelayResponseEnvelope {
+            request_id: envelope.request_id,
+            protocol_version: envelope.protocol_version,
+            body,
+        }
+    }
+
+    fn compaction_error(code: RelayErrorCode, message: &str) -> RelayResponseBody {
+        RelayResponseBody::Error {
+            error: RelayProtocolError {
+                code,
+                message: message.to_owned(),
+                retryable: false,
+                detail: None,
+            },
+        }
     }
 
     /// Serve a credential or skills request against this relay's own harness
@@ -1592,6 +1692,7 @@ mod relay_tests {
             relay.clone(),
             wake_tx,
             Ok(endpoint),
+            None,
             fatal_reports().0,
         ));
         let (reader, mut writer) = client.into_split();
@@ -1669,6 +1770,161 @@ mod relay_tests {
     }
 
     #[tokio::test]
+    async fn compaction_reaches_the_acp_runtime_and_stays_out_of_relay_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay_root = temp.path().join("relay");
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(&relay_root, SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let (commands_tx, mut commands_rx) = mpsc::channel(1);
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(unix::serve_client(
+            server,
+            relay.clone(),
+            wake_tx,
+            test_credentials(),
+            Some(commands_tx),
+            fatal_reports().0,
+        ));
+        let runtime = tokio::spawn(async move {
+            let Some(CommandRequest::Compact { prompt, response }) = commands_rx.recv().await
+            else {
+                panic!("the relay must route compaction to the ACP runtime");
+            };
+            assert!(prompt.contains("summarize the history"));
+            let _ = response.send(Ok("<state_snapshot>kept</state_snapshot>".into()));
+        });
+
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let request = RelayRequestEnvelope {
+            request_id: "compact-request".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Compact {
+                prompt: "please summarize the history".into(),
+            },
+        };
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+
+        let response: RelayResponseEnvelope =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let RelayResponseBody::Ok {
+            payload: RelayResponsePayload::Compacted { text },
+        } = response.body
+        else {
+            panic!("compaction failed: {:?}", response.body);
+        };
+        assert_eq!(text, "<state_snapshot>kept</state_snapshot>");
+        runtime.await.unwrap();
+
+        {
+            let mut relay = relay.lock().unwrap();
+            assert_eq!(relay.latest_ordinal(), 0);
+            assert!(
+                relay
+                    .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(relay.claim_pending_commands(true).unwrap().is_empty());
+            let persisted = std::fs::read_to_string(relay_root.join("relay-state.json")).unwrap();
+            assert!(!persisted.contains("summarize the history"));
+        }
+
+        drop(writer);
+        drop(lines);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_fails_when_no_acp_runtime_can_serve_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path().join("relay"), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(unix::serve_client(
+            server,
+            relay.clone(),
+            wake_tx,
+            test_credentials(),
+            None,
+            fatal_reports().0,
+        ));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let request = RelayRequestEnvelope {
+            request_id: "compact-sealed".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Compact {
+                prompt: "summarize".into(),
+            },
+        };
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+
+        let response: RelayResponseEnvelope =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let RelayResponseBody::Error { error } = response.body else {
+            panic!("a sealed session cannot compact");
+        };
+        assert_eq!(error.code, RelayErrorCode::InvalidState);
+        assert!(!error.retryable);
+
+        drop(writer);
+        drop(lines);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn incompatible_protocol_cannot_compact() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path().join("relay"), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let (commands_tx, mut commands_rx) = mpsc::channel(1);
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(unix::serve_client(
+            server,
+            relay.clone(),
+            wake_tx,
+            test_credentials(),
+            Some(commands_tx),
+            fatal_reports().0,
+        ));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let request = RelayRequestEnvelope {
+            request_id: "compact-old-protocol".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION + 1,
+            request: RelayRequest::Compact {
+                prompt: "summarize".into(),
+            },
+        };
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+
+        let response: RelayResponseEnvelope =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let RelayResponseBody::Error { error } = response.body else {
+            panic!("an incompatible protocol cannot compact");
+        };
+        assert_eq!(error.code, RelayErrorCode::IncompatibleProtocol);
+        assert!(commands_rx.try_recv().is_err());
+
+        drop(writer);
+        drop(lines);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn incompatible_protocol_cannot_read_or_mutate_credentials() {
         let home = tempfile::tempdir().unwrap();
         let relay = Arc::new(Mutex::new(
@@ -1685,6 +1941,7 @@ mod relay_tests {
             relay,
             wake_tx,
             Ok(endpoint),
+            None,
             fatal_reports().0,
         ));
         let (reader, mut writer) = client.into_split();
@@ -2884,6 +3141,7 @@ mod relay_tests {
             relay.clone(),
             wake_tx,
             test_credentials(),
+            None,
             fatal_reports().0,
         ));
         let request = RelayRequestEnvelope {
@@ -3190,6 +3448,7 @@ mod relay_tests {
             relay.clone(),
             wake_tx,
             test_credentials(),
+            None,
             fatal_tx,
         ));
         std::fs::remove_dir_all(&root).unwrap();
@@ -3261,6 +3520,7 @@ mod relay_tests {
             relay.clone(),
             wake_tx.clone(),
             test_credentials(),
+            None,
             fatal_reports().0,
         ));
         let (reader, mut writer) = client.into_split();
@@ -3376,6 +3636,7 @@ mod relay_tests {
             relay,
             wake_tx,
             test_credentials(),
+            None,
             fatal_reports().0,
         ));
         let (reader, mut writer) = client.into_split();
@@ -3448,6 +3709,7 @@ mod relay_tests {
             relay.clone(),
             wake_tx.clone(),
             test_credentials(),
+            None,
             fatal_reports().0,
         ));
         let (reader, mut writer) = client.into_split();
@@ -3550,6 +3812,7 @@ mod relay_tests {
             relay,
             wake_tx.clone(),
             test_credentials(),
+            None,
             fatal_reports().0,
         ));
         let (reader, mut writer) = client.into_split();

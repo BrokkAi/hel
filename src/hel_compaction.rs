@@ -7,11 +7,23 @@ use std::pin::Pin;
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 
-use crate::hel_acp::RuntimeEvent;
-use crate::hel_worker::{SequencedEvent, WorkerEvent};
+use crate::hel_archive::{CanonicalSessionSnapshot, CanonicalTranscriptBody};
 
 pub const DEFAULT_CONTEXT_BYTES: usize = 256 * 1024;
-pub const HANDOFF_MEDIA_TYPE: &str = "application/x-hel-cross-harness-handoff";
+/// Opening sentence of every handoff this module writes. Generation and
+/// detection share it so a later resume can always recognize its own prior
+/// handoff turns.
+pub const HANDOFF_PREAMBLE: &str =
+    "You are continuing a coding session previously run by another ACP harness.";
+/// Opening sentence of the byte-truncating handoff this pipeline replaced.
+/// Sessions resumed by that build still carry it in their transcripts.
+pub const LEGACY_HANDOFF_PREAMBLE: &str =
+    "Continue this coding session from the portable transcript below.";
+/// What a prior handoff turn contributes to a new compaction. The transcript
+/// already carries the pre-resume lineage as ordinary turns, so repeating the
+/// handoff body would only spend budget on a summary of a summary.
+const HANDOFF_PLACEHOLDER: &str =
+    "[cross-harness resume handoff: continuing work from a prior harness]";
 const MIN_CONTEXT_BYTES: usize = 32 * 1024;
 const EXACT_TAIL_TURNS: usize = 2;
 // OpenCode v2 protects 40k estimated tokens of older tool output and only
@@ -44,8 +56,8 @@ enum TurnEvent {
 /// Produce the single synthetic handoff turn sent to the target session.
 /// Short transcripts take exactly one model request. Larger inputs are
 /// summarized in bounded pages and reduced as a balanced tree.
-pub async fn compact_events(
-    canonical_events: &[u8],
+pub async fn compact_snapshot(
+    snapshot: &CanonicalSessionSnapshot,
     context_bytes: usize,
     backend: &mut impl CompactionBackend,
 ) -> Result<String> {
@@ -53,7 +65,7 @@ pub async fn compact_events(
         context_bytes >= MIN_CONTEXT_BYTES,
         "cross-harness context byte budget must be at least {MIN_CONTEXT_BYTES}"
     );
-    let turns = parse_complete_raw_history(canonical_events)?;
+    let turns = turns_from_snapshot(snapshot)?;
     let compactable_turns = prune_old_tool_outputs(&turns);
     let page_overhead = page_prompt("").len();
     let rendered_bytes = compactable_turns
@@ -124,9 +136,7 @@ fn prune_old_tool_outputs(turns: &[Turn]) -> Vec<Turn> {
 }
 
 fn completed_tool_output_bytes(value: &Value) -> Option<usize> {
-    (value.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call_update")
-        && value.get("status").and_then(Value::as_str) == Some("completed"))
-    .then(|| {
+    (value.get("status").and_then(Value::as_str) == Some("completed")).then(|| {
         value
             .get("content")
             .map_or(0, |content| content.to_string().len())
@@ -228,10 +238,13 @@ fn render_oversize_turn(turn: &Turn, index: usize, limit: usize) -> Vec<String> 
     fragments
 }
 
+/// Terminal ACP `ToolCallStatus` values, as serialized into a canonical tool
+/// call. The other statuses (`pending`, `in_progress`) mean the exchange is
+/// still open, so its fragments belong together.
 fn tool_event_finished(value: &Value) -> bool {
     matches!(
         value.get("status").and_then(Value::as_str),
-        Some("completed" | "failed" | "cancelled")
+        Some("completed" | "failed")
     )
 }
 
@@ -263,86 +276,57 @@ fn split_at_utf8_midpoint(text: &str) -> (&str, &str) {
     text.split_at(midpoint)
 }
 
-fn parse_complete_raw_history(bytes: &[u8]) -> Result<Vec<Turn>> {
+/// Fold the archived transcript into user turns with their agent, tool, and
+/// plan events. Thoughts and system notices carry no durable state, so they
+/// are dropped rather than summarized.
+fn turns_from_snapshot(snapshot: &CanonicalSessionSnapshot) -> Result<Vec<Turn>> {
     let mut turns = Vec::<Turn>::new();
-    let mut saw_compaction_artifact = false;
-    let mut skip_synthetic_turn = false;
-    for (line_index, line) in bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .enumerate()
-    {
-        let event: SequencedEvent = serde_json::from_slice(line)
-            .with_context(|| format!("parse canonical event line {}", line_index + 1))?;
-        match event.event {
-            WorkerEvent::PromptAccepted {
-                text, attachments, ..
-            } => {
-                skip_synthetic_turn = attachments
-                    .iter()
-                    .any(|attachment| attachment.media_type == HANDOFF_MEDIA_TYPE);
-                if !skip_synthetic_turn {
-                    turns.push(Turn {
-                        user: text,
-                        events: Vec::new(),
-                    });
-                }
-            }
-            WorkerEvent::QueuedPromptPromoted { prompt, .. } => {
-                skip_synthetic_turn = false;
+    for item in &snapshot.transcript {
+        match &item.body {
+            CanonicalTranscriptBody::User { content } => {
+                let text = crate::hel_chat::materialized_content_text(content);
                 turns.push(Turn {
-                    user: prompt.text,
+                    user: if is_synthetic_handoff(&text) {
+                        HANDOFF_PLACEHOLDER.to_owned()
+                    } else {
+                        text
+                    },
                     events: Vec::new(),
                 });
             }
-            WorkerEvent::Adapter { payload, .. } => {
-                if is_provider_compaction_artifact(&payload) {
-                    saw_compaction_artifact = true;
-                    continue;
-                }
-                if skip_synthetic_turn {
-                    continue;
-                }
-                let Ok(RuntimeEvent::SessionUpdate { update }) =
-                    serde_json::from_value::<RuntimeEvent>(payload)
-                else {
-                    continue;
-                };
-                let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) else {
-                    continue;
-                };
-                let item = match kind {
-                    "agent_message_chunk" => update
-                        .pointer("/content/text")
-                        .and_then(Value::as_str)
-                        .map(|text| TurnEvent::Assistant(text.to_owned())),
-                    "tool_call" | "tool_call_update" => Some(TurnEvent::Tool(update)),
-                    "plan" => Some(TurnEvent::Plan(update)),
-                    _ => None,
-                };
-                if let Some(item) = item {
-                    let turn = turns.last_mut().with_context(|| {
-                        if saw_compaction_artifact {
-                            "raw history is unavailable before a provider compaction artifact"
-                        } else {
-                            "canonical transcript contains assistant/tool history before its first user turn"
-                        }
-                    })?;
-                    append_turn_event(turn, item);
-                }
+            CanonicalTranscriptBody::Agent { chunks, .. } => push_turn_event(
+                &mut turns,
+                TurnEvent::Assistant(crate::hel_chat::materialized_chunks_text(chunks)),
+            )?,
+            CanonicalTranscriptBody::Tool { call } => {
+                push_turn_event(&mut turns, TurnEvent::Tool(call.clone()))?;
             }
-            _ => {}
+            CanonicalTranscriptBody::Plan { plan } => {
+                push_turn_event(&mut turns, TurnEvent::Plan(plan.clone()))?;
+            }
+            CanonicalTranscriptBody::Thought { .. } | CanonicalTranscriptBody::System { .. } => {}
         }
     }
     ensure!(
         !turns.is_empty(),
-        if saw_compaction_artifact {
-            "raw history is unavailable; archive contains only provider compaction artifacts"
-        } else {
-            "canonical transcript contains no user turns"
-        }
+        "canonical transcript contains no user turns"
     );
     Ok(turns)
+}
+
+fn push_turn_event(turns: &mut [Turn], event: TurnEvent) -> Result<()> {
+    let turn = turns.last_mut().context(
+        "canonical transcript contains assistant/tool history before its first user turn",
+    )?;
+    append_turn_event(turn, event);
+    Ok(())
+}
+
+/// Whether a user turn is a handoff this pipeline (or the one it replaced)
+/// wrote into an earlier resume.
+fn is_synthetic_handoff(user_text: &str) -> bool {
+    let text = user_text.trim_start();
+    text.starts_with(HANDOFF_PREAMBLE) || text.starts_with(LEGACY_HANDOFF_PREAMBLE)
 }
 
 fn append_turn_event(turn: &mut Turn, item: TurnEvent) {
@@ -356,15 +340,6 @@ fn append_turn_event(turn: &mut Turn, item: TurnEvent) {
         }
         other => turn.events.push(other),
     }
-}
-
-fn is_provider_compaction_artifact(payload: &Value) -> bool {
-    let update = payload.get("update").unwrap_or(payload);
-    matches!(
-        update.get("sessionUpdate").and_then(Value::as_str),
-        Some("compaction" | "context_compaction" | "compaction_summary")
-    ) || update.get("encrypted_content").is_some()
-        || update.get("encryptedContent").is_some()
 }
 
 fn render_user_index(turns: &[Turn]) -> String {
@@ -513,8 +488,8 @@ async fn run_compaction(backend: &mut impl CompactionBackend, prompt: String) ->
 }
 
 fn handoff(summary: &str, exact_tail: Option<&str>, context_bytes: usize) -> Result<String> {
-    let mut result = String::from(
-        "You are continuing a coding session previously run by another ACP harness. The restored workspace is authoritative. Use the historical state below for continuity, and do not repeat completed work unless verification requires it.\n\n",
+    let mut result = format!(
+        "{HANDOFF_PREAMBLE} The restored workspace is authoritative. Use the historical state below for continuity, and do not repeat completed work unless verification requires it.\n\n"
     );
     result.push_str(summary);
     if let Some(tail) = exact_tail {
@@ -532,6 +507,10 @@ fn handoff(summary: &str, exact_tail: Option<&str>, context_bytes: usize) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hel_archive::{
+        CanonicalExecutionState, CanonicalSessionState, CanonicalTranscriptItem,
+    };
+    use std::collections::BTreeMap;
 
     #[derive(Default)]
     struct FakeBackend {
@@ -548,68 +527,74 @@ mod tests {
         }
     }
 
-    fn events(turns: &[(&str, &str)]) -> Vec<u8> {
-        let mut output = Vec::new();
-        let mut seq = 0;
-        for (user, assistant) in turns {
-            seq += 1;
-            write_event(
-                &mut output,
-                SequencedEvent {
-                    seq,
-                    recorded_at_ms: None,
-                    request_id: None,
-                    event: WorkerEvent::PromptAccepted {
-                        request_id: format!("r{seq}"),
-                        text: (*user).into(),
-                        attachments: Vec::new(),
-                    },
-                },
-            );
-            seq += 1;
-            write_event(
-                &mut output,
-                SequencedEvent {
-                    seq,
-                    recorded_at_ms: None,
-                    request_id: None,
-                    event: WorkerEvent::Adapter {
-                        kind: "session_update".into(),
-                        payload: serde_json::json!({
-                            "type": "session_update",
-                            "update": {
-                                "sessionUpdate": "agent_message_chunk",
-                                "content": {"type": "text", "text": assistant},
-                            }
-                        }),
-                    },
-                },
-            );
+    fn user(text: &str) -> CanonicalTranscriptBody {
+        CanonicalTranscriptBody::User {
+            content: vec![serde_json::json!({"type": "text", "text": text})],
         }
-        output
     }
 
-    fn write_event(output: &mut Vec<u8>, event: SequencedEvent) {
-        serde_json::to_writer(&mut *output, &event).unwrap();
-        output.push(b'\n');
+    fn agent(text: &str) -> CanonicalTranscriptBody {
+        CanonicalTranscriptBody::Agent {
+            chunks: vec![serde_json::json!({"content": {"type": "text", "text": text}})],
+            streaming: false,
+        }
+    }
+
+    /// A canonical tool item as `hel_projection` writes it: a whole ACP
+    /// `ToolCall`, not a `sessionUpdate`-tagged update.
+    fn tool_call(status: &str, text: &str) -> Value {
+        serde_json::json!({
+            "toolCallId": "call-1",
+            "title": "read file",
+            "status": status,
+            "content": [{"type": "content", "content": {"type": "text", "text": text}}]
+        })
+    }
+
+    fn snapshot(bodies: Vec<CanonicalTranscriptBody>) -> CanonicalSessionSnapshot {
+        let transcript = bodies
+            .into_iter()
+            .enumerate()
+            .map(|(index, body)| CanonicalTranscriptItem {
+                stable_id: format!("item-{index}"),
+                position: index as u64 + 1,
+                latest_content_event_ordinal: None,
+                created_at_ms: 0,
+                last_changed_at_ms: 0,
+                body,
+            })
+            .collect();
+        CanonicalSessionSnapshot {
+            event_frontier: 0,
+            event_frontier_digest: "0".repeat(64),
+            session: CanonicalSessionState {
+                execution: CanonicalExecutionState::Idle,
+                last_activity_at_ms: None,
+                session_title: None,
+                configuration: BTreeMap::new(),
+            },
+            transcript,
+            queued_prompts: Vec::new(),
+        }
+    }
+
+    fn exchanges(turns: &[(&str, &str)]) -> CanonicalSessionSnapshot {
+        snapshot(
+            turns
+                .iter()
+                .flat_map(|(prompt, answer)| [user(prompt), agent(answer)])
+                .collect(),
+        )
     }
 
     fn completed_tool_output(text: &str) -> TurnEvent {
-        TurnEvent::Tool(serde_json::json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": "call",
-            "status": "completed",
-            "content": [{
-                "type": "content",
-                "content": {"type": "text", "text": text}
-            }]
-        }))
+        TurnEvent::Tool(tool_call("completed", text))
     }
 
     #[tokio::test]
     async fn short_history_uses_one_compaction_request() {
         let mut backend = FakeBackend::default();
-        let handoff = compact_events(&events(&[("fix it", "done")]), 64 * 1024, &mut backend)
+        let handoff = compact_snapshot(&exchanges(&[("fix it", "done")]), 64 * 1024, &mut backend)
             .await
             .unwrap();
         assert_eq!(backend.prompts.len(), 1);
@@ -619,18 +604,66 @@ mod tests {
     #[tokio::test]
     async fn large_history_pages_then_reduces_and_keeps_exact_tail() {
         let large = "x".repeat(20 * 1024);
-        let input = events(&[
+        let input = exchanges(&[
             ("first", &large),
             ("second", &large),
             ("latest user", "latest answer"),
         ]);
         let mut backend = FakeBackend::default();
-        let handoff = compact_events(&input, 32 * 1024, &mut backend)
+        let handoff = compact_snapshot(&input, 32 * 1024, &mut backend)
             .await
             .unwrap();
         assert!(backend.prompts.len() >= 3);
         assert!(handoff.contains("latest user"));
         assert!(handoff.contains("latest answer"));
+    }
+
+    #[tokio::test]
+    async fn oversize_turn_is_split_into_summarizable_fragments() {
+        let huge = "y".repeat(200 * 1024);
+        let input = snapshot(vec![
+            user("start"),
+            agent(&huge),
+            user("end"),
+            agent("done"),
+        ]);
+        let mut backend = FakeBackend::default();
+
+        compact_snapshot(&input, 32 * 1024, &mut backend)
+            .await
+            .unwrap();
+
+        assert!(backend.prompts.len() >= 6);
+        assert!(
+            backend
+                .prompts
+                .iter()
+                .any(|prompt| prompt.contains("oversize turn fragment"))
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_over_the_budget_is_an_error() {
+        struct OversizeBackend;
+
+        impl CompactionBackend for OversizeBackend {
+            fn compact<'a>(
+                &'a mut self,
+                _prompt: String,
+            ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+                Box::pin(async { Ok("z".repeat(64 * 1024)) })
+            }
+        }
+
+        let error = compact_snapshot(
+            &exchanges(&[("fix it", "done")]),
+            MIN_CONTEXT_BYTES,
+            &mut OversizeBackend,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("context byte budget"), "{error}");
     }
 
     #[test]
@@ -664,100 +697,106 @@ mod tests {
     }
 
     #[test]
-    fn provider_blob_is_omitted_when_raw_turns_exist() {
-        let mut input = events(&[("before", "answer")]);
-        write_event(
-            &mut input,
-            SequencedEvent {
-                seq: 3,
-                recorded_at_ms: None,
-                request_id: None,
-                event: WorkerEvent::Adapter {
-                    kind: "session_update".into(),
-                    payload: serde_json::json!({
-                        "type": "session_update",
-                        "update": {
-                            "sessionUpdate": "context_compaction",
-                            "encrypted_content": "opaque"
-                        }
-                    }),
-                },
+    fn unfinished_tool_output_is_never_pruned() {
+        let large_output = "x".repeat(TOOL_OUTPUT_PROTECT_BYTES + 1);
+        let turns = vec![
+            Turn {
+                user: "old".into(),
+                events: vec![TurnEvent::Tool(tool_call("in_progress", &large_output))],
             },
-        );
-        let parsed = parse_complete_raw_history(&input).unwrap();
-        assert!(!render_turns(&parsed, 0).contains("opaque"));
+            Turn {
+                user: "recent".into(),
+                events: vec![completed_tool_output(&large_output)],
+            },
+            Turn {
+                user: "latest".into(),
+                events: Vec::new(),
+            },
+        ];
+
+        let pruned = prune_old_tool_outputs(&turns);
+
+        assert!(!render_turns(&pruned, 0).contains(CLEARED_TOOL_RESULT));
     }
 
     #[test]
-    fn provider_blob_without_raw_history_is_an_error() {
-        let mut input = Vec::new();
-        write_event(
-            &mut input,
-            SequencedEvent {
-                seq: 1,
-                recorded_at_ms: None,
-                request_id: None,
-                event: WorkerEvent::Adapter {
-                    kind: "session_update".into(),
-                    payload: serde_json::json!({
-                        "type": "session_update",
-                        "update": {
-                            "sessionUpdate": "compaction_summary",
-                            "encryptedContent": "opaque"
-                        }
-                    }),
-                },
+    fn prior_handoff_turn_keeps_its_work_under_a_placeholder() {
+        for preamble in [HANDOFF_PREAMBLE, LEGACY_HANDOFF_PREAMBLE] {
+            let handoff_text = format!("{preamble} Everything the prior harness knew, verbatim.");
+            let turns = turns_from_snapshot(&snapshot(vec![
+                user("real user"),
+                agent("real answer"),
+                user(&handoff_text),
+                agent("handoff response"),
+            ]))
+            .unwrap();
+
+            let rendered = render_turns(&turns, 0);
+            assert_eq!(turns.len(), 2);
+            assert!(rendered.contains("real user"));
+            assert!(rendered.contains(HANDOFF_PLACEHOLDER));
+            assert!(!rendered.contains("verbatim"));
+            assert!(
+                rendered.contains("handoff response"),
+                "work done after a handoff is real history"
+            );
+        }
+    }
+
+    #[test]
+    fn thoughts_and_system_notices_are_left_out() {
+        let turns = turns_from_snapshot(&snapshot(vec![
+            user("do it"),
+            CanonicalTranscriptBody::Thought {
+                chunks: vec![serde_json::json!({"content": {"type": "text", "text": "musing"}})],
+                streaming: false,
             },
-        );
+            CanonicalTranscriptBody::System {
+                text: "target restarted".into(),
+            },
+            agent("done"),
+        ]))
+        .unwrap();
+
+        let rendered = render_turns(&turns, 0);
+        assert!(rendered.contains("done"));
+        assert!(!rendered.contains("musing"));
+        assert!(!rendered.contains("target restarted"));
+    }
+
+    #[test]
+    fn plan_and_tool_events_join_their_user_turn() {
+        let turns = turns_from_snapshot(&snapshot(vec![
+            user("do it"),
+            CanonicalTranscriptBody::Plan {
+                plan: serde_json::json!({"entries": [{"content": "step one", "status": "pending", "priority": "medium"}]}),
+            },
+            CanonicalTranscriptBody::Tool {
+                call: tool_call("completed", "tool output"),
+            },
+        ]))
+        .unwrap();
+
+        assert_eq!(turns.len(), 1);
+        let rendered = render_turns(&turns, 0);
+        assert!(rendered.contains("step one"));
+        assert!(rendered.contains("tool output"));
+    }
+
+    #[test]
+    fn agent_history_before_a_user_turn_is_an_error() {
+        let error = turns_from_snapshot(&snapshot(vec![agent("orphan")])).unwrap_err();
+
         assert!(
-            parse_complete_raw_history(&input)
-                .unwrap_err()
-                .to_string()
-                .contains("raw history is unavailable")
+            error.to_string().contains("before its first user turn"),
+            "{error}"
         );
     }
 
     #[test]
-    fn prior_synthetic_handoff_is_not_compacted_as_user_history() {
-        let mut input = events(&[("real user", "real answer")]);
-        write_event(
-            &mut input,
-            SequencedEvent {
-                seq: 3,
-                recorded_at_ms: None,
-                request_id: None,
-                event: WorkerEvent::PromptAccepted {
-                    request_id: "handoff".into(),
-                    text: "synthetic snapshot".into(),
-                    attachments: vec![crate::hel_worker::Attachment {
-                        name: "handoff".into(),
-                        media_type: HANDOFF_MEDIA_TYPE.into(),
-                        reference: "synthetic".into(),
-                    }],
-                },
-            },
-        );
-        write_event(
-            &mut input,
-            SequencedEvent {
-                seq: 4,
-                recorded_at_ms: None,
-                request_id: None,
-                event: WorkerEvent::Adapter {
-                    kind: "session_update".into(),
-                    payload: serde_json::json!({
-                        "type": "session_update",
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": {"type": "text", "text": "handoff response"},
-                        }
-                    }),
-                },
-            },
-        );
-        let rendered = render_turns(&parse_complete_raw_history(&input).unwrap(), 0);
-        assert!(rendered.contains("real user"));
-        assert!(!rendered.contains("synthetic snapshot"));
-        assert!(!rendered.contains("handoff response"));
+    fn a_transcript_without_user_turns_is_an_error() {
+        let error = turns_from_snapshot(&snapshot(Vec::new())).unwrap_err();
+
+        assert!(error.to_string().contains("no user turns"), "{error}");
     }
 }

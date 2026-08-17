@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_client_protocol::schema::v1::{ContentBlock, Plan, TextContent, ToolCall};
+use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use rayon::prelude::*;
@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 
 use crate::hel_archive::{
     ArchiveInput, BundleManifest, CanonicalQueuedCommandKind, CanonicalSessionSnapshot,
-    CanonicalTranscriptBody, GitCollectionSpec, GitHistoryMode, SessionManifest, SystemGit,
-    TargetManifest, collect_git_snapshot, verify_archive_streaming, write_archive_atomic,
+    GitCollectionSpec, GitHistoryMode, SessionManifest, SystemGit, TargetManifest,
+    collect_git_snapshot, verify_archive_streaming, write_archive_atomic,
 };
 use crate::hel_checkpoint::{
     CheckpointExportSpec, CheckpointRepositoryCapture, CheckpointRepositorySpec,
@@ -2227,12 +2227,12 @@ impl Controller {
             canonical_session.event_frontier,
             &canonical_session.event_frontier_digest,
         );
-        // Both computations are pure functions of the archive and cost seconds
-        // on a long session. Start them now so they run while the target is
-        // being provisioned; their results are awaited where they were
-        // consumed before, and the writes they feed have not moved.
+        // Rebuilding the projection is a pure function of the archive and costs
+        // seconds on a long session. Start it now so it runs while the target is
+        // being provisioned; its result is awaited where it was consumed
+        // before, and the writes it feeds have not moved.
         //
-        // A resume that fails before a result is needed drops the handle.
+        // A resume that fails before the result is needed drops the handle.
         // `spawn_blocking` work cannot be cancelled, so the computation still
         // finishes on the blocking pool and its result is discarded; it owns
         // nothing but its own inputs, so nothing leaks beyond that CPU.
@@ -2242,10 +2242,6 @@ impl Controller {
             tokio::task::spawn_blocking(move || {
                 materialized_session_from_canonical(session_id, &canonical)
             })
-        });
-        let handoff_build = (!same_harness).then(|| {
-            let canonical = Arc::clone(&canonical_session);
-            tokio::task::spawn_blocking(move || canonical_handoff_text(&canonical, context_bytes))
         });
         let github_token = controller_github_token();
 
@@ -2504,10 +2500,15 @@ impl Controller {
                     );
                 }
             } else {
-                let context = handoff_build
-                    .context("cross-harness resume is missing canonical session")?
-                    .await
-                    .context("compact the cross-harness handoff transcript")?;
+                // The new harness compacts the prior transcript itself, in a
+                // scratch session on this relay, before its first real prompt.
+                let context = crate::hel_compaction::compact_snapshot(
+                    &canonical_session,
+                    context_bytes,
+                    &mut relay,
+                )
+                .await
+                .context("compact the cross-harness handoff transcript")?;
                 relay
                     .submit(
                         new_command_id("cross-harness-handoff")?,
@@ -3803,63 +3804,6 @@ fn projection_rebuild_required(
     archive_frontier_digest: &str,
 ) -> bool {
     stored != Some((archive_frontier, archive_frontier_digest))
-}
-
-fn canonical_handoff_text(snapshot: &CanonicalSessionSnapshot, maximum_bytes: usize) -> String {
-    const PREFIX: &str = "Continue this coding session from the portable transcript below. Preserve the user's intent and the work already completed.\n\n";
-    let mut transcript = String::new();
-    for item in &snapshot.transcript {
-        let (label, body) = match &item.body {
-            CanonicalTranscriptBody::User { content } => {
-                ("User", crate::hel_chat::materialized_content_text(content))
-            }
-            CanonicalTranscriptBody::Agent { chunks, .. } => {
-                ("Agent", crate::hel_chat::materialized_chunks_text(chunks))
-            }
-            CanonicalTranscriptBody::Thought { chunks, .. } => (
-                "Agent reasoning",
-                crate::hel_chat::materialized_chunks_text(chunks),
-            ),
-            CanonicalTranscriptBody::Tool { call } => (
-                "Tool",
-                serde_json::from_value::<ToolCall>(call.clone())
-                    .map(|call| format!("{} [{:?}]", call.title, call.status))
-                    .unwrap_or_else(|_| "[invalid tool call]".into()),
-            ),
-            CanonicalTranscriptBody::Plan { plan } => (
-                "Plan",
-                serde_json::from_value::<Plan>(plan.clone())
-                    .map(|plan| plan.entries)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|entry| {
-                        format!(
-                            "- [{}] {}",
-                            format!("{:?}", entry.status).to_ascii_lowercase(),
-                            entry.content
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
-            CanonicalTranscriptBody::System { text } => ("System", text.clone()),
-        };
-        if !body.trim().is_empty() {
-            transcript.push_str(label);
-            transcript.push_str(":\n");
-            transcript.push_str(&body);
-            transcript.push_str("\n\n");
-        }
-    }
-    let available = maximum_bytes.saturating_sub(PREFIX.len());
-    if transcript.len() > available {
-        let mut start = transcript.len() - available;
-        while !transcript.is_char_boundary(start) {
-            start += 1;
-        }
-        transcript.drain(..start);
-    }
-    format!("{PREFIX}{transcript}")
 }
 
 /// A harness such as Codex can spend minutes on its first launch, so the
@@ -7864,7 +7808,9 @@ mod tests {
     use std::sync::{Barrier, Mutex};
 
     use super::*;
-    use crate::hel_archive::{CanonicalTranscriptItem, RepositoryMetadata};
+    use crate::hel_archive::{
+        CanonicalTranscriptBody, CanonicalTranscriptItem, RepositoryMetadata,
+    };
     use crate::hel_config::{
         ContainerTemplate as ConfigContainer, HarnessProfile, ProjectRepository,
     };

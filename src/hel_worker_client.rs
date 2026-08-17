@@ -19,6 +19,9 @@ use crate::hel_worker::{
 };
 
 const RELAY_RPC_TIMEOUT: Duration = Duration::from_secs(15);
+/// A compaction request runs a full model turn in a scratch ACP session, so it
+/// outlives the deadline that suits the relay's bookkeeping calls.
+const RELAY_COMPACT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Forward a relay proxy's stderr to the log, one line at a time, until the
 /// child closes it. Reporting rather than dropping keeps connect failures
@@ -400,6 +403,19 @@ impl RelayClient {
         }
     }
 
+    /// Run a prompt in a disposable ACP session and return its agent text.
+    /// The relay serves this on the connection, so it never becomes session
+    /// history.
+    pub async fn compact(&mut self, prompt: String) -> Result<String> {
+        match self
+            .call_with_timeout(RelayRequest::Compact { prompt }, RELAY_COMPACT_TIMEOUT)
+            .await?
+        {
+            RelayResponsePayload::Compacted { text } => Ok(text),
+            _ => bail!("relay returned an unexpected compaction response"),
+        }
+    }
+
     pub async fn detach(mut self) -> Result<()> {
         self.input
             .shutdown()
@@ -418,6 +434,14 @@ impl RelayClient {
     }
 
     async fn call(&mut self, request: RelayRequest) -> Result<RelayResponsePayload> {
+        self.call_with_timeout(request, self.request_timeout).await
+    }
+
+    async fn call_with_timeout(
+        &mut self,
+        request: RelayRequest,
+        timeout: Duration,
+    ) -> Result<RelayResponsePayload> {
         let operation = request.method_name();
         let request_id = self.request_id();
         let envelope = RelayRequestEnvelope {
@@ -430,7 +454,7 @@ impl RelayClient {
             bail!("relay request frame is too large");
         }
         frame.push(b'\n');
-        let line = tokio::time::timeout(self.request_timeout, async {
+        let line = tokio::time::timeout(timeout, async {
             self.input
                 .write_all(&frame)
                 .await
@@ -445,7 +469,7 @@ impl RelayClient {
         .with_context(|| {
             format!(
                 "relay {operation} timed out after {} seconds",
-                self.request_timeout.as_secs_f64()
+                timeout.as_secs_f64()
             )
         })??;
         decode_relay_response(&line, &request_id, self.protocol_version)

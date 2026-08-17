@@ -1187,6 +1187,12 @@ impl StandaloneSession {
         Ok(ordinal)
     }
 
+    /// Run a prompt in a disposable ACP session. The result is not session
+    /// history, so nothing is projected and no sync is needed.
+    pub async fn compact(&mut self, prompt: String) -> Result<String> {
+        self.client.compact(prompt).await
+    }
+
     async fn apply_event_page(&mut self, page: RelayEventPage) -> Result<RelayCursor> {
         let mut delivered_through = self.materialized.applied_event_ordinal;
         let mut delivered_digest = self.materialized.applied_event_digest.clone();
@@ -1256,6 +1262,15 @@ impl StandaloneSession {
             ordinal: delivered_through,
             digest: delivered_digest,
         })
+    }
+}
+
+impl crate::hel_compaction::CompactionBackend for StandaloneSession {
+    fn compact<'a>(
+        &'a mut self,
+        prompt: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(Self::compact(self, prompt))
     }
 }
 
