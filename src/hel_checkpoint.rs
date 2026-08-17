@@ -31,7 +31,6 @@ use crate::hel_targets::{
 };
 const MAX_NATIVE_FILE: u64 = 1024 * 1024 * 1024;
 const MAX_NATIVE_TOTAL: u64 = 8 * 1024 * 1024 * 1024;
-pub const RESTORED_CANONICAL_SESSION_FILE: &str = "canonical-session.json";
 /// Clock-skew slack subtracted from a Codex session's own creation time before
 /// it is used as an mtime floor for content probes.
 const CODEX_PROBE_FLOOR_SLACK_MS: i64 = 48 * 3600 * 1000;
@@ -200,10 +199,19 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
     let archive = read_archive_verified(&spec.archive_path)?;
     // Deserialize and validate the schema-2 canonical projection before any
     // repository, relay, or native-session state can be mutated.
-    let mut canonical_session = archive.canonical_session()?;
+    let canonical_session = archive.canonical_session()?;
+    // The relay that opens next needs the frontier it continues from and the
+    // commands still queued, and nothing else. The transcript stays in the
+    // archive; the controller already holds it as the durable projection.
+    let mut seed = crate::hel_worker::RestoredRelaySeed {
+        event_frontier: canonical_session.event_frontier,
+        event_frontier_digest: canonical_session.event_frontier_digest,
+        queued_prompts: canonical_session.queued_prompts,
+    };
     if spec.discard_queued_prompts {
-        canonical_session.queued_prompts.clear();
+        seed.queued_prompts.clear();
     }
+    seed.validate()?;
     if spec.restore_repositories {
         restore_repositories_from_archive(&archive, &spec.workspace_root, git)?;
     }
@@ -211,8 +219,8 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
     fs::create_dir_all(&spec.relay_root)?;
     crate::hel_worker::clear_native_session_identity(&spec.relay_root)?;
     write_private_file(
-        &restored_canonical_session_path(&spec.relay_root),
-        &serde_json::to_vec_pretty(&canonical_session)?,
+        &crate::hel_worker::restored_relay_seed_path(&spec.relay_root),
+        &serde_json::to_vec(&seed)?,
         0o600,
     )?;
 
@@ -251,10 +259,6 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
         }
     }
     Ok(())
-}
-
-pub fn restored_canonical_session_path(relay_root: &Path) -> PathBuf {
-    relay_root.join(RESTORED_CANONICAL_SESSION_FILE)
 }
 
 /// Reads the controller-owned projection without restoring target artifacts.
@@ -3142,38 +3146,94 @@ mod tests {
         );
     }
 
-    #[test]
-    fn restore_seeds_materialized_session_and_can_discard_queued_prompts() {
-        let temp = tempfile::tempdir().unwrap();
-        let (spec, _) = fixture(temp.path());
-        export_checkpoint(&spec).unwrap();
-        let relay_root = temp.path().join("restored-relay");
+    fn restore_into(
+        temp: &Path,
+        spec: &CheckpointExportSpec,
+        discard_queued_prompts: bool,
+    ) -> PathBuf {
+        let relay_root = temp.join(format!("restored-relay-{discard_queued_prompts}"));
         restore_checkpoint(
             &CheckpointRestoreSpec {
                 archive_path: spec.output_path.clone(),
                 workspace_root: spec.workspace_root.clone(),
                 relay_root: relay_root.clone(),
-                harness_home: temp.path().join("restored-harness"),
+                harness_home: temp.join("restored-harness"),
                 restore_repositories: false,
                 restore_native: false,
-                discard_queued_prompts: true,
+                discard_queued_prompts,
                 primary_repository_root: None,
             },
             &SystemGit,
         )
         .unwrap();
+        relay_root
+    }
 
-        let restored: CanonicalSessionSnapshot = serde_json::from_slice(
-            &fs::read(restored_canonical_session_path(&relay_root)).unwrap(),
+    fn restored_seed(relay_root: &Path) -> crate::hel_worker::RestoredRelaySeed {
+        serde_json::from_slice(
+            &fs::read(crate::hel_worker::restored_relay_seed_path(relay_root)).unwrap(),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn restore_seeds_the_relay_frontier_and_can_discard_queued_prompts() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        export_checkpoint(&spec).unwrap();
+
+        let kept = restored_seed(&restore_into(temp.path(), &spec, false));
+        assert_eq!(kept.event_frontier, spec.canonical_session.event_frontier);
         assert_eq!(
-            restored.event_frontier,
+            kept.event_frontier_digest,
+            spec.canonical_session.event_frontier_digest
+        );
+        assert_eq!(kept.queued_prompts, spec.canonical_session.queued_prompts);
+
+        let relay_root = restore_into(temp.path(), &spec, true);
+        let discarded = restored_seed(&relay_root);
+        assert_eq!(
+            discarded.event_frontier,
             spec.canonical_session.event_frontier
         );
-        assert_eq!(restored.transcript, spec.canonical_session.transcript);
-        assert!(restored.queued_prompts.is_empty());
+        assert!(discarded.queued_prompts.is_empty());
         assert!(!relay_root.join("events.jsonl").exists());
+    }
+
+    /// The relay seed must stay proportional to the queue, never to the
+    /// conversation: a long session used to write its whole transcript into the
+    /// target's relay root for three fields nobody else read.
+    #[test]
+    fn the_relay_seed_does_not_grow_with_the_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut spec, _) = fixture(temp.path());
+        let item = spec.canonical_session.transcript[0].clone();
+        spec.canonical_session.transcript = (1..=20_000_u64)
+            .map(|position| CanonicalTranscriptItem {
+                stable_id: format!("user-{position}"),
+                position,
+                body: CanonicalTranscriptBody::User {
+                    content: vec![json!({"type": "text", "text": "x".repeat(256)})],
+                },
+                ..item.clone()
+            })
+            .collect();
+        spec.canonical_session.event_frontier = 20_000;
+        export_checkpoint(&spec).unwrap();
+
+        let relay_root = restore_into(temp.path(), &spec, false);
+        let seed = fs::metadata(crate::hel_worker::restored_relay_seed_path(&relay_root))
+            .unwrap()
+            .len();
+
+        assert!(
+            seed < 4096,
+            "the relay seed embedded the transcript: {seed} bytes"
+        );
+        assert_eq!(
+            restored_seed(&relay_root).queued_prompts,
+            spec.canonical_session.queued_prompts
+        );
     }
 
     /// A restore seeds a relay that has none of its own state yet. Existing
@@ -3211,7 +3271,7 @@ mod tests {
             format!("{error:#}").contains("relay state already present"),
             "{error:#}"
         );
-        assert!(!restored_canonical_session_path(&relay_root).exists());
+        assert!(!crate::hel_worker::restored_relay_seed_path(&relay_root).exists());
     }
 
     #[test]
