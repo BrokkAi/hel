@@ -19,6 +19,12 @@ include = [
 members = [".", "crates/hel-tui", "crates/hel-cli", "voice-worker"]
 default-members = [".", "crates/hel-tui", "crates/hel-cli"]
 
+[workspace.lints.clippy]
+disallowed_methods = "warn"
+
+[lints]
+workspace = true
+
 [dependencies]
 agent-client-protocol = { version = "1", features = ["unstable_session_fork", "unstable_end_turn_token_usage", "unstable_elicitation", "unstable_auth_methods"] }
 anyhow = "1"

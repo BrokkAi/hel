@@ -159,6 +159,14 @@ struct SessionOperationDisplay {
     /// When the current `stage` began, so the clock can count that stage's
     /// progress instead of the whole operation's.
     stage_started_at_epoch_seconds: Option<u64>,
+    /// The (profile, target) a resume is moving the session TO. The
+    /// controller updates the session record's own profile/target as soon as
+    /// a resume starts, but that update lands in a separate, disk-persisted
+    /// `Controller` inside the background task; the dashboard's local
+    /// session snapshot is not refreshed until the operation finishes. This
+    /// field lets the in-flight row show the destination instead of the
+    /// stale snapshot's pre-resume profile/target.
+    resume_destination: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -981,10 +989,26 @@ impl DashboardState {
                 placeholder,
                 stage: None,
                 stage_started_at_epoch_seconds: None,
+                resume_destination: None,
             },
         );
         self.apply_operation_projection();
         self.clamp_selections();
+    }
+
+    /// Record the profile/target a resume is moving `session_id` to, so its
+    /// in-flight "Resuming" row shows the destination rather than the
+    /// session's pre-resume profile/target. A finished or unknown operation
+    /// is left alone.
+    pub fn set_resume_destination(
+        &mut self,
+        session_id: &str,
+        profile_id: String,
+        target_template_id: String,
+    ) {
+        if let Some(operation) = self.session_operations.get_mut(session_id) {
+            operation.resume_destination = Some((profile_id, target_template_id));
+        }
     }
 
     /// Name the launch phase in flight; a finished or unknown operation is
@@ -5049,10 +5073,21 @@ fn session_values(
             detail.and_then(|detail| detail.current_turn_started_at),
         )
     };
+    // An in-flight resume already told the controller its destination; show
+    // that instead of the session record, which the dashboard won't refresh
+    // until the operation finishes (see `SessionOperationDisplay::resume_destination`).
+    let (profile_id, target_template_id) = operation
+        .and_then(|operation| operation.resume_destination.clone())
+        .unwrap_or_else(|| {
+            (
+                session.last_profile.clone(),
+                session.target_template_id.clone(),
+            )
+        });
     (
         clock,
-        session.last_profile.clone(),
-        session.target_template_id.clone(),
+        profile_id,
+        target_template_id,
         session.project_name(config),
         session_name(session).to_string(),
     )
@@ -10905,6 +10940,7 @@ mod tests {
             placeholder: None,
             stage,
             stage_started_at_epoch_seconds: stage.map(|_| 1_000),
+            resume_destination: None,
         }
     }
 
@@ -10945,6 +10981,56 @@ mod tests {
     fn setting_a_stage_for_an_unknown_session_is_ignored() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
         dashboard.set_session_operation_stage("missing", ProvisionStage::Booting);
+        assert!(dashboard.session_operations.is_empty());
+    }
+
+    #[test]
+    fn resuming_row_shows_the_destination_profile_and_target_not_the_stale_record() {
+        // The controller updates the session's own last_profile/target as
+        // soon as a resume starts, but the dashboard's local session
+        // snapshot only refreshes once the operation finishes. The in-flight
+        // row must show where the resume is going, not where it came from.
+        let session = archived_session();
+        assert_eq!(session.last_profile, "codex-1");
+        assert_eq!(session.target_template_id, "podman");
+        let mut resuming = operation(SessionOperationKind::Resuming, None);
+        resuming.resume_destination = Some(("grok-1".into(), "raw-localhost".into()));
+
+        let (_, profile_id, target_template_id, _, _) =
+            session_values(&session, None, Some(&resuming), 1_012, &config());
+
+        assert_eq!(profile_id, "grok-1");
+        assert_eq!(target_template_id, "raw-localhost");
+    }
+
+    #[test]
+    fn without_a_resume_destination_the_row_falls_back_to_the_session_record() {
+        let session = archived_session();
+        let resuming = operation(SessionOperationKind::Resuming, None);
+
+        let (_, profile_id, target_template_id, _, _) =
+            session_values(&session, None, Some(&resuming), 1_012, &config());
+
+        assert_eq!(profile_id, session.last_profile);
+        assert_eq!(target_template_id, session.target_template_id);
+    }
+
+    #[test]
+    fn set_resume_destination_updates_the_in_flight_operation() {
+        let mut dashboard = dashboard_with_session(archived_session());
+        dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Resuming, None);
+        dashboard.set_resume_destination("session-1", "grok-1".into(), "raw-localhost".into());
+
+        assert_eq!(
+            dashboard.session_operations["session-1"].resume_destination,
+            Some(("grok-1".to_string(), "raw-localhost".to_string()))
+        );
+    }
+
+    #[test]
+    fn set_resume_destination_for_an_unknown_session_is_ignored() {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.set_resume_destination("missing", "grok-1".into(), "raw-localhost".into());
         assert!(dashboard.session_operations.is_empty());
     }
 

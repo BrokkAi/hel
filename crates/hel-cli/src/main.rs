@@ -2430,6 +2430,9 @@ async fn execute_resource_command(command: &CommandSpec) -> Result<CommandOutput
     let child = process
         .spawn()
         .with_context(|| format!("start {} for {}", command.program, command.purpose))?;
+    // stdin is null; nothing writes while output drains, so this cannot hit
+    // the write-then-wait deadlock the disallowed_methods lint guards against.
+    #[allow(clippy::disallowed_methods)]
     let output = child
         .wait_with_output()
         .await
@@ -4716,6 +4719,18 @@ async fn run_dashboard() -> Result<()> {
                     session_id.clone(),
                     SessionOperationKind::Resuming,
                     None,
+                );
+                // The wizard's chosen profile/target become the record's
+                // last_profile/target_template_id as soon as resume starts
+                // (Controller::resume_session_controlled), but this
+                // dashboard's session snapshot won't see that update until
+                // the background operation finishes. Tell the in-flight row
+                // where the resume is going so it doesn't show where the
+                // session resumed from.
+                dashboard.set_resume_destination(
+                    &session_id,
+                    profile_id.clone(),
+                    target_template_id.clone(),
                 );
                 let cancelled = Arc::new(AtomicBool::new(false));
                 lifecycle_operations.insert(

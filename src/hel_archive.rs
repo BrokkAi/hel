@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use rayon::prelude::*;
@@ -1740,23 +1740,10 @@ pub struct SystemGit;
 
 impl GitCommandRunner for SystemGit {
     fn run(&self, repository: &Path, command: &GitCommand) -> Result<GitOutput> {
-        let mut child = Command::new("git")
-            .args(&command.arguments)
-            .current_dir(repository)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("start git in {}", repository.display()))?;
-        if !command.stdin.is_empty() {
-            child
-                .stdin
-                .take()
-                .expect("piped Git stdin")
-                .write_all(&command.stdin)
-                .context("write Git stdin")?;
-        }
-        let output = child.wait_with_output().context("wait for Git")?;
+        let mut process = Command::new("git");
+        process.args(&command.arguments).current_dir(repository);
+        let output = crate::hel_subprocess::run_with_input(&mut process, &command.stdin)
+            .with_context(|| format!("run git in {}", repository.display()))?;
         Ok(GitOutput {
             status: output.status.code().unwrap_or(-1),
             stdout: output.stdout,

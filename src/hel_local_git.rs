@@ -1,12 +1,12 @@
 //! Controller-side support for repositories configured with `local` sources.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
 use crate::hel_config::ProjectBundle;
+use crate::hel_subprocess::run_with_input;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirtyLocalRepository {
@@ -99,21 +99,12 @@ fn reject_git_lfs(repository: &Path) -> Result<()> {
     if !paths.status.success() {
         bail!("could not list tracked files for Git LFS check");
     }
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["check-attr", "-z", "--stdin", "filter"])
-        .current_dir(repository)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("start Git LFS attribute check")?;
-    child
-        .stdin
-        .take()
-        .context("Git attribute stdin is missing")?
-        .write_all(&paths.stdout)?;
-    let output = child
-        .wait_with_output()
-        .context("wait for Git LFS attribute check")?;
+        .current_dir(repository);
+    let output =
+        run_with_input(&mut command, &paths.stdout).context("run Git LFS attribute check")?;
     if !output.status.success() {
         bail!("could not inspect Git LFS attributes");
     }
