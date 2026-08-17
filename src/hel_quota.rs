@@ -301,7 +301,7 @@ async fn refresh_profile(
                             .and_then(crate::usage_format::format_reset_local_seconds),
                         resets_at_epoch_seconds: report.resets_at,
                     }],
-                    extra: report.subscription_tier,
+                    extra: None,
                     error: None,
                     refreshed_at_epoch_seconds,
                 })
@@ -849,9 +849,10 @@ mod tests {
         assert_eq!(report.windows.len(), 1);
         assert_eq!(report.weekly_window().unwrap().remaining_percent, Some(75));
         assert_eq!(report.five_hour_window(), None);
-        assert_eq!(report.extra.as_deref(), Some("X Premium+"));
+        // The subscription tier stays off the row; the fixture carries it to
+        // prove it is ignored.
+        assert_eq!(report.extra, None);
         assert!(report.compact().starts_with("Week 75% left, resets "));
-        assert!(report.compact().ends_with("X Premium+"));
     }
 
     #[tokio::test]

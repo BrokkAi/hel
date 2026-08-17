@@ -34,8 +34,6 @@ pub struct GrokUsageReport {
     pub used_percent: f64,
     /// Epoch seconds when the current period ends.
     pub resets_at: Option<i64>,
-    /// Plan name, for example "X Premium+".
-    pub subscription_tier: Option<String>,
 }
 
 impl GrokUsageReport {
@@ -315,11 +313,6 @@ pub fn parse(result: &Value) -> Result<GrokUsageReport, GrokUsageError> {
         period_label: period_label.to_owned(),
         used_percent,
         resets_at,
-        subscription_tier: result
-            .get("subscription_tier")
-            .and_then(Value::as_str)
-            .filter(|tier| !tier.trim().is_empty())
-            .map(ToOwned::to_owned),
     })
 }
 
@@ -344,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn a_weekly_response_reports_its_period_reset_and_tier() {
+    fn a_weekly_response_reports_its_period_and_reset() {
         let usage = report(json!({
             "config": {
                 "creditUsagePercent": 42.5,
@@ -367,7 +360,6 @@ mod tests {
         assert_eq!(usage.used_percent, 42.5);
         assert_eq!(usage.remaining_percent(), 58);
         assert_eq!(usage.resets_at, Some(1_787_030_527));
-        assert_eq!(usage.subscription_tier.as_deref(), Some("X Premium+"));
     }
 
     #[test]
@@ -431,7 +423,6 @@ mod tests {
         // The legacy shape only ever described a monthly budget.
         assert_eq!(usage.period_label, "Month");
         assert_eq!(usage.resets_at, Some(1_788_220_800));
-        assert_eq!(usage.subscription_tier, None);
     }
 
     #[test]
@@ -525,7 +516,6 @@ done
 
         assert_eq!(usage.period_label, "Week");
         assert_eq!(usage.remaining_percent(), 70);
-        assert_eq!(usage.subscription_tier.as_deref(), Some("X Premium+"));
     }
 
     #[cfg(unix)]
