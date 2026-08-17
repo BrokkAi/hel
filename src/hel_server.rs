@@ -186,6 +186,15 @@ impl ViewerSnapshot {
                 preview: Vec::new(),
                 queued_prompts: Vec::new(),
                 conversation_available: false,
+                incompatible_resume_targets: config
+                    .targets
+                    .keys()
+                    .filter(|target_id| {
+                        crate::hel_controller::resume_compatibility(session, config, target_id)
+                            .is_err()
+                    })
+                    .cloned()
+                    .collect(),
             })
             .collect();
         let profiles = config
@@ -255,6 +264,11 @@ pub struct ViewerSession {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_prompts: Vec<ViewerQueuedPrompt>,
     pub conversation_available: bool,
+    /// Target ids this session cannot resume on. Only the ids travel: the
+    /// controller's reasons name project paths and SSH hosts, which this
+    /// projection deliberately keeps on the controller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incompatible_resume_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,9 +654,18 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
             validate_public_id(session_id)?;
             validate_public_id(profile_id)?;
             validate_public_id(target_id)?;
-            require_session_record(snapshot, session_id)?;
+            let session = require_session_record(snapshot, session_id)?;
             require_profile(snapshot, profile_id)?;
             require_target(snapshot, target_id)?;
+            if session
+                .incompatible_resume_targets
+                .iter()
+                .any(|incompatible| incompatible == target_id)
+            {
+                return Err(ApiError::bad_request(
+                    "this session cannot resume on that target",
+                ));
+            }
         }
         ControllerAction::Open { session_id }
         | ControllerAction::Close { session_id }
@@ -1358,6 +1381,29 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn resume_action_refuses_a_target_the_session_cannot_use() {
+        let (config, state) = sample_config_state();
+        let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
+        assert_eq!(
+            snapshot.sessions[0].incompatible_resume_targets,
+            vec!["raw".to_owned()]
+        );
+
+        let error = validate_action(
+            &ControllerAction::Resume {
+                session_id: "session-1".into(),
+                profile_id: "codex-1".into(),
+                target_id: "raw".into(),
+                queue: ResumeQueueDisposition::Start,
+            },
+            &snapshot,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -2022,34 +2022,15 @@ impl Controller {
             .targets
             .get(target_id)
             .with_context(|| format!("unknown target template {target_id:?}"))?;
-        if let Some(project_directory) = &previous.project_directory {
-            if let Some(worktree) = &previous.managed_worktree {
-                let resume_target = managed_worktree_target(target_template)?;
-                if resume_target != worktree.target {
-                    bail!("managed raw project sessions must resume on their original host");
-                }
-            } else {
-                let previous_template = self
-                    .config
-                    .targets
-                    .get(&previous.target_template_id)
-                    .context("previous bare target template is missing")?;
-                if !is_bare_project_target(target_template)
-                    || matches!(previous_template, TargetTemplate::LocalBare)
-                        != matches!(target_template, TargetTemplate::LocalBare)
-                {
-                    bail!("raw project sessions must resume on the same bare target kind");
-                }
-            }
+        // Decide the representation before the record changes, so an
+        // incompatible target fails here instead of during provisioning.
+        let plan = resume_compatibility(&previous, &self.config, target_id)
+            .map_err(|reason| anyhow::anyhow!("{reason}"))?;
+        if plan == ResumePlan::InPlace
+            && let Some(project_directory) = &previous.project_directory
+        {
             self.validate_project_directory(target_id, project_directory, executor)
                 .context("raw project is unavailable for resume")?;
-        } else if matches!(target_template, TargetTemplate::LocalBare) {
-            // A local bare target has no managed workspace to restore a bundle
-            // into. Fail here, before the record changes, instead of failing
-            // during provisioning and rolling back.
-            bail!(
-                "this session was created from a project bundle; a local bare target only hosts raw project sessions — resume it on a container, SSH, or EC2 target"
-            );
         }
         let resource_allocation =
             resource_allocation.or_else(|| previous.resource_allocation.clone());
@@ -5207,6 +5188,79 @@ fn is_bare_project_target(template: &TargetTemplate) -> bool {
         template,
         TargetTemplate::LocalBare | TargetTemplate::SshBare { .. }
     )
+}
+
+/// Why a bundle session cannot resume on a local bare target. A bare target has
+/// no managed workspace to restore the bundle into.
+const BUNDLE_ON_LOCAL_BARE: &str = "this session was created from a project bundle; a local bare target only hosts raw project sessions — resume it on a container, SSH, or EC2 target";
+
+/// What a resume has to do to the session record before it provisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumePlan {
+    /// Keep the session in the representation it already has.
+    InPlace,
+    /// Move a raw checkout session into a workspace target as a bundle session.
+    RawToWorkspace,
+    /// Move a bundle session out of its workspace into a raw local worktree.
+    WorkspaceToRaw,
+}
+
+/// Whether `session` may resume on `target_id`, and what the resume must do to
+/// the session record. The error is shown to the person choosing the target, so
+/// it says where the session is tied down and what to pick instead.
+///
+/// This decides representation only. It performs no I/O, so it can run on every
+/// row of a target picker.
+pub fn resume_compatibility(
+    session: &SessionRecord,
+    config: &HelConfig,
+    target_id: &str,
+) -> Result<ResumePlan, String> {
+    let Some(target) = config.targets.get(target_id) else {
+        return Err(format!("target {target_id} is no longer configured"));
+    };
+    let Some(project_directory) = &session.project_directory else {
+        if matches!(target, TargetTemplate::LocalBare) {
+            return Err(BUNDLE_ON_LOCAL_BARE.to_owned());
+        }
+        return Ok(ResumePlan::InPlace);
+    };
+    let directory = project_directory.display();
+    let Some(worktree) = &session.managed_worktree else {
+        let Some(previous) = config.targets.get(&session.target_template_id) else {
+            return Err(
+                "the bare target this session last used is no longer configured".to_owned(),
+            );
+        };
+        if is_bare_project_target(target)
+            && matches!(previous, TargetTemplate::LocalBare)
+                == matches!(target, TargetTemplate::LocalBare)
+        {
+            return Ok(ResumePlan::InPlace);
+        }
+        return Err(format!(
+            "this session opens {directory} directly on its host; resume it on the same kind of bare target"
+        ));
+    };
+    match managed_worktree_target(target) {
+        Ok(resume_target) if resume_target == worktree.target => Ok(ResumePlan::InPlace),
+        Ok(_) => Err(format!(
+            "this session's working tree lives on {}; resume it there",
+            managed_worktree_location(&worktree.target)
+        )),
+        Err(_) => Err(format!(
+            "this session works directly in {directory} on {}; resume it on a bare target there",
+            managed_worktree_location(&worktree.target)
+        )),
+    }
+}
+
+/// Where a managed worktree's checkout physically lives, in words a user reads.
+fn managed_worktree_location(target: &ManagedWorktreeTarget) -> String {
+    match target {
+        ManagedWorktreeTarget::Local => "this machine".to_owned(),
+        ManagedWorktreeTarget::Ssh { destination, .. } => destination.clone(),
+    }
 }
 
 pub(crate) fn backend_ssh(ssh: &SshConnection) -> SshTarget {
@@ -8878,6 +8932,195 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    /// Config with one container target, one local bare target, and one SSH
+    /// bare target, which is every shape `resume_compatibility` distinguishes.
+    fn resume_compatibility_config() -> HelConfig {
+        let mut config = HelConfig::default();
+        config.targets.insert(
+            "podman".into(),
+            TargetTemplate::LocalPodman {
+                container: ConfigContainer {
+                    image: "example.invalid/hel-test:latest".into(),
+                    platform: None,
+                    cpus: None,
+                    memory: None,
+                    environment: BTreeMap::new(),
+                },
+            },
+        );
+        config
+            .targets
+            .insert("local-bare".into(), TargetTemplate::LocalBare);
+        config.targets.insert(
+            "ssh-bare".into(),
+            TargetTemplate::SshBare {
+                ssh: SshConnection {
+                    host: "builder".into(),
+                    user: Some("dev".into()),
+                    identity_file: None,
+                    extra_args: Vec::new(),
+                },
+                workspace_prefix: ".local/share/hel/workspaces".into(),
+            },
+        );
+        config
+    }
+
+    fn raw_session_on(target_template_id: &str, directory: &str) -> SessionRecord {
+        let mut session = checkpoint_test_session("0123456789abcdef0123456789abcdef");
+        session.state = SessionState::Archived;
+        session.bundle_id = "remote-project-abcdef".into();
+        session.project_directory = Some(PathBuf::from(directory));
+        session.target_template_id = target_template_id.into();
+        session
+    }
+
+    fn managed_raw_session(target: ManagedWorktreeTarget) -> SessionRecord {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let repository = PathBuf::from("/home/dev/project");
+        let worktree_root = repository.join(".hel").join("worktrees").join(session_id);
+        let mut session = raw_session_on(
+            match target {
+                ManagedWorktreeTarget::Local => "local-bare",
+                ManagedWorktreeTarget::Ssh { .. } => "ssh-bare",
+            },
+            &worktree_root.to_string_lossy(),
+        );
+        session.managed_worktree = Some(ManagedWorktree {
+            source_project_directory: repository.clone(),
+            source_repository: repository,
+            worktree_root,
+            branch: format!("hel/{session_id}"),
+            target,
+        });
+        session
+    }
+
+    fn ssh_worktree_target() -> ManagedWorktreeTarget {
+        managed_worktree_target(&resume_compatibility_config().targets["ssh-bare"]).unwrap()
+    }
+
+    #[test]
+    fn bundle_sessions_resume_on_any_workspace_target() {
+        let config = resume_compatibility_config();
+        let session = checkpoint_test_session("0123456789abcdef0123456789abcdef");
+
+        assert_eq!(
+            resume_compatibility(&session, &config, "podman"),
+            Ok(ResumePlan::InPlace)
+        );
+        assert_eq!(
+            resume_compatibility(&session, &config, "ssh-bare"),
+            Ok(ResumePlan::InPlace)
+        );
+    }
+
+    #[test]
+    fn bundle_sessions_refuse_a_local_bare_target_with_a_reason() {
+        let config = resume_compatibility_config();
+        let session = checkpoint_test_session("0123456789abcdef0123456789abcdef");
+
+        let reason = resume_compatibility(&session, &config, "local-bare").unwrap_err();
+
+        assert!(reason.contains("created from a project bundle"), "{reason}");
+        assert!(
+            reason.contains("resume it on a container, SSH, or EC2 target"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn managed_raw_sessions_resume_on_their_own_worktree_host() {
+        let config = resume_compatibility_config();
+
+        assert_eq!(
+            resume_compatibility(
+                &managed_raw_session(ManagedWorktreeTarget::Local),
+                &config,
+                "local-bare",
+            ),
+            Ok(ResumePlan::InPlace)
+        );
+        assert_eq!(
+            resume_compatibility(
+                &managed_raw_session(ssh_worktree_target()),
+                &config,
+                "ssh-bare",
+            ),
+            Ok(ResumePlan::InPlace)
+        );
+    }
+
+    #[test]
+    fn managed_raw_sessions_refuse_a_bare_target_on_another_host() {
+        let config = resume_compatibility_config();
+
+        let reason = resume_compatibility(
+            &managed_raw_session(ManagedWorktreeTarget::Local),
+            &config,
+            "ssh-bare",
+        )
+        .unwrap_err();
+        assert!(reason.contains("this machine"), "{reason}");
+
+        let reason = resume_compatibility(
+            &managed_raw_session(ssh_worktree_target()),
+            &config,
+            "local-bare",
+        )
+        .unwrap_err();
+        assert!(reason.contains("dev@builder"), "{reason}");
+    }
+
+    #[test]
+    fn managed_raw_sessions_refuse_a_container_target_with_a_reason() {
+        let config = resume_compatibility_config();
+
+        let reason = resume_compatibility(
+            &managed_raw_session(ManagedWorktreeTarget::Local),
+            &config,
+            "podman",
+        )
+        .unwrap_err();
+
+        assert!(reason.contains("works directly in"), "{reason}");
+        assert!(reason.contains("/home/dev/project"), "{reason}");
+    }
+
+    #[test]
+    fn unmanaged_raw_sessions_require_the_same_bare_target_kind() {
+        let config = resume_compatibility_config();
+        let local = raw_session_on("local-bare", "/home/dev/project");
+        let remote = raw_session_on("ssh-bare", "/srv/project");
+
+        assert_eq!(
+            resume_compatibility(&local, &config, "local-bare"),
+            Ok(ResumePlan::InPlace)
+        );
+        assert_eq!(
+            resume_compatibility(&remote, &config, "ssh-bare"),
+            Ok(ResumePlan::InPlace)
+        );
+        for (session, target) in [
+            (&local, "ssh-bare"),
+            (&remote, "local-bare"),
+            (&local, "podman"),
+        ] {
+            let reason = resume_compatibility(session, &config, target).unwrap_err();
+            assert!(reason.contains("directly on its host"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn resume_compatibility_names_a_target_that_is_gone() {
+        let config = resume_compatibility_config();
+        let session = checkpoint_test_session("0123456789abcdef0123456789abcdef");
+
+        let reason = resume_compatibility(&session, &config, "retired").unwrap_err();
+
+        assert!(reason.contains("retired"), "{reason}");
     }
 
     #[test]
