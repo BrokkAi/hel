@@ -3,14 +3,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, watch};
 
 use crate::hel_config::{HarnessKind, HelConfig, atomic_write, data_dir, validate_id};
 use crate::hel_targets::{AdditionalMount, validate_additional_mounts};
-use crate::hel_worker::{RELAY_EVENT_GENESIS_DIGEST, SequencedEvent, WorkerEvent};
+use crate::hel_worker::{
+    RELAY_EVENT_GENESIS_DIGEST, RelayOperationalState, SequencedEvent, WorkerEvent,
+};
 
 pub const STATE_VERSION: u32 = 1;
 
@@ -42,114 +46,7 @@ pub enum MaterializedExecutionState {
     Closed,
 }
 
-/// The current value of one logical transcript item. ACP structures whose
-/// schemas can grow are kept as JSON values, while logical item identity and
-/// lifecycle remain controller-owned and stable.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TranscriptBody {
-    User {
-        content: Vec<serde_json::Value>,
-    },
-    Agent {
-        /// Complete ACP `ContentChunk` values, including message IDs, content
-        /// metadata, and non-text content blocks.
-        chunks: Vec<serde_json::Value>,
-        streaming: bool,
-    },
-    Thought {
-        /// Complete ACP `ContentChunk` values, including message IDs, content
-        /// metadata, and non-text content blocks.
-        chunks: Vec<serde_json::Value>,
-        streaming: bool,
-    },
-    Tool {
-        /// Complete current ACP `ToolCall`, updated field-for-field as
-        /// `ToolCallUpdate` notifications arrive.
-        call: serde_json::Value,
-    },
-    Plan {
-        /// Complete current ACP `Plan`, including entry priorities and all
-        /// plan- and entry-level metadata.
-        plan: serde_json::Value,
-    },
-    System {
-        text: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TranscriptItem {
-    pub stable_id: String,
-    /// Ordinal of the relay event that first created this logical item.
-    pub position: u64,
-    /// Ordinal of the most recent content chunk for an agent message. This is
-    /// `None` for every other logical item.
-    pub latest_content_event_ordinal: Option<u64>,
-    pub created_at_ms: i64,
-    pub last_changed_at_ms: i64,
-    pub body: TranscriptBody,
-}
-
-impl TranscriptItem {
-    pub fn is_nonempty_agent_message(&self) -> bool {
-        let TranscriptBody::Agent { chunks, .. } = &self.body else {
-            return false;
-        };
-        chunks.iter().any(|chunk| {
-            let Some(content) = chunk.get("content") else {
-                return false;
-            };
-            match content.get("type").and_then(serde_json::Value::as_str) {
-                Some("text") => content
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|text| !text.trim().is_empty()),
-                Some(_) => true,
-                None => false,
-            }
-        })
-    }
-
-    pub(crate) fn validate(&self, through: u64) -> Result<()> {
-        if self.stable_id.trim().is_empty() {
-            bail!("materialized transcript item has an empty stable id");
-        }
-        if self.position == 0 || self.position > through {
-            bail!(
-                "materialized transcript item {:?} has invalid position {} at frontier {through}",
-                self.stable_id,
-                self.position
-            );
-        }
-        match (&self.body, self.latest_content_event_ordinal) {
-            (TranscriptBody::Agent { .. }, Some(ordinal))
-                if ordinal >= self.position && ordinal <= through => {}
-            (TranscriptBody::Agent { .. }, Some(ordinal)) => bail!(
-                "materialized agent message {:?} has invalid latest content ordinal {ordinal} at position {} and frontier {through}",
-                self.stable_id,
-                self.position
-            ),
-            (TranscriptBody::Agent { .. }, None) => bail!(
-                "materialized agent message {:?} has no latest content ordinal",
-                self.stable_id
-            ),
-            (_, Some(ordinal)) => bail!(
-                "non-agent transcript item {:?} has latest content ordinal {ordinal}",
-                self.stable_id
-            ),
-            (_, None) => {}
-        }
-        if self.last_changed_at_ms < self.created_at_ms {
-            bail!(
-                "materialized transcript item {:?} changed before it was created",
-                self.stable_id
-            );
-        }
-        Ok(())
-    }
-}
+pub use crate::hel_transcript::{TranscriptBody, TranscriptItem};
 
 /// What a durable queue entry does when its turn comes.
 ///
@@ -286,6 +183,234 @@ impl MaterializedSession {
             }
         }
         Ok(())
+    }
+}
+
+/// A materialized session paired with the live worker's relay state. The
+/// session manager hands this to every reader that needs both the durable
+/// projection and the connection's operational status.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManagedSessionSnapshot {
+    pub materialized: MaterializedSession,
+    pub operational: RelayOperationalState,
+    /// Newest relay event observed by this live actor that reports an
+    /// authentication failure. This is intentionally ephemeral: it avoids
+    /// retaining raw replay pages or rescanning projected history.
+    pub latest_auth_failure_ordinal: Option<u64>,
+}
+
+/// One session's activity, reported to the recovery coordinator.
+#[derive(Debug, Clone)]
+pub struct RecoveryObservation {
+    pub session: SessionRecord,
+    pub config: HelConfig,
+    pub latest_completed_turn_ordinal: Option<u64>,
+    pub execution: MaterializedExecutionState,
+}
+
+pub fn latest_completed_turn_ordinal(session: &MaterializedSession) -> Option<u64> {
+    if session.execution != MaterializedExecutionState::Idle {
+        return None;
+    }
+    session
+        .transcript
+        .iter()
+        .rev()
+        .find(|item| matches!(item.body, TranscriptBody::User { .. }))
+        .map(|item| item.position)
+}
+
+/// Reports session activity to the recovery coordinator.
+///
+/// Reporting is a queued hand-off, never a round trip: the caller is often a
+/// UI event loop, and a copy decision must never hold that loop up. The queue
+/// is unbounded so an observation is never dropped, which matters because the
+/// idle observation that ends a turn is the one that makes a copy due. Queue
+/// depth stays small in practice: the coordinator only folds an observation
+/// into per-session policy state and hands the copy itself to another task.
+/// It does pause while it records a failed copy, and the queue is what absorbs
+/// that pause instead of the caller.
+///
+/// A caller that must know no copy can start uses [`RecoveryObserver::reserve`]
+/// rather than the queue: the reservation blocks a copy from starting whether
+/// or not queued observations have been read yet.
+#[derive(Clone)]
+pub struct RecoveryObserver {
+    pub(crate) observations: mpsc::UnboundedSender<RecoveryObservation>,
+    pub(crate) busy: watch::Receiver<BTreeSet<String>>,
+    pub(crate) gate: Arc<RecoveryGate>,
+}
+
+/// A per-session reservation held by a foreground lifecycle operation. The
+/// coordinator cannot start another recovery copy until this value is dropped.
+pub struct RecoveryReservation {
+    session_id: String,
+    gate: Arc<RecoveryGate>,
+}
+
+impl Drop for RecoveryReservation {
+    fn drop(&mut self) {
+        self.gate.release(&self.session_id);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RecoveryGate {
+    state: Mutex<RecoveryGateState>,
+}
+
+#[derive(Default)]
+struct RecoveryGateState {
+    /// In-flight copies, each with the cancel flag its executor watches, so a
+    /// foreground lifecycle operation can preempt one instead of waiting.
+    busy: BTreeMap<String, Arc<AtomicBool>>,
+    reservations: BTreeMap<String, usize>,
+}
+
+impl RecoveryGate {
+    pub(crate) fn reserve(self: &Arc<Self>, session_id: &str) -> RecoveryReservation {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        *state.reservations.entry(session_id.to_owned()).or_default() += 1;
+        RecoveryReservation {
+            session_id: session_id.to_owned(),
+            gate: self.clone(),
+        }
+    }
+
+    fn release(&self, session_id: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(count) = state.reservations.get_mut(session_id) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            state.reservations.remove(session_id);
+        }
+    }
+
+    /// Claims the session for a copy and returns the cancel flag that copy
+    /// must watch, or `None` when a copy or a reservation already holds it.
+    pub(crate) fn try_start(&self, session_id: &str) -> Option<Arc<AtomicBool>> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.busy.contains_key(session_id) || state.reservations.contains_key(session_id) {
+            return None;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        state.busy.insert(session_id.to_owned(), cancelled.clone());
+        Some(cancelled)
+    }
+
+    pub(crate) fn finish(&self, session_id: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .busy
+            .remove(session_id);
+    }
+
+    pub(crate) fn is_busy(&self, session_id: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .busy
+            .contains_key(session_id)
+    }
+
+    /// Asks the in-flight copy for this session, if any, to stop.
+    pub(crate) fn cancel_busy(&self, session_id: &str) {
+        if let Some(cancelled) = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .busy
+            .get(session_id)
+        {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    /// Asks every in-flight copy to stop, used when the coordinator shuts down.
+    pub(crate) fn cancel_all(&self) {
+        for cancelled in self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .busy
+            .values()
+        {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn busy_sessions(&self) -> BTreeSet<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .busy
+            .keys()
+            .cloned()
+            .collect()
+    }
+}
+
+/// What a chat view or session lifecycle operation holds to report activity
+/// to, and check busy status with, the recovery coordinator for one session.
+#[derive(Clone)]
+pub struct RecoveryContext {
+    pub observer: RecoveryObserver,
+    pub session: SessionRecord,
+    pub config: HelConfig,
+}
+
+impl RecoveryContext {
+    pub fn observe(&self, materialized: &MaterializedSession) {
+        self.observer.observe(RecoveryObservation {
+            session: self.session.clone(),
+            config: self.config.clone(),
+            latest_completed_turn_ordinal: latest_completed_turn_ordinal(materialized),
+            execution: materialized.execution,
+        });
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.observer.is_busy(&self.session.id)
+    }
+}
+
+impl RecoveryObserver {
+    /// Queues one observation for the coordinator. Returns as soon as the
+    /// observation is queued; a stopped coordinator makes this a no-op.
+    pub fn observe(&self, observation: RecoveryObservation) {
+        let _ = self.observations.send(observation);
+    }
+
+    pub fn is_busy(&self, session_id: &str) -> bool {
+        self.gate.is_busy(session_id)
+    }
+
+    /// Holds off any recovery copy for this session until the returned
+    /// reservation is dropped. This, not the observation queue, is what a
+    /// lifecycle operation relies on: queued observations may still be
+    /// unread, and the coordinator refuses to start a copy for a reserved
+    /// session whenever it reads them.
+    pub fn reserve(&self, session_id: &str) -> RecoveryReservation {
+        self.gate.reserve(session_id)
+    }
+
+    /// Asks an in-flight recovery copy for this session to stop. A foreground
+    /// lifecycle operation calls this after reserving so it preempts the copy
+    /// instead of waiting behind it.
+    pub fn cancel_busy(&self, session_id: &str) {
+        self.gate.cancel_busy(session_id);
+    }
+
+    pub async fn wait_idle(&self, session_id: &str) {
+        let mut busy = self.busy.clone();
+        while self.is_busy(session_id) {
+            if busy.changed().await.is_err() {
+                break;
+            }
+        }
     }
 }
 
@@ -448,6 +573,22 @@ impl SessionResourceAllocation {
             }
             _ => Ok(()),
         }
+    }
+}
+
+/// The CPU count an allocation grants, regardless of target kind.
+pub fn allocation_cpus(allocation: &SessionResourceAllocation) -> u64 {
+    match allocation {
+        SessionResourceAllocation::Container { cpus, .. } => *cpus,
+        SessionResourceAllocation::AwsEc2 { vcpus, .. } => *vcpus,
+    }
+}
+
+/// The memory, in bytes, an allocation grants, regardless of target kind.
+pub fn allocation_memory(allocation: &SessionResourceAllocation) -> u64 {
+    match allocation {
+        SessionResourceAllocation::Container { memory_bytes, .. }
+        | SessionResourceAllocation::AwsEc2 { memory_bytes, .. } => *memory_bytes,
     }
 }
 

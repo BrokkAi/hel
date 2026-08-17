@@ -1,6 +1,7 @@
 //! Hel's reusable controller, worker, and session-management core.
 
 mod claude_usage;
+pub mod clock;
 mod codex_usage;
 mod grok_usage;
 pub mod speech;
@@ -33,6 +34,7 @@ pub mod hel_skills;
 pub mod hel_state;
 pub mod hel_subprocess;
 pub mod hel_targets;
+pub mod hel_transcript;
 pub mod hel_worker;
 pub mod hel_worker_client;
 pub mod hel_worker_protocol;

@@ -7,10 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hel_config::HarnessKind;
 
-/// File in which a running worker daemon records its own PID, inside its
-/// worker root. Session teardown reads it to stop that daemon before the root
-/// it writes to is removed.
-pub const WORKER_PID_FILE: &str = "worker.pid";
+pub use crate::hel_worker::WORKER_PID_FILE;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

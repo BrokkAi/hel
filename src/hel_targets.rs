@@ -1825,7 +1825,7 @@ hel_ps -eo pid=,args= | while read -r hel_pid hel_args; do
     esac
 done"#,
         root = posix_quote(worker_root),
-        pid_file = crate::hel_worker_runtime::WORKER_PID_FILE,
+        pid_file = crate::hel_worker::WORKER_PID_FILE,
     )
 }
 
