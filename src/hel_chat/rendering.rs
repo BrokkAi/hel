@@ -614,6 +614,58 @@ pub(super) fn display_width(text: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(text)
 }
 
+/// Truncate a styled line to `width` characters, keeping each span's style and
+/// marking the cut with `…` in the style of the span it landed in.
+pub(super) fn truncate_line_to_width(line: Line<'static>, width: usize) -> Line<'static> {
+    let total = line
+        .spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum::<usize>();
+    if total <= width {
+        return line;
+    }
+    let budget = width.saturating_sub(1);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for span in line.spans {
+        if used >= budget {
+            if width > 0 {
+                spans.push(Span::styled("…", span.style));
+            }
+            return Line::from(spans);
+        }
+        let count = span.content.chars().count();
+        if used + count <= budget {
+            used += count;
+            spans.push(span);
+        } else {
+            let kept = span.content.chars().take(budget - used).collect::<String>();
+            let style = span.style;
+            if !kept.is_empty() {
+                spans.push(Span::styled(kept, style));
+            }
+            if width > 0 {
+                spans.push(Span::styled("…", style));
+            }
+            return Line::from(spans);
+        }
+    }
+    Line::from(spans)
+}
+
+pub(super) fn truncate_to_width(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let mut truncated = text.chars().take(width - 1).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
