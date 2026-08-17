@@ -1,0 +1,1755 @@
+//! Durable storage for the relay: the on-disk journal of sealed and active
+//! segments, snapshot persistence, restart recovery, and the parts of
+//! `DurableRelay` that make an event or a snapshot durable before it is
+//! acknowledged to a caller.
+
+use std::collections::{BTreeSet, VecDeque};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, Write};
+use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow, bail};
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use serde_json::Value;
+
+use crate::hel_archive::CanonicalQueuedCommandKind;
+
+use super::snapshot::{
+    RelayCommand, RelayDispatchState, RelayEvent, RelayObservation, RelaySnapshot,
+    apply_relay_event, clamp_observation, ensure_byte_budget, ensure_serialized_budget,
+    relay_event_digest, validate_relay_event,
+};
+use super::types::RESTORED_CANONICAL_SESSION_FILE;
+use super::{
+    DurableRelay, RELAY_ACTIVE_SEGMENT, RELAY_EVENT_BYTE_BUDGET, RELAY_EVENT_ENVELOPE_RESERVE,
+    RELAY_HOT_EVENT_CAPACITY, RELAY_JOURNAL_DIR, RELAY_SEGMENT_BYTE_LIMIT,
+    RELAY_SNAPSHOT_BYTE_BUDGET, RELAY_STATE_BYTE_BUDGET, RELAY_STATE_FILE, now_unix_millis,
+};
+
+#[derive(Debug, Clone)]
+pub(crate) struct RelayJournalSpan {
+    pub(crate) path: PathBuf,
+    /// Physical first ordinal in `path`; it may precede `after_ordinal` when a
+    /// crash left an overlapping active/sealed copy.
+    pub(crate) file_first_ordinal: u64,
+    pub(crate) file_first_previous_digest: String,
+    pub(crate) file_last_ordinal: u64,
+    pub(crate) file_last_digest: String,
+    /// This canonical span contributes only ordinals greater than this value.
+    pub(crate) after_ordinal: u64,
+}
+
+pub(crate) fn persist_relay_snapshot(root: &Path, snapshot: &RelaySnapshot) -> Result<()> {
+    let body = serde_json::to_vec_pretty(snapshot)?;
+    ensure_byte_budget(body.len(), RELAY_SNAPSHOT_BYTE_BUDGET, "relay snapshot")?;
+    crate::hel_config::atomic_write(&root.join(RELAY_STATE_FILE), &body)
+}
+
+pub(crate) fn open_relay_journal(
+    journal: &Path,
+    retained_through: u64,
+    retained_digest: &str,
+    snapshot_ordinal: u64,
+    snapshot: &mut RelaySnapshot,
+) -> Result<(Vec<RelayJournalSpan>, VecDeque<RelayEvent>)> {
+    let mut paths = Vec::new();
+    if journal.exists() {
+        for entry in fs::read_dir(journal)? {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .is_some_and(|name| name == RELAY_ACTIVE_SEGMENT)
+                || path.extension().is_some_and(|extension| extension == "gz")
+            {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    let active = journal.join(RELAY_ACTIVE_SEGMENT);
+    let mut files = Vec::new();
+    for path in paths {
+        if let Some(metadata) = inspect_relay_journal_file(&path, path == active)? {
+            files.push(metadata);
+        }
+    }
+
+    let original_frontiers = [
+        (
+            "snapshot",
+            snapshot.latest_ordinal,
+            snapshot.latest_digest.clone(),
+        ),
+        (
+            "acknowledgement",
+            snapshot.acknowledged_through,
+            snapshot.acknowledged_digest.clone(),
+        ),
+        (
+            "recovery floor",
+            snapshot.recovery_floor_ordinal,
+            snapshot.recovery_floor_digest.clone(),
+        ),
+    ];
+    for (name, ordinal, digest) in &original_frontiers {
+        if *ordinal == retained_through && digest != retained_digest {
+            bail!("relay {name} digest conflicts with retained frontier");
+        }
+    }
+
+    let journal_latest = files
+        .iter()
+        .map(|file| file.file_last_ordinal)
+        .max()
+        .unwrap_or(retained_through);
+    let mut previous_ordinal = retained_through;
+    let mut previous_digest = retained_digest.to_owned();
+    let mut spans = Vec::new();
+    let mut hot_events = VecDeque::new();
+
+    while previous_ordinal < journal_latest {
+        let next_ordinal = previous_ordinal
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("relay event ordinal exhausted"))?;
+        let Some(candidate) = files
+            .iter()
+            .filter(|file| {
+                file.file_first_ordinal <= next_ordinal && file.file_last_ordinal > previous_ordinal
+            })
+            .max_by_key(|file| (file.file_last_ordinal, usize::from(file.path == active)))
+            .cloned()
+        else {
+            bail!("relay journal has a gap after event {previous_ordinal}");
+        };
+        let contribution_after = previous_ordinal;
+        let mut overlap_verified = candidate.file_first_ordinal == next_ordinal;
+        visit_relay_journal_file(&candidate.path, false, |event, _| {
+            if event.ordinal < contribution_after {
+                return Ok(ControlFlow::Continue(()));
+            }
+            if event.ordinal == contribution_after {
+                if event.digest != previous_digest {
+                    bail!(
+                        "overlapping relay journal {} conflicts at event {}",
+                        candidate.path.display(),
+                        event.ordinal
+                    );
+                }
+                overlap_verified = true;
+                return Ok(ControlFlow::Continue(()));
+            }
+            if !overlap_verified {
+                bail!(
+                    "overlapping relay journal {} does not contain boundary event {}",
+                    candidate.path.display(),
+                    contribution_after
+                );
+            }
+            validate_relay_event(previous_ordinal, &previous_digest, &event)
+                .context("validate relay journal event chain")?;
+            for (name, ordinal, digest) in &original_frontiers {
+                if event.ordinal == *ordinal && event.digest != *digest {
+                    bail!(
+                        "relay {name} digest conflicts with journal event {}",
+                        event.ordinal
+                    );
+                }
+            }
+            if event.ordinal > snapshot_ordinal {
+                apply_relay_event(snapshot, &event)?;
+            }
+            previous_ordinal = event.ordinal;
+            previous_digest = event.digest.clone();
+            if hot_events.len() == RELAY_HOT_EVENT_CAPACITY {
+                hot_events.pop_front();
+            }
+            hot_events.push_back(event);
+            Ok(ControlFlow::Continue(()))
+        })?;
+        if previous_ordinal != candidate.file_last_ordinal {
+            bail!(
+                "relay journal {} ended at event {previous_ordinal}, expected {}",
+                candidate.path.display(),
+                candidate.file_last_ordinal
+            );
+        }
+        spans.push(RelayJournalSpan {
+            after_ordinal: contribution_after,
+            ..candidate
+        });
+    }
+
+    if journal_latest < snapshot_ordinal {
+        bail!(
+            "relay snapshot frontier {} is ahead of retained journal {journal_latest}",
+            snapshot_ordinal
+        );
+    }
+    for (name, ordinal, _) in &original_frontiers {
+        if *ordinal > retained_through && *ordinal > journal_latest {
+            bail!("relay {name} event {ordinal} is not retained");
+        }
+    }
+
+    // An active copy left behind by a crash may be fully covered by a sealed
+    // span. Keep it as a zero-width canonical span when it reaches the current
+    // frontier so future appends remain contiguous. A stale shorter active
+    // copy is safe to truncate because the selected sealed chain covers it.
+    if let Some(active_file) = files.iter().find(|file| file.path == active)
+        && !spans.iter().any(|span| span.path == active)
+    {
+        if active_file.file_last_ordinal == previous_ordinal {
+            spans.push(RelayJournalSpan {
+                after_ordinal: previous_ordinal,
+                ..active_file.clone()
+            });
+        } else if active_file.file_last_ordinal < previous_ordinal {
+            truncate_active_relay_journal(journal, &active)?;
+        }
+    }
+    let canonical_paths = spans
+        .iter()
+        .map(|span| span.path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut removed_redundant_copy = false;
+    for file in &files {
+        if file
+            .path
+            .extension()
+            .is_some_and(|extension| extension == "gz")
+            && !canonical_paths.contains(&file.path)
+        {
+            fs::remove_file(&file.path).with_context(|| {
+                format!("remove redundant relay segment {}", file.path.display())
+            })?;
+            removed_redundant_copy = true;
+        }
+    }
+    if removed_redundant_copy {
+        sync_directory(journal)?;
+    }
+    Ok((spans, hot_events))
+}
+
+fn seal_active_relay_segment(journal: &Path, metadata: &mut RelayJournalSpan) -> Result<()> {
+    let active = journal.join(RELAY_ACTIVE_SEGMENT);
+    let sealed_name = format!(
+        "segment-{:020}-{:020}.jsonl.gz",
+        metadata.file_first_ordinal, metadata.file_last_ordinal
+    );
+    let temporary = journal.join(format!("{sealed_name}.new"));
+    let destination = journal.join(sealed_name);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    let mut encoder = GzEncoder::new(file, Compression::default());
+    visit_relay_journal_file(&active, false, |event, _| {
+        serde_json::to_writer(&mut encoder, &event)?;
+        encoder.write_all(b"\n")?;
+        Ok(ControlFlow::Continue(()))
+    })?;
+    let file = encoder.finish()?;
+    file.sync_all()?;
+    fs::rename(&temporary, &destination)?;
+    // The sealed copy must be durable before the active segment is replaced.
+    sync_directory(journal)?;
+
+    let replacement = journal.join("active.jsonl.new");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&replacement)?;
+    file.sync_all()?;
+    fs::rename(&replacement, active)?;
+    // From this point the live active path is empty. Publish the sealed path
+    // in memory before the final directory sync so even a reported sync error
+    // cannot make a subsequent retry append against stale file metadata.
+    metadata.path = destination;
+    sync_directory(journal)
+}
+
+fn inspect_relay_journal_file(
+    path: &Path,
+    repair_partial_tail: bool,
+) -> Result<Option<RelayJournalSpan>> {
+    let mut first: Option<RelayEvent> = None;
+    let mut previous: Option<RelayEvent> = None;
+    visit_relay_journal_file(path, repair_partial_tail, |event, encoded_len| {
+        ensure_byte_budget(encoded_len, RELAY_EVENT_BYTE_BUDGET, "relay event")?;
+        if let Some(previous) = &previous {
+            validate_relay_event(previous.ordinal, &previous.digest, &event)
+                .with_context(|| format!("validate relay journal {}", path.display()))?;
+        } else {
+            let previous_ordinal = event
+                .ordinal
+                .checked_sub(1)
+                .ok_or_else(|| anyhow!("relay event ordinal zero is invalid"))?;
+            validate_relay_event(previous_ordinal, &event.previous_digest, &event)
+                .with_context(|| format!("validate relay journal {}", path.display()))?;
+            first = Some(event.clone());
+        }
+        previous = Some(event);
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(first.zip(previous).map(|(first, last)| RelayJournalSpan {
+        path: path.to_owned(),
+        file_first_ordinal: first.ordinal,
+        file_first_previous_digest: first.previous_digest,
+        file_last_ordinal: last.ordinal,
+        file_last_digest: last.digest,
+        after_ordinal: 0,
+    }))
+}
+
+pub(crate) fn visit_relay_journal_file(
+    path: &Path,
+    repair_partial_tail: bool,
+    mut visitor: impl FnMut(RelayEvent, usize) -> Result<ControlFlow<()>>,
+) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let compressed = path.extension().is_some_and(|extension| extension == "gz");
+    if compressed {
+        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let decoder = GzDecoder::new(file);
+        let mut reader = std::io::BufReader::new(decoder);
+        visit_relay_journal_reader(path, &mut reader, false, &mut visitor)?;
+        return Ok(());
+    }
+
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let scan = visit_relay_journal_reader(path, &mut reader, repair_partial_tail, &mut visitor)?;
+    drop(reader);
+    if let Some(valid_len) = scan.truncate_to {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .with_context(|| format!("open torn relay journal {}", path.display()))?;
+        file.set_len(valid_len)?;
+        file.sync_data()?;
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+    }
+    Ok(())
+}
+
+struct RelayJournalScan {
+    truncate_to: Option<u64>,
+}
+
+fn visit_relay_journal_reader(
+    path: &Path,
+    reader: &mut impl BufRead,
+    repair_partial_tail: bool,
+    visitor: &mut impl FnMut(RelayEvent, usize) -> Result<ControlFlow<()>>,
+) -> Result<RelayJournalScan> {
+    let mut line = Vec::new();
+    let mut complete_bytes = 0_u64;
+    loop {
+        let (consumed, terminated) = read_bounded_line(reader, &mut line, RELAY_EVENT_BYTE_BUDGET)
+            .with_context(|| format!("read relay journal {}", path.display()))?;
+        if consumed == 0 {
+            return Ok(RelayJournalScan { truncate_to: None });
+        }
+        if !terminated && repair_partial_tail {
+            return Ok(RelayJournalScan {
+                truncate_to: Some(complete_bytes),
+            });
+        }
+        complete_bytes = complete_bytes
+            .checked_add(u64::try_from(consumed).context("relay journal length overflow")?)
+            .ok_or_else(|| anyhow!("relay journal length overflow"))?;
+        if line.is_empty() {
+            continue;
+        }
+        let event = serde_json::from_slice(&line)
+            .with_context(|| format!("parse relay journal {}", path.display()))?;
+        if visitor(event, line.len())?.is_break() {
+            return Ok(RelayJournalScan { truncate_to: None });
+        }
+        if !terminated {
+            return Ok(RelayJournalScan { truncate_to: None });
+        }
+    }
+}
+
+pub(crate) fn read_bounded_line(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    maximum_bytes: usize,
+) -> Result<(usize, bool)> {
+    line.clear();
+    let mut consumed_total = 0_usize;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((consumed_total, false));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_bytes = newline.unwrap_or(available.len());
+        let next_len = line
+            .len()
+            .checked_add(content_bytes)
+            .ok_or_else(|| anyhow!("relay journal line length overflow"))?;
+        ensure_byte_budget(next_len, maximum_bytes, "relay journal event")?;
+        line.extend_from_slice(&available[..content_bytes]);
+        let consumed = content_bytes + usize::from(newline.is_some());
+        reader.consume(consumed);
+        consumed_total = consumed_total
+            .checked_add(consumed)
+            .ok_or_else(|| anyhow!("relay journal length overflow"))?;
+        if newline.is_some() {
+            return Ok((consumed_total, true));
+        }
+    }
+}
+
+fn truncate_active_relay_journal(journal: &Path, active: &Path) -> Result<()> {
+    let replacement = journal.join("active.jsonl.new");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&replacement)?;
+    file.sync_all()?;
+    fs::rename(&replacement, active)?;
+    sync_directory(journal)
+}
+
+#[derive(Debug)]
+pub(crate) struct RestoredRelaySeed {
+    pub(crate) event_frontier: u64,
+    pub(crate) event_frontier_digest: String,
+    pub(crate) queued_prompts: Vec<RestoredQueuedPrompt>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RestoredQueuedPrompt {
+    pub(crate) command_id: String,
+    pub(crate) kind: CanonicalQueuedCommandKind,
+    pub(crate) content: Vec<Value>,
+    pub(crate) queued_at_ms: i64,
+}
+
+pub(crate) fn read_restored_relay_seed(root: &Path) -> Result<Option<RestoredRelaySeed>> {
+    let path = root.join(RESTORED_CANONICAL_SESSION_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let canonical: crate::hel_archive::CanonicalSessionSnapshot =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    canonical
+        .validate()
+        .with_context(|| format!("validate {}", path.display()))?;
+    Ok(Some(RestoredRelaySeed {
+        event_frontier: canonical.event_frontier,
+        event_frontier_digest: canonical.event_frontier_digest,
+        queued_prompts: canonical
+            .queued_prompts
+            .into_iter()
+            .map(|queued| RestoredQueuedPrompt {
+                command_id: queued.command_id,
+                kind: queued.kind,
+                content: queued.content,
+                queued_at_ms: queued.queued_at_ms,
+            })
+            .collect(),
+    }))
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    // Directory fsync is only available on Unix; Windows cannot open a
+    // directory handle through File::open.
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+impl DurableRelay {
+    #[cfg(test)]
+    fn retained_event_body_count(&self) -> usize {
+        self.hot_events.len()
+    }
+
+    pub(crate) fn append_relay_event(
+        &mut self,
+        command_id: Option<&str>,
+        observation: RelayObservation,
+    ) -> Result<u64> {
+        let ordinal = self
+            .snapshot
+            .latest_ordinal
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("relay event ordinal exhausted"))?;
+        // Clamp before digesting so the recorded digest covers what was
+        // actually written, and so recording an observation cannot fail on
+        // size alone.
+        let observation = clamp_observation(
+            observation,
+            RELAY_EVENT_BYTE_BUDGET - RELAY_EVENT_ENVELOPE_RESERVE,
+        )?;
+        let event = RelayEvent {
+            ordinal,
+            previous_digest: self.snapshot.latest_digest.clone(),
+            digest: String::new(),
+            recorded_at_ms: now_unix_millis(),
+            command_id: command_id.map(str::to_owned),
+            observation,
+        };
+        let event = RelayEvent {
+            digest: relay_event_digest(&event)?,
+            ..event
+        };
+        ensure_serialized_budget(&event, RELAY_EVENT_BYTE_BUDGET, "relay event")?;
+        let mut next_snapshot = self.snapshot.clone();
+        apply_relay_event(&mut next_snapshot, &event)?;
+        ensure_serialized_budget(&next_snapshot, RELAY_SNAPSHOT_BYTE_BUDGET, "relay snapshot")?;
+        ensure_serialized_budget(
+            &next_snapshot.operational_state(),
+            RELAY_STATE_BYTE_BUDGET,
+            "relay operational state",
+        )?;
+        self.seal_active_segment_if_needed()?;
+        let journal = self.root.join(RELAY_JOURNAL_DIR);
+        let path = journal.join(RELAY_ACTIVE_SEGMENT);
+        let created_active_segment = !path.exists();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        serde_json::to_writer(&mut file, &event)?;
+        file.write_all(b"\n")?;
+        file.sync_data()?;
+        if created_active_segment {
+            sync_directory(&journal)?;
+        }
+
+        self.snapshot = next_snapshot;
+        self.record_journal_append(&path, &event);
+        self.push_hot_event(event);
+        self.persist_snapshot()?;
+        Ok(ordinal)
+    }
+
+    pub(crate) fn persist_snapshot(&self) -> Result<()> {
+        persist_relay_snapshot(&self.root, &self.snapshot)
+    }
+
+    fn seal_active_segment_if_needed(&mut self) -> Result<()> {
+        let journal = self.root.join(RELAY_JOURNAL_DIR);
+        let active = journal.join(RELAY_ACTIVE_SEGMENT);
+        if !active.exists() || active.metadata()?.len() < RELAY_SEGMENT_BYTE_LIMIT {
+            return Ok(());
+        }
+        let Some(index) = self
+            .journal_spans
+            .iter()
+            .position(|span| span.path == active)
+        else {
+            bail!("active relay segment has data but no journal metadata");
+        };
+        seal_active_relay_segment(&journal, &mut self.journal_spans[index])
+    }
+
+    fn record_journal_append(&mut self, active: &Path, event: &RelayEvent) {
+        if let Some(span) = self
+            .journal_spans
+            .last_mut()
+            .filter(|span| span.path == active)
+        {
+            debug_assert_eq!(span.file_last_ordinal + 1, event.ordinal);
+            span.file_last_ordinal = event.ordinal;
+            span.file_last_digest = event.digest.clone();
+            return;
+        }
+        self.journal_spans.push(RelayJournalSpan {
+            path: active.to_owned(),
+            file_first_ordinal: event.ordinal,
+            file_first_previous_digest: event.previous_digest.clone(),
+            file_last_ordinal: event.ordinal,
+            file_last_digest: event.digest.clone(),
+            after_ordinal: event.ordinal - 1,
+        });
+    }
+
+    fn push_hot_event(&mut self, event: RelayEvent) {
+        if self.hot_events.len() == RELAY_HOT_EVENT_CAPACITY {
+            self.hot_events.pop_front();
+        }
+        self.hot_events.push_back(event);
+    }
+
+    fn rewrite_relay_journal(&mut self, retain_after: u64) -> Result<()> {
+        let journal = self.root.join(RELAY_JOURNAL_DIR);
+        fs::create_dir_all(&journal)?;
+        let replacement = journal.join("active.jsonl.new");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&replacement)?;
+        let mut first: Option<RelayEvent> = None;
+        let mut last: Option<RelayEvent> = None;
+        let mut written_through = retain_after;
+        for span in &self.journal_spans {
+            visit_relay_journal_file(&span.path, false, |event, _| {
+                if event.ordinal <= span.after_ordinal || event.ordinal <= written_through {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                if event.ordinal <= retain_after {
+                    written_through = event.ordinal;
+                    return Ok(ControlFlow::Continue(()));
+                }
+                let expected = written_through
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("relay event ordinal exhausted"))?;
+                if event.ordinal != expected {
+                    bail!(
+                        "relay journal rewrite has a gap: expected {expected}, found {}",
+                        event.ordinal
+                    );
+                }
+                serde_json::to_writer(&mut file, &event)?;
+                file.write_all(b"\n")?;
+                if first.is_none() {
+                    first = Some(event.clone());
+                }
+                written_through = event.ordinal;
+                last = Some(event);
+                Ok(ControlFlow::Continue(()))
+            })?;
+        }
+        file.sync_all()?;
+        let active = journal.join(RELAY_ACTIVE_SEGMENT);
+        let next_spans = match (first, last) {
+            (Some(first), Some(last)) => vec![RelayJournalSpan {
+                path: active.clone(),
+                file_first_ordinal: first.ordinal,
+                file_first_previous_digest: first.previous_digest,
+                file_last_ordinal: last.ordinal,
+                file_last_digest: last.digest,
+                after_ordinal: retain_after,
+            }],
+            (None, None) => Vec::new(),
+            _ => unreachable!("relay journal rewrite recorded only one boundary"),
+        };
+        fs::rename(&replacement, &active)?;
+        // Publish the new canonical path immediately after the atomic rename.
+        // If directory sync or redundant-copy cleanup fails, the live relay
+        // must not retain paths that no longer contain its canonical events.
+        self.journal_spans = next_spans;
+        // Make the replacement durable before removing any segment that may
+        // contain the same unacknowledged observations.
+        sync_directory(&journal)?;
+        for entry in fs::read_dir(&journal)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|extension| extension == "gz") {
+                fs::remove_file(path)?;
+            }
+        }
+        sync_directory(&journal)?;
+        Ok(())
+    }
+
+    pub(crate) fn garbage_collect_relay_history(&mut self) -> Result<()> {
+        let through = self.snapshot.retained_through();
+        let mut next_snapshot = self.snapshot.clone();
+        Self::prune_command_ledger(&mut next_snapshot, through);
+        let journal_floor = self
+            .journal_spans
+            .first()
+            .map_or(self.snapshot.latest_ordinal, |span| span.after_ordinal);
+
+        // Stage every in-memory mutation. The already-durable ACK/recovery
+        // frontiers make either the old or rewritten journal valid after a
+        // crash. Only publish the pruned ledger in memory after both durable
+        // writes succeed, so a transient write failure cannot forget command
+        // IDs while the daemon keeps serving retries.
+        if through > journal_floor {
+            self.rewrite_relay_journal(through)?;
+        }
+        persist_relay_snapshot(&self.root, &next_snapshot)?;
+        self.snapshot = next_snapshot;
+        self.hot_events.retain(|event| event.ordinal > through);
+        Ok(())
+    }
+
+    fn prune_command_ledger(snapshot: &mut RelaySnapshot, through: u64) {
+        let removable: Vec<String> = snapshot
+            .handled_commands
+            .iter()
+            .filter_map(|(command_id, handled)| {
+                if handled
+                    .terminal_ordinal
+                    .is_some_and(|terminal| terminal <= through)
+                {
+                    Some(command_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for command_id in removable {
+            snapshot.handled_commands.remove(&command_id);
+            snapshot.dispatches.remove(&command_id);
+        }
+    }
+
+    pub(crate) fn recover_nonterminal_commands(&mut self) -> Result<()> {
+        let mut relay_local: Vec<(u64, String)> = self
+            .snapshot
+            .dispatches
+            .iter()
+            .filter(|(_, dispatch)| {
+                dispatch.command.is_relay_local()
+                    && !matches!(
+                        dispatch.state,
+                        RelayDispatchState::Completed
+                            | RelayDispatchState::Rejected
+                            | RelayDispatchState::Interrupted
+                    )
+            })
+            .filter_map(|(command_id, _)| {
+                self.snapshot
+                    .handled_commands
+                    .get(command_id)
+                    .map(|handled| (handled.accepted_ordinal, command_id.clone()))
+            })
+            .collect();
+        relay_local.sort();
+        for (_, command_id) in relay_local {
+            self.finish_relay_local_command(&command_id)?;
+        }
+
+        // Checkpoint barriers are controller-owned coordination commands. A
+        // restarted relay has no owner that can complete them, regardless of
+        // whether they were merely accepted, started, or already ready.
+        let mut ownerless_barriers: Vec<(u64, String)> = self
+            .snapshot
+            .dispatches
+            .iter()
+            .filter(|(_, dispatch)| {
+                matches!(dispatch.command, RelayCommand::BeginCheckpoint { .. })
+                    && !matches!(
+                        dispatch.state,
+                        RelayDispatchState::Completed
+                            | RelayDispatchState::Rejected
+                            | RelayDispatchState::Interrupted
+                    )
+            })
+            .filter_map(|(command_id, _)| {
+                self.snapshot
+                    .handled_commands
+                    .get(command_id)
+                    .map(|handled| (handled.accepted_ordinal, command_id.clone()))
+            })
+            .collect();
+        ownerless_barriers.sort();
+        for (_, command_id) in ownerless_barriers {
+            self.record_command_interrupted(
+                &command_id,
+                "relay restarted without the controller that owned the checkpoint barrier",
+            )?;
+        }
+
+        let mut in_flight: Vec<(u64, String)> = self
+            .snapshot
+            .dispatches
+            .iter()
+            .filter(|(_, dispatch)| dispatch.state == RelayDispatchState::InFlight)
+            .filter_map(|(command_id, _)| {
+                self.snapshot
+                    .handled_commands
+                    .get(command_id)
+                    .map(|handled| (handled.accepted_ordinal, command_id.clone()))
+            })
+            .collect();
+        in_flight.sort();
+        let mut restored_close = false;
+        for (_, command_id) in in_flight {
+            if matches!(
+                self.snapshot.dispatches[&command_id].command,
+                RelayCommand::Close { .. }
+            ) {
+                // Closing an already-closed session is idempotent. Preserve
+                // the durable close intent across a relay process restart.
+                self.snapshot
+                    .dispatches
+                    .get_mut(&command_id)
+                    .expect("in-flight close disappeared")
+                    .state = RelayDispatchState::Pending;
+                restored_close = true;
+                continue;
+            }
+            self.record_command_interrupted(
+                &command_id,
+                "relay restarted while the ACP command was in flight; it was not replayed",
+            )?;
+        }
+        if restored_close {
+            self.persist_snapshot()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, SessionUpdate};
+
+    use super::*;
+    use crate::hel_worker::test_support::*;
+    use crate::hel_worker::{
+        ClaimedRelayCommand, RELAY_EVENT_GENESIS_DIGEST, RelayCommandKind, RelayCommandOutcome,
+        RelayCursor, RelayErrorCode, RelayErrorDetail, RelayExecutionState, RelayProtocolError,
+        RelayRequest, RelayResponseBody, RelayResponsePayload,
+    };
+
+    #[test]
+    fn restart_finishes_a_durably_accepted_queue_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "active-prompt", prompt("active"));
+        submit_relay(&mut relay, "queued-prompt", prompt("remove me"));
+        relay
+            .append_relay_event(
+                Some("remove-after-crash"),
+                RelayObservation::CommandQueued {
+                    command_id: "remove-after-crash".into(),
+                    command: RelayCommand::RemoveQueuedPrompt {
+                        queued_command_id: "queued-prompt".into(),
+                    },
+                    created_at_ms: now_unix_millis(),
+                },
+            )
+            .unwrap();
+        drop(relay);
+
+        let relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert!(relay.operational_state().queued_prompts.is_empty());
+        assert!(retained_events(&relay).iter().any(|event| matches!(
+            &event.observation,
+            RelayObservation::CommandCompleted {
+                command_id,
+                outcome: RelayCommandOutcome::QueueChanged { removed_command_ids },
+            } if command_id == "remove-after-crash"
+                && removed_command_ids == &["queued-prompt".to_owned()]
+        )));
+    }
+
+    #[test]
+    fn restart_finishes_a_durably_accepted_queue_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "active-prompt", prompt("active"));
+        submit_relay(&mut relay, "queued-one", prompt("one"));
+        submit_relay(&mut relay, "queued-two", prompt("two"));
+        relay
+            .append_relay_event(
+                Some("clear-after-crash"),
+                RelayObservation::CommandQueued {
+                    command_id: "clear-after-crash".into(),
+                    command: RelayCommand::ClearQueuedPrompts,
+                    created_at_ms: now_unix_millis(),
+                },
+            )
+            .unwrap();
+        drop(relay);
+
+        let relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert!(relay.operational_state().queued_prompts.is_empty());
+        assert!(retained_events(&relay).iter().any(|event| matches!(
+            &event.observation,
+            RelayObservation::CommandCompleted {
+                command_id,
+                outcome: RelayCommandOutcome::QueueChanged { removed_command_ids },
+            } if command_id == "clear-after-crash"
+                && removed_command_ids
+                    == &["queued-one".to_owned(), "queued-two".to_owned()]
+        )));
+    }
+
+    #[test]
+    fn restart_finishes_checkpoint_completion_before_releasing_ownerless_barriers() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let ready = ready_checkpoint(&mut relay, "barrier-command");
+        relay
+            .append_relay_event(
+                Some("complete-after-crash"),
+                RelayObservation::CommandQueued {
+                    command_id: "complete-after-crash".into(),
+                    command: RelayCommand::CompleteCheckpoint {
+                        barrier_command_id: "barrier-command".into(),
+                    },
+                    created_at_ms: now_unix_millis(),
+                },
+            )
+            .unwrap();
+        drop(relay);
+
+        let relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(relay.snapshot.recovery_floor_ordinal, ready.ordinal);
+        assert!(relay.snapshot.checkpoint_barrier.is_none());
+        assert!(!retained_events(&relay).iter().any(|event| matches!(
+            &event.observation,
+            RelayObservation::CommandInterrupted { command_id, .. }
+                if command_id == "barrier-command"
+        )));
+    }
+
+    #[test]
+    fn restart_interrupts_ownerless_checkpoint_but_preserves_accepted_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let expected = ready_checkpoint(&mut relay, "close-barrier");
+        submit_relay(
+            &mut relay,
+            "accepted-close",
+            RelayCommand::Close {
+                barrier_command_id: "close-barrier".into(),
+                expected,
+            },
+        );
+        drop(relay);
+
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert!(retained_events(&relay).iter().any(|event| matches!(
+            &event.observation,
+            RelayObservation::CommandInterrupted {
+                command_id,
+                command: RelayCommandKind::BeginCheckpoint,
+                ..
+            } if command_id == "close-barrier"
+        )));
+        assert_eq!(
+            relay.operational_state().execution,
+            RelayExecutionState::Closing
+        );
+        let claimed = relay.claim_pending_commands(true).unwrap();
+        assert!(matches!(
+            claimed.as_slice(),
+            [ClaimedRelayCommand {
+                command_id,
+                command: RelayCommand::Close { .. },
+                ..
+            }] if command_id == "accepted-close"
+        ));
+    }
+
+    #[test]
+    fn relay_command_submission_is_idempotent_across_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_ordinal;
+        {
+            let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+            first_ordinal = submit_relay(&mut relay, "stable-command", prompt("once"));
+        }
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let repeated = submit_relay(&mut relay, "stable-command", prompt("once"));
+        assert_eq!(repeated, first_ordinal);
+        assert_eq!(
+            retained_events(&relay)
+                .iter()
+                .filter(|event| matches!(
+                    &event.observation,
+                    RelayObservation::CommandQueued { command_id, .. }
+                        if command_id == "stable-command"
+                ))
+                .count(),
+            1
+        );
+
+        let response = relay.handle(relay_request(
+            "request-conflict",
+            RelayRequest::Submit {
+                command_id: "stable-command".into(),
+                command: prompt("different"),
+            },
+        ));
+        assert!(matches!(
+            response.body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::InvalidRequest,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn command_idempotency_survives_ack_until_checkpoint_covers_terminal_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let accepted = submit_relay(&mut relay, "checkpointed-command", prompt("once"));
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "checkpointed-command"
+        );
+        relay
+            .record_command_completed(
+                "checkpointed-command",
+                RelayCommandOutcome::Prompt {
+                    stop_reason: "end_turn".into(),
+                },
+            )
+            .unwrap();
+        let terminal = relay.latest_ordinal();
+        attach_relay(&mut relay, "attach-idempotency", 0);
+        acknowledge_relay(&mut relay, "ack-idempotency", terminal);
+        assert_eq!(
+            submit_relay(&mut relay, "checkpointed-command", prompt("once")),
+            accepted,
+            "ACK must not prune the stable command ID"
+        );
+
+        let ready = ready_checkpoint(&mut relay, "idempotency-barrier");
+        acknowledge_relay(&mut relay, "ack-idempotency-barrier", ready.ordinal);
+        submit_relay(
+            &mut relay,
+            "complete-idempotency-barrier",
+            RelayCommand::CompleteCheckpoint {
+                barrier_command_id: "idempotency-barrier".into(),
+            },
+        );
+        let accepted_again = submit_relay(&mut relay, "checkpointed-command", prompt("once"));
+        assert!(accepted_again > accepted);
+    }
+
+    #[test]
+    fn restart_redispatches_a_promoted_configuration_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "config-command", set_config("model", "sonnet"));
+        // The change was started but never handed to ACP.
+        assert!(queued_command_ids(&relay).is_empty());
+        drop(relay);
+
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let claimed = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].command_id, "config-command");
+        assert!(matches!(claimed[0].command, RelayCommand::SetConfig { .. }));
+    }
+
+    #[test]
+    fn restart_adopts_a_config_accepted_outside_the_durable_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        // The prompt is started but never handed to ACP, so restarting keeps
+        // it active instead of interrupting it.
+        submit_relay(&mut relay, "active-prompt", prompt("running"));
+        submit_relay(&mut relay, "config-queued", set_config("model", "sonnet"));
+        drop(relay);
+
+        // Rewrite the durable snapshot the way an older relay wrote it: the
+        // configuration change is accepted, but not in the command queue.
+        let state_path = temp.path().join(RELAY_STATE_FILE);
+        let mut state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        state["queued_prompts"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|queued| queued["command_id"] != "config-queued");
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(queued_command_ids(&relay), ["config-queued"]);
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "active-prompt"
+        );
+        finish_prompt(&mut relay, "active-prompt");
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "config-queued"
+        );
+    }
+
+    #[test]
+    fn acknowledgement_only_garbage_collects_through_a_verified_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        relay
+            .record_observation(RelayObservation::Warning {
+                message: "remember me".into(),
+            })
+            .unwrap();
+        let attach = attach_relay(&mut relay, "attach-1", 0);
+        assert!(matches!(
+            attach.body,
+            RelayResponseBody::Ok {
+                payload: RelayResponsePayload::Attached {
+                    ref events,
+                    through_ordinal: 1,
+                    ..
+                }
+            } if events.len() == 1
+        ));
+        let acknowledged = acknowledge_relay(&mut relay, "ack-1", 1);
+        assert!(matches!(
+            acknowledged.body,
+            RelayResponseBody::Ok {
+                payload: RelayResponsePayload::Acknowledged {
+                    through_ordinal: 1,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(
+            retained_events(&relay).len(),
+            1,
+            "ACK alone is not a recovery cut"
+        );
+
+        let ready = ready_checkpoint(&mut relay, "gc-barrier");
+        acknowledge_relay(&mut relay, "ack-checkpoint", ready.ordinal);
+        submit_relay(
+            &mut relay,
+            "complete-checkpoint",
+            RelayCommand::CompleteCheckpoint {
+                barrier_command_id: "gc-barrier".into(),
+            },
+        );
+        assert!(
+            retained_events(&relay)
+                .iter()
+                .all(|event| event.ordinal > ready.ordinal)
+        );
+
+        drop(relay);
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let stale = attach_relay(&mut relay, "attach-stale", 0);
+        assert!(matches!(
+            stale.body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::Desynchronized,
+                    detail: Some(RelayErrorDetail::Desynchronized {
+                        earliest_available,
+                        ..
+                    }),
+                    ..
+                }
+            } if earliest_available == ready.ordinal
+        ));
+    }
+
+    #[test]
+    fn relay_recovers_an_event_fsynced_before_its_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        drop(relay);
+        let event = RelayEvent {
+            ordinal: 1,
+            previous_digest: RELAY_EVENT_GENESIS_DIGEST.to_owned(),
+            digest: String::new(),
+            recorded_at_ms: now_unix_millis(),
+            command_id: None,
+            observation: RelayObservation::Warning {
+                message: "after journal fsync".into(),
+            },
+        };
+        let event = RelayEvent {
+            digest: relay_event_digest(&event).unwrap(),
+            ..event
+        };
+        let path = temp
+            .path()
+            .join(RELAY_JOURNAL_DIR)
+            .join(RELAY_ACTIVE_SEGMENT);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        serde_json::to_writer(&mut file, &event).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_all().unwrap();
+
+        let relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(relay.latest_ordinal(), 1);
+        assert_eq!(
+            relay.events_after(0, RELAY_EVENT_GENESIS_DIGEST).unwrap(),
+            vec![event]
+        );
+    }
+
+    #[test]
+    fn relay_truncates_a_torn_active_tail_before_appending_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        relay
+            .record_observation(RelayObservation::Warning {
+                message: "durable prefix".into(),
+            })
+            .unwrap();
+        let active = temp
+            .path()
+            .join(RELAY_JOURNAL_DIR)
+            .join(RELAY_ACTIVE_SEGMENT);
+        let durable_len = active.metadata().unwrap().len();
+        drop(relay);
+
+        let mut file = OpenOptions::new().append(true).open(&active).unwrap();
+        file.write_all(br#"{"ordinal":2,"previous_digest":"#)
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert!(active.metadata().unwrap().len() > durable_len);
+
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(relay.latest_ordinal(), 1);
+        assert_eq!(active.metadata().unwrap().len(), durable_len);
+        relay
+            .record_observation(RelayObservation::Warning {
+                message: "after repair".into(),
+            })
+            .unwrap();
+        drop(relay);
+
+        let relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(relay.latest_ordinal(), 2);
+        assert_eq!(retained_events(&relay).len(), 2);
+    }
+
+    #[test]
+    fn first_active_journal_file_is_reopenable_after_its_first_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        relay
+            .record_observation(RelayObservation::Warning {
+                message: "first durable event".into(),
+            })
+            .unwrap();
+        drop(relay);
+
+        let relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(relay.latest_ordinal(), 1);
+        assert_eq!(retained_events(&relay).len(), 1);
+    }
+
+    #[test]
+    fn failed_gc_persistence_keeps_command_idempotency_in_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let accepted = submit_relay(&mut relay, "keep-idempotent", prompt("once"));
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "keep-idempotent"
+        );
+        relay
+            .record_command_completed(
+                "keep-idempotent",
+                RelayCommandOutcome::Prompt {
+                    stop_reason: "end_turn".into(),
+                },
+            )
+            .unwrap();
+        let terminal = relay.latest_ordinal();
+        let digest = relay.latest_digest().to_owned();
+        relay.snapshot.acknowledged_through = terminal;
+        relay.snapshot.acknowledged_digest.clone_from(&digest);
+        relay.snapshot.recovery_floor_ordinal = terminal;
+        relay.snapshot.recovery_floor_digest = digest;
+        relay.persist_snapshot().unwrap();
+
+        let state_path = temp.path().join(RELAY_STATE_FILE);
+        fs::remove_file(&state_path).unwrap();
+        fs::create_dir(&state_path).unwrap();
+        let error = relay.garbage_collect_relay_history().unwrap_err();
+        assert!(format!("{error:#}").contains("relay-state.json"));
+        assert!(
+            relay
+                .snapshot
+                .handled_commands
+                .contains_key("keep-idempotent")
+        );
+        assert_eq!(
+            submit_relay(&mut relay, "keep-idempotent", prompt("once")),
+            accepted
+        );
+    }
+
+    #[test]
+    fn retry_resumes_a_relay_local_command_after_snapshot_persistence_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let state_path = temp.path().join(RELAY_STATE_FILE);
+        fs::remove_file(&state_path).unwrap();
+        fs::create_dir(&state_path).unwrap();
+        let command = RelayCommand::ClearQueuedPrompts;
+
+        let failed = relay.handle(relay_request(
+            "first-local-attempt",
+            RelayRequest::Submit {
+                command_id: "retry-local".into(),
+                command: command.clone(),
+            },
+        ));
+        assert!(matches!(
+            failed.body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::Internal,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(
+            relay.snapshot.dispatches["retry-local"].state,
+            RelayDispatchState::Queued
+        );
+
+        fs::remove_dir(&state_path).unwrap();
+        let retried = relay.handle(relay_request(
+            "retry-local-attempt",
+            RelayRequest::Submit {
+                command_id: "retry-local".into(),
+                command,
+            },
+        ));
+        assert!(matches!(
+            retried.body,
+            RelayResponseBody::Ok {
+                payload: RelayResponsePayload::Accepted { .. }
+            }
+        ));
+        assert_eq!(
+            relay.snapshot.dispatches["retry-local"].state,
+            RelayDispatchState::Completed
+        );
+    }
+
+    #[test]
+    fn duplicate_acknowledgement_retries_incomplete_journal_gc() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        relay
+            .record_observation(RelayObservation::Warning {
+                message: "collect after retry".into(),
+            })
+            .unwrap();
+        let through = relay.latest_ordinal();
+        let digest = relay.latest_digest().to_owned();
+        relay.snapshot.acknowledged_through = through;
+        relay.snapshot.acknowledged_digest.clone_from(&digest);
+        relay.snapshot.recovery_floor_ordinal = through;
+        relay.snapshot.recovery_floor_digest.clone_from(&digest);
+        relay.persist_snapshot().unwrap();
+
+        let state_path = temp.path().join(RELAY_STATE_FILE);
+        fs::remove_file(&state_path).unwrap();
+        fs::create_dir(&state_path).unwrap();
+        let failed = relay.handle(relay_request(
+            "gc-fails-after-ack",
+            RelayRequest::Acknowledge {
+                through_ordinal: through,
+                through_digest: digest.clone(),
+            },
+        ));
+        assert!(matches!(
+            failed.body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::Internal,
+                    ..
+                }
+            }
+        ));
+
+        fs::remove_dir(&state_path).unwrap();
+        let retried = relay.handle(relay_request(
+            "gc-retry-after-ack",
+            RelayRequest::Acknowledge {
+                through_ordinal: through,
+                through_digest: digest.clone(),
+            },
+        ));
+        assert!(matches!(
+            retried.body,
+            RelayResponseBody::Ok {
+                payload: RelayResponsePayload::Acknowledged {
+                    through_ordinal,
+                    ..
+                }
+            } if through_ordinal == through
+        ));
+        assert_eq!(relay.retained_event_body_count(), 0);
+        assert!(relay.events_after(through, &digest).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_ack_persistence_does_not_advance_the_live_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        relay
+            .record_observation(RelayObservation::Warning {
+                message: "retain until ACK is durable".into(),
+            })
+            .unwrap();
+        let digest = relay.latest_digest().to_owned();
+        let state_path = temp.path().join(RELAY_STATE_FILE);
+        fs::remove_file(&state_path).unwrap();
+        fs::create_dir(&state_path).unwrap();
+
+        let failed = relay.handle(relay_request(
+            "ack-persistence-fails",
+            RelayRequest::Acknowledge {
+                through_ordinal: 1,
+                through_digest: digest.clone(),
+            },
+        ));
+        assert!(matches!(
+            failed.body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::Internal,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(relay.acknowledged_through(), 0);
+        assert_eq!(retained_events(&relay).len(), 1);
+
+        fs::remove_dir(&state_path).unwrap();
+        let retry = relay.handle(relay_request(
+            "ack-persistence-retry",
+            RelayRequest::Acknowledge {
+                through_ordinal: 1,
+                through_digest: digest,
+            },
+        ));
+        assert!(matches!(
+            retry.body,
+            RelayResponseBody::Ok {
+                payload: RelayResponsePayload::Acknowledged {
+                    through_ordinal: 1,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn failed_claim_persistence_leaves_the_command_claimable() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "claim-retry", prompt("run once"));
+        assert_eq!(
+            relay.snapshot.dispatches["claim-retry"].state,
+            RelayDispatchState::Pending
+        );
+        let state_path = temp.path().join(RELAY_STATE_FILE);
+        fs::remove_file(&state_path).unwrap();
+        fs::create_dir(&state_path).unwrap();
+
+        assert!(relay.claim_pending_commands(true).is_err());
+        assert_eq!(
+            relay.snapshot.dispatches["claim-retry"].state,
+            RelayDispatchState::Pending
+        );
+
+        fs::remove_dir(&state_path).unwrap();
+        let claimed = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].command_id, "claim-retry");
+        assert_eq!(
+            relay.snapshot.dispatches["claim-retry"].state,
+            RelayDispatchState::InFlight
+        );
+    }
+
+    /// A relay that truncated an event must still be able to reopen the
+    /// journal it wrote — the readback path bounds lines by the same budget.
+    #[test]
+    fn a_truncated_event_can_be_read_back_after_reopening() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        relay
+            .record_session_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                ContentBlock::from("y".repeat(3 * 1024 * 1024)),
+            )))
+            .unwrap();
+        drop(relay);
+
+        let reopened = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(reopened.latest_ordinal(), 1);
+    }
+
+    #[test]
+    fn sealed_relay_segments_replay_and_are_removed_after_checkpointed_ack() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        relay
+            .record_observation(RelayObservation::Warning {
+                message: "sealed".into(),
+            })
+            .unwrap();
+        let mut metadata = relay
+            .journal_spans
+            .iter()
+            .find(|span| span.path.ends_with(RELAY_ACTIVE_SEGMENT))
+            .unwrap()
+            .clone();
+        seal_active_relay_segment(&temp.path().join(RELAY_JOURNAL_DIR), &mut metadata).unwrap();
+        assert!(
+            fs::read_dir(temp.path().join(RELAY_JOURNAL_DIR))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "gz"))
+        );
+        drop(relay);
+
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(
+            relay
+                .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+                .unwrap()
+                .len(),
+            1
+        );
+        let _ = attach_relay(&mut relay, "attach-sealed", 0);
+        let _ = acknowledge_relay(&mut relay, "ack-sealed", 1);
+        assert!(
+            fs::read_dir(temp.path().join(RELAY_JOURNAL_DIR))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "gz"))
+        );
+        let ready = ready_checkpoint(&mut relay, "sealed-barrier");
+        acknowledge_relay(&mut relay, "ack-sealed-checkpoint", ready.ordinal);
+        submit_relay(
+            &mut relay,
+            "sealed-complete",
+            RelayCommand::CompleteCheckpoint {
+                barrier_command_id: "sealed-barrier".into(),
+            },
+        );
+        assert!(
+            !fs::read_dir(temp.path().join(RELAY_JOURNAL_DIR))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "gz"))
+        );
+    }
+
+    #[test]
+    fn large_relay_history_stays_disk_backed_and_replays_across_segments() {
+        const EVENT_COUNT: usize = 80;
+        const MESSAGE_BYTES: usize = 64 * 1024;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        for index in 0..EVENT_COUNT {
+            relay
+                .record_observation(RelayObservation::Warning {
+                    message: format!("{index:04}:{}", "x".repeat(MESSAGE_BYTES)),
+                })
+                .unwrap();
+        }
+        assert_eq!(relay.retained_event_body_count(), RELAY_HOT_EVENT_CAPACITY);
+        assert!(
+            fs::read_dir(temp.path().join(RELAY_JOURNAL_DIR))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "gz"))
+                .count()
+                >= 2,
+            "test history did not cross multiple sealed journal files"
+        );
+        let expected_latest = relay.latest_ordinal();
+        let expected_digest = relay.latest_digest().to_owned();
+        drop(relay);
+
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(relay.latest_ordinal(), expected_latest);
+        assert_eq!(relay.latest_digest(), expected_digest);
+        assert_eq!(relay.retained_event_body_count(), RELAY_HOT_EVENT_CAPACITY);
+
+        let mut cursor = RelayCursor {
+            ordinal: 0,
+            digest: RELAY_EVENT_GENESIS_DIGEST.into(),
+        };
+        let mut replayed = 0_usize;
+        let mut pages = 0_usize;
+        while cursor.ordinal < expected_latest {
+            let response = relay.handle(relay_request(
+                &format!("paged-replay-{pages}"),
+                RelayRequest::Attach {
+                    after_ordinal: cursor.ordinal,
+                    after_digest: cursor.digest.clone(),
+                },
+            ));
+            let RelayResponseBody::Ok {
+                payload:
+                    RelayResponsePayload::Attached {
+                        events,
+                        through_ordinal,
+                        through_digest,
+                        ..
+                    },
+            } = response.body
+            else {
+                panic!("disk-backed replay failed: {:?}", response.body);
+            };
+            assert!(!events.is_empty());
+            for event in &events {
+                validate_relay_event(cursor.ordinal, &cursor.digest, event).unwrap();
+                cursor.ordinal = event.ordinal;
+                cursor.digest = event.digest.clone();
+            }
+            assert_eq!(cursor.ordinal, through_ordinal);
+            assert_eq!(cursor.digest, through_digest);
+            replayed += events.len();
+            pages += 1;
+        }
+        assert_eq!(replayed, EVENT_COUNT);
+        assert!(pages >= 2, "history unexpectedly fit in one replay page");
+        assert_eq!(cursor.digest, expected_digest);
+    }
+
+    #[test]
+    fn restored_relay_continues_after_canonical_event_frontier() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path()
+                .join(RESTORED_CANONICAL_SESSION_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "event_frontier": 41,
+                "event_frontier_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "session": {
+                    "execution": {"state": "idle"},
+                    "last_activity_at_ms": 1234,
+                    "session_title": null,
+                    "configuration": {}
+                },
+                "transcript": [],
+                "queued_prompts": [{
+                    "command_id": "restored-command",
+                    "content": [{"type": "text", "text": "continue offline"}],
+                    "queued_at_ms": 1234
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(relay.latest_ordinal(), 42);
+        assert_eq!(relay.acknowledged_through(), 41);
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "restored-command"
+        );
+        let ordinal = relay
+            .record_observation(RelayObservation::Warning {
+                message: "restored".into(),
+            })
+            .unwrap();
+        assert_eq!(ordinal, 43);
+
+        drop(relay);
+        let relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        assert_eq!(
+            relay
+                .events_after(
+                    41,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                )
+                .unwrap()[0]
+                .ordinal,
+            42
+        );
+    }
+
+    #[test]
+    fn restored_relay_rebuilds_a_queued_configuration_change() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path()
+                .join(RESTORED_CANONICAL_SESSION_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "event_frontier": 41,
+                "event_frontier_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "session": {
+                    "execution": {"state": "idle"},
+                    "last_activity_at_ms": 1234,
+                    "session_title": null,
+                    "configuration": {}
+                },
+                "transcript": [],
+                "queued_prompts": [
+                    {
+                        "command_id": "restored-config",
+                        "kind": {"set_config": {"key": "model", "value": "sonnet"}},
+                        "content": [{"type": "text", "text": "/model sonnet"}],
+                        "queued_at_ms": 1234
+                    },
+                    {
+                        "command_id": "restored-prompt",
+                        "content": [{"type": "text", "text": "continue offline"}],
+                        "queued_at_ms": 1235
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let claimed = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].command_id, "restored-config");
+        assert_eq!(
+            claimed[0].command,
+            set_config("model", "sonnet"),
+            "a restored configuration change must not become a prompt"
+        );
+
+        relay
+            .record_command_completed("restored-config", RelayCommandOutcome::Configured)
+            .unwrap();
+        assert_eq!(
+            relay.claim_pending_commands(true).unwrap()[0].command_id,
+            "restored-prompt"
+        );
+    }
+
+    #[test]
+    fn restored_relay_rejects_an_invalid_canonical_frontier() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join(RESTORED_CANONICAL_SESSION_FILE),
+            br#"{"event_frontier":"forty-one"}"#,
+        )
+        .unwrap();
+        let error = DurableRelay::open(temp.path(), SESSION, "1.0.0")
+            .err()
+            .expect("invalid frontier should fail");
+        assert!(error.to_string().contains("canonical-session.json"));
+        assert!(!temp.path().join(RELAY_STATE_FILE).exists());
+    }
+}
