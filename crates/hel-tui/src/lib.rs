@@ -4,6 +4,7 @@
 //! Input is reduced to [`DashboardAction`] values for the controller to run.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -39,6 +40,10 @@ pub use crate::render::render;
 pub(crate) const DASHBOARD_PANE_COUNT: usize = 4;
 
 pub(crate) const MOUSE_SCROLL_ROWS: isize = 3;
+
+/// Maximum gap between two left clicks on the same session row for the pair
+/// to count as a double click.
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Rows one wheel notch moves the selected session's conversation preview.
 const PREVIEW_SCROLL_ROWS: usize = 3;
@@ -268,6 +273,9 @@ pub struct DashboardState {
     /// the tail, which is why the owning session is tracked alongside it.
     pub(crate) preview_scroll: usize,
     pub(crate) preview_scroll_session: Option<String>,
+    /// The pane, row index, and time of the most recent left click on a
+    /// session row, so the next click can be recognized as a double click.
+    last_row_click: Option<(Focus, usize, Instant)>,
     pub(crate) mode: Mode,
     pub(crate) notices: Notices,
     pub(crate) greeting: String,
@@ -296,6 +304,7 @@ impl DashboardState {
             archived_row_areas: Vec::new(),
             preview_scroll: 0,
             preview_scroll_session: None,
+            last_row_click: None,
             mode: Mode::Dashboard,
             notices: Notices::default(),
             greeting: "Welcome to Hel".into(),
@@ -410,26 +419,26 @@ impl DashboardState {
         }
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> DashboardAction {
         if let Mode::Import(dialog) = &mut self.mode {
             let Some(area) = self.import_sessions_area else {
-                return;
+                return DashboardAction::None;
             };
             if !rect_contains(area, mouse.column, mouse.row) {
-                return;
+                return DashboardAction::None;
             }
             let delta = match mouse.kind {
                 MouseEventKind::ScrollUp => -MOUSE_SCROLL_ROWS,
                 MouseEventKind::ScrollDown => MOUSE_SCROLL_ROWS,
-                _ => return,
+                _ => return DashboardAction::None,
             };
             let len = dialog.filtered_sessions().len();
             dialog.focus = ImportFocus::Sessions;
             dialog.session_index = offset_index(dialog.session_index, len, delta);
-            return;
+            return DashboardAction::None;
         }
         if !matches!(self.mode, Mode::Dashboard) {
-            return;
+            return DashboardAction::None;
         }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             if let Some(&(index, _)) = self
@@ -437,19 +446,18 @@ impl DashboardState {
                 .iter()
                 .find(|(_, area)| rect_contains(*area, mouse.column, mouse.row))
             {
-                self.focus = Focus::Active;
-                self.set_selection_for(Focus::Active, index);
-                return;
+                return self.handle_row_click(Focus::Active, index);
             }
             if let Some(&(index, _)) = self
                 .archived_row_areas
                 .iter()
                 .find(|(_, area)| rect_contains(*area, mouse.column, mouse.row))
             {
-                self.focus = Focus::Archived;
-                self.set_selection_for(Focus::Archived, index);
-                return;
+                return self.handle_row_click(Focus::Archived, index);
             }
+            // The click missed every row; forget any pending double click so
+            // a stray click elsewhere can't pair up with the next row click.
+            self.last_row_click = None;
         }
         // The selected session's conversation preview scrolls its own history;
         // anywhere else the wheel moves the hovered list's selection.
@@ -465,7 +473,7 @@ impl DashboardState {
                 }
                 _ => {}
             }
-            return;
+            return DashboardAction::None;
         }
         let hovered = self.pane_areas.and_then(|areas| {
             areas
@@ -480,12 +488,36 @@ impl DashboardState {
                 })
         });
         let Some(hovered) = hovered else {
-            return;
+            return DashboardAction::None;
         };
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_selection_for(hovered, -MOUSE_SCROLL_ROWS),
             MouseEventKind::ScrollDown => self.scroll_selection_for(hovered, MOUSE_SCROLL_ROWS),
             _ => {}
+        }
+        DashboardAction::None
+    }
+
+    /// Selects the clicked row and, if it's the second click on the same row
+    /// within `DOUBLE_CLICK_INTERVAL`, performs the same action Enter would:
+    /// opening an active session or starting a resume for an archived one.
+    fn handle_row_click(&mut self, focus: Focus, index: usize) -> DashboardAction {
+        self.focus = focus;
+        self.set_selection_for(focus, index);
+        let now = Instant::now();
+        let is_double_click = matches!(
+            self.last_row_click,
+            Some((last_focus, last_index, last_time))
+                if last_focus == focus
+                    && last_index == index
+                    && now.saturating_duration_since(last_time) <= DOUBLE_CLICK_INTERVAL
+        );
+        if is_double_click {
+            self.last_row_click = None;
+            self.open_or_resume()
+        } else {
+            self.last_row_click = Some((focus, index, now));
+            DashboardAction::None
         }
     }
 
@@ -1572,6 +1604,98 @@ mod tests {
             "there are no active sessions, so the archived index is the raw session index"
         );
         assert_eq!(dashboard.focus, Focus::Archived);
+    }
+
+    #[test]
+    fn a_single_click_on_a_row_selects_but_reports_no_action() {
+        let mut dashboard = dashboard_with_conversations(3);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw active row hitboxes");
+
+        let (_, row) = *dashboard
+            .active_row_areas
+            .iter()
+            .find(|(index, _)| *index == 1)
+            .expect("the second active row has a recorded hitbox");
+        let action = dashboard.handle_mouse(mouse_at_row(
+            MouseEventKind::Down(MouseButton::Left),
+            row,
+            0,
+        ));
+
+        assert_eq!(action, DashboardAction::None);
+        assert_eq!(dashboard.session_index, 1);
+    }
+
+    #[test]
+    fn a_double_click_on_an_active_row_opens_it_like_enter() {
+        let mut dashboard = dashboard_with_conversations(3);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw active row hitboxes");
+
+        let (_, row) = *dashboard
+            .active_row_areas
+            .iter()
+            .find(|(index, _)| *index == 1)
+            .expect("the second active row has a recorded hitbox");
+        let click = || mouse_at_row(MouseEventKind::Down(MouseButton::Left), row, 0);
+
+        let first = dashboard.handle_mouse(click());
+        assert_eq!(first, DashboardAction::None, "the first click just selects");
+
+        let second = dashboard.handle_mouse(click());
+        assert_eq!(
+            second,
+            DashboardAction::Open {
+                session_id: "session-1".into(),
+            },
+            "a quick second click on the same row opens it, matching Enter"
+        );
+        assert_eq!(dashboard.session_index, 1);
+    }
+
+    #[test]
+    fn clicks_on_different_rows_do_not_count_as_a_double_click() {
+        let mut dashboard = dashboard_with_conversations(3);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw active row hitboxes");
+
+        let row_for = |index: usize| {
+            *dashboard
+                .active_row_areas
+                .iter()
+                .find(|(row_index, _)| *row_index == index)
+                .map(|(_, area)| area)
+                .expect("row has a recorded hitbox")
+        };
+        let first_row = row_for(0);
+        let second_row = row_for(1);
+
+        let first = dashboard.handle_mouse(mouse_at_row(
+            MouseEventKind::Down(MouseButton::Left),
+            first_row,
+            0,
+        ));
+        assert_eq!(first, DashboardAction::None);
+
+        // A click on a different row is a fresh first click, not the second
+        // half of a double click on row 0.
+        let second = dashboard.handle_mouse(mouse_at_row(
+            MouseEventKind::Down(MouseButton::Left),
+            second_row,
+            0,
+        ));
+        assert_eq!(second, DashboardAction::None);
+        assert_eq!(
+            dashboard.session_index, 1,
+            "the second click's row is selected"
+        );
     }
 
     /// A dashboard with `count` running sessions, each carrying a numbered
