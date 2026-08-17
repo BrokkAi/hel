@@ -156,18 +156,22 @@ impl QuotaManager {
     }
 
     /// Refresh each profile independently so one slow harness cannot delay the
-    /// others. Reports are returned in completion order.
-    pub async fn refresh_profiles(
+    /// others. `on_report` runs per profile in completion order, so fast
+    /// harnesses report without waiting for the slowest one in the batch.
+    pub async fn refresh_profiles<F, Fut>(
         &mut self,
         requests: Vec<QuotaRefreshRequest>,
-    ) -> Vec<ProfileQuota> {
+        mut on_report: F,
+    ) where
+        F: FnMut(ProfileQuota) -> Fut,
+        Fut: Future<Output = ()> + Send,
+    {
         let mut tasks = tokio::task::JoinSet::new();
         for request in requests {
             let client = self.codex_clients.remove(&request.profile_id);
             tasks.spawn(refresh_profile(request, client));
         }
 
-        let mut refreshed = Vec::new();
         while let Some(result) = tasks.join_next().await {
             let (report, client) = match result {
                 Ok(output) => output,
@@ -181,9 +185,8 @@ impl QuotaManager {
             }
             self.reports
                 .insert(report.profile_id.clone(), report.clone());
-            refreshed.push(report);
+            on_report(report).await;
         }
-        refreshed
     }
 
     pub async fn shutdown(mut self) {

@@ -381,10 +381,23 @@ async fn refresh_profile_quotas(
     {
         return false;
     }
-    for quota in quotas.refresh_profiles(profiles.to_vec()).await {
-        if updates.send(QuotaUpdate::Report(quota)).await.is_err() {
-            return false;
-        }
+    // Keep draining even if the UI is gone so codex clients return to the
+    // manager for a clean shutdown; just stop sending.
+    let delivered = AtomicBool::new(true);
+    quotas
+        .refresh_profiles(profiles.to_vec(), |quota| {
+            let delivered = &delivered;
+            async move {
+                if delivered.load(Ordering::Acquire)
+                    && updates.send(QuotaUpdate::Report(quota)).await.is_err()
+                {
+                    delivered.store(false, Ordering::Release);
+                }
+            }
+        })
+        .await;
+    if !delivered.into_inner() {
+        return false;
     }
     updates
         .send(QuotaUpdate::Finished { generation })

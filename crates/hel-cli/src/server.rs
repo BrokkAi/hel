@@ -728,7 +728,9 @@ fn viewer_snapshot(
 
 async fn refresh_all_quotas(controller: &Controller, quotas: &mut QuotaManager) {
     quotas
-        .refresh_profiles(quota_refresh_profiles(controller))
+        .refresh_profiles(quota_refresh_profiles(controller), |_| {
+            std::future::ready(())
+        })
         .await;
 }
 
