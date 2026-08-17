@@ -173,6 +173,16 @@ pub(crate) enum ImportFocus {
     Import,
 }
 
+/// Tab order for the import dialog. Profiles lead because the chosen profile
+/// decides which sessions the filter and session pane can show.
+const IMPORT_FOCUS_ORDER: [ImportFocus; 5] = [
+    ImportFocus::Profiles,
+    ImportFocus::Filter,
+    ImportFocus::Sessions,
+    ImportFocus::Cancel,
+    ImportFocus::Import,
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImportDialog {
     discovery_id: u64,
@@ -810,32 +820,11 @@ impl DashboardState {
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None
             }
-            KeyCode::Tab => {
+            KeyCode::Tab | KeyCode::BackTab => {
                 dialog.focus = cycle_control(
                     dialog.focus,
-                    &[
-                        ImportFocus::Profiles,
-                        ImportFocus::Filter,
-                        ImportFocus::Sessions,
-                        ImportFocus::Cancel,
-                        ImportFocus::Import,
-                    ],
-                    false,
-                );
-                self.mode = Mode::Import(dialog);
-                DashboardAction::None
-            }
-            KeyCode::BackTab => {
-                dialog.focus = cycle_control(
-                    dialog.focus,
-                    &[
-                        ImportFocus::Profiles,
-                        ImportFocus::Filter,
-                        ImportFocus::Sessions,
-                        ImportFocus::Cancel,
-                        ImportFocus::Import,
-                    ],
-                    true,
+                    &IMPORT_FOCUS_ORDER,
+                    key.code == KeyCode::BackTab,
                 );
                 self.mode = Mode::Import(dialog);
                 DashboardAction::None

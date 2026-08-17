@@ -69,6 +69,15 @@ pub(crate) enum MountFocus {
     Add,
 }
 
+/// Tab order for the mount editor, shared by the new-session and resume paths.
+const MOUNT_FOCUS_ORDER: [MountFocus; 5] = [
+    MountFocus::Source,
+    MountFocus::Destination,
+    MountFocus::Cancel,
+    MountFocus::Back,
+    MountFocus::Add,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReviewFocus {
     Attachments,
@@ -1696,13 +1705,7 @@ impl DashboardState {
             KeyCode::Tab | KeyCode::BackTab => {
                 wizard.mounts.focus = cycle_control(
                     wizard.mounts.focus,
-                    &[
-                        MountFocus::Source,
-                        MountFocus::Destination,
-                        MountFocus::Cancel,
-                        MountFocus::Back,
-                        MountFocus::Add,
-                    ],
+                    &MOUNT_FOCUS_ORDER,
                     code == KeyCode::BackTab,
                 );
                 self.mode = Mode::New(wizard);
@@ -2432,13 +2435,7 @@ impl DashboardState {
             KeyCode::Tab | KeyCode::BackTab => {
                 wizard.mounts.focus = cycle_control(
                     wizard.mounts.focus,
-                    &[
-                        MountFocus::Source,
-                        MountFocus::Destination,
-                        MountFocus::Cancel,
-                        MountFocus::Back,
-                        MountFocus::Add,
-                    ],
+                    &MOUNT_FOCUS_ORDER,
                     code == KeyCode::BackTab,
                 );
                 self.mode = Mode::Resume(wizard);
