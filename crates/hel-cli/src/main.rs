@@ -3538,10 +3538,7 @@ fn dashboard_event_action(dashboard: &mut DashboardState, event: Event) -> Dashb
             dashboard.handle_paste(&pasted);
             DashboardAction::None
         }
-        Event::Mouse(mouse) => {
-            dashboard.handle_mouse(mouse);
-            DashboardAction::None
-        }
+        Event::Mouse(mouse) => dashboard.handle_mouse(mouse),
         // Resize and focus changes only need the redraw.
         _ => DashboardAction::None,
     }
