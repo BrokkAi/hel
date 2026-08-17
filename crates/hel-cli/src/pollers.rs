@@ -565,15 +565,19 @@ impl CredentialSyncNotices {
         // Authentication-triggered syncs always speak: the upstream per-session
         // cooldown, not this dedup, is what keeps them rare.
         if let Some(session_id) = &result.triggered_by {
+            // The first ~80 columns are all most people read before a notice
+            // scrolls off, so the profile leads and the advice trails.
             return Some(if result.pushed_to(session_id) {
                 format!(
-                    "Session {} hit an authentication failure; refreshed credentials were pushed. Retry the prompt, and if it repeats run `hel login --profile {}`.",
+                    "Auth failure on profile {} (session {}); refreshed credentials were pushed. Retry the prompt, and if it repeats run `hel login --profile {}`.",
+                    result.profile_id,
                     short_id(session_id),
                     result.profile_id
                 )
             } else {
                 format!(
-                    "Session {} hit an authentication failure and Hel has nothing fresher to push. Run `hel login --profile {}`.",
+                    "Auth failure on profile {} (session {}); nothing fresher to push. Run `hel login --profile {}`.",
+                    result.profile_id,
                     short_id(session_id),
                     result.profile_id
                 )
@@ -594,7 +598,8 @@ impl CredentialSyncNotices {
             failures.insert(
                 (result.profile_id.clone(), Some(session_id.to_owned())),
                 format!(
-                    "Credential sync for {} failed: {detail}",
+                    "Credential sync for profile {} (session {}) failed: {detail}",
+                    result.profile_id,
                     short_id(session_id)
                 ),
             );

@@ -36,7 +36,9 @@ pub use types::{
 };
 
 use std::collections::VecDeque;
-use std::fs::{self, File};
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 

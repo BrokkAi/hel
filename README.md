@@ -130,6 +130,28 @@ sequence, most-recent activity, and profile-then-sequence ordering; the current
 order is shown in the footer.
 Returning to the dashboard with `Ctrl+G` preserves the current message draft.
 
+## What hel configures vs. what you configure
+
+Hel deterministically discovers harness homes, writes `config.toml` through
+`hel setup`, and verifies prerequisites through `hel doctor --json`. An agent
+driving Hel on your behalf should loop on `hel doctor --json` until it reports
+clean, rather than guessing at readiness.
+
+Hel does not do privileged, host-level, or external-account work for you. You
+(or your agent, acting with your credentials) still have to:
+
+- Install Podman and configure `subuid`/`subgid` for rootless containers on
+  Linux or WSL2. See [docs/PODMAN.md](docs/PODMAN.md).
+- Log in to each harness with `hel login --profile <id>`.
+- Create AWS account resources a target needs: a launch template, a security
+  group, and any key material. See [docs/AWS.md](docs/AWS.md).
+- Make an SSH target reachable: key-based, non-interactive auth and a
+  trusted host key. See [docs/SSH.md](docs/SSH.md).
+
+Podman container targets (`local-podman`, `ssh-podman`) are Linux and WSL2
+only. On macOS, the equivalent isolated-container target uses Apple's
+`container` runtime (macOS 26 or newer on Apple silicon) instead of Podman.
+
 ## Configuration
 
 Hel reads `~/.config/hel/config.toml` on Linux (the platform-equivalent config
@@ -222,10 +244,21 @@ ssh_user = "ubuntu"
 address_source = "public-dns"
 ```
 
-For the rotating RunsOn Ubuntu 26 image, use the included updater instead of
-pinning an upstream AMI ID. It copies the newest RunsOn image into your AWS
-account, makes that copy the default version of `hel-runson`, refreshes the
-controller's SSH ingress, and can add the matching target on its first run:
+`ssh-bare` and `ssh-podman` targets need key-based, non-interactive SSH access
+that you set up ahead of time; see [docs/SSH.md](docs/SSH.md) for the
+prerequisites, the full set of configuration keys, and how to verify a target.
+
+`aws-ec2` targets launch a disposable EC2 instance from a launch template you
+create yourself; Hel does not create the launch template, security group, or
+key material. See [docs/AWS.md](docs/AWS.md) for prerequisites, configuration
+keys, and required IAM permissions.
+
+For the rotating RunsOn Ubuntu 26 image, a source checkout includes an updater
+script instead of pinning an upstream AMI ID (this script is not part of the
+`install.sh` release and needs a source checkout to run). It copies the newest
+RunsOn image into your AWS account, makes that copy the default version of
+`hel-runson`, refreshes the controller's SSH ingress, and can add a matching
+target on its first run:
 
 ```bash
 scripts/update-runson-launch-template.sh --write-hel-config
@@ -405,5 +438,13 @@ Hel's own state. `hel recover adopt --session <id> --target <id> [--profile
 ownership markers. `hel recover destroy --session <id> --target <id>
 --confirm <id>` removes an orphan without adopting it; `--confirm` must
 repeat the session ID exactly.
+
+## Further reading
+
+- [docs/PODMAN.md](docs/PODMAN.md) — rootless Podman setup and verification.
+- [docs/src/content/docs/containers.md](docs/src/content/docs/containers.md) — container target overview.
+- [docs/src/content/docs/custom-images.md](docs/src/content/docs/custom-images.md) — building your own agent image.
+- [docs/AWS.md](docs/AWS.md) — `aws-ec2` target setup.
+- [docs/SSH.md](docs/SSH.md) — `ssh-bare` and `ssh-podman` target setup.
 
 Hel is licensed under `GPL-3.0-only`.

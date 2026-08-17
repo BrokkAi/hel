@@ -12,7 +12,7 @@ selected harness in its unrestricted mode (`agent-full-access`,
 `bypassPermissions`, `auto`, or Grok Build's `--always-approve` launch flag),
 instead of the raw-localhost approval flow. Every one of those approves every
 call. Note that Kimi Code's mode is named `auto` but is not a review policy
-that approves only low-risk calls; see [What "auto" means](/cli-reference/).
+that approves only low-risk calls.
 
 Closing a session first writes and verifies a recovery archive, then removes
 that exact container. Nothing about the container persists past the session

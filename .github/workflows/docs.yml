@@ -1,9 +1,8 @@
 name: Docs
 
+# Manual-only until a docs site is wanted for Hel; deploying also needs
+# GitHub Pages enabled in the repository settings.
 on:
-  push:
-    tags:
-      - 'v*.*.*'
   workflow_dispatch: {}
 
 permissions:

@@ -1,6 +1,7 @@
 //! Actionable host and configuration prerequisite checks.
 
 use std::io::Write;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -16,7 +17,7 @@ use crate::hel_setup::{
 use crate::hel_targets::{
     CommandExecutor, CommandSpec, ContainerTemplate as RuntimeContainerTemplate, ProcessExecutor,
     SshTarget as RuntimeSshTarget, TargetTemplate as RuntimeTargetTemplate, run_setup_smoke_test,
-    verify_local_podman, verify_ssh_podman,
+    ssh_connectivity_probe, verify_local_podman, verify_ssh_podman,
 };
 
 // Only the image for the Apple container smoke test when the config has no
@@ -129,11 +130,27 @@ pub fn run_with(
     apple_platform: ApplePlatform,
     options: DoctorOptions,
 ) -> Vec<DoctorCheck> {
-    let (config, mut checks) = configuration_checks();
+    run_with_config_path(&config_path(), executor, apple_platform, options)
+}
+
+/// The same checks as [`run_with`], against an explicit configuration file.
+///
+/// `hel setup` uses this to report on the configuration it just wrote, so a
+/// first run ends with exactly the summary and remediations `hel doctor`
+/// would print.
+pub fn run_with_config_path(
+    config_path: &Path,
+    executor: &impl CommandExecutor,
+    apple_platform: ApplePlatform,
+    options: DoctorOptions,
+) -> Vec<DoctorCheck> {
+    let (config, mut checks) = configuration_checks(config_path);
     checks.push(harness_discovery_check(config.as_ref()));
     checks.extend(harness_checks(config.as_ref()));
     checks.extend(podman_checks(config.as_ref(), executor, options.smoke));
+    checks.extend(ssh_bare_checks(config.as_ref(), executor));
     checks.extend(ssh_podman_checks(config.as_ref(), executor, options.smoke));
+    checks.extend(aws_checks(config.as_ref(), executor));
     checks.extend(worker_binary_checks(config.as_ref()));
     checks.push(apple_container_check(
         &apple_platform,
@@ -266,8 +283,7 @@ Podman prerequisites. Resolve every `fixable` status before starting a session."
     }
 }
 
-fn configuration_checks() -> (Option<HelConfig>, Vec<DoctorCheck>) {
-    let path = config_path();
+fn configuration_checks(path: &Path) -> (Option<HelConfig>, Vec<DoctorCheck>) {
     if !path.exists() {
         return (
             None,
@@ -279,7 +295,7 @@ fn configuration_checks() -> (Option<HelConfig>, Vec<DoctorCheck>) {
             )],
         );
     }
-    match HelConfig::load_from(&path) {
+    match HelConfig::load_from(path) {
         Ok(config) => {
             let mut checks = vec![DoctorCheck::ready(
                 "config",
@@ -421,6 +437,16 @@ fn podman_check(config: Option<&HelConfig>, executor: &impl CommandExecutor) -> 
             "No local-podman target is configured.",
         );
     }
+    local_podman_runtime_check(executor)
+}
+
+/// Probe the local rootless Podman prerequisites and phrase the result as a
+/// doctor check.
+///
+/// This is the single source of truth for Podman availability wording and
+/// remediation. `hel setup` calls it directly so its runtime list reports the
+/// same detail and fix that `hel doctor` would.
+pub fn local_podman_runtime_check(executor: &impl CommandExecutor) -> DoctorCheck {
     match verify_local_podman(executor) {
         Ok(preflight) => DoctorCheck::ready(
             "runtime.podman",
@@ -525,6 +551,128 @@ fn missing_image_remediation(image: &str) -> String {
     )
 }
 
+/// The outcome of the shared SSH connectivity probe.
+///
+/// Both SSH-backed checks run this first: an unreachable host makes every
+/// later probe fail with a misleading message.
+enum SshConnectivity {
+    Reachable,
+    Failed { detail: String, remediation: String },
+}
+
+/// Probe `ssh <destination> true` and map any failure to a copy-paste fix.
+///
+/// Hel never generates keys, runs `ssh-copy-id`, or accepts a host key on the
+/// user's behalf; it only says exactly which command would fix the failure.
+fn ssh_connectivity(ssh: &RuntimeSshTarget, executor: &impl CommandExecutor) -> SshConnectivity {
+    let destination = &ssh.destination;
+    let command = ssh_connectivity_probe(ssh);
+    match executor.execute(&command) {
+        Err(error) => SshConnectivity::Failed {
+            detail: format!("Could not run `ssh {destination} true`: {error}"),
+            remediation: SSH_MISSING_REMEDIATION.to_owned(),
+        },
+        Ok(output) if output.status != 0 => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            SshConnectivity::Failed {
+                detail: format!("`ssh {destination} true` failed: {stderr}"),
+                remediation: ssh_failure_remediation(&stderr, ssh),
+            }
+        }
+        Ok(_) => SshConnectivity::Reachable,
+    }
+}
+
+const SSH_MISSING_REMEDIATION: &str = "Install an OpenSSH client and put `ssh` on PATH: `sudo apt update && sudo apt install -y openssh-client` (Debian/Ubuntu) or `sudo dnf install -y openssh-clients` (Fedora).";
+
+/// Map `ssh -o BatchMode=yes` stderr to the command that fixes it.
+fn ssh_failure_remediation(stderr: &str, ssh: &RuntimeSshTarget) -> String {
+    let destination = &ssh.destination;
+    if stderr.contains("Host key verification failed")
+        || stderr.contains("No ECDSA host key is known")
+        || stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
+    {
+        let host = ssh_host_only(destination);
+        return format!(
+            "Add the host key with `ssh-keyscan -H {host} >> ~/.ssh/known_hosts`. Verify the fingerprint out of band before trusting it; if the key changed, remove the stale entry with `ssh-keygen -R {host}` first."
+        );
+    }
+    if stderr.contains("Permission denied")
+        || stderr.contains("Too many authentication failures")
+        || stderr.contains("no matching host key")
+        || stderr.contains("Authentication failed")
+    {
+        return match ssh_identity_file(ssh) {
+            Some(identity) => format!(
+                "Install your public key on the host with `ssh-copy-id -i {identity}.pub {destination}`."
+            ),
+            None => {
+                format!("Install your public key on the host with `ssh-copy-id {destination}`.")
+            }
+        };
+    }
+    if stderr.contains("ssh: command not found") || stderr.contains("No such file or directory") {
+        return SSH_MISSING_REMEDIATION.to_owned();
+    }
+    format!("Run `ssh {destination} true` by hand and resolve the error it reports: {stderr}")
+}
+
+/// The host part of an OpenSSH destination, without any `user@` prefix.
+fn ssh_host_only(destination: &str) -> &str {
+    destination
+        .rsplit_once('@')
+        .map_or(destination, |(_, host)| host)
+}
+
+/// The identity file provisioning passes, recovered from the built ssh args.
+fn ssh_identity_file(ssh: &RuntimeSshTarget) -> Option<&str> {
+    let position = ssh.ssh_args.iter().position(|arg| arg == "-i")?;
+    ssh.ssh_args.get(position + 1).map(String::as_str)
+}
+
+/// One check per `ssh-bare` target: can Hel reach the host noninteractively?
+fn ssh_bare_checks(
+    config: Option<&HelConfig>,
+    executor: &impl CommandExecutor,
+) -> Vec<DoctorCheck> {
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    config
+        .targets
+        .iter()
+        .filter_map(|(id, target)| match target {
+            TargetTemplate::SshBare { ssh, .. } => {
+                Some(ssh_bare_check(id, &backend_ssh(ssh), executor))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn ssh_bare_check(
+    id: &str,
+    ssh: &RuntimeSshTarget,
+    executor: &impl CommandExecutor,
+) -> DoctorCheck {
+    let check_id = format!("runtime.ssh-bare.{id}");
+    let title = format!("SSH access for target {id}");
+    match ssh_connectivity(ssh, executor) {
+        SshConnectivity::Reachable => DoctorCheck::ready(
+            check_id,
+            title,
+            format!(
+                "`ssh {} true` succeeds noninteractively from this host.",
+                ssh.destination
+            ),
+        ),
+        SshConnectivity::Failed {
+            detail,
+            remediation,
+        } => DoctorCheck::fixable(check_id, title, detail, remediation),
+    }
+}
+
 /// One check per `ssh-podman` target: the same Podman probes, run over SSH.
 fn ssh_podman_checks(
     config: Option<&HelConfig>,
@@ -560,6 +708,15 @@ fn ssh_podman_check(
     let check_id = format!("runtime.ssh-podman.{id}");
     let title = format!("Remote Podman for target {id}");
     let destination = &ssh.destination;
+    // Connectivity first: a remote Podman probe on an unreachable host reports
+    // a Podman problem the user does not have.
+    if let SshConnectivity::Failed {
+        detail,
+        remediation,
+    } = ssh_connectivity(ssh, executor)
+    {
+        return DoctorCheck::fixable(check_id, title, detail, remediation);
+    }
     let preflight = match verify_ssh_podman(ssh, executor) {
         Ok(preflight) => preflight,
         Err(error) => {
@@ -646,6 +803,159 @@ fn podman_remediation_match(detail: &str) -> Option<&'static str> {
         )
     } else {
         None
+    }
+}
+
+const AWS_CLI_INSTALL_URL: &str =
+    "https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html";
+
+/// One check per `aws-ec2` target: the AWS CLI, its credentials, and the
+/// configured launch template.
+fn aws_checks(config: Option<&HelConfig>, executor: &impl CommandExecutor) -> Vec<DoctorCheck> {
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    config
+        .targets
+        .iter()
+        .filter_map(|(id, target)| match target {
+            TargetTemplate::AwsEc2 {
+                aws_profile,
+                region,
+                launch_template,
+                ..
+            } => Some(aws_target_check(
+                id,
+                aws_profile.as_deref(),
+                region,
+                launch_template,
+                executor,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The profile and region every AWS probe carries, applied exactly the way
+/// provisioning applies them in `hel_targets`.
+fn aws_global_args<'a>(profile: Option<&'a str>, region: &'a str) -> Vec<String> {
+    vec![
+        "--profile".to_owned(),
+        profile.unwrap_or("default").to_owned(),
+        "--region".to_owned(),
+        region.to_owned(),
+    ]
+}
+
+fn aws_target_check(
+    id: &str,
+    profile: Option<&str>,
+    region: &str,
+    launch_template: &str,
+    executor: &impl CommandExecutor,
+) -> DoctorCheck {
+    let check_id = format!("runtime.aws-ec2.{id}");
+    let title = format!("AWS EC2 target {id}");
+    let profile_label = profile.unwrap_or("default");
+
+    let version = CommandSpec::new("aws", ["--version"]).purpose("check AWS CLI installation");
+    match executor.execute(&version) {
+        Err(error) => {
+            return DoctorCheck::fixable(
+                check_id,
+                title,
+                format!("The `aws` command is not available: {error}"),
+                format!("Install the AWS CLI and put `aws` on PATH: {AWS_CLI_INSTALL_URL}"),
+            );
+        }
+        Ok(output) if output.status != 0 => {
+            return DoctorCheck::fixable(
+                check_id,
+                title,
+                format!(
+                    "`aws --version` failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                format!("Reinstall the AWS CLI: {AWS_CLI_INSTALL_URL}"),
+            );
+        }
+        Ok(_) => {}
+    }
+
+    let mut identity_args = aws_global_args(profile, region);
+    identity_args.extend(["sts".to_owned(), "get-caller-identity".to_owned()]);
+    identity_args.extend(["--output".to_owned(), "json".to_owned()]);
+    let identity =
+        CommandSpec::new("aws", identity_args).purpose("check AWS credentials for a doctor target");
+    match executor.execute(&identity) {
+        Err(error) => {
+            return DoctorCheck::fixable(
+                check_id,
+                title,
+                format!("Could not run `aws sts get-caller-identity`: {error}"),
+                format!(
+                    "Configure credentials with `aws configure --profile {profile_label}`, or sign in with `aws sso login --profile {profile_label}`."
+                ),
+            );
+        }
+        Ok(output) if output.status != 0 => {
+            return DoctorCheck::fixable(
+                check_id,
+                title,
+                format!(
+                    "AWS credentials for profile {profile_label} are not usable: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                format!(
+                    "Configure credentials with `aws configure --profile {profile_label}`, or sign in with `aws sso login --profile {profile_label}`."
+                ),
+            );
+        }
+        Ok(_) => {}
+    }
+
+    // Launch templates are addressed by id when they carry the `lt-` prefix
+    // and by name otherwise, the same split provisioning uses.
+    let by_id = launch_template.starts_with("lt-");
+    let mut template_args = aws_global_args(profile, region);
+    template_args.extend(["ec2".to_owned(), "describe-launch-templates".to_owned()]);
+    template_args.extend([
+        if by_id {
+            "--launch-template-ids".to_owned()
+        } else {
+            "--launch-template-names".to_owned()
+        },
+        launch_template.to_owned(),
+    ]);
+    template_args.extend(["--output".to_owned(), "json".to_owned()]);
+    let template =
+        CommandSpec::new("aws", template_args).purpose("check the configured AWS launch template");
+    let template_remediation = format!(
+        "Create the launch template in {region}, or point this target at an existing one; `aws --profile {profile_label} --region {region} ec2 describe-launch-templates` lists them."
+    );
+    match executor.execute(&template) {
+        Err(error) => DoctorCheck::fixable(
+            check_id,
+            title,
+            format!("Could not query launch template {launch_template}: {error}"),
+            template_remediation,
+        ),
+        Ok(output) if output.status != 0 => DoctorCheck::fixable(
+            check_id,
+            title,
+            format!(
+                "Launch template {launch_template} was not found in {region}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            template_remediation,
+        ),
+        Ok(_) => DoctorCheck::ready(
+            check_id,
+            title,
+            format!(
+                "The AWS CLI is installed, profile {profile_label} has valid credentials, and launch template {launch_template} exists in {region}."
+            ),
+        ),
     }
 }
 
@@ -794,54 +1104,9 @@ pub fn apple_container_check(
         ApplePlatform::Macos { .. } => {}
     }
 
-    let installed =
-        CommandSpec::new("container", ["--version"]).purpose("check Apple container installation");
-    match executor.execute(&installed) {
-        Err(error) => {
-            return DoctorCheck::fixable(
-                "runtime.apple-container",
-                "Apple container runtime",
-                format!("The `container` command is not available: {error}"),
-                format!("Install the official signed package: {APPLE_CONTAINER_INSTALL_URL}"),
-            );
-        }
-        Ok(output) if output.status != 0 => {
-            return DoctorCheck::fixable(
-                "runtime.apple-container",
-                "Apple container runtime",
-                format!(
-                    "The installed `container --version` command failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-                format!("Reinstall the official signed package: {APPLE_CONTAINER_INSTALL_URL}"),
-            );
-        }
-        Ok(_) => {}
-    }
-
-    let status =
-        CommandSpec::new("container", ["system", "status"]).purpose("check Apple container daemon");
-    match executor.execute(&status) {
-        Ok(output) if output.status == 0 => {}
-        Ok(output) => {
-            return DoctorCheck::fixable(
-                "runtime.apple-container",
-                "Apple container runtime",
-                format!(
-                    "The Apple container daemon is stopped: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-                "Run `container system start`.",
-            );
-        }
-        Err(error) => {
-            return DoctorCheck::fixable(
-                "runtime.apple-container",
-                "Apple container runtime",
-                format!("Could not query the Apple container daemon: {error}"),
-                "Run `container system start`.",
-            );
-        }
+    let daemon = apple_container_daemon_check(executor);
+    if daemon.status != CheckStatus::Ready {
+        return daemon;
     }
 
     if !smoke {
@@ -872,7 +1137,65 @@ pub fn apple_container_check(
     }
 }
 
-fn current_apple_platform(executor: &impl CommandExecutor) -> ApplePlatform {
+/// Probe that the Apple `container` command is installed and its daemon is
+/// running, phrased as a doctor check.
+///
+/// Split out of [`apple_container_check`] so `hel setup` can reuse the same
+/// probes and remediation text without also demanding the opt-in smoke test.
+/// The caller is responsible for platform gating.
+pub fn apple_container_daemon_check(executor: &impl CommandExecutor) -> DoctorCheck {
+    let installed =
+        CommandSpec::new("container", ["--version"]).purpose("check Apple container installation");
+    match executor.execute(&installed) {
+        Err(error) => {
+            return DoctorCheck::fixable(
+                "runtime.apple-container",
+                "Apple container runtime",
+                format!("The `container` command is not available: {error}"),
+                format!("Install the official signed package: {APPLE_CONTAINER_INSTALL_URL}"),
+            );
+        }
+        Ok(output) if output.status != 0 => {
+            return DoctorCheck::fixable(
+                "runtime.apple-container",
+                "Apple container runtime",
+                format!(
+                    "The installed `container --version` command failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                format!("Reinstall the official signed package: {APPLE_CONTAINER_INSTALL_URL}"),
+            );
+        }
+        Ok(_) => {}
+    }
+
+    let status =
+        CommandSpec::new("container", ["system", "status"]).purpose("check Apple container daemon");
+    match executor.execute(&status) {
+        Ok(output) if output.status == 0 => DoctorCheck::ready(
+            "runtime.apple-container",
+            "Apple container runtime",
+            "Installed, and the Apple container daemon is running.",
+        ),
+        Ok(output) => DoctorCheck::fixable(
+            "runtime.apple-container",
+            "Apple container runtime",
+            format!(
+                "The Apple container daemon is stopped: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            "Run `container system start`.",
+        ),
+        Err(error) => DoctorCheck::fixable(
+            "runtime.apple-container",
+            "Apple container runtime",
+            format!("Could not query the Apple container daemon: {error}"),
+            "Run `container system start`.",
+        ),
+    }
+}
+
+pub fn current_apple_platform(executor: &impl CommandExecutor) -> ApplePlatform {
     if cfg!(target_os = "linux") {
         return ApplePlatform::Linux;
     }
@@ -898,6 +1221,7 @@ fn current_apple_platform(executor: &impl CommandExecutor) -> ApplePlatform {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::path::PathBuf;
 
     use anyhow::anyhow;
 
@@ -942,6 +1266,16 @@ mod tests {
     }
 
     /// The three host probes `verify_local_podman`/`verify_ssh_podman` run.
+    /// Prefix canned responses with a successful SSH connectivity probe, which
+    /// every SSH-backed check now runs first.
+    fn reachable_then(
+        responses: impl IntoIterator<Item = Result<CommandOutput>>,
+    ) -> Vec<Result<CommandOutput>> {
+        let mut all = vec![Ok(output(b""))];
+        all.extend(responses);
+        all
+    }
+
     fn passing_podman_probes() -> Vec<Result<CommandOutput>> {
         vec![
             Ok(output(b"podman version 5.4.2\n")),
@@ -1035,7 +1369,7 @@ mod tests {
 
     #[test]
     fn podman_check_is_fixable_with_an_upgrade_remediation_for_an_old_runtime() {
-        let executor = FakeExecutor::new([Ok(output(b"podman version 3.4.7\n"))]);
+        let executor = FakeExecutor::new(reachable_then([Ok(output(b"podman version 3.4.7\n"))]));
         let config = config_with([(
             "podman",
             TargetTemplate::LocalPodman {
@@ -1112,7 +1446,7 @@ mod tests {
 
     #[test]
     fn image_checks_are_skipped_when_the_host_podman_preflight_fails() {
-        let executor = FakeExecutor::new([Ok(output(b"podman version 3.4.7\n"))]);
+        let executor = FakeExecutor::new(reachable_then([Ok(output(b"podman version 3.4.7\n"))]));
         let config = config_with([(
             "podman",
             TargetTemplate::LocalPodman {
@@ -1166,7 +1500,7 @@ mod tests {
 
     #[test]
     fn ssh_podman_check_is_ready_after_ssh_wrapped_probes_without_smoke() {
-        let executor = FakeExecutor::new(passing_podman_probes());
+        let executor = FakeExecutor::new(reachable_then(passing_podman_probes()));
 
         let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, false);
 
@@ -1176,8 +1510,9 @@ mod tests {
         assert!(check.detail.contains("Remote rootless Podman 5.4.2"));
         assert!(check.detail.contains("dev@example.test"));
         let commands = executor.commands.borrow();
-        assert_eq!(commands.len(), 3);
-        for command in commands.iter() {
+        assert_eq!(commands.len(), 4);
+        assert_eq!(commands[0].args.last().unwrap(), "'true'");
+        for command in commands.iter().skip(1) {
             assert_eq!(command.program, "ssh");
             assert!(command.args.contains(&"dev@example.test".to_owned()));
             assert!(command.args.last().unwrap().starts_with("'podman'"));
@@ -1186,7 +1521,7 @@ mod tests {
 
     #[test]
     fn ssh_podman_check_failure_scopes_the_remediation_to_the_remote_host() {
-        let executor = FakeExecutor::new([Ok(output(b"podman version 3.4.7\n"))]);
+        let executor = FakeExecutor::new(reachable_then([Ok(output(b"podman version 3.4.7\n"))]));
 
         let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, false);
 
@@ -1202,19 +1537,20 @@ mod tests {
     }
 
     #[test]
-    fn ssh_podman_check_unreachable_host_recommends_verifying_ssh() {
-        let executor =
-            FakeExecutor::new([Err(anyhow!("ssh: connect to host example.test: timeout"))]);
+    fn ssh_podman_check_reports_the_shared_ssh_remediation_before_probing_podman() {
+        let executor = FakeExecutor::new([Ok(failed(
+            b"dev@example.test: Permission denied (publickey).",
+        ))]);
 
         let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, false);
 
         assert_eq!(check.status, CheckStatus::Fixable);
         assert_eq!(
             check.remediation.as_deref(),
-            Some(
-                "Verify `ssh dev@example.test` succeeds noninteractively from this host, then install rootless Podman 4 or newer there (see docs/PODMAN.md)."
-            )
+            Some("Install your public key on the host with `ssh-copy-id dev@example.test`.")
         );
+        // The remote Podman probes never ran: the host is not reachable.
+        assert_eq!(executor.commands.borrow().len(), 1);
     }
 
     #[test]
@@ -1225,20 +1561,20 @@ mod tests {
             Ok(output(b"ok\n")),
             Ok(output(b"removed\n")),
         ]);
-        let executor = FakeExecutor::new(responses);
+        let executor = FakeExecutor::new(reachable_then(responses));
 
         let check = ssh_podman_check("remote", &runtime_ssh(), "ubuntu:24.04", &executor, true);
 
         assert_eq!(check.status, CheckStatus::Ready);
         let commands = executor.commands.borrow();
-        assert_eq!(commands.len(), 6);
-        for command in commands.iter().skip(3) {
+        assert_eq!(commands.len(), 7);
+        for command in commands.iter().skip(4) {
             assert_eq!(command.program, "ssh");
             assert!(command.args.contains(&"dev@example.test".to_owned()));
         }
-        assert!(commands[3].args.last().unwrap().contains("'run' '--init'"));
-        assert!(commands[4].args.last().unwrap().ends_with("'true'"));
-        assert!(commands[5].args.last().unwrap().contains("'rm' '--force'"));
+        assert!(commands[4].args.last().unwrap().contains("'run' '--init'"));
+        assert!(commands[5].args.last().unwrap().ends_with("'true'"));
+        assert!(commands[6].args.last().unwrap().contains("'rm' '--force'"));
     }
 
     #[test]
@@ -1246,6 +1582,117 @@ mod tests {
         let executor = FakeExecutor::new([]);
 
         assert!(ssh_podman_checks(None, &executor, false).is_empty());
+        assert!(executor.commands.borrow().is_empty());
+    }
+
+    fn ssh_bare_config() -> HelConfig {
+        config_with([(
+            "builder",
+            TargetTemplate::SshBare {
+                ssh: crate::hel_config::SshConnection {
+                    host: "example.test".into(),
+                    user: Some("dev".into()),
+                    identity_file: Some(PathBuf::from("/home/dev/.ssh/id_ed25519")),
+                    extra_args: vec![],
+                },
+                workspace_prefix: PathBuf::from(".local/share/hel/workspaces"),
+            },
+        )])
+    }
+
+    #[test]
+    fn ssh_bare_check_is_ready_when_the_batch_mode_probe_succeeds() {
+        let executor = FakeExecutor::new([Ok(output(b""))]);
+
+        let checks = ssh_bare_checks(Some(&ssh_bare_config()), &executor);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].id, "runtime.ssh-bare.builder");
+        assert_eq!(checks[0].status, CheckStatus::Ready);
+        let command = &executor.commands.borrow()[0];
+        assert_eq!(command.program, "ssh");
+        assert_eq!(
+            command.args[..4],
+            ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]
+        );
+        assert!(command.args.contains(&"dev@example.test".to_owned()));
+        assert_eq!(command.args.last().unwrap(), "'true'");
+    }
+
+    #[test]
+    fn ssh_bare_check_permission_denied_recommends_ssh_copy_id_with_the_identity() {
+        let executor = FakeExecutor::new([Ok(failed(
+            b"dev@example.test: Permission denied (publickey).",
+        ))]);
+
+        let checks = ssh_bare_checks(Some(&ssh_bare_config()), &executor);
+
+        assert_eq!(checks[0].status, CheckStatus::Fixable);
+        assert_eq!(
+            checks[0].remediation.as_deref(),
+            Some(
+                "Install your public key on the host with `ssh-copy-id -i /home/dev/.ssh/id_ed25519.pub dev@example.test`."
+            )
+        );
+    }
+
+    #[test]
+    fn ssh_bare_check_host_key_failure_recommends_keyscan_with_a_fingerprint_caution() {
+        let executor = FakeExecutor::new([Ok(failed(
+            b"Host key verification failed.\nNo ECDSA host key is known for example.test",
+        ))]);
+
+        let checks = ssh_bare_checks(Some(&ssh_bare_config()), &executor);
+
+        assert_eq!(checks[0].status, CheckStatus::Fixable);
+        let remediation = checks[0].remediation.as_deref().unwrap();
+        assert!(
+            remediation.contains("ssh-keyscan -H example.test >> ~/.ssh/known_hosts"),
+            "{remediation}"
+        );
+        assert!(
+            remediation.contains("Verify the fingerprint"),
+            "{remediation}"
+        );
+    }
+
+    #[test]
+    fn ssh_bare_check_without_an_ssh_client_recommends_installing_openssh() {
+        let executor = FakeExecutor::new([Err(anyhow!("No such file or directory (os error 2)"))]);
+
+        let checks = ssh_bare_checks(Some(&ssh_bare_config()), &executor);
+
+        assert_eq!(checks[0].status, CheckStatus::Fixable);
+        assert_eq!(
+            checks[0].remediation.as_deref(),
+            Some(SSH_MISSING_REMEDIATION)
+        );
+    }
+
+    #[test]
+    fn ssh_bare_check_falls_back_to_quoting_an_unrecognized_ssh_failure() {
+        let executor = FakeExecutor::new([Ok(failed(
+            b"ssh: connect to host example.test port 22: Connection timed out",
+        ))]);
+
+        let checks = ssh_bare_checks(Some(&ssh_bare_config()), &executor);
+
+        let remediation = checks[0].remediation.as_deref().unwrap();
+        assert!(
+            remediation.contains("Connection timed out"),
+            "{remediation}"
+        );
+        assert!(
+            remediation.contains("Run `ssh dev@example.test true` by hand"),
+            "{remediation}"
+        );
+    }
+
+    #[test]
+    fn ssh_bare_checks_are_skipped_without_a_valid_config() {
+        let executor = FakeExecutor::new([]);
+
+        assert!(ssh_bare_checks(None, &executor).is_empty());
         assert!(executor.commands.borrow().is_empty());
     }
 
@@ -1459,6 +1906,136 @@ mod tests {
         );
         assert_eq!(check.status, CheckStatus::Unsupported);
         assert_eq!(check.detail, "macOS only");
+    }
+
+    fn aws_target(launch_template: &str) -> TargetTemplate {
+        TargetTemplate::AwsEc2 {
+            aws_profile: Some("hel".into()),
+            region: "us-east-1".into(),
+            launch_template: launch_template.to_owned(),
+            launch_template_version: None,
+            ssh_user: "ubuntu".into(),
+            address_source: crate::hel_config::AwsAddressSource::default(),
+            identity_file: None,
+            ssh_args: vec![],
+        }
+    }
+
+    #[test]
+    fn aws_check_is_ready_after_the_cli_credential_and_launch_template_probes() {
+        let executor = FakeExecutor::new([
+            Ok(output(b"aws-cli/2.17.0\n")),
+            Ok(output(b"{\"Account\":\"123456789012\"}\n")),
+            Ok(output(b"{\"LaunchTemplates\":[{}]}\n")),
+        ]);
+        let config = config_with([("aws", aws_target("hel-runson"))]);
+
+        let checks = aws_checks(Some(&config), &executor);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].id, "runtime.aws-ec2.aws");
+        assert_eq!(checks[0].status, CheckStatus::Ready);
+        let commands = executor.commands.borrow();
+        assert!(commands.iter().all(|command| command.program == "aws"));
+        // Profile and region are applied exactly as provisioning applies them.
+        assert_eq!(
+            commands[2].args,
+            vec![
+                "--profile",
+                "hel",
+                "--region",
+                "us-east-1",
+                "ec2",
+                "describe-launch-templates",
+                "--launch-template-names",
+                "hel-runson",
+                "--output",
+                "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn aws_check_is_fixable_with_an_install_remediation_without_the_cli() {
+        let executor = FakeExecutor::new([Err(anyhow!("No such file or directory"))]);
+
+        let check = aws_target_check("aws", None, "us-east-1", "hel-runson", &executor);
+
+        assert_eq!(check.status, CheckStatus::Fixable);
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains(AWS_CLI_INSTALL_URL)
+        );
+        assert_eq!(executor.commands.borrow().len(), 1);
+    }
+
+    #[test]
+    fn aws_check_is_fixable_with_a_sign_in_remediation_for_expired_credentials() {
+        let executor = FakeExecutor::new([
+            Ok(output(b"aws-cli/2.17.0\n")),
+            Ok(failed(b"ExpiredToken: the security token has expired")),
+        ]);
+
+        let check = aws_target_check("aws", Some("hel"), "us-east-1", "hel-runson", &executor);
+
+        assert_eq!(check.status, CheckStatus::Fixable);
+        assert!(check.detail.contains("ExpiredToken"));
+        assert_eq!(
+            check.remediation.as_deref(),
+            Some(
+                "Configure credentials with `aws configure --profile hel`, or sign in with `aws sso login --profile hel`."
+            )
+        );
+    }
+
+    #[test]
+    fn aws_check_is_fixable_when_the_launch_template_is_missing() {
+        let executor = FakeExecutor::new([
+            Ok(output(b"aws-cli/2.17.0\n")),
+            Ok(output(b"{\"Account\":\"123456789012\"}\n")),
+            Ok(failed(b"InvalidLaunchTemplateName.NotFoundException")),
+        ]);
+
+        let check = aws_target_check("aws", Some("hel"), "us-east-1", "lt-0123456789", &executor);
+
+        assert_eq!(check.status, CheckStatus::Fixable);
+        assert!(check.detail.contains("was not found in us-east-1"));
+        // An `lt-` value is a template id, not a name.
+        assert_eq!(
+            executor.commands.borrow()[2].args[6],
+            "--launch-template-ids"
+        );
+    }
+
+    #[test]
+    fn aws_checks_are_skipped_for_configs_without_an_aws_target() {
+        let executor = FakeExecutor::new([]);
+        let config = config_with([(
+            "podman",
+            TargetTemplate::LocalPodman {
+                container: container("ubuntu:24.04"),
+            },
+        )]);
+
+        assert!(aws_checks(Some(&config), &executor).is_empty());
+        assert!(aws_checks(None, &executor).is_empty());
+        assert!(executor.commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn apple_container_daemon_check_is_ready_once_the_daemon_answers() {
+        let executor = FakeExecutor::new([
+            Ok(output(b"container version 1\n")),
+            Ok(output(b"running\n")),
+        ]);
+
+        let check = apple_container_daemon_check(&executor);
+
+        assert_eq!(check.status, CheckStatus::Ready);
+        assert_eq!(executor.commands.borrow().len(), 2);
     }
 
     #[test]

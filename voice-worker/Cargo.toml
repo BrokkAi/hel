@@ -1,10 +1,10 @@
 [package]
 name = "hel-voice-worker"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Native local speech-recognition sidecar for Hel"
 license = "GPL-3.0-only"
-repository = "https://github.com/BrokkAi/mjolnir"
+repository = "https://github.com/BrokkAi/hel"
 publish = true
 
 [lints]
