@@ -2502,10 +2502,12 @@ impl Controller {
             } else {
                 // The new harness compacts the prior transcript itself, in a
                 // scratch session on this relay, before its first real prompt.
-                let context = crate::hel_compaction::compact_snapshot(
+                executor.notify_stage(ProvisionStage::Compacting);
+                let context = compact_while_cancellable(
                     &canonical_session,
                     context_bytes,
                     &mut relay,
+                    executor,
                 )
                 .await
                 .context("compact the cross-harness handoff transcript")?;
@@ -3838,6 +3840,33 @@ impl NativeSessionProbe for StandaloneSession {
             Ok(NativeSessionReadiness::Closed)
         } else {
             Ok(NativeSessionReadiness::Waiting)
+        }
+    }
+}
+
+/// Run the cross-harness handoff compaction while still watching for
+/// cancellation. Compaction is several model turns long, so a resume that the
+/// user cancels must not wait it out; dropping the pinned future abandons the
+/// scratch request, and the resume failure path rolls the session back.
+async fn compact_while_cancellable(
+    snapshot: &CanonicalSessionSnapshot,
+    context_bytes: usize,
+    backend: &mut impl crate::hel_compaction::CompactionBackend,
+    executor: &impl CommandExecutor,
+) -> Result<String> {
+    if executor.cancellation_requested() {
+        bail!("operation cancelled while compacting the cross-harness handoff");
+    }
+    let compaction = crate::hel_compaction::compact_snapshot(snapshot, context_bytes, backend);
+    tokio::pin!(compaction);
+    loop {
+        tokio::select! {
+            context = &mut compaction => return context,
+            _ = tokio::time::sleep(CANCELLATION_POLL_INTERVAL) => {
+                if executor.cancellation_requested() {
+                    bail!("operation cancelled while compacting the cross-harness handoff");
+                }
+            }
         }
     }
 }
@@ -6698,6 +6727,10 @@ impl<E: CommandExecutor> CommandExecutor for StagedExecutor<'_, E> {
 
     fn cancellation_requested(&self) -> bool {
         self.inner.cancellation_requested()
+    }
+
+    fn notify_stage(&self, stage: ProvisionStage) {
+        self.inner.notify_stage(stage);
     }
 
     fn execute_with_stdin(

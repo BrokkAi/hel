@@ -57,6 +57,7 @@ pub enum ProvisionStage {
     Booting,
     Syncing,
     Starting,
+    Compacting,
 }
 
 impl ProvisionStage {
@@ -66,6 +67,7 @@ impl ProvisionStage {
             Self::Booting => "Boot",
             Self::Syncing => "Sync",
             Self::Starting => "Start",
+            Self::Compacting => "Compact",
         }
     }
 }
@@ -285,6 +287,10 @@ pub trait CommandExecutor {
     fn cancellation_requested(&self) -> bool {
         false
     }
+
+    /// Report a lifecycle stage for work that is not a command execution, so
+    /// long in-process phases still name themselves on the session clock.
+    fn notify_stage(&self, _stage: ProvisionStage) {}
 
     fn execute_with_stdin(
         &self,

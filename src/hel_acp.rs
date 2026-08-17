@@ -1164,11 +1164,141 @@ async fn drive_connection(
                 }
             }
             CommandRequest::Compact { prompt, response } => {
-                let result =
-                    compact_in_scratch_session(&connection, spec, prompt, &scratch_outputs)
-                        .await
-                        .map_err(|error| format!("{error:#}"));
-                let _ = response.send(result);
+                // Compaction is several model turns long. It runs in a scratch
+                // session, so the destination stays idle and the coordinator
+                // keeps serving cancels, closes and rejections meanwhile.
+                let compaction =
+                    compact_in_scratch_session(&connection, spec, prompt, &scratch_outputs);
+                tokio::pin!(compaction);
+                let mut response = Some(response);
+                loop {
+                    tokio::select! {
+                        result = &mut compaction => {
+                            if let Some(response) = response.take() {
+                                let _ = response.send(result.map_err(|error| format!("{error:#}")));
+                            }
+                            break;
+                        }
+                        command = requests.recv() => match command {
+                            Some(CommandRequest::Cancel { request_id: cancel_id }) => {
+                                match connection.send_notification(CancelNotification::new(session_id.clone())) {
+                                    Ok(()) => {
+                                        emit_runtime_event(
+                                            events,
+                                            RuntimeEvent::CancelApplied {
+                                                request_id: cancel_id,
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                    Err(error) => {
+                                        emit_runtime_event(
+                                            events,
+                                            RuntimeEvent::CommandRejected {
+                                                request_id: cancel_id,
+                                                message: format!("cancel ACP prompt: {error}"),
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
+                            Some(CommandRequest::Close { request_id: close_id }) => {
+                                if let Some(response) = response.take() {
+                                    let _ = response.send(Err("session closed during compaction".into()));
+                                }
+                                if let Err(error) = connection.send_notification(CancelNotification::new(session_id.clone())) {
+                                    emit_runtime_event(
+                                        events,
+                                        RuntimeEvent::Warning {
+                                            message: format!("cancel ACP prompt before close: {error}"),
+                                        },
+                                    )
+                                    .await?;
+                                }
+                                emit_runtime_event(
+                                    events,
+                                    RuntimeEvent::Warning {
+                                        message: "a compaction was abandoned because the session was closed".into(),
+                                    },
+                                )
+                                .await?;
+                                match connection
+                                    .send_request(CloseSessionRequest::new(session_id.clone()))
+                                    .block_task()
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        emit_runtime_event(
+                                            events,
+                                            RuntimeEvent::CloseApplied {
+                                                request_id: close_id,
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                    Err(error) => {
+                                        emit_runtime_event(
+                                            events,
+                                            RuntimeEvent::CommandRejected {
+                                                request_id: close_id,
+                                                message: format!("close ACP session: {error}"),
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                }
+                                return Ok(());
+                            }
+                            None => {
+                                if let Some(response) = response.take() {
+                                    let _ = response.send(Err(
+                                        "ACP command channel closed while a compaction was running".into(),
+                                    ));
+                                }
+                                connection
+                                    .send_notification(CancelNotification::new(session_id.clone()))
+                                    .context("cancel ACP prompt during runtime shutdown")?;
+                                return Ok(());
+                            }
+                            Some(CommandRequest::Prompt { request_id, .. }) => {
+                                emit_runtime_event(
+                                    events,
+                                    RuntimeEvent::CommandRejected {
+                                        request_id,
+                                        message: "a compaction is running; retry when it finishes".into(),
+                                    },
+                                )
+                                .await?;
+                            }
+                            Some(CommandRequest::SetConfig { request_id, .. }) => {
+                                emit_runtime_event(
+                                    events,
+                                    RuntimeEvent::CommandRejected {
+                                        request_id,
+                                        message: "configuration can only be changed while the agent is idle".into(),
+                                    },
+                                )
+                                .await?;
+                            }
+                            Some(CommandRequest::SetSessionMode { request_id, .. }) => {
+                                emit_runtime_event(
+                                    events,
+                                    RuntimeEvent::CommandRejected {
+                                        request_id,
+                                        message: "the session mode can only be changed while the agent is idle".into(),
+                                    },
+                                )
+                                .await?;
+                            }
+                            Some(CommandRequest::Compact { response, .. }) => {
+                                let _ = response.send(Err(
+                                    "a compaction is already running".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
             }
             CommandRequest::Cancel { request_id } => {
                 match connection.send_notification(CancelNotification::new(session_id.clone())) {
@@ -2270,6 +2400,123 @@ mod tests {
             .expect("the runtime task must not panic")
             .expect("a failed prompt must not fail the runtime");
         assert_eq!(bridge.await.unwrap(), 2);
+    }
+
+    /// Answers `initialize` and both `session/new` calls, then leaves the
+    /// scratch `session/prompt` unanswered so a compaction stays in flight.
+    /// Every method it sees is republished so a test can wait for one.
+    async fn stalled_compaction_bridge(
+        stream: tokio::io::DuplexStream,
+        observed: mpsc::UnboundedSender<String>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (read, mut write) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read).lines();
+        let mut sessions = 0_usize;
+        while let Some(line) = lines.next_line().await.expect("read bridge input") {
+            let message: serde_json::Value =
+                serde_json::from_str(&line).expect("bridge input must be JSON-RPC");
+            let Some(method) = message.get("method").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let _ = observed.send(method.to_owned());
+            let id = message
+                .get("id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let response = match method {
+                "initialize" => {
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": 1}})
+                }
+                "session/new" => {
+                    sessions += 1;
+                    let session = if sessions == 1 {
+                        "destination"
+                    } else {
+                        "scratch"
+                    };
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"sessionId": session}})
+                }
+                _ => continue,
+            };
+            if write
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancel_is_served_while_a_compaction_is_in_flight() {
+        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+        let bridge = tokio::spawn(stalled_compaction_bridge(bridge_stream, observed_tx));
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
+
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let spec = LaunchSpec {
+            command: "scripted".into(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: std::env::current_dir().unwrap(),
+            additional_directories: Vec::new(),
+            resume_session: None,
+            // Kimi has no production compactor, so the scratch session goes
+            // straight from `session/new` to the prompt that stalls.
+            harness: HarnessKind::Kimi,
+            force_unrestricted_mode: false,
+        };
+        let driver = tokio::spawn(drive(transport, spec, request_rx, event_tx));
+
+        let (compacted_tx, mut compacted_rx) = oneshot::channel();
+        request_tx
+            .send(CommandRequest::Compact {
+                prompt: "summarize the transcript".into(),
+                response: compacted_tx,
+            })
+            .await
+            .unwrap();
+        loop {
+            let method =
+                tokio::time::timeout(std::time::Duration::from_secs(5), observed_rx.recv())
+                    .await
+                    .expect("the compaction must reach the scratch prompt")
+                    .expect("the bridge must keep reporting methods");
+            if method == "session/prompt" {
+                break;
+            }
+        }
+
+        request_tx
+            .send(CommandRequest::Cancel {
+                request_id: "cancel-1".into(),
+            })
+            .await
+            .unwrap();
+        let applied = loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("the coordinator must keep serving while a compaction runs")
+                .expect("the runtime must not drop its event channel");
+            if let RuntimeEvent::CancelApplied { request_id } = event {
+                break request_id;
+            }
+        };
+        assert_eq!(applied, "cancel-1");
+        assert!(
+            compacted_rx.try_recv().is_err(),
+            "the cancel must be served without ending the compaction"
+        );
+
+        drop(request_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
+        bridge.abort();
     }
 
     #[cfg(unix)]

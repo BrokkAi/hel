@@ -3257,6 +3257,12 @@ impl<E: CommandExecutor> StageReportingExecutor<E> {
         let Some(stage) = command.stage else {
             return;
         };
+        self.report_stage(stage);
+    }
+
+    /// The single place a stage reaches the dashboard, so command-driven and
+    /// explicit reports dedupe against the same last-reported stage.
+    fn report_stage(&self, stage: ProvisionStage) {
         let mut reported = self
             .reported
             .lock()
@@ -3280,6 +3286,10 @@ impl<E: CommandExecutor> CommandExecutor for StageReportingExecutor<E> {
 
     fn cancellation_requested(&self) -> bool {
         self.inner.cancellation_requested()
+    }
+
+    fn notify_stage(&self, stage: ProvisionStage) {
+        self.report_stage(stage);
     }
 
     fn execute_with_stdin(
@@ -5524,6 +5534,42 @@ mod tests {
             panic!("export-checkpoint did not parse as a worker command");
         };
         assert_eq!(spec, PathBuf::from("-"));
+    }
+
+    /// Compaction is not a command execution, so the resume path names its
+    /// stage explicitly. The explicit report must reach the dashboard and
+    /// dedupe against the same last-reported stage a staged command sets.
+    #[test]
+    fn notify_stage_reports_a_lifecycle_stage_and_dedupes_a_repeat() {
+        struct UnusedExecutor;
+
+        impl CommandExecutor for UnusedExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                panic!("a stage notification must not run {}", command.program)
+            }
+        }
+
+        let (updates, mut reported) = tokio::sync::mpsc::unbounded_channel();
+        let executor = StageReportingExecutor::new(UnusedExecutor, "session-1".to_owned(), updates);
+
+        executor.notify_stage(ProvisionStage::Compacting);
+        executor.notify_stage(ProvisionStage::Compacting);
+        executor.notify_stage(ProvisionStage::Starting);
+        drop(executor);
+
+        let stages = std::iter::from_fn(|| reported.try_recv().ok())
+            .map(|update| match update {
+                DashboardIoUpdate::LifecycleStage { session_id, stage } => (session_id, stage),
+                _ => panic!("a stage notification must publish a lifecycle stage"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            vec![
+                ("session-1".to_owned(), ProvisionStage::Compacting),
+                ("session-1".to_owned(), ProvisionStage::Starting),
+            ]
+        );
     }
 
     /// The dashboard loop batches buffered input and stops at the first event
