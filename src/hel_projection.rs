@@ -506,9 +506,17 @@ fn push_stream_chunk(
     mutation: &mut MaterializedSessionMutation,
     event: &RelayEvent,
     agent: bool,
-    // ACP permits trailing session updates after a prompt completes or is cancelled. A chunk
-    // recorded while the session is not running is complete by definition, so it must not
-    // (re)open a stream: checkpoint export requires no open streams at an idle barrier.
+    // ACP permits trailing session updates after a prompt completes or is cancelled (some
+    // agents, like Grok Build's goal mode, stream an entire autonomous turn this way, one small
+    // delta per chunk, and never set `message_id`). A chunk recorded while the session is not
+    // running is complete by definition, so it must not (re)open a stream: checkpoint export
+    // requires no open streams at an idle barrier. Instead, a no-message-id chunk recorded while
+    // idle is coalesced into the transcript's last item when that item is the same kind (Agent
+    // for an agent chunk, Thought for a thought chunk), staying closed (`streaming: false`).
+    // This keeps a long run of trailing chunks from Grok Build a single transcript item instead
+    // of thousands, while still segmenting the transcript naturally: an intervening item of
+    // another kind (a tool call, a plan update, ...) or a thought/agent kind switch makes the
+    // transcript's last item mismatch, so the next chunk starts a fresh item.
     running: bool,
     chunk: &agent_client_protocol::schema::v1::ContentChunk,
 ) -> Result<()> {
@@ -563,6 +571,37 @@ fn push_stream_chunk(
         }
         upsert(mutation, item);
         return Ok(());
+    }
+    // No message ID and no open same-kind stream: while idle, coalesce into the transcript's
+    // last item rather than opening a new item per chunk, as long as that last item is the same
+    // kind. The item stays closed; see the `running` doc comment above.
+    if explicit_id.is_none()
+        && !running
+        && let Some(last) = current.transcript.last()
+    {
+        let same_kind = match &last.body {
+            TranscriptBody::Agent { .. } => agent,
+            TranscriptBody::Thought { .. } => !agent,
+            _ => false,
+        };
+        if same_kind {
+            let mut item = TranscriptItem::clone(last);
+            match &mut item.body {
+                TranscriptBody::Agent { chunks, .. } if agent => {
+                    chunks.push(serde_json::to_value(chunk)?);
+                }
+                TranscriptBody::Thought { chunks, .. } if !agent => {
+                    chunks.push(serde_json::to_value(chunk)?);
+                }
+                _ => unreachable!("same_kind matched the item's body above"),
+            }
+            item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
+            if agent {
+                item.latest_content_event_ordinal = Some(event.ordinal);
+            }
+            upsert(mutation, item);
+            return Ok(());
+        }
     }
     upsert(
         mutation,
@@ -878,6 +917,28 @@ mod tests {
         apply(session, next);
     }
 
+    /// An agent message chunk with no `message_id`, as Grok Build's goal mode streams them.
+    fn untagged_agent_chunk(text: &str) -> RelayObservation {
+        RelayObservation::SessionUpdate {
+            update: Box::new(SessionUpdate::AgentMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(text),
+                )),
+            )),
+        }
+    }
+
+    /// An agent thought chunk with no `message_id`, mirroring [`untagged_agent_chunk`].
+    fn untagged_thought_chunk(text: &str) -> RelayObservation {
+        RelayObservation::SessionUpdate {
+            update: Box::new(SessionUpdate::AgentThoughtChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(text),
+                )),
+            )),
+        }
+    }
+
     #[test]
     fn streamed_chunks_are_one_unread_logical_agent_message() {
         let mut session = MaterializedSession::empty("session-1");
@@ -1008,6 +1069,126 @@ mod tests {
             &item.body,
             TranscriptBody::Agent { chunks, streaming }
                 if *streaming && crate::hel_chat::materialized_chunks_text(chunks) == "live"
+        ));
+    }
+
+    #[test]
+    fn idle_untagged_agent_chunks_coalesce_into_one_closed_item() {
+        let mut session = MaterializedSession::empty("session-1");
+        session.execution = MaterializedExecutionState::Idle;
+        for word in ["Grok ", "streams ", "one ", "word ", "at ", "a ", "time"] {
+            apply_observation(&mut session, untagged_agent_chunk(word));
+        }
+        assert_eq!(session.transcript.len(), 1);
+        let item = &session.transcript[0];
+        assert!(matches!(
+            &item.body,
+            TranscriptBody::Agent { chunks, streaming }
+                if !*streaming
+                    && crate::hel_chat::materialized_chunks_text(chunks)
+                        == "Grok streams one word at a time"
+        ));
+    }
+
+    #[test]
+    fn idle_untagged_thought_chunks_coalesce_into_one_closed_item() {
+        let mut session = MaterializedSession::empty("session-1");
+        session.execution = MaterializedExecutionState::Idle;
+        for word in ["thinking ", "in ", "small ", "pieces"] {
+            apply_observation(&mut session, untagged_thought_chunk(word));
+        }
+        assert_eq!(session.transcript.len(), 1);
+        let item = &session.transcript[0];
+        assert!(matches!(
+            &item.body,
+            TranscriptBody::Thought { chunks, streaming }
+                if !*streaming
+                    && crate::hel_chat::materialized_chunks_text(chunks)
+                        == "thinking in small pieces"
+        ));
+    }
+
+    #[test]
+    fn idle_untagged_thought_then_agent_chunks_split_into_two_items() {
+        let mut session = MaterializedSession::empty("session-1");
+        session.execution = MaterializedExecutionState::Idle;
+        apply_observation(&mut session, untagged_thought_chunk("pondering "));
+        apply_observation(&mut session, untagged_thought_chunk("the goal"));
+        apply_observation(&mut session, untagged_agent_chunk("here's "));
+        apply_observation(&mut session, untagged_agent_chunk("the plan"));
+
+        assert_eq!(session.transcript.len(), 2);
+        assert!(matches!(
+            &session.transcript[0].body,
+            TranscriptBody::Thought { chunks, streaming }
+                if !*streaming
+                    && crate::hel_chat::materialized_chunks_text(chunks) == "pondering the goal"
+        ));
+        assert!(matches!(
+            &session.transcript[1].body,
+            TranscriptBody::Agent { chunks, streaming }
+                if !*streaming
+                    && crate::hel_chat::materialized_chunks_text(chunks) == "here's the plan"
+        ));
+    }
+
+    #[test]
+    fn idle_untagged_agent_chunks_split_around_an_intervening_tool_call() {
+        let mut session = MaterializedSession::empty("session-1");
+        session.execution = MaterializedExecutionState::Idle;
+        apply_observation(&mut session, untagged_agent_chunk("checking "));
+        apply_observation(&mut session, untagged_agent_chunk("the repo"));
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCall(ToolCall::new("call-1", "grep"))),
+            },
+        );
+        apply_observation(&mut session, untagged_agent_chunk("found "));
+        apply_observation(&mut session, untagged_agent_chunk("it"));
+
+        let agent_items: Vec<&TranscriptItem> = session
+            .transcript
+            .iter()
+            .filter(|item| matches!(item.body, TranscriptBody::Agent { .. }))
+            .map(|item| item.as_ref())
+            .collect();
+        assert_eq!(agent_items.len(), 2, "transcript: {:?}", session.transcript);
+        assert!(matches!(
+            &agent_items[0].body,
+            TranscriptBody::Agent { chunks, streaming }
+                if !*streaming
+                    && crate::hel_chat::materialized_chunks_text(chunks) == "checking the repo"
+        ));
+        assert!(matches!(
+            &agent_items[1].body,
+            TranscriptBody::Agent { chunks, streaming }
+                if !*streaming
+                    && crate::hel_chat::materialized_chunks_text(chunks) == "found it"
+        ));
+        assert!(
+            session
+                .transcript
+                .iter()
+                .any(|item| matches!(&item.body, TranscriptBody::Tool { .. })),
+            "the tool call item survives between the two agent items"
+        );
+    }
+
+    #[test]
+    fn running_untagged_agent_chunks_still_merge_into_one_open_stream() {
+        let mut session = MaterializedSession::empty("session-1");
+        session.execution = MaterializedExecutionState::Running { started_at_ms: 1 };
+        for word in ["live ", "streaming ", "text"] {
+            apply_observation(&mut session, untagged_agent_chunk(word));
+        }
+        assert_eq!(session.transcript.len(), 1);
+        let item = &session.transcript[0];
+        assert!(matches!(
+            &item.body,
+            TranscriptBody::Agent { chunks, streaming }
+                if *streaming
+                    && crate::hel_chat::materialized_chunks_text(chunks) == "live streaming text"
         ));
     }
 
