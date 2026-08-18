@@ -728,16 +728,17 @@ pub fn save_session(session: &SessionRecord) -> Result<()> {
     save_session_to(&database_path(), session)
 }
 
-/// Persist fields owned by a lifecycle transition while retaining values
-/// written independently by the controller's projection/recovery paths.
+/// Update only the fields a lifecycle transition owns on a session that
+/// already exists. Everything else — display titles, checkpoints, container
+/// settings, and attached directories — stays with its own writer.
 pub fn save_lifecycle_session(session: &SessionRecord) -> Result<()> {
-    save_session_scoped_to(&database_path(), session, SessionWriteScope::Lifecycle)
+    save_lifecycle_session_to(&database_path(), session)
 }
 
-/// Install a lifecycle transition and the checkpoint it just verified. User
-/// and ACP display titles remain owned by their field-specific writers.
+/// Install a lifecycle transition together with the checkpoint it just
+/// verified and the harness session id that produced it.
 pub fn save_checkpointed_session(session: &SessionRecord) -> Result<()> {
-    save_session_scoped_to(&database_path(), session, SessionWriteScope::Checkpoint)
+    save_checkpointed_session_to(&database_path(), session)
 }
 
 /// Recover lifecycle rows stranded by a process exit during checkpoint
@@ -938,19 +939,7 @@ fn recover_interrupted_checkpointing_sessions_to(path: &Path, updated_at: &str) 
 }
 
 fn save_session_to(path: &Path, session: &SessionRecord) -> Result<()> {
-    save_session_scoped_to(path, session, SessionWriteScope::Authoritative)
-}
-
-fn save_session_scoped_to(
-    path: &Path,
-    session: &SessionRecord,
-    scope: SessionWriteScope,
-) -> Result<()> {
-    let mut validation = HelState::default();
-    validation
-        .sessions
-        .insert(session.id.clone(), session.clone());
-    validation.validate()?;
+    validate_session_record(session)?;
 
     let mut connection = open(path)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -970,9 +959,42 @@ fn save_session_scoped_to(
             session.bundle_id
         );
     }
-    insert_session_scoped(&tx, session, scope)?;
+    insert_session(&tx, session)?;
     tx.commit()?;
     Ok(())
+}
+
+fn save_lifecycle_session_to(path: &Path, session: &SessionRecord) -> Result<()> {
+    validate_session_record(session)?;
+
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    update_lifecycle_fields(&tx, session)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn save_checkpointed_session_to(path: &Path, session: &SessionRecord) -> Result<()> {
+    validate_session_record(session)?;
+
+    let mut connection = open(path)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    update_lifecycle_fields(&tx, session)?;
+    tx.execute(
+        "UPDATE sessions SET native_session_id = ?2 WHERE session_id = ?1",
+        params![session.id, session.native_session_id],
+    )?;
+    replace_checkpoint(&tx, session)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn validate_session_record(session: &SessionRecord) -> Result<()> {
+    let mut validation = HelState::default();
+    validation
+        .sessions
+        .insert(session.id.clone(), session.clone());
+    validation.validate()
 }
 
 /// Remove one operational session while retaining its relational history
@@ -1812,35 +1834,25 @@ fn parse_materialized_execution(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionWriteScope {
-    Authoritative,
-    Lifecycle,
-    Checkpoint,
-}
-
+/// Write every field of a session, including the ones other writers own.
+/// Only a flow that authors the whole record — creation, import, resume, or
+/// orphan adoption — may use this.
 fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
-    insert_session_scoped(tx, session, SessionWriteScope::Authoritative)
-}
-
-fn insert_session_scoped(
-    tx: &Transaction<'_>,
-    session: &SessionRecord,
-    scope: SessionWriteScope,
-) -> Result<()> {
-    let existed = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1)",
-        [session.id.as_str()],
-        |row| row.get::<_, bool>(0),
-    )?;
     tx.execute(
         "INSERT INTO session_contexts(session_id, bundle_id, created_at) VALUES (?1, ?2, ?3)
          ON CONFLICT(session_id) DO NOTHING",
         params![session.id, session.bundle_id, session.created_at],
     )?;
-    let update_fields = match scope {
-        SessionWriteScope::Authoritative => {
-            "title = excluded.title,
+    tx.execute(
+        "INSERT INTO sessions(
+             session_id, title, harness_kind, last_profile, target_template_id, state,
+             native_session_id, acp_session_title, session_title_override, updated_at,
+             detached_after_event_ordinal, last_error, resource_allocation,
+             last_checkpoint_error, project_directory, managed_worktree,
+             container_cpus, container_memory
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+         ON CONFLICT(session_id) DO UPDATE SET
+             title = excluded.title,
              harness_kind = excluded.harness_kind,
              last_profile = excluded.last_profile,
              target_template_id = excluded.target_template_id,
@@ -1859,56 +1871,7 @@ fn insert_session_scoped(
              project_directory = excluded.project_directory,
              managed_worktree = excluded.managed_worktree,
              container_cpus = excluded.container_cpus,
-             container_memory = excluded.container_memory"
-        }
-        SessionWriteScope::Lifecycle => {
-            "title = excluded.title,
-             harness_kind = excluded.harness_kind,
-             last_profile = excluded.last_profile,
-             target_template_id = excluded.target_template_id,
-             state = excluded.state,
-             updated_at = excluded.updated_at,
-             detached_after_event_ordinal = max(
-                 sessions.detached_after_event_ordinal,
-                 excluded.detached_after_event_ordinal
-             ),
-             last_error = excluded.last_error,
-             resource_allocation = excluded.resource_allocation,
-             last_checkpoint_error = excluded.last_checkpoint_error,
-             project_directory = excluded.project_directory,
-             managed_worktree = excluded.managed_worktree"
-        }
-        SessionWriteScope::Checkpoint => {
-            "title = excluded.title,
-             harness_kind = excluded.harness_kind,
-             last_profile = excluded.last_profile,
-             target_template_id = excluded.target_template_id,
-             state = excluded.state,
-             native_session_id = excluded.native_session_id,
-             updated_at = excluded.updated_at,
-             detached_after_event_ordinal = max(
-                 sessions.detached_after_event_ordinal,
-                 excluded.detached_after_event_ordinal
-             ),
-             last_error = excluded.last_error,
-             resource_allocation = excluded.resource_allocation,
-             last_checkpoint_error = excluded.last_checkpoint_error,
-             project_directory = excluded.project_directory,
-             managed_worktree = excluded.managed_worktree"
-        }
-    };
-    let upsert = format!(
-        "INSERT INTO sessions(
-             session_id, title, harness_kind, last_profile, target_template_id, state,
-             native_session_id, acp_session_title, session_title_override, updated_at,
-             detached_after_event_ordinal, last_error, resource_allocation,
-             last_checkpoint_error, project_directory, managed_worktree,
-             container_cpus, container_memory
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
-         ON CONFLICT(session_id) DO UPDATE SET {update_fields}"
-    );
-    tx.execute(
-        &upsert,
+             container_memory = excluded.container_memory",
         params![
             session.id,
             session.title,
@@ -1946,24 +1909,11 @@ fn insert_session_scoped(
          ON CONFLICT(session_id) DO NOTHING",
         [session.id.as_str()],
     )?;
-    tx.execute(
-        "DELETE FROM session_targets WHERE session_id = ?1",
-        [session.id.as_str()],
-    )?;
+    replace_targets(tx, session)?;
     tx.execute(
         "DELETE FROM session_mounts WHERE session_id = ?1",
         [session.id.as_str()],
     )?;
-    let replace_checkpoint = scope != SessionWriteScope::Lifecycle || !existed;
-    if replace_checkpoint {
-        tx.execute(
-            "DELETE FROM session_checkpoints WHERE session_id = ?1",
-            [session.id.as_str()],
-        )?;
-    }
-    if let Some(target) = &session.target {
-        insert_target(tx, &session.id, target)?;
-    }
     for (ordinal, mount) in session.additional_mounts.iter().enumerate() {
         tx.execute(
             "INSERT INTO session_mounts(session_id, ordinal, source, destination)
@@ -1976,7 +1926,81 @@ fn insert_session_scoped(
             ],
         )?;
     }
-    if replace_checkpoint && let Some(checkpoint) = &session.checkpoint {
+    replace_checkpoint(tx, session)?;
+    Ok(())
+}
+
+/// Update the columns a lifecycle transition owns, plus the target locator
+/// that provisioning and teardown maintain with them. The row must exist:
+/// a transition never resurrects a session another writer deleted.
+fn update_lifecycle_fields(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
+    let changed = tx.execute(
+        // The detach ordinal only ever moves forward, so a transition that
+        // started before a detach receipt cannot rewind it.
+        "UPDATE sessions
+         SET title = ?2,
+             harness_kind = ?3,
+             last_profile = ?4,
+             target_template_id = ?5,
+             state = ?6,
+             updated_at = ?7,
+             detached_after_event_ordinal = max(detached_after_event_ordinal, ?8),
+             last_error = ?9,
+             resource_allocation = ?10,
+             last_checkpoint_error = ?11,
+             project_directory = ?12,
+             managed_worktree = ?13
+         WHERE session_id = ?1",
+        params![
+            session.id,
+            session.title,
+            session.harness_kind.id(),
+            session.last_profile,
+            session.target_template_id,
+            session_state_name(session.state),
+            session.updated_at,
+            session.detached_after_event_ordinal,
+            session.last_error,
+            session
+                .resource_allocation
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+            session.last_checkpoint_error,
+            session
+                .project_directory
+                .as_ref()
+                .map(|path| path_to_blob(path)),
+            session
+                .managed_worktree
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        ],
+    )?;
+    if changed != 1 {
+        bail!("unknown session {}", session.id);
+    }
+    replace_targets(tx, session)
+}
+
+fn replace_targets(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
+    tx.execute(
+        "DELETE FROM session_targets WHERE session_id = ?1",
+        [session.id.as_str()],
+    )?;
+    if let Some(target) = &session.target {
+        insert_target(tx, &session.id, target)?;
+    }
+    Ok(())
+}
+
+fn replace_checkpoint(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
+    tx.execute(
+        "DELETE FROM session_checkpoints WHERE session_id = ?1",
+        [session.id.as_str()],
+    )?;
+    if let Some(checkpoint) = &session.checkpoint {
         tx.execute(
             "INSERT INTO session_checkpoints(session_id, archive_path, sha256, created_at, event_frontier)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -2646,6 +2670,107 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_save_preserves_container_settings_and_mounts() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        let mut stale = session("session-1", "project-1");
+        stale.additional_mounts.clear();
+        save_session_to(&database, &stale).unwrap();
+
+        let attached = AdditionalMount {
+            source: PathBuf::from("/host/models"),
+            destination: PathBuf::from("/mnt/models"),
+        };
+        set_session_container_settings_to(
+            &database,
+            "session-1",
+            Some("6"),
+            Some("12g"),
+            std::slice::from_ref(&attached),
+            "2026-08-15T00:00:00Z",
+        )
+        .unwrap();
+
+        // The lifecycle writer still holds the record as it was before the
+        // container settings were edited.
+        stale.state = SessionState::Destroying;
+        stale.updated_at = "2026-08-15T00:01:00Z".into();
+        save_lifecycle_session_to(&database, &stale).unwrap();
+
+        let loaded = load_state_from(&database).unwrap();
+        let session = &loaded.sessions["session-1"];
+        assert_eq!(session.state, SessionState::Destroying);
+        assert_eq!(session.additional_mounts, vec![attached]);
+        assert_eq!(session.container_cpus.as_deref(), Some("6"));
+        assert_eq!(session.container_memory.as_deref(), Some("12g"));
+    }
+
+    #[test]
+    fn checkpointed_save_preserves_container_settings_and_mounts() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        let mut stale = session("session-1", "project-1");
+        stale.additional_mounts.clear();
+        save_session_to(&database, &stale).unwrap();
+
+        let attached = AdditionalMount {
+            source: PathBuf::from("/host/models"),
+            destination: PathBuf::from("/mnt/models"),
+        };
+        set_session_container_settings_to(
+            &database,
+            "session-1",
+            Some("6"),
+            Some("12g"),
+            std::slice::from_ref(&attached),
+            "2026-08-15T00:00:00Z",
+        )
+        .unwrap();
+
+        let verified = CheckpointMetadata {
+            archive_path: PathBuf::from("sessions/verified.hel.zip"),
+            sha256: "c".repeat(64),
+            created_at: "2026-08-15T00:02:00Z".into(),
+            event_frontier: 21,
+        };
+        stale.state = SessionState::Running;
+        stale.updated_at = "2026-08-15T00:02:00Z".into();
+        stale.native_session_id = Some("native-checkpointed".into());
+        stale.checkpoint = Some(verified.clone());
+        save_checkpointed_session_to(&database, &stale).unwrap();
+
+        let loaded = load_state_from(&database).unwrap();
+        let session = &loaded.sessions["session-1"];
+        assert_eq!(session.checkpoint.as_ref(), Some(&verified));
+        assert_eq!(
+            session.native_session_id.as_deref(),
+            Some("native-checkpointed")
+        );
+        assert_eq!(session.additional_mounts, vec![attached]);
+        assert_eq!(session.container_cpus.as_deref(), Some("6"));
+        assert_eq!(session.container_memory.as_deref(), Some("12g"));
+    }
+
+    #[test]
+    fn lifecycle_save_fails_for_unknown_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        let missing = session("session-1", "project-1");
+
+        for error in [
+            save_lifecycle_session_to(&database, &missing).unwrap_err(),
+            save_checkpointed_session_to(&database, &missing).unwrap_err(),
+        ] {
+            assert!(
+                format!("{error:#}").contains("unknown session session-1"),
+                "{error:#}"
+            );
+        }
+
+        assert!(load_state_from(&database).unwrap().sessions.is_empty());
+    }
+
+    #[test]
     fn destroying_session_round_trip_is_durable() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("hel.sqlite3");
@@ -2784,7 +2909,7 @@ mod tests {
         set_session_acp_title_to(&database, "session-1", Some("Current harness title")).unwrap();
 
         stale.state = SessionState::Destroying;
-        save_session_scoped_to(&database, &stale, SessionWriteScope::Lifecycle).unwrap();
+        save_lifecycle_session_to(&database, &stale).unwrap();
 
         let loaded = load_state_from(&database).unwrap();
         let session = &loaded.sessions["session-1"];

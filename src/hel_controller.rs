@@ -345,7 +345,8 @@ impl Controller {
         if let Some(host) = mount_history_host(template) {
             self.state.remember_mount_sources(host, &additional_mounts);
         }
-        self.persist_session_state(&id)?;
+        // Creation authors the whole record, so it writes the whole row.
+        crate::hel_database::save_session(&self.state.sessions[&id])?;
         if let Some(host) = mount_history_host(template) {
             crate::hel_database::remember_mount_sources(host, &additional_mounts)?;
         }

@@ -321,7 +321,9 @@ impl Controller {
         {
             crate::hel_database::rebind_session_bundle(session_id, &conversion.bundle_id)?;
         }
-        self.persist_session_state(session_id)?;
+        // Resume rewrites the record it resumes, including the attached
+        // directories and the harness session id, so it writes the whole row.
+        crate::hel_database::save_session(&self.state.sessions[session_id])?;
 
         let result = async {
             // The record already names the worktree, so a failure here rolls
@@ -697,7 +699,9 @@ impl Controller {
             let bundle_id = record.bundle_id.clone();
             crate::hel_database::rebind_session_bundle(session_id, &bundle_id)?;
         }
-        self.persist_session_state(session_id)?;
+        // The rollback restores the record the resume replaced, attached
+        // directories included, so it writes the whole row back.
+        crate::hel_database::save_session(&self.state.sessions[session_id])?;
         Ok(failure)
     }
 }
@@ -1170,11 +1174,25 @@ mod tests {
             return;
         }
 
-        struct FailingPreflightExecutor;
+        /// Provisioning runs after the resumed record is persisted, so the
+        /// durable mounts read here are the ones resume just committed.
+        #[derive(Default)]
+        struct FailingPreflightExecutor {
+            mounts_during_provisioning: Mutex<Option<Vec<AdditionalMount>>>,
+        }
 
         impl CommandExecutor for FailingPreflightExecutor {
             fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
                 assert_eq!(command.program, "podman");
+                let mut observed = self.mounts_during_provisioning.lock().unwrap();
+                if observed.is_none() {
+                    let durable = crate::hel_database::load_state().unwrap();
+                    *observed = Some(
+                        durable.sessions["0123456789abcdef0123456789abcdef"]
+                            .additional_mounts
+                            .clone(),
+                    );
+                }
                 Ok(CommandOutput {
                     status: 1,
                     stdout: Vec::new(),
@@ -1195,7 +1213,15 @@ mod tests {
         let mut session = checkpoint_test_session(session_id);
         session.state = SessionState::Archived;
         session.checkpoint = Some(checkpoint.clone());
+        session.additional_mounts = vec![AdditionalMount {
+            source: PathBuf::from("/host/old"),
+            destination: PathBuf::from("/mnt/old"),
+        }];
         let previous = session.clone();
+        let resumed_mounts = vec![AdditionalMount {
+            source: PathBuf::from("/host/new"),
+            destination: PathBuf::from("/mnt/new"),
+        }];
         let profile_home = data_directory.join("profile");
         std::fs::create_dir_all(&profile_home).unwrap();
         let mut config = HelConfig::default();
@@ -1248,22 +1274,27 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let executor = FailingPreflightExecutor::default();
         let error = runtime
             .block_on(controller.resume_session_controlled(
                 session_id,
                 "codex",
                 "podman",
                 SessionResumeOptions {
-                    additional_mounts: None,
+                    additional_mounts: Some(resumed_mounts.clone()),
                     resource_allocation: None,
                     discard_queue: false,
                 },
-                &FailingPreflightExecutor,
+                &executor,
             ))
             .unwrap_err();
         let detail = format!("{error:#}");
         assert!(detail.contains("returned to archived"), "{detail}");
         assert!(!detail.contains("unknown session"), "{detail}");
+        assert_eq!(
+            executor.mounts_during_provisioning.into_inner().unwrap(),
+            Some(resumed_mounts)
+        );
 
         let retained = controller.state.sessions.get(session_id).unwrap();
         assert_eq!(retained.state, SessionState::Archived);
@@ -1275,6 +1306,10 @@ mod tests {
         let durable_session = durable.sessions.get(session_id).unwrap();
         assert_eq!(durable_session.state, SessionState::Archived);
         assert_eq!(durable_session.checkpoint, previous.checkpoint);
+        assert_eq!(
+            durable_session.additional_mounts,
+            previous.additional_mounts
+        );
         assert_eq!(
             crate::hel_database::load_materialized_session(session_id).unwrap(),
             Some(expected_projection)
