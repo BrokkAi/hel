@@ -205,6 +205,10 @@ pub enum CanonicalTranscriptBody {
         /// Output of the terminals this call's content refers to.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         terminal_outputs: Vec<CanonicalTerminalOutput>,
+        /// Every terminal this call has ever referred to, including references
+        /// a later content update dropped.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        terminal_refs: Vec<String>,
     },
     /// Terminal output no tool call refers to.
     TerminalOutput {
@@ -1537,6 +1541,7 @@ fn validate_canonical_session(snapshot: &CanonicalSessionSnapshot) -> Result<()>
             CanonicalTranscriptBody::Tool {
                 call,
                 terminal_outputs,
+                terminal_refs,
             } => {
                 serde_json::from_value::<agent_client_protocol::schema::v1::ToolCall>(call.clone())
                     .with_context(|| {
@@ -1547,6 +1552,13 @@ fn validate_canonical_session(snapshot: &CanonicalSessionSnapshot) -> Result<()>
                     })?;
                 for output in terminal_outputs {
                     validate_canonical_terminal_output(output, &item.stable_id)?;
+                }
+                for terminal_id in terminal_refs {
+                    ensure!(
+                        !terminal_id.trim().is_empty(),
+                        "canonical transcript item '{}' refers to a terminal with an empty id",
+                        item.stable_id
+                    );
                 }
             }
             CanonicalTranscriptBody::TerminalOutput { record } => {

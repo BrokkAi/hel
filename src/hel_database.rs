@@ -2575,6 +2575,7 @@ mod tests {
                             "_meta": {"provider": "test"}
                         }),
                         terminal_outputs: Vec::new(),
+                        terminal_refs: Vec::new(),
                     },
                 }),
                 Arc::new(TranscriptItem {

@@ -338,6 +338,7 @@ fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEnt
         TranscriptBody::Tool {
             call,
             terminal_outputs,
+            ..
         } => {
             let call = ToolCall::deserialize(call).ok();
             let mut entry = ChatEntry::tool(
@@ -349,7 +350,8 @@ fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEnt
                     .map_or(ToolStatus::Pending, |call| tool_status(&call.status)),
             );
             if let Some(call) = call {
-                entry.tool_content = tool_content_details(&call.content, terminal_outputs);
+                entry.tool_content =
+                    tool_content_details(&call.content, terminal_outputs, call.raw_output.as_ref());
                 entry.tool_diffstats = tool_diffstats(&call.content);
                 entry.tool_locations = tool_location_details(&call.locations);
             }
@@ -447,9 +449,10 @@ fn browser_entry(entry: &ChatEntry) -> BrowserTranscriptEntry {
             })
             .collect::<Vec<_>>()
     } else if entry.role == ChatRole::Tool {
+        // The remote viewer mirrors the TUI's Rich feed: the tool title plus
+        // any diffstat, not the full Raw detail.
         std::iter::once(entry.text.clone())
-            .chain(entry.tool_content.clone())
-            .chain(entry.tool_locations.clone())
+            .chain(entry.tool_diffstats.clone())
             .collect()
     } else {
         entry.text.lines().map(str::to_owned).collect()
@@ -889,8 +892,10 @@ pub(super) fn content_block_text(content: &ContentBlock) -> Option<String> {
 pub(super) fn tool_content_details(
     content: &[ToolCallContent],
     terminal_outputs: &[TerminalOutputRecord],
+    raw_output: Option<&serde_json::Value>,
 ) -> Vec<String> {
     let mut details = Vec::new();
+    let mut referenced: Vec<&str> = Vec::new();
     for item in content {
         let detail = match item {
             ToolCallContent::Content(content) => content_block_text(&content.content),
@@ -898,22 +903,53 @@ pub(super) fn tool_content_details(
             // Kimi-style agents send a terminal reference and no textual copy
             // of the output, so the record hel captured is the only thing a
             // reader ever sees. Until the terminal is reaped there is none.
-            ToolCallContent::Terminal(terminal) => Some(
-                terminal_outputs
-                    .iter()
-                    .find(|record| record.terminal_id.as_str() == terminal.terminal_id.0.as_ref())
-                    .map_or_else(
-                        || format!("terminal {}", terminal.terminal_id),
-                        terminal_output_detail,
-                    ),
-            ),
+            ToolCallContent::Terminal(terminal) => {
+                let terminal_id = terminal.terminal_id.0.as_ref();
+                referenced.push(terminal_id);
+                Some(
+                    terminal_outputs
+                        .iter()
+                        .find(|record| record.terminal_id.as_str() == terminal_id)
+                        .map(terminal_output_detail)
+                        .or_else(|| raw_output.and_then(raw_output_terminal_detail))
+                        .unwrap_or_else(|| format!("terminal {}", terminal.terminal_id)),
+                )
+            }
             _ => None,
         };
         if let Some(detail) = detail {
             details.push(sanitize_terminal_text(&detail));
         }
     }
+    // Grok-style agents name the terminal on a mid-flight update and then
+    // replace `content` wholesale without it, so the output hel captured has
+    // nothing in the final call pointing at it. Show it rather than lose it.
+    for record in terminal_outputs {
+        if referenced.contains(&record.terminal_id.as_str()) {
+            continue;
+        }
+        details.push(sanitize_terminal_text(&terminal_output_detail(record)));
+    }
     details
+}
+
+/// The output codex reports for a terminal it ran itself. Codex names its own
+/// server-side terminal, which hel never opened and has no record for, and
+/// puts the text in `rawOutput`; reading it here keeps such a call from
+/// rendering as a bare terminal id.
+fn raw_output_terminal_detail(raw_output: &serde_json::Value) -> Option<String> {
+    let output = raw_output.get("formatted_output")?.as_str()?;
+    let Some(exit_code) = raw_output
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+    else {
+        return Some(output.to_owned());
+    };
+    let summary = format!("exited {exit_code}");
+    if output.is_empty() {
+        return Some(summary);
+    }
+    Some(format!("{output}\n{summary}"))
 }
 
 /// One terminal's output followed by how it ended.
@@ -1421,6 +1457,7 @@ mod tests {
                     "locations": [{"path": format!("src/file-{position}.rs"), "line": 3}]
                 }),
                 terminal_outputs: Vec::new(),
+                terminal_refs: Vec::new(),
             },
         )
     }
@@ -2440,6 +2477,7 @@ mod tests {
                         "locations": locations
                     }),
                     terminal_outputs: Vec::new(),
+                    terminal_refs: Vec::new(),
                 },
             }),
             Arc::new(TranscriptItem {
@@ -2460,18 +2498,10 @@ mod tests {
         assert_eq!(entries[1].plan.len(), 12);
 
         let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
-        assert!(
-            browser.entries[0]
-                .lines
-                .iter()
-                .any(|line| line == "result-11")
-        );
-        assert!(
-            browser.entries[0]
-                .lines
-                .iter()
-                .any(|line| line == "src/file-11.rs:12")
-        );
+        // The remote viewer mirrors the TUI's Rich feed, so a tool entry is its
+        // title alone: neither the content details nor the locations belong
+        // there, however many the projection kept for Raw mode.
+        assert_eq!(browser.entries[0].lines, ["inspect"]);
         assert!(
             browser.entries[1]
                 .lines
@@ -2507,6 +2537,7 @@ mod tests {
                     exit_code: Some(0),
                     signal: None,
                 }],
+                terminal_refs: vec!["term-1".into()],
             },
         })];
 
@@ -2534,13 +2565,135 @@ mod tests {
         );
 
         let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
-        assert!(
-            browser.entries[0]
-                .lines
-                .iter()
-                .any(|line| line.contains("tests passed") && line.contains("exited 0")),
-            "the remote viewer shows the same output: {:?}",
-            browser.entries[0].lines
+        assert_eq!(
+            browser.entries[0].lines,
+            ["Bash"],
+            "the remote viewer shows the decluttered title, not the output"
+        );
+    }
+
+    /// Grok Build's final update replaces `content` with plain text, so the
+    /// output hel captured is attached to the item with nothing in the call
+    /// pointing at it. It is still the only copy of what the command printed.
+    #[test]
+    fn attached_terminal_output_renders_when_the_call_no_longer_refers_to_it() {
+        let mut session = MaterializedSession::empty("session-dropped-terminal");
+        session.applied_event_ordinal = 1;
+        session.applied_event_digest = "a".repeat(64);
+        session.transcript = vec![Arc::new(TranscriptItem {
+            stable_id: "tool:bash".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 1,
+            last_changed_at_ms: 1,
+            body: TranscriptBody::Tool {
+                call: serde_json::json!({
+                    "toolCallId": "bash",
+                    "title": "Bash",
+                    "status": "completed",
+                    "content": [{
+                        "type": "content",
+                        "content": {"type": "text", "text": "ran the build"}
+                    }]
+                }),
+                terminal_outputs: vec![TerminalOutputRecord {
+                    terminal_id: "term-1".into(),
+                    output: "build finished".into(),
+                    truncated: false,
+                    exit_code: Some(0),
+                    signal: None,
+                }],
+                terminal_refs: vec!["term-1".into()],
+            },
+        })];
+
+        let entries = materialized_chat_entries(&session);
+        assert_eq!(
+            entries[0].tool_content,
+            ["ran the build", "build finished\nexited 0"],
+            "the captured output follows the content the call still carries"
+        );
+    }
+
+    /// Codex runs the command in its own terminal, which hel never opened, and
+    /// reports the text in `rawOutput` beside the reference.
+    #[test]
+    fn codex_raw_output_renders_for_a_terminal_hel_has_no_record_for() {
+        let call = |raw_output: serde_json::Value| {
+            serde_json::json!({
+                "toolCallId": "exec",
+                "title": "Shell",
+                "status": "completed",
+                "content": [{"type": "terminal", "terminalId": "exec-1"}],
+                "rawOutput": raw_output
+            })
+        };
+        let details = |raw_output: serde_json::Value| {
+            let call = ToolCall::deserialize(&call(raw_output)).expect("valid ACP tool call");
+            tool_content_details(&call.content, &[], call.raw_output.as_ref())
+        };
+
+        assert_eq!(
+            details(serde_json::json!({"formatted_output": "tests passed", "exit_code": 0})),
+            ["tests passed\nexited 0"]
+        );
+        assert_eq!(
+            details(serde_json::json!({"formatted_output": "still running"})),
+            ["still running"],
+            "an exit line needs an exit code to report"
+        );
+        assert_eq!(
+            details(serde_json::json!({"exit_code": 0})),
+            ["terminal exec-1"],
+            "without output there is nothing to show but the id"
+        );
+    }
+
+    #[test]
+    fn browser_tool_entries_show_the_title_and_diffstats_only() {
+        let mut session = MaterializedSession::empty("session-browser-tool");
+        session.applied_event_ordinal = 1;
+        session.applied_event_digest = "a".repeat(64);
+        session.transcript = vec![Arc::new(TranscriptItem {
+            stable_id: "tool:edit".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 1,
+            last_changed_at_ms: 1,
+            body: TranscriptBody::Tool {
+                call: serde_json::json!({
+                    "toolCallId": "edit",
+                    "title": "Edit src/lib.rs",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "content",
+                            "content": {"type": "text", "text": "wrote the file"}
+                        },
+                        {
+                            "type": "diff",
+                            "path": "/workspace/src/lib.rs",
+                            "oldText": "alpha\n",
+                            "newText": "alpha\nbeta\n"
+                        }
+                    ],
+                    "locations": [{"path": "/workspace/src/lib.rs", "line": 2}]
+                }),
+                terminal_outputs: Vec::new(),
+                terminal_refs: Vec::new(),
+            },
+        })];
+
+        let entries = materialized_chat_entries(&session);
+        assert!(entries[0].tool_content.contains(&"wrote the file".into()));
+        assert_eq!(entries[0].tool_locations, ["/workspace/src/lib.rs:2"]);
+
+        let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
+        assert_eq!(
+            browser.entries[0].lines,
+            ["Edit src/lib.rs", "/workspace/src/lib.rs  +1 −0"],
+            "the remote viewer carries the Rich feed's title and diffstat, \
+             not the Raw content or locations"
         );
     }
 

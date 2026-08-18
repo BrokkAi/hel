@@ -347,13 +347,7 @@ fn project_observation(
             };
             let mut attached = false;
             for existing in &current.transcript {
-                let TranscriptBody::Tool { call, .. } = &existing.body else {
-                    continue;
-                };
-                if !tool_call_terminal_ids(call)
-                    .iter()
-                    .any(|id| id == terminal_id)
-                {
+                if !tool_refers_to_terminal(&existing.body, terminal_id) {
                     continue;
                 }
                 let mut item = TranscriptItem::clone(existing);
@@ -480,6 +474,7 @@ fn project_session_update(
                     body: TranscriptBody::Tool {
                         call: serde_json::to_value(call)?,
                         terminal_outputs: Vec::new(),
+                        terminal_refs: Vec::new(),
                     },
                 };
                 attach_terminal_outputs(current, mutation, &mut item);
@@ -732,6 +727,25 @@ fn tool_call_terminal_ids(call: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Whether one transcript item is a tool call that refers to `terminal_id`,
+/// now or at any earlier point in its life. The current call is still consulted
+/// because items restored from an archive written before terminal references
+/// were remembered carry none.
+fn tool_refers_to_terminal(body: &TranscriptBody, terminal_id: &str) -> bool {
+    let TranscriptBody::Tool {
+        call,
+        terminal_refs,
+        ..
+    } = body
+    else {
+        return false;
+    };
+    terminal_refs.iter().any(|id| id == terminal_id)
+        || tool_call_terminal_ids(call)
+            .iter()
+            .any(|id| id == terminal_id)
+}
+
 /// The output already recorded for `terminal_id`, wherever it is parked.
 fn find_terminal_record(
     current: &MaterializedSession,
@@ -758,9 +772,12 @@ fn replace_or_push_terminal_record(
     }
 }
 
-/// Move any parked output for the terminals `item` refers to into the item,
-/// and remove the standalone items it consumed. Output that arrives before the
-/// tool call therefore ends up exactly where output that arrives after it does.
+/// Remember every terminal the current call refers to, move any parked output
+/// for the terminals `item` has ever referred to into the item, and remove the
+/// standalone items it consumed. Output that arrives before the tool call
+/// therefore ends up exactly where output that arrives after it does, and a
+/// call that drops its terminal reference on a later content update still owns
+/// the terminal it started.
 fn attach_terminal_outputs(
     current: &MaterializedSession,
     mutation: &mut MaterializedSessionMutation,
@@ -769,17 +786,23 @@ fn attach_terminal_outputs(
     let TranscriptBody::Tool {
         call,
         terminal_outputs,
+        terminal_refs,
     } = &mut item.body
     else {
         return;
     };
-    let mut consumed = Vec::new();
     for terminal_id in tool_call_terminal_ids(call) {
-        let Some(record) = find_terminal_record(current, &terminal_id) else {
+        if !terminal_refs.contains(&terminal_id) {
+            terminal_refs.push(terminal_id);
+        }
+    }
+    let mut consumed = Vec::new();
+    for terminal_id in terminal_refs.iter() {
+        let Some(record) = find_terminal_record(current, terminal_id) else {
             continue;
         };
         replace_or_push_terminal_record(terminal_outputs, record);
-        consumed.push(terminal_item_id(&terminal_id));
+        consumed.push(terminal_item_id(terminal_id));
     }
     for stable_id in consumed {
         mutation
@@ -918,12 +941,14 @@ pub fn canonical_session_from_materialized(
                 TranscriptBody::Tool {
                     call,
                     terminal_outputs,
+                    terminal_refs,
                 } => CanonicalTranscriptBody::Tool {
                     call: call.clone(),
                     terminal_outputs: terminal_outputs
                         .iter()
                         .map(canonical_terminal_output)
                         .collect(),
+                    terminal_refs: terminal_refs.clone(),
                 },
                 TranscriptBody::TerminalOutput { record } => {
                     CanonicalTranscriptBody::TerminalOutput {
@@ -1008,12 +1033,14 @@ pub fn materialized_session_from_canonical(
                 CanonicalTranscriptBody::Tool {
                     call,
                     terminal_outputs,
+                    terminal_refs,
                 } => TranscriptBody::Tool {
                     call: call.clone(),
                     terminal_outputs: terminal_outputs
                         .iter()
                         .map(materialized_terminal_output)
                         .collect(),
+                    terminal_refs: terminal_refs.clone(),
                 },
                 CanonicalTranscriptBody::TerminalOutput { record } => {
                     TranscriptBody::TerminalOutput {
@@ -1674,6 +1701,54 @@ mod tests {
         assert_eq!(call["status"], json!("completed"));
     }
 
+    /// Grok Build names the terminal on a mid-flight update and then replaces
+    /// `content` wholesale with plain text before the terminal is reaped, so
+    /// the close event arrives with nothing in the call pointing at it.
+    #[test]
+    fn a_tool_call_that_dropped_its_terminal_reference_still_attaches_the_output() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, terminal_tool_call("call-1", "term-1"));
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    "call-1",
+                    ToolCallUpdateFields::new()
+                        .status(agent_client_protocol::schema::v1::ToolCallStatus::Completed)
+                        .content(vec![ToolCallContent::from(ContentBlock::Text(
+                            TextContent::new("ran the build"),
+                        ))]),
+                ))),
+            },
+        );
+        apply_observation(&mut session, terminal_output("term-1"));
+
+        assert_eq!(
+            session.transcript.len(),
+            1,
+            "the output attaches instead of parking in its own item: {:?}",
+            session.transcript
+        );
+        assert_eq!(session.transcript[0].stable_id, "tool:call-1");
+        let outputs = attached_terminal_outputs(&session.transcript[0]);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].output, "build finished\n");
+        let TranscriptBody::Tool {
+            call,
+            terminal_refs,
+            ..
+        } = &session.transcript[0].body
+        else {
+            panic!("the item stayed a tool item");
+        };
+        assert_eq!(terminal_refs, &["term-1".to_owned()]);
+        assert_eq!(
+            tool_call_terminal_ids(call),
+            Vec::<String>::new(),
+            "the final call really did drop the reference"
+        );
+    }
+
     #[test]
     fn queued_prompt_becomes_user_message_only_when_started() {
         let mut session = MaterializedSession::empty("session-1");
@@ -1988,6 +2063,9 @@ mod tests {
                     exit_code: Some(0),
                     signal: None,
                 }],
+                // "term-3" is a reference the call no longer carries, so only
+                // the remembered list can survive the archive round trip.
+                terminal_refs: vec!["term-1".into(), "term-3".into()],
             },
         }));
         session.transcript.push(Arc::new(TranscriptItem {

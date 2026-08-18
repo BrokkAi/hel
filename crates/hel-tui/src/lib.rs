@@ -1426,6 +1426,7 @@ mod tests {
                     "status": "in_progress"
                 }),
                 terminal_outputs: Vec::new(),
+                terminal_refs: Vec::new(),
             },
         );
         Arc::make_mut(&mut later_tool).last_changed_at_ms = 2_000_000_400_000;

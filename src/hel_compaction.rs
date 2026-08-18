@@ -776,6 +776,7 @@ mod tests {
             CanonicalTranscriptBody::Tool {
                 call: tool_call("completed", "tool output"),
                 terminal_outputs: Vec::new(),
+                terminal_refs: Vec::new(),
             },
         ]))
         .unwrap();

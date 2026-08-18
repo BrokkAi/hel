@@ -1994,6 +1994,7 @@ mod tests {
                         "status": "completed"
                     }),
                     terminal_outputs: Vec::new(),
+                    terminal_refs: Vec::new(),
                 },
             ),
         ];

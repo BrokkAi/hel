@@ -41,6 +41,12 @@ pub enum TranscriptBody {
         /// into the stored ACP value.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         terminal_outputs: Vec<TerminalOutputRecord>,
+        /// Every terminal this call has ever referred to. Agents that replace
+        /// `content` wholesale can drop a terminal reference before the
+        /// terminal is reaped, so the current call is not enough to decide
+        /// where a terminal's output belongs.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        terminal_refs: Vec<String>,
     },
     /// Terminal output that no tool call refers to yet. It becomes a
     /// `Tool` item's `terminal_outputs` entry as soon as a call naming the
