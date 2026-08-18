@@ -214,6 +214,7 @@ enum UsageWindowKind {
 
 fn parse_window(lines: &[String], kind: UsageWindowKind) -> Option<ClaudeUsageWindow> {
     let mut fallback = None;
+    let mut preferred = Vec::new();
 
     for (idx, line) in lines.iter().enumerate() {
         if !matches_window(line, kind) {
@@ -225,13 +226,22 @@ fn parse_window(lines: &[String], kind: UsageWindowKind) -> Option<ClaudeUsageWi
             window.reset_context = reset_context(lines, idx, kind);
             window
         });
-        if parsed.is_some() && preferred_window_line(line, kind) {
-            return parsed;
+        if let Some(window) = parsed {
+            if preferred_window_line(line, kind) {
+                if kind == UsageWindowKind::FiveHour {
+                    return Some(window);
+                }
+                preferred.push(window);
+            } else {
+                fallback.get_or_insert(window);
+            }
         }
-        fallback = fallback.or(parsed);
     }
 
-    fallback
+    preferred
+        .into_iter()
+        .min_by_key(|window| window.remaining_percent)
+        .or(fallback)
 }
 
 fn reset_context(lines: &[String], start: usize, kind: UsageWindowKind) -> Option<String> {
@@ -295,9 +305,13 @@ fn preferred_window_line(line: &str, kind: UsageWindowKind) -> bool {
         return true;
     }
     let lower = line.to_ascii_lowercase();
-    // Prefer the global weekly bucket when Claude also emits model-specific
-    // weekly buckets such as Opus/Sonnet.
-    !lower.contains("opus") && !lower.contains("sonnet")
+    // Claude may report both the overall allowance and a separate Fable
+    // allowance. Both constrain weekly usage, while model-specific buckets do
+    // not represent the subscription-wide limit shown by Hel.
+    lower.contains("fable")
+        || lower.contains("all models")
+        || lower.contains("overall")
+        || (!lower.contains('(') && !lower.contains("opus") && !lower.contains("sonnet"))
 }
 
 fn matches_any_window(line: &str) -> bool {
@@ -666,6 +680,34 @@ mod tests {
         .expect("report");
 
         assert_eq!(report.week.unwrap().remaining_percent, 66);
+    }
+
+    #[test]
+    fn weekly_usage_uses_lower_of_overall_and_fable_remaining() {
+        let report = parse(
+            r#"
+            Current week (all models): 20% used · resets Aug 20 at 9am
+            Current week (Fable): 65% used · resets Aug 21 at 10am
+            "#,
+        )
+        .expect("report");
+
+        let week = report.week.unwrap();
+        assert_eq!(week.remaining_percent, 35);
+        assert_eq!(week.reset_context.as_deref(), Some("Aug 21 at 10am"));
+    }
+
+    #[test]
+    fn weekly_usage_uses_overall_when_it_has_less_remaining_than_fable() {
+        let report = parse(
+            r#"
+            Current week (Fable): 10% used · resets Aug 21 at 10am
+            Current week (all models): 70% used · resets Aug 20 at 9am
+            "#,
+        )
+        .expect("report");
+
+        assert_eq!(report.week.unwrap().remaining_percent, 30);
     }
 
     #[test]
