@@ -9,6 +9,7 @@
 
 mod active;
 mod autocomplete;
+mod elicitation;
 mod history;
 mod input;
 mod remote;
@@ -36,6 +37,7 @@ use sha2::{Digest, Sha256};
 use crate::clock::epoch_seconds;
 use crate::hel_acp::RuntimeEvent;
 use crate::hel_config::{HarnessKind, PlanModeIds};
+use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
     TranscriptBody, TranscriptItem,
@@ -51,6 +53,7 @@ use autocomplete::{
     Autocomplete, CommandChoice, ConfigValueChoice, LocalCommand, builtin_command_choices,
     config_current_value, is_goal_prompt, parse_local_command,
 };
+use elicitation::ElicitationDialog;
 use history::{HistorySearch, HistorySearchRequest};
 use rendering::{TranscriptRenderMode, sanitize_terminal_text};
 use transcript::{
@@ -90,7 +93,7 @@ pub enum ChatEventOutcome {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChatAction {
     None,
     Prompt(String),
@@ -107,6 +110,10 @@ pub enum ChatAction {
         mode_id: String,
     },
     Cancel,
+    RespondElicitation {
+        request: ElicitationRequest,
+        response: ElicitationResponse,
+    },
     PasteFromClipboard,
     ToggleVoice,
     SwitchSession {
@@ -254,6 +261,7 @@ pub struct ChatState {
     next_history_search_generation: u64,
     pending_history_search: Option<HistorySearchRequest>,
     queued_prompts: VecDeque<QueuedPrompt>,
+    elicitation: Option<ElicitationDialog>,
     recovery_busy: bool,
     goal_prompt_active: bool,
     /// Harness behind this session, when the profile is still configured. It
@@ -316,6 +324,7 @@ impl ChatState {
             next_history_search_generation: 0,
             pending_history_search: None,
             queued_prompts: VecDeque::new(),
+            elicitation: None,
             recovery_busy: false,
             goal_prompt_active: snapshot
                 .active_prompt
@@ -445,6 +454,7 @@ impl ChatState {
         self.latest_seq = session.applied_event_ordinal;
         // The controller's projection is authoritative for the turn clock.
         self.turn_started_at_epoch_seconds = turn_started_at_epoch_seconds(session.execution);
+        self.sync_elicitation(&session.pending_elicitations);
         if rebuild_projection {
             // While a prefix conversion is in flight the entries stand for the
             // tail only, so the rebuild has to line up with the same tail.
@@ -497,6 +507,23 @@ impl ChatState {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
             .or_else(|| config_current_value(config_options, "effort"));
+    }
+
+    fn sync_elicitation(&mut self, pending: &[ElicitationRequest]) {
+        if self
+            .elicitation
+            .as_ref()
+            .is_some_and(|dialog| pending.iter().any(|request| request.id == dialog.id()))
+        {
+            return;
+        }
+        self.elicitation = pending.first().cloned().map(ElicitationDialog::new);
+    }
+
+    fn restore_elicitation(&mut self, request: ElicitationRequest) {
+        if self.elicitation.is_none() {
+            self.elicitation = Some(ElicitationDialog::new(request));
+        }
     }
 
     #[cfg(test)]
@@ -788,6 +815,11 @@ impl ChatState {
                     queued_at_ms: 0,
                 })
                 .collect(),
+            pending_elicitations: self
+                .elicitation
+                .as_ref()
+                .map(|dialog| vec![dialog.request().clone()])
+                .unwrap_or_default(),
         }
     }
 
@@ -971,6 +1003,20 @@ impl ChatState {
         // Any key breaks a Ctrl-K chain; only the Ctrl-K arm sets it again.
         let chained = std::mem::take(&mut self.chain_kill);
         let (code, modifiers) = normalize_key(key.code, key.modifiers);
+
+        if let Some(dialog) = self.elicitation.as_mut() {
+            if code == KeyCode::Char('v')
+                && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+            {
+                return ChatAction::PasteFromClipboard;
+            }
+            let request = dialog.request().clone();
+            if let Some(response) = dialog.handle_key(code, modifiers) {
+                self.elicitation = None;
+                return ChatAction::RespondElicitation { request, response };
+            }
+            return ChatAction::None;
+        }
 
         if code == KeyCode::Char('v')
             && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)

@@ -6,20 +6,22 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ClientCapabilities, CloseSessionRequest, ContentBlock,
-    CreateTerminalRequest, CreateTerminalResponse, Implementation, InitializeRequest,
-    KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, NewSessionRequest,
-    PermissionOptionKind, PromptRequest, ReleaseTerminalRequest, ReleaseTerminalResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigValueId, SessionId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, TerminalExitStatus,
-    TerminalId, TerminalOutputRequest, TerminalOutputResponse, TextContent,
-    WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    CreateTerminalRequest, CreateTerminalResponse, ElicitationCapabilities,
+    ElicitationFormCapabilities, Implementation, InitializeRequest, KillTerminalRequest,
+    KillTerminalResponse, LoadSessionRequest, NewSessionRequest, PermissionOptionKind,
+    PromptRequest, ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, TerminalExitStatus, TerminalId,
+    TerminalOutputRequest, TerminalOutputResponse, TextContent, WaitForTerminalExitRequest,
+    WaitForTerminalExitResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -30,6 +32,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::hel_config::{HarnessKind, UnrestrictedEnforcement};
+use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
 use crate::hel_terminal::{
     DEFAULT_TERMINAL_OUTPUT_BYTES, TerminalExit, TerminalRegistry, TerminalSpawn,
 };
@@ -91,6 +94,13 @@ pub enum CommandRequest {
         prompt: String,
         response: oneshot::Sender<std::result::Result<String, String>>,
     },
+    /// Connection-only answer to an in-flight ACP elicitation. The content is
+    /// deliberately never put in the durable relay command ledger.
+    ResolveElicitation {
+        elicitation_id: String,
+        response: ElicitationResponse,
+        resolved: oneshot::Sender<std::result::Result<(), String>>,
+    },
     Cancel {
         request_id: String,
     },
@@ -127,6 +137,13 @@ pub enum RuntimeEvent {
     PermissionAutoApproved {
         option_id: String,
         option_name: String,
+    },
+    ElicitationRequested {
+        request: ElicitationRequest,
+    },
+    ElicitationResolved {
+        elicitation_id: String,
+        action: String,
     },
     PromptFinished {
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -181,6 +198,8 @@ pub enum RuntimeEvent {
     },
     Stopped,
 }
+
+type PendingElicitations = Arc<Mutex<BTreeMap<String, oneshot::Sender<ElicitationResponse>>>>;
 
 pub async fn run(
     spec: LaunchSpec,
@@ -436,6 +455,11 @@ where
     let notification_events = events.clone();
     let permission_events = events.clone();
     let ext_events = events.clone();
+    let elicitation_events = events.clone();
+    let pending_elicitations = PendingElicitations::default();
+    let handler_elicitations = pending_elicitations.clone();
+    let session_elicitations = pending_elicitations.clone();
+    let next_elicitation_id = Arc::new(AtomicU64::new(1));
     let auto_approve_permissions = spec.force_unrestricted_mode;
     let scratch_outputs = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
     let notification_scratch_outputs = scratch_outputs.clone();
@@ -649,6 +673,89 @@ where
         .on_receive_request(
             async move |request: agent_client_protocol::UntypedMessage, responder, _cx| {
                 let method = request.method().to_owned();
+                if method == "elicitation/create" {
+                    let id = format!(
+                        "elicitation-{}",
+                        next_elicitation_id.fetch_add(1, Ordering::Relaxed)
+                    );
+                    let request = match ElicitationRequest::from_acp_params(
+                        id.clone(),
+                        request.params().clone(),
+                    ) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params().data(
+                                    serde_json::Value::String(format!(
+                                        "invalid ACP form elicitation: {error:#}"
+                                    )),
+                                ),
+                            );
+                        }
+                    };
+                    let (answer, answer_rx) = oneshot::channel();
+                    handler_elicitations
+                        .lock()
+                        .expect("pending elicitation lock poisoned")
+                        .insert(id.clone(), answer);
+                    let pending = handler_elicitations.clone();
+                    let events = elicitation_events.clone();
+                    let cancellation = responder.cancellation();
+                    tokio::spawn(async move {
+                        if events
+                            .send(RuntimeEvent::ElicitationRequested { request })
+                            .await
+                            .is_err()
+                        {
+                            pending
+                                .lock()
+                                .expect("pending elicitation lock poisoned")
+                                .remove(&id);
+                            let _ = responder.respond_with_error(relay_event_channel_error());
+                            return;
+                        }
+                        let response = tokio::select! {
+                            response = answer_rx => response.ok(),
+                            () = cancellation.cancelled() => None,
+                        };
+                        pending
+                            .lock()
+                            .expect("pending elicitation lock poisoned")
+                            .remove(&id);
+                        let action = response
+                            .as_ref()
+                            .map_or("cancel", ElicitationResponse::action_name)
+                            .to_owned();
+                        let _ = events
+                            .send(RuntimeEvent::ElicitationResolved {
+                                elicitation_id: id,
+                                action,
+                            })
+                            .await;
+                        match response {
+                            Some(response) => match serde_json::to_value(response) {
+                                Ok(response) => {
+                                    let _ = responder.respond(response);
+                                }
+                                Err(error) => {
+                                    let _ = responder.respond_with_error(
+                                        agent_client_protocol::Error::internal_error().data(
+                                            serde_json::Value::String(format!(
+                                                "serialize elicitation response: {error}"
+                                            )),
+                                        ),
+                                    );
+                                }
+                            },
+                            None => {
+                                let _ = responder.respond_with_error(
+                                    agent_client_protocol::Error::request_cancelled(),
+                                );
+                            }
+                        }
+                    });
+                    return Ok(());
+                }
                 if is_exit_plan_mode_method(&method) {
                     ext_events
                         .send(RuntimeEvent::Warning {
@@ -679,6 +786,7 @@ where
                 &events,
                 scratch_outputs,
                 terminals,
+                session_elicitations,
             )
             .await
             .map_err(|error| {
@@ -947,11 +1055,24 @@ async fn drive_connection(
     events: &mpsc::Sender<RuntimeEvent>,
     scratch_outputs: Arc<Mutex<BTreeMap<String, String>>>,
     terminals: TerminalRegistry,
+    pending_elicitations: PendingElicitations,
 ) -> Result<()> {
     // Terminals belong to the connection. However the session ends — closed,
     // failed, or with its command channel dropped — their process groups must
     // not outlive it.
-    let result = serve_session(&connection, spec, requests, events, scratch_outputs).await;
+    let result = serve_session(
+        &connection,
+        spec,
+        requests,
+        events,
+        scratch_outputs,
+        &pending_elicitations,
+    )
+    .await;
+    pending_elicitations
+        .lock()
+        .expect("pending elicitation lock poisoned")
+        .clear();
     terminals.shutdown(events).await;
     result
 }
@@ -962,12 +1083,16 @@ async fn serve_session(
     requests: &mut mpsc::Receiver<CommandRequest>,
     events: &mpsc::Sender<RuntimeEvent>,
     scratch_outputs: Arc<Mutex<BTreeMap<String, String>>>,
+    pending_elicitations: &PendingElicitations,
 ) -> Result<()> {
     let mut meta = serde_json::Map::new();
     meta.insert("terminal_output".into(), serde_json::Value::Bool(true));
     // Kimi routes every shell call through the client's terminal surface and
     // has no local fallback, so this capability is what makes Bash work.
-    let capabilities = ClientCapabilities::new().terminal(true).meta(meta);
+    let capabilities = ClientCapabilities::new()
+        .terminal(true)
+        .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()))
+        .meta(meta);
     let initialized = connection
         .send_request(
             InitializeRequest::new(ProtocolVersion::V1)
@@ -1267,6 +1392,17 @@ async fn serve_session(
                                     "cannot compact while the destination prompt is running".into(),
                                 ));
                             }
+                            Some(CommandRequest::ResolveElicitation {
+                                elicitation_id,
+                                response,
+                                resolved,
+                            }) => {
+                                let _ = resolved.send(resolve_pending_elicitation(
+                                    pending_elicitations,
+                                    &elicitation_id,
+                                    response,
+                                ));
+                            }
                         }
                     }
                 }
@@ -1483,6 +1619,17 @@ async fn serve_session(
                                     "a compaction is already running".into(),
                                 ));
                             }
+                            Some(CommandRequest::ResolveElicitation {
+                                elicitation_id,
+                                response,
+                                resolved,
+                            }) => {
+                                let _ = resolved.send(resolve_pending_elicitation(
+                                    pending_elicitations,
+                                    &elicitation_id,
+                                    response,
+                                ));
+                            }
                         }
                     }
                 }
@@ -1504,6 +1651,17 @@ async fn serve_session(
                         .await?;
                     }
                 }
+            }
+            CommandRequest::ResolveElicitation {
+                elicitation_id,
+                response,
+                resolved,
+            } => {
+                let _ = resolved.send(resolve_pending_elicitation(
+                    pending_elicitations,
+                    &elicitation_id,
+                    response,
+                ));
             }
             CommandRequest::Close { request_id } => {
                 match connection
@@ -1531,6 +1689,25 @@ async fn serve_session(
         }
     }
     Ok(())
+}
+
+fn resolve_pending_elicitation(
+    pending: &PendingElicitations,
+    elicitation_id: &str,
+    response: ElicitationResponse,
+) -> std::result::Result<(), String> {
+    let Some(answer) = pending
+        .lock()
+        .expect("pending elicitation lock poisoned")
+        .remove(elicitation_id)
+    else {
+        return Err(format!(
+            "elicitation {elicitation_id:?} is no longer pending"
+        ));
+    };
+    answer
+        .send(response)
+        .map_err(|_| format!("elicitation {elicitation_id:?} was cancelled before it was answered"))
 }
 
 async fn set_session_config(
@@ -1806,6 +1983,8 @@ fn select_contains(kind: &SessionConfigKind, desired: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use agent_client_protocol::schema::v1::{
         SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions,
@@ -2126,6 +2305,178 @@ mod tests {
         bridge.abort();
         events.abort();
         answer
+    }
+
+    async fn elicitation_bridge(
+        stream: tokio::io::DuplexStream,
+        initialized: oneshot::Sender<serde_json::Value>,
+        answered: oneshot::Sender<serde_json::Value>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (read, mut write) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read).lines();
+        let mut initialized = Some(initialized);
+        let mut answered = Some(answered);
+        let mut prompt_id = None;
+        while let Some(line) = lines.next_line().await.expect("read bridge input") {
+            let message: serde_json::Value = serde_json::from_str(&line).expect("valid JSON-RPC");
+            if message.get("id").and_then(serde_json::Value::as_str) == Some("ask-1") {
+                if let Some(answered) = answered.take() {
+                    let _ = answered.send(message);
+                }
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": prompt_id.take().expect("prompt id recorded"),
+                    "result": {"stopReason": "end_turn"},
+                });
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .expect("finish prompt");
+                continue;
+            }
+            let Some(method) = message.get("method").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let id = message
+                .get("id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let response = match method {
+                "initialize" => {
+                    if let Some(initialized) = initialized.take() {
+                        let _ = initialized.send(message.clone());
+                    }
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"protocolVersion": 1},
+                    })
+                }
+                "session/new" => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {"sessionId": "scripted"},
+                }),
+                "session/prompt" => {
+                    prompt_id = Some(id);
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": "ask-1",
+                        "method": "elicitation/create",
+                        "params": {
+                            "sessionId": "scripted",
+                            "toolCallId": "question-tool",
+                            "mode": "form",
+                            "message": "Choose an architecture",
+                            "requestedSchema": {
+                                "type": "object",
+                                "required": ["architecture"],
+                                "properties": {
+                                    "architecture": {
+                                        "type": "string",
+                                        "title": "Architecture",
+                                        "oneOf": [
+                                            {"const": "thin", "title": "Thin callers"},
+                                            {"const": "dynamic", "title": "Dynamic matrix"}
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    })
+                }
+                _ => continue,
+            };
+            if write
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn form_elicitation_is_advertised_rendered_and_answered() {
+        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+        let (initialized_tx, initialized_rx) = oneshot::channel();
+        let (answered_tx, answered_rx) = oneshot::channel();
+        let bridge = tokio::spawn(elicitation_bridge(
+            bridge_stream,
+            initialized_tx,
+            answered_tx,
+        ));
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let spec = LaunchSpec {
+            command: "scripted".into(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: std::env::current_dir().unwrap(),
+            additional_directories: Vec::new(),
+            resume_session: None,
+            harness: HarnessKind::Claude,
+            force_unrestricted_mode: false,
+        };
+        let driver = tokio::spawn(drive(transport, spec, request_rx, event_tx));
+        let initialized = tokio::time::timeout(Duration::from_secs(5), initialized_rx)
+            .await
+            .expect("runtime initializes")
+            .expect("bridge observes initialization");
+        assert!(initialized["params"]["clientCapabilities"]["elicitation"]["form"].is_object());
+
+        request_tx
+            .send(CommandRequest::Prompt {
+                request_id: "prompt-1".into(),
+                prompt: vec![ContentBlock::Text(TextContent::new("plan it"))],
+            })
+            .await
+            .unwrap();
+        let request = loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("elicitation arrives")
+                .expect("runtime event channel stays open");
+            if let RuntimeEvent::ElicitationRequested { request } = event {
+                break request;
+            }
+        };
+        assert_eq!(request.message, "Choose an architecture");
+        assert_eq!(request.fields[0].title, "Architecture");
+        let (resolved_tx, resolved_rx) = oneshot::channel();
+        request_tx
+            .send(CommandRequest::ResolveElicitation {
+                elicitation_id: request.id,
+                response: ElicitationResponse::Accept {
+                    content: BTreeMap::from([(
+                        "architecture".into(),
+                        crate::hel_elicitation::ElicitationValue::String("thin".into()),
+                    )]),
+                },
+                resolved: resolved_tx,
+            })
+            .await
+            .unwrap();
+        assert_eq!(resolved_rx.await.unwrap(), Ok(()));
+        let answered = tokio::time::timeout(Duration::from_secs(5), answered_rx)
+            .await
+            .expect("bridge receives answer")
+            .expect("answer is published");
+        assert_eq!(answered["result"]["action"], "accept");
+        assert_eq!(answered["result"]["content"]["architecture"], "thin");
+
+        drop(request_tx);
+        tokio::time::timeout(Duration::from_secs(5), driver)
+            .await
+            .expect("runtime exits")
+            .expect("runtime task does not panic")
+            .expect("runtime exits cleanly");
+        bridge.await.unwrap();
     }
 
     /// Modeled on the `_meta.modelState` a signed-in `grok agent stdio`

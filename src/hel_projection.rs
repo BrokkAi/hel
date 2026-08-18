@@ -136,6 +136,9 @@ pub fn apply_committed_projection_event(
     if let Some(queued_prompts) = mutation.queued_prompts {
         current.queued_prompts = queued_prompts;
     }
+    if let Some(pending_elicitations) = mutation.pending_elicitations {
+        current.pending_elicitations = pending_elicitations;
+    }
     if let Some(activity) = mutation.last_activity_at_ms {
         current.last_activity_at_ms = Some(
             current
@@ -155,15 +158,18 @@ fn project_observation(
 ) -> Result<()> {
     match &event.observation {
         RelayObservation::AgentInitialized { .. } => {}
-        RelayObservation::SessionOpened { resumed, .. } => push_system(
-            mutation,
-            event,
-            if *resumed {
-                "harness session resumed"
-            } else {
-                "harness session started"
-            },
-        ),
+        RelayObservation::SessionOpened { resumed, .. } => {
+            mutation.pending_elicitations = Some(Vec::new());
+            push_system(
+                mutation,
+                event,
+                if *resumed {
+                    "harness session resumed"
+                } else {
+                    "harness session started"
+                },
+            );
+        }
         RelayObservation::SessionConfigured { config_options } => {
             mutation.configuration = Some(configuration_values(config_options));
         }
@@ -178,6 +184,20 @@ fn project_observation(
             event,
             format!("permission auto-approved: {option_name} ({option_id})"),
         ),
+        RelayObservation::ElicitationRequested { request } => {
+            let mut pending = current.pending_elicitations.clone();
+            pending.retain(|existing| existing.id != request.id);
+            pending.push(request.clone());
+            mutation.pending_elicitations = Some(pending);
+        }
+        RelayObservation::ElicitationResolved { elicitation_id, .. } => {
+            let mut pending = current.pending_elicitations.clone();
+            pending.retain(|request| request.id != *elicitation_id);
+            mutation.pending_elicitations = Some(pending);
+        }
+        RelayObservation::ElicitationsCleared => {
+            mutation.pending_elicitations = Some(Vec::new());
+        }
         RelayObservation::CommandQueued {
             command_id,
             command,
@@ -1081,6 +1101,7 @@ pub fn materialized_session_from_canonical(
         configuration: canonical.session.configuration.clone(),
         transcript,
         queued_prompts: materialized_queued_prompts_from_canonical(&canonical.queued_prompts),
+        pending_elicitations: Vec::new(),
     })
 }
 
@@ -1141,6 +1162,34 @@ mod tests {
     fn apply_observation(session: &mut MaterializedSession, observation: RelayObservation) {
         let next = event(session, observation);
         apply(session, next);
+    }
+
+    #[test]
+    fn elicitation_projection_keeps_only_pending_request_metadata() {
+        let mut session = MaterializedSession::empty("session-1");
+        let request = crate::hel_elicitation::ElicitationRequest {
+            id: "elicitation-1".into(),
+            message: "Choose one".into(),
+            title: None,
+            description: None,
+            fields: Vec::new(),
+        };
+        apply_observation(
+            &mut session,
+            RelayObservation::ElicitationRequested {
+                request: request.clone(),
+            },
+        );
+        assert_eq!(session.pending_elicitations, vec![request]);
+
+        apply_observation(
+            &mut session,
+            RelayObservation::ElicitationResolved {
+                elicitation_id: "elicitation-1".into(),
+                action: "accept".into(),
+            },
+        );
+        assert!(session.pending_elicitations.is_empty());
     }
 
     /// An agent message chunk with no `message_id`, as Grok Build's goal mode streams them.

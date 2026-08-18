@@ -106,6 +106,10 @@ pub struct MaterializedSession {
     pub transcript: Vec<Arc<TranscriptItem>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_prompts: Vec<MaterializedQueuedPrompt>,
+    /// In-flight form requests are projected durably, but their answers are
+    /// connection-only and never enter this state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_elicitations: Vec<crate::hel_elicitation::ElicitationRequest>,
 }
 
 impl MaterializedSession {
@@ -120,6 +124,7 @@ impl MaterializedSession {
             configuration: BTreeMap::new(),
             transcript: Vec::new(),
             queued_prompts: Vec::new(),
+            pending_elicitations: Vec::new(),
         }
     }
 

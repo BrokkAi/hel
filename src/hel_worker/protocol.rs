@@ -8,6 +8,8 @@ use std::io::{BufRead, Write};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::hel_elicitation::ElicitationResponse;
+
 use super::DurableRelay;
 use super::journal::read_bounded_line;
 use super::snapshot::{RelayCommand, RelayEvent, RelayOperationalState};
@@ -89,6 +91,11 @@ pub enum RelayRequest {
     Compact {
         prompt: String,
     },
+    /// Resolve one in-flight form without journaling its answer.
+    RespondElicitation {
+        elicitation_id: String,
+        response: ElicitationResponse,
+    },
 }
 
 impl RelayRequest {
@@ -105,6 +112,7 @@ impl RelayRequest {
             Self::SkillsState => "skills_state",
             Self::InstallSkills { .. } => "install_skills",
             Self::Compact { .. } => "compact",
+            Self::RespondElicitation { .. } => "respond_elicitation",
         }
     }
 }
@@ -178,6 +186,9 @@ pub enum RelayResponsePayload {
     /// Agent text from a disposable ACP compaction session.
     Compacted {
         text: String,
+    },
+    ElicitationResolved {
+        elicitation_id: String,
     },
 }
 

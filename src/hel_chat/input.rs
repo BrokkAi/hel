@@ -20,6 +20,10 @@ impl ChatState {
     }
 
     pub(super) fn handle_paste(&mut self, pasted: &str) {
+        if let Some(dialog) = self.elicitation.as_mut() {
+            dialog.paste(pasted);
+            return;
+        }
         let pasted = sanitize_terminal_text(pasted);
         if pasted.is_empty() {
             return;

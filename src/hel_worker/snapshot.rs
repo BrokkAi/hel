@@ -14,6 +14,8 @@ use agent_client_protocol::schema::v1::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+
+use crate::hel_elicitation::ElicitationRequest;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -257,6 +259,14 @@ pub enum RelayObservation {
         option_id: String,
         option_name: String,
     },
+    ElicitationRequested {
+        request: ElicitationRequest,
+    },
+    ElicitationResolved {
+        elicitation_id: String,
+        action: String,
+    },
+    ElicitationsCleared,
     CommandQueued {
         command_id: String,
         command: RelayCommand,
@@ -1069,6 +1079,9 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
             _ => {}
         },
         RelayObservation::PermissionAutoApproved { .. }
+        | RelayObservation::ElicitationRequested { .. }
+        | RelayObservation::ElicitationResolved { .. }
+        | RelayObservation::ElicitationsCleared
         | RelayObservation::Warning { .. }
         | RelayObservation::TerminalOutput { .. }
         | RelayObservation::Notice { .. } => {}

@@ -74,6 +74,7 @@ pub struct MaterializedSessionMutation {
     pub configuration: Option<BTreeMap<String, serde_json::Value>>,
     pub transcript: Vec<TranscriptMutation>,
     pub queued_prompts: Option<Vec<MaterializedQueuedPrompt>>,
+    pub pending_elicitations: Option<Vec<crate::hel_elicitation::ElicitationRequest>>,
 }
 
 pub fn database_path() -> PathBuf {
@@ -349,6 +350,7 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
     // Added after the v9 rebuild so the rebuild never has to copy them.
     ensure_session_container_override_columns(connection)?;
     ensure_session_mount_read_only_column(connection)?;
+    ensure_materialized_elicitation_column(connection)?;
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -399,6 +401,22 @@ fn ensure_session_mount_read_only_column(connection: &Connection) -> Result<()> 
         connection.execute_batch(
             "BEGIN IMMEDIATE;
              ALTER TABLE session_mounts ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0;
+             COMMIT;",
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_materialized_elicitation_column(connection: &Connection) -> Result<()> {
+    if !table_has_column(
+        connection,
+        "materialized_sessions",
+        "pending_elicitations_json",
+    )? {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE materialized_sessions
+                 ADD COLUMN pending_elicitations_json TEXT NOT NULL DEFAULT '[]';
              COMMIT;",
         )?;
     }
@@ -1134,7 +1152,8 @@ fn load_materialized_session_with(
     let row = connection
         .query_row(
             "SELECT applied_event_ordinal, applied_event_digest, last_activity_at_ms,
-                    execution_state, running_started_at_ms, session_title, configuration_json
+                    execution_state, running_started_at_ms, session_title, configuration_json,
+                    pending_elicitations_json
              FROM materialized_sessions WHERE session_id = ?1",
             [session_id],
             |row| {
@@ -1146,6 +1165,7 @@ fn load_materialized_session_with(
                     row.get::<_, Option<i64>>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             },
         )
@@ -1158,6 +1178,7 @@ fn load_materialized_session_with(
         running_started_at_ms,
         session_title,
         configuration_json,
+        pending_elicitations_json,
     )) = row
     else {
         return Ok(None);
@@ -1165,6 +1186,8 @@ fn load_materialized_session_with(
 
     let configuration = serde_json::from_str(&configuration_json)
         .with_context(|| format!("parse materialized configuration for session {session_id}"))?;
+    let pending_elicitations = serde_json::from_str(&pending_elicitations_json)
+        .with_context(|| format!("parse pending elicitations for session {session_id}"))?;
     let mut transcript_statement = connection.prepare(
         "SELECT stable_id, position, latest_content_event_ordinal, created_at_ms,
                 last_changed_at_ms, body_json
@@ -1251,6 +1274,7 @@ fn load_materialized_session_with(
         configuration,
         transcript,
         queued_prompts,
+        pending_elicitations,
     };
     materialized.validate()?;
     Ok(Some(materialized))
@@ -1402,6 +1426,13 @@ fn apply_projection_event_to(
     }
     if let Some(queued_prompts) = &mutation.queued_prompts {
         replace_materialized_queue(&tx, session_id, queued_prompts)?;
+    }
+    if let Some(pending_elicitations) = &mutation.pending_elicitations {
+        tx.execute(
+            "UPDATE materialized_sessions
+             SET pending_elicitations_json = ?2 WHERE session_id = ?1",
+            params![session_id, serde_json::to_string(pending_elicitations)?],
+        )?;
     }
     tx.execute(
         "UPDATE materialized_sessions
@@ -1673,8 +1704,9 @@ fn write_materialized_session(
     tx.execute(
         "INSERT INTO materialized_sessions(
              session_id, applied_event_ordinal, applied_event_digest, execution_state,
-             running_started_at_ms, session_title, configuration_json, last_activity_at_ms
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             running_started_at_ms, session_title, configuration_json, last_activity_at_ms,
+             pending_elicitations_json
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
          ON CONFLICT(session_id) DO UPDATE SET
              applied_event_ordinal = excluded.applied_event_ordinal,
              applied_event_digest = excluded.applied_event_digest,
@@ -1682,7 +1714,8 @@ fn write_materialized_session(
              running_started_at_ms = excluded.running_started_at_ms,
              session_title = excluded.session_title,
              configuration_json = excluded.configuration_json,
-             last_activity_at_ms = excluded.last_activity_at_ms",
+             last_activity_at_ms = excluded.last_activity_at_ms,
+             pending_elicitations_json = excluded.pending_elicitations_json",
         params![
             materialized.session_id,
             materialized.applied_event_ordinal,
@@ -1692,6 +1725,7 @@ fn write_materialized_session(
             materialized.session_title,
             serde_json::to_string(&materialized.configuration)?,
             materialized.last_activity_at_ms,
+            serde_json::to_string(&materialized.pending_elicitations)?,
         ],
     )?;
     tx.execute(
@@ -2602,6 +2636,13 @@ mod tests {
                 kind: QueuedCommandKind::Prompt,
                 content: vec![serde_json::json!({"type": "text", "text": "then test"})],
                 queued_at_ms: 1_500,
+            }],
+            pending_elicitations: vec![crate::hel_elicitation::ElicitationRequest {
+                id: "elicitation-1".into(),
+                message: "Choose one".into(),
+                title: Some("Question".into()),
+                description: None,
+                fields: Vec::new(),
             }],
         }
     }
@@ -3626,6 +3667,7 @@ mod tests {
             ("session_checkpoints", "event_frontier"),
             ("prompt_history", "event_ordinal"),
             ("materialized_sessions", "applied_event_digest"),
+            ("materialized_sessions", "pending_elicitations_json"),
             ("materialized_queued_prompts", "kind_json"),
         ] {
             assert!(table_has_column(&connection, table, column).unwrap());
@@ -3815,6 +3857,7 @@ mod tests {
                 content: vec![serde_json::json!({"type": "text", "text": "next"})],
                 queued_at_ms: 105,
             }]),
+            pending_elicitations: None,
         };
         let first_digest = event_digest(1);
         let second_digest = event_digest(2);

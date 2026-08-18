@@ -25,6 +25,7 @@ use crate::hel_transcript::ChatEntry;
 use crate::hel_worker::WorkerPhase;
 
 use super::autocomplete::render_autocomplete;
+use super::elicitation::render_elicitation;
 use super::history::{highlighted_input_lines, history_scope_name, history_search_footer};
 use super::input::{input_cursor_visual_position, input_visual_rows, set_input_cursor};
 use super::remote::{
@@ -936,6 +937,14 @@ impl ActiveChat {
                     &mut self.state,
                 );
             }
+            ChatAction::RespondElicitation { request, response } => {
+                self.state.set_notice("Sending answer…");
+                queue_chat_remote_operation(
+                    self.remote.operations(),
+                    ChatRemoteOperation::RespondElicitation { request, response },
+                    &mut self.state,
+                );
+            }
             ChatAction::PasteFromClipboard => {
                 let updates = self.chat_io_tx.clone();
                 tokio::spawn(async move {
@@ -1214,6 +1223,9 @@ pub(super) fn render(frame: &mut Frame, chat: &mut ChatState) {
         ));
     }
     render_autocomplete(frame, prompt_area, chat);
+    if let Some(dialog) = chat.elicitation.as_ref() {
+        render_elicitation(frame, dialog);
+    }
 }
 
 fn prompt_title(chat: &ChatState, queued: usize) -> String {

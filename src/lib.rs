@@ -19,6 +19,7 @@ pub mod hel_controller;
 pub mod hel_credentials;
 pub mod hel_database;
 pub mod hel_doctor;
+pub mod hel_elicitation;
 pub mod hel_git_proxy;
 pub mod hel_greeting;
 pub mod hel_import;

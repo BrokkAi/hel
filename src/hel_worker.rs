@@ -88,7 +88,7 @@ const RELAY_TRUNCATION_FLOOR: usize = 4 * 1024;
 const RELAY_SNAPSHOT_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 /// The first protocol for the durable ACP relay. There is deliberately no
 /// wire-level compatibility or negotiation with the retired worker protocol.
-pub const RELAY_PROTOCOL_VERSION: u32 = 1;
+pub const RELAY_PROTOCOL_VERSION: u32 = 2;
 pub const RELAY_MIN_PROTOCOL_VERSION: u32 = RELAY_PROTOCOL_VERSION;
 /// Digest for the empty relay event prefix (ordinal zero).
 pub const RELAY_EVENT_GENESIS_DIGEST: &str = crate::hel_archive::EVENT_FRONTIER_GENESIS_DIGEST;
@@ -473,6 +473,14 @@ impl DurableRelay {
                 return Ok(relay_error(
                     RelayErrorCode::InvalidState,
                     "compaction requests must be handled by the live relay transport",
+                    false,
+                    None,
+                ));
+            }
+            RelayRequest::RespondElicitation { .. } => {
+                return Ok(relay_error(
+                    RelayErrorCode::InvalidState,
+                    "elicitation responses must be handled by the live relay transport",
                     false,
                     None,
                 ));

@@ -1435,6 +1435,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "rayon",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

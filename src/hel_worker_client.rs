@@ -19,6 +19,7 @@ use crate::hel_credentials::{
     profiles_with_targets, read_credential_file, reconcile, validate_credential_payload,
     write_credential_file,
 };
+use crate::hel_elicitation::ElicitationResponse;
 use crate::hel_setup::harness_authentication_marker;
 use crate::hel_targets::CommandSpec;
 use crate::hel_worker::{
@@ -423,6 +424,30 @@ impl RelayClient {
         {
             RelayResponsePayload::Compacted { text } => Ok(text),
             _ => bail!("relay returned an unexpected compaction response"),
+        }
+    }
+
+    /// Answer an ACP form over the live relay connection. User-entered content
+    /// is intentionally excluded from the relay's durable command path.
+    pub async fn respond_elicitation(
+        &mut self,
+        elicitation_id: String,
+        response: ElicitationResponse,
+    ) -> Result<()> {
+        match self
+            .call(RelayRequest::RespondElicitation {
+                elicitation_id: elicitation_id.clone(),
+                response,
+            })
+            .await?
+        {
+            RelayResponsePayload::ElicitationResolved {
+                elicitation_id: resolved,
+            } if resolved == elicitation_id => Ok(()),
+            RelayResponsePayload::ElicitationResolved {
+                elicitation_id: resolved,
+            } => bail!("relay resolved elicitation {resolved:?}, expected {elicitation_id:?}"),
+            _ => bail!("relay returned an unexpected elicitation response"),
         }
     }
 

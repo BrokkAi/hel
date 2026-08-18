@@ -13,6 +13,7 @@ use crate::hel_database::{
     ProjectionApplyOutcome, ProjectionIntegrityError, apply_projection_event,
     save_materialized_session,
 };
+use crate::hel_elicitation::ElicitationResponse;
 use crate::hel_projection::{
     apply_committed_projection_event, materialized_session_from_canonical, project_relay_event,
 };
@@ -266,6 +267,26 @@ impl ManagedSessionHandle {
         self.enqueue_sync().await?.wait().await
     }
 
+    pub async fn respond_elicitation(
+        &self,
+        elicitation_id: String,
+        response: ElicitationResponse,
+    ) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(ActorCommand::RespondElicitation {
+                elicitation_id,
+                response,
+                reply,
+            })
+            .await
+            .context("session manager stopped")?;
+        result
+            .await
+            .context("session manager stopped")?
+            .map_err(anyhow::Error::msg)
+    }
+
     pub(crate) async fn enqueue_sync(&self) -> Result<PendingRelaySync> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -371,6 +392,11 @@ enum ActorCommand {
     Sync {
         reply: oneshot::Sender<std::result::Result<(), String>>,
     },
+    RespondElicitation {
+        elicitation_id: String,
+        response: ElicitationResponse,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
     Lease {
         reply: oneshot::Sender<std::result::Result<(u64, StandaloneSession), String>>,
     },
@@ -383,6 +409,9 @@ impl ActorCommand {
                 let _ = reply.send(Err(message.to_owned()));
             }
             Self::Sync { reply } => {
+                let _ = reply.send(Err(message.to_owned()));
+            }
+            Self::RespondElicitation { reply, .. } => {
                 let _ = reply.send(Err(message.to_owned()));
             }
             Self::Lease { reply } => {
@@ -752,6 +781,44 @@ async fn run_session_actor(
                             connection = None;
                         }
                         let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                    }
+                    ActorCommand::RespondElicitation {
+                        elicitation_id,
+                        response,
+                        reply,
+                    } => {
+                        if lifecycle.is_leased() {
+                            let _ = reply.send(Err(
+                                "session is reserved for a lifecycle operation".into(),
+                            ));
+                            continue;
+                        }
+                        let result = async {
+                            sync_actor_connection(&target, &mut connection).await?;
+                            let connection = connection
+                                .as_mut()
+                                .context("relay is disconnected")?;
+                            connection
+                                .respond_elicitation(elicitation_id, response)
+                                .await?;
+                            Ok::<_, anyhow::Error>(connection.snapshot())
+                        }
+                        .await;
+                        match result {
+                            Ok(ref snapshot) => publish_view(
+                                &target.session_id,
+                                ManagedSessionView {
+                                    snapshot: Some(snapshot.clone()),
+                                    connected: true,
+                                    error: None,
+                                },
+                                &view_tx,
+                                &updates,
+                            ),
+                            Err(ref error) if !is_final_rejection(error) => connection = None,
+                            Err(_) => {}
+                        }
+                        let _ = reply.send(result.map(|_| ()).map_err(|error| format!("{error:#}")));
                     }
                     ActorCommand::Lease { reply } => {
                         if lifecycle.is_leased() {
@@ -1175,6 +1242,18 @@ impl StandaloneSession {
         let ordinal = self.client.submit(command_id, command).await?;
         self.sync_in_place().await?;
         Ok(ordinal)
+    }
+
+    pub async fn respond_elicitation(
+        &mut self,
+        elicitation_id: String,
+        response: ElicitationResponse,
+    ) -> Result<()> {
+        self.client
+            .respond_elicitation(elicitation_id, response)
+            .await?;
+        self.sync_in_place().await?;
+        Ok(())
     }
 
     /// Run a prompt in a disposable ACP session. The result is not session

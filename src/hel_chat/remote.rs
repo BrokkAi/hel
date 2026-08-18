@@ -3,6 +3,7 @@
 
 use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
 
+use crate::hel_elicitation::{ElicitationRequest, ElicitationResponse};
 use crate::hel_session_manager::ManagedSessionHandle;
 use crate::hel_state::{QueuedCommandKind, config_command_text};
 use crate::hel_worker::RelayCommand;
@@ -38,6 +39,10 @@ pub(super) enum ChatRemoteOperation {
     Cancel {
         command_id: String,
     },
+    RespondElicitation {
+        request: ElicitationRequest,
+        response: ElicitationResponse,
+    },
 }
 
 #[derive(Debug)]
@@ -63,6 +68,10 @@ pub(super) enum ChatRemoteResult {
         result: std::result::Result<(), String>,
     },
     Cancel(std::result::Result<(), String>),
+    RespondElicitation {
+        request: ElicitationRequest,
+        result: std::result::Result<(), String>,
+    },
     WorkerFailed(String),
 }
 
@@ -83,6 +92,9 @@ impl ChatRemoteResult {
                 result: Err(error), ..
             }
             | Self::Cancel(Err(error))
+            | Self::RespondElicitation {
+                result: Err(error), ..
+            }
             | Self::WorkerFailed(error) => Some(error),
             Self::Prompt {
                 result: Ok((_, Some(error))),
@@ -497,6 +509,22 @@ async fn enqueue_chat_remote_operation(
                 }
             }
         }
+        ChatRemoteOperation::RespondElicitation { request, response } => {
+            let session = session.clone();
+            let results = results.clone();
+            let attached = attached.clone();
+            pending.spawn(async move {
+                let result = session
+                    .respond_elicitation(request.id.clone(), response)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                publish_chat_remote_result(
+                    &results,
+                    &attached,
+                    ChatRemoteResult::RespondElicitation { request, result },
+                );
+            });
+        }
     }
 }
 
@@ -575,6 +603,16 @@ pub(super) fn apply_chat_remote_result(chat: &mut ChatState, result: ChatRemoteR
         ChatRemoteResult::Cancel(Err(error)) => {
             chat.set_notice(format!("Cancellation failed: {error}"))
         }
+        ChatRemoteResult::RespondElicitation { result: Ok(()), .. } => {
+            chat.set_notice("Answer sent")
+        }
+        ChatRemoteResult::RespondElicitation {
+            request,
+            result: Err(error),
+        } => {
+            chat.restore_elicitation(request);
+            chat.set_notice(format!("Answer was not sent: {error}"));
+        }
         ChatRemoteResult::WorkerFailed(error) => chat.set_notice(error),
     }
 }
@@ -598,6 +636,9 @@ pub(super) fn queue_chat_remote_operation(
                 restore_unsent_input(chat, &config_command_text(&key, &value));
             }
             ChatRemoteOperation::SetSessionMode { .. } => chat.current_mode = None,
+            ChatRemoteOperation::RespondElicitation { request, .. } => {
+                chat.restore_elicitation(request)
+            }
             ChatRemoteOperation::Sync | ChatRemoteOperation::Cancel { .. } => {}
         }
         chat.set_notice("The session command queue is full; the command was not sent");

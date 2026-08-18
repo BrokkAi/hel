@@ -588,6 +588,18 @@ mod unix {
                     option_name,
                 })?;
             }
+            RuntimeEvent::ElicitationRequested { request } => {
+                relay.record_observation(RelayObservation::ElicitationRequested { request })?;
+            }
+            RuntimeEvent::ElicitationResolved {
+                elicitation_id,
+                action,
+            } => {
+                relay.record_observation(RelayObservation::ElicitationResolved {
+                    elicitation_id,
+                    action,
+                })?;
+            }
             RuntimeEvent::PromptFinished {
                 request_id,
                 stop_reason,
@@ -665,6 +677,7 @@ mod unix {
                 })?;
             }
             RuntimeEvent::Stopped => {
+                relay.record_observation(RelayObservation::ElicitationsCleared)?;
                 if relay.operational_state().execution
                     != crate::hel_worker::RelayExecutionState::Closed
                 {
@@ -886,6 +899,13 @@ mod unix {
                     write_response(&mut writer, &response).await?;
                     continue;
                 }
+                if let RelayRequest::RespondElicitation { .. } = &envelope.request {
+                    // Form answers can contain private user input. They travel
+                    // directly to the ACP runtime and never touch relay state.
+                    let response = elicitation_response(envelope, commands.as_ref()).await;
+                    write_response(&mut writer, &response).await?;
+                    continue;
+                }
                 let wakes_dispatch = matches!(&envelope.request, RelayRequest::Submit { .. });
                 let checkpoint_change = checkpoint_change(&envelope.request);
                 let response = relay
@@ -1025,6 +1045,71 @@ mod unix {
                 retryable: false,
                 detail: None,
             },
+        }
+    }
+
+    async fn elicitation_response(
+        envelope: RelayRequestEnvelope,
+        commands: Option<&mpsc::Sender<CommandRequest>>,
+    ) -> RelayResponseEnvelope {
+        let protocol_version = envelope.protocol_version;
+        let request_id = envelope.request_id;
+        let body = if protocol_version != RELAY_PROTOCOL_VERSION {
+            compaction_error(
+                RelayErrorCode::IncompatibleProtocol,
+                &format!(
+                    "request uses protocol {protocol_version}, relay requires protocol {RELAY_PROTOCOL_VERSION}"
+                ),
+            )
+        } else {
+            let RelayRequest::RespondElicitation {
+                elicitation_id,
+                response,
+            } = envelope.request
+            else {
+                unreachable!("elicitation_response only serves form answers")
+            };
+            match commands {
+                None => compaction_error(
+                    RelayErrorCode::InvalidState,
+                    "session is closed; no ACP runtime can answer the elicitation",
+                ),
+                Some(commands) => {
+                    let (resolved, resolution) = tokio::sync::oneshot::channel();
+                    match commands
+                        .send(CommandRequest::ResolveElicitation {
+                            elicitation_id: elicitation_id.clone(),
+                            response,
+                            resolved,
+                        })
+                        .await
+                    {
+                        Ok(()) => match resolution.await {
+                            Ok(Ok(())) => RelayResponseBody::Ok {
+                                payload: RelayResponsePayload::ElicitationResolved {
+                                    elicitation_id,
+                                },
+                            },
+                            Ok(Err(message)) => {
+                                compaction_error(RelayErrorCode::InvalidState, &message)
+                            }
+                            Err(_) => compaction_error(
+                                RelayErrorCode::Internal,
+                                "ACP runtime stopped before resolving the elicitation",
+                            ),
+                        },
+                        Err(_) => compaction_error(
+                            RelayErrorCode::Internal,
+                            "ACP runtime stopped before accepting the elicitation answer",
+                        ),
+                    }
+                }
+            }
+        };
+        RelayResponseEnvelope {
+            request_id,
+            protocol_version,
+            body,
         }
     }
 
