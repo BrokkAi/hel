@@ -3,8 +3,7 @@
 > Welcome to Hel.
 
 Hel (`hel`) is a terminal control plane for long-running ACP coding-agent
-sessions. It keeps the useful ACP client and TUI shell from Mjolnir, while
-removing its review, council, delegation, and subagent business logic.
+sessions.
 
 The dashboard gives one view of sessions and quotas across any number of
 Codex, Claude Code, and Kimi Code profiles. A session can run directly in an
