@@ -17,7 +17,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 
-use crate::hel_state::{MaterializedSession, TranscriptBody, TranscriptItem};
+use crate::hel_state::{MaterializedSession, TerminalOutputRecord, TranscriptBody, TranscriptItem};
 use crate::hel_transcript::{
     ChatEntry, ChatRole, PlanLine, PlanStatus, ToolStatus, TranscriptSource,
 };
@@ -302,7 +302,10 @@ fn entry_matches_transcript_item(entry: &ChatEntry, item: &TranscriptItem) -> bo
                 | (ChatRole::Thought, TranscriptBody::Thought { .. })
                 | (ChatRole::Tool, TranscriptBody::Tool { .. })
                 | (ChatRole::Plan, TranscriptBody::Plan { .. })
-                | (ChatRole::System, TranscriptBody::System { .. })
+                | (
+                    ChatRole::System,
+                    TranscriptBody::System { .. } | TranscriptBody::TerminalOutput { .. }
+                )
         )
         && match &item.body {
             TranscriptBody::Agent { .. } | TranscriptBody::Thought { .. } => {
@@ -332,7 +335,10 @@ fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEnt
             ChatRole::Thought,
             materialized_chunks_text(chunks),
         ),
-        TranscriptBody::Tool { call } => {
+        TranscriptBody::Tool {
+            call,
+            terminal_outputs,
+        } => {
             let call = ToolCall::deserialize(call).ok();
             let mut entry = ChatEntry::tool(
                 item.position,
@@ -343,12 +349,17 @@ fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEnt
                     .map_or(ToolStatus::Pending, |call| tool_status(&call.status)),
             );
             if let Some(call) = call {
-                entry.tool_content = tool_content_details(&call.content);
+                entry.tool_content = tool_content_details(&call.content, terminal_outputs);
                 entry.tool_diffstats = tool_diffstats(&call.content);
                 entry.tool_locations = tool_location_details(&call.locations);
             }
             entry
         }
+        TranscriptBody::TerminalOutput { record } => ChatEntry::plain(
+            item.position,
+            ChatRole::System,
+            sanitize_terminal_text(&terminal_output_detail(record)),
+        ),
         TranscriptBody::Plan { plan } => ChatEntry::plan(
             item.position,
             Plan::deserialize(plan)
@@ -875,15 +886,27 @@ pub(super) fn content_block_text(content: &ContentBlock) -> Option<String> {
     }
 }
 
-pub(super) fn tool_content_details(content: &[ToolCallContent]) -> Vec<String> {
+pub(super) fn tool_content_details(
+    content: &[ToolCallContent],
+    terminal_outputs: &[TerminalOutputRecord],
+) -> Vec<String> {
     let mut details = Vec::new();
     for item in content {
         let detail = match item {
             ToolCallContent::Content(content) => content_block_text(&content.content),
             ToolCallContent::Diff(diff) => Some(format_diffstat(diff)),
-            ToolCallContent::Terminal(terminal) => {
-                Some(format!("terminal {}", terminal.terminal_id))
-            }
+            // Kimi-style agents send a terminal reference and no textual copy
+            // of the output, so the record hel captured is the only thing a
+            // reader ever sees. Until the terminal is reaped there is none.
+            ToolCallContent::Terminal(terminal) => Some(
+                terminal_outputs
+                    .iter()
+                    .find(|record| record.terminal_id.as_str() == terminal.terminal_id.0.as_ref())
+                    .map_or_else(
+                        || format!("terminal {}", terminal.terminal_id),
+                        terminal_output_detail,
+                    ),
+            ),
             _ => None,
         };
         if let Some(detail) = detail {
@@ -891,6 +914,28 @@ pub(super) fn tool_content_details(content: &[ToolCallContent]) -> Vec<String> {
         }
     }
     details
+}
+
+/// One terminal's output followed by how it ended.
+fn terminal_output_detail(record: &TerminalOutputRecord) -> String {
+    let summary = terminal_exit_summary(record);
+    if record.output.is_empty() {
+        return summary;
+    }
+    format!("{}\n{summary}", record.output)
+}
+
+/// How a terminal ended, in one line.
+fn terminal_exit_summary(record: &TerminalOutputRecord) -> String {
+    let mut summary = match (record.exit_code, &record.signal) {
+        (_, Some(signal)) => format!("killed by {signal}"),
+        (Some(code), None) => format!("exited {code}"),
+        (None, None) => "released before exit".to_owned(),
+    };
+    if record.truncated {
+        summary.push_str(" · output truncated");
+    }
+    summary
 }
 
 pub(super) fn tool_diffstats(content: &[ToolCallContent]) -> Vec<String> {
@@ -1375,6 +1420,7 @@ mod tests {
                     }],
                     "locations": [{"path": format!("src/file-{position}.rs"), "line": 3}]
                 }),
+                terminal_outputs: Vec::new(),
             },
         )
     }
@@ -2393,6 +2439,7 @@ mod tests {
                         "content": tool_content,
                         "locations": locations
                     }),
+                    terminal_outputs: Vec::new(),
                 },
             }),
             Arc::new(TranscriptItem {
@@ -2431,6 +2478,104 @@ mod tests {
                 .iter()
                 .any(|line| line == "○ step-11")
         );
+    }
+
+    #[test]
+    fn materialized_terminal_content_renders_output_and_exit_summary() {
+        let mut session = MaterializedSession::empty("session-terminal");
+        session.applied_event_ordinal = 1;
+        session.applied_event_digest = "a".repeat(64);
+        session.transcript = vec![Arc::new(TranscriptItem {
+            stable_id: "tool:bash".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 1,
+            last_changed_at_ms: 1,
+            body: TranscriptBody::Tool {
+                call: serde_json::json!({
+                    "toolCallId": "bash",
+                    "title": "Bash",
+                    "status": "completed",
+                    "content": [{"type": "terminal", "terminalId": "term-1"}]
+                }),
+                terminal_outputs: vec![TerminalOutputRecord {
+                    terminal_id: "term-1".into(),
+                    // Colored output from a real build tool: the escape must
+                    // not survive into the terminal hel is drawing on.
+                    output: "\u{1b}[32mtests passed\u{1b}[0m".into(),
+                    truncated: false,
+                    exit_code: Some(0),
+                    signal: None,
+                }],
+            },
+        })];
+
+        let entries = materialized_chat_entries(&session);
+        assert_eq!(entries[0].tool_content, ["tests passed\nexited 0"]);
+
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+        chat.render_mode = TranscriptRenderMode::Raw;
+        let rendered = transcript_text(&mut chat, 80);
+        assert!(
+            rendered.iter().any(|line| line.contains("tests passed")),
+            "raw rows show the captured output: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("exited 0")),
+            "raw rows show how the terminal ended: {rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains("terminal term-1")),
+            "the id placeholder is replaced once output exists: {rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains('\u{1b}')),
+            "escape sequences are sanitized out: {rendered:?}"
+        );
+
+        let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
+        assert!(
+            browser.entries[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("tests passed") && line.contains("exited 0")),
+            "the remote viewer shows the same output: {:?}",
+            browser.entries[0].lines
+        );
+    }
+
+    #[test]
+    fn terminal_exit_summary_names_signal_release_and_truncation() {
+        let record = |exit_code, signal: Option<&str>, truncated| TerminalOutputRecord {
+            terminal_id: "term-1".into(),
+            output: "out".into(),
+            truncated,
+            exit_code,
+            signal: signal.map(str::to_owned),
+        };
+
+        assert_eq!(
+            terminal_exit_summary(&record(Some(0), None, false)),
+            "exited 0"
+        );
+        assert_eq!(
+            terminal_exit_summary(&record(Some(1), None, true)),
+            "exited 1 · output truncated"
+        );
+        assert_eq!(
+            terminal_exit_summary(&record(None, Some("SIGKILL"), false)),
+            "killed by SIGKILL"
+        );
+        assert_eq!(
+            terminal_exit_summary(&record(None, None, false)),
+            "released before exit"
+        );
+
+        // A terminal that produced nothing is still worth a line: the summary
+        // is all a reader has to go on.
+        let mut silent = record(None, Some("SIGTERM"), false);
+        silent.output.clear();
+        assert_eq!(terminal_output_detail(&silent), "killed by SIGTERM");
     }
 
     #[test]

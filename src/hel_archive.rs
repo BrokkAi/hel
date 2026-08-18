@@ -20,6 +20,7 @@ use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
 
 use crate::hel_config::HarnessKind;
+use crate::hel_transcript::is_false;
 
 /// Baseline schema. Every payload occupies exactly one ZIP entry, so any build
 /// that understands schema 2 can read the archive.
@@ -201,6 +202,13 @@ pub enum CanonicalTranscriptBody {
     Tool {
         /// Complete current ACP `ToolCall` value.
         call: serde_json::Value,
+        /// Output of the terminals this call's content refers to.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        terminal_outputs: Vec<CanonicalTerminalOutput>,
+    },
+    /// Terminal output no tool call refers to.
+    TerminalOutput {
+        record: CanonicalTerminalOutput,
     },
     Plan {
         /// Complete current ACP `Plan` value.
@@ -209,6 +217,21 @@ pub enum CanonicalTranscriptBody {
     System {
         text: String,
     },
+}
+
+/// Archived form of one client-run terminal's output. Mirrors
+/// [`crate::hel_state::TerminalOutputRecord`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalTerminalOutput {
+    pub terminal_id: String,
+    pub output: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
 }
 
 /// What a queued entry does when its turn comes. Archives written before
@@ -1511,7 +1534,10 @@ fn validate_canonical_session(snapshot: &CanonicalSessionSnapshot) -> Result<()>
                     })?;
                 }
             }
-            CanonicalTranscriptBody::Tool { call } => {
+            CanonicalTranscriptBody::Tool {
+                call,
+                terminal_outputs,
+            } => {
                 serde_json::from_value::<agent_client_protocol::schema::v1::ToolCall>(call.clone())
                     .with_context(|| {
                         format!(
@@ -1519,6 +1545,12 @@ fn validate_canonical_session(snapshot: &CanonicalSessionSnapshot) -> Result<()>
                             item.stable_id
                         )
                     })?;
+                for output in terminal_outputs {
+                    validate_canonical_terminal_output(output, &item.stable_id)?;
+                }
+            }
+            CanonicalTranscriptBody::TerminalOutput { record } => {
+                validate_canonical_terminal_output(record, &item.stable_id)?;
             }
             CanonicalTranscriptBody::Plan { plan } => {
                 serde_json::from_value::<agent_client_protocol::schema::v1::Plan>(plan.clone())
@@ -1569,6 +1601,17 @@ fn validate_canonical_session(snapshot: &CanonicalSessionSnapshot) -> Result<()>
             })?;
         }
     }
+    Ok(())
+}
+
+fn validate_canonical_terminal_output(
+    output: &CanonicalTerminalOutput,
+    stable_id: &str,
+) -> Result<()> {
+    ensure!(
+        !output.terminal_id.trim().is_empty(),
+        "canonical transcript item '{stable_id}' has terminal output with an empty terminal id"
+    );
     Ok(())
 }
 

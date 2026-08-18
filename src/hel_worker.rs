@@ -25,6 +25,7 @@ pub use protocol::{
     invalid_relay_request_response, read_relay_frame, serve_relay_json_lines,
     unsupported_relay_method_response, write_relay_frame,
 };
+pub(crate) use snapshot::truncate_start_with_marker;
 pub use snapshot::{
     ActiveRelayPrompt, ClaimedRelayCommand, QueuedRelayPrompt, RelayCommand, RelayCommandKind,
     RelayCommandOutcome, RelayCursor, RelayEvent, RelayExecutionState, RelayObservation,
@@ -72,6 +73,10 @@ pub const RELAY_COMMAND_BYTE_BUDGET: usize = 1024 * 1024;
 pub const RELAY_EVENT_BYTE_BUDGET: usize = 2 * 1024 * 1024;
 /// The public operational state shares an attach frame with a replay page.
 pub const RELAY_STATE_BYTE_BUDGET: usize = 2 * 1024 * 1024;
+/// Bytes of terminal output one journal entry keeps. The agent read the whole
+/// stream over `terminal/output`; the journal copy is for the person reading
+/// the transcript, so it keeps the tail and stays far below the event budget.
+pub const TERMINAL_JOURNAL_OUTPUT_BYTES: usize = 256 * 1024;
 /// Headroom left for an event's envelope — ordinals, digests, timestamp and
 /// command id — when clamping an observation to `RELAY_EVENT_BYTE_BUDGET`.
 const RELAY_EVENT_ENVELOPE_RESERVE: usize = 8 * 1024;

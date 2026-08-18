@@ -692,6 +692,7 @@ impl ChatState {
                         TranscriptBody::Tool {
                             call: serde_json::to_value(call)
                                 .expect("ACP tool call serialization cannot fail"),
+                            terminal_outputs: Vec::new(),
                         }
                     }
                     ChatRole::Plan => TranscriptBody::Plan {
@@ -1346,7 +1347,7 @@ impl ChatState {
                     Some(call.tool_call_id.to_string()),
                     tool_status(&call.status),
                 );
-                entry.tool_content = tool_content_details(&call.content);
+                entry.tool_content = tool_content_details(&call.content, &[]);
                 entry.tool_diffstats = tool_diffstats(&call.content);
                 entry.tool_locations = tool_location_details(&call.locations);
                 self.entries.push(entry);
@@ -1367,7 +1368,7 @@ impl ChatState {
                     entry.tool_status = Some(tool_status(&status));
                 }
                 if let Some(content) = update.fields.content {
-                    entry.tool_content = tool_content_details(&content);
+                    entry.tool_content = tool_content_details(&content, &[]);
                     entry.tool_diffstats = tool_diffstats(&content);
                 }
                 if let Some(locations) = update.fields.locations {

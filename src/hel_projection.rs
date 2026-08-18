@@ -3,21 +3,25 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{ContentBlock, SessionUpdate, TextContent, ToolCall};
+use agent_client_protocol::schema::v1::{
+    ContentBlock, SessionUpdate, TextContent, ToolCall, ToolCallContent,
+};
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::hel_archive::{
     CanonicalExecutionState, CanonicalQueuedCommandKind, CanonicalQueuedPrompt,
-    CanonicalSessionSnapshot, CanonicalSessionState, CanonicalTranscriptBody,
-    CanonicalTranscriptItem,
+    CanonicalSessionSnapshot, CanonicalSessionState, CanonicalTerminalOutput,
+    CanonicalTranscriptBody, CanonicalTranscriptItem,
 };
 use crate::hel_database::{
     MaterializedSessionMutation, ProjectionIntegrityError, TranscriptMutation,
 };
 use crate::hel_state::{
     MaterializedExecutionState, MaterializedQueuedPrompt, MaterializedSession, QueuedCommandKind,
-    TranscriptBody, TranscriptItem, config_command_text, normalize_session_title,
+    TerminalOutputRecord, TranscriptBody, TranscriptItem, config_command_text,
+    normalize_session_title,
 };
 use crate::hel_worker::{
     RelayCommand, RelayCommandKind, RelayEvent, RelayObservation, validate_relay_event,
@@ -323,6 +327,74 @@ fn project_observation(
             mutation.configuration = Some(configuration);
         }
         RelayObservation::CheckpointReady { .. } => {}
+        // Terminal output can land before or after the tool call that names the
+        // terminal, so both orderings have to end in the same place: attached to
+        // every referencing tool item, or parked in a standalone item that the
+        // tool call consumes when it arrives.
+        RelayObservation::TerminalOutput {
+            terminal_id,
+            output,
+            truncated,
+            exit_code,
+            signal,
+        } => {
+            let record = TerminalOutputRecord {
+                terminal_id: terminal_id.clone(),
+                output: output.clone(),
+                truncated: *truncated,
+                exit_code: *exit_code,
+                signal: signal.clone(),
+            };
+            let mut attached = false;
+            for existing in &current.transcript {
+                let TranscriptBody::Tool { call, .. } = &existing.body else {
+                    continue;
+                };
+                if !tool_call_terminal_ids(call)
+                    .iter()
+                    .any(|id| id == terminal_id)
+                {
+                    continue;
+                }
+                let mut item = TranscriptItem::clone(existing);
+                let TranscriptBody::Tool {
+                    terminal_outputs, ..
+                } = &mut item.body
+                else {
+                    unreachable!("matched a tool body above");
+                };
+                replace_or_push_terminal_record(terminal_outputs, record.clone());
+                item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
+                upsert(mutation, item);
+                attached = true;
+            }
+            if !attached {
+                let stable_id = terminal_item_id(terminal_id);
+                match current
+                    .transcript
+                    .iter()
+                    .find(|item| item.stable_id == stable_id)
+                {
+                    Some(existing) => {
+                        let mut item = TranscriptItem::clone(existing);
+                        item.body = TranscriptBody::TerminalOutput { record };
+                        item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
+                        upsert(mutation, item);
+                    }
+                    None => upsert(
+                        mutation,
+                        TranscriptItem {
+                            stable_id,
+                            position: event.ordinal,
+                            latest_content_event_ordinal: None,
+                            created_at_ms: event.recorded_at_ms,
+                            last_changed_at_ms: event.recorded_at_ms,
+                            body: TranscriptBody::TerminalOutput { record },
+                        },
+                    ),
+                }
+            }
+        }
         RelayObservation::Warning { message } => {
             push_system(mutation, event, format!("warning: {message}"));
         }
@@ -388,7 +460,7 @@ fn project_session_update(
                 .find(|item| item.stable_id == stable_id)
                 .map(|item| TranscriptItem::clone(item))
             {
-                let TranscriptBody::Tool { call: existing } = &mut item.body else {
+                let TranscriptBody::Tool { call: existing, .. } = &mut item.body else {
                     bail!(
                         "ACP tool call {} conflicts with transcript item {stable_id}",
                         call.tool_call_id
@@ -396,21 +468,22 @@ fn project_session_update(
                 };
                 *existing = serde_json::to_value(call)?;
                 item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
+                attach_terminal_outputs(current, mutation, &mut item);
                 upsert(mutation, item);
             } else {
-                upsert(
-                    mutation,
-                    TranscriptItem {
-                        stable_id,
-                        position: event.ordinal,
-                        latest_content_event_ordinal: None,
-                        created_at_ms: event.recorded_at_ms,
-                        last_changed_at_ms: event.recorded_at_ms,
-                        body: TranscriptBody::Tool {
-                            call: serde_json::to_value(call)?,
-                        },
+                let mut item = TranscriptItem {
+                    stable_id,
+                    position: event.ordinal,
+                    latest_content_event_ordinal: None,
+                    created_at_ms: event.recorded_at_ms,
+                    last_changed_at_ms: event.recorded_at_ms,
+                    body: TranscriptBody::Tool {
+                        call: serde_json::to_value(call)?,
+                        terminal_outputs: Vec::new(),
                     },
-                );
+                };
+                attach_terminal_outputs(current, mutation, &mut item);
+                upsert(mutation, item);
             }
         }
         SessionUpdate::ToolCallUpdate(update) => {
@@ -427,7 +500,7 @@ fn project_session_update(
                         update.tool_call_id
                     )
                 })?;
-            let TranscriptBody::Tool { call } = &mut item.body else {
+            let TranscriptBody::Tool { call, .. } = &mut item.body else {
                 bail!(
                     "ACP tool call {} conflicts with transcript item {stable_id}",
                     update.tool_call_id
@@ -440,6 +513,7 @@ fn project_session_update(
             materialized_call.update(update.fields.clone());
             *call = serde_json::to_value(materialized_call)?;
             item.last_changed_at_ms = item.last_changed_at_ms.max(event.recorded_at_ms);
+            attach_terminal_outputs(current, mutation, &mut item);
             upsert(mutation, item);
         }
         SessionUpdate::Plan(plan) => {
@@ -633,6 +707,87 @@ fn push_stream_chunk(
     Ok(())
 }
 
+/// Stable id of the standalone item that holds a terminal's output until a
+/// tool call refers to it.
+fn terminal_item_id(terminal_id: &str) -> String {
+    format!("terminal:{terminal_id}")
+}
+
+/// The terminal ids one stored ACP tool call refers to. This is the only place
+/// that reads terminal content out of a call, so attaching output and
+/// consuming a parked item cannot disagree about what a call refers to.
+///
+/// Content hel cannot read as an ACP block names no terminal; the renderer
+/// already reports such a call as invalid, so this hides no failure.
+fn tool_call_terminal_ids(call: &Value) -> Vec<String> {
+    let Some(Value::Array(content)) = call.get("content") else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter_map(|value| match ToolCallContent::deserialize(value).ok()? {
+            ToolCallContent::Terminal(terminal) => Some(terminal.terminal_id.0.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The output already recorded for `terminal_id`, wherever it is parked.
+fn find_terminal_record(
+    current: &MaterializedSession,
+    terminal_id: &str,
+) -> Option<TerminalOutputRecord> {
+    current.transcript.iter().find_map(|item| match &item.body {
+        TranscriptBody::TerminalOutput { record } if record.terminal_id == terminal_id => {
+            Some(record.clone())
+        }
+        _ => None,
+    })
+}
+
+fn replace_or_push_terminal_record(
+    records: &mut Vec<TerminalOutputRecord>,
+    record: TerminalOutputRecord,
+) {
+    match records
+        .iter_mut()
+        .find(|existing| existing.terminal_id == record.terminal_id)
+    {
+        Some(existing) => *existing = record,
+        None => records.push(record),
+    }
+}
+
+/// Move any parked output for the terminals `item` refers to into the item,
+/// and remove the standalone items it consumed. Output that arrives before the
+/// tool call therefore ends up exactly where output that arrives after it does.
+fn attach_terminal_outputs(
+    current: &MaterializedSession,
+    mutation: &mut MaterializedSessionMutation,
+    item: &mut TranscriptItem,
+) {
+    let TranscriptBody::Tool {
+        call,
+        terminal_outputs,
+    } = &mut item.body
+    else {
+        return;
+    };
+    let mut consumed = Vec::new();
+    for terminal_id in tool_call_terminal_ids(call) {
+        let Some(record) = find_terminal_record(current, &terminal_id) else {
+            continue;
+        };
+        replace_or_push_terminal_record(terminal_outputs, record);
+        consumed.push(terminal_item_id(&terminal_id));
+    }
+    for stable_id in consumed {
+        mutation
+            .transcript
+            .push(TranscriptMutation::Remove { stable_id });
+    }
+}
+
 fn close_stream_kind(
     current: &MaterializedSession,
     mutation: &mut MaterializedSessionMutation,
@@ -721,6 +876,26 @@ fn configuration_values(
         .collect()
 }
 
+fn canonical_terminal_output(record: &TerminalOutputRecord) -> CanonicalTerminalOutput {
+    CanonicalTerminalOutput {
+        terminal_id: record.terminal_id.clone(),
+        output: record.output.clone(),
+        truncated: record.truncated,
+        exit_code: record.exit_code,
+        signal: record.signal.clone(),
+    }
+}
+
+fn materialized_terminal_output(record: &CanonicalTerminalOutput) -> TerminalOutputRecord {
+    TerminalOutputRecord {
+        terminal_id: record.terminal_id.clone(),
+        output: record.output.clone(),
+        truncated: record.truncated,
+        exit_code: record.exit_code,
+        signal: record.signal.clone(),
+    }
+}
+
 pub fn canonical_session_from_materialized(
     materialized: &MaterializedSession,
 ) -> Result<CanonicalSessionSnapshot> {
@@ -740,8 +915,20 @@ pub fn canonical_session_from_materialized(
                     chunks: chunks.clone(),
                     streaming: *streaming,
                 },
-                TranscriptBody::Tool { call } => {
-                    CanonicalTranscriptBody::Tool { call: call.clone() }
+                TranscriptBody::Tool {
+                    call,
+                    terminal_outputs,
+                } => CanonicalTranscriptBody::Tool {
+                    call: call.clone(),
+                    terminal_outputs: terminal_outputs
+                        .iter()
+                        .map(canonical_terminal_output)
+                        .collect(),
+                },
+                TranscriptBody::TerminalOutput { record } => {
+                    CanonicalTranscriptBody::TerminalOutput {
+                        record: canonical_terminal_output(record),
+                    }
                 }
                 TranscriptBody::Plan { plan } => {
                     CanonicalTranscriptBody::Plan { plan: plan.clone() }
@@ -818,8 +1005,20 @@ pub fn materialized_session_from_canonical(
                     chunks: chunks.clone(),
                     streaming: *streaming,
                 },
-                CanonicalTranscriptBody::Tool { call } => {
-                    TranscriptBody::Tool { call: call.clone() }
+                CanonicalTranscriptBody::Tool {
+                    call,
+                    terminal_outputs,
+                } => TranscriptBody::Tool {
+                    call: call.clone(),
+                    terminal_outputs: terminal_outputs
+                        .iter()
+                        .map(materialized_terminal_output)
+                        .collect(),
+                },
+                CanonicalTranscriptBody::TerminalOutput { record } => {
+                    TranscriptBody::TerminalOutput {
+                        record: materialized_terminal_output(record),
+                    }
                 }
                 CanonicalTranscriptBody::Plan { plan } => {
                     TranscriptBody::Plan { plan: plan.clone() }
@@ -1308,7 +1507,7 @@ mod tests {
             item.latest_content_event_ordinal,
             created.latest_content_event_ordinal
         );
-        let TranscriptBody::Tool { call } = &item.body else {
+        let TranscriptBody::Tool { call, .. } = &item.body else {
             panic!("re-sent tool call stayed a tool item");
         };
         assert_eq!(call["title"], json!("read file again"));
@@ -1353,10 +1552,126 @@ mod tests {
         assert_eq!(item.position, 1);
         assert_eq!(item.created_at_ms, 100);
         assert_eq!(item.last_changed_at_ms, 300);
-        let TranscriptBody::Tool { call } = &item.body else {
+        let TranscriptBody::Tool { call, .. } = &item.body else {
             panic!("the item stayed a tool item");
         };
         assert_eq!(call["title"], json!("shell (retried)"));
+    }
+
+    /// A tool call whose only content is a terminal reference, the shape
+    /// kimi-code sends for every Bash call.
+    fn terminal_tool_call(call_id: &'static str, terminal_id: &'static str) -> RelayObservation {
+        RelayObservation::SessionUpdate {
+            update: Box::new(SessionUpdate::ToolCall(
+                ToolCall::new(call_id, "shell").content(vec![ToolCallContent::Terminal(
+                    agent_client_protocol::schema::v1::Terminal::new(terminal_id),
+                )]),
+            )),
+        }
+    }
+
+    fn terminal_output(terminal_id: &str) -> RelayObservation {
+        RelayObservation::TerminalOutput {
+            terminal_id: terminal_id.into(),
+            output: "build finished\n".into(),
+            truncated: false,
+            exit_code: Some(0),
+            signal: None,
+        }
+    }
+
+    fn attached_terminal_outputs(item: &TranscriptItem) -> &[TerminalOutputRecord] {
+        let TranscriptBody::Tool {
+            terminal_outputs, ..
+        } = &item.body
+        else {
+            panic!("expected a tool item, got {:?}", item.body);
+        };
+        terminal_outputs
+    }
+
+    #[test]
+    fn terminal_output_after_the_tool_call_attaches_to_the_tool_item() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, terminal_tool_call("call-1", "term-1"));
+        apply_observation(&mut session, terminal_output("term-1"));
+
+        assert_eq!(session.transcript.len(), 1, "no standalone item is left");
+        let outputs = attached_terminal_outputs(&session.transcript[0]);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].terminal_id, "term-1");
+        assert_eq!(outputs[0].output, "build finished\n");
+        assert_eq!(outputs[0].exit_code, Some(0));
+        assert_eq!(session.transcript[0].last_changed_at_ms, 200);
+    }
+
+    #[test]
+    fn terminal_output_before_the_tool_call_attaches_when_the_call_arrives() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, terminal_output("term-1"));
+
+        // Output nobody refers to yet is parked in its own item rather than
+        // dropped, so a terminal a call never names still reaches the reader.
+        assert_eq!(session.transcript.len(), 1);
+        assert_eq!(session.transcript[0].stable_id, "terminal:term-1");
+        assert!(matches!(
+            &session.transcript[0].body,
+            TranscriptBody::TerminalOutput { record } if record.terminal_id == "term-1"
+        ));
+
+        apply_observation(&mut session, terminal_tool_call("call-1", "term-1"));
+
+        assert_eq!(
+            session.transcript.len(),
+            1,
+            "the tool call consumes the parked item: {:?}",
+            session.transcript
+        );
+        assert_eq!(session.transcript[0].stable_id, "tool:call-1");
+        let outputs = attached_terminal_outputs(&session.transcript[0]);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].output, "build finished\n");
+
+        // Both orderings converge on the same tool body.
+        let mut reversed = MaterializedSession::empty("session-1");
+        apply_observation(&mut reversed, terminal_tool_call("call-1", "term-1"));
+        apply_observation(&mut reversed, terminal_output("term-1"));
+        assert_eq!(
+            attached_terminal_outputs(&reversed.transcript[0]),
+            outputs,
+            "output arriving before or after the call must read the same"
+        );
+    }
+
+    #[test]
+    fn wholesale_tool_call_update_keeps_the_attached_terminal_output() {
+        let mut session = MaterializedSession::empty("session-1");
+        apply_observation(&mut session, terminal_tool_call("call-1", "term-1"));
+        apply_observation(&mut session, terminal_output("term-1"));
+        // `ToolCall::update` replaces `content` wholesale, which is why the
+        // output lives beside the call rather than inside it.
+        apply_observation(
+            &mut session,
+            RelayObservation::SessionUpdate {
+                update: Box::new(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    "call-1",
+                    ToolCallUpdateFields::new()
+                        .status(agent_client_protocol::schema::v1::ToolCallStatus::Completed)
+                        .content(vec![ToolCallContent::Terminal(
+                            agent_client_protocol::schema::v1::Terminal::new("term-1"),
+                        )]),
+                ))),
+            },
+        );
+
+        assert_eq!(session.transcript.len(), 1);
+        let outputs = attached_terminal_outputs(&session.transcript[0]);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].output, "build finished\n");
+        let TranscriptBody::Tool { call, .. } = &session.transcript[0].body else {
+            panic!("the item stayed a tool item");
+        };
+        assert_eq!(call["status"], json!("completed"));
     }
 
     #[test]
@@ -1661,10 +1976,34 @@ mod tests {
                     "title": "Read file",
                     "kind": "read",
                     "status": "completed",
+                    "content": [{"type": "terminal", "terminalId": "term-1"}],
                     "rawInput": {"path": "README.md"},
                     "rawOutput": {"bytes": 42},
                     "_meta": {"provider": "test"}
                 }),
+                terminal_outputs: vec![TerminalOutputRecord {
+                    terminal_id: "term-1".into(),
+                    output: "ok\n".into(),
+                    truncated: true,
+                    exit_code: Some(0),
+                    signal: None,
+                }],
+            },
+        }));
+        session.transcript.push(Arc::new(TranscriptItem {
+            stable_id: "terminal:term-2".into(),
+            position: 4,
+            latest_content_event_ordinal: None,
+            created_at_ms: 40,
+            last_changed_at_ms: 40,
+            body: TranscriptBody::TerminalOutput {
+                record: TerminalOutputRecord {
+                    terminal_id: "term-2".into(),
+                    output: "orphaned output\n".into(),
+                    truncated: false,
+                    exit_code: None,
+                    signal: Some("SIGKILL".into()),
+                },
             },
         }));
         session.transcript.push(Arc::new(TranscriptItem {

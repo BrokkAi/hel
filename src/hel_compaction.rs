@@ -298,13 +298,15 @@ fn turns_from_snapshot(snapshot: &CanonicalSessionSnapshot) -> Result<Vec<Turn>>
                 &mut turns,
                 TurnEvent::Assistant(crate::hel_chat::materialized_chunks_text(chunks)),
             )?,
-            CanonicalTranscriptBody::Tool { call } => {
+            CanonicalTranscriptBody::Tool { call, .. } => {
                 push_turn_event(&mut turns, TurnEvent::Tool(call.clone()))?;
             }
             CanonicalTranscriptBody::Plan { plan } => {
                 push_turn_event(&mut turns, TurnEvent::Plan(plan.clone()))?;
             }
-            CanonicalTranscriptBody::Thought { .. } | CanonicalTranscriptBody::System { .. } => {}
+            CanonicalTranscriptBody::Thought { .. }
+            | CanonicalTranscriptBody::System { .. }
+            | CanonicalTranscriptBody::TerminalOutput { .. } => {}
         }
     }
     ensure!(
@@ -773,6 +775,7 @@ mod tests {
             },
             CanonicalTranscriptBody::Tool {
                 call: tool_call("completed", "tool output"),
+                terminal_outputs: Vec::new(),
             },
         ]))
         .unwrap();

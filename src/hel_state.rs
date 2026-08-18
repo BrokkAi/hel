@@ -46,7 +46,7 @@ pub enum MaterializedExecutionState {
     Closed,
 }
 
-pub use crate::hel_transcript::{TranscriptBody, TranscriptItem};
+pub use crate::hel_transcript::{TerminalOutputRecord, TranscriptBody, TranscriptItem};
 
 /// What a durable queue entry does when its turn comes.
 ///

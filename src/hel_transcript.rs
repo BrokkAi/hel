@@ -35,6 +35,19 @@ pub enum TranscriptBody {
         /// Complete current ACP `ToolCall`, updated field-for-field as
         /// `ToolCallUpdate` notifications arrive.
         call: serde_json::Value,
+        /// Output of the terminals this call's content refers to. It is a
+        /// sibling of `call` rather than part of it because `ToolCall::update`
+        /// replaces `content` wholesale, which would discard anything injected
+        /// into the stored ACP value.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        terminal_outputs: Vec<TerminalOutputRecord>,
+    },
+    /// Terminal output that no tool call refers to yet. It becomes a
+    /// `Tool` item's `terminal_outputs` entry as soon as a call naming the
+    /// terminal arrives, and stays here permanently otherwise so output is
+    /// never dropped.
+    TerminalOutput {
+        record: TerminalOutputRecord,
     },
     Plan {
         /// Complete current ACP `Plan`, including entry priorities and all
@@ -44,6 +57,21 @@ pub enum TranscriptBody {
     System {
         text: String,
     },
+}
+
+/// What one client-run terminal produced, as hel recorded it when the child
+/// was reaped. `exit_code` and `signal` mirror ACP `TerminalExitStatus`; both
+/// are `None` when the terminal was released before a status was observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalOutputRecord {
+    pub terminal_id: String,
+    pub output: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

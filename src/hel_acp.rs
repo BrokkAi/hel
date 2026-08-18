@@ -129,6 +129,19 @@ pub enum RuntimeEvent {
     Warning {
         message: String,
     },
+    /// A client-run terminal was reaped. Exactly one of these is emitted per
+    /// terminal, by the supervisor that waits on the child, so kill and
+    /// release flow through the same report.
+    TerminalClosed {
+        terminal_id: String,
+        output: String,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<String>,
+    },
     ConfigApplied {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         request_id: String,

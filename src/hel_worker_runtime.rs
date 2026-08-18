@@ -642,6 +642,28 @@ mod unix {
             RuntimeEvent::Warning { message } => {
                 relay.record_observation(RelayObservation::Warning { message })?;
             }
+            RuntimeEvent::TerminalClosed {
+                terminal_id,
+                mut output,
+                mut truncated,
+                exit_code,
+                signal,
+            } => {
+                // Cap here rather than letting `clamp_observation` fire: that
+                // keeps the head of a string, and a terminal's tail is what
+                // says how the command ended.
+                truncated |= crate::hel_worker::truncate_start_with_marker(
+                    &mut output,
+                    crate::hel_worker::TERMINAL_JOURNAL_OUTPUT_BYTES,
+                );
+                relay.record_observation(RelayObservation::TerminalOutput {
+                    terminal_id,
+                    output,
+                    truncated,
+                    exit_code,
+                    signal,
+                })?;
+            }
             RuntimeEvent::Stopped => {
                 if relay.operational_state().execution
                     != crate::hel_worker::RelayExecutionState::Closed
@@ -2934,6 +2956,79 @@ mod relay_tests {
             events
                 .iter()
                 .any(|event| matches!(event.observation, RelayObservation::SessionUpdate { .. }))
+        );
+    }
+
+    #[test]
+    fn terminal_close_journals_a_tail_capped_terminal_output_observation() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let mut in_flight = BTreeMap::new();
+
+        // A build log the size of a real one: far past both the pipe buffer and
+        // the journal cap, so only the tail can survive.
+        let mut output = String::from("first line of the build log\n");
+        while output.len() < 512 * 1024 {
+            output.push_str("compiling something that says nothing useful\n");
+        }
+        output.push_str("error: the last line is the one that matters\n");
+        let produced = output.len();
+
+        unix::record_runtime_event(
+            &relay,
+            &mut in_flight,
+            RuntimeEvent::TerminalClosed {
+                terminal_id: "term-1".into(),
+                output,
+                truncated: false,
+                exit_code: Some(101),
+                signal: None,
+            },
+        )
+        .unwrap();
+
+        let events = relay
+            .lock()
+            .unwrap()
+            .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+            .unwrap();
+        let event = events
+            .iter()
+            .find(|event| matches!(event.observation, RelayObservation::TerminalOutput { .. }))
+            .expect("the closed terminal is journaled");
+        let RelayObservation::TerminalOutput {
+            terminal_id,
+            output,
+            truncated,
+            exit_code,
+            signal,
+        } = &event.observation
+        else {
+            unreachable!("matched a terminal observation above");
+        };
+
+        assert_eq!(terminal_id, "term-1");
+        assert_eq!(*exit_code, Some(101));
+        assert_eq!(*signal, None);
+        assert!(*truncated, "dropping the head must be disclosed");
+        assert!(
+            output.ends_with("error: the last line is the one that matters\n"),
+            "the tail of the output is what says how the command ended"
+        );
+        assert!(
+            !output.contains("first line of the build log"),
+            "the head is what gets dropped, not the tail"
+        );
+        assert!(output.contains("[hel dropped"), "the drop is disclosed");
+        assert!(
+            output.len() < produced,
+            "the journal copy is capped below what the terminal produced"
+        );
+        assert!(
+            serde_json::to_vec(event).unwrap().len() <= crate::hel_worker::RELAY_EVENT_BYTE_BUDGET,
+            "the capped event fits a replay page without further clamping"
         );
     }
 
