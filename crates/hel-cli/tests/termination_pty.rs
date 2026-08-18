@@ -122,6 +122,8 @@ fn sigterm_restores_real_pty_terminal() {
 [profiles.codex]
 kind = "codex"
 home = "/profiles/codex"
+# Keep this terminal test independent from any Codex installation on the host.
+environment = { PATH = "/hel-termination-test-no-executables" }
 
 [bundles.hel]
 primary_repo = "hel"
