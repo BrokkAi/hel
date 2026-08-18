@@ -30,6 +30,7 @@ use crate::event::{
 };
 use crate::palette::TerminalTheme;
 use crate::ragnarok;
+use crate::session_state::SessionState;
 use crate::settings::{SettingsAction, SettingsEditor};
 use crate::spinner::SpinnerStyle;
 use crate::theme::TerminalThemeKind;
@@ -649,7 +650,7 @@ pub enum ToolCallOutput {
 /// record. Registering terminals here gives `/terminals` a stable, ordered
 /// place to read them from without the transcript having to carry live state.
 #[derive(Debug, Clone)]
-struct TerminalRegistration {
+pub(crate) struct TerminalRegistration {
     terminal_id: String,
     /// Tool call that started it, used to resolve current output and status.
     tool_call_id: String,
@@ -1086,27 +1087,7 @@ pub struct AppState {
     /// Score catalog for this UI run. It may be populated asynchronously after
     /// startup; render code reads through this explicit state rather than a
     /// process-global catalog.
-    pub session_id: Option<String>,
-    pub session_title: Option<String>,
-    /// Current connection lifecycle state. Private to enforce the invariant
-    /// that it and `connection_state_started_at` change together: mutate only
-    /// via `set_connection_state`, read via `connection_state()`.
-    connection_state: ConnectionState,
-    pub current_mode: Option<String>,
-    pub available_commands: Vec<AvailableCommand>,
-    pub session_config_options: Vec<SessionConfigOption>,
-    pub session_config_targets: Vec<SessionConfigTarget>,
-    hidden_session_config_ids: HashSet<String>,
-    pub prompt_images_supported: bool,
-    pub session_fork_supported: bool,
-    pub side_session_supported: bool,
-    pub side_session_unsupported_reason: Option<String>,
-    pub is_side: bool,
-    pub side_start_requested: bool,
-    pub side_initial_question: Option<String>,
-    pub side_exit_requested: bool,
-    pub side_main_notice: Option<String>,
-    pub transcript: Vec<Entry>,
+    pub session: SessionState,
     /// Whether periodic local feature-discovery hints are enabled.
     pub feature_hints_enabled: bool,
     /// Holds an OS sleep assertion while a turn is in flight (and the config
@@ -1115,15 +1096,6 @@ pub struct AppState {
     pub keep_awake: crate::keep_awake::KeepAwake,
     completed_turns_since_hint: usize,
     feature_hint_cursor: usize,
-    /// Actor-owned streaming message blocks.  Unlike thoughts, a message can
-    /// remain open while another actor reports coordination activity after it.
-    /// Keeping that ownership separate from transcript position prevents a
-    /// later primary row from splitting a subagent's result into immutable pieces.
-    agent_open_message_index: Option<usize>,
-    pub tool_calls: HashMap<String, ToolCallView>,
-    /// Per-tool expansion choices, keyed by ACP tool-call ID. `true` means
-    /// expanded; entries matching the renderer's default are omitted.
-    tool_detail_overrides: HashMap<String, bool>,
     /// Latest on-demand worktree-versus-`HEAD` diff backing the Ctrl-G reader.
     /// One `Option` rather than a history: the workspace has a single current
     /// state, and every refresh supersedes the last.
@@ -1135,20 +1107,6 @@ pub struct AppState {
     /// Consumed when that turn completes so an older diff cannot affect a
     /// later no-diff turn's status.
     pending_workspace_diff_total: Option<usize>,
-    /// Primary-agent MCP calls that transport a subagent turn. Their protocol
-    /// state remains available, but the redundant parent row is omitted from
-    /// the transcript so it cannot pin nested activity behind a pending tool.
-    suppressed_tool_calls: HashSet<String>,
-    terminal_outputs: HashMap<String, TerminalOutputSnapshot>,
-    /// Every terminal seen this session, in the order the agent started them.
-    /// `terminal_outputs` is keyed for lookup and loses ordering; this keeps
-    /// the sequence and labels that `/terminals` presents.
-    terminal_registry: Vec<TerminalRegistration>,
-    /// Bumped whenever `transcript` or `tool_calls` change in a way that
-    /// affects rendering. The UI layer uses this as a cache key so it can
-    /// skip rebuilding `Vec<Line>` and re-running word-wrap when nothing
-    /// visible changed.
-    transcript_revision: u64,
     /// UI-owned reveal bounds for currently streaming prose. The canonical
     /// transcript always retains the complete source; this only lets the
     /// terminal renderer hold back incomplete or not-yet-paced source.
@@ -1281,8 +1239,6 @@ pub struct AppState {
     last_turn_elapsed: Option<Duration>,
     prompt_turns: Vec<PromptTurn>,
     active_prompt_turn: Option<usize>,
-    /// Time since the current connection lifecycle state was entered.
-    connection_state_started_at: Instant,
     /// Last token/context usage reported by the agent.
     pub token_usage: TokenUsage,
     /// Usage for the most recently started nested subagent session. Kept
@@ -1972,6 +1928,20 @@ fn fallback_workspace_files(root: &Path, limit: usize) -> Vec<PathBuf> {
     files
 }
 
+impl std::ops::Deref for AppState {
+    type Target = SessionState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for AppState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
+    }
+}
+
 impl AppState {
     pub fn new() -> Self {
         let now = Instant::now();
@@ -1992,41 +1962,17 @@ impl AppState {
             agent_source_id: String::new(),
             primary_reasoning_effort: None,
             active_agent_launch: None,
-            session_id: None,
-            session_title: None,
-            connection_state: ConnectionState::Launching,
-            current_mode: None,
-            available_commands: {
+            session: SessionState::new(now, {
                 let mut commands = Vec::new();
                 install_builtin_commands(&mut commands, false, false);
                 commands
-            },
-            session_config_options: Vec::new(),
-            session_config_targets: Vec::new(),
-            hidden_session_config_ids: HashSet::new(),
-            prompt_images_supported: false,
-            session_fork_supported: false,
-            side_session_supported: false,
-            side_session_unsupported_reason: None,
-            is_side: false,
-            side_start_requested: false,
-            side_initial_question: None,
-            side_exit_requested: false,
-            side_main_notice: None,
-            transcript: Vec::new(),
+            }),
             feature_hints_enabled: true,
             keep_awake: crate::keep_awake::KeepAwake::new(),
             completed_turns_since_hint: 0,
             feature_hint_cursor: 0,
-            agent_open_message_index: None,
-            tool_calls: HashMap::new(),
-            tool_detail_overrides: HashMap::new(),
             workspace_head_diff: None,
             workspace_diff_loading: false,
-            suppressed_tool_calls: HashSet::new(),
-            terminal_outputs: HashMap::new(),
-            terminal_registry: Vec::new(),
-            transcript_revision: 0,
             stream_visible_bytes: HashMap::new(),
             committed_transcript_entries: 0,
             input: String::new(),
@@ -2083,7 +2029,6 @@ impl AppState {
             last_turn_elapsed: None,
             prompt_turns: Vec::new(),
             active_prompt_turn: None,
-            connection_state_started_at: now,
             token_usage: TokenUsage::default(),
             subagent_token_usage: TokenUsage::default(),
             claude_usage: None,
@@ -3793,11 +3738,16 @@ impl AppState {
     /// case-insensitive substring match over each choice's `name` and
     /// (if present) `description`.
     pub fn config_picker_set_search(&mut self, query: impl Into<String>) {
+        let selected_option = match self.config_picker.as_ref() {
+            Some(picker) => picker.selected_option,
+            None => return,
+        };
+        let query = query.into();
+        let option = self.session_config_options.get(selected_option).cloned();
         let Some(picker) = self.config_picker.as_mut() else {
             return;
         };
-        let query = query.into();
-        let Some(option) = self.session_config_options.get(picker.selected_option) else {
+        let Some(option) = option.as_ref() else {
             picker.search_query = query;
             picker.filtered_indices = Vec::new();
             picker.selected_value = 0;
@@ -5065,14 +5015,14 @@ impl AppState {
 
     fn append_message_chunk(&mut self, kind: EntryKind, text: String) {
         let open_entry = match kind {
-            EntryKind::Agent => &mut self.agent_open_message_index,
+            EntryKind::Agent => self.agent_open_message_index,
             _ => unreachable!("append_message_chunk requires a message entry kind"),
         };
-        *open_entry = Some(append_or_start_owned(
-            &mut self.transcript,
+        self.agent_open_message_index = Some(append_or_start_owned(
+            &mut self.session.transcript,
             kind,
             text,
-            *open_entry,
+            open_entry,
         ));
     }
 
@@ -5417,10 +5367,12 @@ impl AppState {
                 if self.is_side {
                     install_side_builtin_commands(&mut self.available_commands);
                 } else {
+                    let session_fork_supported = self.session_fork_supported;
+                    let side_session_supported = self.side_session_supported;
                     install_builtin_commands(
                         &mut self.available_commands,
-                        self.session_fork_supported,
-                        self.side_session_supported,
+                        session_fork_supported,
+                        side_session_supported,
                     );
                 }
                 // The catalog changed mid-typing; rebuild the popover so
@@ -6600,8 +6552,8 @@ mod tests {
         s.apply_event(UiEvent::SessionUpdate(SessionUpdate::AgentMessageChunk(
             text_chunk("world"),
         )));
-        assert_eq!(s.transcript.len(), 1);
-        match &s.transcript[0] {
+        assert_eq!(s.session.transcript.len(), 1);
+        match &s.session.transcript[0] {
             Entry::AgentMessage(s) => assert_eq!(s, "hello world"),
             other => panic!("unexpected entry: {other:?}"),
         }
@@ -6638,7 +6590,7 @@ mod tests {
             replacement.clone(),
         ))));
 
-        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(state.session.transcript.len(), 1);
         assert!(
             matches!(state.transcript.last(), Some(Entry::Plan(entries)) if entries == &replacement)
         );
@@ -6802,7 +6754,7 @@ mod tests {
 
         state.record_user_prompt("x".repeat(100));
 
-        let title = state.session_title.expect("provisional title");
+        let title = state.session.session_title.expect("provisional title");
         assert_eq!(title, format!("{}...", "x".repeat(45)));
     }
 
@@ -8371,7 +8323,7 @@ mod tests {
                 1,
                 "block {block:?} produced an empty transcript"
             );
-            match &s.transcript[0] {
+            match &s.session.transcript[0] {
                 Entry::AgentMessage(text) => assert!(
                     text.contains(expected_substring),
                     "block {block:?} rendered as {text:?}, expected substring {expected_substring:?}"
@@ -8398,8 +8350,8 @@ mod tests {
         )));
 
         assert!(s.has_pending_permission(), "modal must remain queued");
-        assert_eq!(s.transcript.len(), 1);
-        match &s.transcript[0] {
+        assert_eq!(s.session.transcript.len(), 1);
+        match &s.session.transcript[0] {
             Entry::AgentMessage(text) => assert_eq!(text, "thinking..."),
             other => panic!("unexpected entry: {other:?}"),
         }
@@ -8663,8 +8615,8 @@ mod tests {
         assert_eq!(s.connection_state, ConnectionState::Fatal);
         assert!(!s.has_pending_permission());
         assert!(!s.autocomplete.visible);
-        assert_eq!(s.transcript.len(), 1);
-        match &s.transcript[0] {
+        assert_eq!(s.session.transcript.len(), 1);
+        match &s.session.transcript[0] {
             Entry::System(text) => assert_eq!(text, "fatal: boom"),
             other => panic!("unexpected entry: {other:?}"),
         }
@@ -9021,8 +8973,8 @@ mod tests {
         let status = s.status_line.expect("status");
         assert_eq!(status.kind, StatusKind::Info);
         assert_eq!(status.text, "acp runtime closed; press Ctrl-C to quit");
-        assert_eq!(s.transcript.len(), 1);
-        match &s.transcript[0] {
+        assert_eq!(s.session.transcript.len(), 1);
+        match &s.session.transcript[0] {
             Entry::System(text) => assert_eq!(text, "acp runtime closed; press Ctrl-C to quit"),
             other => panic!("unexpected entry: {other:?}"),
         }
@@ -9150,8 +9102,8 @@ mod tests {
         let status = s.status_line.expect("status");
         assert_eq!(status.kind, StatusKind::Warning);
         assert_eq!(status.text, "prompt failed: boom");
-        assert_eq!(s.transcript.len(), 2);
-        match &s.transcript[1] {
+        assert_eq!(s.session.transcript.len(), 2);
+        match &s.session.transcript[1] {
             Entry::System(text) => assert_eq!(text, "warning: prompt failed: boom"),
             other => panic!("unexpected entry: {other:?}"),
         }
@@ -9890,7 +9842,7 @@ mod tests {
         // must be dropped.
         let mut s = AppState::new();
         s.record_user_prompt("hello".to_string());
-        assert_eq!(s.transcript.len(), 1);
+        assert_eq!(s.session.transcript.len(), 1);
         s.apply_event(UiEvent::SessionUpdate(SessionUpdate::UserMessageChunk(
             text_chunk("hello"),
         )));
@@ -9908,8 +9860,8 @@ mod tests {
         s.apply_event(UiEvent::SessionUpdate(SessionUpdate::UserMessageChunk(
             text_chunk("replayed"),
         )));
-        assert_eq!(s.transcript.len(), 1);
-        match &s.transcript[0] {
+        assert_eq!(s.session.transcript.len(), 1);
+        match &s.session.transcript[0] {
             Entry::UserPrompt(t) => assert_eq!(t, "replayed"),
             other => panic!("unexpected: {other:?}"),
         }
