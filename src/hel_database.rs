@@ -348,6 +348,7 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
     }
     // Added after the v9 rebuild so the rebuild never has to copy them.
     ensure_session_container_override_columns(connection)?;
+    ensure_session_mount_read_only_column(connection)?;
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -386,6 +387,20 @@ fn ensure_session_container_override_columns(connection: &Connection) -> Result<
                  COMMIT;"
             ))?;
         }
+    }
+    Ok(())
+}
+
+/// Per-mount read-only flag. It is an additive column, so a database written
+/// before the mount editors offered the option opens unchanged and its mounts
+/// keep the copy-on-write overlay they were provisioned with.
+fn ensure_session_mount_read_only_column(connection: &Connection) -> Result<()> {
+    if !table_has_column(connection, "session_mounts", "read_only")? {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE session_mounts ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0;
+             COMMIT;",
+        )?;
     }
     Ok(())
 }
@@ -803,13 +818,14 @@ fn set_session_container_settings_to(
     )?;
     for (ordinal, mount) in mounts.iter().enumerate() {
         tx.execute(
-            "INSERT INTO session_mounts(session_id, ordinal, source, destination)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO session_mounts(session_id, ordinal, source, destination, read_only)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 session_id,
                 ordinal as i64,
                 path_to_blob(&mount.source),
-                path_to_blob(&mount.destination)
+                path_to_blob(&mount.destination),
+                mount.read_only
             ],
         )?;
     }
@@ -1916,13 +1932,14 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
     )?;
     for (ordinal, mount) in session.additional_mounts.iter().enumerate() {
         tx.execute(
-            "INSERT INTO session_mounts(session_id, ordinal, source, destination)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO session_mounts(session_id, ordinal, source, destination, read_only)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 session.id,
                 ordinal as i64,
                 path_to_blob(&mount.source),
-                path_to_blob(&mount.destination)
+                path_to_blob(&mount.destination),
+                mount.read_only
             ],
         )?;
     }
@@ -2131,7 +2148,8 @@ fn load_targets(connection: &Connection, state: &mut HelState) -> Result<()> {
 
 fn load_mounts(connection: &Connection, state: &mut HelState) -> Result<()> {
     let mut statement = connection.prepare(
-        "SELECT session_id, source, destination FROM session_mounts ORDER BY session_id, ordinal",
+        "SELECT session_id, source, destination, read_only
+         FROM session_mounts ORDER BY session_id, ordinal",
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -2139,6 +2157,7 @@ fn load_mounts(connection: &Connection, state: &mut HelState) -> Result<()> {
             AdditionalMount {
                 source: blob_to_path(row.get_ref(1)?.as_blob()?),
                 destination: blob_to_path(row.get_ref(2)?.as_blob()?),
+                read_only: row.get(3)?,
             },
         ))
     })?;
@@ -2467,6 +2486,7 @@ mod tests {
             additional_mounts: vec![AdditionalMount {
                 source: PathBuf::from("/host/cache"),
                 destination: PathBuf::from("/mnt/cache"),
+                read_only: false,
             }],
             state: SessionState::Archived,
             target: Some(TargetLocator::LocalPodman {
@@ -2645,6 +2665,7 @@ mod tests {
             &[AdditionalMount {
                 source: PathBuf::from("/host/models"),
                 destination: PathBuf::from("/mnt/models"),
+                read_only: true,
             }],
             "2026-08-13T00:00:00Z",
         )
@@ -2660,12 +2681,60 @@ mod tests {
             vec![AdditionalMount {
                 source: PathBuf::from("/host/models"),
                 destination: PathBuf::from("/mnt/models"),
+                read_only: true,
             }]
         );
         assert_eq!(session.updated_at, "2026-08-13T00:00:00Z");
         assert_eq!(
             loaded.mount_history["local"],
             vec![PathBuf::from("/host/models")]
+        );
+    }
+
+    #[test]
+    fn mount_read_only_round_trips_through_both_writers_and_defaults_before_the_column() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        let mut record = session("session-1", "project-1");
+        record.additional_mounts = vec![
+            AdditionalMount {
+                source: PathBuf::from("/host/cache"),
+                destination: PathBuf::from("/mnt/cache"),
+                read_only: false,
+            },
+            AdditionalMount {
+                source: PathBuf::from("/net/share"),
+                destination: PathBuf::from("/mnt/share"),
+                read_only: true,
+            },
+        ];
+
+        save_session_to(&database, &record).unwrap();
+        assert_eq!(
+            load_state_from(&database).unwrap().sessions["session-1"].additional_mounts,
+            record.additional_mounts
+        );
+
+        // A database written before the column existed keeps its rows, and they
+        // load as overlay mounts.
+        let connection = open(&database).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE session_mounts DROP COLUMN read_only;
+                 DELETE FROM session_mounts;
+                 INSERT INTO session_mounts(session_id, ordinal, source, destination)
+                     VALUES ('session-1', 0, CAST('/net/share' AS BLOB), CAST('/mnt/share' AS BLOB));",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            load_state_from(&database).unwrap().sessions["session-1"].additional_mounts,
+            vec![AdditionalMount {
+                source: PathBuf::from("/net/share"),
+                destination: PathBuf::from("/mnt/share"),
+                read_only: false,
+            }]
         );
     }
 
@@ -2677,9 +2746,11 @@ mod tests {
         stale.additional_mounts.clear();
         save_session_to(&database, &stale).unwrap();
 
+        // A read-only mount proves the flag survives a stale lifecycle save too.
         let attached = AdditionalMount {
             source: PathBuf::from("/host/models"),
             destination: PathBuf::from("/mnt/models"),
+            read_only: true,
         };
         set_session_container_settings_to(
             &database,
@@ -2716,6 +2787,7 @@ mod tests {
         let attached = AdditionalMount {
             source: PathBuf::from("/host/models"),
             destination: PathBuf::from("/mnt/models"),
+            read_only: true,
         };
         set_session_container_settings_to(
             &database,
@@ -2966,6 +3038,14 @@ mod tests {
                      last_checkpoint_error TEXT,
                      project_directory BLOB
                  ) STRICT;
+                 CREATE TABLE session_mounts (
+                     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                     source BLOB NOT NULL,
+                     destination BLOB NOT NULL,
+                     PRIMARY KEY(session_id, ordinal),
+                     UNIQUE(session_id, destination)
+                 ) STRICT;
                  CREATE TABLE session_checkpoints (
                      session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
                      archive_path BLOB NOT NULL,
@@ -3083,6 +3163,14 @@ mod tests {
                      resource_allocation TEXT,
                      last_checkpoint_error TEXT,
                      project_directory BLOB
+                 ) STRICT;
+                 CREATE TABLE session_mounts (
+                     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                     source BLOB NOT NULL,
+                     destination BLOB NOT NULL,
+                     PRIMARY KEY(session_id, ordinal),
+                     UNIQUE(session_id, destination)
                  ) STRICT;
                  CREATE TABLE session_checkpoints (
                      session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
@@ -3251,6 +3339,14 @@ mod tests {
                      address TEXT,
                      workspace BLOB,
                      worker_id TEXT
+                 ) STRICT;
+                 CREATE TABLE session_mounts (
+                     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                     source BLOB NOT NULL,
+                     destination BLOB NOT NULL,
+                     PRIMARY KEY(session_id, ordinal),
+                     UNIQUE(session_id, destination)
                  ) STRICT;
                  CREATE TABLE session_checkpoints (
                      session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
@@ -3484,6 +3580,14 @@ mod tests {
                      last_checkpoint_error TEXT,
                      project_directory BLOB,
                      managed_worktree TEXT
+                 ) STRICT;
+                 CREATE TABLE session_mounts (
+                     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                     source BLOB NOT NULL,
+                     destination BLOB NOT NULL,
+                     PRIMARY KEY(session_id, ordinal),
+                     UNIQUE(session_id, destination)
                  ) STRICT;
                  CREATE TABLE session_checkpoints (
                      session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,

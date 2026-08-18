@@ -18,6 +18,7 @@ use crate::render::render_session_scrollbar;
 use crate::widgets::{
     action_buttons, centered_rect, focus_border, focused_buttons, popup_height, truncate_text,
 };
+use crate::wizards::read_only_marker;
 use crate::{
     ButtonKey, DashboardAction, DashboardState, Mode, button_row_key, cycle_button_focus,
     cycle_control, move_index,
@@ -548,6 +549,9 @@ pub(crate) struct ContainerEditor {
     pub(crate) suggestions: Vec<PathBuf>,
     pub(crate) source: String,
     pub(crate) destination: String,
+    /// Read-only setting for the directory being typed, carried into the list
+    /// when it is attached.
+    pub(crate) read_only: bool,
     pub(crate) focus: ContainerEditFocus,
     pub(crate) mount_index: usize,
     pub(crate) suggestion_index: usize,
@@ -560,6 +564,7 @@ pub(crate) enum ContainerEditFocus {
     Memory,
     Source,
     Destination,
+    ReadOnly,
     Mounts,
     Suggestions,
     Cancel,
@@ -579,6 +584,7 @@ impl ContainerEditor {
             ContainerEditFocus::Memory,
             ContainerEditFocus::Source,
             ContainerEditFocus::Destination,
+            ContainerEditFocus::ReadOnly,
         ];
         if !self.mounts.is_empty() {
             order.push(ContainerEditFocus::Mounts);
@@ -596,7 +602,8 @@ impl ContainerEditor {
             ContainerEditFocus::Memory => Some(&mut self.memory),
             ContainerEditFocus::Source => Some(&mut self.source),
             ContainerEditFocus::Destination => Some(&mut self.destination),
-            ContainerEditFocus::Mounts
+            ContainerEditFocus::ReadOnly
+            | ContainerEditFocus::Mounts
             | ContainerEditFocus::Suggestions
             | ContainerEditFocus::Cancel
             | ContainerEditFocus::Save => None,
@@ -625,6 +632,7 @@ impl ContainerEditor {
         let mount = AdditionalMount {
             source,
             destination,
+            read_only: self.read_only,
         };
         let mut mounts = self.mounts.clone();
         mounts.push(mount);
@@ -634,8 +642,22 @@ impl ContainerEditor {
         self.mounts = mounts;
         self.source.clear();
         self.destination.clear();
+        self.read_only = false;
         self.mount_index = self.mounts.len() - 1;
         None
+    }
+
+    /// Toggle read-only for the entry being typed, or for the selected row.
+    fn toggle_read_only(&mut self) {
+        match self.focus {
+            ContainerEditFocus::ReadOnly => self.read_only = !self.read_only,
+            ContainerEditFocus::Mounts => {
+                if let Some(mount) = self.mounts.get_mut(self.mount_index) {
+                    mount.read_only = !mount.read_only;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn take_suggestion(&mut self) {
@@ -727,10 +749,11 @@ pub(crate) fn render_container_editor(frame: &mut Frame, area: Rect, editor: &Co
         let selected = editor.focus == ContainerEditFocus::Mounts && index == editor.mount_index;
         lines.push(Line::styled(
             format!(
-                "{} {} -> {}",
+                "{} {} -> {}{}",
                 if selected { "›" } else { " " },
                 mount.source.display(),
-                mount.destination.display()
+                mount.destination.display(),
+                read_only_marker(mount.read_only)
             ),
             if selected {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
@@ -750,6 +773,11 @@ pub(crate) fn render_container_editor(frame: &mut Frame, area: Rect, editor: &Co
             "Container destination",
             &editor.destination,
             editor.focus == ContainerEditFocus::Destination,
+        ),
+        field(
+            "Read-only",
+            if editor.read_only { "[x]" } else { "[ ]" },
+            editor.focus == ContainerEditFocus::ReadOnly,
         ),
     ]);
     if !editor.suggestions.is_empty() {
@@ -777,7 +805,8 @@ pub(crate) fn render_container_editor(frame: &mut Frame, area: Rect, editor: &Co
     lines.extend([
         Line::raw(""),
         Line::styled(
-            "Enter attaches or takes the selected row · d forgets it · Tab moves",
+            "Enter attaches or takes the selected row · Space toggles read-only · d forgets it · \
+             Tab moves",
             Style::default().fg(Color::DarkGray),
         ),
         focused_buttons(CONTAINER_EDIT_BUTTONS, editor.button_index()),
@@ -942,6 +971,7 @@ impl DashboardState {
             suggestions,
             source: String::new(),
             destination: String::new(),
+            read_only: false,
             focus: ContainerEditFocus::Cpus,
             mount_index: 0,
             suggestion_index: 0,
@@ -1006,6 +1036,21 @@ impl DashboardState {
             KeyCode::Enter if editor.focus == ContainerEditFocus::Suggestions => {
                 editor.take_suggestion();
                 editor.error = None;
+                DashboardAction::None
+            }
+            // Enter belongs to Save everywhere else, so only the checkbox
+            // itself answers to it; Space also toggles the selected row.
+            KeyCode::Enter if editor.focus == ContainerEditFocus::ReadOnly => {
+                editor.toggle_read_only();
+                DashboardAction::None
+            }
+            KeyCode::Char(' ')
+                if matches!(
+                    editor.focus,
+                    ContainerEditFocus::ReadOnly | ContainerEditFocus::Mounts
+                ) =>
+            {
+                editor.toggle_read_only();
                 DashboardAction::None
             }
             KeyCode::Enter
@@ -1656,6 +1701,7 @@ mod tests {
         session.additional_mounts = vec![AdditionalMount {
             source: PathBuf::from("/srv/data"),
             destination: PathBuf::from("/mnt/data"),
+            read_only: false,
         }];
         let mut dashboard = dashboard_with_session(session);
         dashboard
@@ -1724,10 +1770,12 @@ mod tests {
                 AdditionalMount {
                     source: PathBuf::from("/srv/data"),
                     destination: PathBuf::from("/mnt/data"),
+                    read_only: false,
                 },
                 AdditionalMount {
                     source: PathBuf::from("/srv/models"),
                     destination: PathBuf::from("/mnt/models"),
+                    read_only: false,
                 },
             ]
         );
@@ -1757,11 +1805,71 @@ mod tests {
                 additional_mounts: vec![AdditionalMount {
                     source: PathBuf::from("/srv/models"),
                     destination: PathBuf::from("/mnt/models"),
+                    read_only: false,
                 }],
                 mount_history: Vec::new(),
             }
         );
         assert!(matches!(dashboard.mode, Mode::Dashboard));
+    }
+
+    #[test]
+    fn container_editor_marks_new_and_existing_mounts_read_only() {
+        let mut dashboard = dashboard_with_container_session();
+        dashboard.handle_key(ctrl_key('e'));
+
+        // Space on the checkbox attaches the next directory read-only.
+        while container_editor(&dashboard).focus != ContainerEditFocus::Source {
+            dashboard.handle_key(key(KeyCode::Tab));
+        }
+        for character in "/nfs/share".chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+        dashboard.handle_key(key(KeyCode::Tab));
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(
+            container_editor(&dashboard).focus,
+            ContainerEditFocus::ReadOnly
+        );
+        dashboard.handle_key(key(KeyCode::Char(' ')));
+        assert!(container_editor(&dashboard).read_only);
+        while container_editor(&dashboard).focus != ContainerEditFocus::Source {
+            dashboard.handle_key(key(KeyCode::Tab));
+        }
+        dashboard.handle_key(key(KeyCode::Enter));
+
+        // Space on a listed row toggles that row, and the flag is saved.
+        while container_editor(&dashboard).focus != ContainerEditFocus::Mounts {
+            dashboard.handle_key(key(KeyCode::Tab));
+        }
+        dashboard.handle_key(key(KeyCode::Up));
+        assert_eq!(container_editor(&dashboard).mount_index, 0);
+        dashboard.handle_key(key(KeyCode::Char(' ')));
+
+        while container_editor(&dashboard).focus != ContainerEditFocus::Save {
+            dashboard.handle_key(key(KeyCode::Tab));
+        }
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::SaveContainerSettings {
+                session_id: "session-1".into(),
+                cpus: None,
+                memory: None,
+                additional_mounts: vec![
+                    AdditionalMount {
+                        source: PathBuf::from("/srv/data"),
+                        destination: PathBuf::from("/mnt/data"),
+                        read_only: true,
+                    },
+                    AdditionalMount {
+                        source: PathBuf::from("/nfs/share"),
+                        destination: PathBuf::from("/mnt/share"),
+                        read_only: true,
+                    },
+                ],
+                mount_history: vec![PathBuf::from("/srv/models")],
+            }
+        );
     }
 
     #[test]

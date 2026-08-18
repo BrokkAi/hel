@@ -184,13 +184,18 @@ impl Controller {
         }
     }
 
-    /// Verify a mount source on the host where Hel will consume it.
+    /// Verify a mount source on the host where Hel will consume it, and report
+    /// the filesystem reason it must be attached read-only, if there is one.
+    ///
+    /// The probe runs in the same round trip as the existence check so the
+    /// editor learns both answers without a second wait. A probe that cannot
+    /// answer reports no reason: provisioning decides that authoritatively.
     pub fn validate_mount_source(
         &self,
         target_id: &str,
         source: &Path,
         executor: &impl CommandExecutor,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let target = self
             .config
             .targets
@@ -221,7 +226,39 @@ impl Controller {
             "source path {} does not exist or is not a directory",
             source.display()
         );
-        Ok(())
+        Ok(self.forced_read_only_reason(target, source, executor))
+    }
+
+    /// The `filesystem (reason)` label for a source Podman cannot overlay.
+    fn forced_read_only_reason(
+        &self,
+        target: &TargetTemplate,
+        source: &Path,
+        executor: &impl CommandExecutor,
+    ) -> Option<String> {
+        let ssh = match target {
+            TargetTemplate::LocalPodman { .. } => None,
+            TargetTemplate::SshPodman { ssh, .. } => Some(backend_ssh(ssh)),
+            // Apple Container already mounts read-only, and EC2 copies instead
+            // of mounting, so neither has an overlay to lose.
+            _ => return None,
+        };
+        let filesystem = hel_targets::probe_filesystem_types(
+            ssh.as_ref(),
+            std::slice::from_ref(&source.to_path_buf()),
+            executor,
+        )
+        .map_err(|error| {
+            tracing::debug!(
+                source = %source.display(),
+                error = format!("{error:#}"),
+                "could not probe the filesystem under a mount source"
+            );
+        })
+        .ok()?
+        .pop()?;
+        let reason = hel_targets::overlay_unsupported_filesystem(&filesystem)?;
+        Some(format!("{filesystem} ({reason})"))
     }
 
     fn fail_new_session_with_cleanup(

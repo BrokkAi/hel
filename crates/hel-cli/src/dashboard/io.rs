@@ -82,7 +82,7 @@ pub(crate) enum DashboardIoUpdate {
     },
     MountValidation {
         source: String,
-        result: std::result::Result<(), String>,
+        result: std::result::Result<Option<String>, String>,
     },
     ProjectValidation {
         directory: String,
@@ -91,6 +91,11 @@ pub(crate) enum DashboardIoUpdate {
     LifecycleStage {
         session_id: String,
         stage: ProvisionStage,
+    },
+    /// Something a lifecycle operation decided on the user's behalf, such as
+    /// attaching a directory read-only because its filesystem cannot overlay.
+    LifecycleNotice {
+        notice: String,
     },
 }
 
@@ -569,6 +574,12 @@ impl<E: CommandExecutor> CommandExecutor for StageReportingExecutor<E> {
         self.report_stage(stage);
     }
 
+    fn notify_notice(&self, notice: &str) {
+        let _ = self.updates.send(DashboardIoUpdate::LifecycleNotice {
+            notice: notice.to_owned(),
+        });
+    }
+
     fn execute_with_stdin(
         &self,
         command: &CommandSpec,
@@ -606,6 +617,7 @@ impl DashboardContext {
                 self.dashboard
                     .set_session_operation_stage(&session_id, stage);
             }
+            DashboardIoUpdate::LifecycleNotice { notice } => self.dashboard.set_notice(notice),
             DashboardIoUpdate::MaterializedSessionProjection { detail } => {
                 self.dashboard.apply_prepared_materialized_session(*detail);
             }

@@ -183,6 +183,79 @@ pub struct DeploymentCapacityUsage {
 pub struct AdditionalMount {
     pub source: PathBuf,
     pub destination: PathBuf,
+    /// Attach the source read-only instead of behind Podman's copy-on-write
+    /// overlay. Defaults to false so archives and records written before the
+    /// option existed keep the overlay they were provisioned with.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Why a filesystem cannot host Podman's `:O` copy-on-write overlay, or `None`
+/// when it can. Unknown types are allowed: the overlay is the better mount and
+/// only a filesystem known to break it is downgraded.
+///
+/// The names are those `stat -f -c %T` reports, matched case-insensitively.
+pub fn overlay_unsupported_filesystem(filesystem: &str) -> Option<&'static str> {
+    let name = filesystem.trim().to_ascii_lowercase();
+    // FUSE reports the backing driver as `fuse.sshfs`, `fuse.s3fs`, and so on.
+    if name == "fuse" || name == "fuseblk" || name.starts_with("fuse.") {
+        return Some("FUSE filesystem");
+    }
+    match name.as_str() {
+        "nfs" | "nfs4" | "cifs" | "smb2" | "smb3" | "9p" | "v9fs" | "virtiofs" | "ceph"
+        | "lustre" | "afs" | "glusterfs" | "ocfs2" | "gfs" | "gfs2" => Some("network filesystem"),
+        "msdos" | "vfat" | "fat" | "exfat" | "ntfs" | "ntfs3" => Some("no POSIX metadata"),
+        "overlayfs" => Some("overlay stacking limit"),
+        _ => None,
+    }
+}
+
+/// Filesystem type of each directory, probed on the host that runs the
+/// container engine. `ssh` names that host for a remote Podman target; `None`
+/// probes this machine.
+///
+/// The reply is positional, so the whole batch fails unless `stat` answered for
+/// every directory in order.
+pub fn probe_filesystem_types(
+    ssh: Option<&SshTarget>,
+    paths: &[PathBuf],
+    executor: &impl CommandExecutor,
+) -> Result<Vec<String>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec![
+        "stat".to_owned(),
+        "-f".to_owned(),
+        "-c".to_owned(),
+        "%T".to_owned(),
+        "--".to_owned(),
+    ];
+    args.extend(paths.iter().map(|path| path.to_string_lossy().into_owned()));
+    let host = match ssh {
+        Some(ssh) => PodmanHost::Ssh(ssh),
+        None => PodmanHost::Local,
+    };
+    let output = executor.execute(&host.command_owned(args, "probe mount source filesystem"))?;
+    if output.status != 0 {
+        bail!(
+            "filesystem probe failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let types = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| line.trim().to_owned())
+        .collect::<Vec<_>>();
+    if types.len() != paths.len() {
+        bail!(
+            "filesystem probe named {} filesystems for {} directories",
+            types.len(),
+            paths.len()
+        );
+    }
+    Ok(types)
 }
 
 pub fn validate_additional_mounts(mounts: &[AdditionalMount]) -> Result<()> {
@@ -291,6 +364,10 @@ pub trait CommandExecutor {
     /// Report a lifecycle stage for work that is not a command execution, so
     /// long in-process phases still name themselves on the session clock.
     fn notify_stage(&self, _stage: ProvisionStage) {}
+
+    /// Report a decision an operation made on the user's behalf. This is not a
+    /// failure: the work continues, and the user is told what changed.
+    fn notify_notice(&self, _notice: &str) {}
 
     fn execute_with_stdin(
         &self,
@@ -629,13 +706,15 @@ impl PodmanHost<'_> {
     }
 
     fn command(self, args: &[&str], purpose: &'static str) -> CommandSpec {
+        self.command_owned(args.iter().map(|arg| (*arg).to_owned()).collect(), purpose)
+    }
+
+    fn command_owned(self, args: Vec<String>, purpose: &'static str) -> CommandSpec {
         match self {
-            Self::Local => CommandSpec::new(args[0], args[1..].iter().copied()).purpose(purpose),
-            Self::Ssh(ssh) => ssh_validation_command(
-                ssh,
-                args.iter().map(|arg| (*arg).to_owned()).collect(),
-                purpose,
-            ),
+            Self::Local => {
+                CommandSpec::new(args[0].clone(), args[1..].iter().cloned()).purpose(purpose)
+            }
+            Self::Ssh(ssh) => ssh_validation_command(ssh, args, purpose),
         }
         .stage(ProvisionStage::Provisioning)
     }
@@ -2138,7 +2217,13 @@ fn container_run_args(
         let source = mount.source.to_string_lossy();
         let destination = mount.destination.to_string_lossy();
         match engine {
-            "podman" => args.extend(["--volume".to_owned(), format!("{source}:{destination}:O")]),
+            "podman" => {
+                let mode = if mount.read_only { "ro" } else { "O" };
+                args.extend([
+                    "--volume".to_owned(),
+                    format!("{source}:{destination}:{mode}"),
+                ]);
+            }
             "container" => args.extend([
                 "--mount".to_owned(),
                 format!("type=bind,source={source},target={destination},readonly"),
@@ -2986,10 +3071,18 @@ mod tests {
 
     #[test]
     fn podman_additional_mounts_use_copy_on_write_overlay_volumes() {
-        let mounts = [AdditionalMount {
-            source: PathBuf::from("/host/cache"),
-            destination: PathBuf::from("/mnt/cache"),
-        }];
+        let mounts = [
+            AdditionalMount {
+                source: PathBuf::from("/host/cache"),
+                destination: PathBuf::from("/mnt/cache"),
+                read_only: false,
+            },
+            AdditionalMount {
+                source: PathBuf::from("/host/models"),
+                destination: PathBuf::from("/mnt/models"),
+                read_only: true,
+            },
+        ];
         let plan = provision_plan(
             &TargetTemplate::LocalPodman(ContainerTemplate {
                 image: "ubuntu:24.04".to_owned(),
@@ -3007,6 +3100,104 @@ mod tests {
                 .windows(2)
                 .any(|args| args == ["--volume", "/host/cache:/mnt/cache:O"])
         );
+        assert!(
+            plan.commands[0]
+                .args
+                .windows(2)
+                .any(|args| args == ["--volume", "/host/models:/mnt/models:ro"])
+        );
+    }
+
+    #[test]
+    fn overlay_denylist_covers_network_fuse_and_metadata_poor_filesystems() {
+        assert_eq!(
+            overlay_unsupported_filesystem("nfs"),
+            Some("network filesystem")
+        );
+        assert_eq!(
+            overlay_unsupported_filesystem("  NFS4 "),
+            Some("network filesystem")
+        );
+        // FUSE names its backing driver, and the case comes from the kernel.
+        assert_eq!(
+            overlay_unsupported_filesystem("FUSE.sshfs"),
+            Some("FUSE filesystem")
+        );
+        assert_eq!(
+            overlay_unsupported_filesystem("fuseblk"),
+            Some("FUSE filesystem")
+        );
+        assert_eq!(
+            overlay_unsupported_filesystem("exfat"),
+            Some("no POSIX metadata")
+        );
+        assert_eq!(
+            overlay_unsupported_filesystem("overlayfs"),
+            Some("overlay stacking limit")
+        );
+        // Anything else, known-good or unrecognized, keeps the overlay.
+        assert_eq!(overlay_unsupported_filesystem("ext4"), None);
+        assert_eq!(overlay_unsupported_filesystem("btrfs"), None);
+        assert_eq!(overlay_unsupported_filesystem("futurefs"), None);
+        assert_eq!(overlay_unsupported_filesystem(""), None);
+    }
+
+    #[test]
+    fn filesystem_probe_answers_positionally_and_reaches_the_podman_host() {
+        let executor = PodmanPreflightExecutor::with_outputs([podman_output(b"ext4\nnfs\n")]);
+        let paths = [PathBuf::from("/host/cache"), PathBuf::from("/host/models")];
+
+        assert_eq!(
+            probe_filesystem_types(None, &paths, &executor).unwrap(),
+            vec!["ext4".to_owned(), "nfs".to_owned()]
+        );
+        let seen = executor.seen.borrow();
+        assert_eq!(seen[0].program, "stat");
+        assert_eq!(
+            seen[0].args,
+            ["-f", "-c", "%T", "--", "/host/cache", "/host/models"]
+        );
+
+        let remote = PodmanPreflightExecutor::with_outputs([podman_output(b"ext4\nnfs\n")]);
+        probe_filesystem_types(Some(&ssh()), &paths, &remote).unwrap();
+        let seen = remote.seen.borrow();
+        assert_eq!(seen[0].program, "ssh");
+        assert!(
+            seen[0].args.last().is_some_and(|remote| {
+                remote == "'stat' '-f' '-c' '%T' '--' '/host/cache' '/host/models'"
+            }),
+            "{:?}",
+            seen[0].args
+        );
+    }
+
+    #[test]
+    fn filesystem_probe_rejects_a_partial_or_failed_answer() {
+        let short = PodmanPreflightExecutor::with_outputs([podman_output(b"ext4\n")]);
+        let error = probe_filesystem_types(
+            None,
+            &[PathBuf::from("/host/cache"), PathBuf::from("/host/models")],
+            &short,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("named 1 filesystems for 2 directories"),
+            "{error}"
+        );
+
+        let failed = PodmanPreflightExecutor::with_outputs([CommandOutput {
+            status: 1,
+            stdout: Vec::new(),
+            stderr: b"stat: cannot read file system information".to_vec(),
+        }]);
+        let error = probe_filesystem_types(None, &[PathBuf::from("/host/cache")], &failed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot read file system information"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3014,6 +3205,7 @@ mod tests {
         let mounts = [AdditionalMount {
             source: PathBuf::from("/Users/me/assets"),
             destination: PathBuf::from("/mnt/assets"),
+            read_only: false,
         }];
         let plan = provision_plan(
             &TargetTemplate::AppleContainer(ContainerTemplate {

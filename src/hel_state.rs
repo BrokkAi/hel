@@ -1074,6 +1074,7 @@ mod tests {
             additional_mounts: vec![AdditionalMount {
                 source: PathBuf::from("/home/test/cache"),
                 destination: PathBuf::from("/mnt/cache"),
+                read_only: false,
             }],
             state: SessionState::Running,
             target: Some(TargetLocator::LocalPodman {
@@ -1299,10 +1300,12 @@ mod tests {
                 AdditionalMount {
                     source: "/srv/first".into(),
                     destination: "/mnt/first".into(),
+                    read_only: false,
                 },
                 AdditionalMount {
                     source: "/srv/second".into(),
                     destination: "/mnt/second".into(),
+                    read_only: false,
                 },
             ],
         );
@@ -1311,6 +1314,7 @@ mod tests {
             &[AdditionalMount {
                 source: "/srv/first".into(),
                 destination: "/mnt/again".into(),
+                read_only: false,
             }],
         );
 

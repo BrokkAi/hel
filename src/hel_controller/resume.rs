@@ -1183,6 +1183,15 @@ mod tests {
 
         impl CommandExecutor for FailingPreflightExecutor {
             fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                // Provisioning probes the mount source's filesystem before it
+                // builds the run arguments; a local disk keeps the overlay.
+                if command.program == "stat" {
+                    return Ok(CommandOutput {
+                        status: 0,
+                        stdout: b"ext4\n".to_vec(),
+                        stderr: Vec::new(),
+                    });
+                }
                 assert_eq!(command.program, "podman");
                 let mut observed = self.mounts_during_provisioning.lock().unwrap();
                 if observed.is_none() {
@@ -1216,11 +1225,13 @@ mod tests {
         session.additional_mounts = vec![AdditionalMount {
             source: PathBuf::from("/host/old"),
             destination: PathBuf::from("/mnt/old"),
+            read_only: false,
         }];
         let previous = session.clone();
         let resumed_mounts = vec![AdditionalMount {
             source: PathBuf::from("/host/new"),
             destination: PathBuf::from("/mnt/new"),
+            read_only: false,
         }];
         let profile_home = data_directory.join("profile");
         std::fs::create_dir_all(&profile_home).unwrap();
