@@ -39,16 +39,18 @@ pub(super) struct TranscriptRenderCache {
     width: u16,
     mode: TranscriptRenderMode,
     entries: Vec<Option<CachedEntry>>,
-    collapse: Vec<ToolCollapse>,
+    collapse: Vec<EntryCollapse>,
 }
 
-/// Whether an entry renders on its own, heads a collapsed run of completed
-/// tools, or is folded into the run above it.
+/// Whether an entry renders on its own, renders nothing, or heads a collapsed
+/// run of completed tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolCollapse {
+enum EntryCollapse {
     None,
     /// Member of a collapsed run whose summary renders on the run head.
     Hidden,
+    /// Detail the decluttered feed leaves out.
+    Omitted,
     /// Head of a collapsed run spanning `self..end` (end exclusive).
     Summary {
         end: usize,
@@ -159,6 +161,9 @@ impl TranscriptSnapshot {
             .entries
             .iter()
             .filter(|entry| entry.start_seq > self.last_compaction_seq)
+            // The remote viewer mirrors the Rich feed, so detail Rich leaves
+            // out never reaches it.
+            .filter(|entry| !entry.raw_only)
             .map(browser_entry)
             .collect::<Vec<_>>();
         let mut remaining = BROWSER_TRANSCRIPT_LINES;
@@ -357,11 +362,19 @@ fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEnt
             }
             entry
         }
-        TranscriptBody::TerminalOutput { record } => ChatEntry::plain(
-            item.position,
-            ChatRole::System,
-            sanitize_terminal_text(&terminal_output_detail(record)),
-        ),
+        TranscriptBody::TerminalOutput { record } => {
+            let mut entry = ChatEntry::plain(
+                item.position,
+                ChatRole::System,
+                sanitize_terminal_text(&terminal_output_detail(record)),
+            );
+            // Output no tool call refers to is a whole block per command. A
+            // command that ended cleanly says nothing the decluttered feed
+            // needs, so only the raw transcript carries it; anything abnormal
+            // stays visible everywhere.
+            entry.raw_only = record.exited_cleanly();
+            entry
+        }
         TranscriptBody::Plan { plan } => ChatEntry::plan(
             item.position,
             Plan::deserialize(plan)
@@ -516,7 +529,7 @@ fn prepare_render_cache(
         cache.entries.clear();
     }
     cache.entries.resize(entries.len(), None);
-    let collapse = tool_collapse_states(entries, mode);
+    let collapse = entry_collapse_states(entries, mode);
     for (index, state) in collapse.iter().enumerate() {
         if cache.collapse.get(index) != Some(state) {
             cache.entries[index] = None;
@@ -539,15 +552,23 @@ fn protected_tool_index(entries: &[ChatEntry]) -> Option<usize> {
         .filter(|&index| is_completed_tool(&entries[index]))
 }
 
-/// Collapse state per entry. In rich mode a maximal run of two or more
-/// consecutive completed tools renders as one summary cell; every other entry,
-/// including a pending, running, or failed tool, breaks the run. The protected
-/// newest result breaks runs too and never joins one. Raw mode never collapses
-/// so the full commands stay inspectable.
-fn tool_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> Vec<ToolCollapse> {
-    let mut states = vec![ToolCollapse::None; entries.len()];
+/// What every entry renders as, which is the one place the decluttered feed is
+/// decided. In rich mode a maximal run of two or more consecutive completed
+/// tools renders as one summary cell; every other entry, including a pending,
+/// running, or failed tool, breaks the run. The protected newest result breaks
+/// runs too and never joins one. A `raw_only` entry renders nothing at all and
+/// is transparent to a run rather than breaking it, since nothing of it is on
+/// screen to separate the tools around it. Raw mode neither collapses nor
+/// omits, so the full commands stay inspectable.
+fn entry_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> Vec<EntryCollapse> {
+    let mut states = vec![EntryCollapse::None; entries.len()];
     if mode != TranscriptRenderMode::Rich {
         return states;
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.raw_only {
+            states[index] = EntryCollapse::Omitted;
+        }
     }
     let protected = protected_tool_index(entries);
     let collapsible = |index: usize| is_completed_tool(&entries[index]) && Some(index) != protected;
@@ -557,19 +578,33 @@ fn tool_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> Ve
             start += 1;
             continue;
         }
+        // `end` stops at the last collapsible member, so an omitted entry the
+        // run reached across is only inside the run when a tool follows it.
         let mut end = start + 1;
-        while end < entries.len() && collapsible(end) {
-            end += 1;
+        let mut members = 1;
+        let mut cursor = start + 1;
+        while cursor < entries.len() {
+            if collapsible(cursor) {
+                members += 1;
+                cursor += 1;
+                end = cursor;
+            } else if entries[cursor].raw_only {
+                cursor += 1;
+            } else {
+                break;
+            }
         }
-        if end - start > 1 {
+        if members > 1 {
             // A member's update does not bump the head's revision, so fold the
             // members' revisions into the head's state: the summary's cached
             // rows then drop whenever any member changes.
             let fingerprint = entries[start..end].iter().fold(0u64, |accumulated, entry| {
                 accumulated.wrapping_mul(31).wrapping_add(entry.revision)
             });
-            states[start] = ToolCollapse::Summary { end, fingerprint };
-            states[start + 1..end].fill(ToolCollapse::Hidden);
+            states[start] = EntryCollapse::Summary { end, fingerprint };
+            // Omitted members render nothing either way, so one state covers
+            // everything the head speaks for.
+            states[start + 1..end].fill(EntryCollapse::Hidden);
         }
         start = end;
     }
@@ -577,10 +612,12 @@ fn tool_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> Ve
 }
 
 /// The single cell that stands in for a run of completed tools: the first word
-/// of each member's title, in order.
+/// of each member's title, in order. Entries the run reached across contribute
+/// no title, having no row of their own to stand in for.
 fn collapsed_tool_entry(members: &[ChatEntry]) -> ChatEntry {
     let titles = members
         .iter()
+        .filter(|member| is_completed_tool(member))
         .map(|member| member.text.split_whitespace().next().unwrap_or("tool"))
         .collect::<Vec<_>>()
         .join(", ");
@@ -601,9 +638,9 @@ fn cached_entry_lines<'cache>(
     if stale {
         let width = usize::from(cache.width);
         let lines = match cache.collapse[index] {
-            ToolCollapse::None => render_transcript_entry(entry, width, cache.mode),
-            ToolCollapse::Hidden => Vec::new(),
-            ToolCollapse::Summary { end, .. } => {
+            EntryCollapse::None => render_transcript_entry(entry, width, cache.mode),
+            EntryCollapse::Hidden | EntryCollapse::Omitted => Vec::new(),
+            EntryCollapse::Summary { end, .. } => {
                 let summary = collapsed_tool_entry(&entries[index..end]);
                 render_transcript_entry(&summary, width, cache.mode)
             }
@@ -1339,8 +1376,8 @@ mod tests {
     use super::*;
     use crate::hel_acp::RuntimeEvent;
     use crate::hel_chat::test_support::{
-        agent_transcript_item, drawn_transcript, key, line_text, mouse_in, queued, snapshot,
-        transcript_text,
+        agent_message_item, agent_transcript_item, drawn_transcript, key, line_text, mouse_in,
+        queued, snapshot, transcript_text,
     };
     use crate::hel_worker::{SequencedEvent, WorkerEvent};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -2569,6 +2606,159 @@ mod tests {
             browser.entries[0].lines,
             ["Bash"],
             "the remote viewer shows the decluttered title, not the output"
+        );
+    }
+
+    const STANDALONE_OUTPUT: &str = "cargo build finished";
+
+    fn terminal_record(exit_code: Option<u32>, signal: Option<&str>) -> TerminalOutputRecord {
+        TerminalOutputRecord {
+            terminal_id: "term-1".into(),
+            output: STANDALONE_OUTPUT.into(),
+            truncated: false,
+            exit_code,
+            signal: signal.map(str::to_owned),
+        }
+    }
+
+    fn terminal_output_item(position: u64, record: TerminalOutputRecord) -> Arc<TranscriptItem> {
+        Arc::new(TranscriptItem {
+            stable_id: format!("terminal:{}", record.terminal_id),
+            position,
+            latest_content_event_ordinal: None,
+            created_at_ms: position as i64,
+            last_changed_at_ms: position as i64,
+            body: TranscriptBody::TerminalOutput { record },
+        })
+    }
+
+    /// A hel-hosted command whose output no tool call refers to, after an agent
+    /// message so the feed has something else to show.
+    fn standalone_terminal_session(record: TerminalOutputRecord) -> MaterializedSession {
+        let mut session = MaterializedSession::empty("session-standalone-terminal");
+        session.applied_event_ordinal = 2;
+        session.transcript = vec![
+            agent_message_item("agent:1", 1, "running the build"),
+            terminal_output_item(2, record),
+        ];
+        session
+    }
+
+    fn browser_lines(session: &MaterializedSession) -> Vec<String> {
+        TranscriptSnapshot::from_materialized(session)
+            .browser_transcript(None)
+            .entries
+            .into_iter()
+            .flat_map(|entry| entry.lines)
+            .collect()
+    }
+
+    #[test]
+    fn a_cleanly_exited_standalone_terminal_item_renders_only_in_raw_mode() {
+        let session = standalone_terminal_session(terminal_record(Some(0), None));
+
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+        let rich = transcript_text(&mut chat, 80);
+        assert!(
+            rich.iter().any(|line| line.contains("running the build")),
+            "the rest of the conversation still renders: {rich:?}"
+        );
+        assert!(
+            !rich.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
+            "a clean command's output is left out of the rich feed: {rich:?}"
+        );
+        assert!(
+            !rich.iter().any(|line| line.contains("exited 0")),
+            "and so is its exit summary: {rich:?}"
+        );
+
+        let browser = browser_lines(&session);
+        assert!(
+            browser
+                .iter()
+                .any(|line| line.contains("running the build")),
+            "the rest of the conversation still reaches the remote viewer: {browser:?}"
+        );
+        assert!(
+            !browser.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
+            "the remote viewer mirrors the rich feed: {browser:?}"
+        );
+
+        chat.render_mode = TranscriptRenderMode::Raw;
+        let raw = transcript_text(&mut chat, 80);
+        assert!(
+            raw.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
+            "raw rows keep the captured output: {raw:?}"
+        );
+        assert!(
+            raw.iter().any(|line| line.contains("exited 0")),
+            "raw rows keep how the terminal ended: {raw:?}"
+        );
+    }
+
+    #[test]
+    fn an_abnormally_ended_standalone_terminal_item_renders_everywhere() {
+        for (record, summary) in [
+            (terminal_record(Some(3), None), "exited 3"),
+            (terminal_record(None, Some("SIGKILL")), "killed by SIGKILL"),
+            (
+                terminal_record(Some(0), Some("SIGKILL")),
+                "killed by SIGKILL",
+            ),
+            (terminal_record(None, None), "released before exit"),
+        ] {
+            let session = standalone_terminal_session(record);
+
+            let mut chat = ChatState::from_materialized(&session, &[], &[]);
+            let rich = transcript_text(&mut chat, 80);
+            assert!(
+                rich.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
+                "{summary}: the rich feed keeps the output: {rich:?}"
+            );
+            assert!(
+                rich.iter().any(|line| line.contains(summary)),
+                "{summary}: the rich feed says how it ended: {rich:?}"
+            );
+
+            let browser = browser_lines(&session);
+            assert!(
+                browser.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
+                "{summary}: the remote viewer keeps the output: {browser:?}"
+            );
+            assert!(
+                browser.iter().any(|line| line.contains(summary)),
+                "{summary}: the remote viewer says how it ended: {browser:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clean_standalone_terminal_item_between_completed_tools_keeps_one_run() {
+        let mut session = MaterializedSession::empty("session-terminal-between-tools");
+        session.applied_event_ordinal = 3;
+        session.transcript = vec![
+            fixture_tool_item(1),
+            terminal_output_item(2, terminal_record(Some(0), None)),
+            fixture_tool_item(3),
+        ];
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+        // Ends the newest result's protection, so both tools can collapse.
+        chat.entries
+            .push(ChatEntry::plain(4, ChatRole::User, "now ship it"));
+
+        let text = transcript_text(&mut chat, 80);
+
+        assert_eq!(
+            text,
+            [
+                "✓ Tool · done",
+                "│ read, read",
+                "",
+                "❯ You",
+                "│ now ship it",
+                "",
+            ],
+            "the omitted entry neither renders nor splits the run"
         );
     }
 

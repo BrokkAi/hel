@@ -80,6 +80,16 @@ pub struct TerminalOutputRecord {
     pub signal: Option<String>,
 }
 
+impl TerminalOutputRecord {
+    /// Whether the command ended the way a caller asked for: exit status zero
+    /// and no signal. Anything else — a nonzero exit, a signal, or no status at
+    /// all because the terminal was released before one was observed — is
+    /// abnormal, and stays visible in every render mode.
+    pub(crate) fn exited_cleanly(&self) -> bool {
+        self.exit_code == Some(0) && self.signal.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TranscriptItem {
@@ -184,6 +194,11 @@ pub struct ChatEntry {
     pub(crate) plan: Vec<PlanLine>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) leading_omitted: bool,
+    /// Detail the decluttered feed leaves out: the entry renders only in the
+    /// raw transcript mode. Set once, when the entry is built, because Ctrl-T
+    /// switches render mode without rebuilding entries.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) raw_only: bool,
     /// The materialized transcript item this entry was derived from, when it
     /// came from the controller's projection. Provenance only, so it is
     /// neither serialized nor part of the entry's value.
@@ -233,6 +248,7 @@ impl ChatEntry {
             tool_locations: Vec::new(),
             plan,
             leading_omitted: false,
+            raw_only: false,
             source: TranscriptSource::default(),
         }
     }

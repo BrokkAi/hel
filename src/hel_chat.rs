@@ -193,6 +193,7 @@ impl ChatEntry {
             tool_locations: Vec::new(),
             plan: Vec::new(),
             leading_omitted: false,
+            raw_only: false,
             source: TranscriptSource::default(),
         }
     }
@@ -218,6 +219,7 @@ impl ChatEntry {
             tool_locations: Vec::new(),
             plan: Vec::new(),
             leading_omitted: false,
+            raw_only: false,
             source: TranscriptSource::default(),
         }
     }
