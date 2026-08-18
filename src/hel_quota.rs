@@ -241,7 +241,7 @@ async fn refresh_profile(
                 CodexUsageStatus::Unavailable(error) => Err(anyhow::anyhow!(error)),
             }
         }
-        HarnessKind::Claude => claude_usage::query(cwd, environment)
+        HarnessKind::Claude => claude_usage::query(source_home)
             .await
             .map(|report| ProfileQuota {
                 profile_id: profile_id.clone(),
