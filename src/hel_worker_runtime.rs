@@ -1417,7 +1417,9 @@ mod unix {
         Ok(())
     }
 
-    fn terminate_process_group(pid: i32, signal: i32) {
+    /// Signal a whole process group. Terminals reuse this so process-group
+    /// termination lives in one place.
+    pub(crate) fn terminate_process_group(pid: i32, signal: i32) {
         // SAFETY: a negative, validated child PID targets only the process
         // group created for this supervisor's child.
         unsafe {
@@ -1495,6 +1497,9 @@ fn resolve_relative_worker_root(root: PathBuf, base: &Path) -> PathBuf {
 
 #[cfg(unix)]
 pub use unix::{lead_process_group, proxy, run_acp_supervisor, run_daemon};
+
+#[cfg(unix)]
+pub(crate) use unix::terminate_process_group;
 
 #[cfg(not(unix))]
 pub async fn run_daemon(

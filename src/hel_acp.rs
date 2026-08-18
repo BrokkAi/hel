@@ -11,11 +11,15 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ClientCapabilities, CloseSessionRequest, ContentBlock,
-    Implementation, InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOptionKind,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    CreateTerminalRequest, CreateTerminalResponse, Implementation, InitializeRequest,
+    KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, NewSessionRequest,
+    PermissionOptionKind, PromptRequest, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigValueId, SessionId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, TextContent,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, TerminalExitStatus,
+    TerminalId, TerminalOutputRequest, TerminalOutputResponse, TextContent,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -26,6 +30,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::hel_config::{HarnessKind, UnrestrictedEnforcement};
+use crate::hel_terminal::{
+    DEFAULT_TERMINAL_OUTPUT_BYTES, TerminalExit, TerminalRegistry, TerminalSpawn,
+};
 
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {
@@ -369,6 +376,20 @@ async fn emit_runtime_event(
         .map_err(|_| anyhow!("relay event coordinator stopped"))
 }
 
+/// Answer for a `terminal/*` request naming a terminal this connection does
+/// not have, most often one the agent already released.
+fn unknown_terminal_error(terminal_id: &str) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::invalid_params().data(serde_json::Value::String(format!(
+        "unknown terminal {terminal_id}"
+    )))
+}
+
+fn terminal_exit_status(exit: &TerminalExit) -> TerminalExitStatus {
+    TerminalExitStatus::new()
+        .exit_code(exit.exit_code)
+        .signal(exit.signal.clone())
+}
+
 fn relay_event_channel_error() -> agent_client_protocol::Error {
     agent_client_protocol::Error::internal_error().data(serde_json::Value::String(
         "relay event coordinator stopped".into(),
@@ -418,6 +439,18 @@ where
     let auto_approve_permissions = spec.force_unrestricted_mode;
     let scratch_outputs = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
     let notification_scratch_outputs = scratch_outputs.clone();
+    let terminals = TerminalRegistry::new();
+    let create_terminals = terminals.clone();
+    let output_terminals = terminals.clone();
+    let wait_terminals = terminals.clone();
+    let kill_terminals = terminals.clone();
+    let release_terminals = terminals.clone();
+    let create_events = events.clone();
+    let wait_events = events.clone();
+    let release_events = events.clone();
+    // A terminal runs where the session runs unless the agent names a
+    // directory of its own.
+    let session_cwd = spec.cwd.clone();
     Client
         .builder()
         .on_receive_notification(
@@ -492,6 +525,122 @@ where
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            async move |request: CreateTerminalRequest, responder, _cx| {
+                let spawn = TerminalSpawn {
+                    command: request.command.clone(),
+                    args: request.args.clone(),
+                    // Additions, not a replacement: the child inherits the
+                    // daemon environment it needs to reach the toolchain.
+                    env: request
+                        .env
+                        .iter()
+                        .map(|variable| (variable.name.clone(), variable.value.clone()))
+                        .collect(),
+                    cwd: request.cwd.clone().unwrap_or_else(|| session_cwd.clone()),
+                    output_byte_limit: request
+                        .output_byte_limit
+                        .and_then(|limit| usize::try_from(limit).ok())
+                        .unwrap_or(DEFAULT_TERMINAL_OUTPUT_BYTES),
+                };
+                match create_terminals.create(spawn, create_events.clone()) {
+                    Ok(terminal_id) => responder
+                        .respond(CreateTerminalResponse::new(TerminalId::from(terminal_id))),
+                    Err(error) => {
+                        create_events
+                            .send(RuntimeEvent::Warning {
+                                message: format!("a client terminal failed to start: {error:#}"),
+                            })
+                            .await
+                            .map_err(|_| relay_event_channel_error())?;
+                        responder.respond_with_error(
+                            agent_client_protocol::Error::internal_error()
+                                .data(serde_json::Value::String(format!("{error:#}"))),
+                        )
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: TerminalOutputRequest, responder, _cx| {
+                let terminal_id = request.terminal_id.to_string();
+                let Some(snapshot) = output_terminals.output(&terminal_id) else {
+                    return responder.respond_with_error(unknown_terminal_error(&terminal_id));
+                };
+                let mut response = TerminalOutputResponse::new(snapshot.output, snapshot.truncated);
+                if let Some(exit) = &snapshot.exit {
+                    response = response.exit_status(terminal_exit_status(exit));
+                }
+                responder.respond(response)
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: WaitForTerminalExitRequest, responder, _cx| {
+                let terminal_id = request.terminal_id.to_string();
+                let Some(exit) = wait_terminals.exit_receiver(&terminal_id) else {
+                    return responder.respond_with_error(unknown_terminal_error(&terminal_id));
+                };
+                // Handlers run on the dispatch loop, so awaiting the child here
+                // would stop every other message until it exits.
+                let events = wait_events.clone();
+                tokio::spawn(async move {
+                    let exit = crate::hel_terminal::wait_for_exit(exit).await;
+                    if let Err(error) = responder.respond(WaitForTerminalExitResponse::new(
+                        terminal_exit_status(&exit),
+                    )) {
+                        // A closed channel means the relay already stopped, so
+                        // this warning has nowhere left to go.
+                        let _ = events
+                            .send(RuntimeEvent::Warning {
+                                message: format!(
+                                    "report the exit of client terminal {terminal_id}: {error}"
+                                ),
+                            })
+                            .await;
+                    }
+                });
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: KillTerminalRequest, responder, _cx| {
+                let terminal_id = request.terminal_id.to_string();
+                // The terminal stays valid: output and wait_for_exit still
+                // answer for it until the agent releases it.
+                if !kill_terminals.kill(&terminal_id) {
+                    return responder.respond_with_error(unknown_terminal_error(&terminal_id));
+                }
+                responder.respond(KillTerminalResponse::new())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: ReleaseTerminalRequest, responder, _cx| {
+                let terminal_id = request.terminal_id.to_string();
+                let Some(supervisor) = release_terminals.release(&terminal_id) else {
+                    return responder.respond_with_error(unknown_terminal_error(&terminal_id));
+                };
+                // Reap off the dispatch loop: the supervisor still has to watch
+                // the killed child exit before it reports the terminal closed.
+                let events = release_events.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = supervisor.await {
+                        let _ = events
+                            .send(RuntimeEvent::Warning {
+                                message: format!(
+                                    "reap released client terminal {terminal_id}: {error}"
+                                ),
+                            })
+                            .await;
+                    }
+                });
+                responder.respond(ReleaseTerminalResponse::new())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         // Catch-all, registered last so the typed handlers above win. The ACP
         // crate parks an unhandled request that carries a session id instead of
         // rejecting it, so without this an agent that sends an ext request Hel
@@ -523,12 +672,19 @@ where
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
-            drive_connection(connection, &spec, &mut requests, &events, scratch_outputs)
-                .await
-                .map_err(|error| {
-                    agent_client_protocol::Error::internal_error()
-                        .data(serde_json::Value::String(format!("{error:#}")))
-                })
+            drive_connection(
+                connection,
+                &spec,
+                &mut requests,
+                &events,
+                scratch_outputs,
+                terminals,
+            )
+            .await
+            .map_err(|error| {
+                agent_client_protocol::Error::internal_error()
+                    .data(serde_json::Value::String(format!("{error:#}")))
+            })
         })
         .await
         .map_err(|error| {
@@ -790,10 +946,28 @@ async fn drive_connection(
     requests: &mut mpsc::Receiver<CommandRequest>,
     events: &mpsc::Sender<RuntimeEvent>,
     scratch_outputs: Arc<Mutex<BTreeMap<String, String>>>,
+    terminals: TerminalRegistry,
+) -> Result<()> {
+    // Terminals belong to the connection. However the session ends — closed,
+    // failed, or with its command channel dropped — their process groups must
+    // not outlive it.
+    let result = serve_session(&connection, spec, requests, events, scratch_outputs).await;
+    terminals.shutdown(events).await;
+    result
+}
+
+async fn serve_session(
+    connection: &ConnectionTo<Agent>,
+    spec: &LaunchSpec,
+    requests: &mut mpsc::Receiver<CommandRequest>,
+    events: &mpsc::Sender<RuntimeEvent>,
+    scratch_outputs: Arc<Mutex<BTreeMap<String, String>>>,
 ) -> Result<()> {
     let mut meta = serde_json::Map::new();
     meta.insert("terminal_output".into(), serde_json::Value::Bool(true));
-    let capabilities = ClientCapabilities::new().meta(meta);
+    // Kimi routes every shell call through the client's terminal surface and
+    // has no local fallback, so this capability is what makes Bash work.
+    let capabilities = ClientCapabilities::new().terminal(true).meta(meta);
     let initialized = connection
         .send_request(
             InitializeRequest::new(ProtocolVersion::V1)
@@ -886,7 +1060,7 @@ async fn drive_connection(
         .then(|| spec.harness.unrestricted_enforcement());
     if let Some(desired_mode) = enforcement.and_then(UnrestrictedEnforcement::acp_mode) {
         enforce_unrestricted_mode(
-            &connection,
+            connection,
             &session_id,
             desired_mode,
             config_options.as_deref().unwrap_or_default(),
@@ -1103,12 +1277,12 @@ async fn drive_connection(
                 value,
             } => {
                 let applied = match grok_models.as_mut() {
-                    Some(state) => set_grok_model(&connection, &session_id, state, &key, &value)
+                    Some(state) => set_grok_model(connection, &session_id, state, &key, &value)
                         .await
                         .inspect(|()| config_options = grok_config_options(state)),
                     None => {
                         set_session_config(
-                            &connection,
+                            connection,
                             &session_id,
                             &mut config_options,
                             &key,
@@ -1181,7 +1355,7 @@ async fn drive_connection(
                 // session, so the destination stays idle and the coordinator
                 // keeps serving cancels, closes and rejections meanwhile.
                 let compaction =
-                    compact_in_scratch_session(&connection, spec, prompt, &scratch_outputs);
+                    compact_in_scratch_session(connection, spec, prompt, &scratch_outputs);
                 tokio::pin!(compaction);
                 let mut response = Some(response);
                 loop {
@@ -2530,6 +2704,557 @@ mod tests {
         drop(request_tx);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
         bridge.abort();
+    }
+
+    /// Terminals run real children in real process groups, which only Unix has.
+    #[cfg(unix)]
+    mod terminals {
+        use super::*;
+
+        /// Every wait carries this bound, so a handler that stalls the dispatch
+        /// loop or a child that deadlocks on a full pipe fails the test in
+        /// seconds instead of hanging the suite.
+        const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        /// Answers `initialize` and `session/new`, writes the requests a test
+        /// scripts, and republishes every answer Hel sends back.
+        async fn client_request_bridge(
+            stream: tokio::io::DuplexStream,
+            mut scripted: mpsc::UnboundedReceiver<serde_json::Value>,
+            answers: mpsc::UnboundedSender<serde_json::Value>,
+        ) {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+            let (read, mut write) = tokio::io::split(stream);
+            let mut lines = BufReader::new(read).lines();
+            loop {
+                let outgoing = tokio::select! {
+                    line = lines.next_line() => {
+                        let Some(line) = line.expect("read bridge input") else {
+                            break;
+                        };
+                        let message: serde_json::Value =
+                            serde_json::from_str(&line).expect("bridge input must be JSON-RPC");
+                        let Some(method) =
+                            message.get("method").and_then(serde_json::Value::as_str)
+                        else {
+                            // No method: an answer to one of the scripted requests.
+                            if answers.send(message).is_err() {
+                                break;
+                            }
+                            continue;
+                        };
+                        let id = message
+                            .get("id")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        match method {
+                            "initialize" => serde_json::json!({
+                                "jsonrpc": "2.0", "id": id, "result": {"protocolVersion": 1},
+                            }),
+                            "session/new" => serde_json::json!({
+                                "jsonrpc": "2.0", "id": id, "result": {"sessionId": "scripted"},
+                            }),
+                            _ => continue,
+                        }
+                    }
+                    request = scripted.recv() => {
+                        let Some(request) = request else {
+                            break;
+                        };
+                        request
+                    }
+                };
+                if write
+                    .write_all(format!("{outgoing}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+
+        /// The agent side of a scripted connection. Answers are collected by
+        /// id, so a test can keep one request in flight while it sends others.
+        struct ScriptedAgent {
+            scripted: mpsc::UnboundedSender<serde_json::Value>,
+            answers: mpsc::UnboundedReceiver<serde_json::Value>,
+            received: BTreeMap<String, serde_json::Value>,
+            sent: usize,
+        }
+
+        impl ScriptedAgent {
+            fn send(&mut self, method: &str, params: serde_json::Value) -> String {
+                self.sent += 1;
+                let id = format!("agent-{}", self.sent);
+                self.scripted
+                    .send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": method,
+                        "params": params,
+                    }))
+                    .expect("the scripted bridge must accept requests");
+                id
+            }
+
+            async fn answer(&mut self, id: &str) -> serde_json::Value {
+                loop {
+                    if let Some(answer) = self.received.remove(id) {
+                        return answer;
+                    }
+                    let answer = tokio::time::timeout(ANSWER_TIMEOUT, self.answers.recv())
+                        .await
+                        .expect(
+                            "Hel must answer every terminal request instead of leaving the agent waiting",
+                        )
+                        .expect("the bridge must keep publishing answers");
+                    let answer_id = answer
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("an answer must carry the request id")
+                        .to_owned();
+                    self.received.insert(answer_id, answer);
+                }
+            }
+
+            async fn call(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+                let id = self.send(method, params);
+                self.answer(&id).await
+            }
+        }
+
+        struct ScriptedRuntime {
+            agent: ScriptedAgent,
+            observed: Arc<Mutex<Vec<RuntimeEvent>>>,
+            requests: mpsc::Sender<CommandRequest>,
+            driver: tokio::task::JoinHandle<Result<()>>,
+            bridge: tokio::task::JoinHandle<()>,
+            events: tokio::task::JoinHandle<()>,
+        }
+
+        impl ScriptedRuntime {
+            /// Close the command channel and wait for the runtime to finish,
+            /// which is also what tears the terminals down.
+            async fn stop(self) {
+                drop(self.requests);
+                tokio::time::timeout(ANSWER_TIMEOUT, self.driver)
+                    .await
+                    .expect("closing the command channel must end the runtime")
+                    .expect("the runtime task must not panic")
+                    .expect("terminal work must not fail the runtime");
+                self.bridge.abort();
+                self.events.abort();
+            }
+        }
+
+        fn start_scripted_runtime() -> ScriptedRuntime {
+            let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+            let (scripted_tx, scripted_rx) = mpsc::unbounded_channel();
+            let (answers_tx, answers_rx) = mpsc::unbounded_channel();
+            let bridge = tokio::spawn(client_request_bridge(
+                bridge_stream,
+                scripted_rx,
+                answers_tx,
+            ));
+            let (client_read, client_write) = tokio::io::split(client_stream);
+            let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
+
+            let (request_tx, request_rx) = mpsc::channel(4);
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            // Drain events so a full channel can never be mistaken for silence,
+            // and keep them so a test can read what the runtime reported.
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let recorder = observed.clone();
+            let events = tokio::spawn(async move {
+                while let Some(event) = event_rx.recv().await {
+                    recorder
+                        .lock()
+                        .expect("observed events lock poisoned")
+                        .push(event);
+                }
+            });
+            let spec = LaunchSpec {
+                command: "scripted".into(),
+                args: Vec::new(),
+                environment: BTreeMap::new(),
+                cwd: std::env::current_dir().unwrap(),
+                additional_directories: Vec::new(),
+                resume_session: None,
+                harness: HarnessKind::Kimi,
+                force_unrestricted_mode: false,
+            };
+            let driver = tokio::spawn(drive(transport, spec, request_rx, event_tx));
+            ScriptedRuntime {
+                agent: ScriptedAgent {
+                    scripted: scripted_tx,
+                    answers: answers_rx,
+                    received: BTreeMap::new(),
+                    sent: 0,
+                },
+                observed,
+                requests: request_tx,
+                driver,
+                bridge,
+                events,
+            }
+        }
+
+        fn terminal_params(terminal_id: &str) -> serde_json::Value {
+            serde_json::json!({"sessionId": "scripted", "terminalId": terminal_id})
+        }
+
+        /// Every close report a terminal made. Waits for the first, then keeps
+        /// watching: a second report would arrive right behind it.
+        async fn terminal_close_reports(
+            observed: &Arc<Mutex<Vec<RuntimeEvent>>>,
+            terminal_id: &str,
+        ) -> Vec<RuntimeEvent> {
+            let reports = || {
+                observed
+                    .lock()
+                    .expect("observed events lock poisoned")
+                    .iter()
+                    .filter(|event| {
+                        matches!(event, RuntimeEvent::TerminalClosed { terminal_id: id, .. }
+                            if id == terminal_id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            for _ in 0..100 {
+                if !reports().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            reports()
+        }
+
+        async fn create_terminal(agent: &mut ScriptedAgent, params: serde_json::Value) -> String {
+            let created = agent.call("terminal/create", params).await;
+            assert!(
+                created.get("result").is_some(),
+                "terminal/create must be answered with a result, not the catch-all's \
+                 method-not-found error: {created}"
+            );
+            created["result"]["terminalId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("terminal/create must return a terminal id: {created}"))
+                .to_owned()
+        }
+
+        #[tokio::test]
+        async fn terminal_create_output_wait_and_release_round_trip() {
+            let mut runtime = start_scripted_runtime();
+            let terminal_id = create_terminal(
+                &mut runtime.agent,
+                serde_json::json!({
+                    "sessionId": "scripted",
+                    "command": "/bin/sh",
+                    // `PATH` proves the daemon environment is inherited rather
+                    // than replaced by the agent's additions.
+                    "args": ["-c", "printf 'ran %s %s' \"$HEL_TERMINAL_TEST\" \"${PATH:+inherited}\""],
+                    "env": [{"name": "HEL_TERMINAL_TEST", "value": "overlaid"}],
+                }),
+            )
+            .await;
+
+            let exited = runtime
+                .agent
+                .call("terminal/wait_for_exit", terminal_params(&terminal_id))
+                .await;
+            assert_eq!(exited["result"]["exitCode"], 0, "{exited}");
+
+            let output = runtime
+                .agent
+                .call("terminal/output", terminal_params(&terminal_id))
+                .await;
+            assert_eq!(output["result"]["output"], "ran overlaid inherited");
+            assert_eq!(output["result"]["truncated"], false);
+            assert_eq!(output["result"]["exitStatus"]["exitCode"], 0);
+
+            let released = runtime
+                .agent
+                .call("terminal/release", terminal_params(&terminal_id))
+                .await;
+            assert!(released.get("result").is_some(), "{released}");
+
+            // A released terminal is gone, and Hel says so rather than hanging.
+            let stale = runtime
+                .agent
+                .call("terminal/output", terminal_params(&terminal_id))
+                .await;
+            assert_eq!(stale["error"]["code"], -32602, "{stale}");
+            assert!(
+                stale["error"]["data"]
+                    .as_str()
+                    .is_some_and(|data| data.contains(&terminal_id)),
+                "the error must name the terminal: {stale}"
+            );
+
+            runtime.stop().await;
+        }
+
+        #[tokio::test]
+        async fn terminal_output_keeps_the_last_bytes_when_a_child_exceeds_the_limit() {
+            let mut runtime = start_scripted_runtime();
+            // 512 KiB is far past the 64 KiB pipe buffer: a supervisor that did
+            // not drain the pipes while the child ran would block it forever,
+            // and the answer timeouts would report that as a failure.
+            let script = "data=0123456789abcdef; \
+                          while [ ${#data} -lt 524288 ]; do data=\"$data$data\"; done; \
+                          printf '%s' \"$data\"; printf 'TAIL-MARKER'";
+            let limit = 8 * 1024;
+            let terminal_id = create_terminal(
+                &mut runtime.agent,
+                serde_json::json!({
+                    "sessionId": "scripted",
+                    "command": "/bin/sh",
+                    "args": ["-c", script],
+                    "outputByteLimit": limit,
+                }),
+            )
+            .await;
+
+            let exited = runtime
+                .agent
+                .call("terminal/wait_for_exit", terminal_params(&terminal_id))
+                .await;
+            assert_eq!(exited["result"]["exitCode"], 0, "{exited}");
+
+            let output = runtime
+                .agent
+                .call("terminal/output", terminal_params(&terminal_id))
+                .await;
+            let text = output["result"]["output"]
+                .as_str()
+                .unwrap_or_else(|| panic!("terminal/output must serve text: {output}"));
+            assert!(
+                text.len() <= limit,
+                "served {} bytes for a {limit} byte limit",
+                text.len()
+            );
+            assert!(
+                text.ends_with("TAIL-MARKER"),
+                "the retained output must be the tail, ended with {:?}",
+                &text[text.len().saturating_sub(32)..]
+            );
+            assert_eq!(output["result"]["truncated"], true, "{output}");
+
+            runtime.stop().await;
+        }
+
+        #[tokio::test]
+        async fn terminal_kill_reports_the_signal_and_keeps_output_readable() {
+            let mut runtime = start_scripted_runtime();
+            let terminal_id = create_terminal(
+                &mut runtime.agent,
+                serde_json::json!({
+                    "sessionId": "scripted",
+                    "command": "/bin/sh",
+                    "args": ["-c", "printf running; sleep 300"],
+                }),
+            )
+            .await;
+
+            // The wait stays outstanding while the terminal runs: an inline
+            // wait would stall the dispatch loop and nothing below could be
+            // answered.
+            let waiting = runtime
+                .agent
+                .send("terminal/wait_for_exit", terminal_params(&terminal_id));
+            let mut running = String::new();
+            for _ in 0..100 {
+                let polled = runtime
+                    .agent
+                    .call("terminal/output", terminal_params(&terminal_id))
+                    .await;
+                running = polled["result"]["output"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                if running == "running" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(running, "running", "a live terminal must serve its output");
+
+            let killed = runtime
+                .agent
+                .call("terminal/kill", terminal_params(&terminal_id))
+                .await;
+            assert!(killed.get("result").is_some(), "{killed}");
+
+            let exited = runtime.agent.answer(&waiting).await;
+            assert_eq!(exited["result"]["signal"], "SIGKILL", "{exited}");
+            assert!(
+                exited["result"].get("exitCode").is_none(),
+                "a killed terminal has no exit code: {exited}"
+            );
+
+            // A kill does not release the terminal.
+            let after = runtime
+                .agent
+                .call("terminal/output", terminal_params(&terminal_id))
+                .await;
+            assert_eq!(after["result"]["output"], "running");
+            assert_eq!(after["result"]["exitStatus"]["signal"], "SIGKILL");
+
+            let released = runtime
+                .agent
+                .call("terminal/release", terminal_params(&terminal_id))
+                .await;
+            assert!(released.get("result").is_some(), "{released}");
+
+            // The transcript gets one report per terminal, from whichever of
+            // kill, release, or teardown reaped the child.
+            let observed = runtime.observed.clone();
+            runtime.stop().await;
+            let reports = terminal_close_reports(&observed, &terminal_id).await;
+            assert_eq!(
+                reports.len(),
+                1,
+                "a killed and released terminal must report its close once: {reports:?}"
+            );
+            let RuntimeEvent::TerminalClosed { output, signal, .. } = &reports[0] else {
+                panic!("expected a terminal close report: {reports:?}");
+            };
+            assert_eq!(output, "running");
+            assert_eq!(signal.as_deref(), Some("SIGKILL"));
+        }
+
+        #[tokio::test]
+        async fn terminal_create_accepts_a_grok_style_single_string_command() {
+            let mut runtime = start_scripted_runtime();
+            // Grok Build puts the whole shell line in `command` and sends no
+            // arguments at all.
+            let terminal_id = create_terminal(
+                &mut runtime.agent,
+                serde_json::json!({
+                    "sessionId": "scripted",
+                    "command": "/bin/sh -c 'printf grok-ok'",
+                    "args": [],
+                }),
+            )
+            .await;
+
+            let exited = runtime
+                .agent
+                .call("terminal/wait_for_exit", terminal_params(&terminal_id))
+                .await;
+            assert_eq!(exited["result"]["exitCode"], 0, "{exited}");
+
+            let output = runtime
+                .agent
+                .call("terminal/output", terminal_params(&terminal_id))
+                .await;
+            assert_eq!(output["result"]["output"], "grok-ok", "{output}");
+
+            runtime.stop().await;
+        }
+
+        /// A process still visible but already dead — a zombie waiting for its
+        /// parent — counts as gone; the parent died with it.
+        fn process_is_gone(pid: i32) -> bool {
+            // SAFETY: signal 0 only probes whether the process exists.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit(')')
+                        .next()
+                        .map(|rest| rest.trim_start().starts_with('Z'))
+                })
+                .unwrap_or(false)
+        }
+
+        /// A shell that keeps a grandchild alive and publishes both pids, so a
+        /// test can prove a kill reached the whole process group rather than
+        /// only the shell Hel spawned.
+        async fn start_terminal_with_a_grandchild(
+            runtime: &mut ScriptedRuntime,
+            pids_path: &std::path::Path,
+        ) -> Vec<i32> {
+            let script = format!(
+                "sleep 300 & printf '%s %s' \"$$\" \"$!\" > '{}'; wait",
+                pids_path.display()
+            );
+            create_terminal(
+                &mut runtime.agent,
+                serde_json::json!({
+                    "sessionId": "scripted",
+                    "command": "/bin/sh",
+                    "args": ["-c", script],
+                }),
+            )
+            .await;
+
+            let mut pids = Vec::new();
+            for _ in 0..250 {
+                if let Ok(recorded) = std::fs::read_to_string(pids_path) {
+                    pids = recorded
+                        .split_whitespace()
+                        .filter_map(|pid| pid.parse::<i32>().ok())
+                        .collect();
+                    if pids.len() == 2 {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(pids.len(), 2, "the terminal must report both of its pids");
+            pids
+        }
+
+        async fn assert_processes_are_gone(pids: &[i32]) {
+            for pid in pids {
+                let mut gone = false;
+                for _ in 0..250 {
+                    if process_is_gone(*pid) {
+                        gone = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                assert!(gone, "process {pid} survived the runtime that started it");
+            }
+        }
+
+        #[tokio::test]
+        async fn runtime_teardown_kills_terminal_process_groups() {
+            let temp = tempfile::tempdir().unwrap();
+            let pids_path = temp.path().join("pids");
+            let mut runtime = start_scripted_runtime();
+            // Nothing killed or released this terminal: teardown owns it.
+            let pids = start_terminal_with_a_grandchild(&mut runtime, &pids_path).await;
+
+            runtime.stop().await;
+
+            assert_processes_are_gone(&pids).await;
+        }
+
+        #[tokio::test]
+        async fn dropping_the_connection_kills_terminal_process_groups() {
+            let temp = tempfile::tempdir().unwrap();
+            let pids_path = temp.path().join("pids");
+            let mut runtime = start_scripted_runtime();
+            let pids = start_terminal_with_a_grandchild(&mut runtime, &pids_path).await;
+
+            // A bridge that dies mid-session leaves the runtime dropping the
+            // whole connection rather than ending its command loop, so orderly
+            // teardown never runs and the terminals still must not survive.
+            runtime.driver.abort();
+
+            assert_processes_are_gone(&pids).await;
+            runtime.bridge.abort();
+            runtime.events.abort();
+        }
     }
 
     #[cfg(unix)]
