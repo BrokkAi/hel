@@ -1993,6 +1993,8 @@ mod tests {
                         "title": "Run dashboard tests",
                         "status": "completed"
                     }),
+                    terminal_outputs: Vec::new(),
+                    terminal_refs: Vec::new(),
                 },
             ),
         ];

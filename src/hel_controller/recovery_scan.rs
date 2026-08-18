@@ -140,7 +140,9 @@ impl Controller {
         self.state
             .sessions
             .insert(session_id.to_owned(), record.clone());
-        self.persist_session_state(session_id)?;
+        // Adoption authors the whole record for a session Hel has never
+        // tracked, so it writes the whole row.
+        crate::hel_database::save_session(&record)?;
         let mut relay = StandaloneSession::connect_command(&spec, session_id)
             .await
             .context("orphan relay did not complete the v1 handshake")?;

@@ -35,6 +35,25 @@ pub enum TranscriptBody {
         /// Complete current ACP `ToolCall`, updated field-for-field as
         /// `ToolCallUpdate` notifications arrive.
         call: serde_json::Value,
+        /// Output of the terminals this call's content refers to. It is a
+        /// sibling of `call` rather than part of it because `ToolCall::update`
+        /// replaces `content` wholesale, which would discard anything injected
+        /// into the stored ACP value.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        terminal_outputs: Vec<TerminalOutputRecord>,
+        /// Every terminal this call has ever referred to. Agents that replace
+        /// `content` wholesale can drop a terminal reference before the
+        /// terminal is reaped, so the current call is not enough to decide
+        /// where a terminal's output belongs.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        terminal_refs: Vec<String>,
+    },
+    /// Terminal output that no tool call refers to yet. It becomes a
+    /// `Tool` item's `terminal_outputs` entry as soon as a call naming the
+    /// terminal arrives, and stays here permanently otherwise so output is
+    /// never dropped.
+    TerminalOutput {
+        record: TerminalOutputRecord,
     },
     Plan {
         /// Complete current ACP `Plan`, including entry priorities and all
@@ -44,6 +63,31 @@ pub enum TranscriptBody {
     System {
         text: String,
     },
+}
+
+/// What one client-run terminal produced, as hel recorded it when the child
+/// was reaped. `exit_code` and `signal` mirror ACP `TerminalExitStatus`; both
+/// are `None` when the terminal was released before a status was observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalOutputRecord {
+    pub terminal_id: String,
+    pub output: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+}
+
+impl TerminalOutputRecord {
+    /// Whether the command ended the way a caller asked for: exit status zero
+    /// and no signal. Anything else — a nonzero exit, a signal, or no status at
+    /// all because the terminal was released before one was observed — is
+    /// abnormal, and stays visible in every render mode.
+    pub(crate) fn exited_cleanly(&self) -> bool {
+        self.exit_code == Some(0) && self.signal.is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -150,6 +194,11 @@ pub struct ChatEntry {
     pub(crate) plan: Vec<PlanLine>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) leading_omitted: bool,
+    /// Detail the decluttered feed leaves out: the entry renders only in the
+    /// raw transcript mode. Set once, when the entry is built, because Ctrl-T
+    /// switches render mode without rebuilding entries.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) raw_only: bool,
     /// The materialized transcript item this entry was derived from, when it
     /// came from the controller's projection. Provenance only, so it is
     /// neither serialized nor part of the entry's value.
@@ -199,6 +248,7 @@ impl ChatEntry {
             tool_locations: Vec::new(),
             plan,
             leading_omitted: false,
+            raw_only: false,
             source: TranscriptSource::default(),
         }
     }

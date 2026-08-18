@@ -291,6 +291,16 @@ pub enum RelayObservation {
     Warning {
         message: String,
     },
+    /// What a client-run terminal produced, journaled once when its child was
+    /// reaped. The agent already read the full output over `terminal/output`;
+    /// this copy is tail-capped for the person reading the transcript.
+    TerminalOutput {
+        terminal_id: String,
+        output: String,
+        truncated: bool,
+        exit_code: Option<u32>,
+        signal: Option<String>,
+    },
     /// A controller-authored conversation line. Unlike a warning it reports
     /// something Hel did on purpose, so it reaches the transcript unadorned.
     Notice {
@@ -540,6 +550,26 @@ fn truncate_with_marker(text: &mut String, keep: usize) {
     let dropped = text.len() - end;
     text.truncate(end);
     text.push_str(&format!("… [hel truncated {dropped} bytes]"));
+}
+
+/// Keep at most the last `keep` bytes of `text` and describe what was dropped.
+/// The kept part starts on a character boundary, so the result stays valid
+/// UTF-8. Returns whether anything was dropped.
+///
+/// This is the mirror of [`truncate_with_marker`] for output whose end is the
+/// interesting part, such as a terminal's tail.
+pub(crate) fn truncate_start_with_marker(text: &mut String, keep: usize) -> bool {
+    if text.len() <= keep {
+        return false;
+    }
+    let mut start = text.len() - keep;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let dropped = start;
+    text.drain(..start);
+    text.insert_str(0, &format!("[hel dropped {dropped} earlier bytes]\n"));
+    true
 }
 
 /// Fit an observation inside `budget` serialized bytes by shortening its
@@ -1040,6 +1070,7 @@ pub(crate) fn apply_relay_event(snapshot: &mut RelaySnapshot, event: &RelayEvent
         },
         RelayObservation::PermissionAutoApproved { .. }
         | RelayObservation::Warning { .. }
+        | RelayObservation::TerminalOutput { .. }
         | RelayObservation::Notice { .. } => {}
     }
     snapshot.latest_ordinal = event.ordinal;

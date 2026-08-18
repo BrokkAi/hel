@@ -17,7 +17,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 
-use crate::hel_state::{MaterializedSession, TranscriptBody, TranscriptItem};
+use crate::hel_state::{MaterializedSession, TerminalOutputRecord, TranscriptBody, TranscriptItem};
 use crate::hel_transcript::{
     ChatEntry, ChatRole, PlanLine, PlanStatus, ToolStatus, TranscriptSource,
 };
@@ -39,16 +39,18 @@ pub(super) struct TranscriptRenderCache {
     width: u16,
     mode: TranscriptRenderMode,
     entries: Vec<Option<CachedEntry>>,
-    collapse: Vec<ToolCollapse>,
+    collapse: Vec<EntryCollapse>,
 }
 
-/// Whether an entry renders on its own, heads a collapsed run of completed
-/// tools, or is folded into the run above it.
+/// Whether an entry renders on its own, renders nothing, or heads a collapsed
+/// run of completed tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolCollapse {
+enum EntryCollapse {
     None,
     /// Member of a collapsed run whose summary renders on the run head.
     Hidden,
+    /// Detail the decluttered feed leaves out.
+    Omitted,
     /// Head of a collapsed run spanning `self..end` (end exclusive).
     Summary {
         end: usize,
@@ -159,6 +161,9 @@ impl TranscriptSnapshot {
             .entries
             .iter()
             .filter(|entry| entry.start_seq > self.last_compaction_seq)
+            // The remote viewer mirrors the Rich feed, so detail Rich leaves
+            // out never reaches it.
+            .filter(|entry| !entry.raw_only)
             .map(browser_entry)
             .collect::<Vec<_>>();
         let mut remaining = BROWSER_TRANSCRIPT_LINES;
@@ -302,7 +307,10 @@ fn entry_matches_transcript_item(entry: &ChatEntry, item: &TranscriptItem) -> bo
                 | (ChatRole::Thought, TranscriptBody::Thought { .. })
                 | (ChatRole::Tool, TranscriptBody::Tool { .. })
                 | (ChatRole::Plan, TranscriptBody::Plan { .. })
-                | (ChatRole::System, TranscriptBody::System { .. })
+                | (
+                    ChatRole::System,
+                    TranscriptBody::System { .. } | TranscriptBody::TerminalOutput { .. }
+                )
         )
         && match &item.body {
             TranscriptBody::Agent { .. } | TranscriptBody::Thought { .. } => {
@@ -332,7 +340,11 @@ fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEnt
             ChatRole::Thought,
             materialized_chunks_text(chunks),
         ),
-        TranscriptBody::Tool { call } => {
+        TranscriptBody::Tool {
+            call,
+            terminal_outputs,
+            ..
+        } => {
             let call = ToolCall::deserialize(call).ok();
             let mut entry = ChatEntry::tool(
                 item.position,
@@ -343,10 +355,24 @@ fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEnt
                     .map_or(ToolStatus::Pending, |call| tool_status(&call.status)),
             );
             if let Some(call) = call {
-                entry.tool_content = tool_content_details(&call.content);
+                entry.tool_content =
+                    tool_content_details(&call.content, terminal_outputs, call.raw_output.as_ref());
                 entry.tool_diffstats = tool_diffstats(&call.content);
                 entry.tool_locations = tool_location_details(&call.locations);
             }
+            entry
+        }
+        TranscriptBody::TerminalOutput { record } => {
+            let mut entry = ChatEntry::plain(
+                item.position,
+                ChatRole::System,
+                sanitize_terminal_text(&terminal_output_detail(record)),
+            );
+            // Output no tool call refers to is a whole block per command. A
+            // command that ended cleanly says nothing the decluttered feed
+            // needs, so only the raw transcript carries it; anything abnormal
+            // stays visible everywhere.
+            entry.raw_only = record.exited_cleanly();
             entry
         }
         TranscriptBody::Plan { plan } => ChatEntry::plan(
@@ -436,9 +462,10 @@ fn browser_entry(entry: &ChatEntry) -> BrowserTranscriptEntry {
             })
             .collect::<Vec<_>>()
     } else if entry.role == ChatRole::Tool {
+        // The remote viewer mirrors the TUI's Rich feed: the tool title plus
+        // any diffstat, not the full Raw detail.
         std::iter::once(entry.text.clone())
-            .chain(entry.tool_content.clone())
-            .chain(entry.tool_locations.clone())
+            .chain(entry.tool_diffstats.clone())
             .collect()
     } else {
         entry.text.lines().map(str::to_owned).collect()
@@ -502,7 +529,7 @@ fn prepare_render_cache(
         cache.entries.clear();
     }
     cache.entries.resize(entries.len(), None);
-    let collapse = tool_collapse_states(entries, mode);
+    let collapse = entry_collapse_states(entries, mode);
     for (index, state) in collapse.iter().enumerate() {
         if cache.collapse.get(index) != Some(state) {
             cache.entries[index] = None;
@@ -525,15 +552,23 @@ fn protected_tool_index(entries: &[ChatEntry]) -> Option<usize> {
         .filter(|&index| is_completed_tool(&entries[index]))
 }
 
-/// Collapse state per entry. In rich mode a maximal run of two or more
-/// consecutive completed tools renders as one summary cell; every other entry,
-/// including a pending, running, or failed tool, breaks the run. The protected
-/// newest result breaks runs too and never joins one. Raw mode never collapses
-/// so the full commands stay inspectable.
-fn tool_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> Vec<ToolCollapse> {
-    let mut states = vec![ToolCollapse::None; entries.len()];
+/// What every entry renders as, which is the one place the decluttered feed is
+/// decided. In rich mode a maximal run of two or more consecutive completed
+/// tools renders as one summary cell; every other entry, including a pending,
+/// running, or failed tool, breaks the run. The protected newest result breaks
+/// runs too and never joins one. A `raw_only` entry renders nothing at all and
+/// is transparent to a run rather than breaking it, since nothing of it is on
+/// screen to separate the tools around it. Raw mode neither collapses nor
+/// omits, so the full commands stay inspectable.
+fn entry_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> Vec<EntryCollapse> {
+    let mut states = vec![EntryCollapse::None; entries.len()];
     if mode != TranscriptRenderMode::Rich {
         return states;
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.raw_only {
+            states[index] = EntryCollapse::Omitted;
+        }
     }
     let protected = protected_tool_index(entries);
     let collapsible = |index: usize| is_completed_tool(&entries[index]) && Some(index) != protected;
@@ -543,19 +578,33 @@ fn tool_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> Ve
             start += 1;
             continue;
         }
+        // `end` stops at the last collapsible member, so an omitted entry the
+        // run reached across is only inside the run when a tool follows it.
         let mut end = start + 1;
-        while end < entries.len() && collapsible(end) {
-            end += 1;
+        let mut members = 1;
+        let mut cursor = start + 1;
+        while cursor < entries.len() {
+            if collapsible(cursor) {
+                members += 1;
+                cursor += 1;
+                end = cursor;
+            } else if entries[cursor].raw_only {
+                cursor += 1;
+            } else {
+                break;
+            }
         }
-        if end - start > 1 {
+        if members > 1 {
             // A member's update does not bump the head's revision, so fold the
             // members' revisions into the head's state: the summary's cached
             // rows then drop whenever any member changes.
             let fingerprint = entries[start..end].iter().fold(0u64, |accumulated, entry| {
                 accumulated.wrapping_mul(31).wrapping_add(entry.revision)
             });
-            states[start] = ToolCollapse::Summary { end, fingerprint };
-            states[start + 1..end].fill(ToolCollapse::Hidden);
+            states[start] = EntryCollapse::Summary { end, fingerprint };
+            // Omitted members render nothing either way, so one state covers
+            // everything the head speaks for.
+            states[start + 1..end].fill(EntryCollapse::Hidden);
         }
         start = end;
     }
@@ -563,10 +612,12 @@ fn tool_collapse_states(entries: &[ChatEntry], mode: TranscriptRenderMode) -> Ve
 }
 
 /// The single cell that stands in for a run of completed tools: the first word
-/// of each member's title, in order.
+/// of each member's title, in order. Entries the run reached across contribute
+/// no title, having no row of their own to stand in for.
 fn collapsed_tool_entry(members: &[ChatEntry]) -> ChatEntry {
     let titles = members
         .iter()
+        .filter(|member| is_completed_tool(member))
         .map(|member| member.text.split_whitespace().next().unwrap_or("tool"))
         .collect::<Vec<_>>()
         .join(", ");
@@ -587,9 +638,9 @@ fn cached_entry_lines<'cache>(
     if stale {
         let width = usize::from(cache.width);
         let lines = match cache.collapse[index] {
-            ToolCollapse::None => render_transcript_entry(entry, width, cache.mode),
-            ToolCollapse::Hidden => Vec::new(),
-            ToolCollapse::Summary { end, .. } => {
+            EntryCollapse::None => render_transcript_entry(entry, width, cache.mode),
+            EntryCollapse::Hidden | EntryCollapse::Omitted => Vec::new(),
+            EntryCollapse::Summary { end, .. } => {
                 let summary = collapsed_tool_entry(&entries[index..end]);
                 render_transcript_entry(&summary, width, cache.mode)
             }
@@ -875,14 +926,31 @@ pub(super) fn content_block_text(content: &ContentBlock) -> Option<String> {
     }
 }
 
-pub(super) fn tool_content_details(content: &[ToolCallContent]) -> Vec<String> {
+pub(super) fn tool_content_details(
+    content: &[ToolCallContent],
+    terminal_outputs: &[TerminalOutputRecord],
+    raw_output: Option<&serde_json::Value>,
+) -> Vec<String> {
     let mut details = Vec::new();
+    let mut referenced: Vec<&str> = Vec::new();
     for item in content {
         let detail = match item {
             ToolCallContent::Content(content) => content_block_text(&content.content),
             ToolCallContent::Diff(diff) => Some(format_diffstat(diff)),
+            // Kimi-style agents send a terminal reference and no textual copy
+            // of the output, so the record hel captured is the only thing a
+            // reader ever sees. Until the terminal is reaped there is none.
             ToolCallContent::Terminal(terminal) => {
-                Some(format!("terminal {}", terminal.terminal_id))
+                let terminal_id = terminal.terminal_id.0.as_ref();
+                referenced.push(terminal_id);
+                Some(
+                    terminal_outputs
+                        .iter()
+                        .find(|record| record.terminal_id.as_str() == terminal_id)
+                        .map(terminal_output_detail)
+                        .or_else(|| raw_output.and_then(raw_output_terminal_detail))
+                        .unwrap_or_else(|| format!("terminal {}", terminal.terminal_id)),
+                )
             }
             _ => None,
         };
@@ -890,7 +958,57 @@ pub(super) fn tool_content_details(content: &[ToolCallContent]) -> Vec<String> {
             details.push(sanitize_terminal_text(&detail));
         }
     }
+    // Grok-style agents name the terminal on a mid-flight update and then
+    // replace `content` wholesale without it, so the output hel captured has
+    // nothing in the final call pointing at it. Show it rather than lose it.
+    for record in terminal_outputs {
+        if referenced.contains(&record.terminal_id.as_str()) {
+            continue;
+        }
+        details.push(sanitize_terminal_text(&terminal_output_detail(record)));
+    }
     details
+}
+
+/// The output codex reports for a terminal it ran itself. Codex names its own
+/// server-side terminal, which hel never opened and has no record for, and
+/// puts the text in `rawOutput`; reading it here keeps such a call from
+/// rendering as a bare terminal id.
+fn raw_output_terminal_detail(raw_output: &serde_json::Value) -> Option<String> {
+    let output = raw_output.get("formatted_output")?.as_str()?;
+    let Some(exit_code) = raw_output
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+    else {
+        return Some(output.to_owned());
+    };
+    let summary = format!("exited {exit_code}");
+    if output.is_empty() {
+        return Some(summary);
+    }
+    Some(format!("{output}\n{summary}"))
+}
+
+/// One terminal's output followed by how it ended.
+fn terminal_output_detail(record: &TerminalOutputRecord) -> String {
+    let summary = terminal_exit_summary(record);
+    if record.output.is_empty() {
+        return summary;
+    }
+    format!("{}\n{summary}", record.output)
+}
+
+/// How a terminal ended, in one line.
+fn terminal_exit_summary(record: &TerminalOutputRecord) -> String {
+    let mut summary = match (record.exit_code, &record.signal) {
+        (_, Some(signal)) => format!("killed by {signal}"),
+        (Some(code), None) => format!("exited {code}"),
+        (None, None) => "released before exit".to_owned(),
+    };
+    if record.truncated {
+        summary.push_str(" · output truncated");
+    }
+    summary
 }
 
 pub(super) fn tool_diffstats(content: &[ToolCallContent]) -> Vec<String> {
@@ -1258,8 +1376,8 @@ mod tests {
     use super::*;
     use crate::hel_acp::RuntimeEvent;
     use crate::hel_chat::test_support::{
-        agent_transcript_item, drawn_transcript, key, line_text, mouse_in, queued, snapshot,
-        transcript_text,
+        agent_message_item, agent_transcript_item, drawn_transcript, key, line_text, mouse_in,
+        queued, snapshot, transcript_text,
     };
     use crate::hel_worker::{SequencedEvent, WorkerEvent};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -1375,6 +1493,8 @@ mod tests {
                     }],
                     "locations": [{"path": format!("src/file-{position}.rs"), "line": 3}]
                 }),
+                terminal_outputs: Vec::new(),
+                terminal_refs: Vec::new(),
             },
         )
     }
@@ -2393,6 +2513,8 @@ mod tests {
                         "content": tool_content,
                         "locations": locations
                     }),
+                    terminal_outputs: Vec::new(),
+                    terminal_refs: Vec::new(),
                 },
             }),
             Arc::new(TranscriptItem {
@@ -2413,24 +2535,390 @@ mod tests {
         assert_eq!(entries[1].plan.len(), 12);
 
         let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
-        assert!(
-            browser.entries[0]
-                .lines
-                .iter()
-                .any(|line| line == "result-11")
-        );
-        assert!(
-            browser.entries[0]
-                .lines
-                .iter()
-                .any(|line| line == "src/file-11.rs:12")
-        );
+        // The remote viewer mirrors the TUI's Rich feed, so a tool entry is its
+        // title alone: neither the content details nor the locations belong
+        // there, however many the projection kept for Raw mode.
+        assert_eq!(browser.entries[0].lines, ["inspect"]);
         assert!(
             browser.entries[1]
                 .lines
                 .iter()
                 .any(|line| line == "○ step-11")
         );
+    }
+
+    #[test]
+    fn materialized_terminal_content_renders_output_and_exit_summary() {
+        let mut session = MaterializedSession::empty("session-terminal");
+        session.applied_event_ordinal = 1;
+        session.applied_event_digest = "a".repeat(64);
+        session.transcript = vec![Arc::new(TranscriptItem {
+            stable_id: "tool:bash".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 1,
+            last_changed_at_ms: 1,
+            body: TranscriptBody::Tool {
+                call: serde_json::json!({
+                    "toolCallId": "bash",
+                    "title": "Bash",
+                    "status": "completed",
+                    "content": [{"type": "terminal", "terminalId": "term-1"}]
+                }),
+                terminal_outputs: vec![TerminalOutputRecord {
+                    terminal_id: "term-1".into(),
+                    // Colored output from a real build tool: the escape must
+                    // not survive into the terminal hel is drawing on.
+                    output: "\u{1b}[32mtests passed\u{1b}[0m".into(),
+                    truncated: false,
+                    exit_code: Some(0),
+                    signal: None,
+                }],
+                terminal_refs: vec!["term-1".into()],
+            },
+        })];
+
+        let entries = materialized_chat_entries(&session);
+        assert_eq!(entries[0].tool_content, ["tests passed\nexited 0"]);
+
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+        chat.render_mode = TranscriptRenderMode::Raw;
+        let rendered = transcript_text(&mut chat, 80);
+        assert!(
+            rendered.iter().any(|line| line.contains("tests passed")),
+            "raw rows show the captured output: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("exited 0")),
+            "raw rows show how the terminal ended: {rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains("terminal term-1")),
+            "the id placeholder is replaced once output exists: {rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains('\u{1b}')),
+            "escape sequences are sanitized out: {rendered:?}"
+        );
+
+        let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
+        assert_eq!(
+            browser.entries[0].lines,
+            ["Bash"],
+            "the remote viewer shows the decluttered title, not the output"
+        );
+    }
+
+    const STANDALONE_OUTPUT: &str = "cargo build finished";
+
+    fn terminal_record(exit_code: Option<u32>, signal: Option<&str>) -> TerminalOutputRecord {
+        TerminalOutputRecord {
+            terminal_id: "term-1".into(),
+            output: STANDALONE_OUTPUT.into(),
+            truncated: false,
+            exit_code,
+            signal: signal.map(str::to_owned),
+        }
+    }
+
+    fn terminal_output_item(position: u64, record: TerminalOutputRecord) -> Arc<TranscriptItem> {
+        Arc::new(TranscriptItem {
+            stable_id: format!("terminal:{}", record.terminal_id),
+            position,
+            latest_content_event_ordinal: None,
+            created_at_ms: position as i64,
+            last_changed_at_ms: position as i64,
+            body: TranscriptBody::TerminalOutput { record },
+        })
+    }
+
+    /// A hel-hosted command whose output no tool call refers to, after an agent
+    /// message so the feed has something else to show.
+    fn standalone_terminal_session(record: TerminalOutputRecord) -> MaterializedSession {
+        let mut session = MaterializedSession::empty("session-standalone-terminal");
+        session.applied_event_ordinal = 2;
+        session.transcript = vec![
+            agent_message_item("agent:1", 1, "running the build"),
+            terminal_output_item(2, record),
+        ];
+        session
+    }
+
+    fn browser_lines(session: &MaterializedSession) -> Vec<String> {
+        TranscriptSnapshot::from_materialized(session)
+            .browser_transcript(None)
+            .entries
+            .into_iter()
+            .flat_map(|entry| entry.lines)
+            .collect()
+    }
+
+    #[test]
+    fn a_cleanly_exited_standalone_terminal_item_renders_only_in_raw_mode() {
+        let session = standalone_terminal_session(terminal_record(Some(0), None));
+
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+        let rich = transcript_text(&mut chat, 80);
+        assert!(
+            rich.iter().any(|line| line.contains("running the build")),
+            "the rest of the conversation still renders: {rich:?}"
+        );
+        assert!(
+            !rich.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
+            "a clean command's output is left out of the rich feed: {rich:?}"
+        );
+        assert!(
+            !rich.iter().any(|line| line.contains("exited 0")),
+            "and so is its exit summary: {rich:?}"
+        );
+
+        let browser = browser_lines(&session);
+        assert!(
+            browser
+                .iter()
+                .any(|line| line.contains("running the build")),
+            "the rest of the conversation still reaches the remote viewer: {browser:?}"
+        );
+        assert!(
+            !browser.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
+            "the remote viewer mirrors the rich feed: {browser:?}"
+        );
+
+        chat.render_mode = TranscriptRenderMode::Raw;
+        let raw = transcript_text(&mut chat, 80);
+        assert!(
+            raw.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
+            "raw rows keep the captured output: {raw:?}"
+        );
+        assert!(
+            raw.iter().any(|line| line.contains("exited 0")),
+            "raw rows keep how the terminal ended: {raw:?}"
+        );
+    }
+
+    #[test]
+    fn an_abnormally_ended_standalone_terminal_item_renders_everywhere() {
+        for (record, summary) in [
+            (terminal_record(Some(3), None), "exited 3"),
+            (terminal_record(None, Some("SIGKILL")), "killed by SIGKILL"),
+            (
+                terminal_record(Some(0), Some("SIGKILL")),
+                "killed by SIGKILL",
+            ),
+            (terminal_record(None, None), "released before exit"),
+        ] {
+            let session = standalone_terminal_session(record);
+
+            let mut chat = ChatState::from_materialized(&session, &[], &[]);
+            let rich = transcript_text(&mut chat, 80);
+            assert!(
+                rich.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
+                "{summary}: the rich feed keeps the output: {rich:?}"
+            );
+            assert!(
+                rich.iter().any(|line| line.contains(summary)),
+                "{summary}: the rich feed says how it ended: {rich:?}"
+            );
+
+            let browser = browser_lines(&session);
+            assert!(
+                browser.iter().any(|line| line.contains(STANDALONE_OUTPUT)),
+                "{summary}: the remote viewer keeps the output: {browser:?}"
+            );
+            assert!(
+                browser.iter().any(|line| line.contains(summary)),
+                "{summary}: the remote viewer says how it ended: {browser:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clean_standalone_terminal_item_between_completed_tools_keeps_one_run() {
+        let mut session = MaterializedSession::empty("session-terminal-between-tools");
+        session.applied_event_ordinal = 3;
+        session.transcript = vec![
+            fixture_tool_item(1),
+            terminal_output_item(2, terminal_record(Some(0), None)),
+            fixture_tool_item(3),
+        ];
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+        // Ends the newest result's protection, so both tools can collapse.
+        chat.entries
+            .push(ChatEntry::plain(4, ChatRole::User, "now ship it"));
+
+        let text = transcript_text(&mut chat, 80);
+
+        assert_eq!(
+            text,
+            [
+                "✓ Tool · done",
+                "│ read, read",
+                "",
+                "❯ You",
+                "│ now ship it",
+                "",
+            ],
+            "the omitted entry neither renders nor splits the run"
+        );
+    }
+
+    /// Grok Build's final update replaces `content` with plain text, so the
+    /// output hel captured is attached to the item with nothing in the call
+    /// pointing at it. It is still the only copy of what the command printed.
+    #[test]
+    fn attached_terminal_output_renders_when_the_call_no_longer_refers_to_it() {
+        let mut session = MaterializedSession::empty("session-dropped-terminal");
+        session.applied_event_ordinal = 1;
+        session.applied_event_digest = "a".repeat(64);
+        session.transcript = vec![Arc::new(TranscriptItem {
+            stable_id: "tool:bash".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 1,
+            last_changed_at_ms: 1,
+            body: TranscriptBody::Tool {
+                call: serde_json::json!({
+                    "toolCallId": "bash",
+                    "title": "Bash",
+                    "status": "completed",
+                    "content": [{
+                        "type": "content",
+                        "content": {"type": "text", "text": "ran the build"}
+                    }]
+                }),
+                terminal_outputs: vec![TerminalOutputRecord {
+                    terminal_id: "term-1".into(),
+                    output: "build finished".into(),
+                    truncated: false,
+                    exit_code: Some(0),
+                    signal: None,
+                }],
+                terminal_refs: vec!["term-1".into()],
+            },
+        })];
+
+        let entries = materialized_chat_entries(&session);
+        assert_eq!(
+            entries[0].tool_content,
+            ["ran the build", "build finished\nexited 0"],
+            "the captured output follows the content the call still carries"
+        );
+    }
+
+    /// Codex runs the command in its own terminal, which hel never opened, and
+    /// reports the text in `rawOutput` beside the reference.
+    #[test]
+    fn codex_raw_output_renders_for_a_terminal_hel_has_no_record_for() {
+        let call = |raw_output: serde_json::Value| {
+            serde_json::json!({
+                "toolCallId": "exec",
+                "title": "Shell",
+                "status": "completed",
+                "content": [{"type": "terminal", "terminalId": "exec-1"}],
+                "rawOutput": raw_output
+            })
+        };
+        let details = |raw_output: serde_json::Value| {
+            let call = ToolCall::deserialize(&call(raw_output)).expect("valid ACP tool call");
+            tool_content_details(&call.content, &[], call.raw_output.as_ref())
+        };
+
+        assert_eq!(
+            details(serde_json::json!({"formatted_output": "tests passed", "exit_code": 0})),
+            ["tests passed\nexited 0"]
+        );
+        assert_eq!(
+            details(serde_json::json!({"formatted_output": "still running"})),
+            ["still running"],
+            "an exit line needs an exit code to report"
+        );
+        assert_eq!(
+            details(serde_json::json!({"exit_code": 0})),
+            ["terminal exec-1"],
+            "without output there is nothing to show but the id"
+        );
+    }
+
+    #[test]
+    fn browser_tool_entries_show_the_title_and_diffstats_only() {
+        let mut session = MaterializedSession::empty("session-browser-tool");
+        session.applied_event_ordinal = 1;
+        session.applied_event_digest = "a".repeat(64);
+        session.transcript = vec![Arc::new(TranscriptItem {
+            stable_id: "tool:edit".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 1,
+            last_changed_at_ms: 1,
+            body: TranscriptBody::Tool {
+                call: serde_json::json!({
+                    "toolCallId": "edit",
+                    "title": "Edit src/lib.rs",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "content",
+                            "content": {"type": "text", "text": "wrote the file"}
+                        },
+                        {
+                            "type": "diff",
+                            "path": "/workspace/src/lib.rs",
+                            "oldText": "alpha\n",
+                            "newText": "alpha\nbeta\n"
+                        }
+                    ],
+                    "locations": [{"path": "/workspace/src/lib.rs", "line": 2}]
+                }),
+                terminal_outputs: Vec::new(),
+                terminal_refs: Vec::new(),
+            },
+        })];
+
+        let entries = materialized_chat_entries(&session);
+        assert!(entries[0].tool_content.contains(&"wrote the file".into()));
+        assert_eq!(entries[0].tool_locations, ["/workspace/src/lib.rs:2"]);
+
+        let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
+        assert_eq!(
+            browser.entries[0].lines,
+            ["Edit src/lib.rs", "/workspace/src/lib.rs  +1 −0"],
+            "the remote viewer carries the Rich feed's title and diffstat, \
+             not the Raw content or locations"
+        );
+    }
+
+    #[test]
+    fn terminal_exit_summary_names_signal_release_and_truncation() {
+        let record = |exit_code, signal: Option<&str>, truncated| TerminalOutputRecord {
+            terminal_id: "term-1".into(),
+            output: "out".into(),
+            truncated,
+            exit_code,
+            signal: signal.map(str::to_owned),
+        };
+
+        assert_eq!(
+            terminal_exit_summary(&record(Some(0), None, false)),
+            "exited 0"
+        );
+        assert_eq!(
+            terminal_exit_summary(&record(Some(1), None, true)),
+            "exited 1 · output truncated"
+        );
+        assert_eq!(
+            terminal_exit_summary(&record(None, Some("SIGKILL"), false)),
+            "killed by SIGKILL"
+        );
+        assert_eq!(
+            terminal_exit_summary(&record(None, None, false)),
+            "released before exit"
+        );
+
+        // A terminal that produced nothing is still worth a line: the summary
+        // is all a reader has to go on.
+        let mut silent = record(None, Some("SIGTERM"), false);
+        silent.output.clear();
+        assert_eq!(terminal_output_detail(&silent), "killed by SIGTERM");
     }
 
     #[test]

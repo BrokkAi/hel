@@ -130,6 +130,12 @@ attached directories before launch. On container targets, each attached
 directory is mounted using the runtime's isolated mount mode, so a container
 can't write back into your host filesystem through it.
 
+Each attached directory also has a read-only checkbox. Podman's isolated mode
+is a copy-on-write overlay, which some filesystems cannot host: when hel finds
+a source on NFS, SMB, FUSE, a FAT-family filesystem, or another overlay, it
+attaches that directory read-only instead and says so while the session
+launches.
+
 ## Two useful facts
 
 If the `gh` CLI on the machine running hel is authenticated, hel passes its

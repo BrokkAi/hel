@@ -67,15 +67,17 @@ pub(crate) struct NewWizard {
 pub(crate) enum MountFocus {
     Source,
     Destination,
+    ReadOnly,
     Cancel,
     Back,
     Add,
 }
 
 /// Tab order for the mount editor, shared by the new-session and resume paths.
-const MOUNT_FOCUS_ORDER: [MountFocus; 5] = [
+const MOUNT_FOCUS_ORDER: [MountFocus; 6] = [
     MountFocus::Source,
     MountFocus::Destination,
+    MountFocus::ReadOnly,
     MountFocus::Cancel,
     MountFocus::Back,
     MountFocus::Add,
@@ -95,12 +97,16 @@ pub(crate) struct MountWizard {
     pub(crate) source: String,
     pub(crate) destination: String,
     pub(crate) focus: MountFocus,
+    pub(crate) read_only: bool,
     pub(crate) mounts: Vec<AdditionalMount>,
     pub(crate) history: Vec<std::path::PathBuf>,
     history_index: usize,
     completion_cache: BTreeMap<String, Vec<String>>,
     completion_candidates: Vec<String>,
     completion_index: usize,
+    /// Sources the target's host reported as unable to hold Podman's overlay,
+    /// keyed by the typed source and holding the `filesystem (reason)` label.
+    forced_sources: BTreeMap<String, String>,
     pub(crate) error: Option<String>,
     editing_mount: Option<usize>,
 }
@@ -111,12 +117,14 @@ impl MountWizard {
             source: String::new(),
             destination: String::new(),
             focus: MountFocus::Source,
+            read_only: false,
             mounts: Vec::new(),
             history,
             history_index: 0,
             completion_cache: BTreeMap::new(),
             completion_candidates: Vec::new(),
             completion_index: 0,
+            forced_sources: BTreeMap::new(),
             error: None,
             editing_mount: None,
         }
@@ -128,10 +136,27 @@ impl MountWizard {
         wizard
     }
 
+    /// Why the source under edit can only be attached read-only, if it can.
+    pub(crate) fn forced_read_only(&self) -> Option<&str> {
+        self.forced_sources
+            .get(self.source.trim())
+            .map(String::as_str)
+    }
+
+    /// Space and Enter toggle the checkbox, except where the host's filesystem
+    /// has already settled the answer.
+    fn toggle_read_only(&mut self) {
+        if self.forced_read_only().is_some() {
+            return;
+        }
+        self.read_only = !self.read_only;
+    }
+
     fn add_validated_mount(&mut self) {
         let mount = AdditionalMount {
             source: self.source.clone().into(),
             destination: self.destination.clone().into(),
+            read_only: self.read_only,
         };
         if let Some(index) = self.editing_mount.take() {
             self.mounts[index] = mount;
@@ -140,6 +165,7 @@ impl MountWizard {
         }
         self.source.clear();
         self.destination.clear();
+        self.read_only = false;
         self.focus = MountFocus::Source;
         self.completion_candidates.clear();
         self.error = None;
@@ -208,6 +234,7 @@ fn remove_selected_mount(mounts: &mut MountWizard) {
 fn prepare_mount_editor(step: &mut WizardStep, mounts: &mut MountWizard) {
     mounts.source.clear();
     mounts.destination.clear();
+    mounts.read_only = false;
     mounts.focus = MountFocus::Source;
     mounts.error = None;
     mounts.editing_mount = None;
@@ -220,9 +247,10 @@ fn prepare_selected_mount_editor(step: &mut WizardStep, mounts: &mut MountWizard
         return;
     }
     let index = mounts.history_index;
-    let mount = &mounts.mounts[index];
+    let mount = mounts.mounts[index].clone();
     mounts.source = mount.source.to_string_lossy().into_owned();
     mounts.destination = mount.destination.to_string_lossy().into_owned();
+    mounts.read_only = mount.read_only || mounts.forced_read_only().is_some();
     mounts.focus = MountFocus::Source;
     mounts.error = None;
     mounts.editing_mount = Some(index);
@@ -250,6 +278,7 @@ fn validate_mount_entry(mounts: &MountWizard) -> Option<String> {
     let mount = AdditionalMount {
         source: mounts.source.clone().into(),
         destination: mounts.destination.clone().into(),
+        read_only: mounts.read_only,
     };
     if let Err(error) = hel::hel_targets::validate_additional_mounts(std::slice::from_ref(&mount)) {
         return Some(error.to_string());
@@ -828,10 +857,11 @@ fn render_review_wizard(
                         focus == ReviewFocus::Attachments && index == mounts.history_index;
                     Line::styled(
                         format!(
-                            "{}{} → {}",
+                            "{}{} → {}{}",
                             if selected { "› " } else { "  " },
                             mount.source.display(),
-                            mount.destination.display()
+                            mount.destination.display(),
+                            read_only_marker(mount.read_only)
                         ),
                         if selected {
                             Style::default().bg(Color::DarkGray).fg(Color::White)
@@ -870,6 +900,35 @@ fn render_review_wizard(
     );
 }
 
+/// Suffix that marks an attached directory as read-only in a list row.
+pub(crate) fn read_only_marker(read_only: bool) -> &'static str {
+    if read_only { " · ro" } else { "" }
+}
+
+/// The read-only checkbox, locked when the host's filesystem has settled it.
+fn read_only_line(mounts: &MountWizard) -> Line<'static> {
+    let marker = if mounts.focus == MountFocus::ReadOnly {
+        "› "
+    } else {
+        "  "
+    };
+    let box_text = if mounts.read_only { "[x]" } else { "[ ]" };
+    match mounts.forced_read_only() {
+        Some(reason) => Line::styled(
+            format!("{marker}Read-only: [x] locked · {reason}"),
+            Style::default().fg(Color::Yellow),
+        ),
+        None => Line::styled(
+            format!("{marker}Read-only: {box_text} (Space toggles)"),
+            if mounts.focus == MountFocus::ReadOnly {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            },
+        ),
+    }
+}
+
 fn render_mount_wizard(
     frame: &mut Frame,
     area: Rect,
@@ -889,7 +948,7 @@ fn render_mount_wizard(
             "Apple Container has no :O overlay mode; each extra bind is read-only."
         }
         TargetTemplate::LocalPodman { .. } | TargetTemplate::SshPodman { .. } => {
-            "Podman uses :O copy-on-write overlays; container writes never change the source."
+            "Podman uses :O copy-on-write overlays; read-only skips the overlay."
         }
         TargetTemplate::AwsEc2 { .. } => {
             "EC2 directories stream as tar.gz through one SSH connection into the destination."
@@ -941,15 +1000,17 @@ fn render_mount_wizard(
                 Style::default()
             },
         ),
+        read_only_line(mounts),
     ];
     if !mounts.mounts.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::raw("Already attached:"));
         lines.extend(mounts.mounts.iter().map(|mount| {
             Line::raw(format!(
-                "  {} → {}",
+                "  {} → {}{}",
                 mount.source.display(),
-                mount.destination.display()
+                mount.destination.display(),
+                read_only_marker(mount.read_only)
             ))
         }));
     }
@@ -1003,7 +1064,7 @@ fn render_mount_wizard(
     lines.extend([
         Line::raw(""),
         Line::styled(
-            "Tab completes source · Shift-Tab moves focus · Enter continues/adds",
+            "Tab completes · Shift-Tab moves · Space toggles read-only · Enter continues/adds",
             Style::default().fg(Color::DarkGray),
         ),
         action_buttons(&[
@@ -1012,7 +1073,8 @@ fn render_mount_wizard(
             ("Add directory", mounts.focus == MountFocus::Add),
         ]),
     ]);
-    let popup = centered_rect(84, (lines.len() as u16 + 2).clamp(12, 24), area);
+    // One row taller than before the read-only checkbox joined the editor.
+    let popup = centered_rect(84, (lines.len() as u16 + 2).clamp(13, 25), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -1756,9 +1818,17 @@ impl DashboardState {
                     MountFocus::Destination => {
                         wizard.mounts.destination.pop();
                     }
-                    MountFocus::Cancel | MountFocus::Back | MountFocus::Add => {}
+                    MountFocus::ReadOnly
+                    | MountFocus::Cancel
+                    | MountFocus::Back
+                    | MountFocus::Add => {}
                 }
                 wizard.mounts.error = None;
+                self.mode = Mode::New(wizard);
+                DashboardAction::None
+            }
+            KeyCode::Char(' ') if wizard.mounts.focus == MountFocus::ReadOnly => {
+                wizard.mounts.toggle_read_only();
                 self.mode = Mode::New(wizard);
                 DashboardAction::None
             }
@@ -1790,6 +1860,11 @@ impl DashboardState {
                     self.mode = Mode::New(wizard);
                     DashboardAction::None
                 }
+                MountFocus::ReadOnly => {
+                    wizard.mounts.toggle_read_only();
+                    self.mode = Mode::New(wizard);
+                    DashboardAction::None
+                }
                 MountFocus::Destination | MountFocus::Add => {
                     self.validate_new_mount(wizard, target_template_id)
                 }
@@ -1811,7 +1886,10 @@ impl DashboardState {
                         wizard.mounts.completion_candidates.clear();
                     }
                     MountFocus::Destination => wizard.mounts.destination.push(character),
-                    MountFocus::Cancel | MountFocus::Back | MountFocus::Add => {}
+                    MountFocus::ReadOnly
+                    | MountFocus::Cancel
+                    | MountFocus::Back
+                    | MountFocus::Add => {}
                 }
                 wizard.mounts.error = None;
                 self.mode = Mode::New(wizard);
@@ -2094,41 +2172,52 @@ impl DashboardState {
         }
     }
 
-    pub fn apply_mount_source_validation(&mut self, source: &str, result: Result<(), String>) {
-        match &mut self.mode {
+    /// Apply the host's answer about one mount source. A source whose
+    /// filesystem cannot hold the overlay is remembered, so the entry is
+    /// attached read-only and the editor locks the checkbox from then on.
+    pub fn apply_mount_source_validation(
+        &mut self,
+        source: &str,
+        result: Result<Option<String>, String>,
+    ) {
+        let (mounts, review_focus, step) = match &mut self.mode {
             Mode::New(wizard)
                 if wizard.step == WizardStep::Mounts && wizard.mounts.source == source =>
             {
-                match result {
-                    Ok(()) => {
-                        wizard.mounts.add_validated_mount();
-                        wizard.mounts.history_index = wizard.mounts.mounts.len().saturating_sub(1);
-                        wizard.review_focus = ReviewFocus::Attachments;
-                        wizard.step = WizardStep::Review;
-                    }
-                    Err(error) => {
-                        wizard.mounts.error = Some(error);
-                        wizard.mounts.focus = MountFocus::Source;
-                    }
-                }
+                (
+                    &mut wizard.mounts,
+                    &mut wizard.review_focus,
+                    &mut wizard.step,
+                )
             }
             Mode::Resume(wizard)
                 if wizard.step == WizardStep::Mounts && wizard.mounts.source == source =>
             {
-                match result {
-                    Ok(()) => {
-                        wizard.mounts.add_validated_mount();
-                        wizard.mounts.history_index = wizard.mounts.mounts.len().saturating_sub(1);
-                        wizard.review_focus = ReviewFocus::Attachments;
-                        wizard.step = WizardStep::Review;
-                    }
-                    Err(error) => {
-                        wizard.mounts.error = Some(error);
-                        wizard.mounts.focus = MountFocus::Source;
-                    }
-                }
+                (
+                    &mut wizard.mounts,
+                    &mut wizard.review_focus,
+                    &mut wizard.step,
+                )
             }
-            _ => {}
+            _ => return,
+        };
+        match result {
+            Ok(forced) => {
+                if let Some(reason) = forced {
+                    mounts
+                        .forced_sources
+                        .insert(source.trim().to_owned(), reason);
+                    mounts.read_only = true;
+                }
+                mounts.add_validated_mount();
+                mounts.history_index = mounts.mounts.len().saturating_sub(1);
+                *review_focus = ReviewFocus::Attachments;
+                *step = WizardStep::Review;
+            }
+            Err(error) => {
+                mounts.error = Some(error);
+                mounts.focus = MountFocus::Source;
+            }
         }
     }
 
@@ -2485,9 +2574,17 @@ impl DashboardState {
                     MountFocus::Destination => {
                         wizard.mounts.destination.pop();
                     }
-                    MountFocus::Cancel | MountFocus::Back | MountFocus::Add => {}
+                    MountFocus::ReadOnly
+                    | MountFocus::Cancel
+                    | MountFocus::Back
+                    | MountFocus::Add => {}
                 }
                 wizard.mounts.error = None;
+                self.mode = Mode::Resume(wizard);
+                DashboardAction::None
+            }
+            KeyCode::Char(' ') if wizard.mounts.focus == MountFocus::ReadOnly => {
+                wizard.mounts.toggle_read_only();
                 self.mode = Mode::Resume(wizard);
                 DashboardAction::None
             }
@@ -2519,6 +2616,11 @@ impl DashboardState {
                     self.mode = Mode::Resume(wizard);
                     DashboardAction::None
                 }
+                MountFocus::ReadOnly => {
+                    wizard.mounts.toggle_read_only();
+                    self.mode = Mode::Resume(wizard);
+                    DashboardAction::None
+                }
                 MountFocus::Destination | MountFocus::Add => {
                     self.validate_resume_mount(wizard, target_template_id)
                 }
@@ -2540,7 +2642,10 @@ impl DashboardState {
                         wizard.mounts.completion_candidates.clear();
                     }
                     MountFocus::Destination => wizard.mounts.destination.push(character),
-                    MountFocus::Cancel | MountFocus::Back | MountFocus::Add => {}
+                    MountFocus::ReadOnly
+                    | MountFocus::Cancel
+                    | MountFocus::Back
+                    | MountFocus::Add => {}
                 }
                 wizard.mounts.error = None;
                 self.mode = Mode::Resume(wizard);
@@ -3177,6 +3282,116 @@ mod tests {
         );
     }
 
+    /// Walk the new-session wizard as far as an open mount editor with the
+    /// source already typed and the destination filled in.
+    fn dashboard_at_mount_editor(source: &str) -> DashboardState {
+        let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        dashboard.handle_key(ctrl_key('n'));
+        dashboard.handle_key(key(KeyCode::Down));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::BackTab));
+        dashboard.handle_key(key(KeyCode::Enter));
+        for character in source.chars() {
+            dashboard.handle_key(key(KeyCode::Char(character)));
+        }
+        // Enter on the source fills the default destination and moves on.
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard
+    }
+
+    fn wizard_mounts(dashboard: &DashboardState) -> &MountWizard {
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("expected the new-session wizard");
+        };
+        &wizard.mounts
+    }
+
+    #[test]
+    fn the_read_only_checkbox_rides_the_mount_into_the_created_session() {
+        let mut dashboard = dashboard_at_mount_editor("/opt/cache");
+
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(wizard_mounts(&dashboard).focus, MountFocus::ReadOnly);
+        dashboard.handle_key(key(KeyCode::Char(' ')));
+        assert!(wizard_mounts(&dashboard).read_only);
+
+        // Tab past Cancel and Back to the add button, then commit.
+        for _ in 0..3 {
+            dashboard.handle_key(key(KeyCode::Tab));
+        }
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ValidateMountSource {
+                target_template_id: "podman".into(),
+                source: "/opt/cache".into(),
+            }
+        );
+        dashboard.apply_mount_source_validation("/opt/cache", Ok(None));
+
+        assert_eq!(
+            wizard_mounts(&dashboard).mounts,
+            vec![AdditionalMount {
+                source: "/opt/cache".into(),
+                destination: "/mnt/cache".into(),
+                read_only: true,
+            }]
+        );
+        // The next entry starts unchecked again.
+        assert!(!wizard_mounts(&dashboard).read_only);
+    }
+
+    #[test]
+    fn a_source_the_host_forces_read_only_cannot_be_unchecked() {
+        let mut dashboard = dashboard_at_mount_editor("/nfs/share");
+
+        assert!(!wizard_mounts(&dashboard).read_only);
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.apply_mount_source_validation(
+            "/nfs/share",
+            Ok(Some("nfs (network filesystem)".into())),
+        );
+        assert_eq!(
+            wizard_mounts(&dashboard).mounts,
+            vec![AdditionalMount {
+                source: "/nfs/share".into(),
+                destination: "/mnt/share".into(),
+                read_only: true,
+            }]
+        );
+
+        // Reopen the entry: the checkbox is checked, locked, and named.
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert!(wizard_mounts(&dashboard).read_only);
+        assert_eq!(
+            wizard_mounts(&dashboard).forced_read_only(),
+            Some("nfs (network filesystem)")
+        );
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.handle_key(key(KeyCode::Tab));
+        assert_eq!(wizard_mounts(&dashboard).focus, MountFocus::ReadOnly);
+        dashboard.handle_key(key(KeyCode::Char(' ')));
+        dashboard.handle_key(key(KeyCode::Enter));
+        assert!(
+            wizard_mounts(&dashboard).read_only,
+            "a forced source must stay read-only"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw the mount editor");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Read-only: [x] locked · nfs (network filesystem)"));
+    }
+
     #[test]
     fn new_session_mount_wizard_adds_mount_and_preserves_typed_source() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
@@ -3212,7 +3427,7 @@ mod tests {
                 source: "/opt/cache".into(),
             }
         );
-        dashboard.apply_mount_source_validation("/opt/cache", Ok(()));
+        dashboard.apply_mount_source_validation("/opt/cache", Ok(None));
         dashboard.handle_key(key(KeyCode::BackTab));
 
         assert_eq!(
@@ -3225,6 +3440,7 @@ mod tests {
                 additional_mounts: vec![AdditionalMount {
                     source: "/opt/cache".into(),
                     destination: "/mnt/cache".into(),
+                    read_only: false,
                 }],
                 allow_dirty_local: false,
                 resource_allocation: Some(SessionResourceAllocation::Container {
@@ -3458,7 +3674,7 @@ mod tests {
                 source: "/opt/cache".into(),
             }
         );
-        dashboard.apply_mount_source_validation("/opt/cache", Ok(()));
+        dashboard.apply_mount_source_validation("/opt/cache", Ok(None));
         dashboard.handle_key(key(KeyCode::BackTab));
 
         assert_eq!(
@@ -3470,6 +3686,7 @@ mod tests {
                 additional_mounts: vec![AdditionalMount {
                     source: "/opt/cache".into(),
                     destination: "/mnt/cache".into(),
+                    read_only: false,
                 }],
                 resource_allocation: Some(SessionResourceAllocation::Container {
                     cpus: BASELINE_CPUS,
@@ -3486,6 +3703,7 @@ mod tests {
         session.additional_mounts = vec![AdditionalMount {
             source: "/opt/old-cache".into(),
             destination: "/mnt/old-cache".into(),
+            read_only: false,
         }];
         let mut dashboard = dashboard_with_session(session);
         dashboard.handle_key(key(KeyCode::Enter));
@@ -3506,6 +3724,7 @@ mod tests {
         session.additional_mounts = vec![AdditionalMount {
             source: "/opt/cache".into(),
             destination: "/mnt/cache".into(),
+            read_only: false,
         }];
         let mut dashboard = dashboard_with_session(session);
         dashboard.handle_key(key(KeyCode::Enter));
@@ -3529,7 +3748,7 @@ mod tests {
                 source: "/opt/cache".into(),
             }
         );
-        dashboard.apply_mount_source_validation("/opt/cache", Ok(()));
+        dashboard.apply_mount_source_validation("/opt/cache", Ok(None));
         let Mode::Resume(wizard) = &dashboard.mode else {
             panic!("expected resume review");
         };

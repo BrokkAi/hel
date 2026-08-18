@@ -227,11 +227,18 @@ impl Controller {
                 session.resource_allocation.as_ref(),
                 ContainerOverrides::for_session(&session),
             )?;
-            let runtime_mounts = if matches!(target, hel_targets::TargetTemplate::AwsEc2(_)) {
-                &[][..]
+            let mut runtime_mounts = if matches!(target, hel_targets::TargetTemplate::AwsEc2(_)) {
+                Vec::new()
             } else {
-                session.additional_mounts.as_slice()
+                session.additional_mounts.clone()
             };
+            // The mounts this container runs with, not the ones the session
+            // stores: a forced downgrade belongs to the host the container
+            // lands on, so it is decided here every time and never written
+            // over the user's choice.
+            for notice in enforce_overlay_capable_mounts(&target, &mut runtime_mounts, executor) {
+                executor.notify_notice(&notice);
+            }
             let mut bundle = session
                 .project_directory
                 .is_none()
@@ -258,7 +265,7 @@ impl Controller {
                     bundle
                         .as_ref()
                         .context("project bundle disappeared during provisioning")?,
-                    runtime_mounts,
+                    &runtime_mounts,
                 )?
             };
 
@@ -1001,6 +1008,60 @@ fn ensure_git_broker(
     }
 }
 
+/// Attach read-only whatever Podman's `:O` overlay cannot hold, and say so.
+///
+/// The filesystem is probed on the host that runs the container, because that
+/// is where the overlay would be built. A probe that cannot answer leaves the
+/// overlay alone: a failed probe is no evidence of an unsupported filesystem,
+/// and refusing to provision over one would cost the user their session.
+///
+/// Apple's `container` engine already mounts every extra directory read-only,
+/// and EC2 copies the directory instead of mounting it, so neither is probed.
+pub(super) fn enforce_overlay_capable_mounts(
+    target: &hel_targets::TargetTemplate,
+    mounts: &mut [hel_targets::AdditionalMount],
+    executor: &impl CommandExecutor,
+) -> Vec<String> {
+    let ssh = match target {
+        hel_targets::TargetTemplate::LocalPodman(_) => None,
+        hel_targets::TargetTemplate::SshPodman { ssh, .. } => Some(ssh),
+        _ => return Vec::new(),
+    };
+    let overlaid = mounts
+        .iter()
+        .filter(|mount| !mount.read_only)
+        .map(|mount| mount.source.clone())
+        .collect::<Vec<_>>();
+    if overlaid.is_empty() {
+        return Vec::new();
+    }
+    let filesystems = match hel_targets::probe_filesystem_types(ssh, &overlaid, executor) {
+        Ok(filesystems) => filesystems,
+        Err(error) => {
+            return vec![format!(
+                "Could not read the filesystem under the attached directories, so they keep the \
+                 copy-on-write overlay: {error:#}"
+            )];
+        }
+    };
+    let mut notices = Vec::new();
+    for (mount, filesystem) in mounts
+        .iter_mut()
+        .filter(|mount| !mount.read_only)
+        .zip(filesystems)
+    {
+        let Some(reason) = hel_targets::overlay_unsupported_filesystem(&filesystem) else {
+            continue;
+        };
+        mount.read_only = true;
+        notices.push(format!(
+            "Mounted {} read-only: the overlay is unreliable on {filesystem} ({reason}).",
+            mount.source.display()
+        ));
+    }
+    notices
+}
+
 /// Reports every command an installer issues as one launch stage, so progress
 /// stays accurate without threading the stage through each `CommandSpec`.
 /// A command that already names a stage keeps it.
@@ -1033,6 +1094,10 @@ impl<E: CommandExecutor> CommandExecutor for StagedExecutor<'_, E> {
 
     fn notify_stage(&self, stage: ProvisionStage) {
         self.inner.notify_stage(stage);
+    }
+
+    fn notify_notice(&self, notice: &str) {
+        self.inner.notify_notice(notice);
     }
 
     fn execute_with_stdin(
@@ -1159,11 +1224,211 @@ fn parse_inherited_git_settings(output: &[u8]) -> Result<BTreeMap<String, String
 mod tests {
     use std::collections::BTreeMap;
 
+    use std::sync::Mutex;
+
     use crate::hel_config::ProjectRepository;
     use crate::hel_state::{HelState, SessionRecord, SessionState, TargetLocator};
-    use crate::hel_targets::{self, SshTarget};
+    use crate::hel_targets::{
+        self, AdditionalMount, ContainerTemplate, ProjectBundleSpec, SshTarget,
+    };
 
     use super::*;
+
+    /// Answers the filesystem probe, and records every notice provisioning
+    /// reported while it ran.
+    struct ProbeExecutor {
+        answer: std::result::Result<&'static str, &'static str>,
+        notices: Mutex<Vec<String>>,
+    }
+
+    impl ProbeExecutor {
+        fn answering(answer: &'static str) -> Self {
+            Self {
+                answer: Ok(answer),
+                notices: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing(stderr: &'static str) -> Self {
+            Self {
+                answer: Err(stderr),
+                notices: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CommandExecutor for ProbeExecutor {
+        fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+            assert_eq!(command.program, "stat", "only the probe may run here");
+            Ok(match self.answer {
+                Ok(filesystem) => CommandOutput {
+                    status: 0,
+                    stdout: format!("{filesystem}\n").into_bytes(),
+                    stderr: Vec::new(),
+                },
+                Err(stderr) => CommandOutput {
+                    status: 1,
+                    stdout: Vec::new(),
+                    stderr: stderr.as_bytes().to_vec(),
+                },
+            })
+        }
+
+        fn notify_notice(&self, notice: &str) {
+            self.notices.lock().unwrap().push(notice.to_owned());
+        }
+    }
+
+    fn podman_target() -> hel_targets::TargetTemplate {
+        hel_targets::TargetTemplate::LocalPodman(ContainerTemplate {
+            image: "ubuntu:24.04".into(),
+            extra_run_args: Vec::new(),
+        })
+    }
+
+    fn probe_bundle() -> ProjectBundleSpec {
+        ProjectBundleSpec {
+            primary: "app".into(),
+            repositories: vec![crate::hel_targets::RepositorySpec {
+                url: Some("https://github.com/example/app.git".into()),
+                destination: "app".into(),
+                git_ref: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_source_that_cannot_overlay_is_mounted_read_only_and_reported() {
+        let executor = ProbeExecutor::answering("nfs");
+        let mut mounts = vec![AdditionalMount {
+            source: PathBuf::from("/nfs/share"),
+            destination: PathBuf::from("/mnt/share"),
+            read_only: false,
+        }];
+
+        let notices = enforce_overlay_capable_mounts(&podman_target(), &mut mounts, &executor);
+
+        assert!(mounts[0].read_only);
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0]
+                .contains("Mounted /nfs/share read-only: the overlay is unreliable on nfs (network filesystem)"),
+            "{notices:?}"
+        );
+        let plan = hel_targets::provision_plan(
+            &podman_target(),
+            "0123456789abcdef0123456789abcdef",
+            &probe_bundle(),
+            &mounts,
+        )
+        .unwrap();
+        assert!(
+            plan.commands[0]
+                .args
+                .windows(2)
+                .any(|args| args == ["--volume", "/nfs/share:/mnt/share:ro"]),
+            "{:?}",
+            plan.commands[0].args
+        );
+    }
+
+    #[test]
+    fn a_probe_that_cannot_answer_keeps_the_overlay_and_says_so() {
+        let executor = ProbeExecutor::failing("stat: cannot read file system information");
+        let mut mounts = vec![AdditionalMount {
+            source: PathBuf::from("/host/cache"),
+            destination: PathBuf::from("/mnt/cache"),
+            read_only: false,
+        }];
+
+        let notices = enforce_overlay_capable_mounts(&podman_target(), &mut mounts, &executor);
+
+        assert!(!mounts[0].read_only);
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].contains("keep the copy-on-write overlay")
+                && notices[0].contains("cannot read file system information"),
+            "{notices:?}"
+        );
+        let plan = hel_targets::provision_plan(
+            &podman_target(),
+            "0123456789abcdef0123456789abcdef",
+            &probe_bundle(),
+            &mounts,
+        )
+        .unwrap();
+        assert!(
+            plan.commands[0]
+                .args
+                .windows(2)
+                .any(|args| args == ["--volume", "/host/cache:/mnt/cache:O"]),
+            "{:?}",
+            plan.commands[0].args
+        );
+    }
+
+    #[test]
+    fn engines_without_an_overlay_to_lose_are_never_probed() {
+        struct UnusedExecutor;
+
+        impl CommandExecutor for UnusedExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                panic!("this target must not probe: {}", command.program)
+            }
+        }
+
+        let mut mounts = vec![AdditionalMount {
+            source: PathBuf::from("/host/cache"),
+            destination: PathBuf::from("/mnt/cache"),
+            read_only: false,
+        }];
+        for target in [
+            hel_targets::TargetTemplate::AppleContainer(ContainerTemplate {
+                image: "ubuntu:24.04".into(),
+                extra_run_args: Vec::new(),
+            }),
+            hel_targets::TargetTemplate::AwsEc2(hel_targets::AwsTemplate {
+                profile: "default".into(),
+                region: "us-east-1".into(),
+                launch_template: "lt-0123456789abcdef0".into(),
+                launch_template_version: None,
+                instance_type: None,
+                ssh: SshTarget {
+                    destination: "ubuntu@example.test".into(),
+                    ssh_args: Vec::new(),
+                },
+            }),
+        ] {
+            assert!(
+                enforce_overlay_capable_mounts(&target, &mut mounts, &UnusedExecutor).is_empty()
+            );
+            assert!(!mounts[0].read_only);
+        }
+    }
+
+    /// A mount the user already marked read-only has no overlay to protect, so
+    /// the probe never has to reach a host that may not answer.
+    #[test]
+    fn mounts_already_read_only_are_not_probed() {
+        struct UnusedExecutor;
+
+        impl CommandExecutor for UnusedExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                panic!("a read-only mount must not probe: {}", command.program)
+            }
+        }
+
+        let mut mounts = vec![AdditionalMount {
+            source: PathBuf::from("/host/cache"),
+            destination: PathBuf::from("/mnt/cache"),
+            read_only: true,
+        }];
+
+        assert!(
+            enforce_overlay_capable_mounts(&podman_target(), &mut mounts, &UnusedExecutor)
+                .is_empty()
+        );
+    }
 
     #[test]
     fn failed_new_session_provisioning_discards_provisional_record() {

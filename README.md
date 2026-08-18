@@ -3,8 +3,7 @@
 > Welcome to Hel.
 
 Hel (`hel`) is a terminal control plane for long-running ACP coding-agent
-sessions. It keeps the useful ACP client and TUI shell from Mjolnir, while
-removing its review, council, delegation, and subagent business logic.
+sessions.
 
 The dashboard gives one view of sessions and quotas across any number of
 Codex, Claude Code, and Kimi Code profiles. A session can run directly in an
@@ -375,7 +374,9 @@ the same launch template and AMI.
 
 New and resumed sessions end with a review screen where attached directories
 can optionally be added, edited, or removed before launch. Container
-targets expose them with the runtime's isolated mount mode. EC2 targets stream
+targets expose them with the runtime's isolated mount mode, or read-only when
+the entry asks for it or when the source sits on a filesystem that cannot host
+Podman's copy-on-write overlay. EC2 targets stream
 each directory as tar.gz through one SSH process directly into the installed
 Hel worker, without writing a controller or target archive. Symbolic links are
 rejected so an attachment cannot escape its source or destination tree.
