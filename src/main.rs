@@ -2255,8 +2255,7 @@ async fn run_session(
         memory: memory::SessionMemory::from_config(
             &memory_config,
             &cwd,
-            launched_adapter_kind(&roster, agent)
-                .is_some_and(|kind| matches!(kind, roster::AdapterKind::Codex)),
+            launched_adapter_kind(&roster, agent),
         ),
         side_prompt_policy: false,
         termination: None,
