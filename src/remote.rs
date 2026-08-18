@@ -4347,7 +4347,7 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
         ensure_cookie_key(&paths.cookie_key_path)?
     };
     let workspace_roots =
-        crate::paths::WorkspaceRoots::new(&cwd, &additional_directories)?.active_roots();
+        mj_core::paths::WorkspaceRoots::new(&cwd, &additional_directories)?.active_roots();
     let mjconfig = Arc::new(MjConfigRuntime::new(
         config_path.clone(),
         resolved.choices.clone(),
@@ -4550,8 +4550,8 @@ fn start_server_agent_session(
             config::SessionConfigSeat::Primary,
         )
     });
-    let project_label = crate::paths::project_label_from_cwd(&cwd);
-    let worktree_label = crate::paths::worktree_name_from_cwd(&cwd);
+    let project_label = mj_core::paths::project_label_from_cwd(&cwd);
+    let worktree_label = mj_core::paths::worktree_name_from_cwd(&cwd);
     // With a roster the session has a real primary model; align the published
     // identity with what a TUI session publishes (model + adapter source)
     // instead of the adapter display label alone.
@@ -4586,7 +4586,10 @@ fn start_server_agent_session(
     let mut roster_setup_error = None;
     let (subagent_roles, subagent_codex_home) = match roster.as_ref() {
         Some(resolved) => {
-            match crate::isolated_subagent_roles(resolved.subagent_failover_roles(), "subagent") {
+            match crate::isolated_subagent_roles(
+                crate::roster::subagent_failover_roles(resolved),
+                "subagent",
+            ) {
                 Ok(pair) => pair,
                 Err(error) => {
                     roster_setup_error = Some(format!("prepare subagents: {error:#}"));
@@ -4629,29 +4632,36 @@ fn start_server_agent_session(
     // into the subagent config and the runtime config respectively.
     let review_workers = subagent_pool.clone();
     let review_additional_directories = additional_directories.clone();
-    let subagents = subagent_pool.map(|subagent_pool| {
-        subagent::Config::new(subagent_pool, None)
-            .with_subagent_handoff_counter(subagent_handoffs.clone())
-            .with_id_allocator(subagent_ids.clone())
-            .with_active_implementation_workers(active_implementation_workers.clone())
-            .with_max_parallel(app_config.subagents.max_parallel)
-            .with_debrief(app_config.subagents.debrief)
-            .with_reports(subagent_reports.clone())
-            .with_run_registry(subagent_runs.clone())
-            .with_prewarm(subagent::RunContext {
-                cwd: cwd.clone(),
-                additional_directories: additional_directories.clone(),
-                snapshot_exclusions: snapshot_exclusions.clone(),
-                fs_max_text_bytes,
-                access_mode: crate::acp::RuntimeAccessMode::Full,
-            })
-    });
+    let subagents = subagent_pool
+        .map(|subagent_pool| {
+            subagent::Config::new(subagent_pool, None)
+                .with_subagent_handoff_counter(subagent_handoffs.clone())
+                .with_id_allocator(subagent_ids.clone())
+                .with_active_implementation_workers(active_implementation_workers.clone())
+                .with_max_parallel(app_config.subagents.max_parallel)
+                .with_debrief(app_config.subagents.debrief)
+                .with_reports(subagent_reports.clone())
+                .with_run_registry(subagent_runs.clone())
+                .with_prewarm(subagent::RunContext {
+                    cwd: cwd.clone(),
+                    additional_directories: additional_directories.clone(),
+                    snapshot_exclusions: snapshot_exclusions.clone(),
+                    fs_max_text_bytes,
+                    access_mode: crate::acp::RuntimeAccessMode::Full,
+                })
+        })
+        .map(subagent::runtime_service);
     let provenance_primary = roster.as_ref().map(|resolved| resolved.primary.clone());
     let provenance_cwd = cwd.clone();
     let session_memory = crate::memory::SessionMemory::from_config(
         &app_config.memory,
         &cwd,
-        roster.as_ref().map(|resolved| resolved.primary.launch.kind),
+        roster.as_ref().is_some_and(|resolved| {
+            matches!(
+                resolved.primary.launch.kind,
+                crate::roster::AdapterKind::Codex
+            )
+        }),
     );
     let mut workspace_roots = Vec::with_capacity(1 + additional_directories.len());
     workspace_roots.push(cwd.clone());
@@ -4690,7 +4700,7 @@ fn start_server_agent_session(
             active_subagent_workers: active_implementation_workers.clone(),
             subagent_reports: subagent_report_rx,
             subagent_report_bus: subagent_reports,
-            subagent_runs,
+            subagent_runs: mj_core::orchestrator::SubagentProgressService::new(subagent_runs),
             progress_wake: crate::orchestrator::progress_wake_interval(
                 app_config.subagents.progress_wake_minutes,
             ),
@@ -4708,7 +4718,7 @@ fn start_server_agent_session(
                         .and_then(|resolved| resolved.review_supervisor.clone()),
                 )
                 .map(|(workers, supervisor)| {
-                    crate::discrete_review::Spawner::live(crate::discrete_review::FanoutConfig {
+                    crate::discrete_review::live_spawner(crate::discrete_review::FanoutConfig {
                         workers,
                         supervisor,
                         cwd: provenance_cwd.clone(),
@@ -4909,7 +4919,7 @@ fn start_server_agent_session(
                     if let (Some(primary), UiEvent::SessionStarted { session_id, .. }) =
                         (provenance_primary.as_ref(), &event)
                     {
-                        crate::session_provenance::record(crate::session_provenance::Record {
+                        mj_core::session_provenance::record(mj_core::session_provenance::Record {
                             session_id: session_id.clone(),
                             cwd: provenance_cwd.clone(),
                             adapter_source_id: primary.launch.source_id.clone(),
@@ -7357,7 +7367,7 @@ async fn unarchive_session(
     Ok((
         StatusCode::ACCEPTED,
         Json(NewServerSessionResponse {
-            display_path: crate::paths::display_path_with_tilde(&cwd),
+            display_path: mj_core::paths::display_path_with_tilde(&cwd),
             cwd: cwd.display().to_string(),
             worktree: session.worktree,
             launch_id,
@@ -7432,7 +7442,7 @@ async fn create_server_owned_session(
                 ),
             )
         })?;
-        if !crate::paths::path_is_under_any_root(roots.as_slice(), &canonical_project_root) {
+        if !mj_core::paths::path_is_under_any_root(roots.as_slice(), &canonical_project_root) {
             return Err((
                 StatusCode::FORBIDDEN,
                 "project root is outside configured workspace roots".to_string(),
@@ -7440,7 +7450,7 @@ async fn create_server_owned_session(
         }
         let created = crate::worktree::create_noninteractive(&selected_cwd)
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))?;
-        let name = crate::paths::folder_label(&created.worktree_root);
+        let name = mj_core::paths::folder_label(&created.worktree_root);
         Ok((selected_cwd, created.session_cwd, Some(name)))
     })
     .await
@@ -7478,7 +7488,7 @@ async fn create_server_owned_session(
     Ok((
         StatusCode::ACCEPTED,
         Json(NewServerSessionResponse {
-            display_path: crate::paths::display_path_with_tilde(&cwd),
+            display_path: mj_core::paths::display_path_with_tilde(&cwd),
             cwd: cwd.display().to_string(),
             worktree,
             launch_id,
@@ -7827,7 +7837,7 @@ fn browse_filesystem_under_roots(
     };
     let parent = current.parent().and_then(|path| {
         let parent = std::fs::canonicalize(path).ok()?;
-        crate::paths::path_is_under_any_root(roots, &parent)
+        mj_core::paths::path_is_under_any_root(roots, &parent)
             .then(|| filesystem_directory_record(&parent))
     });
     let query = search_query
@@ -7878,7 +7888,7 @@ fn list_child_directories(
             Ok(path) => path,
             Err(_) => continue,
         };
-        if !path.is_dir() || !crate::paths::path_is_under_any_root(roots, &path) {
+        if !path.is_dir() || !mj_core::paths::path_is_under_any_root(roots, &path) {
             continue;
         }
         entries.push(filesystem_directory_record(&path));
@@ -7938,7 +7948,7 @@ fn search_filesystem_under_roots_with_limits(
                 continue;
             };
             if !path.is_dir()
-                || !crate::paths::path_is_under_any_root(roots, &path)
+                || !mj_core::paths::path_is_under_any_root(roots, &path)
                 || visited.contains(&path)
             {
                 continue;
@@ -7947,9 +7957,9 @@ fn search_filesystem_under_roots_with_limits(
             children.push(path);
         }
         children.sort_by(|left, right| {
-            crate::paths::folder_label(left)
+            mj_core::paths::folder_label(left)
                 .to_lowercase()
-                .cmp(&crate::paths::folder_label(right).to_lowercase())
+                .cmp(&mj_core::paths::folder_label(right).to_lowercase())
                 .then_with(|| left.cmp(right))
         });
         for child in children {
@@ -8030,7 +8040,7 @@ fn directory_under_roots(
             format!("path is not a directory: {}", canonical.display()),
         ));
     }
-    if !crate::paths::path_is_under_any_root(roots, &canonical) {
+    if !mj_core::paths::path_is_under_any_root(roots, &canonical) {
         return Err((
             StatusCode::FORBIDDEN,
             "path is outside configured workspace roots".to_string(),
@@ -8042,8 +8052,8 @@ fn directory_under_roots(
 fn filesystem_directory_record(path: &Path) -> FilesystemDirectoryRecord {
     FilesystemDirectoryRecord {
         path: path.display().to_string(),
-        name: crate::paths::folder_label(path),
-        display_path: crate::paths::display_path_with_tilde(path),
+        name: mj_core::paths::folder_label(path),
+        display_path: mj_core::paths::display_path_with_tilde(path),
     }
 }
 
@@ -8675,7 +8685,7 @@ pub(crate) async fn prepare_desktop_server(
         .with_context(|| format!("load {}", config_path.display()))?;
     let resolved = roster::resolve(&cfg, &cwd).await?;
     let workspace_roots =
-        crate::paths::WorkspaceRoots::new(&cwd, &additional_directories)?.active_roots();
+        mj_core::paths::WorkspaceRoots::new(&cwd, &additional_directories)?.active_roots();
     let mjconfig = Arc::new(MjConfigRuntime::new(
         config_path.clone(),
         resolved.choices.clone(),
@@ -14102,7 +14112,7 @@ mod tests {
         let session_cwd = Path::new(&parsed.cwd);
         assert!(session_cwd.is_dir());
         assert_eq!(
-            crate::paths::worktree_name_from_cwd(session_cwd).as_deref(),
+            mj_core::paths::worktree_name_from_cwd(session_cwd).as_deref(),
             Some(name.as_str())
         );
         let recent =

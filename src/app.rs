@@ -29,6 +29,7 @@ use crate::event::{
     SubagentStatusKind, TerminalOutputSnapshot, UiEvent, content_block_text,
 };
 use crate::palette::TerminalTheme;
+use crate::palette::TerminalThemeKindExt;
 use crate::ragnarok;
 use crate::session_state::SessionState;
 use crate::settings::{SettingsAction, SettingsEditor};
@@ -1837,7 +1838,7 @@ fn git_workspace_files(root: &Path, limit: usize) -> Option<Vec<PathBuf>> {
 }
 
 fn workspace_root_label(root: &Path, index: usize) -> Option<String> {
-    (index > 0).then(|| crate::paths::folder_label(root))
+    (index > 0).then(|| mj_core::paths::folder_label(root))
 }
 
 pub(crate) fn workspace_file_candidates(roots: &[PathBuf]) -> Vec<WorkspaceFile> {
@@ -10919,7 +10920,7 @@ mod tests {
 
         assert!(state.autocomplete.visible);
         let path = state.autocomplete.matches[0];
-        let root_label = crate::paths::folder_label(additional.path());
+        let root_label = mj_core::paths::folder_label(additional.path());
         assert_eq!(
             state.autocomplete_file_path(path),
             Some(format!("{root_label}/notes.md").as_str())

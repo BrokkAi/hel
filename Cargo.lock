@@ -522,6 +522,7 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "arboard",
+ "async-trait",
  "axum",
  "axum-server",
  "base64",
@@ -537,6 +538,7 @@ dependencies = [
  "iana-time-zone",
  "image",
  "libc",
+ "mj-core",
  "mj-desktop",
  "qrcode",
  "ratatui",
@@ -2712,6 +2714,43 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mj-core"
+version = "1.10.1"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64",
+ "chrono",
+ "dirs",
+ "flate2",
+ "futures",
+ "getrandom 0.3.4",
+ "iana-time-zone",
+ "libc",
+ "reqwest",
+ "rmcp",
+ "rusqlite",
+ "schemars 1.2.1",
+ "semver",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "signal-hook",
+ "similar",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "unicode-width",
+ "url",
+ "zip",
 ]
 
 [[package]]
