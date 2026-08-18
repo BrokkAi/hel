@@ -5,14 +5,14 @@
 //! this module independent from the UI state machine so the parser can be
 //! tested against captured command output without spawning `claude`.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::process::Command;
+use serde_json::Value;
 
 const USAGE_TIMEOUT: Duration = Duration::from_secs(20);
+const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(test)]
@@ -78,10 +78,18 @@ impl ClaudeUsageWindow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeUsageError {
     TimedOut,
+    #[cfg(test)]
     NotInstalled,
     NotSignedIn,
+    #[cfg(test)]
     Launch(String),
-    Exit { status: String, detail: String },
+    Query(String),
+    #[cfg(test)]
+    Exit {
+        status: String,
+        detail: String,
+    },
+    #[cfg(test)]
     UnsupportedOutput,
     Parse,
 }
@@ -94,6 +102,7 @@ impl ClaudeUsageError {
             Self::NotInstalled => "Claude Code not installed",
             Self::NotSignedIn => "not signed in",
             Self::Launch(_) => "could not launch Claude Code",
+            Self::Query(_) => "could not query Claude usage",
             Self::Exit { detail, .. } if is_authentication_error(detail) => "not signed in",
             Self::Exit { .. } => "Claude /usage failed",
             Self::UnsupportedOutput => "Claude /usage is unsupported",
@@ -106,82 +115,135 @@ impl fmt::Display for ClaudeUsageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TimedOut => write!(f, "claude /usage timed out"),
+            #[cfg(test)]
             Self::NotInstalled => write!(f, "Claude Code executable not found"),
             Self::NotSignedIn => write!(f, "Claude Code is not signed in"),
+            #[cfg(test)]
             Self::Launch(error) => write!(f, "run claude /usage: {error}"),
+            Self::Query(error) => write!(f, "query Claude usage: {error}"),
+            #[cfg(test)]
             Self::Exit { status, detail } if detail.is_empty() => {
                 write!(f, "claude /usage exited with {status}")
             }
+            #[cfg(test)]
             Self::Exit { status, detail } => {
                 write!(f, "claude /usage exited with {status}: {detail}")
             }
+            #[cfg(test)]
             Self::UnsupportedOutput => write!(f, "Claude Code does not support /usage"),
             Self::Parse => write!(f, "could not parse claude /usage output"),
         }
     }
 }
 
-/// Run `claude -p "/usage"` and parse the resulting quota summary.
-pub async fn query(
-    cwd: PathBuf,
-    env: HashMap<String, String>,
-) -> Result<ClaudeUsageReport, ClaudeUsageError> {
-    let mut cmd = Command::new(claude_program());
-    cmd.arg("-p")
-        .arg("/usage")
-        .current_dir(cwd)
-        .envs(env)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-
-    let output = tokio::time::timeout(USAGE_TIMEOUT, cmd.output())
+/// Query the same OAuth usage endpoint as Claude Code's interactive `/usage`.
+/// Print mode does not execute that slash command and can return an estimated,
+/// stale-looking response instead of the account's authoritative limits.
+pub async fn query(home: PathBuf) -> Result<ClaudeUsageReport, ClaudeUsageError> {
+    let credentials = tokio::fs::read(home.join(".credentials.json"))
         .await
-        .map_err(|_| ClaudeUsageError::TimedOut)?
+        .map_err(|_| ClaudeUsageError::NotSignedIn)?;
+    let credentials: Value =
+        serde_json::from_slice(&credentials).map_err(|_| ClaudeUsageError::NotSignedIn)?;
+    let token = credentials
+        .get("claudeAiOauth")
+        .and_then(|oauth| oauth.get("accessToken"))
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or(ClaudeUsageError::NotSignedIn)?;
+    let client = reqwest::Client::builder()
+        .timeout(USAGE_TIMEOUT)
+        .build()
+        .map_err(|error| ClaudeUsageError::Query(error.to_string()))?;
+    let response = client
+        .get(USAGE_URL)
+        .bearer_auth(token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .send()
+        .await
         .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ClaudeUsageError::NotInstalled
+            if error.is_timeout() {
+                ClaudeUsageError::TimedOut
             } else {
-                ClaudeUsageError::Launch(error.to_string())
+                ClaudeUsageError::Query(error.to_string())
             }
         })?;
-
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{stdout}\n{stderr}");
-        if is_authentication_error(&combined) {
-            return Err(ClaudeUsageError::NotSignedIn);
-        }
-        let detail = combined
-            .split_whitespace()
-            .take(24)
-            .collect::<Vec<_>>()
-            .join(" ");
-        return Err(ClaudeUsageError::Exit {
-            status: output.status.to_string(),
-            detail,
-        });
+    if matches!(response.status().as_u16(), 401 | 403) {
+        return Err(ClaudeUsageError::NotSignedIn);
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = if stderr.trim().is_empty() {
-        stdout.into_owned()
-    } else if stdout.trim().is_empty() {
-        stderr.into_owned()
-    } else {
-        format!("{stdout}\n{stderr}")
-    };
-
-    parse(&combined).ok_or_else(|| classify_unparsed_output(&combined))
+    if !response.status().is_success() {
+        return Err(ClaudeUsageError::Query(format!(
+            "HTTP {}",
+            response.status()
+        )));
+    }
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|error| ClaudeUsageError::Query(error.to_string()))?;
+    parse_api_usage(&payload).ok_or(ClaudeUsageError::Parse)
 }
 
-fn claude_program() -> &'static str {
-    if cfg!(windows) {
-        "claude.cmd"
+fn parse_api_usage(payload: &Value) -> Option<ClaudeUsageReport> {
+    let mut five_hour = None;
+    let mut weekly = Vec::new();
+
+    if let Some(limits) = payload.get("limits").and_then(Value::as_array) {
+        for limit in limits {
+            let Some(kind) = limit.get("kind").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(window) = api_window(limit, "percent") else {
+                continue;
+            };
+            match kind {
+                "session" => five_hour = Some(window),
+                "weekly_all" => weekly.push(window),
+                "weekly_scoped" if api_scope_name(limit).is_some_and(|name| name == "fable") => {
+                    weekly.push(window);
+                }
+                _ => {}
+            }
+        }
     } else {
-        "claude"
+        five_hour = payload
+            .get("five_hour")
+            .filter(|value| !value.is_null())
+            .and_then(|value| api_window(value, "utilization"));
+        for key in ["seven_day", "seven_day_fable"] {
+            if let Some(window) = payload
+                .get(key)
+                .filter(|value| !value.is_null())
+                .and_then(|value| api_window(value, "utilization"))
+            {
+                weekly.push(window);
+            }
+        }
     }
+
+    let week = weekly
+        .into_iter()
+        .min_by_key(|window| window.remaining_percent);
+    (five_hour.is_some() || week.is_some()).then_some(ClaudeUsageReport { five_hour, week })
+}
+
+fn api_window(value: &Value, percent_key: &str) -> Option<ClaudeUsageWindow> {
+    let used = value.get(percent_key)?.as_f64()?;
+    let used = used.round().clamp(0.0, 100.0) as u8;
+    Some(ClaudeUsageWindow {
+        remaining_percent: 100 - used,
+        reset_context: value
+            .get("resets_at")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn api_scope_name(value: &Value) -> Option<String> {
+    value
+        .pointer("/scope/model/display_name")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
 }
 
 /// Scrape Claude Code `/usage` output for the two quota windows we display.
@@ -190,6 +252,7 @@ fn claude_program() -> &'static str {
 /// lines, markdown-ish tables, and the ACP metadata wording all show up in the
 /// wild), so the parser intentionally keys off semantic labels plus nearby
 /// percentage words rather than a single exact template.
+#[cfg(test)]
 pub fn parse(output: &str) -> Option<ClaudeUsageReport> {
     let stripped = strip_ansi(output);
     let lines = stripped
@@ -207,11 +270,13 @@ pub fn parse(output: &str) -> Option<ClaudeUsageReport> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum UsageWindowKind {
     FiveHour,
     Week,
 }
 
+#[cfg(test)]
 fn parse_window(lines: &[String], kind: UsageWindowKind) -> Option<ClaudeUsageWindow> {
     let mut fallback = None;
     let mut preferred = Vec::new();
@@ -244,6 +309,7 @@ fn parse_window(lines: &[String], kind: UsageWindowKind) -> Option<ClaudeUsageWi
         .or(fallback)
 }
 
+#[cfg(test)]
 fn reset_context(lines: &[String], start: usize, kind: UsageWindowKind) -> Option<String> {
     lines
         .iter()
@@ -253,6 +319,7 @@ fn reset_context(lines: &[String], start: usize, kind: UsageWindowKind) -> Optio
         .find_map(|line| reset_context_in_line(line))
 }
 
+#[cfg(test)]
 fn reset_context_in_line(line: &str) -> Option<String> {
     let lower = line.to_ascii_lowercase();
     let reset_start = lower.find("reset")?;
@@ -269,6 +336,7 @@ fn reset_context_in_line(line: &str) -> Option<String> {
     (!context.is_empty()).then(|| context.chars().take(96).collect())
 }
 
+#[cfg(test)]
 fn section_around(lines: &[String], start: usize, kind: UsageWindowKind) -> String {
     let mut section = String::new();
     if let Some(header) = lines[..start]
@@ -294,12 +362,14 @@ fn section_around(lines: &[String], start: usize, kind: UsageWindowKind) -> Stri
     section
 }
 
+#[cfg(test)]
 fn quota_percent_header(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("used")
         && (lower.contains("remaining") || lower.contains("left") || lower.contains("available"))
 }
 
+#[cfg(test)]
 fn preferred_window_line(line: &str, kind: UsageWindowKind) -> bool {
     if kind != UsageWindowKind::Week {
         return true;
@@ -314,10 +384,12 @@ fn preferred_window_line(line: &str, kind: UsageWindowKind) -> bool {
         || (!lower.contains('(') && !lower.contains("opus") && !lower.contains("sonnet"))
 }
 
+#[cfg(test)]
 fn matches_any_window(line: &str) -> bool {
     matches_window(line, UsageWindowKind::FiveHour) || matches_window(line, UsageWindowKind::Week)
 }
 
+#[cfg(test)]
 fn matches_window(line: &str, kind: UsageWindowKind) -> bool {
     let lower = line.to_ascii_lowercase();
     match kind {
@@ -341,6 +413,7 @@ fn matches_window(line: &str, kind: UsageWindowKind) -> bool {
     }
 }
 
+#[cfg(test)]
 fn parse_window_section(section: &str) -> Option<ClaudeUsageWindow> {
     let percents = percentages(section);
     if percents.is_empty() {
@@ -421,6 +494,7 @@ fn parse_window_section(section: &str) -> Option<ClaudeUsageWindow> {
     })
 }
 
+#[cfg(test)]
 fn classify_unparsed_output(output: &str) -> ClaudeUsageError {
     let lower = output.to_ascii_lowercase();
     if is_authentication_error(&lower) {
@@ -432,6 +506,7 @@ fn classify_unparsed_output(output: &str) -> ClaudeUsageError {
     }
 }
 
+#[cfg(test)]
 fn is_authentication_error(detail: &str) -> bool {
     let lower = detail.to_ascii_lowercase();
     [
@@ -448,12 +523,14 @@ fn is_authentication_error(detail: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 struct Percent {
     value: u8,
     start: usize,
     end: usize,
 }
 
+#[cfg(test)]
 fn percentages(text: &str) -> Vec<Percent> {
     let mut out = Vec::new();
     let mut iter = text.char_indices().peekable();
@@ -499,12 +576,14 @@ fn percentages(text: &str) -> Vec<Percent> {
     out
 }
 
+#[cfg(test)]
 fn context_for<'a>(lower: &'a str, percent: &Percent) -> &'a str {
     let start = lower_floor_char_boundary(lower, percent.start.saturating_sub(40));
     let end = lower_ceil_char_boundary(lower, (percent.end + 40).min(lower.len()));
     &lower[start..end]
 }
 
+#[cfg(test)]
 fn lower_floor_char_boundary(text: &str, mut idx: usize) -> usize {
     while idx > 0 && !text.is_char_boundary(idx) {
         idx -= 1;
@@ -512,6 +591,7 @@ fn lower_floor_char_boundary(text: &str, mut idx: usize) -> usize {
     idx
 }
 
+#[cfg(test)]
 fn lower_ceil_char_boundary(text: &str, mut idx: usize) -> usize {
     while idx < text.len() && !text.is_char_boundary(idx) {
         idx += 1;
@@ -519,6 +599,7 @@ fn lower_ceil_char_boundary(text: &str, mut idx: usize) -> usize {
     idx
 }
 
+#[cfg(test)]
 fn strip_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -537,6 +618,7 @@ fn strip_ansi(input: &str) -> String {
     out
 }
 
+#[cfg(test)]
 fn normalize_line(line: &str) -> String {
     line.chars()
         .filter(|ch| !ch.is_control())
@@ -708,6 +790,58 @@ mod tests {
         .expect("report");
 
         assert_eq!(report.week.unwrap().remaining_percent, 30);
+    }
+
+    #[test]
+    fn api_usage_uses_exhausted_fable_limit_over_overall_limit() {
+        let report = parse_api_usage(&serde_json::json!({
+            "limits": [
+                {
+                    "kind": "session",
+                    "percent": 13.0,
+                    "resets_at": "2026-08-18T23:30:00Z"
+                },
+                {
+                    "kind": "weekly_all",
+                    "percent": 96.0,
+                    "resets_at": "2026-08-19T22:59:00Z"
+                },
+                {
+                    "kind": "weekly_scoped",
+                    "percent": 100.0,
+                    "resets_at": "2026-08-19T22:59:00Z",
+                    "scope": { "model": { "display_name": "Fable" } }
+                }
+            ]
+        }))
+        .expect("report");
+
+        assert_eq!(report.five_hour.unwrap().remaining_percent, 87);
+        let week = report.week.unwrap();
+        assert_eq!(week.remaining_percent, 0);
+        assert_eq!(week.reset_context.as_deref(), Some("2026-08-19T22:59:00Z"));
+    }
+
+    #[test]
+    fn api_usage_ignores_other_model_scoped_weekly_limits() {
+        let report = parse_api_usage(&serde_json::json!({
+            "limits": [
+                { "kind": "weekly_all", "percent": 40.0 },
+                {
+                    "kind": "weekly_scoped",
+                    "percent": 90.0,
+                    "scope": { "model": { "display_name": "Opus" } }
+                },
+                {
+                    "kind": "weekly_scoped",
+                    "percent": 50.0,
+                    "scope": { "model": { "display_name": "Fable" } }
+                }
+            ]
+        }))
+        .expect("report");
+
+        assert_eq!(report.week.unwrap().remaining_percent, 50);
     }
 
     #[test]
