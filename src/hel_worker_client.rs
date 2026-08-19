@@ -23,10 +23,11 @@ use crate::hel_elicitation::ElicitationResponse;
 use crate::hel_setup::harness_authentication_marker;
 use crate::hel_targets::CommandSpec;
 use crate::hel_worker::{
-    MAX_FRAME_BYTES, RELAY_EVENT_GENESIS_DIGEST, RELAY_PROTOCOL_VERSION, RelayCommand, RelayCursor,
-    RelayErrorCode, RelayEvent, RelayOperationalState, RelayProtocolError, RelayRequest,
-    RelayRequestEnvelope, RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload,
-    RelayVersionRange, validate_relay_event,
+    MAX_FRAME_BYTES, RELAY_EVENT_GENESIS_DIGEST, RELAY_MIN_PROTOCOL_VERSION,
+    RELAY_PROTOCOL_VERSION, RelayCommand, RelayCursor, RelayErrorCode, RelayEvent,
+    RelayOperationalState, RelayProtocolError, RelayRequest, RelayRequestEnvelope,
+    RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload, RelayVersionRange,
+    validate_relay_event,
 };
 
 const RELAY_RPC_TIMEOUT: Duration = Duration::from_secs(15);
@@ -190,9 +191,11 @@ impl RelayClient {
         if session_id != expected_session_id {
             bail!("relay belongs to session {session_id}, not {expected_session_id}");
         }
-        if negotiated != RELAY_PROTOCOL_VERSION {
+        if !RelayVersionRange::CURRENT.contains(negotiated) {
             bail!(
-                "relay negotiated unsupported protocol {negotiated}; this controller requires {RELAY_PROTOCOL_VERSION}"
+                "relay negotiated unsupported protocol {negotiated}; this controller supports {}-{}",
+                RELAY_MIN_PROTOCOL_VERSION,
+                RELAY_PROTOCOL_VERSION
             );
         }
         client.protocol_version = negotiated;
@@ -207,6 +210,10 @@ impl RelayClient {
 
     pub fn relay_version(&self) -> &str {
         &self.relay_version
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
     }
 
     pub fn latest_ordinal(&self) -> u64 {
@@ -434,13 +441,18 @@ impl RelayClient {
         elicitation_id: String,
         response: ElicitationResponse,
     ) -> Result<()> {
-        match self
-            .call(RelayRequest::RespondElicitation {
-                elicitation_id: elicitation_id.clone(),
-                response,
-            })
-            .await?
-        {
+        let request = RelayRequest::RespondElicitation {
+            elicitation_id: elicitation_id.clone(),
+            response,
+        };
+        if !request.supported_at(self.protocol_version) {
+            bail!(
+                "elicitation responses require relay protocol {}; this session negotiated {}",
+                request.minimum_protocol(),
+                self.protocol_version
+            );
+        }
+        match self.call(request).await? {
             RelayResponsePayload::ElicitationResolved {
                 elicitation_id: resolved,
             } if resolved == elicitation_id => Ok(()),
@@ -1079,6 +1091,84 @@ mod tests {
         assert_eq!(
             RelayVersionRange::CURRENT.negotiate(RelayVersionRange::CURRENT),
             Some(RELAY_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            RelayVersionRange::CURRENT.negotiate(RelayVersionRange { min: 1, max: 1 }),
+            Some(1)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn controller_accepts_negotiated_protocol_v1() {
+        let script = format!(
+            r#"python3 -c '
+import json, sys
+session = {session:?}
+req = json.loads(sys.stdin.readline())
+assert req["request"]["method"] == "hello"
+supported = req["request"]["params"]["supported"]
+assert supported["min"] <= 1 <= supported["max"]
+print(json.dumps({{
+    "request_id": req["request_id"],
+    "protocol_version": 1,
+    "result": "ok",
+    "payload": {{
+        "type": "hello",
+        "data": {{
+            "negotiated": 1,
+            "relay_version": "v1-fixture",
+            "session_id": session,
+        }},
+    }},
+}}), flush=True)
+sys.stdin.read()
+'"#,
+            session = SESSION_ID
+        );
+        let spec = CommandSpec::new("sh", ["-c", &script]).purpose("v1 relay fixture");
+        let client = RelayClient::connect_with_timeout(&spec, SESSION_ID, Duration::from_secs(5))
+            .await
+            .expect("protocol v1 hello must be accepted");
+        assert_eq!(client.protocol_version(), 1);
+        assert_eq!(client.relay_version(), "v1-fixture");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn controller_rejects_negotiated_protocol_outside_supported_range() {
+        let script = format!(
+            r#"python3 -c '
+import json, sys
+session = {session:?}
+req = json.loads(sys.stdin.readline())
+print(json.dumps({{
+    "request_id": req["request_id"],
+    "protocol_version": 3,
+    "result": "ok",
+    "payload": {{
+        "type": "hello",
+        "data": {{
+            "negotiated": 3,
+            "relay_version": "future",
+            "session_id": session,
+        }},
+    }},
+}}), flush=True)
+sys.stdin.read()
+'"#,
+            session = SESSION_ID
+        );
+        let spec = CommandSpec::new("sh", ["-c", &script]).purpose("future relay fixture");
+        let error = RelayClient::connect_with_timeout(&spec, SESSION_ID, Duration::from_secs(5))
+            .await
+            .err()
+            .expect("protocol 3 hello must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("negotiated unsupported protocol 3"),
+            "{error:#}"
         );
     }
 

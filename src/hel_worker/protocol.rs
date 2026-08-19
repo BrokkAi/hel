@@ -28,6 +28,10 @@ impl RelayVersionRange {
         max: RELAY_PROTOCOL_VERSION,
     };
 
+    pub const fn contains(self, version: u32) -> bool {
+        self.min <= version && version <= self.max
+    }
+
     pub fn negotiate(self, peer: Self) -> Option<u32> {
         let minimum = self.min.max(peer.min);
         let maximum = self.max.min(peer.max);
@@ -114,6 +118,43 @@ impl RelayRequest {
             Self::Compact { .. } => "compact",
             Self::RespondElicitation { .. } => "respond_elicitation",
         }
+    }
+
+    /// Oldest protocol that understands this method. Form answers landed in
+    /// protocol 2; every earlier durable method is still valid on protocol 1.
+    pub const fn minimum_protocol(&self) -> u32 {
+        match self {
+            Self::RespondElicitation { .. } => 2,
+            _ => RELAY_MIN_PROTOCOL_VERSION,
+        }
+    }
+
+    pub const fn supported_at(&self, protocol_version: u32) -> bool {
+        RelayVersionRange::CURRENT.contains(protocol_version)
+            && protocol_version >= self.minimum_protocol()
+    }
+}
+
+pub(crate) fn incompatible_request_protocol(protocol_version: u32) -> RelayResponseBody {
+    relay_error(
+        RelayErrorCode::IncompatibleProtocol,
+        format!(
+            "request uses protocol {protocol_version}, relay supports protocol {}-{}",
+            RELAY_MIN_PROTOCOL_VERSION, RELAY_PROTOCOL_VERSION
+        ),
+        false,
+        None,
+    )
+}
+
+pub fn incompatible_request_protocol_response(
+    request_id: String,
+    protocol_version: u32,
+) -> RelayResponseEnvelope {
+    RelayResponseEnvelope {
+        request_id,
+        protocol_version,
+        body: incompatible_request_protocol(protocol_version),
     }
 }
 
@@ -330,6 +371,94 @@ mod tests {
             request: RelayRequest::Hello {
                 controller_version: "old".into(),
                 supported: RelayVersionRange { min: 0, max: 0 },
+            },
+        });
+        assert!(matches!(
+            response.body,
+            RelayResponseBody::Error {
+                error: RelayProtocolError {
+                    code: RelayErrorCode::IncompatibleProtocol,
+                    retryable: false,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn current_range_overlaps_protocol_v1() {
+        let v1 = RelayVersionRange { min: 1, max: 1 };
+        let v2 = RelayVersionRange { min: 2, max: 2 };
+        assert_eq!(RelayVersionRange::CURRENT.negotiate(v1), Some(1));
+        assert_eq!(v1.negotiate(RelayVersionRange::CURRENT), Some(1));
+        assert_eq!(
+            RelayVersionRange::CURRENT.negotiate(RelayVersionRange::CURRENT),
+            Some(RELAY_PROTOCOL_VERSION)
+        );
+        assert_eq!(v1.negotiate(v2), None);
+        assert!(RelayVersionRange::CURRENT.contains(1));
+        assert!(RelayVersionRange::CURRENT.contains(2));
+        assert!(!RelayVersionRange::CURRENT.contains(0));
+        assert!(!RelayVersionRange::CURRENT.contains(3));
+        assert!(RelayRequest::Status.supported_at(1));
+        assert!(
+            !RelayRequest::RespondElicitation {
+                elicitation_id: String::new(),
+                response: crate::hel_elicitation::ElicitationResponse::Cancel,
+            }
+            .supported_at(1)
+        );
+    }
+
+    #[test]
+    fn hello_from_protocol_v1_controller_negotiates_v1() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let response = relay.handle(RelayRequestEnvelope {
+            request_id: "hello-v1".into(),
+            protocol_version: 1,
+            request: RelayRequest::Hello {
+                controller_version: "old".into(),
+                supported: RelayVersionRange { min: 1, max: 1 },
+            },
+        });
+        assert_eq!(response.protocol_version, 1);
+        match response.body {
+            RelayResponseBody::Ok {
+                payload: RelayResponsePayload::Hello { negotiated, .. },
+            } => assert_eq!(negotiated, 1),
+            other => panic!("expected a v1 hello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn protocol_v1_status_is_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let response = relay.handle(RelayRequestEnvelope {
+            request_id: "status-v1".into(),
+            protocol_version: 1,
+            request: RelayRequest::Status,
+        });
+        assert_eq!(response.protocol_version, 1);
+        assert!(matches!(
+            response.body,
+            RelayResponseBody::Ok {
+                payload: RelayResponsePayload::Status(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn protocol_v1_cannot_respond_to_elicitation_on_the_durable_relay() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        let response = relay.handle(RelayRequestEnvelope {
+            request_id: "elicit-v1".into(),
+            protocol_version: 1,
+            request: RelayRequest::RespondElicitation {
+                elicitation_id: "form-1".into(),
+                response: crate::hel_elicitation::ElicitationResponse::Cancel,
             },
         });
         assert!(matches!(

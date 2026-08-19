@@ -22,8 +22,8 @@ pub use journal::{RestoredRelaySeed, restored_relay_seed_path};
 pub use protocol::{
     RelayErrorCode, RelayErrorDetail, RelayProtocolError, RelayRequest, RelayRequestEnvelope,
     RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload, RelayVersionRange,
-    invalid_relay_request_response, read_relay_frame, serve_relay_json_lines,
-    unsupported_relay_method_response, write_relay_frame,
+    incompatible_request_protocol_response, invalid_relay_request_response, read_relay_frame,
+    serve_relay_json_lines, unsupported_relay_method_response, write_relay_frame,
 };
 pub(crate) use snapshot::truncate_start_with_marker;
 pub use snapshot::{
@@ -52,7 +52,7 @@ use journal::{
     RelayJournalSpan, open_relay_journal, persist_relay_snapshot, read_restored_relay_seed,
     visit_relay_journal_file,
 };
-use protocol::{relay_error, relay_protocol_error};
+use protocol::{incompatible_request_protocol, relay_error, relay_protocol_error};
 use snapshot::{
     HandledRelayCommand, RelayDispatchRecord, RelayDispatchState, RelaySnapshot,
     StoredQueuedRelayCommand, StoredQueuedRelayPayload, ensure_byte_budget,
@@ -86,10 +86,11 @@ const RELAY_TRUNCATION_FLOOR: usize = 4 * 1024;
 /// The private snapshot also has a hard ceiling so repeated accepted commands
 /// cannot grow the durable state file without bound between checkpoints.
 const RELAY_SNAPSHOT_BYTE_BUDGET: usize = 16 * 1024 * 1024;
-/// The first protocol for the durable ACP relay. There is deliberately no
-/// wire-level compatibility or negotiation with the retired worker protocol.
+/// Current durable ACP relay protocol. Peers that only speak an older
+/// version in [`RELAY_MIN_PROTOCOL_VERSION`]..=this range still connect.
+/// Protocol 0 is the retired pre-relay worker protocol and is rejected.
 pub const RELAY_PROTOCOL_VERSION: u32 = 2;
-pub const RELAY_MIN_PROTOCOL_VERSION: u32 = RELAY_PROTOCOL_VERSION;
+pub const RELAY_MIN_PROTOCOL_VERSION: u32 = 1;
 /// Digest for the empty relay event prefix (ordinal zero).
 pub const RELAY_EVENT_GENESIS_DIGEST: &str = crate::hel_archive::EVENT_FRONTIER_GENESIS_DIGEST;
 const RELAY_EVENT_DIGEST_DOMAIN: &[u8] = b"hel-relay-event-v1\0";
@@ -398,8 +399,11 @@ impl DurableRelay {
                 return Ok(relay_error(
                     RelayErrorCode::IncompatibleProtocol,
                     format!(
-                        "controller supports {}-{}, relay requires protocol {RELAY_PROTOCOL_VERSION}",
-                        supported.min, supported.max
+                        "controller supports {}-{}, relay supports protocol {}-{}",
+                        supported.min,
+                        supported.max,
+                        RELAY_MIN_PROTOCOL_VERSION,
+                        RELAY_PROTOCOL_VERSION
                     ),
                     false,
                     None,
@@ -413,16 +417,8 @@ impl DurableRelay {
                 },
             });
         }
-        if envelope.protocol_version != RELAY_PROTOCOL_VERSION {
-            return Ok(relay_error(
-                RelayErrorCode::IncompatibleProtocol,
-                format!(
-                    "request uses protocol {}, relay requires protocol {RELAY_PROTOCOL_VERSION}",
-                    envelope.protocol_version
-                ),
-                false,
-                None,
-            ));
+        if !envelope.request.supported_at(envelope.protocol_version) {
+            return Ok(incompatible_request_protocol(envelope.protocol_version));
         }
 
         let payload = match &envelope.request {

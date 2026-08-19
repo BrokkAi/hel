@@ -108,6 +108,7 @@ mod unix {
         ClaimedRelayCommand, DurableRelay, RELAY_PROTOCOL_VERSION, RelayCommand,
         RelayCommandOutcome, RelayErrorCode, RelayObservation, RelayProtocolError, RelayRequest,
         RelayRequestEnvelope, RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload,
+        incompatible_request_protocol_response,
     };
 
     pub(super) const ACP_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -973,22 +974,11 @@ mod unix {
         envelope: RelayRequestEnvelope,
         commands: Option<&mpsc::Sender<CommandRequest>>,
     ) -> RelayResponseEnvelope {
-        if envelope.protocol_version != RELAY_PROTOCOL_VERSION {
-            return RelayResponseEnvelope {
-                request_id: envelope.request_id,
-                protocol_version: envelope.protocol_version,
-                body: RelayResponseBody::Error {
-                    error: RelayProtocolError {
-                        code: RelayErrorCode::IncompatibleProtocol,
-                        message: format!(
-                            "request uses protocol {}, relay requires protocol {RELAY_PROTOCOL_VERSION}",
-                            envelope.protocol_version
-                        ),
-                        retryable: false,
-                        detail: None,
-                    },
-                },
-            };
+        if !envelope.request.supported_at(envelope.protocol_version) {
+            return incompatible_request_protocol_response(
+                envelope.request_id,
+                envelope.protocol_version,
+            );
         }
         let RelayRequest::Compact { prompt } = envelope.request else {
             unreachable!("compaction_response only serves compact requests");
@@ -1052,57 +1042,52 @@ mod unix {
         envelope: RelayRequestEnvelope,
         commands: Option<&mpsc::Sender<CommandRequest>>,
     ) -> RelayResponseEnvelope {
+        if !envelope.request.supported_at(envelope.protocol_version) {
+            return incompatible_request_protocol_response(
+                envelope.request_id,
+                envelope.protocol_version,
+            );
+        }
         let protocol_version = envelope.protocol_version;
         let request_id = envelope.request_id;
-        let body = if protocol_version != RELAY_PROTOCOL_VERSION {
-            compaction_error(
-                RelayErrorCode::IncompatibleProtocol,
-                &format!(
-                    "request uses protocol {protocol_version}, relay requires protocol {RELAY_PROTOCOL_VERSION}"
-                ),
-            )
-        } else {
-            let RelayRequest::RespondElicitation {
-                elicitation_id,
-                response,
-            } = envelope.request
-            else {
-                unreachable!("elicitation_response only serves form answers")
-            };
-            match commands {
-                None => compaction_error(
-                    RelayErrorCode::InvalidState,
-                    "session is closed; no ACP runtime can answer the elicitation",
-                ),
-                Some(commands) => {
-                    let (resolved, resolution) = tokio::sync::oneshot::channel();
-                    match commands
-                        .send(CommandRequest::ResolveElicitation {
-                            elicitation_id: elicitation_id.clone(),
-                            response,
-                            resolved,
-                        })
-                        .await
-                    {
-                        Ok(()) => match resolution.await {
-                            Ok(Ok(())) => RelayResponseBody::Ok {
-                                payload: RelayResponsePayload::ElicitationResolved {
-                                    elicitation_id,
-                                },
-                            },
-                            Ok(Err(message)) => {
-                                compaction_error(RelayErrorCode::InvalidState, &message)
-                            }
-                            Err(_) => compaction_error(
-                                RelayErrorCode::Internal,
-                                "ACP runtime stopped before resolving the elicitation",
-                            ),
+        let RelayRequest::RespondElicitation {
+            elicitation_id,
+            response,
+        } = envelope.request
+        else {
+            unreachable!("elicitation_response only serves form answers")
+        };
+        let body = match commands {
+            None => compaction_error(
+                RelayErrorCode::InvalidState,
+                "session is closed; no ACP runtime can answer the elicitation",
+            ),
+            Some(commands) => {
+                let (resolved, resolution) = tokio::sync::oneshot::channel();
+                match commands
+                    .send(CommandRequest::ResolveElicitation {
+                        elicitation_id: elicitation_id.clone(),
+                        response,
+                        resolved,
+                    })
+                    .await
+                {
+                    Ok(()) => match resolution.await {
+                        Ok(Ok(())) => RelayResponseBody::Ok {
+                            payload: RelayResponsePayload::ElicitationResolved { elicitation_id },
                         },
+                        Ok(Err(message)) => {
+                            compaction_error(RelayErrorCode::InvalidState, &message)
+                        }
                         Err(_) => compaction_error(
                             RelayErrorCode::Internal,
-                            "ACP runtime stopped before accepting the elicitation answer",
+                            "ACP runtime stopped before resolving the elicitation",
                         ),
-                    }
+                    },
+                    Err(_) => compaction_error(
+                        RelayErrorCode::Internal,
+                        "ACP runtime stopped before accepting the elicitation answer",
+                    ),
                 }
             }
         };
@@ -1120,22 +1105,11 @@ mod unix {
         envelope: RelayRequestEnvelope,
         credentials: &std::result::Result<CredentialEndpoint, String>,
     ) -> RelayResponseEnvelope {
-        if envelope.protocol_version != RELAY_PROTOCOL_VERSION {
-            return RelayResponseEnvelope {
-                request_id: envelope.request_id,
-                protocol_version: envelope.protocol_version,
-                body: RelayResponseBody::Error {
-                    error: RelayProtocolError {
-                        code: RelayErrorCode::IncompatibleProtocol,
-                        message: format!(
-                            "request uses protocol {}, relay requires protocol {RELAY_PROTOCOL_VERSION}",
-                            envelope.protocol_version
-                        ),
-                        retryable: false,
-                        detail: None,
-                    },
-                },
-            };
+        if !envelope.request.supported_at(envelope.protocol_version) {
+            return incompatible_request_protocol_response(
+                envelope.request_id,
+                envelope.protocol_version,
+            );
         }
         let body = match credentials {
             Err(message) => RelayResponseBody::Error {
@@ -2024,6 +1998,92 @@ mod relay_tests {
             serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         let RelayResponseBody::Error { error } = response.body else {
             panic!("an incompatible protocol cannot compact");
+        };
+        assert_eq!(error.code, RelayErrorCode::IncompatibleProtocol);
+        assert!(commands_rx.try_recv().is_err());
+
+        drop(writer);
+        drop(lines);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn protocol_v1_can_compact() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path().join("relay"), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(unix::serve_client(
+            server,
+            relay,
+            wake_tx,
+            test_credentials(),
+            None,
+            fatal_reports().0,
+        ));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let request = RelayRequestEnvelope {
+            request_id: "compact-v1".into(),
+            protocol_version: 1,
+            request: RelayRequest::Compact {
+                prompt: "summarize".into(),
+            },
+        };
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+
+        let response: RelayResponseEnvelope =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let RelayResponseBody::Error { error } = response.body else {
+            panic!("expected a closed-session compact error, got {response:?}");
+        };
+        assert_eq!(error.code, RelayErrorCode::InvalidState);
+        assert!(error.message.contains("session is closed"), "{error:?}");
+
+        drop(writer);
+        drop(lines);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn protocol_v1_cannot_respond_to_elicitation() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path().join("relay"), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let (commands_tx, mut commands_rx) = mpsc::channel(1);
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(unix::serve_client(
+            server,
+            relay,
+            wake_tx,
+            test_credentials(),
+            Some(commands_tx),
+            fatal_reports().0,
+        ));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let request = RelayRequestEnvelope {
+            request_id: "elicit-v1".into(),
+            protocol_version: 1,
+            request: RelayRequest::RespondElicitation {
+                elicitation_id: "form-1".into(),
+                response: crate::hel_elicitation::ElicitationResponse::Cancel,
+            },
+        };
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+
+        let response: RelayResponseEnvelope =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let RelayResponseBody::Error { error } = response.body else {
+            panic!("protocol v1 must not answer elicitations, got {response:?}");
         };
         assert_eq!(error.code, RelayErrorCode::IncompatibleProtocol);
         assert!(commands_rx.try_recv().is_err());
