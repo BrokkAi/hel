@@ -552,6 +552,21 @@ impl DashboardContext {
         );
     }
 
+    /// Drops the warm chat when it belongs to `session_id`.
+    ///
+    /// Pause and destroy retire that session's actor. Resume starts a new one,
+    /// often on a different profile. Keeping the old view would redraw a
+    /// Closing/Closed snapshot and refuse prompts.
+    pub(crate) fn drop_warm_chat_for(&mut self, session_id: &str) {
+        if self
+            .active_chat
+            .as_ref()
+            .is_some_and(|chat| chat.session_id() == session_id)
+        {
+            self.active_chat = None;
+        }
+    }
+
     /// Opens or reveals the chat for `session_id`, reporting a failure as a
     /// notice rather than ending the run.
     pub(crate) async fn hold_chat_session(&mut self, session_id: &str) -> Result<(), ()> {
@@ -1066,6 +1081,10 @@ async fn open_chat_view(
 /// Makes `session_id` the chat the loop holds. A warm chat for the same
 /// session is left as it is, so showing it costs a draw; any other session is
 /// opened fresh, which drops the previous chat and detaches its proxy.
+///
+/// A warm chat whose session actor has already been retired is not reused.
+/// Pause closes that actor after sealing the worker, and the view keeps the
+/// Closing/Closed snapshot; reopening attaches to the worker resume started.
 async fn hold_chat_session(
     controller: &Controller,
     active_chat: &mut Option<hel::hel_chat::ActiveChat>,
@@ -1076,10 +1095,10 @@ async fn hold_chat_session(
 ) -> Result<()> {
     if active_chat
         .as_ref()
-        .is_some_and(|chat| chat.session_id() == session_id)
+        .is_some_and(|chat| chat.session_id() == session_id && chat.session_feed_open())
     {
-        // The warm chat is this session: it has been following the worker off
-        // screen, so showing it is only a redraw.
+        // The warm chat is this session and still follows its worker, so
+        // showing it is only a redraw.
         return Ok(());
     }
     let chat = open_chat_view(controller, session_id, sessions, recovery_observer, notices).await?;

@@ -705,6 +705,16 @@ impl ActiveChat {
         self.session.session_id()
     }
 
+    /// Whether this view is still attached to a live session actor.
+    ///
+    /// Pause, destroy, and a replaced target retire the actor and close this
+    /// feed. A warm chat whose feed is closed still holds the last snapshot,
+    /// including a Closing/Closed phase, so the dashboard must open a new view
+    /// instead of redrawing this one.
+    pub fn session_feed_open(&self) -> bool {
+        self.session_open
+    }
+
     /// The composer's current text. The dashboard saves this on detach so
     /// unsent input survives a quit or a crash while the view is off screen.
     pub fn draft(&self) -> &str {
@@ -1479,6 +1489,18 @@ mod tests {
             chat.notice().as_deref(),
             Some("connection lost: session manager stopped")
         );
+    }
+
+    #[test]
+    fn retiring_the_session_feed_keeps_a_closing_phase_in_place() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        chat.phase = WorkerPhase::Closed;
+
+        assert!(!apply_session_view(
+            &mut chat,
+            Err(anyhow::anyhow!("session manager stopped"))
+        ));
+        assert_eq!(chat.phase(), WorkerPhase::Closed);
     }
 
     #[test]
