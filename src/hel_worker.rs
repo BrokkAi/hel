@@ -25,6 +25,7 @@ pub use protocol::{
     incompatible_request_protocol_response, invalid_relay_request_response, read_relay_frame,
     serve_relay_json_lines, unsupported_relay_method_response, write_relay_frame,
 };
+#[cfg(unix)]
 pub(crate) use snapshot::truncate_start_with_marker;
 pub use snapshot::{
     ActiveRelayPrompt, ClaimedRelayCommand, QueuedRelayPrompt, RelayCommand, RelayCommandKind,
