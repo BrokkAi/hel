@@ -1163,10 +1163,11 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
                     quota_reset_summary(quota),
                 ),
                 Some(quota) => (
-                    Line::raw(format!(
-                        "unavailable: {}",
-                        quota.error.as_deref().unwrap_or("unknown error")
-                    )),
+                    Line::raw(
+                        quota
+                            .error_label()
+                            .unwrap_or_else(|| "unavailable: unknown error".into()),
+                    ),
                     Line::default(),
                     String::new(),
                 ),
@@ -2745,6 +2746,39 @@ mod tests {
         assert!(!rendered.contains("Refreshed"));
         assert!(!rendered.contains("Access"));
         assert!(!rendered.contains("agent-full-access"));
+    }
+
+    #[test]
+    fn quota_render_shows_login_expired_without_unavailable_prefix() {
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState::default(),
+            BTreeMap::from([(
+                "claude-1".into(),
+                ProfileQuota {
+                    profile_id: "claude-1".into(),
+                    harness: HarnessKind::Claude,
+                    windows: vec![],
+                    extra: None,
+                    error: Some("login expired".into()),
+                    refreshed_at_epoch_seconds: 1,
+                },
+            )]),
+        );
+        let backend = TestBackend::new(120, 28);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("login expired"));
+        assert!(!rendered.contains("unavailable: login expired"));
     }
 
     #[test]

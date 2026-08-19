@@ -14,6 +14,9 @@ use serde_json::Value;
 const USAGE_TIMEOUT: Duration = Duration::from_secs(20);
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
+/// Quota-row copy when the stored Claude OAuth access token is past `expiresAt`.
+pub(crate) const LOGIN_EXPIRED: &str = "login expired";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(test)]
 pub enum ClaudeUsageStatus {
@@ -81,6 +84,7 @@ pub enum ClaudeUsageError {
     #[cfg(test)]
     NotInstalled,
     NotSignedIn,
+    LoginExpired,
     #[cfg(test)]
     Launch(String),
     Query(String),
@@ -101,6 +105,7 @@ impl ClaudeUsageError {
             Self::TimedOut => "request timed out",
             Self::NotInstalled => "Claude Code not installed",
             Self::NotSignedIn => "not signed in",
+            Self::LoginExpired => LOGIN_EXPIRED,
             Self::Launch(_) => "could not launch Claude Code",
             Self::Query(_) => "could not query Claude usage",
             Self::Exit { detail, .. } if is_authentication_error(detail) => "not signed in",
@@ -118,6 +123,7 @@ impl fmt::Display for ClaudeUsageError {
             #[cfg(test)]
             Self::NotInstalled => write!(f, "Claude Code executable not found"),
             Self::NotSignedIn => write!(f, "Claude Code is not signed in"),
+            Self::LoginExpired => write!(f, "{LOGIN_EXPIRED}"),
             #[cfg(test)]
             Self::Launch(error) => write!(f, "run claude /usage: {error}"),
             Self::Query(error) => write!(f, "query Claude usage: {error}"),
@@ -145,12 +151,7 @@ pub async fn query(home: PathBuf) -> Result<ClaudeUsageReport, ClaudeUsageError>
         .map_err(|_| ClaudeUsageError::NotSignedIn)?;
     let credentials: Value =
         serde_json::from_slice(&credentials).map_err(|_| ClaudeUsageError::NotSignedIn)?;
-    let token = credentials
-        .get("claudeAiOauth")
-        .and_then(|oauth| oauth.get("accessToken"))
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty())
-        .ok_or(ClaudeUsageError::NotSignedIn)?;
+    let token = oauth_access_token(&credentials, crate::clock::epoch_millis())?;
     let client = reqwest::Client::builder()
         .timeout(USAGE_TIMEOUT)
         .build()
@@ -169,7 +170,7 @@ pub async fn query(home: PathBuf) -> Result<ClaudeUsageReport, ClaudeUsageError>
             }
         })?;
     if matches!(response.status().as_u16(), 401 | 403) {
-        return Err(ClaudeUsageError::NotSignedIn);
+        return Err(ClaudeUsageError::LoginExpired);
     }
     if !response.status().is_success() {
         return Err(ClaudeUsageError::Query(format!(
@@ -182,6 +183,29 @@ pub async fn query(home: PathBuf) -> Result<ClaudeUsageReport, ClaudeUsageError>
         .await
         .map_err(|error| ClaudeUsageError::Query(error.to_string()))?;
     parse_api_usage(&payload).ok_or(ClaudeUsageError::Parse)
+}
+
+fn oauth_access_token(credentials: &Value, now_ms: i64) -> Result<&str, ClaudeUsageError> {
+    let oauth = credentials
+        .get("claudeAiOauth")
+        .ok_or(ClaudeUsageError::NotSignedIn)?;
+    let token = oauth
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or(ClaudeUsageError::NotSignedIn)?;
+    if oauth_expires_at(oauth).is_some_and(|expires_at| expires_at <= now_ms) {
+        return Err(ClaudeUsageError::LoginExpired);
+    }
+    Ok(token)
+}
+
+fn oauth_expires_at(oauth: &Value) -> Option<i64> {
+    let value = oauth.get("expiresAt")?;
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|ms| i64::try_from(ms).ok()))
+        .or_else(|| value.as_str()?.parse().ok())
 }
 
 fn parse_api_usage(payload: &Value) -> Option<ClaudeUsageReport> {
@@ -877,6 +901,7 @@ mod tests {
             "Claude Code not installed"
         );
         assert_eq!(ClaudeUsageError::NotSignedIn.user_reason(), "not signed in");
+        assert_eq!(ClaudeUsageError::LoginExpired.user_reason(), LOGIN_EXPIRED);
         assert_eq!(
             ClaudeUsageError::Launch("permission denied".to_string()).user_reason(),
             "could not launch Claude Code"
@@ -914,5 +939,63 @@ mod tests {
             ClaudeUsageError::NotSignedIn
         );
         assert_eq!(classify_unparsed_output("hello"), ClaudeUsageError::Parse);
+    }
+
+    #[test]
+    fn expired_oauth_access_token_is_login_expired() {
+        let credentials = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-test",
+                "expiresAt": 1_000
+            }
+        });
+        assert_eq!(
+            oauth_access_token(&credentials, 1_001),
+            Err(ClaudeUsageError::LoginExpired)
+        );
+        assert_eq!(
+            oauth_access_token(&credentials, 1_000),
+            Err(ClaudeUsageError::LoginExpired)
+        );
+    }
+
+    #[test]
+    fn current_oauth_access_token_is_usable() {
+        let credentials = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-test",
+                "expiresAt": 2_000
+            }
+        });
+        assert_eq!(
+            oauth_access_token(&credentials, 1_999).expect("token"),
+            "sk-ant-oat01-test"
+        );
+    }
+
+    #[test]
+    fn oauth_access_token_without_expiry_is_usable() {
+        let credentials = serde_json::json!({
+            "claudeAiOauth": { "accessToken": "sk-ant-oat01-test" }
+        });
+        assert_eq!(
+            oauth_access_token(&credentials, 9_000).expect("token"),
+            "sk-ant-oat01-test"
+        );
+    }
+
+    #[test]
+    fn missing_oauth_access_token_is_not_signed_in() {
+        assert_eq!(
+            oauth_access_token(&serde_json::json!({}), 1),
+            Err(ClaudeUsageError::NotSignedIn)
+        );
+        assert_eq!(
+            oauth_access_token(
+                &serde_json::json!({ "claudeAiOauth": { "accessToken": "" } }),
+                1
+            ),
+            Err(ClaudeUsageError::NotSignedIn)
+        );
     }
 }

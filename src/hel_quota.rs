@@ -67,7 +67,7 @@ impl ProfileQuota {
 
     pub fn compact(&self) -> String {
         if let Some(error) = &self.error {
-            return format!("unavailable: {error}");
+            return quota_error_label(error);
         }
         let mut seen_resets = BTreeSet::new();
         let mut parts = self
@@ -101,6 +101,18 @@ impl ProfileQuota {
         } else {
             parts.join(" · ")
         }
+    }
+
+    pub fn error_label(&self) -> Option<String> {
+        self.error.as_deref().map(quota_error_label)
+    }
+}
+
+fn quota_error_label(error: &str) -> String {
+    if error == claude_usage::LOGIN_EXPIRED {
+        claude_usage::LOGIN_EXPIRED.to_string()
+    } else {
+        format!("unavailable: {error}")
     }
 }
 
@@ -757,6 +769,39 @@ mod tests {
     }
 
     #[test]
+    fn compact_shows_login_expired_without_unavailable_prefix() {
+        let report = ProfileQuota {
+            profile_id: "claude2".into(),
+            harness: HarnessKind::Claude,
+            windows: vec![],
+            extra: None,
+            error: Some(claude_usage::LOGIN_EXPIRED.into()),
+            refreshed_at_epoch_seconds: 0,
+        };
+        assert_eq!(report.compact(), claude_usage::LOGIN_EXPIRED);
+        assert_eq!(
+            report.error_label().as_deref(),
+            Some(claude_usage::LOGIN_EXPIRED)
+        );
+    }
+
+    #[test]
+    fn compact_still_prefixes_other_errors_with_unavailable() {
+        let report = ProfileQuota {
+            profile_id: "claude2".into(),
+            harness: HarnessKind::Claude,
+            windows: vec![],
+            extra: None,
+            error: Some("query Claude usage: HTTP 429".into()),
+            refreshed_at_epoch_seconds: 0,
+        };
+        assert_eq!(
+            report.compact(),
+            "unavailable: query Claude usage: HTTP 429"
+        );
+    }
+
+    #[test]
     fn compact_displays_a_shared_reset_once() {
         let report = ProfileQuota {
             profile_id: "codex-1".into(),
@@ -880,6 +925,40 @@ mod tests {
             report.error.as_deref(),
             Some("Grok Build executable not found")
         );
+    }
+
+    #[tokio::test]
+    async fn expired_claude_credentials_report_login_expired() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join(".credentials.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "sk-ant-oat01-expired",
+                    "refreshToken": "refresh",
+                    "expiresAt": 1,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (report, _) = refresh_profile(
+            QuotaRefreshRequest {
+                profile_id: "claude2".into(),
+                harness: HarnessKind::Claude,
+                source_home: directory.path().to_path_buf(),
+                executable: None,
+                environment: BTreeMap::new(),
+                cwd: directory.path().to_path_buf(),
+            },
+            None,
+        )
+        .await;
+
+        assert!(report.windows.is_empty());
+        assert_eq!(report.error.as_deref(), Some(claude_usage::LOGIN_EXPIRED));
+        assert_eq!(report.compact(), claude_usage::LOGIN_EXPIRED);
     }
 
     #[test]
