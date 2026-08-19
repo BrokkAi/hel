@@ -35,7 +35,7 @@ use hel_tui::DashboardState;
 use crate::dashboard::io::DashboardIoUpdate;
 use crate::short_id;
 
-const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub(crate) const RESOURCE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const RESOURCE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const CAPACITY_POLL_INTERVAL: Duration = Duration::from_secs(30);
