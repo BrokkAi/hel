@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
@@ -222,10 +223,25 @@ pub async fn run(
 }
 
 async fn run_inner(
-    spec: LaunchSpec,
-    requests: mpsc::Receiver<CommandRequest>,
+    mut spec: LaunchSpec,
+    mut requests: mpsc::Receiver<CommandRequest>,
     events: mpsc::Sender<RuntimeEvent>,
 ) -> Result<()> {
+    loop {
+        match run_bridge(&spec, &mut requests, &events).await? {
+            None => return Ok(()),
+            Some(native_session_id) => spec.resume_session = Some(native_session_id),
+        }
+    }
+}
+
+/// Run one ACP bridge process. `Some(native_session_id)` means cancel was not
+/// acknowledged and the caller should load that session on a fresh bridge.
+async fn run_bridge(
+    spec: &LaunchSpec,
+    requests: &mut mpsc::Receiver<CommandRequest>,
+    events: &mpsc::Sender<RuntimeEvent>,
+) -> Result<Option<String>> {
     let mut child = Command::new(&spec.command)
         .args(&spec.args)
         .envs(&spec.environment)
@@ -249,7 +265,7 @@ async fn run_inner(
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
 
     let (mut result, child_reaped) = {
-        let drive = drive(transport, spec, requests, events.clone());
+        let drive = drive(transport, spec.clone(), requests, events.clone());
         tokio::pin!(drive);
         tokio::select! {
             biased;
@@ -266,52 +282,59 @@ async fn run_inner(
             }
         }
     };
+    let restarting = matches!(&result, Ok(Some(_)));
     // Dropping the transport closes the supervisor's stdin. Give it time to
     // terminate and reap the complete bridge process group before killing the
-    // supervisor itself as a last resort.
+    // supervisor itself as a last resort. A planned restart already decided
+    // to kill the child, so a non-zero exit is the expected outcome.
     if !child_reaped {
-        let cleanup =
-            match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
-                Ok(Ok(status)) if status.success() => Ok(()),
-                Ok(Ok(status)) => Err(anyhow!(
-                    "ACP bridge exited with {status} after the protocol runtime completed"
-                )),
-                Ok(Err(error)) => Err(error).context("wait for ACP bridge shutdown"),
-                Err(_) => {
-                    let killed = child.kill().await.context("kill unresponsive ACP bridge");
-                    let waited = child
-                        .wait()
-                        .await
-                        .context("reap killed ACP bridge")
-                        .map(|_| ());
-                    match (killed, waited) {
-                        (Ok(()), Ok(())) => Ok(()),
-                        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-                        (Err(error), Err(wait_error)) => Err(error.context(format!(
-                            "also failed to reap killed ACP bridge: {wait_error:#}"
-                        ))),
+        if restarting {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        } else {
+            let cleanup =
+                match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
+                    Ok(Ok(status)) if status.success() => Ok(()),
+                    Ok(Ok(status)) => Err(anyhow!(
+                        "ACP bridge exited with {status} after the protocol runtime completed"
+                    )),
+                    Ok(Err(error)) => Err(error).context("wait for ACP bridge shutdown"),
+                    Err(_) => {
+                        let killed = child.kill().await.context("kill unresponsive ACP bridge");
+                        let waited = child
+                            .wait()
+                            .await
+                            .context("reap killed ACP bridge")
+                            .map(|_| ());
+                        match (killed, waited) {
+                            (Ok(()), Ok(())) => Ok(()),
+                            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                            (Err(error), Err(wait_error)) => Err(error.context(format!(
+                                "also failed to reap killed ACP bridge: {wait_error:#}"
+                            ))),
+                        }
                     }
-                }
-            };
-        if let Err(error) = cleanup {
-            merge_runtime_error(&mut result, error);
+                };
+            if let Err(error) = cleanup {
+                merge_drive_error(&mut result, error);
+            }
         }
     }
     let stderr_tail = match stderr_task.await {
         Ok(Ok(tail)) => tail,
         Ok(Err(error)) => {
-            merge_runtime_error(&mut result, error);
+            merge_drive_error(&mut result, error);
             String::new()
         }
         Err(error) => {
-            merge_runtime_error(
+            merge_drive_error(
                 &mut result,
                 anyhow!("ACP stderr collector task failed: {error}"),
             );
             String::new()
         }
     };
-    if let Some(stderr_tail) = actionable_stderr_tail(&stderr_tail) {
+    if !restarting && let Some(stderr_tail) = actionable_stderr_tail(&stderr_tail) {
         result =
             result.map_err(|error| error.context(format!("ACP bridge stderr:\n{stderr_tail}")));
     }
@@ -415,10 +438,10 @@ fn relay_event_channel_error() -> agent_client_protocol::Error {
     ))
 }
 
-fn merge_runtime_error(result: &mut Result<()>, additional: anyhow::Error) {
-    let previous = std::mem::replace(result, Ok(()));
+fn merge_drive_error(result: &mut Result<Option<String>>, additional: anyhow::Error) {
+    let previous = std::mem::replace(result, Ok(None));
     *result = match previous {
-        Ok(()) => Err(additional),
+        Ok(_) => Err(additional),
         Err(error) => Err(error.context(format!("additional ACP runtime error: {additional:#}"))),
     };
 }
@@ -443,12 +466,20 @@ async fn read_stderr_tail(mut stderr: tokio::process::ChildStderr) -> Result<Str
     Ok(String::from_utf8_lossy(&tail).trim().to_owned())
 }
 
+/// How long a `session/cancel` may take to settle `session/prompt` before Hel
+/// kills the bridge and reloads the native session. A cooperative cancel can
+/// flush thinking; this bound is for the case that never acks.
+const CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(60);
+
+const CANCEL_UNACKED_WARNING: &str =
+    "cancel was not acknowledged within 60s; restarting the harness";
+
 async fn drive<T>(
     transport: T,
     spec: LaunchSpec,
-    mut requests: mpsc::Receiver<CommandRequest>,
+    requests: &mut mpsc::Receiver<CommandRequest>,
     events: mpsc::Sender<RuntimeEvent>,
-) -> Result<()>
+) -> Result<Option<String>>
 where
     T: ConnectTo<Client>,
 {
@@ -475,6 +506,8 @@ where
     // A terminal runs where the session runs unless the agent names a
     // directory of its own.
     let session_cwd = spec.cwd.clone();
+    let restart = Arc::new(Mutex::new(None));
+    let restart_slot = restart.clone();
     Client
         .builder()
         .on_receive_notification(
@@ -779,20 +812,25 @@ where
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
-            drive_connection(
+            match drive_connection(
                 connection,
                 &spec,
-                &mut requests,
+                requests,
                 &events,
                 scratch_outputs,
                 terminals,
                 session_elicitations,
             )
             .await
-            .map_err(|error| {
-                agent_client_protocol::Error::internal_error()
-                    .data(serde_json::Value::String(format!("{error:#}")))
-            })
+            {
+                Ok(native_session_id) => {
+                    *restart_slot.lock().expect("ACP restart slot lock poisoned") =
+                        native_session_id;
+                    Ok(())
+                }
+                Err(error) => Err(agent_client_protocol::Error::internal_error()
+                    .data(serde_json::Value::String(format!("{error:#}")))),
+            }
         })
         .await
         .map_err(|error| {
@@ -800,7 +838,11 @@ where
                 "ACP protocol failed: {error}; bridge stdout must contain only JSON-RPC frames \
                  and login-shell startup must be silent"
             )
-        })
+        })?;
+    Ok(restart
+        .lock()
+        .expect("ACP restart slot lock poisoned")
+        .take())
 }
 
 /// Grok Build speaks an older ACP dialect. It never returns `configOptions`,
@@ -1056,7 +1098,7 @@ async fn drive_connection(
     scratch_outputs: Arc<Mutex<BTreeMap<String, String>>>,
     terminals: TerminalRegistry,
     pending_elicitations: PendingElicitations,
-) -> Result<()> {
+) -> Result<Option<String>> {
     // Terminals belong to the connection. However the session ends — closed,
     // failed, or with its command channel dropped — their process groups must
     // not outlive it.
@@ -1066,6 +1108,7 @@ async fn drive_connection(
         requests,
         events,
         scratch_outputs,
+        &terminals,
         &pending_elicitations,
     )
     .await;
@@ -1077,14 +1120,46 @@ async fn drive_connection(
     result
 }
 
+async fn apply_cancel(
+    connection: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    cancel_id: String,
+    events: &mpsc::Sender<RuntimeEvent>,
+    terminals: &TerminalRegistry,
+) -> Result<()> {
+    terminals.kill_live();
+    match connection.send_notification(CancelNotification::new(session_id.clone())) {
+        Ok(()) => {
+            emit_runtime_event(
+                events,
+                RuntimeEvent::CancelApplied {
+                    request_id: cancel_id,
+                },
+            )
+            .await
+        }
+        Err(error) => {
+            emit_runtime_event(
+                events,
+                RuntimeEvent::CommandRejected {
+                    request_id: cancel_id,
+                    message: format!("cancel ACP prompt: {error}"),
+                },
+            )
+            .await
+        }
+    }
+}
+
 async fn serve_session(
     connection: &ConnectionTo<Agent>,
     spec: &LaunchSpec,
     requests: &mut mpsc::Receiver<CommandRequest>,
     events: &mpsc::Sender<RuntimeEvent>,
     scratch_outputs: Arc<Mutex<BTreeMap<String, String>>>,
+    terminals: &TerminalRegistry,
     pending_elicitations: &PendingElicitations,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let mut meta = serde_json::Map::new();
     meta.insert("terminal_output".into(), serde_json::Value::Bool(true));
     // Kimi routes every shell call through the client's terminal surface and
@@ -1245,6 +1320,7 @@ async fn serve_session(
                     .send_request(PromptRequest::new(session_id.clone(), prompt))
                     .block_task();
                 tokio::pin!(prompt);
+                let mut cancel_deadline = None;
                 loop {
                     tokio::select! {
                         response = &mut prompt => {
@@ -1274,28 +1350,42 @@ async fn serve_session(
                             .await?;
                             break;
                         }
+                        _ = async {
+                            tokio::time::sleep_until(
+                                cancel_deadline.expect("cancel deadline branch is guarded"),
+                            )
+                            .await;
+                        }, if cancel_deadline.is_some() => {
+                            emit_runtime_event(
+                                events,
+                                RuntimeEvent::Warning {
+                                    message: CANCEL_UNACKED_WARNING.to_owned(),
+                                },
+                            )
+                            .await?;
+                            emit_runtime_event(
+                                events,
+                                RuntimeEvent::CommandInterrupted {
+                                    request_id,
+                                    message: CANCEL_UNACKED_WARNING.to_owned(),
+                                },
+                            )
+                            .await?;
+                            return Ok(Some(session_id.to_string()));
+                        }
                         command = requests.recv() => match command {
                             Some(CommandRequest::Cancel { request_id: cancel_id }) => {
-                                match connection.send_notification(CancelNotification::new(session_id.clone())) {
-                                    Ok(()) => {
-                                        emit_runtime_event(
-                                            events,
-                                            RuntimeEvent::CancelApplied {
-                                                request_id: cancel_id,
-                                            },
-                                        )
-                                        .await?;
-                                    }
-                                    Err(error) => {
-                                        emit_runtime_event(
-                                            events,
-                                            RuntimeEvent::CommandRejected {
-                                                request_id: cancel_id,
-                                                message: format!("cancel ACP prompt: {error}"),
-                                            },
-                                        )
-                                        .await?;
-                                    }
+                                apply_cancel(
+                                    connection,
+                                    &session_id,
+                                    cancel_id,
+                                    events,
+                                    terminals,
+                                )
+                                .await?;
+                                if cancel_deadline.is_none() {
+                                    cancel_deadline =
+                                        Some(tokio::time::Instant::now() + CANCEL_ACK_TIMEOUT);
                                 }
                             }
                             Some(CommandRequest::Close { request_id: close_id }) => {
@@ -1341,7 +1431,7 @@ async fn serve_session(
                                         .await?;
                                     }
                                 }
-                                return Ok(());
+                                return Ok(None);
                             }
                             None => {
                                 let cancellation = connection
@@ -1355,7 +1445,7 @@ async fn serve_session(
                                 )
                                 .await?;
                                 cancellation.context("cancel ACP prompt during runtime shutdown")?;
-                                return Ok(());
+                                return Ok(None);
                             }
                             Some(CommandRequest::Prompt { request_id, .. }) => {
                                 emit_runtime_event(
@@ -1504,27 +1594,14 @@ async fn serve_session(
                         }
                         command = requests.recv() => match command {
                             Some(CommandRequest::Cancel { request_id: cancel_id }) => {
-                                match connection.send_notification(CancelNotification::new(session_id.clone())) {
-                                    Ok(()) => {
-                                        emit_runtime_event(
-                                            events,
-                                            RuntimeEvent::CancelApplied {
-                                                request_id: cancel_id,
-                                            },
-                                        )
-                                        .await?;
-                                    }
-                                    Err(error) => {
-                                        emit_runtime_event(
-                                            events,
-                                            RuntimeEvent::CommandRejected {
-                                                request_id: cancel_id,
-                                                message: format!("cancel ACP prompt: {error}"),
-                                            },
-                                        )
-                                        .await?;
-                                    }
-                                }
+                                apply_cancel(
+                                    connection,
+                                    &session_id,
+                                    cancel_id,
+                                    events,
+                                    terminals,
+                                )
+                                .await?;
                             }
                             Some(CommandRequest::Close { request_id: close_id }) => {
                                 if let Some(response) = response.take() {
@@ -1571,7 +1648,7 @@ async fn serve_session(
                                         .await?;
                                     }
                                 }
-                                return Ok(());
+                                return Ok(None);
                             }
                             None => {
                                 if let Some(response) = response.take() {
@@ -1582,7 +1659,7 @@ async fn serve_session(
                                 connection
                                     .send_notification(CancelNotification::new(session_id.clone()))
                                     .context("cancel ACP prompt during runtime shutdown")?;
-                                return Ok(());
+                                return Ok(None);
                             }
                             Some(CommandRequest::Prompt { request_id, .. }) => {
                                 emit_runtime_event(
@@ -1635,22 +1712,7 @@ async fn serve_session(
                 }
             }
             CommandRequest::Cancel { request_id } => {
-                match connection.send_notification(CancelNotification::new(session_id.clone())) {
-                    Ok(()) => {
-                        emit_runtime_event(events, RuntimeEvent::CancelApplied { request_id })
-                            .await?;
-                    }
-                    Err(error) => {
-                        emit_runtime_event(
-                            events,
-                            RuntimeEvent::CommandRejected {
-                                request_id,
-                                message: format!("cancel ACP prompt: {error}"),
-                            },
-                        )
-                        .await?;
-                    }
-                }
+                apply_cancel(connection, &session_id, request_id, events, terminals).await?;
             }
             CommandRequest::ResolveElicitation {
                 elicitation_id,
@@ -1688,7 +1750,7 @@ async fn serve_session(
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn resolve_pending_elicitation(
@@ -2272,7 +2334,7 @@ mod tests {
         let (client_read, client_write) = tokio::io::split(client_stream);
         let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
 
-        let (request_tx, request_rx) = mpsc::channel(4);
+        let (request_tx, mut request_rx) = mpsc::channel(4);
         let (event_tx, mut event_rx) = mpsc::channel(64);
         // Drain events so a full channel can never be mistaken for silence.
         let events = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
@@ -2286,7 +2348,8 @@ mod tests {
             harness: HarnessKind::Grok,
             force_unrestricted_mode,
         };
-        let driver = tokio::spawn(drive(transport, spec, request_rx, event_tx));
+        let driver =
+            tokio::spawn(async move { drive(transport, spec, &mut request_rx, event_tx).await });
         request_tx
             .send(CommandRequest::Prompt {
                 request_id: "first".into(),
@@ -2411,7 +2474,7 @@ mod tests {
         ));
         let (client_read, client_write) = tokio::io::split(client_stream);
         let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
-        let (request_tx, request_rx) = mpsc::channel(4);
+        let (request_tx, mut request_rx) = mpsc::channel(4);
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let spec = LaunchSpec {
             command: "scripted".into(),
@@ -2423,7 +2486,8 @@ mod tests {
             harness: HarnessKind::Claude,
             force_unrestricted_mode: false,
         };
-        let driver = tokio::spawn(drive(transport, spec, request_rx, event_tx));
+        let driver =
+            tokio::spawn(async move { drive(transport, spec, &mut request_rx, event_tx).await });
         let initialized = tokio::time::timeout(Duration::from_secs(5), initialized_rx)
             .await
             .expect("runtime initializes")
@@ -2793,7 +2857,7 @@ mod tests {
         let (client_read, client_write) = tokio::io::split(client_stream);
         let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
 
-        let (request_tx, request_rx) = mpsc::channel(4);
+        let (request_tx, mut request_rx) = mpsc::channel(4);
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let events = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
         let spec = LaunchSpec {
@@ -2806,7 +2870,8 @@ mod tests {
             harness,
             force_unrestricted_mode: false,
         };
-        let driver = tokio::spawn(drive(transport, spec, request_rx, event_tx));
+        let driver =
+            tokio::spawn(async move { drive(transport, spec, &mut request_rx, event_tx).await });
         request_tx
             .send(CommandRequest::SetConfig {
                 request_id: "config-1".into(),
@@ -2866,7 +2931,7 @@ mod tests {
         let (client_read, client_write) = tokio::io::split(client_stream);
         let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
 
-        let (request_tx, request_rx) = mpsc::channel(4);
+        let (request_tx, mut request_rx) = mpsc::channel(4);
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let spec = LaunchSpec {
             command: "scripted".into(),
@@ -2878,7 +2943,8 @@ mod tests {
             harness: HarnessKind::Claude,
             force_unrestricted_mode: false,
         };
-        let driver = tokio::spawn(drive(transport, spec, request_rx, event_tx));
+        let driver =
+            tokio::spawn(async move { drive(transport, spec, &mut request_rx, event_tx).await });
 
         let next_event = async |events: &mut mpsc::Receiver<RuntimeEvent>| {
             tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
@@ -2996,7 +3062,7 @@ mod tests {
         let (client_read, client_write) = tokio::io::split(client_stream);
         let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
 
-        let (request_tx, request_rx) = mpsc::channel(4);
+        let (request_tx, mut request_rx) = mpsc::channel(4);
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let spec = LaunchSpec {
             command: "scripted".into(),
@@ -3010,7 +3076,8 @@ mod tests {
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: false,
         };
-        let driver = tokio::spawn(drive(transport, spec, request_rx, event_tx));
+        let driver =
+            tokio::spawn(async move { drive(transport, spec, &mut request_rx, event_tx).await });
 
         let (compacted_tx, mut compacted_rx) = oneshot::channel();
         request_tx
@@ -3054,6 +3121,256 @@ mod tests {
 
         drop(request_tx);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
+        bridge.abort();
+    }
+
+    /// Answers `initialize` and `session/new`, then holds `session/prompt`
+    /// until the test completes it. Used to prove cancel waits for a real
+    /// prompt settlement and restarts when that settlement never arrives.
+    async fn stalled_prompt_bridge(
+        stream: tokio::io::DuplexStream,
+        observed: mpsc::UnboundedSender<String>,
+        mut complete: mpsc::Receiver<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (read, mut write) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read).lines();
+        let mut prompt_id = None;
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    let Some(line) = line.expect("read stalled bridge input") else {
+                        break;
+                    };
+                    let request: serde_json::Value =
+                        serde_json::from_str(&line).expect("bridge input must be JSON-RPC");
+                    let Some(method) = request.get("method").and_then(serde_json::Value::as_str) else {
+                        continue;
+                    };
+                    let _ = observed.send(method.to_owned());
+                    let id = request
+                        .get("id")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let response = match method {
+                        "initialize" => serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"protocolVersion": 1},
+                        }),
+                        "session/new" | "session/load" => serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"sessionId": "scripted"},
+                        }),
+                        "session/prompt" => {
+                            prompt_id = Some(id);
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    if write
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                complete = complete.recv() => {
+                    if complete.is_none() {
+                        break;
+                    }
+                    let Some(id) = prompt_id.take() else {
+                        continue;
+                    };
+                    let response = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"stopReason": "cancelled"},
+                    });
+                    if write
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn wait_for_runtime_event<F>(
+        events: &mut mpsc::Receiver<RuntimeEvent>,
+        mut matches: F,
+    ) -> RuntimeEvent
+    where
+        F: FnMut(&RuntimeEvent) -> bool,
+    {
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("runtime event arrives")
+                .expect("runtime event channel stays open");
+            if matches(&event) {
+                return event;
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_that_the_agent_acks_does_not_restart_the_harness() {
+        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+        let (complete_tx, complete_rx) = mpsc::channel(1);
+        let bridge = tokio::spawn(stalled_prompt_bridge(
+            bridge_stream,
+            observed_tx,
+            complete_rx,
+        ));
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let spec = LaunchSpec {
+            command: "scripted".into(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: std::env::current_dir().unwrap(),
+            additional_directories: Vec::new(),
+            resume_session: None,
+            harness: HarnessKind::Kimi,
+            force_unrestricted_mode: false,
+        };
+        let driver =
+            tokio::spawn(async move { drive(transport, spec, &mut request_rx, event_tx).await });
+        request_tx
+            .send(CommandRequest::Prompt {
+                request_id: "prompt-1".into(),
+                prompt: vec![ContentBlock::Text(TextContent::new("go"))],
+            })
+            .await
+            .unwrap();
+        loop {
+            let method =
+                tokio::time::timeout(std::time::Duration::from_secs(5), observed_rx.recv())
+                    .await
+                    .expect("the prompt must reach the bridge")
+                    .expect("the bridge must keep reporting methods");
+            if method == "session/prompt" {
+                break;
+            }
+        }
+        request_tx
+            .send(CommandRequest::Cancel {
+                request_id: "cancel-1".into(),
+            })
+            .await
+            .unwrap();
+        wait_for_runtime_event(&mut event_rx, |event| {
+            matches!(event, RuntimeEvent::CancelApplied { request_id } if request_id == "cancel-1")
+        })
+        .await;
+        tokio::time::advance(CANCEL_ACK_TIMEOUT - Duration::from_secs(1)).await;
+        complete_tx.send(()).await.unwrap();
+        let finished = wait_for_runtime_event(&mut event_rx, |event| {
+            matches!(
+                event,
+                RuntimeEvent::PromptFinished { request_id, .. } if request_id == "prompt-1"
+            )
+        })
+        .await;
+        let RuntimeEvent::PromptFinished { stop_reason, .. } = finished else {
+            panic!("expected prompt finished: {finished:?}");
+        };
+        assert!(
+            stop_reason.to_lowercase().contains("cancel"),
+            "{stop_reason}"
+        );
+        drop(request_tx);
+        let restart = tokio::time::timeout(std::time::Duration::from_secs(5), driver)
+            .await
+            .expect("runtime exits")
+            .expect("runtime task does not panic")
+            .expect("a cancelled prompt must not fail the runtime");
+        assert_eq!(restart, None);
+        bridge.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unacked_cancel_restarts_the_harness_after_sixty_seconds() {
+        let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+        let (_complete_tx, complete_rx) = mpsc::channel(1);
+        let bridge = tokio::spawn(stalled_prompt_bridge(
+            bridge_stream,
+            observed_tx,
+            complete_rx,
+        ));
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let spec = LaunchSpec {
+            command: "scripted".into(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: std::env::current_dir().unwrap(),
+            additional_directories: Vec::new(),
+            resume_session: None,
+            harness: HarnessKind::Kimi,
+            force_unrestricted_mode: false,
+        };
+        let driver =
+            tokio::spawn(async move { drive(transport, spec, &mut request_rx, event_tx).await });
+        request_tx
+            .send(CommandRequest::Prompt {
+                request_id: "prompt-1".into(),
+                prompt: vec![ContentBlock::Text(TextContent::new("go"))],
+            })
+            .await
+            .unwrap();
+        loop {
+            let method =
+                tokio::time::timeout(std::time::Duration::from_secs(5), observed_rx.recv())
+                    .await
+                    .expect("the prompt must reach the bridge")
+                    .expect("the bridge must keep reporting methods");
+            if method == "session/prompt" {
+                break;
+            }
+        }
+        request_tx
+            .send(CommandRequest::Cancel {
+                request_id: "cancel-1".into(),
+            })
+            .await
+            .unwrap();
+        wait_for_runtime_event(&mut event_rx, |event| {
+            matches!(event, RuntimeEvent::CancelApplied { request_id } if request_id == "cancel-1")
+        })
+        .await;
+        tokio::time::advance(CANCEL_ACK_TIMEOUT).await;
+        let interrupted = wait_for_runtime_event(&mut event_rx, |event| {
+            matches!(
+                event,
+                RuntimeEvent::CommandInterrupted { request_id, .. } if request_id == "prompt-1"
+            )
+        })
+        .await;
+        let RuntimeEvent::CommandInterrupted { message, .. } = interrupted else {
+            panic!("expected interrupt: {interrupted:?}");
+        };
+        assert!(message.contains("60s"), "{message}");
+        drop(request_tx);
+        let restart = tokio::time::timeout(std::time::Duration::from_secs(5), driver)
+            .await
+            .expect("runtime exits after an unacked cancel")
+            .expect("runtime task does not panic")
+            .expect("an unacked cancel restarts instead of failing the runtime");
+        assert_eq!(restart.as_deref(), Some("scripted"));
         bridge.abort();
     }
 
@@ -3180,7 +3497,7 @@ mod tests {
             agent: ScriptedAgent,
             observed: Arc<Mutex<Vec<RuntimeEvent>>>,
             requests: mpsc::Sender<CommandRequest>,
-            driver: tokio::task::JoinHandle<Result<()>>,
+            driver: tokio::task::JoinHandle<Result<Option<String>>>,
             bridge: tokio::task::JoinHandle<()>,
             events: tokio::task::JoinHandle<()>,
         }
@@ -3190,11 +3507,12 @@ mod tests {
             /// which is also what tears the terminals down.
             async fn stop(self) {
                 drop(self.requests);
-                tokio::time::timeout(ANSWER_TIMEOUT, self.driver)
+                let restart = tokio::time::timeout(ANSWER_TIMEOUT, self.driver)
                     .await
                     .expect("closing the command channel must end the runtime")
                     .expect("the runtime task must not panic")
                     .expect("terminal work must not fail the runtime");
+                assert_eq!(restart, None);
                 self.bridge.abort();
                 self.events.abort();
             }
@@ -3212,7 +3530,7 @@ mod tests {
             let (client_read, client_write) = tokio::io::split(client_stream);
             let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
 
-            let (request_tx, request_rx) = mpsc::channel(4);
+            let (request_tx, mut request_rx) = mpsc::channel(4);
             let (event_tx, mut event_rx) = mpsc::channel(64);
             // Drain events so a full channel can never be mistaken for silence,
             // and keep them so a test can read what the runtime reported.
@@ -3236,7 +3554,10 @@ mod tests {
                 harness: HarnessKind::Kimi,
                 force_unrestricted_mode: false,
             };
-            let driver = tokio::spawn(drive(transport, spec, request_rx, event_tx));
+            let driver =
+                tokio::spawn(
+                    async move { drive(transport, spec, &mut request_rx, event_tx).await },
+                );
             ScriptedRuntime {
                 agent: ScriptedAgent {
                     scripted: scripted_tx,
@@ -3476,6 +3797,55 @@ mod tests {
             };
             assert_eq!(output, "running");
             assert_eq!(signal.as_deref(), Some("SIGKILL"));
+        }
+
+        #[tokio::test]
+        async fn cancel_kills_live_client_terminals() {
+            let mut runtime = start_scripted_runtime();
+            let terminal_id = create_terminal(
+                &mut runtime.agent,
+                serde_json::json!({
+                    "sessionId": "scripted",
+                    "command": "/bin/sh",
+                    "args": ["-c", "printf running; sleep 300"],
+                }),
+            )
+            .await;
+
+            let waiting = runtime
+                .agent
+                .send("terminal/wait_for_exit", terminal_params(&terminal_id));
+            let mut running = String::new();
+            for _ in 0..100 {
+                let polled = runtime
+                    .agent
+                    .call("terminal/output", terminal_params(&terminal_id))
+                    .await;
+                running = polled["result"]["output"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                if running == "running" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(running, "running");
+
+            runtime
+                .requests
+                .send(CommandRequest::Cancel {
+                    request_id: "cancel-terminals".into(),
+                })
+                .await
+                .unwrap();
+
+            let exited = tokio::time::timeout(ANSWER_TIMEOUT, runtime.agent.answer(&waiting))
+                .await
+                .expect("cancel must kill the terminal so wait_for_exit can finish");
+            assert_eq!(exited["result"]["signal"], "SIGKILL", "{exited}");
+
+            runtime.stop().await;
         }
 
         #[tokio::test]

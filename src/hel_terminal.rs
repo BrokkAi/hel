@@ -267,6 +267,19 @@ impl TerminalRegistry {
         true
     }
 
+    /// Signal every live terminal's process group without forgetting it.
+    /// Cancel uses this so an agent blocked in `terminal/wait_for_exit` can
+    /// finish a cooperative `session/cancel`.
+    pub fn kill_live(&self) {
+        let terminals = self
+            .terminals
+            .lock()
+            .expect("terminal registry lock poisoned");
+        for entry in terminals.values() {
+            entry.group.kill_if_live();
+        }
+    }
+
     /// Kill a terminal if it still runs, then forget it. The supervisor keeps
     /// the child until it reaps it, so the close report still arrives exactly
     /// once; the returned handle is that supervisor.
