@@ -594,6 +594,9 @@ async fn main() -> Result<()> {
     if let Some(Commands::McpBridge(args)) = &cli.command {
         return mj_core::mcp_bridge::run_bridge(&args.addr).await;
     }
+    // Register the platform adapter before config load or roster resolution.
+    #[cfg(target_os = "android")]
+    mj_anvil::register();
     let debug_file = cli.log_file.clone();
     let snapshot_exclusions =
         configured_snapshot_exclusions(cli.log_file.as_deref(), cli.agent_stderr.as_deref());
@@ -1507,7 +1510,7 @@ async fn run_app(
     let config_path = config::default_config_path();
     let config_exists = config::Config::path_has_saved_config(&config_path);
     let mut cfg = Config::load(&config_path)?;
-    let team_selection_required = config::TeamPreset::from_config(&cfg).is_none();
+    let team_selection_required = !config::has_valid_team(&cfg);
     let onboarding_kind = onboarding_kind(
         config_exists,
         cfg.onboarding_version,
