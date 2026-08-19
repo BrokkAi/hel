@@ -655,6 +655,14 @@ mod unix {
             RuntimeEvent::Warning { message } => {
                 relay.record_observation(RelayObservation::Warning { message })?;
             }
+            RuntimeEvent::HarnessRestarting { message } => {
+                relay.record_observation(RelayObservation::Warning {
+                    message: message.clone(),
+                })?;
+                for (command_id, _) in std::mem::take(in_flight) {
+                    relay.record_command_interrupted(&command_id, message.clone())?;
+                }
+            }
             RuntimeEvent::TerminalClosed {
                 terminal_id,
                 mut output,
@@ -3107,6 +3115,43 @@ mod relay_tests {
                 .iter()
                 .any(|event| matches!(event.observation, RelayObservation::SessionUpdate { .. }))
         );
+    }
+
+    #[test]
+    fn harness_restarting_interrupts_in_flight_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut durable = DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap();
+        submit(&mut durable, "prompt-1", prompt("go"));
+        let relay = Arc::new(Mutex::new(durable));
+        let mut in_flight = BTreeMap::new();
+        in_flight.insert("prompt-1".into(), prompt("go"));
+
+        unix::record_runtime_event(
+            &relay,
+            &mut in_flight,
+            RuntimeEvent::HarnessRestarting {
+                message: "ACP bridge exited; reloading the native session".into(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            in_flight.is_empty(),
+            "the in-flight prompt must be interrupted"
+        );
+        let events = relay
+            .lock()
+            .unwrap()
+            .events_after(0, RELAY_EVENT_GENESIS_DIGEST)
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.observation,
+            RelayObservation::Warning { message } if message.contains("reloading the native session")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.observation,
+            RelayObservation::CommandInterrupted { command_id, .. } if command_id == "prompt-1"
+        )));
     }
 
     #[test]
