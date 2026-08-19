@@ -305,7 +305,7 @@ fn materialize_running_executable(
     Ok(cached.to_path_buf())
 }
 
-fn worker_binary_for(
+pub(super) fn worker_binary_for(
     locator: &hel_targets::TargetLocator,
     executor: &impl CommandExecutor,
 ) -> Result<PathBuf> {
@@ -962,6 +962,163 @@ fn install_worker_over_ssh(
     Ok(())
 }
 
+/// Replace `{worker_root}/hel` with the controller's current worker binary.
+///
+/// Checkpoint export starts that path as a new process. A live daemon already
+/// has the previous inode mapped, so this does not restart it. Writing through
+/// `hel.next` and renaming avoids `ETXTBSY` on a running image.
+pub(super) fn replace_installed_worker_binary(
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+    worker_binary: &Path,
+) -> Result<()> {
+    let worker_root = hel_targets::worker_root(locator, session_id)?;
+    let installed = format!("{worker_root}/hel");
+    let staged = format!("{worker_root}/hel.next");
+    match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => {
+            execute_checked(
+                executor,
+                CommandSpec::new(
+                    "cp",
+                    [worker_binary.to_string_lossy().into_owned(), staged.clone()],
+                )
+                .purpose("stage replacement Hel worker"),
+            )?;
+            execute_checked(
+                executor,
+                CommandSpec::new("mv", ["-f", &staged, &installed])
+                    .purpose("replace installed Hel worker"),
+            )?;
+            execute_checked(
+                executor,
+                CommandSpec::new("chmod", ["700", &installed])
+                    .purpose("make replaced Hel worker executable"),
+            )?;
+        }
+        hel_targets::TargetLocator::LocalPodman { container_id }
+        | hel_targets::TargetLocator::AppleContainer { container_id } => {
+            let engine = if matches!(locator, hel_targets::TargetLocator::LocalPodman { .. }) {
+                "podman"
+            } else {
+                "container"
+            };
+            execute_checked(
+                executor,
+                CommandSpec::new(
+                    engine,
+                    [
+                        "cp".into(),
+                        worker_binary.to_string_lossy().into_owned(),
+                        format!("{container_id}:{staged}"),
+                    ],
+                )
+                .purpose("stage replacement Hel worker"),
+            )?;
+            execute_checked(
+                executor,
+                CommandSpec::new(
+                    engine,
+                    [
+                        "exec".into(),
+                        container_id.clone(),
+                        "mv".into(),
+                        "-f".into(),
+                        staged,
+                        installed.clone(),
+                    ],
+                )
+                .purpose("replace installed Hel worker"),
+            )?;
+            execute_checked(
+                executor,
+                CommandSpec::new(
+                    engine,
+                    [
+                        "exec".into(),
+                        container_id.clone(),
+                        "chmod".into(),
+                        "700".into(),
+                        installed,
+                    ],
+                )
+                .purpose("make replaced Hel worker executable"),
+            )?;
+        }
+        hel_targets::TargetLocator::AwsEc2 { ssh, .. }
+        | hel_targets::TargetLocator::SshBare { ssh, .. } => {
+            execute_checked(
+                executor,
+                scp_command_spec(ssh, worker_binary, &staged, false)
+                    .purpose("stage replacement Hel worker"),
+            )?;
+            execute_checked(
+                executor,
+                ssh_command_spec(ssh, ["mv", "-f", "--", &staged, &installed])
+                    .purpose("replace installed Hel worker"),
+            )?;
+            execute_checked(
+                executor,
+                ssh_command_spec(ssh, ["chmod", "700", &installed])
+                    .purpose("make replaced Hel worker executable"),
+            )?;
+        }
+        hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
+            let upload = format!(".cache/hel/uploads/{session_id}-hel.next");
+            execute_checked(
+                executor,
+                ssh_command_spec(ssh, ["mkdir", "-p", ".cache/hel/uploads"])
+                    .purpose("create remote replacement worker staging"),
+            )?;
+            execute_checked(
+                executor,
+                scp_command_spec(ssh, worker_binary, &upload, false)
+                    .purpose("stage replacement Hel worker"),
+            )?;
+            execute_checked(
+                executor,
+                ssh_command_spec(
+                    ssh,
+                    ["podman", "cp", &upload, &format!("{container_id}:{staged}")],
+                )
+                .purpose("stage replacement Hel worker"),
+            )?;
+            execute_checked(
+                executor,
+                ssh_command_spec(
+                    ssh,
+                    [
+                        "podman",
+                        "exec",
+                        container_id,
+                        "mv",
+                        "-f",
+                        "--",
+                        &staged,
+                        &installed,
+                    ],
+                )
+                .purpose("replace installed Hel worker"),
+            )?;
+            execute_checked(
+                executor,
+                ssh_command_spec(
+                    ssh,
+                    ["podman", "exec", container_id, "chmod", "700", &installed],
+                )
+                .purpose("make replaced Hel worker executable"),
+            )?;
+            execute_checked(
+                executor,
+                ssh_command_spec(ssh, ["rm", "-f", "--", &upload])
+                    .purpose("remove remote replacement worker staging"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn start_worker(
     executor: &impl CommandExecutor,
     locator: &hel_targets::TargetLocator,
@@ -1391,6 +1548,47 @@ mod tests {
                 "expected {name} to still be uploaded per session, got {lines:#?}"
             );
         }
+    }
+    #[test]
+    fn replacing_an_installed_podman_worker_writes_through_a_next_path() {
+        struct RecordingExecutor {
+            commands: RefCell<Vec<CommandSpec>>,
+        }
+        impl CommandExecutor for RecordingExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.commands.borrow_mut().push(command.clone());
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let session = "0123456789abcdef0123456789abcdef";
+        let container_id = hel_targets::resource_name(session).unwrap();
+        let locator = hel_targets::TargetLocator::LocalPodman {
+            container_id: container_id.clone(),
+        };
+        let executor = RecordingExecutor {
+            commands: RefCell::new(Vec::new()),
+        };
+        replace_installed_worker_binary(&executor, &locator, session, Path::new("/controller/hel"))
+            .unwrap();
+
+        let lines = rendered(&executor.commands.borrow());
+        assert_eq!(
+            lines,
+            vec![
+                format!(
+                    "podman cp /controller/hel {container_id}:/var/lib/hel/workers/{session}/hel.next"
+                ),
+                format!(
+                    "podman exec {container_id} mv -f /var/lib/hel/workers/{session}/hel.next /var/lib/hel/workers/{session}/hel"
+                ),
+                format!("podman exec {container_id} chmod 700 /var/lib/hel/workers/{session}/hel"),
+            ]
+        );
     }
     #[test]
     fn default_bridges_pin_command_capable_adapter_versions() {
