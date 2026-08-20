@@ -169,14 +169,36 @@ pub(super) async fn connect_started_worker(
         locator,
         worker_root,
     };
-    connect_to_starting_worker(&mut connection, executor).await
+    connect_to_starting_worker(&mut connection, executor, WORKER_STARTUP_CONNECT_TIMEOUT).await
+}
+
+/// Same as [`connect_started_worker`], with an explicit wait. Restarting a
+/// worker over a large durable journal recovers that journal before it binds
+/// `control.sock`, so a checkpoint bounce has to outlast that recovery.
+pub(super) async fn connect_started_worker_with_timeout(
+    spec: &CommandSpec,
+    session_id: &str,
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    worker_root: &str,
+    timeout: Duration,
+) -> Result<StandaloneSession> {
+    let mut connection = StartingWorkerConnection {
+        spec,
+        session_id,
+        executor,
+        locator,
+        worker_root,
+    };
+    connect_to_starting_worker(&mut connection, executor, timeout).await
 }
 
 async fn connect_to_starting_worker<P: StartingWorkerProbe>(
     probe: &mut P,
     executor: &impl CommandExecutor,
+    timeout: Duration,
 ) -> Result<P::Relay> {
-    let deadline = tokio::time::Instant::now() + WORKER_STARTUP_CONNECT_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut last_error: Option<anyhow::Error> = None;
     loop {
         if executor.cancellation_requested() {
@@ -238,7 +260,7 @@ async fn connect_to_starting_worker<P: StartingWorkerProbe>(
             }
         }
     }
-    let waited = WORKER_STARTUP_CONNECT_TIMEOUT.as_secs();
+    let waited = timeout.as_secs();
     match last_error {
         Some(error) => Err(error.context(format!(
             "worker relay did not accept a connection in {waited}s"
@@ -380,9 +402,10 @@ mod tests {
         let executor = CancellableProcessExecutor::new(cancelled);
         let mut worker = FakeStartingWorker::accepting_after(4);
 
-        let relay = connect_to_starting_worker(&mut worker, &executor)
-            .await
-            .unwrap();
+        let relay =
+            connect_to_starting_worker(&mut worker, &executor, WORKER_STARTUP_CONNECT_TIMEOUT)
+                .await
+                .unwrap();
 
         assert_eq!(relay, "relay");
         assert_eq!(worker.attempts, 4);
@@ -397,9 +420,10 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
 
-        let error = connect_to_starting_worker(&mut worker, &executor)
-            .await
-            .unwrap_err();
+        let error =
+            connect_to_starting_worker(&mut worker, &executor, WORKER_STARTUP_CONNECT_TIMEOUT)
+                .await
+                .unwrap_err();
 
         assert_eq!(worker.attempts, 1);
         assert!(started.elapsed() < WORKER_STARTUP_CONNECT_INTERVAL);
@@ -416,9 +440,10 @@ mod tests {
             ..FakeStartingWorker::never_accepts()
         };
 
-        let error = connect_to_starting_worker(&mut worker, &executor)
-            .await
-            .unwrap_err();
+        let error =
+            connect_to_starting_worker(&mut worker, &executor, WORKER_STARTUP_CONNECT_TIMEOUT)
+                .await
+                .unwrap_err();
 
         assert_eq!(worker.attempts, 1);
         assert!(
@@ -435,9 +460,10 @@ mod tests {
         let mut worker = FakeStartingWorker::never_accepts();
         let started = tokio::time::Instant::now();
 
-        let error = connect_to_starting_worker(&mut worker, &executor)
-            .await
-            .unwrap_err();
+        let error =
+            connect_to_starting_worker(&mut worker, &executor, WORKER_STARTUP_CONNECT_TIMEOUT)
+                .await
+                .unwrap_err();
 
         assert!(worker.attempts > 1, "{} attempts", worker.attempts);
         assert!(started.elapsed() >= WORKER_STARTUP_CONNECT_TIMEOUT);

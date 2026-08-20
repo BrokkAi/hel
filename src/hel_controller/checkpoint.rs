@@ -28,9 +28,10 @@ use crate::hel_targets::{self, CommandExecutor, CommandOutput, CommandSpec, Proc
 use crate::hel_worker::{RelayCommand, RelayCursor, RelayExecutionState};
 
 use super::backend::backend_locator;
-use super::readiness::{connect_started_worker, wait_for_native_session};
+use super::readiness::{connect_started_worker_with_timeout, wait_for_native_session};
 use super::worker_binary::{
     replace_installed_worker_binary, start_worker, stop_worker, worker_binary_for,
+    worker_probe_diagnosis,
 };
 use super::{
     Controller, execute_checked, now, persist_session_record_transition_or_restore,
@@ -910,10 +911,26 @@ impl Controller {
             .context("replace Hel worker binary before retrying checkpoint")?;
         start_worker(executor, backend, worker_root)
             .context("start Hel worker after interrupting a wedged ACP turn")?;
-        let mut connection =
-            connect_started_worker(reconnect, session_id, executor, backend, worker_root)
-                .await
-                .context("connect to Hel worker after restarting it for checkpoint")?;
+        // Journal recovery runs before the daemon binds control.sock. A long
+        // kimi session can take well over the ordinary 30s startup window.
+        let mut connection = match connect_started_worker_with_timeout(
+            reconnect,
+            session_id,
+            executor,
+            backend,
+            worker_root,
+            CHECKPOINT_BARRIER_TIMEOUT_AFTER_RESTART,
+        )
+        .await
+        {
+            Ok(connection) => connection,
+            Err(error) => {
+                return Err(
+                    worker_probe_diagnosis(executor, backend, worker_root, error)
+                        .context("connect to Hel worker after restarting it for checkpoint"),
+                );
+            }
+        };
         wait_for_native_session(&mut connection, executor)
             .await
             .context("wait for ACP session after restarting the worker for checkpoint")?;

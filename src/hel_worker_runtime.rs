@@ -61,10 +61,13 @@ pub struct WorkerLaunchConfig {
     pub bridge_args: Vec<String>,
     pub environment: std::collections::BTreeMap<String, String>,
     pub cwd: PathBuf,
+    #[serde(default)]
     pub additional_directories: Vec<PathBuf>,
+    #[serde(default)]
     pub native_session_id: Option<String>,
     /// Isolated and remote targets deliberately run without harness approval
     /// prompts. Raw localhost instead honors the user's harness configuration.
+    #[serde(default)]
     pub force_unrestricted_mode: bool,
 }
 
@@ -2263,6 +2266,19 @@ mod relay_tests {
         let mut incomplete = serde_json::to_value(&launch).unwrap();
         incomplete.as_object_mut().unwrap().remove("bridge_args");
         assert!(serde_json::from_value::<WorkerLaunchConfig>(incomplete).is_err());
+
+        let mut legacy = serde_json::to_value(&launch).unwrap();
+        for field in [
+            "additional_directories",
+            "native_session_id",
+            "force_unrestricted_mode",
+        ] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        let parsed = serde_json::from_value::<WorkerLaunchConfig>(legacy).unwrap();
+        assert!(parsed.additional_directories.is_empty());
+        assert!(parsed.native_session_id.is_none());
+        assert!(!parsed.force_unrestricted_mode);
 
         let supervisor = AcpSupervisorSpec {
             command: "codex-acp".into(),
