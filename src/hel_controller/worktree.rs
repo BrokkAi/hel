@@ -525,7 +525,7 @@ pub(super) fn raw_checkout_position(
 }
 
 /// One conversation line for a raw session whose checkout moved on while the
-/// session was paused. `None` when the checkout is where the checkpoint left
+/// session was stopped. `None` when the checkout is where the checkpoint left
 /// it, or when the checkpoint recorded no repository to compare against.
 ///
 /// This reports; it never reconciles. The working tree is the truth.
@@ -541,7 +541,7 @@ pub(super) fn raw_checkout_divergence_notice(
         return None;
     }
     Some(format!(
-        "The working tree at {} moved from {} to {} while this session was paused.",
+        "The working tree at {} moved from {} to {} while this session was stopped.",
         directory.display(),
         checkout_position_text(&recorded.head_commit, recorded.branch.as_deref()),
         checkout_position_text(&live.head_commit, live.branch.as_deref()),
@@ -1189,7 +1189,7 @@ mod tests {
         }
     }
     #[test]
-    fn a_raw_checkout_that_moved_while_paused_gets_a_conversation_line() {
+    fn a_raw_checkout_that_moved_while_stopped_gets_a_conversation_line() {
         let config = resume_compatibility_config();
         let session = managed_raw_session(ManagedWorktreeTarget::Local);
         let directory = session.project_directory.clone().unwrap();
@@ -1215,7 +1215,10 @@ mod tests {
             notice.contains("bbbbbbbbbbbb (hel/0123456789abcdef0123456789abcdef)"),
             "{notice}"
         );
-        assert!(notice.contains("while this session was paused"), "{notice}");
+        assert!(
+            notice.contains("while this session was stopped"),
+            "{notice}"
+        );
     }
     #[test]
     fn a_raw_checkout_that_stayed_put_gets_no_conversation_line() {
@@ -1623,7 +1626,7 @@ mod tests {
         let linked = managed_worktree_session(repository.path(), session_id);
         let checkout = linked.managed_worktree.unwrap().worktree_root;
         let mut session = checkpoint_test_session(session_id);
-        session.state = SessionState::Archived;
+        session.state = SessionState::Stopped;
         session.target_template_id = "local-bare".into();
         session.project_directory = Some(checkout.clone());
 
@@ -1652,7 +1655,7 @@ mod tests {
         let symlink = alias.path().join("checkout");
         std::os::unix::fs::symlink(&checkout, &symlink).unwrap();
         let mut session = checkpoint_test_session(session_id);
-        session.state = SessionState::Archived;
+        session.state = SessionState::Stopped;
         session.target_template_id = "local-bare".into();
         session.project_directory = Some(symlink);
 
@@ -1756,7 +1759,7 @@ mod tests {
         let repository = committed_repository();
         let session_id = "0123456789abcdef0123456789abcdef";
         let mut session = checkpoint_test_session(session_id);
-        session.state = SessionState::Archived;
+        session.state = SessionState::Stopped;
         session.bundle_id = "project".into();
         let mut config = resume_compatibility_config();
         config
@@ -1853,7 +1856,7 @@ mod tests {
         let repository = PathBuf::from("/home/dev/project");
         let previous = {
             let mut record = checkpoint_test_session(session_id);
-            record.state = SessionState::Archived;
+            record.state = SessionState::Stopped;
             record.bundle_id = "project".into();
             record
         };

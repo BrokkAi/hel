@@ -121,7 +121,7 @@ async fn imported_claude_session_resumes_natively_async() -> anyhow::Result<()> 
 
     let state = HelState::load()?;
     let (session_id, imported) = state.sessions.iter().next().unwrap();
-    assert_eq!(imported.state, SessionState::Archived);
+    assert_eq!(imported.state, SessionState::Stopped);
     let checkpoint = imported.checkpoint.as_ref().unwrap();
     let archive = read_archive_verified(&checkpoint.archive_path)?;
     assert_eq!(
@@ -233,7 +233,7 @@ async fn imported_kimi_session_resumes_natively_async() -> anyhow::Result<()> {
 
     let state = HelState::load()?;
     let (session_id, imported) = state.sessions.iter().next().unwrap();
-    assert_eq!(imported.state, SessionState::Archived);
+    assert_eq!(imported.state, SessionState::Stopped);
     let checkpoint = imported.checkpoint.as_ref().unwrap();
     let archive = read_archive_verified(&checkpoint.archive_path)?;
     assert_eq!(
@@ -346,7 +346,7 @@ async fn imported_grok_session_resumes_natively_async() -> anyhow::Result<()> {
 
     let state = HelState::load()?;
     let (session_id, imported) = state.sessions.iter().next().unwrap();
-    assert_eq!(imported.state, SessionState::Archived);
+    assert_eq!(imported.state, SessionState::Stopped);
     let checkpoint = imported.checkpoint.as_ref().unwrap();
     let archive = read_archive_verified(&checkpoint.archive_path)?;
     assert_eq!(
@@ -566,7 +566,7 @@ async fn imported_codex_session_resumes_natively_async() -> anyhow::Result<()> {
 
     let state = HelState::load()?;
     let (session_id, imported) = state.sessions.iter().next().unwrap();
-    assert_eq!(imported.state, SessionState::Archived);
+    assert_eq!(imported.state, SessionState::Stopped);
     let checkpoint = imported.checkpoint.as_ref().unwrap();
     let archive = read_archive_verified(&checkpoint.archive_path)?;
     assert_eq!(

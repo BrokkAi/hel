@@ -344,7 +344,7 @@ state, but they do not back up the selected worktree. When the selected path
 belongs to a primary checkout, Hel requires it to be clean and creates
 `<repository>/.hel/worktrees/<session-id>` on `hel/<session-id>`. That branch
 inherits the primary branch's upstream when one exists. Existing linked
-worktrees remain user-owned and are used unchanged. Pausing preserves either
+worktrees remain user-owned and are used unchanged. Stopping preserves either
 worktree for resume; permanently deleting a session also removes its
 Hel-created worktree and branch.
 
@@ -421,7 +421,7 @@ no origin refs, Hel retries one fetch and otherwise fails the checkpoint and
 leaves the session usable. Local repositories are provisioned by fetching
 through the proxy, and a small bootstrap archive carries their uncommitted
 changes. Every payload is SHA-256 verified after the archive is atomically
-installed. Normal Pause refuses teardown if that verification fails; explicit
+installed. A normal Stop refuses teardown if that verification fails; explicit
 force-destroy is the data-loss escape hatch.
 
 Relay protocol v1 and recovery-archive schema v2 are the compatibility floor

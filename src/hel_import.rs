@@ -84,6 +84,9 @@ pub struct LocatedCodexSession {
     pub git_branch: String,
     pub size_bytes: u64,
     pub history_mode: CodexHistoryMode,
+    /// Archived inside Codex itself. Hel mirrors that one way: the row is
+    /// hidden by default and never written back to Codex.
+    pub natively_archived: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +369,8 @@ pub struct NativeSessionListing {
     pub cwd: PathBuf,
     /// Why this session cannot be imported, when it cannot be.
     pub unavailable_reason: Option<&'static str>,
+    /// Archived inside the harness itself. Only Codex reports this today.
+    pub natively_archived: bool,
 }
 
 /// Locate one native session for any harness.
@@ -434,6 +439,7 @@ pub fn scan_native_sessions(
                 git_branch: session.git_branch,
                 size_bytes: session.size_bytes,
                 cwd: session.cwd,
+                natively_archived: session.natively_archived,
             });
             forward(progress.scanned, progress.total, session);
         }),
@@ -446,6 +452,7 @@ pub fn scan_native_sessions(
                 size_bytes: session.size_bytes,
                 cwd: session.cwd,
                 unavailable_reason: None,
+                natively_archived: false,
             });
             forward(progress.scanned, progress.total, session);
         }),
@@ -458,6 +465,7 @@ pub fn scan_native_sessions(
                 size_bytes: session.size_bytes,
                 cwd: session.cwd,
                 unavailable_reason: None,
+                natively_archived: false,
             });
             forward(progress.scanned, progress.total, session);
         }),
@@ -470,6 +478,7 @@ pub fn scan_native_sessions(
                 size_bytes: session.size_bytes,
                 cwd: session.cwd,
                 unavailable_reason: None,
+                natively_archived: false,
             });
             forward(progress.scanned, progress.total, session);
         }),
@@ -481,7 +490,12 @@ pub fn locate_codex_session(
     home: &Path,
     selection: &CodexSessionSelection,
 ) -> Result<LocatedCodexSession> {
-    let listed = list_codex_sessions(home)?;
+    let mut listed = list_codex_sessions(home)?;
+    // `--latest` follows Codex's own default view, which hides what the user
+    // archived there. Asking for an id by name still finds it.
+    if matches!(selection, CodexSessionSelection::Latest) {
+        listed.retain(|session| !session.natively_archived);
+    }
     if let CodexSessionSelection::NativeSessionId(session_id) = selection
         && !listed
             .iter()
@@ -509,6 +523,7 @@ fn locate_unindexed_codex_session(home: &Path, session_id: &str) -> Result<Locat
         };
         if metadata.id == session_id {
             matches.push(LocatedCodexSession {
+                natively_archived: false,
                 title: titles
                     .get(session_id)
                     .cloned()
@@ -588,6 +603,7 @@ pub fn scan_codex_sessions(
         let session = codex_session_metadata(&candidate.path)?.map(|metadata| {
             let session_id = metadata.id;
             LocatedCodexSession {
+                natively_archived: false,
                 title: titles
                     .get(&session_id)
                     .cloned()
@@ -627,12 +643,14 @@ fn codex_indexed_sessions(home: &Path) -> Result<Option<Vec<LocatedCodexSession>
     } else {
         "'legacy'"
     };
+    // Codex's own archived threads are listed too, flagged rather than
+    // filtered: the resume dialog hides them until "show archived" is on, and
+    // Hel never writes this database back.
     let query = format!(
         "SELECT id, rollout_path, updated_at, COALESCE(NULLIF(name, ''), NULLIF(title, ''), id), cwd, \
-         COALESCE(NULLIF(git_branch, ''), 'HEAD'), {history_mode_column} \
+         COALESCE(NULLIF(git_branch, ''), 'HEAD'), {history_mode_column}, archived \
          FROM threads \
-         WHERE archived = 0 \
-           AND source IN ('cli', 'vscode') \
+         WHERE source IN ('cli', 'vscode') \
            AND preview <> '' \
            AND rollout_path IS NOT NULL \
          ORDER BY updated_at DESC, id DESC"
@@ -649,11 +667,13 @@ fn codex_indexed_sessions(home: &Path) -> Result<Option<Vec<LocatedCodexSession>
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
+            row.get::<_, bool>(7)?,
         ))
     })?;
     let mut sessions = Vec::new();
     for row in rows {
-        let (session_id, path, updated_at, title, cwd, git_branch, history_mode) = row?;
+        let (session_id, path, updated_at, title, cwd, git_branch, history_mode, natively_archived) =
+            row?;
         let path = PathBuf::from(path);
         if validate_id("Codex session", &session_id).is_err() || updated_at.is_negative() {
             continue;
@@ -677,6 +697,7 @@ fn codex_indexed_sessions(home: &Path) -> Result<Option<Vec<LocatedCodexSession>
             git_branch,
             size_bytes: metadata.len(),
             history_mode: parse_codex_history_mode(&history_mode)?,
+            natively_archived,
         });
     }
     Ok(Some(sessions))
@@ -2891,6 +2912,7 @@ fn import_claude_session_inner(
     state.sessions.insert(
         session_id.clone(),
         SessionRecord {
+            archived: false,
             container_cpus: None,
             container_memory: None,
             id: session_id.clone(),
@@ -2903,7 +2925,7 @@ fn import_claude_session_inner(
             target_template_id: raw_project.map_or(target_id, |(_, raw_target_id)| raw_target_id),
             resource_allocation: None,
             additional_mounts: Vec::new(),
-            state: SessionState::Archived,
+            state: SessionState::Stopped,
             target: None,
             native_session_id: Some(source.native_session_id.clone()),
             acp_session_title: None,
@@ -3191,6 +3213,7 @@ fn import_native_session(
     state.sessions.insert(
         session_id.clone(),
         SessionRecord {
+            archived: false,
             container_cpus: None,
             container_memory: None,
             id: session_id.clone(),
@@ -3203,7 +3226,7 @@ fn import_native_session(
             target_template_id: raw_project.map_or(target_id, |(_, raw_target_id)| raw_target_id),
             resource_allocation: None,
             additional_mounts: Vec::new(),
-            state: SessionState::Archived,
+            state: SessionState::Stopped,
             target: None,
             native_session_id: Some(native_session_id.to_owned()),
             acp_session_title: None,
@@ -4312,6 +4335,7 @@ mod tests {
         );
         let metadata = fs::metadata(&rollout).unwrap();
         let source = LocatedCodexSession {
+            natively_archived: false,
             native_session_id: native_session_id.into(),
             jsonl_path: rollout,
             modified_at: metadata.modified().unwrap(),
@@ -4444,6 +4468,7 @@ mod tests {
         .unwrap();
         let metadata = fs::metadata(&rollout).unwrap();
         LocatedCodexSession {
+            natively_archived: false,
             native_session_id: IMPORT_FIXTURE_SESSION.into(),
             jsonl_path: rollout,
             modified_at: metadata.modified().unwrap(),
@@ -4916,6 +4941,81 @@ mod tests {
         assert!(listed[0].modified_at > listed[1].modified_at);
         assert_eq!(listed[29].title, "Generated 0");
         assert!(listed.iter().all(|session| session.title != "Ephemeral"));
+    }
+
+    /// Hel mirrors Codex's own archive flag one way: the thread is listed and
+    /// flagged so the resume dialog can hide it, and `--latest` still follows
+    /// Codex's default view. Nothing is written back to Codex.
+    #[test]
+    fn codex_listing_flags_natively_archived_threads_and_latest_skips_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let sessions = directory.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let database = directory.path().join("state_5.sqlite");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT,
+                    updated_at INTEGER,
+                    name TEXT,
+                    title TEXT,
+                    cwd TEXT,
+                    git_branch TEXT,
+                    archived INTEGER,
+                    source TEXT,
+                    preview TEXT,
+                    history_mode TEXT
+                );",
+            )
+            .unwrap();
+        let live_id = "019feb6c-6b55-7111-a210-000000000001";
+        let archived_id = "019feb6c-6b55-7111-a210-000000000002";
+        for (id, updated_at, archived) in [(live_id, 10_i64, 0), (archived_id, 20_i64, 1)] {
+            let rollout = sessions.join(format!("rollout-{id}.jsonl"));
+            fs::write(&rollout, "indexed").unwrap();
+            connection
+                .execute(
+                    "INSERT INTO threads VALUES \
+                     (?1, ?2, ?3, ?4, NULL, '/work/app', 'main', ?5, 'cli', 'visible', 'paginated')",
+                    rusqlite::params![
+                        id,
+                        rollout.to_string_lossy(),
+                        updated_at,
+                        format!("Thread {id}"),
+                        archived
+                    ],
+                )
+                .unwrap();
+        }
+        let modified_before = fs::metadata(&database).unwrap().modified().unwrap();
+        drop(connection);
+
+        let listed = list_codex_sessions(directory.path()).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].native_session_id, archived_id);
+        assert!(listed[0].natively_archived);
+        assert_eq!(listed[1].native_session_id, live_id);
+        assert!(!listed[1].natively_archived);
+
+        // `--latest` follows Codex's default view and skips what it archived.
+        let latest =
+            locate_codex_session(directory.path(), &CodexSessionSelection::Latest).unwrap();
+        assert_eq!(latest.native_session_id, live_id);
+        // Naming an archived thread still finds it, so it stays importable.
+        let by_id = locate_codex_session(
+            directory.path(),
+            &CodexSessionSelection::NativeSessionId(archived_id.into()),
+        )
+        .unwrap();
+        assert!(by_id.natively_archived);
+
+        assert_eq!(
+            fs::metadata(&database).unwrap().modified().unwrap(),
+            modified_before,
+            "Hel must never write Codex's own database"
+        );
     }
 
     #[test]

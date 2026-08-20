@@ -21,7 +21,7 @@ pub const AUTO_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Upper bound on one background recovery copy. A copy that wedges - a child
 /// that never exits, a remote helper that stops reading - must become a
-/// reported failure rather than block pause and delete for the session
+/// reported failure rather than block stop and delete for the session
 /// forever.
 const RECOVERY_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
@@ -265,6 +265,7 @@ mod tests {
 
     fn session_record(id: &str) -> SessionRecord {
         SessionRecord {
+            archived: false,
             container_cpus: None,
             container_memory: None,
             id: id.to_owned(),

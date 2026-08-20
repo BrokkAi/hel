@@ -1,4 +1,4 @@
-//! Adopting a native coding-agent session as an archived Hel session.
+//! Adopting a native coding-agent session as a stopped Hel session.
 //!
 //! One implementation serves every harness: the `hel import <harness>`
 //! subcommands differ only in which agent home they read and what they call the
@@ -429,15 +429,7 @@ pub(crate) fn discover_import_profile(
     let discovered = scan_native_sessions(harness_kind, &home, |progress| {
         profile.scan_progress = Some((progress.scanned, progress.total));
         if let Some(session) = progress.session {
-            profile.sessions.push(import_session_option(
-                session.native_session_id,
-                session.title,
-                session.modified_at,
-                session.git_branch,
-                session.size_bytes,
-                session.cwd,
-                session.unavailable_reason.map(ToOwned::to_owned),
-            ));
+            profile.sessions.push(import_session_option(session));
         }
         publish(&profile);
     });
@@ -448,44 +440,33 @@ pub(crate) fn discover_import_profile(
     profile
 }
 
-fn import_session_option(
-    native_session_id: String,
-    title: String,
-    modified_at: SystemTime,
-    branch: String,
-    size: u64,
-    cwd: PathBuf,
-    unavailable_reason: Option<String>,
-) -> ImportSessionOption {
-    let project_directory = display_home_relative(&cwd);
+fn import_session_option(session: hel::hel_import::NativeSessionListing) -> ImportSessionOption {
+    let project_directory = display_home_relative(&session.cwd);
     let details = format!(
         "{} · {} · {} · {}",
-        system_time_age(modified_at),
-        branch,
-        format_byte_size(size),
+        system_time_age(session.modified_at),
+        session.git_branch,
+        format_byte_size(session.size_bytes),
         project_directory
     );
     ImportSessionOption {
-        native_session_id,
-        title,
+        native_session_id: session.native_session_id,
+        title: session.title,
         project_directory,
         details,
-        unavailable_reason,
+        unavailable_reason: session.unavailable_reason.map(ToOwned::to_owned),
+        last_activity_ms: system_time_epoch_ms(session.modified_at),
+        natively_archived: session.natively_archived,
     }
 }
 
-pub(crate) fn import_profile_placeholders(config: &HelConfig) -> Vec<ImportProfileOption> {
-    config
-        .profiles
-        .iter()
-        .map(|(profile_id, profile)| ImportProfileOption {
-            profile_id: profile_id.clone(),
-            harness_kind: profile.kind,
-            sessions: Vec::new(),
-            scan_progress: None,
-            error: None,
-        })
-        .collect()
+/// Epoch milliseconds for a file timestamp. Times before the epoch clamp to
+/// zero rather than sorting as though they were in the future.
+fn system_time_epoch_ms(time: SystemTime) -> i64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 fn system_time_age(time: SystemTime) -> String {

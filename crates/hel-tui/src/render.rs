@@ -19,11 +19,11 @@ use hel::hel_state::{SessionRecord, SessionState};
 use hel::hel_targets::DeploymentCapacityKind;
 
 use crate::dialogs::{
-    import_sessions_pane, render_confirmation, render_container_editor,
-    render_import_bundle_confirmation, render_import_dialog, render_import_progress,
-    render_rename_editor,
+    render_confirmation, render_container_editor, render_import_bundle_confirmation,
+    render_import_progress, render_rename_editor,
 };
 use crate::ingest::{SessionDetail, SessionOperationDisplay, TranscriptHydration};
+use crate::resume::{render_resume_dialog, resume_sessions_pane};
 use crate::widgets::{focus_border, format_resource_bytes};
 use crate::wizards::{render_new_wizard, render_resume_wizard};
 use crate::{
@@ -44,7 +44,6 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     dashboard.pane_areas = None;
     dashboard.selected_preview_area = None;
     dashboard.active_row_areas.clear();
-    dashboard.archived_row_areas.clear();
     let area = frame.area();
     if area.width < MINIMUM_TERMINAL_WIDTH {
         render_terminal_too_small(
@@ -54,8 +53,8 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
         );
         return;
     }
-    dashboard.import_sessions_area =
-        matches!(dashboard.mode, Mode::Import(_)).then(|| import_sessions_pane(area));
+    dashboard.resume_sessions_area =
+        matches!(dashboard.mode, Mode::ResumeDialog(_)).then(|| resume_sessions_pane(area));
 
     if !dashboard.config_is_empty() {
         render_adaptive_dashboard(frame, area, area, dashboard);
@@ -82,8 +81,8 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     match &dashboard.mode {
         Mode::New(wizard) => render_new_wizard(frame, area, dashboard, wizard),
         Mode::Resume(wizard) => render_resume_wizard(frame, area, dashboard, wizard),
+        Mode::ResumeDialog(dialog) => render_resume_dialog(frame, area, dashboard, dialog),
         Mode::Rename(editor) => render_rename_editor(frame, area, editor),
-        Mode::Import(dialog) => render_import_dialog(frame, area, dialog),
         Mode::EditContainer(editor) => render_container_editor(frame, area, editor),
         Mode::Importing(progress) => render_import_progress(frame, area, progress),
         Mode::ConfirmImportBundle(confirmation) => {
@@ -110,22 +109,20 @@ fn render_dashboard_title(frame: &mut Frame, area: Rect, greeting: &str) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PaneHeights {
     pub(crate) active: u16,
-    pub(crate) archived: u16,
     pub(crate) capacity: u16,
     pub(crate) quotas: u16,
 }
 
 impl PaneHeights {
     fn as_array(self) -> [u16; DASHBOARD_PANE_COUNT] {
-        [self.active, self.archived, self.capacity, self.quotas]
+        [self.active, self.capacity, self.quotas]
     }
 
     fn from_array(heights: [u16; DASHBOARD_PANE_COUNT]) -> Self {
         Self {
             active: heights[0],
-            archived: heights[1],
-            capacity: heights[2],
-            quotas: heights[3],
+            capacity: heights[1],
+            quotas: heights[2],
         }
     }
 }
@@ -163,9 +160,8 @@ fn allocate_pane_heights(
     if full_total > pane_space {
         let focused = match focus {
             Focus::Active => 0,
-            Focus::Archived => 1,
-            Focus::Capacity => 2,
-            Focus::Quotas => 3,
+            Focus::Capacity => 1,
+            Focus::Quotas => 2,
         };
         let growth = remaining.min(full[focused].saturating_sub(allocated[focused]));
         allocated[focused] = allocated[focused].saturating_add(growth);
@@ -182,14 +178,16 @@ fn render_adaptive_dashboard(
     dashboard: &mut DashboardState,
 ) {
     let preview_width = inner.width.saturating_sub(4);
-    // One ordering for the whole frame: the panes, the previews, and the row
-    // widgets all read this partition.
-    let (active, archived) = partition_sessions(
+    // One ordering for the whole frame: the pane, the previews, and the row
+    // widgets all read this list. Only live sessions are on the dashboard;
+    // everything else is in the resume dialog.
+    let active = partition_sessions(
         dashboard.state.sessions.values(),
         &dashboard.session_details,
         dashboard.session_order,
-    );
-    let (active_count, archived_count) = (active.len(), archived.len());
+    )
+    .0;
+    let active_count = active.len();
     let selected_active = (dashboard.focus == Focus::Active)
         .then_some(dashboard.session_index)
         .filter(|index| *index < active_count);
@@ -200,7 +198,7 @@ fn render_adaptive_dashboard(
         dashboard.preview_scroll_session = selected_id;
         dashboard.preview_scroll = 0;
     }
-    // A session mid-launch, mid-resume, or mid-pause has nothing worth
+    // A session mid-launch, mid-resume, or mid-stop has nothing worth
     // previewing, so its row collapses to just the summary line.
     let active_collapsed = active
         .iter()
@@ -233,7 +231,6 @@ fn render_adaptive_dashboard(
         .collect::<Vec<_>>();
     let full = PaneHeights {
         active: active_pane_height(&active_row_heights, active_count),
-        archived: plain_table_height(archived_count),
         capacity: plain_table_height(dashboard.capacity_details.len()),
         quotas: plain_table_height(dashboard.config.profiles.len()),
     };
@@ -243,10 +240,6 @@ fn render_adaptive_dashboard(
         } else {
             active_pane_height(&active_row_heights, active_count.min(2))
         },
-        archived: focused_or_minimized_table_height(
-            dashboard.focus == Focus::Archived,
-            archived_count,
-        ),
         capacity: focused_or_minimized_table_height(
             dashboard.focus == Focus::Capacity,
             dashboard.capacity_details.len(),
@@ -291,7 +284,7 @@ fn render_adaptive_dashboard(
                 .collect::<Vec<_>>(),
         )
         .split(fixed[1]);
-    dashboard.pane_areas = Some([panes[0], panes[1], panes[2], panes[3]]);
+    dashboard.pane_areas = Some([panes[0], panes[1], panes[2]]);
     let selected_lines = usize::from(
         panes[0]
             .height
@@ -318,24 +311,21 @@ fn render_adaptive_dashboard(
     let rendered_rows = render_sessions(
         frame,
         panes[0],
-        panes[1],
         dashboard,
         &active,
-        &archived,
         &active_previews.previews,
     );
     dashboard.selected_preview_area = rendered_rows.selected_preview_area;
     dashboard.active_row_areas = rendered_rows.active_row_areas;
-    dashboard.archived_row_areas = rendered_rows.archived_row_areas;
-    render_capacity(frame, panes[2], dashboard);
-    render_quotas(frame, panes[3], dashboard);
+    render_capacity(frame, panes[1], dashboard);
+    render_quotas(frame, panes[2], dashboard);
     render_footer(frame, fixed[2], dashboard);
 
     match &dashboard.mode {
         Mode::New(wizard) => render_new_wizard(frame, frame_area, dashboard, wizard),
         Mode::Resume(wizard) => render_resume_wizard(frame, frame_area, dashboard, wizard),
+        Mode::ResumeDialog(dialog) => render_resume_dialog(frame, frame_area, dashboard, dialog),
         Mode::Rename(editor) => render_rename_editor(frame, frame_area, editor),
-        Mode::Import(dialog) => render_import_dialog(frame, frame_area, dialog),
         Mode::EditContainer(editor) => render_container_editor(frame, frame_area, editor),
         Mode::Importing(progress) => render_import_progress(frame, frame_area, progress),
         Mode::ConfirmImportBundle(confirmation) => {
@@ -370,7 +360,7 @@ fn active_pane_height(row_heights: &[u16], rows: usize) -> u16 {
         .saturating_add(spacers)
 }
 
-/// A launching, resuming, or pausing session — or one caught mid-provisioning
+/// A launching, resuming, or stopping session — or one caught mid-provisioning
 /// after an interrupted launch with no operation record — has nothing worth
 /// previewing yet, so its Active row collapses to just the summary line.
 fn active_row_collapses_to_summary(
@@ -382,7 +372,7 @@ fn active_row_collapses_to_summary(
             operation.kind,
             SessionOperationKind::Launching
                 | SessionOperationKind::Resuming
-                | SessionOperationKind::Pausing
+                | SessionOperationKind::Stopping
         ),
         None => state == SessionState::Provisioning,
     }
@@ -498,23 +488,20 @@ fn render_onboarding(frame: &mut Frame, area: Rect, dashboard: &DashboardState) 
 }
 
 /// Session-row rendering results that the caller folds back into the
-/// dashboard's mouse hitboxes once the borrow of `active`/`archived` (which
-/// alias `dashboard.state.sessions`) has ended.
+/// dashboard's mouse hitboxes once the borrow of `active` (which aliases
+/// `dashboard.state.sessions`) has ended.
 struct SessionRowsRendered {
     selected_preview_area: Option<Rect>,
     active_row_areas: Vec<(usize, Rect)>,
-    archived_row_areas: Vec<(usize, Rect)>,
 }
 
-/// Draws the Active and Paused panes and reports the selected session's
-/// preview hitbox and the per-row mouse hitboxes.
+/// Draws the Active pane and reports the selected session's preview hitbox and
+/// the per-row mouse hitboxes.
 fn render_sessions(
     frame: &mut Frame,
     active_area: Rect,
-    archived_area: Rect,
     dashboard: &DashboardState,
     active: &[&SessionRecord],
-    archived: &[&SessionRecord],
     active_previews: &[Vec<Line<'static>>],
 ) -> SessionRowsRendered {
     let now_epoch_seconds = SystemTime::now()
@@ -622,68 +609,9 @@ fn render_sessions(
         visible_sessions,
     );
 
-    let archived_rows = archived.iter().map(|session| {
-        archived_session_row(
-            session,
-            &dashboard.config,
-            dashboard.session_operations.get(&session.id),
-            dashboard
-                .checkpoint_archive_sizes
-                .get(&session.id)
-                .copied()
-                .flatten(),
-        )
-    });
-    let archived_focused = dashboard.focus == Focus::Archived;
-    let archived_table = Table::new(archived_rows, archived_session_column_constraints())
-        .header(archived_session_header())
-        .row_highlight_style(if archived_focused {
-            Style::default().bg(Color::DarkGray).fg(Color::White)
-        } else {
-            Style::default()
-        })
-        .highlight_symbol(if archived_focused { "› " } else { "  " })
-        .highlight_spacing(HighlightSpacing::Always)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(focus_border(archived_focused))
-                .title(" Paused "),
-        );
-    let mut archived_state = TableState::default().with_selected(
-        Some(dashboard.session_index.saturating_sub(active.len()))
-            .filter(|index| *index < archived.len()),
-    );
-    frame.render_stateful_widget(archived_table, archived_area, &mut archived_state);
-    let archived_offset = archived_state.offset();
-    let mut archived_row_areas = Vec::new();
-    for (row, index) in (archived_area.y + SESSION_TABLE_CHROME_HEIGHT
-        ..archived_area.bottom().saturating_sub(1))
-        .zip(archived_offset..archived.len())
-    {
-        let row_rect = Rect::new(
-            archived_area.x.saturating_add(1),
-            row,
-            archived_area.width.saturating_sub(2),
-            1,
-        );
-        archived_row_areas.push((index, row_rect));
-    }
-    render_session_scrollbar(
-        frame,
-        archived_area,
-        archived.len(),
-        archived_state.offset(),
-        usize::from(
-            archived_area
-                .height
-                .saturating_sub(SESSION_TABLE_CHROME_HEIGHT),
-        ),
-    );
     SessionRowsRendered {
         selected_preview_area,
         active_row_areas,
-        archived_row_areas,
     }
 }
 
@@ -725,16 +653,6 @@ fn session_column_constraints() -> [Constraint; 6] {
     ]
 }
 
-fn archived_session_column_constraints() -> [Constraint; 5] {
-    [
-        Constraint::Length(18),
-        Constraint::Length(14),
-        Constraint::Length(15),
-        Constraint::Length(7),
-        Constraint::Min(18),
-    ]
-}
-
 fn session_header() -> Row<'static> {
     Row::new([
         "Project",
@@ -745,11 +663,6 @@ fn session_header() -> Row<'static> {
         "Session name",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD))
-}
-
-fn archived_session_header() -> Row<'static> {
-    Row::new(["Project", "Profile", "Archived", "Archive", "Session name"])
-        .style(Style::default().add_modifier(Modifier::BOLD))
 }
 
 fn session_values(
@@ -806,11 +719,6 @@ fn session_updated_at_epoch_seconds(session: &SessionRecord) -> Option<u64> {
         .timestamp()
         .try_into()
         .ok()
-}
-
-fn checkpoint_archive_size(size: Option<u64>) -> String {
-    size.map(format_resource_bytes)
-        .unwrap_or_else(|| "—".into())
 }
 
 fn session_name(session: &SessionRecord) -> &str {
@@ -945,29 +853,6 @@ fn summary_rule_cell(content: Line<'static>, rule_width: usize, band: Color) -> 
     Cell::from(Line::from(spans))
 }
 
-fn archived_session_row(
-    session: &SessionRecord,
-    config: &HelConfig,
-    operation: Option<&SessionOperationDisplay>,
-    archive_size: Option<u64>,
-) -> Row<'static> {
-    let checkpoint = session
-        .checkpoint
-        .as_ref()
-        .map(|checkpoint| checkpoint_time_display(&checkpoint.created_at))
-        .unwrap_or_else(|| "never".into());
-    Row::new([
-        session.project_name(config),
-        session.last_profile.clone(),
-        checkpoint,
-        checkpoint_archive_size(archive_size),
-        operation.map_or_else(
-            || session_name(session).to_string(),
-            |operation| format!("{}… {}", operation.kind.label(), session_name(session)),
-        ),
-    ])
-}
-
 fn checkpoint_age(now_epoch_seconds: u64, checkpointed_at: &str) -> String {
     let Ok(checkpointed_at) = chrono::DateTime::parse_from_rfc3339(checkpointed_at) else {
         return "unknown".into();
@@ -996,12 +881,6 @@ fn recovery_warning_name(session: &SessionRecord, name: String, now_epoch_second
         ),
         None => format!("{name}  ⚠ Recovery unavailable"),
     }
-}
-
-fn checkpoint_time_display(checkpointed_at: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(checkpointed_at)
-        .map(|checkpointed_at| checkpointed_at.format("%y-%m-%d %H:%M").to_string())
-        .unwrap_or_else(|_| "unknown".into())
 }
 
 fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
@@ -1253,14 +1132,11 @@ fn render_footer(frame: &mut Frame, area: Rect, dashboard: &DashboardState) {
     };
     let actions = match dashboard.focus {
         Focus::Active => {
-            "[N]ew · impor[T] · [R]ename · [E]dit container · [S]ort · [P]ause · [D]elete · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · resume/[I]mport · [R]ename · [E]dit container · [S]ort · sto[P] · [D]elete · [U]pdate quotas · [Q]uit · Tab pane"
         }
-        Focus::Archived => {
-            "[N]ew · impor[T] · [R]ename · [S]ort · [D]elete permanently · [U]pdate quotas · [Q]uit · Tab pane"
-        }
-        Focus::Capacity => "[N]ew · impor[T] · [S]ort · [U]pdate quotas · [Q]uit · Tab pane",
+        Focus::Capacity => "[N]ew · resume/[I]mport · [S]ort · [U]pdate quotas · [Q]uit · Tab pane",
         Focus::Quotas => {
-            "[N]ew · impor[T] · [R]efresh · [S]ort · [U]pdate quotas · [Q]uit · Tab pane"
+            "[N]ew · resume/[I]mport · [R]efresh · [S]ort · [U]pdate quotas · [Q]uit · Tab pane"
         }
     };
     frame.render_widget(
@@ -1317,7 +1193,7 @@ mod tests {
 
     #[test]
     fn resuming_session_with_a_transcript_collapses_to_its_summary_line() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
@@ -1359,12 +1235,12 @@ mod tests {
 
     #[test]
     fn pausing_session_with_a_transcript_collapses_to_its_summary_line() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
 
-        dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Pausing, None);
+        dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Stopping, None);
         let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
@@ -1384,7 +1260,7 @@ mod tests {
     fn provisioning_without_an_operation_record_collapses_to_its_summary_line() {
         // Interrupted-launch recovery: the session comes back as Provisioning
         // with no in-flight operation to track it.
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Provisioning;
         let mut dashboard = dashboard_with_session(session);
         apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "Rendered answer")]);
@@ -1401,16 +1277,14 @@ mod tests {
     #[test]
     fn pane_allocator_fills_complete_tables_then_gives_surplus_to_active() {
         let allocation = allocate_pane_heights(
-            37,
+            32,
             PaneHeights {
                 active: 10,
-                archived: 5,
                 capacity: 5,
                 quotas: 5,
             },
             PaneHeights {
                 active: 4,
-                archived: 4,
                 capacity: 4,
                 quotas: 4,
             },
@@ -1421,7 +1295,6 @@ mod tests {
             allocation,
             PaneAllocation::Fits(PaneHeights {
                 active: 19,
-                archived: 5,
                 capacity: 5,
                 quotas: 5,
             })
@@ -1432,13 +1305,11 @@ mod tests {
     fn pane_allocator_grows_focus_then_active_when_tables_do_not_fit() {
         let full = PaneHeights {
             active: 20,
-            archived: 10,
             capacity: 10,
             quotas: 10,
         };
         let minimized = PaneHeights {
             active: 5,
-            archived: 5,
             capacity: 5,
             quotas: 5,
         };
@@ -1446,17 +1317,7 @@ mod tests {
             (
                 Focus::Active,
                 PaneHeights {
-                    active: 24,
-                    archived: 5,
-                    capacity: 5,
-                    quotas: 5,
-                },
-            ),
-            (
-                Focus::Archived,
-                PaneHeights {
-                    active: 19,
-                    archived: 10,
+                    active: 22,
                     capacity: 5,
                     quotas: 5,
                 },
@@ -1464,8 +1325,7 @@ mod tests {
             (
                 Focus::Capacity,
                 PaneHeights {
-                    active: 19,
-                    archived: 5,
+                    active: 17,
                     capacity: 10,
                     quotas: 5,
                 },
@@ -1473,15 +1333,14 @@ mod tests {
             (
                 Focus::Quotas,
                 PaneHeights {
-                    active: 19,
-                    archived: 5,
+                    active: 17,
                     capacity: 5,
                     quotas: 10,
                 },
             ),
         ] {
             assert_eq!(
-                allocate_pane_heights(42, full, minimized, focus),
+                allocate_pane_heights(35, full, minimized, focus),
                 PaneAllocation::Fits(expected)
             );
         }
@@ -1498,18 +1357,17 @@ mod tests {
     fn pane_allocator_reports_content_sensitive_minimum_height() {
         let heights = PaneHeights {
             active: 5,
-            archived: 5,
             capacity: 5,
             quotas: 5,
         };
         assert_eq!(
-            allocate_pane_heights(22, heights, heights, Focus::Active),
+            allocate_pane_heights(17, heights, heights, Focus::Active),
             PaneAllocation::TooSmall {
-                required_frame_height: 23,
+                required_frame_height: 18,
             }
         );
         assert!(matches!(
-            allocate_pane_heights(23, heights, heights, Focus::Active),
+            allocate_pane_heights(18, heights, heights, Focus::Active),
             PaneAllocation::Fits(_)
         ));
     }
@@ -1517,7 +1375,7 @@ mod tests {
     #[test]
     fn dashboard_replaces_too_short_layout_with_required_height() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
-        let mut terminal = Terminal::new(TestBackend::new(120, 16)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw short dashboard");
@@ -1529,9 +1387,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Terminal too small"));
-        assert!(rendered.contains("at least 17 rows (currently 16)"));
+        assert!(rendered.contains("at least 14 rows (currently 12)"));
 
-        let mut terminal = Terminal::new(TestBackend::new(120, 17)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 14)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw exact minimum dashboard");
@@ -1636,7 +1494,7 @@ mod tests {
 
     #[test]
     fn active_status_row_leads_with_project_and_separates_clock_from_profile() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         dashboard.focus = Focus::Quotas;
@@ -1690,7 +1548,7 @@ mod tests {
 
     #[test]
     fn ended_turn_brightens_the_summary_band_even_after_output_is_read() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         // The detach cursor sits past the only agent message, so nothing is
         // unread; the band still brightens because no turn is in flight.
@@ -1727,7 +1585,7 @@ mod tests {
 
     #[test]
     fn session_name_prefers_override_then_acp_title_then_hel_uuid() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         assert_eq!(session_name(&session), "ACP pretty name");
 
         session.acp_session_title = None;
@@ -1790,12 +1648,12 @@ mod tests {
         assert!(header.contains("In Use"));
     }
 
-    /// Active sessions whose previews differ in length, plus paused sessions,
+    /// Active sessions whose previews differ in length, plus stopped sessions,
     /// capacity rows, and quota rows, so every pane contributes to the layout.
     fn mixed_fleet_dashboard() -> DashboardState {
         let sessions = (0..4)
             .map(|index| {
-                let mut session = archived_session();
+                let mut session = stopped_session();
                 session.id = format!("session-{index}");
                 if index < 2 {
                     session.state = SessionState::Running;
@@ -1860,8 +1718,8 @@ mod tests {
     }
 
     /// Locks the Active pane's layout for a fleet that mixes preview lengths
-    /// with paused, capacity, and quota rows. Both the row-sizing pass and the
-    /// pass that renders previews feed these numbers.
+    /// with capacity and quota rows. Both the row-sizing pass and the pass
+    /// that renders previews feed these numbers.
     #[test]
     fn dashboard_layout_is_stable_for_a_mixed_fleet() {
         let mut dashboard = mixed_fleet_dashboard();
@@ -1873,10 +1731,9 @@ mod tests {
         assert_eq!(
             layout_fingerprint(&terminal, &dashboard),
             concat!(
-                "pane 0: 0,1 120x22\n",
-                "pane 1: 0,23 120x5\n",
-                "pane 2: 0,28 120x4\n",
-                "pane 3: 0,32 120x6\n",
+                "pane 0: 0,1 120x27\n",
+                "pane 1: 0,28 120x4\n",
+                "pane 2: 0,32 120x6\n",
                 "preview: 3,4 116x10\n",
                 "row 3: session summary\n",
                 "row 5: answer 11\n",
@@ -1904,22 +1761,23 @@ mod tests {
         assert_eq!(
             layout_fingerprint(&terminal, &dashboard),
             concat!(
-                "pane 0: 0,1 120x9\n",
-                "pane 1: 0,10 120x5\n",
-                "pane 2: 0,15 120x4\n",
-                "pane 3: 0,19 120x5\n",
-                "preview: 3,4 116x5\n",
+                "pane 0: 0,1 120x14\n",
+                "pane 1: 0,15 120x4\n",
+                "pane 2: 0,19 120x5\n",
+                "preview: 3,4 116x10\n",
                 "row 3: session summary\n",
-                "row 4: answer 12\n",
-                "row 6: question 13\n",
-                "row 8: answer 13",
+                "row 5: answer 11\n",
+                "row 7: question 12\n",
+                "row 9: answer 12\n",
+                "row 11: question 13\n",
+                "row 13: answer 13",
             )
         );
     }
 
     #[test]
     fn active_session_renders_the_complete_last_agent_message() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         dashboard.focus = Focus::Quotas;
@@ -1972,7 +1830,7 @@ mod tests {
 
     #[test]
     fn highlighted_active_session_renders_rich_transcript_tail_and_collapses_on_blur() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         let transcript = vec![
@@ -2081,7 +1939,7 @@ mod tests {
 
     #[test]
     fn selected_transcript_tail_adapts_to_a_constrained_terminal() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         let message = (1..=20)
@@ -2103,7 +1961,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Active"));
-        assert!(rendered.contains("Paused"));
+        assert!(rendered.contains("Capacity"));
         assert!(rendered.contains("Profile Quotas"));
     }
 
@@ -2111,13 +1969,13 @@ mod tests {
     fn overflowing_session_pane_shows_a_scrollbar() {
         let mut sessions = BTreeMap::new();
         for index in 0..6 {
-            let mut session = archived_session();
+            let mut session = stopped_session();
             session.id = format!("active-{index:02}");
             session.state = SessionState::Running;
             sessions.insert(session.id.clone(), session);
         }
         for index in 0..20 {
-            let mut session = archived_session();
+            let mut session = stopped_session();
             session.id = format!("archived-{index:02}");
             sessions.insert(session.id.clone(), session);
         }
@@ -2155,7 +2013,7 @@ mod tests {
 
     #[test]
     fn fully_visible_tables_do_not_show_scrollbars() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("test terminal");
 
         terminal
@@ -2201,119 +2059,6 @@ mod tests {
     }
 
     #[test]
-    fn archived_sessions_omit_turn_clock_and_target_infrastructure() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        let backend = TestBackend::new(120, 36);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw dashboard");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert_eq!(rendered.matches("Turn clock").count(), 1);
-        assert!(rendered.contains("Project"));
-        assert!(rendered.contains("hel"));
-        assert!(!rendered.contains("podman: hel"));
-        assert!(rendered.contains("26-08-09 01:00"));
-        assert!(!rendered.contains("2026-08-09T01:00:00Z"));
-        assert!(!rendered.contains("idle"));
-    }
-
-    #[test]
-    fn archived_columns_leave_all_remaining_width_for_the_complete_session_name() {
-        let long_name =
-            "A session name that is deliberately longer than sixty-four characters but still fits";
-        let mut session = archived_session();
-        session.acp_session_title = Some(long_name.into());
-        let mut dashboard = dashboard_with_session(session);
-        let mut terminal = Terminal::new(TestBackend::new(160, 36)).expect("terminal");
-
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw dashboard");
-        let buffer = terminal.backend().buffer();
-        let lines = (buffer.area.y..buffer.area.bottom())
-            .map(|y| {
-                (buffer.area.x..buffer.area.right())
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        let header = lines
-            .iter()
-            .find(|line| {
-                line.contains("Project")
-                    && line.contains("Profile")
-                    && line.contains("Archived")
-                    && line.contains("Session name")
-            })
-            .expect("archived header");
-        let project = header.find("Project").unwrap();
-        let profile = header.find("Profile").unwrap();
-        let archived = header.find("Archived").unwrap();
-        let archive = header[archived + "Archived".len()..]
-            .find("Archive")
-            .map(|offset| offset + archived + "Archived".len())
-            .unwrap();
-        let session_name = header.find("Session name").unwrap();
-
-        assert_eq!(profile - project, 19);
-        assert_eq!(archived - profile, 15);
-        assert_eq!(archive - archived, 16);
-        assert_eq!(session_name - archive, 8);
-        assert!(lines.iter().any(|line| line.contains(long_name)));
-    }
-
-    #[test]
-    fn archived_resources_show_the_checkpoint_archive_size() {
-        assert_eq!(checkpoint_archive_size(Some(1_536)), "1.5K");
-        assert_eq!(checkpoint_archive_size(None), "—");
-    }
-
-    #[test]
-    fn archived_resources_use_cached_checkpoint_archive_size() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        dashboard.apply_checkpoint_archive_sizes(BTreeMap::from([(
-            "session-1".to_string(),
-            Some(1_536),
-        )]));
-
-        assert_eq!(
-            dashboard
-                .checkpoint_archive_sizes
-                .get("session-1")
-                .copied()
-                .flatten(),
-            Some(1_536)
-        );
-        assert_eq!(
-            checkpoint_archive_size(
-                dashboard
-                    .checkpoint_archive_sizes
-                    .get("session-1")
-                    .copied()
-                    .flatten()
-            ),
-            "1.5K"
-        );
-    }
-
-    #[test]
-    fn archived_checkpoint_time_preserves_its_reported_timezone() {
-        assert_eq!(
-            checkpoint_time_display("2026-08-09T01:02:03-05:00"),
-            "26-08-09 01:02"
-        );
-        assert_eq!(checkpoint_time_display("not-a-timestamp"), "unknown");
-    }
-
-    #[test]
     fn active_checkpoint_age_uses_compact_seconds_minutes_hours_and_days() {
         let checkpointed_at = "2026-08-09T01:00:00Z";
         let base = chrono::DateTime::parse_from_rfc3339(checkpointed_at)
@@ -2328,7 +2073,7 @@ mod tests {
 
     #[test]
     fn recovery_state_is_hidden_until_a_failure_needs_attention() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         assert_eq!(
             recovery_warning_name(&session, "Build Hel".into(), 0),
@@ -2345,7 +2090,7 @@ mod tests {
 
     #[test]
     fn active_session_with_no_turn_in_flight_reads_idle() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let detail = SessionDetail {
             last_activity_at_ms: Some(1_000_000),
@@ -2406,7 +2151,7 @@ mod tests {
 
     #[test]
     fn provisioning_clock_uses_elapsed_seconds_since_state_update() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Provisioning;
         session.updated_at = "1970-01-01T00:16:40Z".into();
 
@@ -2416,7 +2161,7 @@ mod tests {
 
     #[test]
     fn launch_clock_names_the_reported_stage() {
-        let session = archived_session();
+        let session = stopped_session();
         let operation = operation(
             SessionOperationKind::Launching,
             Some(ProvisionStage::Booting),
@@ -2429,7 +2174,7 @@ mod tests {
 
     #[test]
     fn launch_clock_falls_back_to_the_kind_label_without_a_stage() {
-        let session = archived_session();
+        let session = stopped_session();
         let operation = operation(SessionOperationKind::Launching, None);
 
         let (clock, _, _, _, _) =
@@ -2439,12 +2184,15 @@ mod tests {
 
     #[test]
     fn a_stage_does_not_rename_a_non_launch_operation() {
-        let session = archived_session();
-        let operation = operation(SessionOperationKind::Pausing, Some(ProvisionStage::Syncing));
+        let session = stopped_session();
+        let operation = operation(
+            SessionOperationKind::Stopping,
+            Some(ProvisionStage::Syncing),
+        );
 
         let (clock, _, _, _, _) =
             session_values(&session, None, Some(&operation), 1_012, &config());
-        assert_eq!(clock, "Pausing 12s");
+        assert_eq!(clock, "Stopping 12s");
     }
 
     #[test]
@@ -2453,7 +2201,7 @@ mod tests {
         // soon as a resume starts, but the dashboard's local session
         // snapshot only refreshes once the operation finishes. The in-flight
         // row must show where the resume is going, not where it came from.
-        let session = archived_session();
+        let session = stopped_session();
         assert_eq!(session.last_profile, "codex-1");
         assert_eq!(session.target_template_id, "podman");
         let mut resuming = operation(SessionOperationKind::Resuming, None);
@@ -2468,7 +2216,7 @@ mod tests {
 
     #[test]
     fn without_a_resume_destination_the_row_falls_back_to_the_session_record() {
-        let session = archived_session();
+        let session = stopped_session();
         let resuming = operation(SessionOperationKind::Resuming, None);
 
         let (_, profile_id, target_template_id, _, _) =
@@ -2480,7 +2228,7 @@ mod tests {
 
     #[test]
     fn stage_clock_counts_from_when_the_stage_began_not_the_operation() {
-        let session = archived_session();
+        let session = stopped_session();
         let mut operation = operation(
             SessionOperationKind::Launching,
             Some(ProvisionStage::Booting),
@@ -2510,50 +2258,14 @@ mod tests {
                 git_ref: None,
             });
 
-        let (_, _, target, project, _) =
-            session_values(&archived_session(), None, None, 0, &config);
+        let (_, _, target, project, _) = session_values(&stopped_session(), None, None, 0, &config);
         assert_eq!(target, "podman");
         assert_eq!(project, "hel");
     }
 
     #[test]
-    fn archived_pane_replaces_checkpoint_and_archive_with_permanent_delete() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        assert_eq!(dashboard.focus, Focus::Archived);
-        assert_eq!(dashboard.handle_key(ctrl_key('k')), DashboardAction::None);
-        assert_eq!(dashboard.handle_key(ctrl_key('p')), DashboardAction::None);
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Char('d'))),
-            DashboardAction::None
-        );
-        assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::DeleteArchived {
-                session_id: "session-1".into()
-            }
-        );
-
-        let mut dashboard = dashboard_with_session(archived_session());
-        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw archived actions");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("[D]elete permanently"));
-        assert!(!rendered.contains("Chec[K]point"));
-        assert!(!rendered.contains("[P]ause"));
-    }
-
-    #[test]
     fn focused_panes_use_double_borders_without_focus_title_text() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(running_session());
         dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -2567,8 +2279,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("╔ Paused"));
-        assert!(rendered.contains("┌ Active"));
+        assert!(rendered.contains("╔ Active"));
+        assert!(rendered.contains("┌ Capacity"));
         assert!(!rendered.contains("[focused]"));
 
         dashboard.handle_key(key(KeyCode::Tab));
@@ -2602,18 +2314,16 @@ mod tests {
 
     #[test]
     fn only_focused_pane_draws_caret_without_shifting_table_columns() {
-        let mut active = archived_session();
-        active.id = "session-0".into();
-        active.state = SessionState::Running;
-        let archived = archived_session();
+        let mut first = stopped_session();
+        first.id = "session-0".into();
+        first.state = SessionState::Running;
+        let mut second = stopped_session();
+        second.state = SessionState::Running;
         let mut dashboard = DashboardState::new(
             config(),
             HelState {
                 version: STATE_VERSION,
-                sessions: BTreeMap::from([
-                    (active.id.clone(), active),
-                    (archived.id.clone(), archived),
-                ]),
+                sessions: BTreeMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
                 mount_history: BTreeMap::new(),
             },
             BTreeMap::new(),
@@ -2623,12 +2333,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut initial_name_columns = None;
 
-        for expected_focus in [
-            Focus::Active,
-            Focus::Archived,
-            Focus::Capacity,
-            Focus::Quotas,
-        ] {
+        for expected_focus in [Focus::Active, Focus::Capacity, Focus::Quotas] {
             assert_eq!(dashboard.focus, expected_focus);
             terminal
                 .draw(|frame| render(frame, &mut dashboard))
@@ -2660,7 +2365,7 @@ mod tests {
             if let Some(initial_name_columns) = &initial_name_columns {
                 assert_eq!(&name_columns, initial_name_columns);
             } else {
-                assert_ne!(name_columns[0], name_columns[1]);
+                assert_eq!(name_columns[0], name_columns[1]);
                 initial_name_columns = Some(name_columns);
             }
 

@@ -753,6 +753,7 @@ mod tests {
     fn started_phone_session_is_visible_and_mapped_before_provisioning() {
         let session_id = "0123456789abcdef0123456789abcdef";
         let session = SessionRecord {
+            archived: false,
             container_cpus: None,
             container_memory: None,
             id: session_id.into(),

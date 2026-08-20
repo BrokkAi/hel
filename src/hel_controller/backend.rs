@@ -934,6 +934,7 @@ mod tests {
         std::fs::write(source.path().join("many/files/two"), b"two").unwrap();
         let session_id = "0123456789abcdef0123456789abcdef";
         let record = SessionRecord {
+            archived: false,
             container_cpus: None,
             container_memory: None,
             id: session_id.into(),

@@ -19,14 +19,16 @@ use hel::hel_targets::AdditionalMount;
 
 use crate::dialogs::{
     ConfirmDialog, Confirmation, ContainerEditor, FORCE_CONFIRMATION, ImportBundleConfirmation,
-    ImportDialog, ImportFocus, ImportProgress, RenameEditor, RenameFocus,
+    ImportProgress, RenameEditor, RenameFocus,
 };
 use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay, TranscriptHydration};
+use crate::resume::ResumeDialog;
 use crate::wizards::{MountFocus, NewWizard, ResumeWizard, WizardStep};
 
 mod dialogs;
 mod ingest;
 mod render;
+mod resume;
 mod widgets;
 mod wizards;
 
@@ -36,8 +38,11 @@ mod test_support;
 pub use crate::dialogs::{ImportProfileOption, ImportSessionOption};
 pub use crate::ingest::{MaterializedProjectionCache, PreparedMaterializedSessionDetail};
 pub use crate::render::render;
+pub use crate::resume::resume_profile_placeholders;
 
-pub(crate) const DASHBOARD_PANE_COUNT: usize = 4;
+/// Active sessions, capacity, and quotas. Sessions that are not live live in
+/// the resume dialog instead of a dashboard pane.
+pub(crate) const DASHBOARD_PANE_COUNT: usize = 3;
 
 pub(crate) const MOUSE_SCROLL_ROWS: isize = 3;
 
@@ -102,7 +107,7 @@ pub enum DashboardAction {
     DeleteActive {
         session_id: String,
     },
-    DeleteArchived {
+    DeleteStopped {
         session_id: String,
     },
     RenameSession {
@@ -110,7 +115,19 @@ pub enum DashboardAction {
         title: String,
     },
     RefreshQuotas,
-    OpenImport,
+    OpenResumeDialog,
+    /// Hide or reveal one Hel session record in the resume dialog.
+    SetSessionArchived {
+        session_id: String,
+        archived: bool,
+    },
+    /// Hide or reveal one native session in the resume dialog. Hel records the
+    /// choice in its own database; the harness home is never written.
+    SetNativeSessionHidden {
+        harness_kind: HarnessKind,
+        native_session_id: String,
+        hidden: bool,
+    },
     ImportSession {
         profile_id: String,
         native_session_id: String,
@@ -138,7 +155,7 @@ pub enum DashboardAction {
 pub enum SessionOperationKind {
     Launching,
     Resuming,
-    Pausing,
+    Stopping,
     Destroying,
     Deleting,
     Connecting,
@@ -150,7 +167,7 @@ impl SessionOperationKind {
         match self {
             Self::Launching => "Launch",
             Self::Resuming => "Resuming",
-            Self::Pausing => "Pausing",
+            Self::Stopping => "Stopping",
             Self::Destroying => "Destroying",
             Self::Deleting => "Deleting",
             Self::Connecting => "Connecting",
@@ -162,7 +179,6 @@ impl SessionOperationKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Focus {
     Active,
-    Archived,
     Capacity,
     Quotas,
 }
@@ -197,8 +213,9 @@ pub(crate) enum Mode {
     Dashboard,
     New(NewWizard),
     Resume(ResumeWizard),
+    /// The unified picker for every session that is not live.
+    ResumeDialog(ResumeDialog),
     Rename(RenameEditor),
-    Import(ImportDialog),
     EditContainer(ContainerEditor),
     Importing(ImportProgress),
     ConfirmImportBundle(ImportBundleConfirmation),
@@ -266,7 +283,9 @@ pub struct DashboardState {
     pub(crate) quota_index: usize,
     pub(crate) focus: Focus,
     pub(crate) pane_areas: Option<[Rect; DASHBOARD_PANE_COUNT]>,
-    pub(crate) import_sessions_area: Option<Rect>,
+    pub(crate) resume_sessions_area: Option<Rect>,
+    /// Native sessions the resume dialog hides, loaded from Hel's database.
+    pub(crate) hidden_native_sessions: BTreeSet<(HarnessKind, String)>,
     /// Hitbox of the selected session's conversation preview, so the wheel can
     /// scroll that preview instead of moving the selection.
     pub(crate) selected_preview_area: Option<Rect>,
@@ -275,9 +294,6 @@ pub struct DashboardState {
     /// visible preview line beneath it, so a click anywhere on the row
     /// selects it.
     pub(crate) active_row_areas: Vec<(usize, Rect)>,
-    /// Row hitboxes for the Archived pane, keyed by the row's index into the
-    /// archived session list. One line per row.
-    pub(crate) archived_row_areas: Vec<(usize, Rect)>,
     /// Rows the selected session's preview sits above its live tail. Only one
     /// preview scrolls at a time; selecting another session snaps this back to
     /// the tail, which is why the owning session is tracked alongside it.
@@ -308,10 +324,10 @@ impl DashboardState {
             quota_index: 0,
             focus: Focus::Active,
             pane_areas: None,
-            import_sessions_area: None,
+            resume_sessions_area: None,
+            hidden_native_sessions: BTreeSet::new(),
             selected_preview_area: None,
             active_row_areas: Vec::new(),
-            archived_row_areas: Vec::new(),
             preview_scroll: 0,
             preview_scroll_session: None,
             last_row_click: None,
@@ -363,8 +379,8 @@ impl DashboardState {
             Mode::Dashboard => self.handle_dashboard_key(key),
             Mode::New(wizard) => self.handle_new_key(key.code, wizard),
             Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
+            Mode::ResumeDialog(dialog) => self.handle_resume_dialog_key(key, dialog),
             Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
-            Mode::Import(dialog) => self.handle_import_key(key, dialog),
             Mode::EditContainer(editor) => self.handle_container_edit_key(key.code, editor),
             // The only control is the Cancel button, so Enter presses it too.
             Mode::Importing(_) => match key.code {
@@ -408,10 +424,6 @@ impl DashboardState {
                     _ => {}
                 }
             }
-            Mode::Import(dialog) if dialog.focus == ImportFocus::Filter => {
-                dialog.filter.push_str(&pasted);
-                dialog.session_index = 0;
-            }
             Mode::Confirm(ConfirmDialog {
                 confirmation:
                     Confirmation::ForceDestroy { typed, .. } | Confirmation::DeleteActive { typed, .. },
@@ -431,8 +443,8 @@ impl DashboardState {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> DashboardAction {
-        if let Mode::Import(dialog) = &mut self.mode {
-            let Some(area) = self.import_sessions_area else {
+        if let Mode::ResumeDialog(dialog) = &self.mode {
+            let Some(area) = self.resume_sessions_area else {
                 return DashboardAction::None;
             };
             if !rect_contains(area, mouse.column, mouse.row) {
@@ -443,9 +455,12 @@ impl DashboardState {
                 MouseEventKind::ScrollDown => MOUSE_SCROLL_ROWS,
                 _ => return DashboardAction::None,
             };
-            let len = dialog.filtered_sessions().len();
-            dialog.focus = ImportFocus::Sessions;
-            dialog.session_index = offset_index(dialog.session_index, len, delta);
+            let len = self.resume_rows(dialog).len();
+            let index = offset_index(dialog.row_index, len, delta);
+            if let Mode::ResumeDialog(dialog) = &mut self.mode {
+                dialog.focus = crate::resume::ResumeFocus::Sessions;
+            }
+            self.select_resume_row(index);
             return DashboardAction::None;
         }
         if !matches!(self.mode, Mode::Dashboard) {
@@ -458,13 +473,6 @@ impl DashboardState {
                 .find(|(_, area)| rect_contains(*area, mouse.column, mouse.row))
             {
                 return self.handle_row_click(Focus::Active, index);
-            }
-            if let Some(&(index, _)) = self
-                .archived_row_areas
-                .iter()
-                .find(|(_, area)| rect_contains(*area, mouse.column, mouse.row))
-            {
-                return self.handle_row_click(Focus::Archived, index);
             }
             // The click missed every row; forget any pending double click so
             // a stray click elsewhere can't pair up with the next row click.
@@ -492,10 +500,9 @@ impl DashboardState {
                 .position(|area| rect_contains(area, mouse.column, mouse.row))
                 .map(|index| match index {
                     0 => Focus::Active,
-                    1 => Focus::Archived,
-                    2 => Focus::Capacity,
-                    3 => Focus::Quotas,
-                    _ => unreachable!("dashboard has exactly four panes"),
+                    1 => Focus::Capacity,
+                    2 => Focus::Quotas,
+                    _ => unreachable!("dashboard has exactly three panes"),
                 })
         });
         let Some(hovered) = hovered else {
@@ -510,8 +517,7 @@ impl DashboardState {
     }
 
     /// Selects the clicked row and, if it's the second click on the same row
-    /// within `DOUBLE_CLICK_INTERVAL`, performs the same action Enter would:
-    /// opening an active session or starting a resume for an archived one.
+    /// within `DOUBLE_CLICK_INTERVAL`, performs the same action Enter would.
     fn handle_row_click(&mut self, focus: Focus, index: usize) -> DashboardAction {
         self.focus = focus;
         self.set_selection_for(focus, index);
@@ -579,11 +585,11 @@ impl DashboardState {
                     DashboardAction::CancelOperation { session_id }
                 })
             }
-            (KeyCode::Char('i') | KeyCode::Char('t'), true) => DashboardAction::OpenImport,
+            (KeyCode::Char('i') | KeyCode::Char('t'), true) => DashboardAction::OpenResumeDialog,
             (KeyCode::Char('r'), true) => {
                 if self.focus == Focus::Quotas {
                     DashboardAction::RefreshQuotas
-                } else if matches!(self.focus, Focus::Active | Focus::Archived) {
+                } else if self.focus == Focus::Active {
                     if !self.reject_selected_operation() {
                         self.begin_rename();
                     }
@@ -597,7 +603,7 @@ impl DashboardState {
             // opens while the config is empty, and an empty config has no
             // sessions to select.
             (KeyCode::Char('e'), true) if self.config_is_empty() => DashboardAction::OpenConfig,
-            (KeyCode::Char('e'), true) if matches!(self.focus, Focus::Active | Focus::Archived) => {
+            (KeyCode::Char('e'), true) if self.focus == Focus::Active => {
                 self.begin_container_edit();
                 DashboardAction::None
             }
@@ -607,17 +613,6 @@ impl DashboardState {
                 }
                 if let Some(session) = self.selected_session() {
                     self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::Close {
-                        session_id: session.id.clone(),
-                    }));
-                }
-                DashboardAction::None
-            }
-            (KeyCode::Char('d'), true) | (KeyCode::Delete, _) if self.focus == Focus::Archived => {
-                if self.reject_selected_operation() {
-                    return DashboardAction::None;
-                }
-                if let Some(session) = self.selected_session() {
-                    self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteArchived {
                         session_id: session.id.clone(),
                     }));
                 }
@@ -703,21 +698,21 @@ impl DashboardState {
     }
 
     pub(crate) fn selected_session(&self) -> Option<&SessionRecord> {
-        let session = self.ordered_sessions().get(self.session_index).copied()?;
-        match self.focus {
-            Focus::Active if session.state.is_active() => Some(session),
-            Focus::Archived if !session.state.is_active() => Some(session),
-            Focus::Active | Focus::Archived | Focus::Capacity | Focus::Quotas => None,
+        if self.focus != Focus::Active {
+            return None;
         }
+        self.ordered_sessions().get(self.session_index).copied()
     }
 
-    fn ordered_sessions(&self) -> Vec<&SessionRecord> {
-        let (active, archived) = partition_sessions(
+    /// The sessions the dashboard lists, in the current sort order. Only live
+    /// sessions appear here; everything else belongs to the resume dialog.
+    pub(crate) fn ordered_sessions(&self) -> Vec<&SessionRecord> {
+        partition_sessions(
             self.state.sessions.values(),
             &self.session_details,
             self.session_order,
-        );
-        active.into_iter().chain(archived).collect()
+        )
+        .0
     }
 
     fn cycle_session_order(&mut self) {
@@ -785,14 +780,8 @@ impl DashboardState {
     }
 
     fn focus_len_for(&self, focus: Focus) -> usize {
-        let (active, archived) = partition_sessions(
-            self.state.sessions.values(),
-            &self.session_details,
-            self.session_order,
-        );
         match focus {
-            Focus::Active => active.len(),
-            Focus::Archived => archived.len(),
+            Focus::Active => self.ordered_sessions().len(),
             Focus::Capacity => self.capacity_details.len(),
             Focus::Quotas => self.config.profiles.len(),
         }
@@ -803,16 +792,8 @@ impl DashboardState {
     }
 
     fn set_selection_for(&mut self, focus: Focus, index: usize) {
-        let active_len = partition_sessions(
-            self.state.sessions.values(),
-            &self.session_details,
-            self.session_order,
-        )
-        .0
-        .len();
         match focus {
             Focus::Active => self.session_index = index,
-            Focus::Archived => self.session_index = active_len + index,
             Focus::Capacity => self.capacity_index = index,
             Focus::Quotas => self.quota_index = index,
         }
@@ -822,18 +803,6 @@ impl DashboardState {
         let len = self.focus_len();
         match self.focus {
             Focus::Active => move_index(&mut self.session_index, len, delta),
-            Focus::Archived => {
-                let active_len = partition_sessions(
-                    self.state.sessions.values(),
-                    &self.session_details,
-                    self.session_order,
-                )
-                .0
-                .len();
-                let mut index = self.session_index.saturating_sub(active_len);
-                move_index(&mut index, len, delta);
-                self.session_index = active_len + index;
-            }
             Focus::Capacity => move_index(&mut self.capacity_index, len, delta),
             Focus::Quotas => move_index(&mut self.quota_index, len, delta),
         }
@@ -845,16 +814,8 @@ impl DashboardState {
             self.set_selection_for(focus, 0);
             return;
         }
-        let active_len = partition_sessions(
-            self.state.sessions.values(),
-            &self.session_details,
-            self.session_order,
-        )
-        .0
-        .len();
         let current = match focus {
             Focus::Active => self.session_index,
-            Focus::Archived => self.session_index.saturating_sub(active_len),
             Focus::Capacity => self.capacity_index,
             Focus::Quotas => self.quota_index,
         };
@@ -870,55 +831,19 @@ impl DashboardState {
 
     fn cycle_focus(&mut self, reverse: bool) {
         self.focus = match (self.focus, reverse) {
-            (Focus::Active, false) | (Focus::Capacity, true) => Focus::Archived,
-            (Focus::Archived, false) | (Focus::Quotas, true) => Focus::Capacity,
+            (Focus::Active, false) | (Focus::Quotas, true) => Focus::Capacity,
             (Focus::Capacity, false) | (Focus::Active, true) => Focus::Quotas,
-            (Focus::Quotas, false) | (Focus::Archived, true) => Focus::Active,
+            (Focus::Quotas, false) | (Focus::Capacity, true) => Focus::Active,
         };
-        let active_len = partition_sessions(
-            self.state.sessions.values(),
-            &self.session_details,
-            self.session_order,
-        )
-        .0
-        .len();
-        match self.focus {
-            Focus::Active => {
-                self.session_index = self.session_index.min(active_len.saturating_sub(1));
-            }
-            Focus::Archived => self.session_index = self.session_index.max(active_len),
-            Focus::Capacity => {}
-            Focus::Quotas => {}
+        let active_len = self.ordered_sessions().len();
+        if self.focus == Focus::Active {
+            self.session_index = self.session_index.min(active_len.saturating_sub(1));
         }
     }
 
     pub(crate) fn clamp_selections(&mut self) {
-        let (active, archived) = partition_sessions(
-            self.state.sessions.values(),
-            &self.session_details,
-            self.session_order,
-        );
-        if self.focus == Focus::Active && active.is_empty() && !archived.is_empty() {
-            self.focus = Focus::Archived;
-        } else if self.focus == Focus::Archived && archived.is_empty() && !active.is_empty() {
-            self.focus = Focus::Active;
-        }
-        self.session_index = match self.focus {
-            Focus::Active => self.session_index.min(active.len().saturating_sub(1)),
-            Focus::Archived => {
-                active.len()
-                    + self
-                        .session_index
-                        .saturating_sub(active.len())
-                        .min(archived.len().saturating_sub(1))
-            }
-            Focus::Capacity => self
-                .session_index
-                .min(self.state.sessions.len().saturating_sub(1)),
-            Focus::Quotas => self
-                .session_index
-                .min(self.state.sessions.len().saturating_sub(1)),
-        };
+        let active_len = self.ordered_sessions().len();
+        self.session_index = self.session_index.min(active_len.saturating_sub(1));
         self.quota_index = self
             .quota_index
             .min(self.config.profiles.len().saturating_sub(1));
@@ -928,18 +853,21 @@ impl DashboardState {
     }
 }
 
+/// Split sessions into the ones the dashboard lists and the ones the resume
+/// dialog lists. The dashboard shows only live sessions; every other state
+/// belongs to the dialog, and nothing appears in both.
 pub(crate) fn partition_sessions<'a>(
     sessions: impl IntoIterator<Item = &'a SessionRecord>,
     session_details: &BTreeMap<String, SessionDetail>,
     order: SessionOrder,
 ) -> (Vec<&'a SessionRecord>, Vec<&'a SessionRecord>) {
     let mut active = Vec::new();
-    let mut archived = Vec::new();
+    let mut terminal = Vec::new();
     for session in sessions {
         if session.state.is_active() {
             active.push(session);
         } else {
-            archived.push(session);
+            terminal.push(session);
         }
     }
     let activity_timestamp = |session: &SessionRecord| match session_details.get(&session.id) {
@@ -962,8 +890,8 @@ pub(crate) fn partition_sessions<'a>(
             .then_with(|| sequence(left, right)),
     };
     active.sort_by(sort);
-    archived.sort_by(sort);
-    (active, archived)
+    terminal.sort_by(sort);
+    (active, terminal)
 }
 
 fn session_timestamp(timestamp: &str) -> Option<i64> {
@@ -1050,7 +978,7 @@ mod tests {
 
     #[test]
     fn dashboard_actions_require_control_while_navigation_does_not() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
 
@@ -1070,7 +998,7 @@ mod tests {
         );
         assert_eq!(
             dashboard.handle_key(ctrl_key('t')),
-            DashboardAction::OpenImport
+            DashboardAction::OpenResumeDialog
         );
         assert_eq!(
             dashboard.handle_key(ctrl_key('q')),
@@ -1081,7 +1009,7 @@ mod tests {
             dashboard.handle_key(key(KeyCode::Tab)),
             DashboardAction::None
         );
-        assert_eq!(dashboard.focus, Focus::Archived);
+        assert_eq!(dashboard.focus, Focus::Capacity);
     }
 
     #[test]
@@ -1089,35 +1017,32 @@ mod tests {
         let mut new_session = DashboardState::new(config(), HelState::default(), BTreeMap::new());
         assert_eq!(new_session.handle_key(ctrl_key('n')), DashboardAction::None);
 
-        let mut resume = dashboard_with_session(archived_session());
-        assert_eq!(
-            resume.handle_key(key(KeyCode::Enter)),
-            DashboardAction::None
-        );
+        let mut resume = dashboard_with_session(stopped_session());
+        assert_eq!(open_resume_wizard(&mut resume), DashboardAction::None);
 
-        let mut running = archived_session();
+        let mut running = stopped_session();
         running.state = SessionState::Running;
         running.checkpoint = None;
         let mut rename = dashboard_with_session(running);
         assert_eq!(rename.handle_key(ctrl_key('r')), DashboardAction::None);
 
-        let mut import = dashboard_with_session(archived_session());
-        import.show_import_dialog(1, Vec::new());
-
-        let mut importing = dashboard_with_session(archived_session());
+        let mut importing = dashboard_with_session(stopped_session());
         importing.show_import_progress("Chosen session".into());
 
-        let mut confirm_import = dashboard_with_session(archived_session());
+        let mut confirm_import = dashboard_with_session(stopped_session());
         confirm_import.show_import_bundle_confirmation(Vec::new(), Vec::new(), Vec::new(), false);
 
-        let mut confirm = dashboard_with_session(archived_session());
+        let mut confirm = dashboard_with_session(stopped_session());
         confirm.show_dirty_local_confirmation(DashboardAction::None, vec!["project".into()]);
+
+        let mut resume_dialog = dashboard_with_session(stopped_session());
+        resume_dialog.show_resume_dialog(1, Vec::new());
 
         for (label, mut dashboard) in [
             ("new session", new_session),
             ("resume", resume),
+            ("resume dialog", resume_dialog),
             ("rename", rename),
-            ("import", import),
             ("import progress", importing),
             ("import confirmation", confirm_import),
             ("confirmation", confirm),
@@ -1135,24 +1060,24 @@ mod tests {
     }
 
     #[test]
-    fn archived_pane_includes_terminal_sessions_with_pane_local_navigation() {
-        let mut running = archived_session();
+    fn the_partition_keeps_terminal_states_off_the_dashboard() {
+        let mut running = stopped_session();
         running.id = "session-0".into();
         running.state = SessionState::Running;
-        let archived = archived_session();
-        let mut lost = archived_session();
+        let stopped = stopped_session();
+        let mut lost = stopped_session();
         lost.id = "session-2".into();
         lost.state = SessionState::Lost;
         let state = HelState {
             version: STATE_VERSION,
             sessions: BTreeMap::from([
                 (running.id.clone(), running),
-                (archived.id.clone(), archived),
+                (stopped.id.clone(), stopped),
                 (lost.id.clone(), lost),
             ]),
             mount_history: BTreeMap::new(),
         };
-        let (active, archived) = partition_sessions(
+        let (active, terminal) = partition_sessions(
             state.sessions.values(),
             &BTreeMap::new(),
             SessionOrder::Sequence,
@@ -1165,13 +1090,15 @@ mod tests {
             ["session-0"]
         );
         assert_eq!(
-            archived
+            terminal
                 .iter()
                 .map(|session| session.id.as_str())
                 .collect::<Vec<_>>(),
             ["session-1", "session-2"]
         );
 
+        // Only the live session is on the dashboard; Tab leaves the session
+        // pane rather than walking into a second one.
         let mut dashboard = DashboardState::new(config(), state, BTreeMap::new());
         dashboard.handle_key(key(KeyCode::Down));
         assert_eq!(
@@ -1181,34 +1108,30 @@ mod tests {
             Some("session-0")
         );
         dashboard.handle_key(key(KeyCode::Tab));
-        assert_eq!(
-            dashboard
-                .selected_session()
-                .map(|session| session.id.as_str()),
-            Some("session-1")
-        );
+        assert_eq!(dashboard.focus, Focus::Capacity);
+        assert!(dashboard.selected_session().is_none());
     }
 
     #[test]
     fn sessions_are_ordered_by_creation_sequence_ascending_by_default() {
-        let mut oldest = archived_session();
+        let mut oldest = stopped_session();
         oldest.id = "session-z".into();
         oldest.created_at = "2026-08-09T01:00:00Z".into();
-        let mut newest = archived_session();
+        let mut newest = stopped_session();
         newest.id = "session-y".into();
         newest.created_at = "2026-08-09T00:30:00-02:00".into();
-        let mut invalid_timestamp = archived_session();
+        let mut invalid_timestamp = stopped_session();
         invalid_timestamp.id = "session-a".into();
         invalid_timestamp.created_at = "unknown".into();
 
-        let (_, archived) = partition_sessions(
+        let (_, terminal) = partition_sessions(
             [&invalid_timestamp, &oldest, &newest],
             &BTreeMap::new(),
             SessionOrder::Sequence,
         );
 
         assert_eq!(
-            archived
+            terminal
                 .iter()
                 .map(|session| session.id.as_str())
                 .collect::<Vec<_>>(),
@@ -1218,11 +1141,11 @@ mod tests {
 
     #[test]
     fn recent_activity_uses_projection_milliseconds_without_metadata_override() {
-        let mut first = archived_session();
+        let mut first = stopped_session();
         first.id = "first".into();
         first.state = SessionState::Running;
         first.updated_at = "2099-01-01T00:00:00Z".into();
-        let mut second = archived_session();
+        let mut second = stopped_session();
         second.id = "second".into();
         second.state = SessionState::Running;
         second.updated_at = "1970-01-01T00:00:00Z".into();
@@ -1259,11 +1182,11 @@ mod tests {
 
     #[test]
     fn hydrated_session_without_activity_does_not_sort_by_lifecycle_timestamp() {
-        let mut hydrated = archived_session();
+        let mut hydrated = stopped_session();
         hydrated.id = "hydrated".into();
         hydrated.state = SessionState::Running;
         hydrated.updated_at = "2099-01-01T00:00:00Z".into();
-        let mut loading = archived_session();
+        let mut loading = stopped_session();
         loading.id = "loading".into();
         loading.state = SessionState::Running;
         loading.updated_at = "2026-01-01T00:00:00Z".into();
@@ -1289,11 +1212,11 @@ mod tests {
 
     #[test]
     fn unavailable_session_keeps_its_committed_activity_watermark() {
-        let mut disconnected = archived_session();
+        let mut disconnected = stopped_session();
         disconnected.id = "disconnected".into();
         disconnected.state = SessionState::Disconnected;
         disconnected.updated_at = "2099-01-01T00:00:00Z".into();
-        let mut connected = archived_session();
+        let mut connected = stopped_session();
         connected.id = "connected".into();
         connected.state = SessionState::Running;
         connected.updated_at = "1970-01-01T00:00:00Z".into();
@@ -1328,7 +1251,7 @@ mod tests {
     #[test]
     fn sort_hotkey_round_robins_sequence_activity_and_profile() {
         let active_session = |id: &str| {
-            let mut session = archived_session();
+            let mut session = stopped_session();
             session.id = id.into();
             session.state = SessionState::Running;
             session
@@ -1439,7 +1362,7 @@ mod tests {
 
     #[test]
     fn bracketed_paste_populates_dashboard_text_editors() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
 
@@ -1458,10 +1381,10 @@ mod tests {
 
     #[test]
     fn dashboard_navigation_keeps_four_distinct_panes() {
-        let mut active = archived_session();
+        let mut active = stopped_session();
         active.id = "session-0".into();
         active.state = SessionState::Running;
-        let archived = archived_session();
+        let archived = stopped_session();
         let mut dashboard = DashboardState::new(
             config(),
             HelState {
@@ -1482,12 +1405,6 @@ mod tests {
         assert_eq!(dashboard.selected_session().unwrap().id, "session-0");
 
         dashboard.handle_key(key(KeyCode::Tab));
-        assert_eq!(dashboard.focus, Focus::Archived);
-        assert_eq!(dashboard.selected_session().unwrap().id, "session-1");
-        dashboard.handle_key(key(KeyCode::Down));
-        assert_eq!(dashboard.selected_session().unwrap().id, "session-1");
-
-        dashboard.handle_key(key(KeyCode::Tab));
         assert_eq!(dashboard.focus, Focus::Capacity);
         assert!(dashboard.selected_session().is_none());
         dashboard.handle_key(key(KeyCode::Tab));
@@ -1501,14 +1418,14 @@ mod tests {
         dashboard.handle_key(key(KeyCode::BackTab));
         assert_eq!(dashboard.focus, Focus::Capacity);
         dashboard.handle_key(key(KeyCode::BackTab));
-        assert_eq!(dashboard.focus, Focus::Archived);
+        assert_eq!(dashboard.focus, Focus::Active);
     }
 
     #[test]
     fn keyboard_selection_stops_at_the_active_panes_ends_instead_of_wrapping() {
         let sessions = (0..3)
             .map(|index| {
-                let mut session = archived_session();
+                let mut session = stopped_session();
                 session.id = format!("session-{index}");
                 session.state = SessionState::Running;
                 (session.id.clone(), session)
@@ -1539,7 +1456,7 @@ mod tests {
     fn mouse_wheel_scrolls_the_hovered_pane_without_changing_focus() {
         let sessions = (0..5)
             .map(|index| {
-                let mut session = archived_session();
+                let mut session = stopped_session();
                 session.id = format!("session-{index}");
                 session.state = SessionState::Running;
                 (session.id.clone(), session)
@@ -1566,7 +1483,7 @@ mod tests {
         assert_eq!(dashboard.session_index, 0);
 
         assert_eq!(dashboard.focus, Focus::Active);
-        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane_areas[3]));
+        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, pane_areas[2]));
         assert_eq!(dashboard.quota_index, 2);
         assert_eq!(dashboard.session_index, 0);
         assert_eq!(dashboard.focus, Focus::Active);
@@ -1603,48 +1520,6 @@ mod tests {
             "clicking the tail line selected the row, not just its summary line"
         );
         assert_eq!(dashboard.focus, Focus::Active);
-    }
-
-    #[test]
-    fn clicking_an_archived_row_selects_it_and_focuses_archived() {
-        let sessions = (0..3)
-            .map(|index| {
-                let mut session = archived_session();
-                session.id = format!("session-{index}");
-                (session.id.clone(), session)
-            })
-            .collect();
-        let mut dashboard = DashboardState::new(
-            config(),
-            HelState {
-                version: STATE_VERSION,
-                sessions,
-                mount_history: BTreeMap::new(),
-            },
-            BTreeMap::new(),
-        );
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw archived row hitboxes");
-        dashboard.focus = Focus::Active;
-
-        let (_, row) = *dashboard
-            .archived_row_areas
-            .iter()
-            .find(|(index, _)| *index == 1)
-            .expect("the second archived row has a recorded hitbox");
-        dashboard.handle_mouse(mouse_at_row(
-            MouseEventKind::Down(MouseButton::Left),
-            row,
-            0,
-        ));
-
-        assert_eq!(
-            dashboard.session_index, 1,
-            "there are no active sessions, so the archived index is the raw session index"
-        );
-        assert_eq!(dashboard.focus, Focus::Archived);
     }
 
     #[test]
@@ -1744,7 +1619,7 @@ mod tests {
     fn dashboard_with_conversations(count: usize) -> DashboardState {
         let sessions = (0..count)
             .map(|index| {
-                let mut session = archived_session();
+                let mut session = stopped_session();
                 session.id = format!("session-{index}");
                 session.state = SessionState::Running;
                 (session.id.clone(), session)
@@ -1864,7 +1739,7 @@ mod tests {
         // SELECTED_TRANSCRIPT_LINES, so the provisional sizing pass must not cap
         // how far the preview can scroll.
         let mut dashboard = dashboard_with_conversations(1);
-        let mut terminal = Terminal::new(TestBackend::new(120, 26)).expect("test terminal");
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("test terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
             .expect("draw previews");
@@ -1922,10 +1797,10 @@ mod tests {
 
     #[test]
     fn newly_ready_session_can_be_selected_after_state_refresh() {
-        let mut new_session = archived_session();
+        let mut new_session = stopped_session();
         new_session.id = "new-session".into();
         new_session.state = SessionState::Running;
-        let mut other = archived_session();
+        let mut other = stopped_session();
         other.id = "other".into();
         other.state = SessionState::Running;
         let mut dashboard = DashboardState::new(
@@ -1937,7 +1812,7 @@ mod tests {
             },
             BTreeMap::new(),
         );
-        dashboard.focus = Focus::Archived;
+        dashboard.focus = Focus::Quotas;
 
         let mut refreshed = dashboard.state.clone();
         refreshed
@@ -1950,18 +1825,22 @@ mod tests {
         assert_eq!(dashboard.selected_session().unwrap().id, "new-session");
     }
 
+    /// Stopping the last session empties the dashboard rather than moving the
+    /// row to another pane: it belongs to the resume dialog now.
     #[test]
-    fn closing_last_active_session_moves_focus_to_archived_then_cycles_all_panes() {
-        let mut session = archived_session();
+    fn stopping_the_last_session_empties_the_dashboard_and_panes_still_cycle() {
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
         assert_eq!(dashboard.focus, Focus::Active);
 
         let mut state = dashboard.state.clone();
-        state.sessions.get_mut("session-1").unwrap().state = SessionState::Archived;
+        state.sessions.get_mut("session-1").unwrap().state = SessionState::Stopped;
         dashboard.set_state(state);
-        assert_eq!(dashboard.focus, Focus::Archived);
+        assert_eq!(dashboard.focus, Focus::Active);
+        assert!(dashboard.ordered_sessions().is_empty());
+        assert!(dashboard.selected_session().is_none());
 
         dashboard.handle_key(key(KeyCode::Tab));
         assert_eq!(dashboard.focus, Focus::Capacity);
@@ -1969,13 +1848,11 @@ mod tests {
         assert_eq!(dashboard.focus, Focus::Quotas);
         dashboard.handle_key(key(KeyCode::Tab));
         assert_eq!(dashboard.focus, Focus::Active);
-        dashboard.handle_key(key(KeyCode::Tab));
-        assert_eq!(dashboard.focus, Focus::Archived);
     }
 
     #[test]
     fn opening_an_active_session_returns_controller_action() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         session.checkpoint = None;
         let mut dashboard = dashboard_with_session(session);
@@ -1989,7 +1866,7 @@ mod tests {
 
     #[test]
     fn opening_a_failed_session_with_a_checkpoint_starts_resume() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Error;
         session.last_error = Some("resume failed: worker upload source was replaced".into());
         let mut dashboard = dashboard_with_session(session);
@@ -2003,7 +1880,7 @@ mod tests {
 
     #[test]
     fn opening_a_failed_session_without_a_checkpoint_preserves_the_actionable_error() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Error;
         session.checkpoint = None;
         session.last_error = Some("worker bootstrap failed: upload failed".into());

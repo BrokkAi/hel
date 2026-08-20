@@ -1221,7 +1221,7 @@ pub(crate) enum LifecycleSuccess {
     Closed,
     Destroyed,
     DeletedActive,
-    DeletedArchived,
+    DeletedStopped,
 }
 
 pub(crate) struct LifecycleUpdate {

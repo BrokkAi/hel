@@ -353,6 +353,7 @@ impl Controller {
         let id = new_session_id()?;
         let now = now();
         let record = SessionRecord {
+            archived: false,
             container_cpus: None,
             container_memory: None,
             id: id.clone(),

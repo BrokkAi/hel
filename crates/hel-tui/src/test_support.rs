@@ -147,8 +147,9 @@ pub(crate) fn config() -> HelConfig {
     }
 }
 
-pub(crate) fn archived_session() -> SessionRecord {
+pub(crate) fn stopped_session() -> SessionRecord {
     SessionRecord {
+        archived: false,
         container_cpus: None,
         container_memory: None,
         id: "session-1".into(),
@@ -161,7 +162,7 @@ pub(crate) fn archived_session() -> SessionRecord {
         target_template_id: "podman".into(),
         resource_allocation: None,
         additional_mounts: vec![],
-        state: SessionState::Archived,
+        state: SessionState::Stopped,
         target: None,
         native_session_id: Some("native-1".into()),
         acp_session_title: Some("ACP pretty name".into()),
@@ -179,6 +180,24 @@ pub(crate) fn archived_session() -> SessionRecord {
             event_frontier: 2,
         }),
     }
+}
+
+/// The same fixture as [`stopped_session`], but live. Dashboard interactions
+/// such as rename and the container editor only apply to a session that is
+/// actually on the dashboard.
+pub(crate) fn running_session() -> SessionRecord {
+    SessionRecord {
+        state: SessionState::Running,
+        ..stopped_session()
+    }
+}
+
+/// Reaches the resume wizard the way the UI does: open the resume dialog with
+/// no native scan results, then activate the first row, which is the session's
+/// own stopped record.
+pub(crate) fn open_resume_wizard(dashboard: &mut DashboardState) -> crate::DashboardAction {
+    dashboard.show_resume_dialog(1, Vec::new());
+    dashboard.handle_key(key(KeyCode::Enter))
 }
 
 pub(crate) fn dashboard_with_session(mut session: SessionRecord) -> DashboardState {

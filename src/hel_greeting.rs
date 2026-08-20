@@ -17,7 +17,7 @@ pub struct GreetingFacts {
     pub returning: bool,
     pub profile_count: usize,
     pub active_sessions: usize,
-    pub paused_sessions: usize,
+    pub stopped_sessions: usize,
     pub active_turn_profile: Option<String>,
     pub queued_prompts: bool,
     pub raw_localhost_active: bool,
@@ -120,7 +120,7 @@ fn expand(template: &str, facts: &GreetingFacts) -> String {
             "$firstname",
             facts.first_name.as_deref().unwrap_or("friend"),
         )
-        .replace("$paused_count", &facts.paused_sessions.to_string())
+        .replace("$stopped_count", &facts.stopped_sessions.to_string())
         .replace(
             "$profile_name",
             facts.active_turn_profile.as_deref().unwrap_or("An agent"),
@@ -174,11 +174,11 @@ fn active_turn(facts: &GreetingFacts, _: &Clock) -> bool {
 fn queued(facts: &GreetingFacts, _: &Clock) -> bool {
     facts.queued_prompts
 }
-fn multiple_paused(facts: &GreetingFacts, _: &Clock) -> bool {
-    facts.paused_sessions > 1
+fn multiple_stopped(facts: &GreetingFacts, _: &Clock) -> bool {
+    facts.stopped_sessions > 1
 }
 fn multiple_sessions(facts: &GreetingFacts, _: &Clock) -> bool {
-    facts.active_sessions + facts.paused_sessions > 1
+    facts.active_sessions + facts.stopped_sessions > 1
 }
 fn clean(facts: &GreetingFacts, _: &Clock) -> bool {
     facts.repository.is_some_and(|repository| repository.clean)
@@ -300,9 +300,9 @@ const GREETINGS: [Greeting; 45] = [
     greeting("Hel is busy on your behalf", Group::State, active_turn),
     greeting("The agents are restless, $firstname", Group::State, queued),
     greeting(
-        "$paused_count agents sleep beneath the mountain",
+        "$stopped_count agents sleep beneath the mountain",
         Group::State,
-        multiple_paused,
+        multiple_stopped,
     ),
     greeting(
         "Many agents, one dashboard",
@@ -427,7 +427,7 @@ mod tests {
     fn selector_uses_eligible_groups_and_expands_metadata() {
         let facts = GreetingFacts {
             first_name: Some("Ada".into()),
-            paused_sessions: 3,
+            stopped_sessions: 3,
             ..GreetingFacts::default()
         };
         let clock = Clock {

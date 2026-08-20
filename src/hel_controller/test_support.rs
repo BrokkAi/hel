@@ -22,6 +22,7 @@ use super::worktree::{
 
 pub(super) fn checkpoint_test_session(session_id: &str) -> SessionRecord {
     SessionRecord {
+        archived: false,
         container_cpus: None,
         container_memory: None,
         id: session_id.into(),
@@ -144,7 +145,7 @@ pub(super) fn resume_compatibility_config() -> HelConfig {
 
 pub(super) fn raw_session_on(target_template_id: &str, directory: &str) -> SessionRecord {
     let mut session = checkpoint_test_session("0123456789abcdef0123456789abcdef");
-    session.state = SessionState::Archived;
+    session.state = SessionState::Stopped;
     session.bundle_id = "remote-project-abcdef".into();
     session.project_directory = Some(PathBuf::from(directory));
     session.target_template_id = target_template_id.into();
@@ -237,7 +238,7 @@ pub(super) fn managed_worktree_session(repository: &Path, session_id: &str) -> S
     )
     .unwrap();
     let mut session = checkpoint_test_session(session_id);
-    session.state = SessionState::Archived;
+    session.state = SessionState::Stopped;
     session.bundle_id = "remote-project-abcdef".into();
     session.target_template_id = "local-bare".into();
     session.project_directory = Some(worktree.worktree_root.clone());
