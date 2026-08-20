@@ -1,0 +1,1448 @@
+//! The resume dialog: the one surface that lists sessions which are not live.
+//!
+//! Per configured profile it merges two sources into a single list — Hel's own
+//! stopped, lost, and destroyed records, and the native sessions scanned out of
+//! the harness home. A Hel record and the native session it was imported from
+//! are the same conversation, so they collapse into one row: the Hel record's,
+//! because that row carries the checkpoint and the durable queue.
+//!
+//! Nothing here reads the filesystem. Native scans arrive from background tasks
+//! as [`ImportProfileOption`] updates, and the merge below is a pure function
+//! over what has already been received.
+
+use std::collections::BTreeSet;
+use std::time::Instant;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::Frame;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+
+use hel::hel_config::{HarnessKind, HelConfig};
+use hel::hel_state::{HelState, SessionRecord, SessionState};
+
+use crate::dialogs::{ConfirmDialog, Confirmation, ImportProfileOption};
+use crate::render::render_session_scrollbar;
+use crate::widgets::{
+    action_buttons, centered_rect, focus_border, format_resource_bytes, truncate_text,
+};
+use crate::{DashboardAction, DashboardState, Mode, cycle_control, move_index};
+
+/// Origin shown for a native session that has never run under Hel.
+pub(crate) const LOCAL_ORIGIN: &str = "local";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeFocus {
+    Filter,
+    Sessions,
+    Cancel,
+    Open,
+}
+
+const RESUME_FOCUS_ORDER: [ResumeFocus; 4] = [
+    ResumeFocus::Filter,
+    ResumeFocus::Sessions,
+    ResumeFocus::Cancel,
+    ResumeFocus::Open,
+];
+
+/// Identity of one row, stable across rescans so the selection survives an
+/// incremental scan update.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ResumeRowKey {
+    /// A Hel session record, keyed by its Hel session id.
+    Hel(String),
+    /// A native session with no Hel record, keyed by harness and native id.
+    Native(HarnessKind, String),
+}
+
+/// What selecting the row does, and whether it may be selected at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeRowStatus {
+    /// A checkpointed Hel record: Enter opens the resume wizard.
+    Resumable,
+    /// A native session Hel has never adopted: Enter imports it.
+    Importable,
+    /// The target vanished without a verified checkpoint.
+    Lost,
+    /// Force-destroyed. There is nothing left to restore.
+    DataLoss,
+}
+
+impl ResumeRowStatus {
+    pub(crate) fn is_recoverable(self) -> bool {
+        matches!(self, Self::Resumable | Self::Importable)
+    }
+
+    /// Short marker shown in the origin column, sized to fit beside it.
+    pub(crate) fn warning(self) -> Option<&'static str> {
+        match self {
+            Self::Lost => Some("⚠ lost"),
+            Self::DataLoss => Some("⚠ data lost"),
+            Self::Resumable | Self::Importable => None,
+        }
+    }
+
+    /// Why the row cannot be resumed, in full, for the details line and the
+    /// notice a rejected Enter leaves behind.
+    pub(crate) fn explanation(self) -> Option<&'static str> {
+        match self {
+            Self::Lost => Some("lost without a verified checkpoint"),
+            Self::DataLoss => Some("force-destroyed; nothing is left to restore"),
+            Self::Resumable | Self::Importable => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResumeRow {
+    pub(crate) key: ResumeRowKey,
+    pub(crate) profile_id: String,
+    pub(crate) title: String,
+    /// Where the session ran: the record's stored target template id, or
+    /// `local` for a native session Hel never provisioned. The stored string is
+    /// shown verbatim, even when config no longer defines that target.
+    pub(crate) origin: String,
+    pub(crate) details: String,
+    pub(crate) last_activity_ms: i64,
+    pub(crate) status: ResumeRowStatus,
+    /// Hidden by Hel, either by the record's flag or the native hidden set.
+    pub(crate) archived: bool,
+    /// Hidden by the harness itself. Hel cannot clear this.
+    pub(crate) natively_archived: bool,
+    pub(crate) unavailable_reason: Option<String>,
+}
+
+impl ResumeRow {
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        match &self.key {
+            ResumeRowKey::Hel(session_id) => Some(session_id),
+            ResumeRowKey::Native(..) => None,
+        }
+    }
+
+    /// Whether the row is hidden from the default view for any reason.
+    pub(crate) fn is_hidden(&self) -> bool {
+        self.archived || self.natively_archived
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResumeDialog {
+    pub(crate) discovery_id: u64,
+    /// Native scan results, one entry per configured profile. Entries appear
+    /// immediately as placeholders and fill in as background scans report.
+    pub(crate) profiles: Vec<ImportProfileOption>,
+    pub(crate) selected: Option<ResumeRowKey>,
+    pub(crate) row_index: usize,
+    pub(crate) filter: String,
+    pub(crate) focus: ResumeFocus,
+    pub(crate) show_archived: bool,
+    pub(crate) opened_at: Instant,
+}
+
+impl ResumeDialog {
+    pub(crate) fn is_scanning(&self) -> bool {
+        self.profiles.iter().any(|profile| {
+            profile.error.is_none()
+                && profile
+                    .scan_progress
+                    .is_none_or(|(scanned, total)| scanned < total)
+        })
+    }
+
+    /// Scanned and total counts summed across every profile still loading.
+    pub(crate) fn scan_progress(&self) -> (usize, usize) {
+        self.profiles
+            .iter()
+            .filter_map(|profile| profile.scan_progress)
+            .fold(
+                (0, 0),
+                |(scanned, total), (profile_scanned, profile_total)| {
+                    (scanned + profile_scanned, total + profile_total)
+                },
+            )
+    }
+
+    pub(crate) fn errors(&self) -> Vec<String> {
+        self.profiles
+            .iter()
+            .filter_map(|profile| {
+                profile
+                    .error
+                    .as_ref()
+                    .map(|error| format!("{}: {error}", profile.profile_id))
+            })
+            .collect()
+    }
+}
+
+/// The row the dialog points at, clamped to the list it actually has. A state
+/// reload can shrink the list under a selection that was valid a moment ago.
+fn selected_index(dialog: &ResumeDialog, len: usize) -> Option<usize> {
+    (len > 0).then(|| dialog.row_index.min(len - 1))
+}
+
+/// Epoch milliseconds for an RFC 3339 timestamp, or `None` when it cannot be
+/// parsed. An unparseable timestamp must not silently sort as "now".
+fn timestamp_ms(timestamp: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|parsed| parsed.timestamp_millis())
+}
+
+fn hel_row_status(session: &SessionRecord) -> ResumeRowStatus {
+    match session.state {
+        SessionState::Lost => ResumeRowStatus::Lost,
+        SessionState::DestroyedWithDataLoss => ResumeRowStatus::DataLoss,
+        _ => ResumeRowStatus::Resumable,
+    }
+}
+
+fn relative_age(now_ms: i64, then_ms: i64) -> String {
+    let seconds = now_ms.saturating_sub(then_ms).max(0) / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 3_600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3_600)
+    } else {
+        format!("{}d ago", seconds / 86_400)
+    }
+}
+
+/// Merge Hel's non-live records with the scanned native sessions into one list,
+/// newest first. Rows are returned unfiltered; the dialog applies the archived
+/// toggle and the text filter on top.
+///
+/// Dedupe rule: a Hel record whose `native_session_id` matches a scanned native
+/// session of the same harness replaces that native row entirely.
+pub(crate) fn merged_resume_rows(
+    config: &HelConfig,
+    state: &HelState,
+    profiles: &[ImportProfileOption],
+    hidden_native: &BTreeSet<(HarnessKind, String)>,
+    now_ms: i64,
+) -> Vec<ResumeRow> {
+    let mut adopted = BTreeSet::new();
+    let mut rows = Vec::new();
+    for session in state.sessions.values() {
+        // Every record adopts its native session, live ones included: the
+        // native file of a session Hel is running now must not be offered as
+        // a second import.
+        if let Some(native_session_id) = &session.native_session_id {
+            adopted.insert((session.harness_kind, native_session_id.clone()));
+        }
+        if session.state.is_active() {
+            continue;
+        }
+        let last_activity_ms = session
+            .checkpoint
+            .as_ref()
+            .and_then(|checkpoint| timestamp_ms(&checkpoint.created_at))
+            .or_else(|| timestamp_ms(&session.updated_at))
+            .unwrap_or(0);
+        let status = hel_row_status(session);
+        let checkpoint = match (&session.checkpoint, status.explanation()) {
+            (_, Some(reason)) => reason.to_owned(),
+            (None, None) => "no checkpoint".to_owned(),
+            (Some(_), None) => relative_age(now_ms, last_activity_ms),
+        };
+        rows.push(ResumeRow {
+            key: ResumeRowKey::Hel(session.id.clone()),
+            profile_id: session.last_profile.clone(),
+            title: session.display_title().to_owned(),
+            origin: session.target_template_id.clone(),
+            details: format!("{checkpoint} · {}", session.project_name(config)),
+            last_activity_ms,
+            status,
+            archived: session.archived,
+            natively_archived: false,
+            unavailable_reason: None,
+        });
+    }
+    for profile in profiles {
+        for native in &profile.sessions {
+            let key = (profile.harness_kind, native.native_session_id.clone());
+            if adopted.contains(&key) {
+                continue;
+            }
+            rows.push(ResumeRow {
+                key: ResumeRowKey::Native(profile.harness_kind, native.native_session_id.clone()),
+                profile_id: profile.profile_id.clone(),
+                title: native.title.clone(),
+                origin: LOCAL_ORIGIN.to_owned(),
+                details: native.details.clone(),
+                last_activity_ms: native.last_activity_ms,
+                status: ResumeRowStatus::Importable,
+                archived: hidden_native.contains(&key),
+                natively_archived: native.natively_archived,
+                unavailable_reason: native.unavailable_reason.clone(),
+            });
+        }
+    }
+    // Newest first across the whole merged list; the key breaks ties so the
+    // order is stable between incremental scan updates.
+    rows.sort_by(|left, right| {
+        right
+            .last_activity_ms
+            .cmp(&left.last_activity_ms)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    rows
+}
+
+impl DashboardState {
+    /// The rows this dialog shows: the merged list with the archived toggle and
+    /// the text filter applied.
+    pub(crate) fn resume_rows(&self, dialog: &ResumeDialog) -> Vec<ResumeRow> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let needle = dialog.filter.to_lowercase();
+        merged_resume_rows(
+            &self.config,
+            &self.state,
+            &dialog.profiles,
+            &self.hidden_native_sessions,
+            now_ms,
+        )
+        .into_iter()
+        .map(|mut row| {
+            // The checkpoint's size is loaded in the background, so it is
+            // appended here rather than folded into the pure merge.
+            if let Some(size) = row
+                .session_id()
+                .and_then(|id| self.checkpoint_archive_sizes.get(id))
+                .copied()
+                .flatten()
+            {
+                row.details
+                    .push_str(&format!(" · {}", format_resource_bytes(size)));
+            }
+            row
+        })
+        .filter(|row| dialog.show_archived || !row.is_hidden())
+        .filter(|row| {
+            needle.is_empty()
+                || row.title.to_lowercase().contains(&needle)
+                || row.details.to_lowercase().contains(&needle)
+                || row.profile_id.to_lowercase().contains(&needle)
+        })
+        .collect()
+    }
+
+    /// Whether anything on screen animates on its own and so needs a redraw
+    /// faster than the one-second clock: the import progress dialog, or the
+    /// resume dialog's scanning spinner.
+    pub fn needs_fast_tick(&self) -> bool {
+        match &self.mode {
+            Mode::Importing(_) => true,
+            Mode::ResumeDialog(dialog) => dialog.is_scanning(),
+            _ => false,
+        }
+    }
+
+    pub fn show_resume_dialog(&mut self, discovery_id: u64, profiles: Vec<ImportProfileOption>) {
+        self.mode = Mode::ResumeDialog(ResumeDialog {
+            discovery_id,
+            profiles,
+            selected: None,
+            row_index: 0,
+            filter: String::new(),
+            focus: ResumeFocus::Sessions,
+            show_archived: false,
+            opened_at: Instant::now(),
+        });
+        // Record which row the initial selection lands on, so the first
+        // incremental scan result cannot slide the selection out from under it.
+        self.resync_resume_selection();
+    }
+
+    /// Fold one profile's scan result into the open dialog, keeping the
+    /// selection on the same row.
+    pub fn apply_resume_profile(&mut self, discovery_id: u64, profile: ImportProfileOption) {
+        let Mode::ResumeDialog(dialog) = &mut self.mode else {
+            return;
+        };
+        if dialog.discovery_id != discovery_id {
+            return;
+        }
+        match dialog
+            .profiles
+            .iter()
+            .position(|candidate| candidate.profile_id == profile.profile_id)
+        {
+            Some(index) => dialog.profiles[index] = profile,
+            None => dialog.profiles.push(profile),
+        }
+        self.resync_resume_selection();
+    }
+
+    /// Replaces the hidden set loaded from Hel's database.
+    pub fn set_hidden_native_sessions(&mut self, hidden: BTreeSet<(HarnessKind, String)>) {
+        self.hidden_native_sessions = hidden;
+    }
+
+    /// Applies a hide/reveal locally so the row moves immediately; the caller
+    /// persists it in the background and reports a failure as a notice.
+    pub fn set_native_session_hidden(
+        &mut self,
+        harness: HarnessKind,
+        native_session_id: String,
+        hidden: bool,
+    ) {
+        if hidden {
+            self.hidden_native_sessions
+                .insert((harness, native_session_id));
+        } else {
+            self.hidden_native_sessions
+                .remove(&(harness, native_session_id));
+        }
+    }
+
+    /// Applies an archive/unarchive of a Hel record locally, for the same
+    /// reason as [`DashboardState::set_native_session_hidden`].
+    pub fn set_session_archived(&mut self, session_id: &str, archived: bool) {
+        if let Some(session) = self.state.sessions.get_mut(session_id) {
+            session.archived = archived;
+        }
+    }
+
+    /// Keeps `row_index` pointed at the selected row after the list changed.
+    fn resync_resume_selection(&mut self) {
+        let Mode::ResumeDialog(dialog) = &self.mode else {
+            return;
+        };
+        let rows = self.resume_rows(dialog);
+        let selected = dialog.selected.clone();
+        let index = selected
+            .and_then(|key| rows.iter().position(|row| row.key == key))
+            .unwrap_or_else(|| dialog.row_index.min(rows.len().saturating_sub(1)));
+        let key = rows.get(index).map(|row| row.key.clone());
+        let Mode::ResumeDialog(dialog) = &mut self.mode else {
+            return;
+        };
+        dialog.row_index = index;
+        dialog.selected = key;
+    }
+
+    fn move_resume_selection(&mut self, dialog: ResumeDialog, delta: isize) {
+        let mut index = dialog.row_index;
+        let len = self.resume_rows(&dialog).len();
+        self.mode = Mode::ResumeDialog(dialog);
+        move_index(&mut index, len, delta);
+        self.select_resume_row(index);
+    }
+
+    pub(crate) fn select_resume_row(&mut self, index: usize) {
+        let Mode::ResumeDialog(dialog) = &self.mode else {
+            return;
+        };
+        let rows = self.resume_rows(dialog);
+        let key = rows.get(index).map(|row| row.key.clone());
+        let Mode::ResumeDialog(dialog) = &mut self.mode else {
+            return;
+        };
+        dialog.row_index = index;
+        dialog.selected = key;
+    }
+
+    pub(crate) fn selected_resume_row(&self, dialog: &ResumeDialog) -> Option<ResumeRow> {
+        let rows = self.resume_rows(dialog);
+        let index = selected_index(dialog, rows.len())?;
+        rows.into_iter().nth(index)
+    }
+
+    pub(crate) fn handle_resume_dialog_key(
+        &mut self,
+        key: KeyEvent,
+        mut dialog: ResumeDialog,
+    ) -> DashboardAction {
+        let typing = dialog.focus == ResumeFocus::Filter;
+        match key.code {
+            KeyCode::Esc => {
+                self.cancel_modal();
+                DashboardAction::None
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                dialog.focus = cycle_control(
+                    dialog.focus,
+                    &RESUME_FOCUS_ORDER,
+                    key.code == KeyCode::BackTab,
+                );
+                self.mode = Mode::ResumeDialog(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Backspace if typing => {
+                dialog.filter.pop();
+                self.mode = Mode::ResumeDialog(dialog);
+                self.select_resume_row(0);
+                DashboardAction::None
+            }
+            KeyCode::Char(character)
+                if typing
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                dialog.filter.push(character);
+                self.mode = Mode::ResumeDialog(dialog);
+                self.select_resume_row(0);
+                DashboardAction::None
+            }
+            // Down leaves the filter for the list, so typing a filter and
+            // walking its results needs no Tab in between.
+            KeyCode::Down if typing => {
+                dialog.focus = ResumeFocus::Sessions;
+                self.mode = Mode::ResumeDialog(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Up | KeyCode::Char('k') if !typing => {
+                self.move_resume_selection(dialog, -1);
+                DashboardAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') if !typing => {
+                self.move_resume_selection(dialog, 1);
+                DashboardAction::None
+            }
+            // `/` jumps to the filter from anywhere, so the list keeps its
+            // single-letter action keys.
+            KeyCode::Char('/') if !typing => {
+                dialog.focus = ResumeFocus::Filter;
+                self.mode = Mode::ResumeDialog(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Char('s') if !typing => {
+                dialog.show_archived = !dialog.show_archived;
+                let shown = dialog.show_archived;
+                self.mode = Mode::ResumeDialog(dialog);
+                self.resync_resume_selection();
+                self.notices.set(if shown {
+                    "Showing archived sessions."
+                } else {
+                    "Hiding archived sessions."
+                });
+                DashboardAction::None
+            }
+            KeyCode::Char('a') if !typing => {
+                let row = self.selected_resume_row(&dialog);
+                self.mode = Mode::ResumeDialog(dialog);
+                self.toggle_selected_resume_archive(row)
+            }
+            KeyCode::Char('d') | KeyCode::Delete if !typing => {
+                let row = self.selected_resume_row(&dialog);
+                let Some(row) = row else {
+                    self.mode = Mode::ResumeDialog(dialog);
+                    return DashboardAction::None;
+                };
+                let Some(session_id) = row.session_id().map(ToOwned::to_owned) else {
+                    self.mode = Mode::ResumeDialog(dialog);
+                    self.notices.set(
+                        "Hel never deletes a harness's own session. Press a to archive this row.",
+                    );
+                    return DashboardAction::None;
+                };
+                self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteStopped {
+                    session_id,
+                    reopen: Some(Box::new(dialog)),
+                }));
+                DashboardAction::None
+            }
+            KeyCode::Enter if dialog.focus == ResumeFocus::Cancel => {
+                self.cancel_modal();
+                DashboardAction::None
+            }
+            KeyCode::Enter if dialog.focus == ResumeFocus::Filter => {
+                dialog.focus = ResumeFocus::Sessions;
+                self.mode = Mode::ResumeDialog(dialog);
+                DashboardAction::None
+            }
+            KeyCode::Enter => {
+                let row = self.selected_resume_row(&dialog);
+                self.mode = Mode::ResumeDialog(dialog);
+                self.activate_selected_resume_row(row)
+            }
+            _ => {
+                self.mode = Mode::ResumeDialog(dialog);
+                DashboardAction::None
+            }
+        }
+    }
+
+    fn toggle_selected_resume_archive(&mut self, row: Option<ResumeRow>) -> DashboardAction {
+        let Some(row) = row else {
+            return DashboardAction::None;
+        };
+        if row.natively_archived {
+            self.notices
+                .set("This session is archived in its own harness; Hel never writes that back.");
+            return DashboardAction::None;
+        }
+        let archived = !row.archived;
+        match &row.key {
+            ResumeRowKey::Hel(session_id) => {
+                let session_id = session_id.clone();
+                self.set_session_archived(&session_id, archived);
+                self.resync_resume_selection();
+                DashboardAction::SetSessionArchived {
+                    session_id,
+                    archived,
+                }
+            }
+            ResumeRowKey::Native(harness, native_session_id) => {
+                let (harness, native_session_id) = (*harness, native_session_id.clone());
+                self.set_native_session_hidden(harness, native_session_id.clone(), archived);
+                self.resync_resume_selection();
+                DashboardAction::SetNativeSessionHidden {
+                    harness_kind: harness,
+                    native_session_id,
+                    hidden: archived,
+                }
+            }
+        }
+    }
+
+    fn activate_selected_resume_row(&mut self, row: Option<ResumeRow>) -> DashboardAction {
+        let Some(row) = row else {
+            return DashboardAction::None;
+        };
+        if let Some(reason) = row.status.explanation() {
+            self.notices.set(format!(
+                "This session was {reason}. Press d to delete its record."
+            ));
+            return DashboardAction::None;
+        }
+        if let Some(reason) = &row.unavailable_reason {
+            self.notices.set(format!("Cannot resume: {reason}"));
+            return DashboardAction::None;
+        }
+        match row.key {
+            ResumeRowKey::Hel(session_id) => {
+                self.cancel_modal();
+                self.begin_resume_for(&session_id)
+            }
+            ResumeRowKey::Native(_, native_session_id) => {
+                let profile_id = row.profile_id;
+                let display_title = row.title;
+                self.cancel_modal();
+                DashboardAction::ImportSession {
+                    profile_id,
+                    native_session_id,
+                    display_title,
+                }
+            }
+        }
+    }
+}
+
+/// Column widths for the row text, derived from the pane width.
+struct RowLayout {
+    title: usize,
+    profile: usize,
+    origin: usize,
+}
+
+fn row_layout(width: u16) -> RowLayout {
+    let width = usize::from(width);
+    let profile = 14.min(width / 5).max(6);
+    let origin = 14.min(width / 5).max(6);
+    RowLayout {
+        title: width.saturating_sub(profile + origin + 6).max(10),
+        profile,
+        origin,
+    }
+}
+
+pub(crate) fn resume_sessions_pane(area: Rect) -> Rect {
+    let popup = centered_rect(84, 24, area);
+    let inner = popup.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(5),
+            Constraint::Length(4),
+        ])
+        .split(inner)[1]
+}
+
+pub(crate) fn render_resume_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    dashboard: &DashboardState,
+    dialog: &ResumeDialog,
+) {
+    let popup = centered_rect(84, 24, area);
+    frame.render_widget(Clear, popup);
+    let (scanned, total) = dialog.scan_progress();
+    let title = if dialog.is_scanning() {
+        format!(" Resume a session · scanning {scanned}/{total} ")
+    } else {
+        " Resume a session ".to_owned()
+    };
+    let outer = Block::default().borders(Borders::ALL).title(title);
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(5),
+            Constraint::Length(4),
+        ])
+        .split(inner);
+
+    let filter_focused = dialog.focus == ResumeFocus::Filter;
+    let cursor = if filter_focused { "▏" } else { "" };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                format!("Filter: {}{cursor}", dialog.filter),
+                if filter_focused {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            ),
+            Line::styled(
+                if dialog.show_archived {
+                    "Archived rows shown."
+                } else {
+                    "Archived rows hidden."
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        rows[0],
+    );
+
+    let list_rows = dashboard.resume_rows(dialog);
+    let sessions_focused = dialog.focus == ResumeFocus::Sessions;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(focus_border(sessions_focused || filter_focused))
+        .title(" Sessions · newest first ");
+    let list_area = block.inner(rows[1]);
+    frame.render_widget(block, rows[1]);
+    let layout = row_layout(list_area.width);
+    let items = if list_rows.is_empty() {
+        vec![ListItem::new(if dialog.is_scanning() {
+            "Scanning native sessions…"
+        } else if dialog.filter.is_empty() {
+            "No stopped or importable sessions"
+        } else {
+            "No matching sessions"
+        })]
+    } else {
+        // Profiles group the list visually: the first row of each profile
+        // repeats its name, the rest leave the column blank.
+        let mut previous_profile: Option<&str> = None;
+        list_rows
+            .iter()
+            .map(|row| {
+                let group = if previous_profile == Some(row.profile_id.as_str()) {
+                    String::new()
+                } else {
+                    previous_profile = Some(&row.profile_id);
+                    truncate_text(&row.profile_id, layout.profile)
+                };
+                ListItem::new(resume_row_line(row, &group, &layout))
+            })
+            .collect()
+    };
+    let mut state = ListState::default().with_selected(selected_index(dialog, list_rows.len()));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol(if sessions_focused { "› " } else { "  " })
+            .highlight_style(if sessions_focused {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            }),
+        list_area,
+        &mut state,
+    );
+    render_session_scrollbar(
+        frame,
+        rows[1],
+        list_rows.len(),
+        state.offset(),
+        usize::from(list_area.height).max(1),
+    );
+
+    let selected = selected_index(dialog, list_rows.len()).and_then(|index| list_rows.get(index));
+    let mut footer = Vec::new();
+    if let Some(detail) = selected {
+        footer.push(Line::styled(
+            truncate_text(&detail.details, usize::from(rows[2].width)),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    let errors = dialog.errors();
+    if let Some(error) = errors.first() {
+        footer.push(Line::styled(
+            truncate_text(
+                &format!("Scan failed for {error}"),
+                usize::from(rows[2].width),
+            ),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    footer.push(Line::styled(
+        "Enter resumes or imports · a archives · d deletes · s shows archived · / filters · Tab moves",
+        Style::default().fg(Color::DarkGray),
+    ));
+    footer.push(action_buttons(&[
+        ("Cancel", dialog.focus == ResumeFocus::Cancel),
+        ("Open", dialog.focus == ResumeFocus::Open),
+    ]));
+    frame.render_widget(
+        Paragraph::new(footer)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        rows[2],
+    );
+    if dialog.is_scanning() {
+        const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+        let frame_index = (dialog.opened_at.elapsed().as_millis() / 125) as usize;
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} Scanning…",
+                SPINNER[frame_index % SPINNER.len()]
+            ))
+            .style(Style::default().fg(Color::Gray)),
+            Rect::new(rows[2].x, rows[2].bottom().saturating_sub(1), 14, 1),
+        );
+    }
+}
+
+fn resume_row_line(row: &ResumeRow, group: &str, layout: &RowLayout) -> Line<'static> {
+    let title_style = if row.status.is_recoverable() {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    let origin = match row.status.warning() {
+        Some(warning) => Span::styled(
+            format!("{:<width$}", warning, width = layout.origin),
+            Style::default().fg(Color::Yellow),
+        ),
+        None => Span::styled(
+            format!(
+                "{:<width$}",
+                truncate_text(&row.origin, layout.origin),
+                width = layout.origin
+            ),
+            Style::default().fg(Color::Cyan),
+        ),
+    };
+    let mut marks = String::new();
+    if row.natively_archived {
+        marks.push_str("  [archived in harness]");
+    } else if row.archived {
+        marks.push_str("  [archived]");
+    }
+    if row.unavailable_reason.is_some() {
+        marks.push_str("  [unavailable]");
+    }
+    Line::from(vec![
+        Span::styled(
+            format!("{:<width$}", group, width = layout.profile),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::raw("  "),
+        origin,
+        Span::raw("  "),
+        Span::styled(truncate_text(&row.title, layout.title), title_style),
+        Span::styled(marks, Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+/// Placeholder entries so every configured profile shows before its scan
+/// reports anything.
+pub fn resume_profile_placeholders(
+    profiles: impl IntoIterator<Item = (String, HarnessKind)>,
+) -> Vec<ImportProfileOption> {
+    profiles
+        .into_iter()
+        .map(|(profile_id, harness_kind)| ImportProfileOption {
+            profile_id,
+            harness_kind,
+            sessions: Vec::new(),
+            scan_progress: None,
+            error: None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crossterm::event::KeyCode;
+    use hel::hel_state::STATE_VERSION;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+    use crate::test_support::*;
+    use crate::{DashboardState, Focus};
+
+    /// Later than `stopped_session`'s checkpoint, so a native row built with
+    /// it sorts above the Hel record.
+    const NEWER_THAN_THE_CHECKPOINT: i64 = 4_000_000_000_000;
+
+    fn native(id: &str, title: &str, last_activity_ms: i64) -> crate::ImportSessionOption {
+        crate::ImportSessionOption {
+            native_session_id: id.into(),
+            title: title.into(),
+            project_directory: "~/Projects/hel".into(),
+            details: "2m ago · master · 1.0KB · ~/Projects/hel".into(),
+            unavailable_reason: None,
+            last_activity_ms,
+            natively_archived: false,
+        }
+    }
+
+    fn codex_profile(sessions: Vec<crate::ImportSessionOption>) -> ImportProfileOption {
+        ImportProfileOption {
+            profile_id: "codex-1".into(),
+            harness_kind: HarnessKind::Codex,
+            sessions,
+            scan_progress: Some((1, 1)),
+            error: None,
+        }
+    }
+
+    fn state_with(sessions: Vec<SessionRecord>) -> HelState {
+        HelState {
+            version: STATE_VERSION,
+            sessions: sessions
+                .into_iter()
+                .map(|session| (session.id.clone(), session))
+                .collect(),
+            mount_history: BTreeMap::new(),
+        }
+    }
+
+    fn rows(dashboard: &DashboardState) -> Vec<ResumeRow> {
+        let Mode::ResumeDialog(dialog) = &dashboard.mode else {
+            panic!("expected the resume dialog");
+        };
+        dashboard.resume_rows(dialog)
+    }
+
+    fn titles(rows: &[ResumeRow]) -> Vec<&str> {
+        rows.iter().map(|row| row.title.as_str()).collect()
+    }
+
+    /// A Hel record and the native session it was imported from are one
+    /// conversation, so the dialog shows the Hel record's row and drops the
+    /// native duplicate.
+    #[test]
+    fn a_hel_record_replaces_the_native_session_it_was_imported_from() {
+        // `stopped_session` carries native_session_id "native-1".
+        let dashboard = DashboardState::new(
+            config(),
+            state_with(vec![stopped_session()]),
+            BTreeMap::new(),
+        );
+        let merged = merged_resume_rows(
+            &dashboard.config,
+            &dashboard.state,
+            &[codex_profile(vec![
+                native("native-1", "Same conversation", 10),
+                native("native-2", "A different conversation", 5),
+            ])],
+            &BTreeSet::new(),
+            0,
+        );
+
+        assert_eq!(merged.len(), 2, "{:?}", titles(&merged));
+        let adopted = merged
+            .iter()
+            .find(|row| row.key == ResumeRowKey::Hel("session-1".into()))
+            .expect("the hel record keeps its row");
+        assert_eq!(adopted.title, "ACP pretty name");
+        assert_eq!(adopted.origin, "podman");
+        assert!(
+            !merged
+                .iter()
+                .any(|row| row.key == ResumeRowKey::Native(HarnessKind::Codex, "native-1".into())),
+            "the native duplicate is gone"
+        );
+        // A native session with no Hel record still shows, marked local.
+        let native_only = merged
+            .iter()
+            .find(|row| row.key == ResumeRowKey::Native(HarnessKind::Codex, "native-2".into()))
+            .expect("the unadopted native session keeps its row");
+        assert_eq!(native_only.origin, LOCAL_ORIGIN);
+    }
+
+    /// The native session behind a live Hel session must not be offered as an
+    /// import: that would start a second Hel session on the same conversation.
+    #[test]
+    fn a_live_session_hides_its_native_counterpart_from_the_dialog() {
+        let mut live = stopped_session();
+        live.state = SessionState::Running;
+        let merged = merged_resume_rows(
+            &config(),
+            &state_with(vec![live]),
+            &[codex_profile(vec![
+                native("native-1", "Running under Hel right now", 10),
+                native("native-2", "Idle native session", 5),
+            ])],
+            &BTreeSet::new(),
+            0,
+        );
+        assert_eq!(titles(&merged), ["Idle native session"]);
+    }
+
+    /// A record whose target was renamed or removed from config still reports
+    /// the target it actually ran on.
+    #[test]
+    fn the_origin_chip_shows_the_stored_target_even_when_config_forgot_it() {
+        let mut session = stopped_session();
+        session.target_template_id = "retired-target".into();
+        let mut config = config();
+        config.targets.clear();
+        let merged = merged_resume_rows(
+            &config,
+            &state_with(vec![session]),
+            &[],
+            &BTreeSet::new(),
+            0,
+        );
+        assert_eq!(merged[0].origin, "retired-target");
+    }
+
+    /// One order across the merged list: newest activity first, whichever
+    /// source the row came from. Hel records date from their checkpoint,
+    /// native sessions from the file's modification time.
+    #[test]
+    fn rows_sort_by_last_activity_descending_across_both_sources() {
+        let mut old_record = stopped_session();
+        old_record.id = "old-record".into();
+        old_record.native_session_id = None;
+        old_record.checkpoint.as_mut().unwrap().created_at = "2026-01-01T00:00:00Z".into();
+        let mut new_record = stopped_session();
+        new_record.id = "new-record".into();
+        new_record.native_session_id = None;
+        new_record.acp_session_title = Some("Newest record".into());
+        new_record.checkpoint.as_mut().unwrap().created_at = "2026-06-01T00:00:00Z".into();
+
+        let january = 1_767_225_600_000; // 2026-01-01T00:00:00Z
+        let march = 1_772_409_600_000; // 2026-03-01T00:00:00Z
+        let july = 1_782_950_400_000; // 2026-07-01T00:00:00Z
+        let merged = merged_resume_rows(
+            &config(),
+            &state_with(vec![old_record, new_record]),
+            &[codex_profile(vec![
+                native("native-mid", "Native March", march),
+                native("native-new", "Native July", july),
+            ])],
+            &BTreeSet::new(),
+            july,
+        );
+
+        assert_eq!(
+            titles(&merged),
+            [
+                "Native July",
+                "Newest record",
+                "Native March",
+                "ACP pretty name",
+            ]
+        );
+        assert_eq!(merged[3].last_activity_ms, january);
+    }
+
+    /// Archiving hides a row from the default view, from either source, and
+    /// the toggle brings both back.
+    #[test]
+    fn the_archived_toggle_covers_the_record_flag_and_the_native_hidden_set() {
+        let mut hidden_record = stopped_session();
+        hidden_record.id = "hidden-record".into();
+        hidden_record.native_session_id = None;
+        hidden_record.acp_session_title = Some("Hidden record".into());
+        hidden_record.archived = true;
+        let mut visible_record = stopped_session();
+        visible_record.id = "visible-record".into();
+        visible_record.native_session_id = None;
+        visible_record.acp_session_title = Some("Visible record".into());
+
+        let mut dashboard = DashboardState::new(
+            config(),
+            state_with(vec![hidden_record, visible_record]),
+            BTreeMap::new(),
+        );
+        dashboard.set_hidden_native_sessions(BTreeSet::from([(
+            HarnessKind::Codex,
+            "native-hidden".to_owned(),
+        )]));
+        dashboard.show_resume_dialog(
+            1,
+            vec![codex_profile(vec![
+                native("native-hidden", "Hidden native", 1),
+                native("native-shown", "Shown native", 2),
+            ])],
+        );
+
+        let visible = titles(&rows(&dashboard))
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        assert!(visible.contains(&"Visible record".to_owned()));
+        assert!(visible.contains(&"Shown native".to_owned()));
+        assert!(!visible.contains(&"Hidden record".to_owned()));
+        assert!(!visible.contains(&"Hidden native".to_owned()));
+
+        dashboard.handle_key(key(KeyCode::Char('s')));
+        let shown = titles(&rows(&dashboard))
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        for title in [
+            "Visible record",
+            "Shown native",
+            "Hidden record",
+            "Hidden native",
+        ] {
+            assert!(shown.contains(&title.to_owned()), "{shown:?} lacks {title}");
+        }
+    }
+
+    /// Codex's own archived threads are mirrored one way: hidden by default,
+    /// listed under the toggle, and never unarchivable from Hel.
+    #[test]
+    fn natively_archived_rows_are_shown_only_under_the_toggle_and_never_unarchived() {
+        let mut natively_archived = native("native-codex", "Archived in Codex", 1);
+        natively_archived.natively_archived = true;
+        let mut dashboard = DashboardState::new(config(), state_with(Vec::new()), BTreeMap::new());
+        dashboard.show_resume_dialog(1, vec![codex_profile(vec![natively_archived])]);
+
+        assert!(rows(&dashboard).is_empty());
+        dashboard.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(titles(&rows(&dashboard)), ["Archived in Codex"]);
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('a'))),
+            DashboardAction::None
+        );
+        assert!(
+            dashboard
+                .notices
+                .current()
+                .unwrap_or_default()
+                .contains("archived in its own harness")
+        );
+        assert!(rows(&dashboard)[0].natively_archived);
+    }
+
+    /// Archiving reports the persistence the caller must do, and hides the row
+    /// straight away rather than waiting for that write.
+    #[test]
+    fn archiving_a_row_hides_it_immediately_and_reports_the_write_to_persist() {
+        let mut dashboard = DashboardState::new(
+            config(),
+            state_with(vec![stopped_session()]),
+            BTreeMap::new(),
+        );
+        dashboard.show_resume_dialog(
+            1,
+            vec![codex_profile(vec![native(
+                "native-2",
+                "Native",
+                NEWER_THAN_THE_CHECKPOINT,
+            )])],
+        );
+        assert_eq!(rows(&dashboard).len(), 2);
+
+        // The native row is newest, so it is selected first.
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('a'))),
+            DashboardAction::SetNativeSessionHidden {
+                harness_kind: HarnessKind::Codex,
+                native_session_id: "native-2".into(),
+                hidden: true,
+            }
+        );
+        assert_eq!(titles(&rows(&dashboard)), ["ACP pretty name"]);
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('a'))),
+            DashboardAction::SetSessionArchived {
+                session_id: "session-1".into(),
+                archived: true,
+            }
+        );
+        assert!(rows(&dashboard).is_empty());
+
+        // The toggle reveals both, and archiving again reverses each one.
+        dashboard.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(rows(&dashboard).len(), 2);
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('a'))),
+            DashboardAction::SetNativeSessionHidden {
+                harness_kind: HarnessKind::Codex,
+                native_session_id: "native-2".into(),
+                hidden: false,
+            }
+        );
+    }
+
+    /// A lost or force-destroyed session cannot be resumed; deleting its
+    /// record is the only thing left to do with it.
+    #[test]
+    fn lost_and_destroyed_rows_are_marked_and_refuse_to_resume() {
+        for (state, marker, reason) in [
+            (
+                SessionState::Lost,
+                "⚠ lost",
+                "lost without a verified checkpoint",
+            ),
+            (
+                SessionState::DestroyedWithDataLoss,
+                "⚠ data lost",
+                "force-destroyed",
+            ),
+        ] {
+            let mut session = stopped_session();
+            session.state = state;
+            let mut dashboard =
+                DashboardState::new(config(), state_with(vec![session]), BTreeMap::new());
+            dashboard.show_resume_dialog(1, Vec::new());
+
+            let row = &rows(&dashboard)[0];
+            assert!(!row.status.is_recoverable());
+            assert_eq!(row.status.warning(), Some(marker));
+            assert!(row.details.contains(reason), "{}", row.details);
+
+            assert_eq!(
+                dashboard.handle_key(key(KeyCode::Enter)),
+                DashboardAction::None
+            );
+            assert!(matches!(dashboard.mode, Mode::ResumeDialog(_)));
+            let notice = dashboard.notices.current().unwrap_or_default();
+            assert!(notice.contains(reason), "{notice}");
+            assert!(notice.contains("delete its record"), "{notice}");
+
+            dashboard.handle_key(key(KeyCode::Char('d')));
+            assert!(matches!(dashboard.mode, Mode::Confirm(_)));
+        }
+    }
+
+    /// Hel never modifies a harness home, so a native-only row has no delete.
+    #[test]
+    fn a_native_only_row_cannot_be_deleted_from_hel() {
+        let mut dashboard = DashboardState::new(config(), state_with(Vec::new()), BTreeMap::new());
+        dashboard.show_resume_dialog(
+            1,
+            vec![codex_profile(vec![native(
+                "native-2",
+                "Native",
+                NEWER_THAN_THE_CHECKPOINT,
+            )])],
+        );
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Char('d'))),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::ResumeDialog(_)));
+        assert!(
+            dashboard
+                .notices
+                .current()
+                .unwrap_or_default()
+                .contains("never deletes")
+        );
+    }
+
+    /// Selecting a row dispatches to the flow that suits its source: the
+    /// resume wizard for a Hel record, the import flow for a native session.
+    #[test]
+    fn selecting_a_row_resumes_a_hel_record_and_imports_a_native_session() {
+        let mut dashboard = DashboardState::new(
+            config(),
+            state_with(vec![stopped_session()]),
+            BTreeMap::new(),
+        );
+        dashboard.show_resume_dialog(
+            1,
+            vec![codex_profile(vec![native(
+                "native-2",
+                "Native",
+                NEWER_THAN_THE_CHECKPOINT,
+            )])],
+        );
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ImportSession {
+                profile_id: "codex-1".into(),
+                native_session_id: "native-2".into(),
+                display_title: "Native".into(),
+            }
+        );
+
+        dashboard.show_resume_dialog(2, Vec::new());
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::None
+        );
+        assert!(matches!(dashboard.mode, Mode::Resume(_)));
+    }
+
+    /// The dashboard lists live sessions; the dialog lists the rest. Nothing
+    /// appears in both, and a stop in progress stays on the dashboard until
+    /// the state machine reaches Stopped.
+    #[test]
+    fn the_dashboard_shows_live_sessions_and_the_dialog_shows_the_rest() {
+        let mut sessions = Vec::new();
+        for (index, state) in [
+            SessionState::Provisioning,
+            SessionState::Running,
+            SessionState::Disconnected,
+            SessionState::Checkpointing,
+            SessionState::Closing,
+            SessionState::Destroying,
+            SessionState::Error,
+            SessionState::Stopped,
+            SessionState::Lost,
+            SessionState::DestroyedWithDataLoss,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut session = stopped_session();
+            session.id = format!("session-{index:02}");
+            session.native_session_id = None;
+            session.state = state;
+            sessions.push(session);
+        }
+        let mut dashboard = DashboardState::new(config(), state_with(sessions), BTreeMap::new());
+        dashboard.show_resume_dialog(1, Vec::new());
+
+        let on_dashboard = dashboard
+            .ordered_sessions()
+            .iter()
+            .map(|session| session.state)
+            .collect::<Vec<_>>();
+        assert_eq!(on_dashboard.len(), 7);
+        assert!(on_dashboard.iter().all(|state| state.is_active()));
+        // Closing and Checkpointing are mid-stop and must not vanish.
+        assert!(on_dashboard.contains(&SessionState::Closing));
+        assert!(on_dashboard.contains(&SessionState::Checkpointing));
+
+        let in_dialog = rows(&dashboard)
+            .into_iter()
+            .map(|row| row.key)
+            .collect::<Vec<_>>();
+        assert_eq!(in_dialog.len(), 3);
+        let dashboard_ids = dashboard
+            .ordered_sessions()
+            .iter()
+            .map(|session| ResumeRowKey::Hel(session.id.clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            in_dialog.iter().all(|key| !dashboard_ids.contains(key)),
+            "no session is listed in both places"
+        );
+    }
+
+    /// Scans arrive one profile at a time; folding one in must not move the
+    /// selection off the row the user was on.
+    #[test]
+    fn an_incremental_scan_update_keeps_the_selected_row() {
+        let mut dashboard = DashboardState::new(
+            config(),
+            state_with(vec![stopped_session()]),
+            BTreeMap::new(),
+        );
+        dashboard.show_resume_dialog(1, vec![codex_profile(Vec::new())]);
+        assert_eq!(titles(&rows(&dashboard)), ["ACP pretty name"]);
+        let Mode::ResumeDialog(dialog) = &dashboard.mode else {
+            panic!("expected the resume dialog");
+        };
+        assert_eq!(dialog.row_index, 0);
+
+        // A newer native session arrives and sorts above the selected row.
+        dashboard.apply_resume_profile(
+            1,
+            codex_profile(vec![native("native-2", "Newer", NEWER_THAN_THE_CHECKPOINT)]),
+        );
+        let Mode::ResumeDialog(dialog) = &dashboard.mode else {
+            panic!("expected the resume dialog");
+        };
+        assert_eq!(dialog.selected, Some(ResumeRowKey::Hel("session-1".into())));
+        assert_eq!(dialog.row_index, 1);
+        // A late update for another discovery is ignored.
+        dashboard.apply_resume_profile(99, codex_profile(Vec::new()));
+        assert_eq!(rows(&dashboard).len(), 2);
+    }
+
+    /// A scan that failed is reported rather than dropped.
+    #[test]
+    fn a_failed_profile_scan_is_reported_in_the_dialog() {
+        let mut dashboard = DashboardState::new(config(), state_with(Vec::new()), BTreeMap::new());
+        dashboard.show_resume_dialog(
+            1,
+            vec![ImportProfileOption {
+                profile_id: "codex-1".into(),
+                harness_kind: HarnessKind::Codex,
+                sessions: Vec::new(),
+                scan_progress: None,
+                error: Some("permission denied".into()),
+            }],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut dashboard))
+            .expect("draw the resume dialog");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Scan failed for codex-1"), "{rendered}");
+    }
+
+    /// The dialog is the only surface for non-live sessions, and Ctrl+I opens it.
+    #[test]
+    fn the_dashboard_opens_the_dialog_and_names_the_key_in_the_footer() {
+        let mut dashboard = dashboard_with_session(running_session());
+        assert_eq!(
+            dashboard.handle_key(ctrl_key('i')),
+            DashboardAction::OpenResumeDialog
+        );
+        assert_eq!(dashboard.focus, Focus::Active);
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).expect("terminal");
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut dashboard))
+            .expect("draw the dashboard");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("resume/[I]mport"), "{rendered}");
+    }
+
+    /// The in-dialog keys are advertised where the user can see them.
+    #[test]
+    fn the_dialog_footer_names_its_own_keys() {
+        let mut dashboard = DashboardState::new(
+            config(),
+            state_with(vec![stopped_session()]),
+            BTreeMap::new(),
+        );
+        dashboard.show_resume_dialog(1, Vec::new());
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).expect("terminal");
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut dashboard))
+            .expect("draw the resume dialog");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        for hint in ["a archives", "d deletes", "s shows archived"] {
+            assert!(rendered.contains(hint), "{rendered}");
+        }
+    }
+}

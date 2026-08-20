@@ -291,7 +291,7 @@ impl Controller {
             }
         }
         let record = self.state.sessions.get_mut(session_id).unwrap();
-        record.state = SessionState::Archived;
+        record.state = SessionState::Stopped;
         record.target = None;
         record.updated_at = now();
         record.last_error = None;
@@ -299,7 +299,7 @@ impl Controller {
             &mut self.state,
             session_id,
             &destroying,
-            "persist archived state after target cleanup",
+            "persist stopped state after target cleanup",
             &persist,
         )
     }
@@ -359,8 +359,8 @@ impl Controller {
             });
         }
         crate::hel_database::delete_session(session_id)
-            .context("delete paused session from database")?;
-        self.state.remove_archived_session(session_id)?;
+            .context("delete stopped session from database")?;
+        self.state.remove_stopped_session(session_id)?;
         Ok(())
     }
 }
@@ -469,12 +469,12 @@ mod tests {
 
         assert_eq!(
             persisted.into_inner(),
-            vec![SessionState::Destroying, SessionState::Archived]
+            vec![SessionState::Destroying, SessionState::Stopped]
         );
         assert_eq!(executor.commands.borrow().len(), 1);
-        let archived = &controller.state.sessions[session_id];
-        assert_eq!(archived.state, SessionState::Archived);
-        assert!(archived.target.is_none());
+        let stopped = &controller.state.sessions[session_id];
+        assert_eq!(stopped.state, SessionState::Stopped);
+        assert!(stopped.target.is_none());
     }
     #[test]
     fn destroying_retry_blocks_cleanup_when_the_archive_gate_changed() {
@@ -610,10 +610,10 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].args[0], "rm");
         assert_eq!(commands[1].args, ["list", "--all", "--quiet"]);
-        assert_eq!(persisted.into_inner(), vec![SessionState::Archived]);
+        assert_eq!(persisted.into_inner(), vec![SessionState::Stopped]);
         assert_eq!(
             controller.state.sessions[session_id].state,
-            SessionState::Archived
+            SessionState::Stopped
         );
     }
     #[test]
