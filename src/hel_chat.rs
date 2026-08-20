@@ -1715,6 +1715,21 @@ mod tests {
     }
 
     #[test]
+    fn enter_does_not_send_a_prompt_while_the_worker_is_closing_or_closed() {
+        for phase in [WorkerPhase::Closing, WorkerPhase::Closed] {
+            let mut chat = ChatState::new(&snapshot(), &[]);
+            chat.phase = phase;
+            chat.input = "hello".into();
+            assert_eq!(chat.handle_key(key(KeyCode::Enter)), ChatAction::None);
+            assert_eq!(
+                chat.notices.current().as_deref(),
+                Some("The worker is closing; this prompt was not sent")
+            );
+            assert_eq!(chat.input, "hello");
+        }
+    }
+
+    #[test]
     fn bootstrap_uses_snapshot_queue_without_duplicating_replayed_additions() {
         let worker: WorkerSnapshot = serde_json::from_value(serde_json::json!({
             "session_id": "1234567890",

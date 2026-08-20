@@ -844,6 +844,9 @@ impl DashboardContext {
         };
         self.controller = loaded;
         self.dashboard.set_state(self.controller.state.clone());
+        if update.result.is_ok() {
+            self.drop_warm_chat_for(&session_id);
+        }
         match update.result {
             Ok(LifecycleSuccess::Created) => {
                 self.dashboard.select_active_session(&session_id);

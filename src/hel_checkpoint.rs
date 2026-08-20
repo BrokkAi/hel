@@ -1016,6 +1016,9 @@ fn collect_native_artifacts_cached(
     if harness == HarnessKind::Kimi && !output.is_empty() {
         collect_kimi_registry_artifacts(home, session_id, &mut output)?;
     }
+    if harness == HarnessKind::Claude {
+        collect_claude_memory_artifacts(home, session_id, &mut output)?;
+    }
     output.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     ensure!(
         allow_empty || !output.is_empty(),
@@ -1175,6 +1178,82 @@ fn kimi_source_workspace(relative_path: &Path, session_id: &str) -> Option<Strin
         && file == "state.json"
         && (session == session_id || session == format!("session_{session_id}")))
     .then_some(workspace)
+}
+
+/// Claude keeps per-project memory next to the transcripts, outside the
+/// session-id subtree the main pass walks, so capture it in a post-pass.
+///
+/// The memory directory is scoped to the slug that owns this session's
+/// transcript. On a LocalBare target the harness home is the user's real
+/// `~/.claude`, which holds memory for every unrelated project; only the
+/// session's own project memory may leave the machine.
+fn collect_claude_memory_artifacts(
+    home: &Path,
+    session_id: &str,
+    output: &mut Vec<NativeArtifact>,
+) -> Result<()> {
+    let mut slugs: Vec<String> = output
+        .iter()
+        .filter_map(|artifact| claude_session_project_slug(&artifact.relative_path, session_id))
+        .collect();
+    slugs.sort();
+    slugs.dedup();
+    // An unprompted session exported with `allow_empty` has no transcript, so
+    // there is no project to scope memory to.
+    for slug in slugs {
+        let root = home.join("projects").join(&slug).join("memory");
+        if root.is_dir() {
+            collect_claude_memory_tree(home, &root, output)?;
+        }
+    }
+    Ok(())
+}
+
+/// Return the project slug when `relative_path` is this session's transcript
+/// (`projects/<slug>/<session_id>.jsonl`) or lives in its session subtree
+/// (`projects/<slug>/<session_id>/...`).
+fn claude_session_project_slug(relative_path: &Path, session_id: &str) -> Option<String> {
+    let mut components = relative_path.components();
+    (components.next() == Some(Component::Normal("projects".as_ref()))).then_some(())?;
+    let slug = components.next()?.as_os_str().to_str()?.to_owned();
+    let entry = components.next()?.as_os_str().to_str()?;
+    let is_transcript = entry == format!("{session_id}.jsonl") && components.next().is_none();
+    (is_transcript || entry == session_id).then_some(slug)
+}
+
+fn collect_claude_memory_tree(
+    home: &Path,
+    path: &Path,
+    output: &mut Vec<NativeArtifact>,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            collect_claude_memory_tree(home, &entry?.path(), output)?;
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    let relative = path.strip_prefix(home)?;
+    if secret_like_path(relative) {
+        return Ok(());
+    }
+    ensure!(
+        metadata.len() <= MAX_NATIVE_FILE,
+        "native artifact is too large"
+    );
+    validate_relative_path(relative)?;
+    output.push(NativeArtifact {
+        relative_path: relative.to_path_buf(),
+        data: fs::read(path)?,
+        mode: file_mode(&metadata),
+    });
+    Ok(())
 }
 
 fn collect_native_tree(
@@ -2409,6 +2488,77 @@ mod tests {
     }
 
     #[test]
+    fn claude_allowlist_collects_project_memory_for_the_session_slug_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("projects/-workspace-app");
+        let nested = project.join("memory/notes");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(project.join(format!("{NATIVE}.jsonl")), b"transcript").unwrap();
+        fs::write(project.join("memory/root.md"), b"root memory").unwrap();
+        fs::write(nested.join("deep.md"), b"nested memory").unwrap();
+
+        // Memory belonging to an unrelated project in the same harness home.
+        let other = temp.path().join("projects/-workspace-other/memory");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("leak.md"), b"other project memory").unwrap();
+
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Claude, temp.path(), NATIVE, false).unwrap();
+        let paths: Vec<_> = artifacts
+            .iter()
+            .map(|artifact| artifact.relative_path.clone())
+            .collect();
+        assert!(paths.contains(&PathBuf::from(format!(
+            "projects/-workspace-app/{NATIVE}.jsonl"
+        ))));
+        assert!(paths.contains(&PathBuf::from("projects/-workspace-app/memory/root.md")));
+        assert!(paths.contains(&PathBuf::from(
+            "projects/-workspace-app/memory/notes/deep.md"
+        )));
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.starts_with("projects/-workspace-other")),
+            "unrelated project memory leaked: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn claude_project_memory_skips_secret_like_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("projects/-workspace-app");
+        fs::create_dir_all(project.join("memory")).unwrap();
+        fs::write(project.join(format!("{NATIVE}.jsonl")), b"transcript").unwrap();
+        fs::write(project.join("memory/settings.json"), b"secret config").unwrap();
+        fs::write(project.join("memory/.env"), b"TOKEN=1").unwrap();
+        fs::write(project.join("memory/keep.md"), b"safe memory").unwrap();
+
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Claude, temp.path(), NATIVE, false).unwrap();
+        let paths: Vec<_> = artifacts
+            .iter()
+            .map(|artifact| artifact.relative_path.clone())
+            .collect();
+        assert!(paths.contains(&PathBuf::from("projects/-workspace-app/memory/keep.md")));
+        assert!(!paths.contains(&PathBuf::from(
+            "projects/-workspace-app/memory/settings.json"
+        )));
+        assert!(!paths.contains(&PathBuf::from("projects/-workspace-app/memory/.env")));
+    }
+
+    #[test]
+    fn claude_project_memory_is_skipped_without_a_session_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("projects/-workspace-app");
+        fs::create_dir_all(project.join("memory")).unwrap();
+        fs::write(project.join("memory/root.md"), b"root memory").unwrap();
+
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Claude, temp.path(), NATIVE, true).unwrap();
+        assert!(artifacts.is_empty(), "collected {artifacts:?}");
+    }
+
+    #[test]
     fn claude_project_slug_matches_captured_local_rollout_fixtures() {
         // These cwd/directory pairs come from the local Claude home used to
         // establish the import format. Dots are substituted just like slash.
@@ -2445,6 +2595,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(path, PathBuf::from("projects/-workspace-app/session.jsonl"));
+
+        // Project memory rides along under the rewritten slug.
+        let memory = restored_native_relative_path(
+            HarnessKind::Claude,
+            Path::new("projects/-home-me-app/memory/foo.md"),
+            target_primary_cwd("app", &repositories, Path::new("/workspace")).as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            memory,
+            PathBuf::from("projects/-workspace-app/memory/foo.md")
+        );
     }
 
     #[test]
