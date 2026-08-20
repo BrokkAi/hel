@@ -555,21 +555,17 @@ impl Controller {
             .into_iter()
             .next()
             .context("reconnect plan is empty")?;
-        let mut relay = if let Some(manager) = manager {
-            let handle = manager
-                .wait_for_session(session_id, Duration::from_secs(5))
-                .await?;
-            let lease = handle.lease_connection().await?;
-            ControllerRelayLease::Managed {
-                handle,
-                lease: Some(lease),
-            }
-        } else {
-            ControllerRelayLease::Standalone(
-                StandaloneSession::connect_command(&reconnect, session_id).await?,
+        let worker_root = hel_targets::worker_root(&backend, session_id)?;
+        let (mut relay, mut restarted_worker) = self
+            .open_checkpoint_relay(
+                session_id,
+                executor,
+                manager,
+                &backend,
+                &worker_root,
+                &reconnect,
             )
-        };
-        let mut restarted_worker = false;
+            .await?;
         let (barrier, barrier_command_id) = loop {
             let barrier_command_id = new_command_id("checkpoint")?;
             let timeout = if restarted_worker {
@@ -598,7 +594,6 @@ impl Controller {
                         session_id,
                         "ACP did not admit the checkpoint barrier; restarting the worker and retrying: {error:#}"
                     );
-                    let worker_root = hel_targets::worker_root(&backend, session_id)?;
                     let connection = self
                         .restart_worker_for_checkpoint(
                             session_id,
@@ -890,6 +885,42 @@ impl Controller {
         })
     }
 
+    /// Reach the session worker for a checkpoint, restarting it when the proxy
+    /// cannot complete hello. A previous Stop can leave the daemon dead; failing
+    /// that first connect without a bounce never gets to the barrier retry.
+    async fn open_checkpoint_relay(
+        &self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+        manager: Option<&SessionManagerControl>,
+        backend: &hel_targets::TargetLocator,
+        worker_root: &str,
+        reconnect: &hel_targets::CommandSpec,
+    ) -> Result<(ControllerRelayLease, bool)> {
+        match connect_checkpoint_relay(session_id, manager, reconnect).await {
+            Ok(relay) => Ok((relay, false)),
+            Err(error) if worker_connect_needs_restart(&error) => {
+                tracing::warn!(
+                    session_id,
+                    "checkpoint could not reach the worker; restarting it: {error:#}"
+                );
+                let connection = self
+                    .restart_worker_for_checkpoint(
+                        session_id,
+                        executor,
+                        backend,
+                        worker_root,
+                        reconnect,
+                    )
+                    .await?;
+                let relay =
+                    adopt_restarted_checkpoint_relay(session_id, manager, connection).await?;
+                Ok((relay, true))
+            }
+            Err(error) => Err(error).context("connect to the session worker for checkpoint"),
+        }
+    }
+
     /// Kill a worker whose ACP turn will not finish, install the current
     /// binary, and reconnect. Restart recovery interrupts the in-flight prompt
     /// so a later BeginCheckpoint can be admitted.
@@ -938,6 +969,56 @@ impl Controller {
     }
 }
 
+async fn connect_checkpoint_relay(
+    session_id: &str,
+    manager: Option<&SessionManagerControl>,
+    reconnect: &hel_targets::CommandSpec,
+) -> Result<ControllerRelayLease> {
+    if let Some(manager) = manager {
+        let handle = manager
+            .wait_for_session(session_id, Duration::from_secs(5))
+            .await?;
+        let lease = handle.lease_connection().await?;
+        Ok(ControllerRelayLease::Managed {
+            handle,
+            lease: Some(lease),
+        })
+    } else {
+        Ok(ControllerRelayLease::Standalone(
+            StandaloneSession::connect_command(reconnect, session_id).await?,
+        ))
+    }
+}
+
+async fn adopt_restarted_checkpoint_relay(
+    session_id: &str,
+    manager: Option<&SessionManagerControl>,
+    connection: StandaloneSession,
+) -> Result<ControllerRelayLease> {
+    let Some(manager) = manager else {
+        return Ok(ControllerRelayLease::Standalone(connection));
+    };
+    let handle = manager
+        .wait_for_session(session_id, Duration::from_secs(5))
+        .await?;
+    match handle.lease_connection().await {
+        Ok(mut lease) => {
+            lease.replace_connection(connection);
+            Ok(ControllerRelayLease::Managed {
+                handle,
+                lease: Some(lease),
+            })
+        }
+        Err(error) => {
+            tracing::warn!(
+                session_id,
+                "session actor could not lease after worker restart; using the restarted proxy: {error:#}"
+            );
+            Ok(ControllerRelayLease::Standalone(connection))
+        }
+    }
+}
+
 async fn wait_for_checkpoint_barrier(
     relay: &mut StandaloneSession,
     command_id: &str,
@@ -963,6 +1044,15 @@ fn checkpoint_barrier_needs_worker_restart(error: &anyhow::Error) -> bool {
     let detail = format!("{error:#}");
     detail.contains("ACP relay did not reach checkpoint barrier")
         || detail.contains("ACP runtime stopped before reaching the checkpoint barrier")
+}
+
+fn worker_connect_needs_restart(error: &anyhow::Error) -> bool {
+    let detail = format!("{error:#}").to_ascii_lowercase();
+    detail.contains("relay proxy disconnected")
+        || detail.contains("disconnected during hello")
+        || detail.contains("connect worker at")
+        || detail.contains("connection refused")
+        || detail.contains("worker relay did not accept")
 }
 
 fn checkpoint_barrier_is_ready(snapshot: &ManagedSessionSnapshot, command_id: &str) -> bool {
@@ -1933,6 +2023,21 @@ mod tests {
         )));
         assert!(!checkpoint_barrier_needs_worker_restart(&anyhow::anyhow!(
             "export target checkpoint failed with status 1"
+        )));
+    }
+    #[test]
+    fn a_dead_worker_hello_failure_is_retried_by_restarting_the_worker() {
+        assert!(worker_connect_needs_restart(&anyhow::anyhow!(
+            "relay proxy disconnected during hello"
+        )));
+        assert!(worker_connect_needs_restart(&anyhow::anyhow!(
+            "relay proxy disconnected"
+        )));
+        assert!(worker_connect_needs_restart(&anyhow::anyhow!(
+            "Connection refused (os error 111)"
+        )));
+        assert!(!worker_connect_needs_restart(&anyhow::anyhow!(
+            "unknown session"
         )));
     }
     #[test]
