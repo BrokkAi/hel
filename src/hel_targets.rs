@@ -1860,6 +1860,7 @@ pub(crate) fn stop_worker_daemon_script(worker_root: &str) -> String {
     format!(
         r#"hel_root={root}
 hel_match="worker run --root $hel_root"
+hel_match_home="worker run --root $HOME/$hel_root"
 hel_ps() {{
     ps -ww "$@" 2>/dev/null || ps "$@" 2>/dev/null
 }}
@@ -1878,11 +1879,17 @@ hel_stop() {{
     done
     kill -0 "$1" 2>/dev/null || return 0
     hel_signal KILL "$1" || true
+    hel_waited=0
+    while [ "$hel_waited" -lt 3 ]; do
+        kill -0 "$1" 2>/dev/null || return 0
+        sleep 1
+        hel_waited=$((hel_waited + 1))
+    done
 }}
 hel_is_worker() {{
     hel_args=$(hel_ps -o args= -p "$1") || return 1
     case "$hel_args" in
-        *"$hel_match"*) return 0 ;;
+        *"$hel_match"*|*"$hel_match_home"*) return 0 ;;
     esac
     return 1
 }}
@@ -1900,9 +1907,14 @@ hel_ps -eo pid=,args= | while read -r hel_pid hel_args; do
         '' | *[!0-9]*) continue ;;
     esac
     case "$hel_args" in
-        *"$hel_match"*) hel_stop "$hel_pid" ;;
+        *"$hel_match"*|*"$hel_match_home"*) hel_stop "$hel_pid" ;;
     esac
-done"#,
+done
+if hel_ps -eo args= | grep -F -- "$hel_match" >/dev/null 2>&1 \
+    || hel_ps -eo args= | grep -F -- "$hel_match_home" >/dev/null 2>&1; then
+    echo "worker still running after stop: $hel_root" >&2
+    exit 1
+fi"#,
         root = posix_quote(worker_root),
         pid_file = crate::hel_worker::WORKER_PID_FILE,
     )
@@ -3743,8 +3755,10 @@ mod tests {
             // something else must survive.
             assert!(script.contains("worker.pid"));
             assert!(script.contains(r#"hel_match="worker run --root $hel_root""#));
+            assert!(script.contains(r#"hel_match_home="worker run --root $HOME/$hel_root""#));
             assert!(script.contains("hel_is_worker"));
             assert!(script.contains("hel_signal KILL"));
+            assert!(script.contains("worker still running after stop"));
             assert!(!script.contains("pkill"));
         }
         assert!(

@@ -1451,6 +1451,10 @@ mod tests {
             script.contains("hel_match=\"worker run --root $hel_root\""),
             "stop must match only this session's worker: {script}"
         );
+        assert!(
+            script.contains("hel_match_home=\"worker run --root $HOME/$hel_root\""),
+            "stop must also match a login-home-absolute --root: {script}"
+        );
     }
     struct PodmanInstallExecutor {
         commands: RefCell<Vec<CommandSpec>>,

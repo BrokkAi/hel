@@ -29,7 +29,9 @@ use crate::hel_worker::{RelayCommand, RelayCursor, RelayExecutionState};
 
 use super::backend::backend_locator;
 use super::readiness::{connect_started_worker, wait_for_native_session};
-use super::worker_binary::{start_worker, stop_worker};
+use super::worker_binary::{
+    replace_installed_worker_binary, start_worker, stop_worker, worker_binary_for,
+};
 use super::{
     Controller, execute_checked, now, persist_session_record_transition_or_restore,
     scp_command_spec, ssh_command_spec, target_kind, target_profile_home,
@@ -900,8 +902,12 @@ impl Controller {
     ) -> Result<StandaloneSession> {
         stop_worker(executor, backend, worker_root)
             .context("stop wedged Hel worker before retrying checkpoint")?;
-        self.prepare_worker_files(session_id, backend, worker_root, executor)
-            .context("install current Hel worker before retrying checkpoint")?;
+        // Copy through hel.next and rename. scp/cp onto a still-mapped hel
+        // fails with ETXTBSY ("dest open ... Failure") even after SIGKILL,
+        // and prepare_worker_files writes that path in place.
+        let binary = worker_binary_for(backend, executor)?;
+        replace_installed_worker_binary(executor, backend, session_id, &binary)
+            .context("replace Hel worker binary before retrying checkpoint")?;
         start_worker(executor, backend, worker_root)
             .context("start Hel worker after interrupting a wedged ACP turn")?;
         let mut connection =
