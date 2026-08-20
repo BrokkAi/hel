@@ -965,6 +965,9 @@ impl Controller {
         wait_for_native_session(&mut connection, executor)
             .await
             .context("wait for ACP session after restarting the worker for checkpoint")?;
+        wait_for_idle_projection(&mut connection, CHECKPOINT_BARRIER_TIMEOUT_AFTER_RESTART)
+            .await
+            .context("wait for ACP to go idle after worker restart")?;
         Ok(connection)
     }
 }
@@ -1016,6 +1019,36 @@ async fn adopt_restarted_checkpoint_relay(
             );
             Ok(ControllerRelayLease::Standalone(connection))
         }
+    }
+}
+
+async fn wait_for_idle_projection(relay: &mut StandaloneSession, timeout: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_ordinal = None;
+    let mut stable_polls = 0_u8;
+    loop {
+        let snapshot = relay.sync().await?;
+        let ordinal = snapshot.operational.latest_ordinal;
+        let idle = snapshot.operational.execution == RelayExecutionState::Idle;
+        if idle && last_ordinal == Some(ordinal) {
+            stable_polls = stable_polls.saturating_add(1);
+            if stable_polls >= 3 {
+                return Ok(());
+            }
+        } else {
+            stable_polls = 0;
+        }
+        last_ordinal = Some(ordinal);
+        if snapshot.operational.execution == RelayExecutionState::Closed {
+            bail!("ACP runtime stopped before becoming idle");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "ACP runtime did not become idle after worker restart (execution={:?}, ordinal={ordinal})",
+                snapshot.operational.execution
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 

@@ -212,6 +212,7 @@ pub fn worker_binary_prerequisite_for_arch(arch: &str) -> Result<WorkerBinaryAva
             packaged_worker_binary_path(directory, &triple),
             "beside the Hel binary",
         ));
+        candidates.push((directory.join("hel"), "beside the running executable"));
         // Development checkout: a controller at target/<profile>/hel finds its
         // musl sibling at target/<triple>/<profile>/hel. The static build is
         // preferred because the target's glibc may be older than the host's.
