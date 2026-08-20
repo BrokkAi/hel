@@ -201,6 +201,36 @@ pub(crate) async fn apply_dashboard_action(
                 move |result| DashboardIoUpdate::MountValidation { source, result },
             );
         }
+        DashboardAction::ValidateSessionMounts {
+            target_template_id,
+            mounts,
+            launch,
+        } => {
+            context
+                .dashboard
+                .set_notice("Checking attached directories…");
+            let config = context.controller.config.clone();
+            spawn_io(
+                context.dashboard_io_tx.clone(),
+                move || {
+                    let controller = config_only_controller(config);
+                    for mount in mounts {
+                        if let Err(error) = controller.validate_mount_source(
+                            &target_template_id,
+                            std::path::Path::new(&mount.source),
+                            &ProcessExecutor,
+                        ) {
+                            return Ok(Some((
+                                mount.source.to_string_lossy().into_owned(),
+                                format!("{error:#}"),
+                            )));
+                        }
+                    }
+                    Ok(None)
+                },
+                move |result| DashboardIoUpdate::SessionMountValidation { launch, result },
+            );
+        }
         DashboardAction::ValidateProjectDirectory {
             target_template_id,
             directory,
@@ -219,92 +249,14 @@ pub(crate) async fn apply_dashboard_action(
                 move |result| DashboardIoUpdate::ProjectValidation { directory, result },
             );
         }
-        DashboardAction::CreateSession {
-            profile_id,
-            bundle_id,
-            project_directory,
-            target_template_id,
-            additional_mounts,
-            allow_dirty_local,
-            resource_allocation,
-        } => {
-            context.dashboard.set_notice("Preparing session launch…");
-            spawn_dashboard_create_session(
-                DashboardAction::CreateSession {
-                    profile_id,
-                    bundle_id,
-                    project_directory,
-                    target_template_id,
-                    additional_mounts,
-                    allow_dirty_local,
-                    resource_allocation,
-                },
-                context.dashboard_io_tx.clone(),
-                context.lifecycle_updates_tx.clone(),
-                tokio::runtime::Handle::current(),
-            );
-        }
+        action @ DashboardAction::CreateSession { .. } => start_session_launch(context, action),
         DashboardAction::Open { session_id } => {
             if context.hold_chat_session(&session_id).await.is_ok() {
                 context.view = View::Chat;
             }
             context.dirty = true;
         }
-        DashboardAction::ResumeSession {
-            session_id,
-            profile_id,
-            target_template_id,
-            additional_mounts,
-            resource_allocation,
-            discard_queue,
-        } => {
-            context.dashboard.set_notice(resume_progress_notice(
-                &session_id,
-                &profile_id,
-                &target_template_id,
-            ));
-            let request = context.begin_lifecycle_operation(
-                &session_id,
-                SessionOperationKind::Resuming,
-                true,
-            );
-            // The wizard's chosen profile/target become the record's
-            // last_profile/target_template_id as soon as resume starts
-            // (Controller::resume_session_controlled), but this dashboard's
-            // session snapshot won't see that update until the background
-            // operation finishes. Tell the in-flight row where the resume is
-            // going so it doesn't show where the session resumed from.
-            context.dashboard.set_resume_destination(
-                &session_id,
-                profile_id.clone(),
-                target_template_id.clone(),
-            );
-            let stage_updates = context.dashboard_io_tx.clone();
-            let runtime = tokio::runtime::Handle::current();
-            spawn_lifecycle_operation(request, move |controller, cancelled| {
-                let executor = StageReportingExecutor::new(
-                    CancellableProcessExecutor::new(cancelled),
-                    session_id.clone(),
-                    stage_updates,
-                );
-                let materialized = runtime.block_on(controller.resume_session_controlled(
-                    &session_id,
-                    &profile_id,
-                    &target_template_id,
-                    SessionResumeOptions {
-                        additional_mounts: Some(additional_mounts),
-                        resource_allocation,
-                        discard_queue,
-                    },
-                    &executor,
-                ))?;
-                Ok(LifecycleSuccess::Resumed {
-                    profile_id,
-                    target_id: target_template_id,
-                    materialized: Box::new(materialized),
-                })
-            });
-        }
+        action @ DashboardAction::ResumeSession { .. } => start_session_launch(context, action),
         DashboardAction::Close { session_id } => {
             context
                 .dashboard
@@ -387,6 +339,70 @@ pub(crate) async fn apply_dashboard_action(
         }
     }
     Ok(ControlFlow::Continue(()))
+}
+
+pub(crate) fn start_session_launch(context: &mut DashboardContext, action: DashboardAction) {
+    match action {
+        action @ DashboardAction::CreateSession { .. } => {
+            context.dashboard.set_notice("Preparing session launch…");
+            spawn_dashboard_create_session(
+                action,
+                context.dashboard_io_tx.clone(),
+                context.lifecycle_updates_tx.clone(),
+                tokio::runtime::Handle::current(),
+            );
+        }
+        DashboardAction::ResumeSession {
+            session_id,
+            profile_id,
+            target_template_id,
+            additional_mounts,
+            resource_allocation,
+            discard_queue,
+        } => {
+            context.dashboard.set_notice(resume_progress_notice(
+                &session_id,
+                &profile_id,
+                &target_template_id,
+            ));
+            let request = context.begin_lifecycle_operation(
+                &session_id,
+                SessionOperationKind::Resuming,
+                true,
+            );
+            context.dashboard.set_resume_destination(
+                &session_id,
+                profile_id.clone(),
+                target_template_id.clone(),
+            );
+            let stage_updates = context.dashboard_io_tx.clone();
+            let runtime = tokio::runtime::Handle::current();
+            spawn_lifecycle_operation(request, move |controller, cancelled| {
+                let executor = StageReportingExecutor::new(
+                    CancellableProcessExecutor::new(cancelled),
+                    session_id.clone(),
+                    stage_updates,
+                );
+                let materialized = runtime.block_on(controller.resume_session_controlled(
+                    &session_id,
+                    &profile_id,
+                    &target_template_id,
+                    SessionResumeOptions {
+                        additional_mounts: Some(additional_mounts),
+                        resource_allocation,
+                        discard_queue,
+                    },
+                    &executor,
+                ))?;
+                Ok(LifecycleSuccess::Resumed {
+                    profile_id,
+                    target_id: target_template_id,
+                    materialized: Box::new(materialized),
+                })
+            });
+        }
+        _ => unreachable!("mount preflight only carries create or resume actions"),
+    }
 }
 
 impl DashboardContext {

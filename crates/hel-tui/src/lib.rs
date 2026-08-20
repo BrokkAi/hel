@@ -77,6 +77,11 @@ pub enum DashboardAction {
         target_template_id: String,
         source: String,
     },
+    ValidateSessionMounts {
+        target_template_id: String,
+        mounts: Vec<AdditionalMount>,
+        launch: Box<DashboardAction>,
+    },
     ValidateProjectDirectory {
         target_template_id: String,
         directory: String,

@@ -84,6 +84,10 @@ pub(crate) enum DashboardIoUpdate {
         source: String,
         result: std::result::Result<Option<String>, String>,
     },
+    SessionMountValidation {
+        launch: Box<DashboardAction>,
+        result: std::result::Result<Option<(String, String)>, String>,
+    },
     ProjectValidation {
         directory: String,
         result: std::result::Result<(), String>,
@@ -787,6 +791,19 @@ impl DashboardContext {
             DashboardIoUpdate::MountValidation { source, result } => self
                 .dashboard
                 .apply_mount_source_validation(&source, result),
+            DashboardIoUpdate::SessionMountValidation { launch, result } => match result {
+                Ok(None) => {
+                    self.dashboard.finish_session_mount_preflight();
+                    super::actions::start_session_launch(self, *launch);
+                }
+                Ok(Some((source, error))) => {
+                    self.dashboard
+                        .apply_session_mount_preflight_failure(&source, error);
+                }
+                Err(error) => self
+                    .dashboard
+                    .set_notice(format!("Could not check attached directories: {error}")),
+            },
             DashboardIoUpdate::ProjectValidation { directory, result } => self
                 .dashboard
                 .apply_project_directory_validation(&directory, result),

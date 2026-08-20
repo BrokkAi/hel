@@ -1720,7 +1720,7 @@ impl DashboardState {
                 }
                 ReviewFocus::Add if can_attach => begin_mount_editor(&mut wizard),
                 ReviewFocus::Add => {}
-                ReviewFocus::Submit => return self.create_session_action(&wizard),
+                ReviewFocus::Submit => return self.preflight_create_session_action(&wizard),
             },
             KeyCode::Esc => {
                 self.cancel_modal();
@@ -1945,9 +1945,27 @@ impl DashboardState {
     }
 
     fn create_session_action(&mut self, wizard: &NewWizard) -> DashboardAction {
+        let action = self.create_session_action_without_closing(wizard);
+        self.cancel_modal();
+        action
+    }
+
+    fn preflight_create_session_action(&mut self, wizard: &NewWizard) -> DashboardAction {
+        if wizard.mounts.mounts.is_empty() {
+            return self.create_session_action(wizard);
+        }
+        let launch = self.create_session_action_without_closing(wizard);
+        DashboardAction::ValidateSessionMounts {
+            target_template_id: nth_key(&self.config.targets, wizard.target),
+            mounts: wizard.mounts.mounts.clone(),
+            launch: Box::new(launch),
+        }
+    }
+
+    fn create_session_action_without_closing(&self, wizard: &NewWizard) -> DashboardAction {
         let target_template_id = nth_key(&self.config.targets, wizard.target);
         let raw_project = is_bare_project_target(&self.config.targets[&target_template_id]);
-        let action = DashboardAction::CreateSession {
+        DashboardAction::CreateSession {
             profile_id: nth_key(&self.config.profiles, wizard.profile),
             bundle_id: if raw_project {
                 raw_project_context_id(&wizard.project_directory)
@@ -1964,9 +1982,7 @@ impl DashboardState {
             },
             allow_dirty_local: false,
             resource_allocation: wizard.resource_allocation.clone(),
-        };
-        self.cancel_modal();
-        action
+        }
     }
 
     pub fn apply_created_bundle(&mut self, config: HelConfig, bundle_id: &str) -> DashboardAction {
@@ -2471,7 +2487,7 @@ impl DashboardState {
                         .get(wizard.profile)
                         .map(|(id, _)| (*id).clone())
                         .expect("resume wizard is only opened with a compatible profile");
-                    return self.resume_session_action(wizard, profile_id);
+                    return self.preflight_resume_session_action(wizard, profile_id);
                 }
             },
             KeyCode::Esc => {
@@ -2715,6 +2731,66 @@ impl DashboardState {
         };
         self.cancel_modal();
         action
+    }
+
+    fn preflight_resume_session_action(
+        &mut self,
+        wizard: ResumeWizard,
+        profile_id: String,
+    ) -> DashboardAction {
+        if wizard.mounts.mounts.is_empty() {
+            return self.resume_session_action(wizard, profile_id);
+        }
+        let target_template_id = nth_key(&self.config.targets, wizard.target);
+        let mounts = wizard.mounts.mounts.clone();
+        let launch = DashboardAction::ResumeSession {
+            session_id: wizard.session_id.clone(),
+            profile_id,
+            target_template_id: target_template_id.clone(),
+            additional_mounts: mounts.clone(),
+            resource_allocation: wizard.resource_allocation.clone(),
+            discard_queue: wizard.discard_queue,
+        };
+        self.mode = Mode::Resume(wizard);
+        DashboardAction::ValidateSessionMounts {
+            target_template_id,
+            mounts,
+            launch: Box::new(launch),
+        }
+    }
+
+    pub fn apply_session_mount_preflight_failure(&mut self, source: &str, error: String) {
+        match &mut self.mode {
+            Mode::New(wizard) => {
+                if let Some(index) = wizard
+                    .mounts
+                    .mounts
+                    .iter()
+                    .position(|mount| mount.source == std::path::Path::new(source))
+                {
+                    wizard.mounts.history_index = index;
+                    prepare_selected_mount_editor(&mut wizard.step, &mut wizard.mounts);
+                }
+                wizard.mounts.error = Some(error);
+            }
+            Mode::Resume(wizard) => {
+                if let Some(index) = wizard
+                    .mounts
+                    .mounts
+                    .iter()
+                    .position(|mount| mount.source == std::path::Path::new(source))
+                {
+                    wizard.mounts.history_index = index;
+                    prepare_selected_mount_editor(&mut wizard.step, &mut wizard.mounts);
+                }
+                wizard.mounts.error = Some(error);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn finish_session_mount_preflight(&mut self) {
+        self.cancel_modal();
     }
 
     pub(crate) fn begin_new(&mut self) -> DashboardAction {
@@ -3443,22 +3519,57 @@ mod tests {
 
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::CreateSession {
-                profile_id: "codex-1".into(),
-                bundle_id: "hel".into(),
-                project_directory: None,
+            DashboardAction::ValidateSessionMounts {
                 target_template_id: "podman".into(),
-                additional_mounts: vec![AdditionalMount {
+                mounts: vec![AdditionalMount {
                     source: "/opt/cache".into(),
                     destination: "/mnt/cache".into(),
                     read_only: false,
                 }],
-                allow_dirty_local: false,
-                resource_allocation: Some(SessionResourceAllocation::Container {
-                    cpus: BASELINE_CPUS,
-                    memory_bytes: BASELINE_MEMORY_BYTES,
+                launch: Box::new(DashboardAction::CreateSession {
+                    profile_id: "codex-1".into(),
+                    bundle_id: "hel".into(),
+                    project_directory: None,
+                    target_template_id: "podman".into(),
+                    additional_mounts: vec![AdditionalMount {
+                        source: "/opt/cache".into(),
+                        destination: "/mnt/cache".into(),
+                        read_only: false,
+                    }],
+                    allow_dirty_local: false,
+                    resource_allocation: Some(SessionResourceAllocation::Container {
+                        cpus: BASELINE_CPUS,
+                        memory_bytes: BASELINE_MEMORY_BYTES,
+                    }),
                 }),
             }
+        );
+    }
+
+    #[test]
+    fn failed_submit_preflight_reopens_the_invalid_mount() {
+        let mut dashboard = dashboard_at_mount_editor("/opt/cache");
+        dashboard.handle_key(key(KeyCode::Enter));
+        dashboard.apply_mount_source_validation("/opt/cache", Ok(None));
+        dashboard.handle_key(key(KeyCode::BackTab));
+        assert!(matches!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ValidateSessionMounts { .. }
+        ));
+
+        dashboard.apply_session_mount_preflight_failure(
+            "/opt/cache",
+            "source path /opt/cache does not exist or is not a directory".into(),
+        );
+
+        let Mode::New(wizard) = &dashboard.mode else {
+            panic!("preflight failure should keep the new-session dialog open");
+        };
+        assert_eq!(wizard.step, WizardStep::Mounts);
+        assert_eq!(wizard.mounts.source, "/opt/cache");
+        assert_eq!(
+            wizard.mounts.error.as_deref(),
+            Some("source path /opt/cache does not exist or is not a directory")
         );
     }
 
@@ -3690,20 +3801,28 @@ mod tests {
 
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::ResumeSession {
-                session_id: "session-1".into(),
-                profile_id: "codex-1".into(),
+            DashboardAction::ValidateSessionMounts {
                 target_template_id: "podman".into(),
-                additional_mounts: vec![AdditionalMount {
+                mounts: vec![AdditionalMount {
                     source: "/opt/cache".into(),
                     destination: "/mnt/cache".into(),
                     read_only: false,
                 }],
-                resource_allocation: Some(SessionResourceAllocation::Container {
-                    cpus: BASELINE_CPUS,
-                    memory_bytes: BASELINE_MEMORY_BYTES,
+                launch: Box::new(DashboardAction::ResumeSession {
+                    session_id: "session-1".into(),
+                    profile_id: "codex-1".into(),
+                    target_template_id: "podman".into(),
+                    additional_mounts: vec![AdditionalMount {
+                        source: "/opt/cache".into(),
+                        destination: "/mnt/cache".into(),
+                        read_only: false,
+                    }],
+                    resource_allocation: Some(SessionResourceAllocation::Container {
+                        cpus: BASELINE_CPUS,
+                        memory_bytes: BASELINE_MEMORY_BYTES,
+                    }),
+                    discard_queue: false,
                 }),
-                discard_queue: false,
             }
         );
     }
