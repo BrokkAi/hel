@@ -1448,12 +1448,16 @@ mod tests {
             .find(|argument| argument.contains("worker run --root"))
             .unwrap_or_else(|| panic!("stop script missing from {commands:?}"));
         assert!(
-            script.contains("hel_match=\"worker run --root $hel_root\""),
+            script.contains("hel_match=\"hel worker run --root $hel_root\""),
             "stop must match only this session's worker: {script}"
         );
         assert!(
-            script.contains("hel_match_home=\"worker run --root $HOME/$hel_root\""),
+            script.contains("hel_match_home=\"hel worker run --root $HOME/$hel_root\""),
             "stop must also match a login-home-absolute --root: {script}"
+        );
+        assert!(
+            !script.contains("grep -F"),
+            "leftover detection must not grep the match string: {script}"
         );
     }
     struct PodmanInstallExecutor {

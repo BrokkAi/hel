@@ -1859,8 +1859,8 @@ pub fn worker_root(locator: &TargetLocator, session_id: &str) -> Result<String> 
 pub(crate) fn stop_worker_daemon_script(worker_root: &str) -> String {
     format!(
         r#"hel_root={root}
-hel_match="worker run --root $hel_root"
-hel_match_home="worker run --root $HOME/$hel_root"
+hel_match="hel worker run --root $hel_root"
+hel_match_home="hel worker run --root $HOME/$hel_root"
 hel_ps() {{
     ps -ww "$@" 2>/dev/null || ps "$@" 2>/dev/null
 }}
@@ -1906,12 +1906,24 @@ hel_ps -eo pid=,args= | while read -r hel_pid hel_args; do
     case "$hel_pid" in
         '' | *[!0-9]*) continue ;;
     esac
+    [ "$hel_pid" -eq $$ ] && continue
     case "$hel_args" in
         *"$hel_match"*|*"$hel_match_home"*) hel_stop "$hel_pid" ;;
     esac
 done
-if hel_ps -eo args= | grep -F -- "$hel_match" >/dev/null 2>&1 \
-    || hel_ps -eo args= | grep -F -- "$hel_match_home" >/dev/null 2>&1; then
+hel_left=0
+while read -r hel_pid hel_args; do
+    case "$hel_pid" in
+        '' | *[!0-9]*) continue ;;
+    esac
+    [ "$hel_pid" -eq $$ ] && continue
+    case "$hel_args" in
+        *"$hel_match"*|*"$hel_match_home"*) hel_left=1 ;;
+    esac
+done <<HEL_PS
+$(hel_ps -eo pid=,args=)
+HEL_PS
+if [ "$hel_left" -ne 0 ]; then
     echo "worker still running after stop: $hel_root" >&2
     exit 1
 fi"#,
@@ -3754,11 +3766,15 @@ mod tests {
             // The pidfile is the identity check; a reused PID running
             // something else must survive.
             assert!(script.contains("worker.pid"));
-            assert!(script.contains(r#"hel_match="worker run --root $hel_root""#));
-            assert!(script.contains(r#"hel_match_home="worker run --root $HOME/$hel_root""#));
+            assert!(script.contains(r#"hel_match="hel worker run --root $hel_root""#));
+            assert!(script.contains(r#"hel_match_home="hel worker run --root $HOME/$hel_root""#));
             assert!(script.contains("hel_is_worker"));
             assert!(script.contains("hel_signal KILL"));
             assert!(script.contains("worker still running after stop"));
+            assert!(
+                !script.contains("grep -F"),
+                "leftover detection must not grep the match string; grep's own argv contains it"
+            );
             assert!(!script.contains("pkill"));
         }
         assert!(
@@ -3767,6 +3783,74 @@ mod tests {
                 .last()
                 .unwrap()
                 .contains(&format!(".local/share/hel/workers/{SESSION}")),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_worker_script_succeeds_when_no_daemon_is_running() {
+        let worker_root = format!("/tmp/hel-stop-absent-{}-{SESSION}", std::process::id());
+        let script = stop_worker_daemon_script(&worker_root);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .expect("run stop script");
+        assert!(
+            output.status.success(),
+            "stop with no daemon must not false-positive leftover detection: status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_worker_script_kills_a_matching_daemon_and_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::ExitStatusExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let worker_root = directory.path().join(SESSION);
+        std::fs::create_dir_all(&worker_root).unwrap();
+        let fake_hel = worker_root.join("hel");
+        std::fs::write(&fake_hel, "#!/bin/sh\nwhile true; do sleep 1; done\n").unwrap();
+        std::fs::set_permissions(&fake_hel, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = worker_root.to_str().unwrap();
+        let mut child = std::process::Command::new(&fake_hel)
+            .args(["worker", "run", "--root", root, "--config", "launch.json"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start fake worker");
+        std::fs::write(worker_root.join("worker.pid"), format!("{}\n", child.id())).unwrap();
+
+        let script = stop_worker_daemon_script(root);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .expect("run stop script");
+        assert!(
+            output.status.success(),
+            "stop must kill the matching daemon: status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let status = child.wait().expect("reap fake worker");
+        assert!(
+            !status.success() || status.signal().is_some(),
+            "fake worker should have been signaled, got {status:?}"
+        );
+
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .expect("run stop script again");
+        assert!(
+            output.status.success(),
+            "second stop must be a no-op: status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
