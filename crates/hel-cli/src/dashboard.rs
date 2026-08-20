@@ -30,7 +30,10 @@ use hel::hel_setup::{SetupOutcome, run_setup_dialog};
 use hel::hel_state::{RecoveryObserver, SessionResourceAllocation, SessionState};
 use hel::hel_targets::DeploymentCapacityTarget;
 use hel::hel_worker_client::CredentialSyncCoordinator;
-use hel_tui::{DashboardAction, DashboardState, ImportProfileOption, SessionOperationKind, render};
+use hel_tui::{
+    DashboardAction, DashboardState, ImportProfileOption, SessionOperationKind, render,
+    resume_profile_placeholders,
+};
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 use tokio_stream::StreamExt as _;
@@ -42,7 +45,7 @@ use crate::dashboard::io::{
 };
 use crate::import::{
     DashboardImportTaskResult, DashboardImportUpdate, PendingDashboardImport,
-    import_profile_placeholders, spawn_dashboard_import,
+    spawn_dashboard_import,
 };
 use crate::pollers::{
     AuthFailureSyncTracker, CapacityPollUpdate, CredentialSyncNotices, Feed, LifecycleUpdate,
@@ -59,7 +62,7 @@ use crate::{TerminalGuard, short_id, startup_greeting};
 /// Redraw cadence for displays that move with the wall clock: turn timers,
 /// countdowns, and elapsed times.
 const DASHBOARD_CLOCK_TICK: Duration = Duration::from_secs(1);
-/// Redraw cadence while the import progress dialog is on screen.
+/// Redraw cadence while a dialog animates on its own.
 const IMPORT_PROGRESS_TICK: Duration = Duration::from_millis(125);
 pub(crate) const QUOTA_REFRESH_NOTICE: &str = "Refreshing profile quotas…";
 pub(crate) const QUOTA_REFRESHED_NOTICE: &str = "Profile quotas refreshed.";
@@ -292,10 +295,11 @@ pub(crate) async fn run_dashboard() -> Result<()> {
                     _ => true,
                 };
             }
-            // The import dialog reports how long a step has stalled; it needs a
-            // faster tick, and only while it is on screen.
+            // The import progress dialog reports how long a step has stalled
+            // and the resume dialog spins while it scans; both need a faster
+            // tick, and only while they are on screen.
             _ = import_tick.tick(),
-                if context.active_import.is_some() && context.view == View::Dashboard =>
+                if context.dashboard.needs_fast_tick() && context.view == View::Dashboard =>
             {
                 context.dirty = true;
             }
@@ -374,7 +378,7 @@ impl DashboardContext {
             let kind = if state == SessionState::Destroying {
                 SessionOperationKind::Destroying
             } else {
-                SessionOperationKind::Pausing
+                SessionOperationKind::Stopping
             };
             let cancelled = Arc::new(AtomicBool::new(false));
             lifecycle_operations.insert(
@@ -777,7 +781,7 @@ impl DashboardContext {
 
     fn drain_import_profiles(&mut self) {
         while let Some((discovery_id, profile)) = self.import_profiles.next_ready() {
-            self.dashboard.apply_import_profile(discovery_id, profile);
+            self.dashboard.apply_resume_profile(discovery_id, profile);
         }
     }
 
@@ -866,14 +870,23 @@ impl DashboardContext {
         }
     }
 
-    /// Starts an import discovery scan for `session_id`'s harness profiles and
-    /// reports the sessions each one finds.
-    pub(crate) fn start_import_discovery(&mut self) {
+    /// Opens the resume dialog and starts one background scan per profile.
+    /// Every profile appears immediately as a placeholder, so the dialog is
+    /// usable while the scans are still running, and the scans run
+    /// concurrently rather than one after another.
+    pub(crate) fn start_resume_discovery(&mut self) {
         self.import_discovery_id = self.import_discovery_id.wrapping_add(1);
-        self.dashboard.show_import_dialog(
+        self.dashboard.show_resume_dialog(
             self.import_discovery_id,
-            import_profile_placeholders(&self.controller.config),
+            resume_profile_placeholders(
+                self.controller
+                    .config
+                    .profiles
+                    .iter()
+                    .map(|(id, profile)| (id.clone(), profile.kind)),
+            ),
         );
+        io::spawn_hidden_native_sessions_load(self.dashboard_io_tx.clone());
         let discovery_id = self.import_discovery_id;
         for (profile_id, profile) in self.controller.config.profiles.clone() {
             let updates = self.import_updates_tx.clone();

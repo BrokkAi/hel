@@ -20,7 +20,7 @@ use crate::hel_state::{
 use crate::hel_targets::AdditionalMount;
 use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// A deterministic projection integrity violation. Retrying cannot fix it, so
 /// callers must report it separately from transport failures.
@@ -351,6 +351,9 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
     ensure_session_container_override_columns(connection)?;
     ensure_session_mount_read_only_column(connection)?;
     ensure_materialized_elicitation_column(connection)?;
+    if version < 10 {
+        migrate_stopped_session_state(connection)?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -620,6 +623,82 @@ fn migrate_grok_harness_kind(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Rename the `archived` lifecycle state to `stopped` and give sessions their
+/// own display-only `archived` flag, which now means "hidden from the resume
+/// dialog". SQLite cannot narrow or widen a CHECK constraint in place, so this
+/// repeats the v9 table rebuild with the new state list and the new column.
+/// It also adds the hidden set for native sessions Hel only reads.
+fn migrate_stopped_session_state(connection: &Connection) -> Result<()> {
+    connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let migration = connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE sessions_v10 (
+             session_id TEXT PRIMARY KEY REFERENCES session_contexts(session_id),
+             title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+             harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi','grok')),
+             last_profile TEXT NOT NULL,
+             target_template_id TEXT NOT NULL,
+             state TEXT NOT NULL CHECK(state IN (
+                 'provisioning','running','disconnected','checkpointing','closing','destroying',
+                 'stopped','lost','error','destroyed-with-data-loss'
+             )),
+             native_session_id TEXT,
+             acp_session_title TEXT CHECK(acp_session_title IS NULL OR length(trim(acp_session_title)) > 0),
+             session_title_override TEXT CHECK(session_title_override IS NULL OR length(trim(session_title_override)) > 0),
+             updated_at TEXT NOT NULL,
+             detached_after_event_ordinal INTEGER NOT NULL DEFAULT 0
+                 CHECK(detached_after_event_ordinal >= 0),
+             last_error TEXT,
+             resource_allocation TEXT,
+             last_checkpoint_error TEXT,
+             project_directory BLOB,
+             managed_worktree TEXT,
+             draft_input TEXT NOT NULL DEFAULT '',
+             container_cpus TEXT,
+             container_memory TEXT,
+             archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1))
+         ) STRICT;
+         INSERT INTO sessions_v10(
+             session_id, title, harness_kind, last_profile, target_template_id, state,
+             native_session_id, acp_session_title, session_title_override, updated_at,
+             detached_after_event_ordinal, last_error, resource_allocation,
+             last_checkpoint_error, project_directory, managed_worktree, draft_input,
+             container_cpus, container_memory
+         )
+         SELECT
+             session_id, title, harness_kind, last_profile, target_template_id,
+             CASE state WHEN 'archived' THEN 'stopped' ELSE state END,
+             native_session_id, acp_session_title, session_title_override, updated_at,
+             detached_after_event_ordinal, last_error, resource_allocation,
+             last_checkpoint_error, project_directory, managed_worktree, draft_input,
+             container_cpus, container_memory
+         FROM sessions;
+         DROP TABLE sessions;
+         ALTER TABLE sessions_v10 RENAME TO sessions;
+         CREATE TABLE hidden_native_sessions (
+             harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi','grok')),
+             native_session_id TEXT NOT NULL CHECK(length(trim(native_session_id)) > 0),
+             hidden_at TEXT NOT NULL,
+             PRIMARY KEY(harness_kind, native_session_id)
+         ) STRICT;
+         INSERT INTO schema_migrations(version, applied_at)
+             VALUES (10, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+         PRAGMA user_version = 10;
+         COMMIT;",
+    );
+    if migration.is_err() {
+        let _ = connection.execute_batch("ROLLBACK;");
+    }
+    let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+    migration.context("migrate sessions table for the stopped session state")?;
+    foreign_keys.context("restore foreign key enforcement after schema migration")?;
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    if statement.exists([])? {
+        bail!("foreign key violation after migrating the stopped session state");
+    }
+    Ok(())
+}
+
 /// Carry unsent chat input across a detach. Added as a structural guard rather
 /// than a new schema version so databases written by either development line
 /// converge, matching `ensure_managed_worktree_column`.
@@ -669,12 +748,13 @@ pub fn load_state_from(path: &Path) -> Result<HelState> {
                 s.session_title_override, c.created_at, s.updated_at,
                 s.detached_after_event_ordinal, s.last_error, s.resource_allocation,
                 s.last_checkpoint_error, s.project_directory, s.managed_worktree,
-                s.draft_input, s.container_cpus, s.container_memory
+                s.draft_input, s.container_cpus, s.container_memory, s.archived
          FROM sessions s JOIN session_contexts c USING(session_id)
          ORDER BY s.session_id",
     )?;
     let rows = statement.query_map([], |row| {
         Ok(SessionRecord {
+            archived: row.get(21)?,
             container_cpus: row.get(19)?,
             container_memory: row.get(20)?,
             id: row.get(0)?,
@@ -785,6 +865,87 @@ pub fn recover_interrupted_checkpointing_sessions(updated_at: &str) -> Result<us
 /// SessionRecord over independently committed checkpoint or relay metadata.
 pub fn set_session_title_override(session_id: &str, title: &str, updated_at: &str) -> Result<()> {
     set_session_title_override_to(&database_path(), session_id, title, updated_at)
+}
+
+/// Change only whether the resume dialog hides this session. Archiving is a
+/// display choice, so it has its own writer and never rewrites lifecycle,
+/// checkpoint, or title columns another task owns.
+pub fn set_session_archived(session_id: &str, archived: bool) -> Result<()> {
+    set_session_archived_to(&database_path(), session_id, archived)
+}
+
+fn set_session_archived_to(path: &Path, session_id: &str, archived: bool) -> Result<()> {
+    let connection = open(path)?;
+    let changed = connection.execute(
+        "UPDATE sessions SET archived = ?2 WHERE session_id = ?1",
+        params![session_id, archived],
+    )?;
+    if changed != 1 {
+        bail!("unknown session {session_id}");
+    }
+    Ok(())
+}
+
+/// Native sessions the resume dialog hides. Hel never writes into a harness
+/// home, so the hidden set lives here instead of in the harness's own store.
+pub fn hidden_native_sessions() -> Result<BTreeSet<(crate::hel_config::HarnessKind, String)>> {
+    hidden_native_sessions_from(&database_path())
+}
+
+fn hidden_native_sessions_from(
+    path: &Path,
+) -> Result<BTreeSet<(crate::hel_config::HarnessKind, String)>> {
+    let connection = open(path)?;
+    let mut statement =
+        connection.prepare("SELECT harness_kind, native_session_id FROM hidden_native_sessions")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut hidden = BTreeSet::new();
+    for row in rows {
+        let (harness, native_session_id) = row?;
+        let harness = harness
+            .parse::<crate::hel_config::HarnessKind>()
+            .with_context(|| format!("unknown harness {harness:?} in the hidden session set"))?;
+        hidden.insert((harness, native_session_id));
+    }
+    Ok(hidden)
+}
+
+/// Hide or reveal one native session in the resume dialog.
+pub fn set_native_session_hidden(
+    harness: crate::hel_config::HarnessKind,
+    native_session_id: &str,
+    hidden: bool,
+) -> Result<()> {
+    set_native_session_hidden_to(&database_path(), harness, native_session_id, hidden)
+}
+
+fn set_native_session_hidden_to(
+    path: &Path,
+    harness: crate::hel_config::HarnessKind,
+    native_session_id: &str,
+    hidden: bool,
+) -> Result<()> {
+    if native_session_id.trim().is_empty() {
+        bail!("native session id is empty");
+    }
+    let connection = open(path)?;
+    if hidden {
+        connection.execute(
+            "INSERT INTO hidden_native_sessions(harness_kind, native_session_id, hidden_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(harness_kind, native_session_id) DO NOTHING",
+            params![harness.id(), native_session_id, Utc::now().to_rfc3339()],
+        )?;
+    } else {
+        connection.execute(
+            "DELETE FROM hidden_native_sessions
+             WHERE harness_kind = ?1 AND native_session_id = ?2",
+            params![harness.id(), native_session_id],
+        )?;
+    }
+    Ok(())
 }
 
 /// Change only the per-session container provisioning inputs: the size
@@ -1899,8 +2060,8 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
              native_session_id, acp_session_title, session_title_override, updated_at,
              detached_after_event_ordinal, last_error, resource_allocation,
              last_checkpoint_error, project_directory, managed_worktree,
-             container_cpus, container_memory
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+             container_cpus, container_memory, archived
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
          ON CONFLICT(session_id) DO UPDATE SET
              title = excluded.title,
              harness_kind = excluded.harness_kind,
@@ -1921,7 +2082,8 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
              project_directory = excluded.project_directory,
              managed_worktree = excluded.managed_worktree,
              container_cpus = excluded.container_cpus,
-             container_memory = excluded.container_memory",
+             container_memory = excluded.container_memory,
+             archived = excluded.archived",
         params![
             session.id,
             session.title,
@@ -1952,6 +2114,7 @@ fn insert_session(tx: &Transaction<'_>, session: &SessionRecord) -> Result<()> {
                 .transpose()?,
             session.container_cpus,
             session.container_memory,
+            session.archived,
         ],
     )?;
     tx.execute(
@@ -2427,7 +2590,7 @@ fn session_state_name(value: SessionState) -> &'static str {
         SessionState::Checkpointing => "checkpointing",
         SessionState::Closing => "closing",
         SessionState::Destroying => "destroying",
-        SessionState::Archived => "archived",
+        SessionState::Stopped => "stopped",
         SessionState::Lost => "lost",
         SessionState::Error => "error",
         SessionState::DestroyedWithDataLoss => "destroyed-with-data-loss",
@@ -2441,7 +2604,8 @@ fn parse_session_state(value: &str) -> SessionState {
         "checkpointing" => SessionState::Checkpointing,
         "closing" => SessionState::Closing,
         "destroying" => SessionState::Destroying,
-        "archived" => SessionState::Archived,
+        // Rows written before the verb was renamed still say "archived".
+        "stopped" | "archived" => SessionState::Stopped,
         "lost" => SessionState::Lost,
         "error" => SessionState::Error,
         "destroyed-with-data-loss" => SessionState::DestroyedWithDataLoss,
@@ -2503,6 +2667,7 @@ mod tests {
 
     fn session(id: &str, bundle: &str) -> SessionRecord {
         SessionRecord {
+            archived: false,
             container_cpus: None,
             container_memory: None,
             id: id.into(),
@@ -2522,7 +2687,7 @@ mod tests {
                 destination: PathBuf::from("/mnt/cache"),
                 read_only: false,
             }],
-            state: SessionState::Archived,
+            state: SessionState::Stopped,
             target: Some(TargetLocator::LocalPodman {
                 container_id: "container-1".into(),
             }),
@@ -3451,6 +3616,15 @@ mod tests {
                      'session-1', 'old session', 'kimi', 'kimi-1', 'podman',
                      'running', 'now', 12, 'nothing yet'
                  );
+                 INSERT INTO session_contexts VALUES ('session-2', 'project-1', 'now');
+                 INSERT INTO sessions(
+                     session_id, title, harness_kind, last_profile, target_template_id,
+                     state, updated_at, detached_after_event_ordinal
+                 ) VALUES (
+                     'session-2', 'stopped session', 'kimi', 'kimi-1', 'podman',
+                     'archived', 'now', 0
+                 );
+                 INSERT INTO materialized_sessions(session_id) VALUES ('session-2');
                  INSERT INTO session_targets(session_id, kind, resource_id)
                      VALUES ('session-1', 'local-podman', 'container-1');
                  INSERT INTO materialized_sessions(session_id) VALUES ('session-1');
@@ -3538,16 +3712,94 @@ mod tests {
 
         connection
             .execute_batch(
-                "INSERT INTO session_contexts VALUES ('session-2', 'project-1', 'now');
+                "INSERT INTO session_contexts VALUES ('session-3', 'project-1', 'now');
                  INSERT INTO sessions(
                      session_id, title, harness_kind, last_profile, target_template_id,
                      state, updated_at
                  ) VALUES (
-                     'session-2', 'grok session', 'grok', 'grok-1', 'podman',
+                     'session-3', 'grok session', 'grok', 'grok-1', 'podman',
                      'running', 'now'
                  );",
             )
             .expect("a migrated database must accept a Grok Build session");
+
+        // Version 10 renamed the `archived` lifecycle state to `stopped` and
+        // gave sessions a display-only archived flag, defaulted off.
+        let (state, archived): (String, bool) = connection
+            .query_row(
+                "SELECT state, archived FROM sessions WHERE session_id = 'session-2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "stopped");
+        assert!(!archived);
+        connection
+            .execute(
+                "UPDATE sessions SET state = 'archived' WHERE session_id = 'session-2'",
+                [],
+            )
+            .expect_err("the retired state name is no longer accepted");
+
+        // The hidden set for native sessions lives in Hel's own database.
+        connection
+            .execute_batch(
+                "INSERT INTO hidden_native_sessions(harness_kind, native_session_id, hidden_at)
+                     VALUES ('codex', 'native-1', 'now');",
+            )
+            .expect("a migrated database holds the native hidden set");
+    }
+
+    /// Archiving is a display choice with its own writer: it must not disturb
+    /// the lifecycle state, checkpoint, or titles other writers own.
+    #[test]
+    fn the_archived_flag_round_trips_without_touching_other_session_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        let mut session = session("session-1", "project-1");
+        save_session_to(&database, &session).unwrap();
+        assert!(!load_state_from(&database).unwrap().sessions["session-1"].archived);
+
+        set_session_archived_to(&database, "session-1", true).unwrap();
+        let reloaded = load_state_from(&database).unwrap().sessions["session-1"].clone();
+        assert!(reloaded.archived);
+        session.archived = true;
+        assert_eq!(reloaded.state, session.state);
+        assert_eq!(reloaded.checkpoint, session.checkpoint);
+        assert_eq!(reloaded.acp_session_title, session.acp_session_title);
+
+        set_session_archived_to(&database, "session-1", false).unwrap();
+        assert!(!load_state_from(&database).unwrap().sessions["session-1"].archived);
+        assert!(set_session_archived_to(&database, "missing", true).is_err());
+    }
+
+    /// Hel never writes a harness home, so the hidden set for native sessions
+    /// is Hel's own state and is keyed per harness.
+    #[test]
+    fn the_native_hidden_set_is_keyed_by_harness_and_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        assert!(hidden_native_sessions_from(&database).unwrap().is_empty());
+
+        set_native_session_hidden_to(&database, HarnessKind::Codex, "native-1", true).unwrap();
+        set_native_session_hidden_to(&database, HarnessKind::Codex, "native-1", true).unwrap();
+        set_native_session_hidden_to(&database, HarnessKind::Claude, "native-1", true).unwrap();
+        assert_eq!(
+            hidden_native_sessions_from(&database).unwrap(),
+            BTreeSet::from([
+                (HarnessKind::Claude, "native-1".to_owned()),
+                (HarnessKind::Codex, "native-1".to_owned()),
+            ])
+        );
+
+        set_native_session_hidden_to(&database, HarnessKind::Codex, "native-1", false).unwrap();
+        assert_eq!(
+            hidden_native_sessions_from(&database).unwrap(),
+            BTreeSet::from([(HarnessKind::Claude, "native-1".to_owned())])
+        );
+        // Revealing something that was never hidden is not an error.
+        set_native_session_hidden_to(&database, HarnessKind::Grok, "native-9", false).unwrap();
+        assert!(set_native_session_hidden_to(&database, HarnessKind::Grok, "  ", true).is_err());
     }
 
     #[test]

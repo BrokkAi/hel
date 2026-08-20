@@ -106,6 +106,7 @@ impl Controller {
             .with_context(|| format!("unknown bundle {bundle_id:?}"))?;
         let now = now();
         let record = SessionRecord {
+            archived: false,
             container_cpus: None,
             container_memory: None,
             id: session_id.to_owned(),

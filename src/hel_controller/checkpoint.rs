@@ -964,28 +964,111 @@ fn export_target_checkpoint(
     spec: &CheckpointExportSpec,
     remote_spec: &str,
 ) -> Result<CommandOutput> {
-    let streamed = export_stdin_command(locator, session_id)?;
+    export_target_checkpoint_with_worker(executor, locator, session_id, spec, remote_spec, None)
+}
+
+fn export_target_checkpoint_with_worker(
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+    spec: &CheckpointExportSpec,
+    remote_spec: &str,
+    worker_binary: Option<&Path>,
+) -> Result<CommandOutput> {
     let body = serde_json::to_vec(spec).context("serialize checkpoint export spec")?;
-    let output = executor.execute_with_stdin(&streamed, &mut body.as_slice())?;
-    if output.status == 0 {
-        return Ok(output);
+    let mut replaced_worker = false;
+    loop {
+        let streamed = export_stdin_command(locator, session_id)?;
+        let output = executor.execute_with_stdin(&streamed, &mut body.as_slice())?;
+        if output.status == 0 {
+            return Ok(output);
+        }
+        let failure = String::from_utf8_lossy(&output.stderr).into_owned();
+        if export_spec_stdin_unsupported(&failure) {
+            tracing::debug!(
+                session_id,
+                "target worker predates streamed checkpoint specs; uploading the spec file instead"
+            );
+            let output = export_uploaded_spec(executor, locator, session_id, spec, remote_spec)?;
+            if output.status == 0 {
+                return Ok(output);
+            }
+            let failure = String::from_utf8_lossy(&output.stderr).into_owned();
+            if replace_stale_export_worker(
+                executor,
+                locator,
+                session_id,
+                worker_binary,
+                &failure,
+                &mut replaced_worker,
+            )? {
+                continue;
+            }
+            bail!(
+                "export target checkpoint failed with status {}: {failure}",
+                output.status
+            );
+        }
+        if replace_stale_export_worker(
+            executor,
+            locator,
+            session_id,
+            worker_binary,
+            &failure,
+            &mut replaced_worker,
+        )? {
+            continue;
+        }
+        bail!(
+            "{} failed with status {}: {failure}",
+            streamed.purpose,
+            output.status
+        );
     }
-    let failure = String::from_utf8_lossy(&output.stderr).into_owned();
-    ensure!(
-        export_spec_stdin_unsupported(&failure),
-        "{} failed with status {}: {failure}",
-        streamed.purpose,
-        output.status
-    );
-    tracing::debug!(
-        session_id,
-        "target worker predates streamed checkpoint specs; uploading the spec file instead"
-    );
+}
+
+fn export_uploaded_spec(
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+    spec: &CheckpointExportSpec,
+    remote_spec: &str,
+) -> Result<CommandOutput> {
     let staging = tempfile::tempdir().context("create checkpoint staging")?;
     let local_spec = staging.path().join("checkpoint-spec.json");
     spec.write(&local_spec)?;
     upload_checkpoint_spec(executor, locator, session_id, &local_spec, remote_spec)?;
-    execute_checked(executor, export_command(locator, session_id, remote_spec)?)
+    executor.execute(&export_command(locator, session_id, remote_spec)?)
+}
+
+/// When the installed worker cannot parse this spec, replace its `hel` with the
+/// controller's current binary and tell the caller to retry. The live daemon
+/// keeps the previous inode; only the next `export-checkpoint` process changes.
+fn replace_stale_export_worker(
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    session_id: &str,
+    worker_binary: Option<&Path>,
+    failure: &str,
+    replaced_worker: &mut bool,
+) -> Result<bool> {
+    if *replaced_worker || !export_spec_schema_unsupported(failure) {
+        return Ok(false);
+    }
+    tracing::debug!(
+        session_id,
+        "target worker cannot parse this checkpoint spec; replacing the installed Hel binary and retrying"
+    );
+    let owned_binary;
+    let binary = if let Some(path) = worker_binary {
+        path
+    } else {
+        owned_binary = super::worker_binary::worker_binary_for(locator, executor)?;
+        owned_binary.as_path()
+    };
+    super::worker_binary::replace_installed_worker_binary(executor, locator, session_id, binary)?;
+    *replaced_worker = true;
+    Ok(true)
 }
 
 /// Whether an export failure says the target's worker cannot read its spec from
@@ -999,6 +1082,15 @@ fn export_spec_stdin_unsupported(failure: &str) -> bool {
     failure.contains("read checkpoint export spec -")
         || failure.contains("unexpected argument")
         || failure.contains("invalid value")
+}
+
+/// Whether an export failure says the target's worker cannot deserialize this
+/// spec. `CheckpointExportSpec` and its nested canonical snapshot use
+/// `deny_unknown_fields`, so a controller that gained a field such as
+/// `terminal_refs` cannot pause a session whose installed `hel` predates it.
+fn export_spec_schema_unsupported(failure: &str) -> bool {
+    failure.contains("parse checkpoint export spec")
+        && (failure.contains("unknown field") || failure.contains("unknown variant"))
 }
 
 pub(super) fn upload_checkpoint_spec(
@@ -1228,7 +1320,7 @@ pub(super) fn prune_replaced_checkpoint(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::fs::OpenOptions;
     use std::path::{Path, PathBuf};
@@ -1445,6 +1537,8 @@ mod tests {
     struct ExportExecutor {
         streamed_status: i32,
         streamed_stderr: String,
+        retry_stdin_after_failure: bool,
+        stdin_calls: Cell<usize>,
         purposes: RefCell<Vec<String>>,
         streamed_spec: RefCell<Vec<u8>>,
     }
@@ -1453,9 +1547,16 @@ mod tests {
             Self {
                 streamed_status,
                 streamed_stderr: streamed_stderr.to_owned(),
+                retry_stdin_after_failure: false,
+                stdin_calls: Cell::new(0),
                 purposes: RefCell::new(Vec::new()),
                 streamed_spec: RefCell::new(Vec::new()),
             }
+        }
+
+        fn retry_stdin_after_failure(mut self) -> Self {
+            self.retry_stdin_after_failure = true;
+            self
         }
     }
     impl CommandExecutor for ExportExecutor {
@@ -1474,15 +1575,25 @@ mod tests {
             input: &mut (dyn std::io::Read + Send),
         ) -> Result<CommandOutput> {
             self.purposes.borrow_mut().push(command.purpose.clone());
-            input.read_to_end(&mut self.streamed_spec.borrow_mut())?;
+            let mut spec = Vec::new();
+            input.read_to_end(&mut spec)?;
+            *self.streamed_spec.borrow_mut() = spec;
+            let attempt = self.stdin_calls.get();
+            self.stdin_calls.set(attempt + 1);
+            let failed =
+                self.streamed_status != 0 && (attempt == 0 || !self.retry_stdin_after_failure);
             Ok(CommandOutput {
-                status: self.streamed_status,
-                stdout: if self.streamed_status == 0 {
+                status: if failed { self.streamed_status } else { 0 },
+                stdout: if failed {
+                    Vec::new()
+                } else {
                     exported_checkpoint_json()
+                },
+                stderr: if failed {
+                    self.streamed_stderr.clone().into_bytes()
                 } else {
                     Vec::new()
                 },
-                stderr: self.streamed_stderr.clone().into_bytes(),
             })
         }
     }
@@ -1570,6 +1681,155 @@ mod tests {
             executor.purposes.into_inner(),
             vec!["export target checkpoint".to_owned()]
         );
+    }
+    /// A worker copied into the target before `terminal_refs` existed rejects
+    /// the current spec. Replacing its `hel` binary lets export keep the full
+    /// latched snapshot instead of stripping fields the old parser forbids.
+    #[test]
+    fn an_export_that_rejects_unknown_spec_fields_replaces_the_worker_binary() {
+        let locator = hel_targets::TargetLocator::LocalPodman {
+            container_id: hel_targets::resource_name(LATCH_RELAY_SESSION).unwrap(),
+        };
+        let spec = export_spec_fixture();
+        let executor = ExportExecutor::new(
+            1,
+            "Error: parse checkpoint export spec from standard input\n\nCaused by:\n    \
+                 unknown field `terminal_refs`, expected `call` at line 1 column 7276552\n",
+        )
+        .retry_stdin_after_failure();
+        let worker_binary = Path::new("/hel-test-worker");
+
+        let output = export_target_checkpoint_with_worker(
+            &executor,
+            &locator,
+            LATCH_RELAY_SESSION,
+            &spec,
+            "/var/lib/hel/workers/session/checkpoint-spec.json",
+            Some(worker_binary),
+        )
+        .unwrap();
+
+        assert_eq!(output.stdout, exported_checkpoint_json());
+        assert_eq!(
+            serde_json::from_slice::<CheckpointExportSpec>(&executor.streamed_spec.borrow())
+                .unwrap(),
+            spec
+        );
+        assert_eq!(
+            executor.purposes.into_inner(),
+            vec![
+                "export target checkpoint".to_owned(),
+                "stage replacement Hel worker".to_owned(),
+                "replace installed Hel worker".to_owned(),
+                "make replaced Hel worker executable".to_owned(),
+                "export target checkpoint".to_owned(),
+            ]
+        );
+    }
+    #[test]
+    fn a_schema_mismatch_after_uploading_the_spec_still_replaces_the_worker_binary() {
+        let locator = hel_targets::TargetLocator::LocalPodman {
+            container_id: hel_targets::resource_name(LATCH_RELAY_SESSION).unwrap(),
+        };
+        struct FileThenRefreshExecutor {
+            purposes: RefCell<Vec<String>>,
+            file_export_calls: Cell<usize>,
+        }
+        impl CommandExecutor for FileThenRefreshExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.purposes.borrow_mut().push(command.purpose.clone());
+                if command.purpose == "export target checkpoint" {
+                    let attempt = self.file_export_calls.get();
+                    self.file_export_calls.set(attempt + 1);
+                    if attempt == 0 {
+                        return Ok(CommandOutput {
+                            status: 1,
+                            stdout: Vec::new(),
+                            stderr: b"Error: parse checkpoint export spec /spec.json\n\nCaused by:\n    unknown variant `terminal_output`, expected one of `user`, `agent`, `thought`, `tool`, `plan`, `system`\n".to_vec(),
+                        });
+                    }
+                }
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: exported_checkpoint_json(),
+                    stderr: Vec::new(),
+                })
+            }
+
+            fn execute_with_stdin(
+                &self,
+                command: &CommandSpec,
+                input: &mut (dyn std::io::Read + Send),
+            ) -> Result<CommandOutput> {
+                self.purposes.borrow_mut().push(command.purpose.clone());
+                let mut discarded = Vec::new();
+                input.read_to_end(&mut discarded)?;
+                let stdin_calls = self
+                    .purposes
+                    .borrow()
+                    .iter()
+                    .filter(|purpose| *purpose == "export target checkpoint")
+                    .count();
+                if stdin_calls == 1 {
+                    return Ok(CommandOutput {
+                        status: 1,
+                        stdout: Vec::new(),
+                        stderr: b"Error: read checkpoint export spec -\n\nCaused by:\n    No such file or directory (os error 2)\n".to_vec(),
+                    });
+                }
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: exported_checkpoint_json(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let executor = FileThenRefreshExecutor {
+            purposes: RefCell::new(Vec::new()),
+            file_export_calls: Cell::new(0),
+        };
+        let output = export_target_checkpoint_with_worker(
+            &executor,
+            &locator,
+            LATCH_RELAY_SESSION,
+            &export_spec_fixture(),
+            "/var/lib/hel/workers/session/checkpoint-spec.json",
+            Some(Path::new("/hel-test-worker")),
+        )
+        .unwrap();
+
+        assert_eq!(output.stdout, exported_checkpoint_json());
+        assert_eq!(
+            executor.purposes.into_inner(),
+            vec![
+                "export target checkpoint".to_owned(),
+                "upload checkpoint specification".to_owned(),
+                "export target checkpoint".to_owned(),
+                "stage replacement Hel worker".to_owned(),
+                "replace installed Hel worker".to_owned(),
+                "make replaced Hel worker executable".to_owned(),
+                "export target checkpoint".to_owned(),
+            ]
+        );
+    }
+    #[test]
+    fn export_spec_schema_mismatch_is_detected_from_the_parse_error() {
+        assert!(export_spec_schema_unsupported(
+            "Error: parse checkpoint export spec from standard input\n\nCaused by:\n    \
+                 unknown field `terminal_refs`, expected `call` at line 1 column 7276552\n"
+        ));
+        assert!(export_spec_schema_unsupported(
+            "Error: parse checkpoint export spec /spec.json\n\nCaused by:\n    \
+                 unknown variant `terminal_output`, expected one of `user`, `agent`\n"
+        ));
+        assert!(!export_spec_schema_unsupported(
+            "Error: repository 'app' is missing\n"
+        ));
+        assert!(!export_spec_schema_unsupported(
+            "Error: parse checkpoint export spec from standard input\n\nCaused by:\n    \
+                 missing field `relay_root`\n"
+        ));
     }
     const LATCH_RELAY_ROOT: &str = "HEL_TEST_LATCH_RELAY_ROOT";
     const LATCH_RELAY_STARTS: &str = "HEL_TEST_LATCH_RELAY_STARTS";

@@ -27,7 +27,10 @@ pub enum SessionState {
     Checkpointing,
     Closing,
     Destroying,
-    Archived,
+    /// Checkpointed and torn down. Persisted as `"archived"` before the verb
+    /// was renamed, so the alias keeps those records loading.
+    #[serde(alias = "archived")]
+    Stopped,
     Lost,
     Error,
     DestroyedWithDataLoss,
@@ -438,7 +441,14 @@ pub(crate) fn validate_relay_event_frontier(ordinal: u64, digest: &str, name: &s
     Ok(())
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl SessionState {
+    /// True while the session still belongs on the dashboard. `Closing` and
+    /// `Checkpointing` stay active on purpose: a stop that has not produced a
+    /// verified checkpoint must not make its row disappear.
     pub const fn is_active(self) -> bool {
         matches!(
             self,
@@ -704,6 +714,11 @@ pub struct SessionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_memory: Option<String>,
     pub state: SessionState,
+    /// Hidden from the resume dialog until "show archived" is on. Archiving is
+    /// a display choice only; it never touches the checkpoint or the record's
+    /// lifecycle state.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<TargetLocator>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -914,7 +929,7 @@ impl HelState {
         directories.truncate(20);
     }
 
-    pub fn remove_archived_session(&mut self, session_id: &str) -> Result<SessionRecord> {
+    pub fn remove_stopped_session(&mut self, session_id: &str) -> Result<SessionRecord> {
         let session = self
             .sessions
             .get(session_id)
@@ -1065,6 +1080,7 @@ mod tests {
 
     fn sample_state() -> HelState {
         let session = SessionRecord {
+            archived: false,
             container_cpus: None,
             container_memory: None,
             id: "0123456789abcdef".into(),
@@ -1455,10 +1471,49 @@ mod tests {
         );
     }
 
+    /// Records written before the verb was renamed say "archived". They must
+    /// still load, and they must be written back with the new name.
     #[test]
-    fn archived_session_does_not_pin_renamed_config_entries() {
+    fn the_stopped_state_reads_the_retired_archived_name_and_writes_the_new_one() {
+        assert_eq!(
+            serde_json::from_str::<SessionState>("\"archived\"").unwrap(),
+            SessionState::Stopped
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionState>("\"stopped\"").unwrap(),
+            SessionState::Stopped
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionState::Stopped).unwrap(),
+            "\"stopped\""
+        );
+        assert!(!SessionState::Stopped.is_active());
+    }
+
+    /// The archived flag is a later addition, so records written without it
+    /// load as visible and stay out of the serialized form until it is set.
+    #[test]
+    fn the_archived_flag_defaults_off_and_is_omitted_when_it_is_off() {
         let mut state = sample_state();
-        state.sessions.values_mut().next().unwrap().state = SessionState::Archived;
+        let session = state.sessions.values_mut().next().unwrap();
+        assert!(!session.archived);
+        let json = serde_json::to_string(&*session).unwrap();
+        assert!(!json.contains("archived"), "{json}");
+
+        session.archived = true;
+        let json = serde_json::to_string(&*session).unwrap();
+        assert!(json.contains("\"archived\":true"), "{json}");
+        assert!(
+            serde_json::from_str::<SessionRecord>(&json)
+                .unwrap()
+                .archived
+        );
+    }
+
+    #[test]
+    fn stopped_session_does_not_pin_renamed_config_entries() {
+        let mut state = sample_state();
+        state.sessions.values_mut().next().unwrap().state = SessionState::Stopped;
         state
             .validate_against_config(&HelConfig::default())
             .unwrap();
@@ -1469,15 +1524,15 @@ mod tests {
         let mut state = sample_state();
         assert!(
             state
-                .remove_archived_session("0123456789abcdef")
+                .remove_stopped_session("0123456789abcdef")
                 .unwrap_err()
                 .to_string()
                 .contains("active session")
         );
         assert!(state.sessions.contains_key("0123456789abcdef"));
 
-        state.sessions.values_mut().next().unwrap().state = SessionState::Archived;
-        let removed = state.remove_archived_session("0123456789abcdef").unwrap();
+        state.sessions.values_mut().next().unwrap().state = SessionState::Stopped;
+        let removed = state.remove_stopped_session("0123456789abcdef").unwrap();
         assert_eq!(removed.id, "0123456789abcdef");
         assert!(state.sessions.is_empty());
     }

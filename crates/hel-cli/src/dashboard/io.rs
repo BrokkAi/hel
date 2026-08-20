@@ -5,14 +5,14 @@
 //! ever happens on the render loop. Failures travel as `Err` payloads rather
 //! than being dropped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use hel::hel_config::{HelConfig, ProjectBundle, ProjectRepository};
+use hel::hel_config::{HarnessKind, HelConfig, ProjectBundle, ProjectRepository};
 use hel::hel_controller::{Controller, SessionLaunchOptions};
 use hel::hel_import::{configured_bundle_for_local, configured_bundle_for_origin};
 use hel::hel_setup::github_repository_from_origin;
@@ -97,6 +97,18 @@ pub(crate) enum DashboardIoUpdate {
     LifecycleNotice {
         notice: String,
     },
+    /// The set of native sessions the resume dialog hides, read from Hel's
+    /// database.
+    HiddenNativeSessions {
+        result: std::result::Result<BTreeSet<(HarnessKind, String)>, String>,
+    },
+    /// A hide or reveal that has already been applied optimistically. Only a
+    /// failure needs handling; the dashboard reloads the set so the row cannot
+    /// stay out of step with what is stored.
+    ArchiveWrite {
+        what: String,
+        result: std::result::Result<(), String>,
+    },
 }
 
 pub(crate) struct ActiveLifecycleOperation {
@@ -155,6 +167,30 @@ where
     tokio::task::spawn_blocking(move || {
         let result = work().map_err(|error| format!("{error:#}"));
         let _ = updates.send(report(result));
+    })
+}
+
+/// Reads the hidden-session set out of Hel's own database. Called when the
+/// resume dialog opens and again whenever a hide or reveal fails to commit.
+pub(crate) fn spawn_hidden_native_sessions_load(
+    updates: UnboundedSender<DashboardIoUpdate>,
+) -> JoinHandle<()> {
+    spawn_io(
+        updates,
+        hel::hel_database::hidden_native_sessions,
+        |result| DashboardIoUpdate::HiddenNativeSessions { result },
+    )
+}
+
+/// Persists one archive or unarchive. The dashboard already moved the row, so
+/// only the failure path matters here.
+pub(crate) fn spawn_archive_write(
+    what: String,
+    write: impl FnOnce() -> Result<()> + Send + 'static,
+    updates: UnboundedSender<DashboardIoUpdate>,
+) -> JoinHandle<()> {
+    spawn_io(updates, write, move |result| {
+        DashboardIoUpdate::ArchiveWrite { what, result }
     })
 }
 
@@ -373,7 +409,7 @@ pub(crate) fn checkpoint_archive_targets(controller: &Controller) -> BTreeMap<St
         .state
         .sessions
         .values()
-        .filter(|session| session.state == SessionState::Archived)
+        .filter(|session| session.state == SessionState::Stopped)
         .filter_map(|session| {
             session
                 .checkpoint
@@ -618,6 +654,22 @@ impl DashboardContext {
                     .set_session_operation_stage(&session_id, stage);
             }
             DashboardIoUpdate::LifecycleNotice { notice } => self.dashboard.set_notice(notice),
+            DashboardIoUpdate::HiddenNativeSessions { result } => match result {
+                Ok(hidden) => self.dashboard.set_hidden_native_sessions(hidden),
+                Err(error) => self
+                    .dashboard
+                    .set_notice(format!("Could not read archived sessions: {error}")),
+            },
+            DashboardIoUpdate::ArchiveWrite { what, result } => {
+                if let Err(error) = result {
+                    self.dashboard
+                        .set_notice(format!("Could not archive {what}: {error}"));
+                    // The optimistic update no longer matches storage, so both
+                    // sources are read back rather than left to drift.
+                    self.controller_changed = true;
+                    spawn_hidden_native_sessions_load(self.dashboard_io_tx.clone());
+                }
+            }
             DashboardIoUpdate::MaterializedSessionProjection { detail } => {
                 self.dashboard.apply_prepared_materialized_session(*detail);
             }
@@ -819,7 +871,7 @@ impl DashboardContext {
             }
             Ok(LifecycleSuccess::Closed) => {
                 self.dashboard
-                    .set_notice(format!("Paused {}", short_id(&session_id)));
+                    .set_notice(format!("Stopped {}", short_id(&session_id)));
             }
             Ok(LifecycleSuccess::Destroyed) => self.dashboard.set_notice(format!(
                 "Destroyed {} without an archive",
@@ -829,14 +881,14 @@ impl DashboardContext {
                 "Deleted active session {} without checkpointing",
                 short_id(&session_id)
             )),
-            Ok(LifecycleSuccess::DeletedArchived) => self.dashboard.set_notice(format!(
-                "Permanently deleted paused session {}",
+            Ok(LifecycleSuccess::DeletedStopped) => self.dashboard.set_notice(format!(
+                "Permanently deleted stopped session {}",
                 short_id(&session_id)
             )),
             Err(error) => {
                 if operation
                     .as_ref()
-                    .is_some_and(|operation| operation.kind == SessionOperationKind::Pausing)
+                    .is_some_and(|operation| operation.kind == SessionOperationKind::Stopping)
                 {
                     self.dashboard.show_close_failure(session_id.clone(), error);
                 } else {

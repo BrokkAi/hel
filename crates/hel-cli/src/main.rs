@@ -62,7 +62,7 @@ enum Command {
     Doctor(DoctorArgs),
     /// Discover local agent homes and create an initial Hel configuration.
     Setup(SetupArgs),
-    /// Adopt a native coding-agent session as an archived Hel session.
+    /// Adopt a native coding-agent session as a stopped Hel session.
     Import(ImportArgs),
     /// Find, adopt, or explicitly destroy managed workers missing from state.
     Recover(RecoverArgs),
@@ -526,11 +526,11 @@ pub(crate) fn startup_greeting(controller: &Controller) -> String {
         returning: !controller.state.sessions.is_empty(),
         profile_count: controller.config.profiles.len(),
         active_sessions: active.len(),
-        paused_sessions: controller
+        stopped_sessions: controller
             .state
             .sessions
             .values()
-            .filter(|session| session.state == SessionState::Archived)
+            .filter(|session| session.state == SessionState::Stopped)
             .count(),
         raw_localhost_active,
         container_active,
@@ -791,10 +791,11 @@ mod tests {
         state.sessions.insert(
             session_id.into(),
             SessionRecord {
+                archived: false,
                 container_cpus: None,
                 container_memory: None,
                 id: session_id.into(),
-                title: "paused".into(),
+                title: "stopped".into(),
                 harness_kind: hel::hel_config::HarnessKind::Codex,
                 last_profile: "codex".into(),
                 bundle_id: "project".into(),
@@ -803,7 +804,7 @@ mod tests {
                 target_template_id: "podman".into(),
                 resource_allocation: None,
                 additional_mounts: Vec::new(),
-                state: SessionState::Archived,
+                state: SessionState::Stopped,
                 target: None,
                 native_session_id: Some("native-session".into()),
                 acp_session_title: None,

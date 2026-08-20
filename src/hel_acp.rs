@@ -197,6 +197,12 @@ pub enum RuntimeEvent {
     CloseApplied {
         request_id: String,
     },
+    /// The ACP child died or the protocol broke after a session was open.
+    /// The coordinator interrupts in-flight commands; the runtime reloads the
+    /// native session on a new bridge instead of stopping the worker.
+    HarnessRestarting {
+        message: String,
+    },
     Stopped,
 }
 
@@ -222,26 +228,54 @@ pub async fn run(
     result
 }
 
+#[derive(Clone)]
+struct OpenedSession {
+    native_session_id: String,
+    started_at: tokio::time::Instant,
+}
+
+struct BridgeRestart {
+    native_session_id: String,
+    unexpected: bool,
+    session_age: Duration,
+}
+
 async fn run_inner(
     mut spec: LaunchSpec,
     mut requests: mpsc::Receiver<CommandRequest>,
     events: mpsc::Sender<RuntimeEvent>,
 ) -> Result<()> {
+    let mut rapid_deaths = 0_u32;
     loop {
-        match run_bridge(&spec, &mut requests, &events).await? {
+        let opened = Arc::new(Mutex::new(None));
+        match run_bridge(&spec, &mut requests, &events, opened.clone()).await? {
             None => return Ok(()),
-            Some(native_session_id) => spec.resume_session = Some(native_session_id),
+            Some(restart) => {
+                if restart.unexpected {
+                    if restart.session_age < RAPID_BRIDGE_WINDOW {
+                        rapid_deaths += 1;
+                        ensure!(
+                            rapid_deaths < RAPID_BRIDGE_RESTART_LIMIT,
+                            "ACP bridge exited repeatedly during startup; giving up"
+                        );
+                    } else {
+                        rapid_deaths = 0;
+                    }
+                }
+                spec.resume_session = Some(restart.native_session_id);
+            }
         }
     }
 }
 
-/// Run one ACP bridge process. `Some(native_session_id)` means cancel was not
-/// acknowledged and the caller should load that session on a fresh bridge.
+/// Run one ACP bridge process. `Some` means reload the native session on a
+/// fresh bridge: a cancel that never acked, or a dead ACP child.
 async fn run_bridge(
     spec: &LaunchSpec,
     requests: &mut mpsc::Receiver<CommandRequest>,
     events: &mpsc::Sender<RuntimeEvent>,
-) -> Result<Option<String>> {
+    opened: Arc<Mutex<Option<OpenedSession>>>,
+) -> Result<Option<BridgeRestart>> {
     let mut child = Command::new(&spec.command)
         .args(&spec.args)
         .envs(&spec.environment)
@@ -265,7 +299,13 @@ async fn run_bridge(
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
 
     let (mut result, child_reaped) = {
-        let drive = drive(transport, spec.clone(), requests, events.clone());
+        let drive = drive(
+            transport,
+            spec.clone(),
+            requests,
+            events.clone(),
+            opened.clone(),
+        );
         tokio::pin!(drive);
         tokio::select! {
             biased;
@@ -282,7 +322,8 @@ async fn run_bridge(
             }
         }
     };
-    let restarting = matches!(&result, Ok(Some(_)));
+    let opened_now = opened.lock().expect("opened session lock poisoned").clone();
+    let restarting = matches!(&result, Ok(Some(_))) || (result.is_err() && opened_now.is_some());
     // Dropping the transport closes the supervisor's stdin. Give it time to
     // terminate and reap the complete bridge process group before killing the
     // supervisor itself as a last resort. A planned restart already decided
@@ -338,7 +379,33 @@ async fn run_bridge(
         result =
             result.map_err(|error| error.context(format!("ACP bridge stderr:\n{stderr_tail}")));
     }
-    result
+    match result {
+        Ok(None) => Ok(None),
+        Ok(Some(native_session_id)) => Ok(Some(BridgeRestart {
+            native_session_id,
+            unexpected: false,
+            session_age: opened_now
+                .map(|opened| opened.started_at.elapsed())
+                .unwrap_or(Duration::ZERO),
+        })),
+        Err(error) => match opened_now {
+            None => Err(error),
+            Some(opened) => {
+                emit_runtime_event(
+                    events,
+                    RuntimeEvent::HarnessRestarting {
+                        message: ACP_BRIDGE_LOST_WARNING.to_owned(),
+                    },
+                )
+                .await?;
+                Ok(Some(BridgeRestart {
+                    native_session_id: opened.native_session_id,
+                    unexpected: true,
+                    session_age: opened.started_at.elapsed(),
+                }))
+            }
+        },
+    }
 }
 
 const ACP_STDERR_TAIL_BYTES: usize = 16 * 1024;
@@ -474,11 +541,20 @@ const CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 const CANCEL_UNACKED_WARNING: &str =
     "cancel was not acknowledged within 60s; restarting the harness";
 
+const ACP_BRIDGE_LOST_WARNING: &str = "ACP bridge exited; reloading the native session";
+
+/// Give up if a freshly opened session dies this many times in a row before it
+/// has lived for [`RAPID_BRIDGE_WINDOW`]. A later crash of a healthy session
+/// resets the count.
+const RAPID_BRIDGE_RESTART_LIMIT: u32 = 3;
+const RAPID_BRIDGE_WINDOW: Duration = Duration::from_secs(5);
+
 async fn drive<T>(
     transport: T,
     spec: LaunchSpec,
     requests: &mut mpsc::Receiver<CommandRequest>,
     events: mpsc::Sender<RuntimeEvent>,
+    opened: Arc<Mutex<Option<OpenedSession>>>,
 ) -> Result<Option<String>>
 where
     T: ConnectTo<Client>,
@@ -820,6 +896,7 @@ where
                 scratch_outputs,
                 terminals,
                 session_elicitations,
+                opened,
             )
             .await
             {
@@ -1090,6 +1167,7 @@ fn prompt_failure_warning(error: &agent_client_protocol::Error) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive_connection(
     connection: ConnectionTo<Agent>,
     spec: &LaunchSpec,
@@ -1098,6 +1176,7 @@ async fn drive_connection(
     scratch_outputs: Arc<Mutex<BTreeMap<String, String>>>,
     terminals: TerminalRegistry,
     pending_elicitations: PendingElicitations,
+    opened: Arc<Mutex<Option<OpenedSession>>>,
 ) -> Result<Option<String>> {
     // Terminals belong to the connection. However the session ends — closed,
     // failed, or with its command channel dropped — their process groups must
@@ -1110,6 +1189,7 @@ async fn drive_connection(
         scratch_outputs,
         &terminals,
         &pending_elicitations,
+        opened,
     )
     .await;
     pending_elicitations
@@ -1151,6 +1231,7 @@ async fn apply_cancel(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_session(
     connection: &ConnectionTo<Agent>,
     spec: &LaunchSpec,
@@ -1159,6 +1240,7 @@ async fn serve_session(
     scratch_outputs: Arc<Mutex<BTreeMap<String, String>>>,
     terminals: &TerminalRegistry,
     pending_elicitations: &PendingElicitations,
+    opened: Arc<Mutex<Option<OpenedSession>>>,
 ) -> Result<Option<String>> {
     let mut meta = serde_json::Map::new();
     meta.insert("terminal_output".into(), serde_json::Value::Bool(true));
@@ -1251,6 +1333,10 @@ async fn serve_session(
                 false,
             )
         };
+    *opened.lock().expect("opened session lock poisoned") = Some(OpenedSession {
+        native_session_id: session_id.to_string(),
+        started_at: tokio::time::Instant::now(),
+    });
 
     // A launch-flag harness was already put in its unrestricted mode when the
     // bridge process started; there is nothing to select over ACP, but the
@@ -1325,8 +1411,10 @@ async fn serve_session(
                     tokio::select! {
                         response = &mut prompt => {
                             // A rejected prompt fails the turn, not the worker: the
-                            // bridge can still serve later prompts, and a bridge that
-                            // really died is caught by the `child.wait()` arm in `run`.
+                            // bridge can still serve later prompts. A JSON-RPC
+                            // error stays on this connection; a dead transport
+                            // is recovered by `run_bridge` via child exit or a
+                            // protocol error after the session is open.
                             let stop_reason = match response {
                                 Ok(response) => format!("{:?}", response.stop_reason),
                                 Err(error) => {
@@ -2348,8 +2436,16 @@ mod tests {
             harness: HarnessKind::Grok,
             force_unrestricted_mode,
         };
-        let driver =
-            tokio::spawn(async move { drive(transport, spec, &mut request_rx, event_tx).await });
+        let driver = tokio::spawn(async move {
+            drive(
+                transport,
+                spec,
+                &mut request_rx,
+                event_tx,
+                Arc::new(Mutex::new(None)),
+            )
+            .await
+        });
         request_tx
             .send(CommandRequest::Prompt {
                 request_id: "first".into(),
@@ -2486,8 +2582,16 @@ mod tests {
             harness: HarnessKind::Claude,
             force_unrestricted_mode: false,
         };
-        let driver =
-            tokio::spawn(async move { drive(transport, spec, &mut request_rx, event_tx).await });
+        let driver = tokio::spawn(async move {
+            drive(
+                transport,
+                spec,
+                &mut request_rx,
+                event_tx,
+                Arc::new(Mutex::new(None)),
+            )
+            .await
+        });
         let initialized = tokio::time::timeout(Duration::from_secs(5), initialized_rx)
             .await
             .expect("runtime initializes")
@@ -2870,8 +2974,16 @@ mod tests {
             harness,
             force_unrestricted_mode: false,
         };
-        let driver =
-            tokio::spawn(async move { drive(transport, spec, &mut request_rx, event_tx).await });
+        let driver = tokio::spawn(async move {
+            drive(
+                transport,
+                spec,
+                &mut request_rx,
+                event_tx,
+                Arc::new(Mutex::new(None)),
+            )
+            .await
+        });
         request_tx
             .send(CommandRequest::SetConfig {
                 request_id: "config-1".into(),
@@ -2943,8 +3055,16 @@ mod tests {
             harness: HarnessKind::Claude,
             force_unrestricted_mode: false,
         };
-        let driver =
-            tokio::spawn(async move { drive(transport, spec, &mut request_rx, event_tx).await });
+        let driver = tokio::spawn(async move {
+            drive(
+                transport,
+                spec,
+                &mut request_rx,
+                event_tx,
+                Arc::new(Mutex::new(None)),
+            )
+            .await
+        });
 
         let next_event = async |events: &mut mpsc::Receiver<RuntimeEvent>| {
             tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
@@ -3076,8 +3196,16 @@ mod tests {
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: false,
         };
-        let driver =
-            tokio::spawn(async move { drive(transport, spec, &mut request_rx, event_tx).await });
+        let driver = tokio::spawn(async move {
+            drive(
+                transport,
+                spec,
+                &mut request_rx,
+                event_tx,
+                Arc::new(Mutex::new(None)),
+            )
+            .await
+        });
 
         let (compacted_tx, mut compacted_rx) = oneshot::channel();
         request_tx
@@ -3244,8 +3372,16 @@ mod tests {
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: false,
         };
-        let driver =
-            tokio::spawn(async move { drive(transport, spec, &mut request_rx, event_tx).await });
+        let driver = tokio::spawn(async move {
+            drive(
+                transport,
+                spec,
+                &mut request_rx,
+                event_tx,
+                Arc::new(Mutex::new(None)),
+            )
+            .await
+        });
         request_tx
             .send(CommandRequest::Prompt {
                 request_id: "prompt-1".into(),
@@ -3323,8 +3459,16 @@ mod tests {
             harness: HarnessKind::Kimi,
             force_unrestricted_mode: false,
         };
-        let driver =
-            tokio::spawn(async move { drive(transport, spec, &mut request_rx, event_tx).await });
+        let driver = tokio::spawn(async move {
+            drive(
+                transport,
+                spec,
+                &mut request_rx,
+                event_tx,
+                Arc::new(Mutex::new(None)),
+            )
+            .await
+        });
         request_tx
             .send(CommandRequest::Prompt {
                 request_id: "prompt-1".into(),
@@ -3554,10 +3698,16 @@ mod tests {
                 harness: HarnessKind::Kimi,
                 force_unrestricted_mode: false,
             };
-            let driver =
-                tokio::spawn(
-                    async move { drive(transport, spec, &mut request_rx, event_tx).await },
-                );
+            let driver = tokio::spawn(async move {
+                drive(
+                    transport,
+                    spec,
+                    &mut request_rx,
+                    event_tx,
+                    Arc::new(Mutex::new(None)),
+                )
+                .await
+            });
             ScriptedRuntime {
                 agent: ScriptedAgent {
                     scripted: scripted_tx,
@@ -3976,6 +4126,105 @@ mod tests {
             runtime.bridge.abort();
             runtime.events.abort();
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dead_bridge_after_session_start_reloads_the_native_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("second-bridge");
+        let script = temp.path().join("dying_acp.py");
+        std::fs::write(
+            &script,
+            format!(
+                r#"
+import json, os, sys
+marker = {marker:?}
+
+def read():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+
+def write(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+second = os.path.exists(marker)
+while True:
+    request = read()
+    if request is None:
+        break
+    method = request.get("method")
+    ident = request.get("id")
+    if method == "initialize":
+        write({{"jsonrpc": "2.0", "id": ident, "result": {{"protocolVersion": 1}}}})
+    elif method in ("session/new", "session/load"):
+        write({{"jsonrpc": "2.0", "id": ident, "result": {{"sessionId": "scripted"}}}})
+        if not second:
+            open(marker, "w").close()
+            import time
+            time.sleep(0.2)
+            break
+    elif ident is not None:
+        write({{"jsonrpc": "2.0", "id": ident, "result": {{}}}})
+"#,
+            ),
+        )
+        .unwrap();
+
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let spec = LaunchSpec {
+            command: "python3".into(),
+            args: vec![script.to_string_lossy().into_owned()],
+            environment: BTreeMap::new(),
+            cwd: temp.path().to_path_buf(),
+            additional_directories: Vec::new(),
+            resume_session: None,
+            harness: HarnessKind::Kimi,
+            force_unrestricted_mode: false,
+        };
+        let runtime = tokio::spawn(run(spec, request_rx, event_tx));
+
+        let mut started = Vec::new();
+        let mut saw_reload = false;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("ACP runtime keeps reporting")
+                .expect("event channel stays open");
+            match event {
+                RuntimeEvent::SessionStarted {
+                    native_session_id,
+                    resumed,
+                    ..
+                } => {
+                    assert_eq!(native_session_id, "scripted");
+                    started.push(resumed);
+                    if started.len() == 2 {
+                        break;
+                    }
+                }
+                RuntimeEvent::HarnessRestarting { message } => {
+                    assert!(
+                        message.contains("reloading the native session"),
+                        "{message}"
+                    );
+                    saw_reload = true;
+                }
+                RuntimeEvent::Stopped => panic!("worker stopped before reloading the session"),
+                _ => {}
+            }
+        }
+        assert!(saw_reload, "a dead bridge after session start must reload");
+        assert_eq!(started, vec![false, true], "the second open is a resume");
+
+        drop(request_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), runtime)
+            .await
+            .expect("closing the command channel must end the runtime")
+            .expect("runtime task does not panic")
+            .expect("a recovered bridge must not fail the worker");
     }
 
     #[cfg(unix)]

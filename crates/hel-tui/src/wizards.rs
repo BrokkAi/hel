@@ -2768,9 +2768,20 @@ impl DashboardState {
     }
 
     pub(crate) fn begin_resume(&mut self) -> DashboardAction {
-        let Some(session) = self.selected_session() else {
+        let Some(session_id) = self.selected_session().map(|session| session.id.clone()) else {
             return DashboardAction::None;
         };
+        self.begin_resume_for(&session_id)
+    }
+
+    /// Open the resume wizard for one session by id. The dashboard reaches
+    /// this for a failed but checkpointed session; the resume dialog reaches it
+    /// for a stopped one.
+    pub(crate) fn begin_resume_for(&mut self, session_id: &str) -> DashboardAction {
+        let Some(session) = self.state.sessions.get(session_id).cloned() else {
+            return DashboardAction::None;
+        };
+        let session = &session;
         if session.state.is_active() && session.state != SessionState::Error {
             self.notices
                 .set("This session is active; press Enter to open it.");
@@ -2957,13 +2968,13 @@ mod tests {
             config,
             HelState {
                 version: STATE_VERSION,
-                sessions: BTreeMap::from([("session-1".into(), archived_session())]),
+                sessions: BTreeMap::from([("session-1".into(), stopped_session())]),
                 mount_history: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
         assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
+            open_resume_wizard(&mut dashboard),
             DashboardAction::ResolveAwsResourceOptions {
                 target_template_ids: vec!["aws-a".into(), "aws-b".into()],
             }
@@ -3204,10 +3215,10 @@ mod tests {
         config.bundles.insert("alpha-unused".into(), bundle.clone());
         config.bundles.insert("zebra-recent".into(), bundle);
 
-        let mut older = archived_session();
+        let mut older = stopped_session();
         older.id = "older".into();
         older.created_at = "2026-08-10T12:00:00Z".into();
-        let mut recent = archived_session();
+        let mut recent = stopped_session();
         recent.id = "recent".into();
         recent.bundle_id = "zebra-recent".into();
         recent.created_at = "2026-08-11T12:00:00Z".into();
@@ -3252,7 +3263,7 @@ mod tests {
         config
             .targets
             .insert("recent-target".into(), config.targets["podman"].clone());
-        let mut recent = archived_session();
+        let mut recent = stopped_session();
         recent.last_profile = "codex-1".into();
         recent.bundle_id = "recent-project".into();
         recent.target_template_id = "recent-target".into();
@@ -3526,8 +3537,8 @@ mod tests {
             Some("source path /missing does not exist or is not a directory")
         );
 
-        let mut dashboard = dashboard_with_session(archived_session());
-        dashboard.handle_key(key(KeyCode::Enter));
+        let mut dashboard = dashboard_with_session(stopped_session());
+        open_resume_wizard(&mut dashboard);
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::BackTab));
@@ -3554,9 +3565,9 @@ mod tests {
 
     #[test]
     fn resume_can_convert_to_another_harness() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         dashboard.set_deployment_capacity_targets(vec![test_capacity_target()]);
-        dashboard.handle_key(key(KeyCode::Enter));
+        open_resume_wizard(&mut dashboard);
         dashboard.handle_key(key(KeyCode::Up));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
@@ -3578,8 +3589,8 @@ mod tests {
 
     #[test]
     fn resume_defaults_to_the_session_profile() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        dashboard.handle_key(key(KeyCode::Enter));
+        let mut dashboard = dashboard_with_session(stopped_session());
+        open_resume_wizard(&mut dashboard);
 
         let Mode::Resume(wizard) = &dashboard.mode else {
             panic!("expected resume wizard");
@@ -3590,11 +3601,11 @@ mod tests {
 
     #[test]
     fn resume_defaults_to_the_previously_used_target() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         let target = dashboard.config.targets["podman"].clone();
         dashboard.config.targets.insert("alternate".into(), target);
 
-        dashboard.handle_key(key(KeyCode::Enter));
+        open_resume_wizard(&mut dashboard);
 
         let Mode::Resume(wizard) = &dashboard.mode else {
             panic!("expected resume wizard");
@@ -3604,13 +3615,13 @@ mod tests {
 
     #[test]
     fn resume_refuses_a_target_the_session_cannot_use_and_says_why() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         dashboard
             .config
             .targets
             .insert("bare".into(), TargetTemplate::LocalBare);
 
-        dashboard.handle_key(key(KeyCode::Enter));
+        open_resume_wizard(&mut dashboard);
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Up));
         assert_eq!(
@@ -3630,12 +3641,12 @@ mod tests {
 
     #[test]
     fn resume_marks_an_unusable_target_row_as_disabled() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         dashboard
             .config
             .targets
             .insert("bare".into(), TargetTemplate::LocalBare);
-        dashboard.handle_key(key(KeyCode::Enter));
+        open_resume_wizard(&mut dashboard);
         dashboard.handle_key(key(KeyCode::Enter));
 
         let mut terminal =
@@ -3657,8 +3668,8 @@ mod tests {
 
     #[test]
     fn resume_dialog_attaches_an_additional_resource() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        dashboard.handle_key(key(KeyCode::Enter));
+        let mut dashboard = dashboard_with_session(stopped_session());
+        open_resume_wizard(&mut dashboard);
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::BackTab));
@@ -3699,14 +3710,14 @@ mod tests {
 
     #[test]
     fn resume_dialog_can_remove_a_previous_resource() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.additional_mounts = vec![AdditionalMount {
             source: "/opt/old-cache".into(),
             destination: "/mnt/old-cache".into(),
             read_only: false,
         }];
         let mut dashboard = dashboard_with_session(session);
-        dashboard.handle_key(key(KeyCode::Enter));
+        open_resume_wizard(&mut dashboard);
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Tab));
@@ -3720,14 +3731,14 @@ mod tests {
 
     #[test]
     fn resume_review_edits_an_existing_attached_directory_in_place() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.additional_mounts = vec![AdditionalMount {
             source: "/opt/cache".into(),
             destination: "/mnt/cache".into(),
             read_only: false,
         }];
         let mut dashboard = dashboard_with_session(session);
-        dashboard.handle_key(key(KeyCode::Enter));
+        open_resume_wizard(&mut dashboard);
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Enter));
         dashboard.handle_key(key(KeyCode::Tab));
@@ -3777,8 +3788,8 @@ mod tests {
 
     #[test]
     fn resume_profile_step_marks_cross_harness_profiles_as_lossy() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        dashboard.handle_key(key(KeyCode::Enter));
+        let mut dashboard = dashboard_with_session(stopped_session());
+        open_resume_wizard(&mut dashboard);
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -3844,13 +3855,13 @@ mod tests {
             config,
             HelState {
                 version: STATE_VERSION,
-                sessions: BTreeMap::from([("session-1".into(), archived_session())]),
+                sessions: BTreeMap::from([("session-1".into(), stopped_session())]),
                 mount_history: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
 
-        dashboard.begin_resume();
+        dashboard.begin_resume_for("session-1");
         let Mode::Resume(wizard) = &dashboard.mode else {
             panic!("expected resume wizard, got {:?}", dashboard.mode);
         };

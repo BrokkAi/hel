@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn resume_is_projected_into_active_while_background_work_runs() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Resuming, None);
 
         assert_eq!(
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn unread_count_uses_logical_agent_positions_after_the_detach_cursor() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         apply_materialized_transcript(
@@ -708,7 +708,7 @@ mod tests {
 
     #[test]
     fn materialized_message_update_does_not_duplicate_unread_count() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         let mut initial = materialized_session_for("session-1", vec![agent_message(1, "first ")]);
@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     fn prepared_materialized_session_drops_stale_ordinals() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         let mut latest = materialized_session_for("session-1", vec![agent_message(2, "latest")]);
@@ -909,7 +909,7 @@ mod tests {
 
     #[test]
     fn later_non_agent_items_do_not_replace_the_last_agent_response() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         apply_materialized_transcript(
@@ -933,7 +933,7 @@ mod tests {
 
     #[test]
     fn materialized_idle_state_clears_a_stale_turn_clock() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         let mut running = MaterializedSession::empty("session-1");
         running.execution = MaterializedExecutionState::Running {
             started_at_ms: 1_000_000,
@@ -950,7 +950,7 @@ mod tests {
 
     #[test]
     fn materialized_running_state_starts_clock_without_transcript_events() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         let mut running = MaterializedSession::empty("session-1");
         running.execution = MaterializedExecutionState::Running {
             started_at_ms: 1_000_000,
@@ -972,7 +972,7 @@ mod tests {
 
     #[test]
     fn set_resume_destination_updates_the_in_flight_operation() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         dashboard.begin_session_operation("session-1".into(), SessionOperationKind::Resuming, None);
         dashboard.set_resume_destination("session-1", "grok-1".into(), "raw-localhost".into());
 

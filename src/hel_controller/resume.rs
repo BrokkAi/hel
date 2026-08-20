@@ -1,4 +1,4 @@
-//! Resuming an archived session onto a profile and target.
+//! Resuming a stopped session onto a profile and target.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,7 +39,7 @@ use super::worktree::{
 use super::{Controller, SessionResumeOptions, execute_checked, now, target_profile_home};
 
 impl Controller {
-    /// Resume an archived logical session on any configured profile and
+    /// Resume a stopped logical session on any configured profile and
     /// target. Cross-harness resume restores Git and canonical history, starts
     /// a fresh native session, and supplies the prior transcript as its first
     /// context turn.
@@ -104,8 +104,8 @@ impl Controller {
             .get(session_id)
             .with_context(|| format!("unknown session {session_id}"))?
             .clone();
-        if !matches!(previous.state, SessionState::Archived | SessionState::Error) {
-            bail!("session {session_id} is not archived or retryable");
+        if !matches!(previous.state, SessionState::Stopped | SessionState::Error) {
+            bail!("session {session_id} is not stopped or retryable");
         }
         let checkpoint = previous
             .checkpoint
@@ -715,12 +715,11 @@ pub(super) fn apply_failed_resume_rollback(
     match cleanup_error {
         None => {
             *current = previous.clone();
-            current.state = SessionState::Archived;
+            current.state = SessionState::Stopped;
             current.target = None;
             current.updated_at = now();
-            let failure = format!(
-                "{original_error}; partial target removed and session returned to archived"
-            );
+            let failure =
+                format!("{original_error}; partial target removed and session returned to stopped");
             current.last_error = Some(format!("resume failed: {failure}"));
             anyhow::anyhow!(failure)
         }
@@ -861,7 +860,7 @@ mod tests {
         let session_id = "0123456789abcdef0123456789abcdef";
         let checkpoint = write_checkpoint_gate_archive(directory.path(), session_id, 3);
         let mut session = checkpoint_test_session(session_id);
-        session.state = SessionState::Archived;
+        session.state = SessionState::Stopped;
         session.checkpoint = Some(checkpoint);
         let previous = session.clone();
         let profile_home = directory.path().join("profile");
@@ -1088,6 +1087,7 @@ mod tests {
     #[test]
     fn failed_resume_rolls_back_only_after_target_cleanup() {
         let previous = SessionRecord {
+            archived: false,
             container_cpus: None,
             container_memory: None,
             id: "0123456789abcdef0123456789abcdef".into(),
@@ -1100,7 +1100,7 @@ mod tests {
             target_template_id: "podman-old".into(),
             resource_allocation: None,
             additional_mounts: Vec::new(),
-            state: SessionState::Archived,
+            state: SessionState::Stopped,
             target: None,
             native_session_id: Some("native-session".into()),
             acp_session_title: None,
@@ -1124,10 +1124,10 @@ mod tests {
         let failure =
             apply_failed_resume_rollback(&mut cleaned, &previous, "worker upload failed", None);
 
-        assert_eq!(cleaned.state, SessionState::Archived);
+        assert_eq!(cleaned.state, SessionState::Stopped);
         assert_eq!(cleaned.last_profile, "codex-old");
         assert_eq!(cleaned.target, None);
-        assert!(failure.to_string().contains("returned to archived"));
+        assert!(failure.to_string().contains("returned to stopped"));
 
         let mut cleanup_failed = previous.clone();
         cleanup_failed.state = SessionState::Error;
@@ -1220,7 +1220,7 @@ mod tests {
             materialized_session_from_canonical(session_id, &archive.canonical_session).unwrap();
 
         let mut session = checkpoint_test_session(session_id);
-        session.state = SessionState::Archived;
+        session.state = SessionState::Stopped;
         session.checkpoint = Some(checkpoint.clone());
         session.additional_mounts = vec![AdditionalMount {
             source: PathBuf::from("/host/old"),
@@ -1300,7 +1300,7 @@ mod tests {
             ))
             .unwrap_err();
         let detail = format!("{error:#}");
-        assert!(detail.contains("returned to archived"), "{detail}");
+        assert!(detail.contains("returned to stopped"), "{detail}");
         assert!(!detail.contains("unknown session"), "{detail}");
         assert_eq!(
             executor.mounts_during_provisioning.into_inner().unwrap(),
@@ -1308,14 +1308,14 @@ mod tests {
         );
 
         let retained = controller.state.sessions.get(session_id).unwrap();
-        assert_eq!(retained.state, SessionState::Archived);
+        assert_eq!(retained.state, SessionState::Stopped);
         assert_eq!(retained.checkpoint, previous.checkpoint);
         assert_eq!(retained.managed_worktree, previous.managed_worktree);
         assert!(checkpoint.archive_path.is_file());
 
         let durable = crate::hel_database::load_state().unwrap();
         let durable_session = durable.sessions.get(session_id).unwrap();
-        assert_eq!(durable_session.state, SessionState::Archived);
+        assert_eq!(durable_session.state, SessionState::Stopped);
         assert_eq!(durable_session.checkpoint, previous.checkpoint);
         assert_eq!(
             durable_session.additional_mounts,
@@ -1425,7 +1425,7 @@ mod tests {
             ))
             .unwrap_err();
         assert!(
-            format!("{error:#}").contains("returned to archived"),
+            format!("{error:#}").contains("returned to stopped"),
             "{error:#}"
         );
 
@@ -1445,7 +1445,7 @@ mod tests {
         assert_eq!(saved.bundles, controller.config.bundles);
 
         let retained = controller.state.sessions.get(session_id).unwrap();
-        assert_eq!(retained.state, SessionState::Archived);
+        assert_eq!(retained.state, SessionState::Stopped);
         assert_eq!(retained.project_directory, previous.project_directory);
         assert_eq!(retained.managed_worktree, previous.managed_worktree);
         assert_eq!(retained.bundle_id, previous.bundle_id);

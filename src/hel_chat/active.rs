@@ -448,7 +448,7 @@ fn other_session_activity(
 }
 
 /// How often the poller retries sessions with no live actor. Resolving costs a
-/// manager round trip, and an archived or lost session never resolves.
+/// manager round trip, and a stopped or lost session never resolves.
 const OTHER_SESSION_RESOLVE_TICKS: u64 = 5;
 
 /// Poll the other sessions once a second so the chat view can show what is
@@ -472,7 +472,7 @@ fn spawn_other_session_poller(
                     if resolved.contains_key(&identity.session_id) {
                         continue;
                     }
-                    // No live actor is normal for archived or lost sessions.
+                    // No live actor is normal for stopped or lost sessions.
                     if let Ok(handle) = control.session(identity.session_id.clone()).await {
                         resolved.insert(identity.session_id.clone(), handle);
                     }

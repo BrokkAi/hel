@@ -1434,6 +1434,7 @@ mod tests {
     fn failed_new_session_provisioning_discards_provisional_record() {
         let session_id = "0123456789abcdef0123456789abcdef";
         let record = SessionRecord {
+            archived: false,
             container_cpus: None,
             container_memory: None,
             id: session_id.into(),
@@ -1475,6 +1476,7 @@ mod tests {
     fn failed_new_worker_start_discards_session_only_after_target_cleanup() {
         let session_id = "0123456789abcdef0123456789abcdef";
         let mut session = SessionRecord {
+            archived: false,
             container_cpus: None,
             container_memory: None,
             id: session_id.into(),

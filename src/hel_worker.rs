@@ -25,6 +25,7 @@ pub use protocol::{
     incompatible_request_protocol_response, invalid_relay_request_response, read_relay_frame,
     serve_relay_json_lines, unsupported_relay_method_response, write_relay_frame,
 };
+#[cfg(unix)]
 pub(crate) use snapshot::truncate_start_with_marker;
 pub use snapshot::{
     ActiveRelayPrompt, ClaimedRelayCommand, QueuedRelayPrompt, RelayCommand, RelayCommandKind,
@@ -2037,7 +2038,7 @@ mod tests {
     fn a_repeated_notice_append_still_leaves_one_conversation_line() {
         let temp = tempfile::tempdir().unwrap();
         let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
-        let text = "The working tree moved while this session was paused.";
+        let text = "The working tree moved while this session was stopped.";
         submit_relay(
             &mut relay,
             "resume-notice-1",

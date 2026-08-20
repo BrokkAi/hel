@@ -1264,6 +1264,21 @@ mod tests {
     }
 
     #[test]
+    fn truncate_start_keeps_the_tail_and_discloses_the_drop() {
+        let mut short = "abcdefghij".to_owned();
+        assert!(!truncate_start_with_marker(&mut short, 100));
+        assert_eq!(short, "abcdefghij");
+
+        let mut long = "abcdefghij".to_owned();
+        assert!(truncate_start_with_marker(&mut long, 4));
+        assert!(
+            long.starts_with("[hel dropped "),
+            "the drop must be disclosed: {long:?}"
+        );
+        assert!(long.ends_with("ghij"), "the tail must be kept: {long:?}");
+    }
+
+    #[test]
     fn oversized_observations_are_truncated_instead_of_failing() {
         let temp = tempfile::tempdir().unwrap();
         let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();

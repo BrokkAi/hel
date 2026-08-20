@@ -15,8 +15,9 @@ use hel_tui::{DashboardAction, SessionOperationKind};
 
 use crate::dashboard::io::{
     ContainerSettingsRequest, DashboardIoUpdate, LifecycleOperationRequest, StageReportingExecutor,
-    config_only_controller, spawn_create_bundle, spawn_dashboard_container_settings,
-    spawn_dashboard_create_session, spawn_dashboard_rename, spawn_io, spawn_lifecycle_operation,
+    config_only_controller, spawn_archive_write, spawn_create_bundle,
+    spawn_dashboard_container_settings, spawn_dashboard_create_session, spawn_dashboard_rename,
+    spawn_io, spawn_lifecycle_operation,
 };
 use crate::dashboard::{DashboardContext, QUOTA_REFRESH_NOTICE, View, resume_progress_notice};
 use crate::import::{DashboardImportSafety, PendingDashboardImport};
@@ -55,7 +56,42 @@ pub(crate) async fn apply_dashboard_action(
             context.manual_quota_refresh_generation = Some(context.request_quota_refresh());
             context.dashboard.set_notice(QUOTA_REFRESH_NOTICE);
         }
-        DashboardAction::OpenImport => context.start_import_discovery(),
+        DashboardAction::OpenResumeDialog => context.start_resume_discovery(),
+        DashboardAction::SetSessionArchived {
+            session_id,
+            archived,
+        } => {
+            let what = format!("session {}", short_id(&session_id));
+            let id = session_id.clone();
+            spawn_archive_write(
+                what,
+                move || hel::hel_database::set_session_archived(&id, archived),
+                context.dashboard_io_tx.clone(),
+            );
+            // The in-memory record the dashboard already updated is the one a
+            // later reload compares against, so keep the controller in step.
+            if let Some(session) = context.controller.state.sessions.get_mut(&session_id) {
+                session.archived = archived;
+            }
+        }
+        DashboardAction::SetNativeSessionHidden {
+            harness_kind,
+            native_session_id,
+            hidden,
+        } => {
+            let what = format!("native session {}", short_id(&native_session_id));
+            spawn_archive_write(
+                what,
+                move || {
+                    hel::hel_database::set_native_session_hidden(
+                        harness_kind,
+                        &native_session_id,
+                        hidden,
+                    )
+                },
+                context.dashboard_io_tx.clone(),
+            );
+        }
         DashboardAction::ImportSession {
             profile_id,
             native_session_id,
@@ -272,9 +308,12 @@ pub(crate) async fn apply_dashboard_action(
         DashboardAction::Close { session_id } => {
             context
                 .dashboard
-                .set_notice(format!("Pausing {}…", short_id(&session_id)));
-            let request =
-                context.begin_lifecycle_operation(&session_id, SessionOperationKind::Pausing, true);
+                .set_notice(format!("Stopping {}…", short_id(&session_id)));
+            let request = context.begin_lifecycle_operation(
+                &session_id,
+                SessionOperationKind::Stopping,
+                true,
+            );
             let session_manager = context.worker_commands_tx.clone();
             let runtime = tokio::runtime::Handle::current();
             spawn_lifecycle_operation(request, move |controller, cancelled| {
@@ -319,8 +358,8 @@ pub(crate) async fn apply_dashboard_action(
                 Ok(LifecycleSuccess::DeletedActive)
             });
         }
-        DashboardAction::DeleteArchived { session_id } => {
-            // An archived session has no worker, so nothing is copying it and
+        DashboardAction::DeleteStopped { session_id } => {
+            // A stopped session has no worker, so nothing is copying it and
             // no recovery reservation is needed.
             let request = context.begin_lifecycle_operation(
                 &session_id,
@@ -333,7 +372,7 @@ pub(crate) async fn apply_dashboard_action(
                 }
                 let executor = CancellableProcessExecutor::new(cancelled);
                 controller.delete_session_controlled(&session_id, &executor)?;
-                Ok(LifecycleSuccess::DeletedArchived)
+                Ok(LifecycleSuccess::DeletedStopped)
             });
         }
         DashboardAction::CancelOperation { session_id } => {

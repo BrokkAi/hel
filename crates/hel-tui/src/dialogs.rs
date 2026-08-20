@@ -2,22 +2,19 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyCode;
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use std::path::PathBuf;
 
 use hel::hel_config::{HarnessKind, mount_history_host};
 use hel::hel_targets::{AdditionalMount, default_mount_destination, validate_additional_mounts};
 
-use crate::render::render_session_scrollbar;
-use crate::widgets::{
-    action_buttons, centered_rect, focus_border, focused_buttons, popup_height, truncate_text,
-};
+use crate::widgets::{centered_rect, focused_buttons, popup_height, truncate_text};
 use crate::wizards::read_only_marker;
 use crate::{
     ButtonKey, DashboardAction, DashboardState, Mode, button_row_key, cycle_button_focus,
@@ -35,6 +32,13 @@ pub struct ImportSessionOption {
     pub project_directory: String,
     pub details: String,
     pub unavailable_reason: Option<String>,
+    /// When the harness last wrote this session's file, in epoch milliseconds.
+    /// The resume dialog sorts hel records and native sessions against each
+    /// other, so the raw instant travels alongside the rendered age.
+    pub last_activity_ms: i64,
+    /// Archived inside the harness itself; only Codex reports this. Hel
+    /// mirrors it one way and never writes the harness home back.
+    pub natively_archived: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,8 +109,11 @@ pub(crate) enum Confirmation {
         session_id: String,
         typed: String,
     },
-    DeleteArchived {
+    DeleteStopped {
         session_id: String,
+        /// The resume dialog to restore afterwards, so confirming or
+        /// cancelling a delete leaves the user where they were.
+        reopen: Option<Box<crate::resume::ResumeDialog>>,
     },
 }
 
@@ -156,9 +163,9 @@ const IMPORT_PROGRESS_BUTTONS: &[&str] = &["Cancel"];
 fn confirmation_buttons(confirmation: &Confirmation) -> &'static [&'static str] {
     match confirmation {
         Confirmation::DirtyLocal { .. } => &["Cancel", "Continue"],
-        Confirmation::Close { .. } => &["Cancel", "Pause"],
-        Confirmation::DeleteArchived { .. } => &["Cancel", "Delete"],
-        Confirmation::CloseFailed { .. } => &["Cancel", "Force destroy", "Retry pause"],
+        Confirmation::Close { .. } => &["Cancel", "Stop"],
+        Confirmation::DeleteStopped { .. } => &["Cancel", "Delete"],
+        Confirmation::CloseFailed { .. } => &["Cancel", "Force destroy", "Retry stop"],
         Confirmation::ForceDestroy { .. } | Confirmation::DeleteActive { .. } => &[],
     }
 }
@@ -166,63 +173,6 @@ fn confirmation_buttons(confirmation: &Confirmation) -> &'static [&'static str] 
 /// Index of the primary (rightmost) button, which is focused when a dialog opens.
 fn primary_button(labels: &[&str]) -> usize {
     labels.len().saturating_sub(1)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ImportFocus {
-    Filter,
-    Profiles,
-    Sessions,
-    Cancel,
-    Import,
-}
-
-/// Tab order for the import dialog. Profiles lead because the chosen profile
-/// decides which sessions the filter and session pane can show.
-const IMPORT_FOCUS_ORDER: [ImportFocus; 5] = [
-    ImportFocus::Profiles,
-    ImportFocus::Filter,
-    ImportFocus::Sessions,
-    ImportFocus::Cancel,
-    ImportFocus::Import,
-];
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ImportDialog {
-    discovery_id: u64,
-    pub(crate) profiles: Vec<ImportProfileOption>,
-    profile_index: usize,
-    pub(crate) session_index: usize,
-    pub(crate) filter: String,
-    pub(crate) focus: ImportFocus,
-    opened_at: Instant,
-}
-
-impl ImportDialog {
-    pub(crate) fn filtered_sessions(&self) -> Vec<&ImportSessionOption> {
-        let needle = self.filter.to_lowercase();
-        self.profiles
-            .get(self.profile_index)
-            .into_iter()
-            .flat_map(|profile| &profile.sessions)
-            .filter(|session| {
-                needle.is_empty() || session.project_directory.to_lowercase().contains(&needle)
-            })
-            .collect()
-    }
-
-    pub(crate) fn selected_session(&self) -> Option<&ImportSessionOption> {
-        self.filtered_sessions().get(self.session_index).copied()
-    }
-
-    fn is_scanning(&self) -> bool {
-        self.profiles.iter().any(|profile| {
-            profile.error.is_none()
-                && profile
-                    .scan_progress
-                    .is_none_or(|(scanned, total)| scanned < total)
-        })
-    }
 }
 
 pub(crate) fn render_import_progress(frame: &mut Frame, area: Rect, progress: &ImportProgress) {
@@ -341,199 +291,6 @@ pub(crate) fn render_import_bundle_confirmation(
     let popup = centered_rect(76, popup_height(&paragraph, 76, 12, area), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
-}
-
-pub(crate) fn render_import_dialog(frame: &mut Frame, area: Rect, dialog: &ImportDialog) {
-    let popup = centered_rect(82, 22, area);
-    frame.render_widget(Clear, popup);
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(" Import native session ");
-    let inner = outer.inner(popup);
-    frame.render_widget(outer, popup);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(3)])
-        .split(inner);
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
-        .split(rows[0]);
-
-    let profile_items = dialog
-        .profiles
-        .iter()
-        .map(|profile| {
-            ListItem::new(format!(
-                "{}  {}",
-                profile.profile_id,
-                profile.harness_kind.display_name()
-            ))
-        })
-        .collect::<Vec<_>>();
-    let mut profile_state = ListState::default()
-        .with_selected((!dialog.profiles.is_empty()).then_some(dialog.profile_index));
-    let profiles_focused = dialog.focus == ImportFocus::Profiles;
-    frame.render_stateful_widget(
-        List::new(profile_items)
-            .highlight_symbol(if profiles_focused { "› " } else { "  " })
-            .highlight_style(if profiles_focused {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
-            } else {
-                Style::default()
-            })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(focus_border(profiles_focused))
-                    .title(" Profiles "),
-            ),
-        panes[0],
-        &mut profile_state,
-    );
-
-    let selected_profile = dialog.profiles.get(dialog.profile_index);
-    let filtered_sessions = dialog.filtered_sessions();
-    let session_items = if filtered_sessions.is_empty() {
-        selected_profile.map_or_else(Vec::new, |profile| {
-            if let Some(error) = &profile.error {
-                vec![ListItem::new(format!("Unavailable: {error}"))]
-            } else if !dialog.filter.is_empty() && !profile.sessions.is_empty() {
-                let message = if profile
-                    .scan_progress
-                    .is_none_or(|(scanned, total)| scanned < total)
-                {
-                    "No matches yet · scanning…"
-                } else {
-                    "No matching native sessions"
-                };
-                vec![ListItem::new(message)]
-            } else if profile
-                .scan_progress
-                .is_none_or(|(scanned, total)| scanned < total)
-            {
-                vec![ListItem::new("Scanning native sessions…")]
-            } else {
-                vec![ListItem::new("No native sessions found")]
-            }
-        })
-    } else {
-        filtered_sessions
-            .iter()
-            .map(|session| {
-                let title_style = if session.unavailable_reason.is_some() {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default().add_modifier(Modifier::BOLD)
-                };
-                let details = if session.unavailable_reason.is_some() {
-                    format!("{} · unavailable", session.details)
-                } else {
-                    session.details.clone()
-                };
-                ListItem::new(vec![
-                    Line::styled(
-                        truncate_text(&session.title, panes[1].width.saturating_sub(4) as usize),
-                        title_style,
-                    ),
-                    Line::styled(details, Style::default().fg(Color::Gray)),
-                ])
-            })
-            .collect()
-    };
-    let selectable_sessions = !filtered_sessions.is_empty();
-    let mut session_state =
-        ListState::default().with_selected(selectable_sessions.then_some(dialog.session_index));
-    let sessions_focused = dialog.focus == ImportFocus::Sessions;
-    let filter_focused = dialog.focus == ImportFocus::Filter;
-    let sessions_title = selected_profile
-        .and_then(|profile| profile.scan_progress)
-        .map(|(scanned, total)| {
-            format!(" Native sessions · newest first · {scanned}/{total} sessions scanned ")
-        })
-        .unwrap_or_else(|| " Native sessions · newest first · scanning… ".into());
-    let sessions_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(focus_border(sessions_focused || filter_focused))
-        .title(sessions_title);
-    let sessions_inner = sessions_block.inner(panes[1]);
-    frame.render_widget(sessions_block, panes[1]);
-    let session_rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1)])
-        .split(sessions_inner);
-    let filter_cursor = if filter_focused { "▏" } else { "" };
-    frame.render_widget(
-        Paragraph::new(format!("Filter: {}{filter_cursor}", dialog.filter)).style(
-            if filter_focused {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
-            } else {
-                Style::default().fg(Color::Gray)
-            },
-        ),
-        session_rows[0],
-    );
-    frame.render_stateful_widget(
-        List::new(session_items)
-            .highlight_symbol(if sessions_focused { "› " } else { "  " })
-            .highlight_style(if sessions_focused {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
-            } else {
-                Style::default()
-            }),
-        session_rows[1],
-        &mut session_state,
-    );
-    let visible_sessions = usize::from(session_rows[1].height) / 2;
-    render_session_scrollbar(
-        frame,
-        panes[1],
-        filtered_sessions.len(),
-        session_state.offset(),
-        visible_sessions.max(1),
-    );
-
-    let unavailable_reason = dialog
-        .selected_session()
-        .and_then(|session| session.unavailable_reason.as_deref());
-    let (status, status_style) = unavailable_reason.map_or_else(
-        || {
-            (
-                "Tab moves focus · ↑/↓ selects · Enter activates".to_owned(),
-                Style::default().fg(Color::Gray),
-            )
-        },
-        |reason| {
-            (
-                format!("Cannot import: {reason}"),
-                Style::default().fg(Color::Yellow),
-            )
-        },
-    );
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(status, status_style),
-            action_buttons(&[
-                ("Cancel", dialog.focus == ImportFocus::Cancel),
-                ("Import", dialog.focus == ImportFocus::Import),
-            ]),
-        ])
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true }),
-        rows[1],
-    );
-    if dialog.is_scanning() {
-        const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
-        let frame_index = (dialog.opened_at.elapsed().as_millis() / 125) as usize;
-        frame.render_widget(
-            Paragraph::new(format!(
-                "{} Parsing sessions…",
-                SPINNER[frame_index % SPINNER.len()]
-            ))
-            .style(Style::default().fg(Color::Gray)),
-            Rect::new(rows[1].x, rows[1].y + rows[1].height - 1, 22, 1),
-        );
-    }
 }
 
 /// Editable per-session container provisioning inputs: the size overrides and
@@ -845,7 +602,7 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
     let nominal = match confirmation {
         Confirmation::DirtyLocal { .. } => 11,
         Confirmation::CloseFailed { .. } => 12,
-        Confirmation::Close { .. } | Confirmation::DeleteArchived { .. } => 10,
+        Confirmation::Close { .. } | Confirmation::DeleteStopped { .. } => 10,
         Confirmation::ForceDestroy { .. } | Confirmation::DeleteActive { .. } => 9,
     };
     let (title, mut lines) = match confirmation {
@@ -864,15 +621,15 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
             (" Local repository has uncommitted changes ", lines)
         }
         Confirmation::Close { session_id } => (
-            " Pause session? ",
+            " Stop session? ",
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
                 Line::raw("Hel will verify a recovery copy before destroying the target."),
             ],
         ),
-        Confirmation::DeleteArchived { session_id } => (
-            " Permanently delete paused session? ",
+        Confirmation::DeleteStopped { session_id, .. } => (
+            " Permanently delete stopped session? ",
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
@@ -881,12 +638,12 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
             ],
         ),
         Confirmation::CloseFailed { session_id, error } => (
-            " Pause could not complete ",
+            " Stop could not complete ",
             vec![
                 Line::raw(format!("Session: {session_id}")),
                 Line::raw(""),
                 Line::styled(
-                    format!("Pause failed: {error}"),
+                    format!("Stop failed: {error}"),
                     Style::default().fg(Color::Yellow),
                 ),
             ],
@@ -928,22 +685,6 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
     let popup = centered_rect(72, popup_height(&paragraph, 72, nominal, area), area);
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);
-}
-
-pub(crate) fn import_sessions_pane(area: Rect) -> Rect {
-    let popup = centered_rect(82, 22, area);
-    let inner = popup.inner(Margin {
-        vertical: 1,
-        horizontal: 1,
-    });
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(3)])
-        .split(inner);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
-        .split(rows[0])[1]
 }
 
 impl DashboardState {
@@ -1108,86 +849,6 @@ impl DashboardState {
         }));
     }
 
-    pub fn show_import_dialog(&mut self, discovery_id: u64, profiles: Vec<ImportProfileOption>) {
-        self.mode = Mode::Import(ImportDialog {
-            discovery_id,
-            profiles,
-            profile_index: 0,
-            session_index: 0,
-            filter: String::new(),
-            focus: ImportFocus::Profiles,
-            opened_at: Instant::now(),
-        });
-    }
-
-    pub fn apply_import_profiles(&mut self, discovery_id: u64, profiles: Vec<ImportProfileOption>) {
-        let Mode::Import(dialog) = &mut self.mode else {
-            return;
-        };
-        if dialog.discovery_id != discovery_id {
-            return;
-        }
-        let selected_profile = dialog
-            .profiles
-            .get(dialog.profile_index)
-            .map(|profile| profile.profile_id.clone());
-        let selected_session = dialog
-            .selected_session()
-            .map(|session| session.native_session_id.clone());
-        dialog.profiles = profiles;
-        dialog.profile_index = selected_profile
-            .and_then(|selected| {
-                dialog
-                    .profiles
-                    .iter()
-                    .position(|profile| profile.profile_id == selected)
-            })
-            .unwrap_or(0);
-        let sessions = dialog.filtered_sessions();
-        dialog.session_index = selected_session
-            .and_then(|selected| {
-                sessions
-                    .iter()
-                    .position(|session| session.native_session_id == selected)
-            })
-            .unwrap_or_else(|| dialog.session_index.min(sessions.len().saturating_sub(1)));
-    }
-
-    pub fn apply_import_profile(&mut self, discovery_id: u64, profile: ImportProfileOption) {
-        let Mode::Import(dialog) = &mut self.mode else {
-            return;
-        };
-        if dialog.discovery_id != discovery_id {
-            return;
-        }
-        let Some(profile_index) = dialog
-            .profiles
-            .iter()
-            .position(|candidate| candidate.profile_id == profile.profile_id)
-        else {
-            return;
-        };
-        let selected_native_session_id = (dialog.profile_index == profile_index)
-            .then(|| {
-                dialog
-                    .selected_session()
-                    .map(|session| session.native_session_id.clone())
-            })
-            .flatten();
-        dialog.profiles[profile_index] = profile;
-        if dialog.profile_index != profile_index {
-            return;
-        }
-        let sessions = dialog.filtered_sessions();
-        dialog.session_index = selected_native_session_id
-            .and_then(|selected| {
-                sessions
-                    .iter()
-                    .position(|session| session.native_session_id == selected)
-            })
-            .unwrap_or_else(|| dialog.session_index.min(sessions.len().saturating_sub(1)));
-    }
-
     pub fn show_import_progress(&mut self, session_title: String) {
         self.mode = Mode::Importing(ImportProgress {
             session_title,
@@ -1238,146 +899,6 @@ impl DashboardState {
 
     pub fn finish_import(&mut self) {
         self.cancel_modal();
-    }
-
-    pub(crate) fn handle_import_key(
-        &mut self,
-        key: KeyEvent,
-        mut dialog: ImportDialog,
-    ) -> DashboardAction {
-        match key.code {
-            KeyCode::Esc => {
-                self.cancel_modal();
-                DashboardAction::None
-            }
-            KeyCode::Left
-                if matches!(dialog.focus, ImportFocus::Filter | ImportFocus::Sessions) =>
-            {
-                dialog.focus = ImportFocus::Profiles;
-                self.mode = Mode::Import(dialog);
-                DashboardAction::None
-            }
-            KeyCode::Right if dialog.focus == ImportFocus::Profiles => {
-                dialog.focus = ImportFocus::Filter;
-                self.mode = Mode::Import(dialog);
-                DashboardAction::None
-            }
-            KeyCode::Tab | KeyCode::BackTab => {
-                dialog.focus = cycle_control(
-                    dialog.focus,
-                    &IMPORT_FOCUS_ORDER,
-                    key.code == KeyCode::BackTab,
-                );
-                self.mode = Mode::Import(dialog);
-                DashboardAction::None
-            }
-            KeyCode::Backspace if dialog.focus == ImportFocus::Filter => {
-                dialog.filter.pop();
-                dialog.session_index = 0;
-                self.mode = Mode::Import(dialog);
-                DashboardAction::None
-            }
-            KeyCode::Char(character)
-                if dialog.focus == ImportFocus::Filter
-                    && !key.modifiers.intersects(
-                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                    ) =>
-            {
-                dialog.filter.push(character);
-                dialog.session_index = 0;
-                self.mode = Mode::Import(dialog);
-                DashboardAction::None
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                match dialog.focus {
-                    ImportFocus::Profiles => {
-                        move_index(&mut dialog.profile_index, dialog.profiles.len(), -1);
-                        dialog.session_index = 0;
-                    }
-                    ImportFocus::Sessions => {
-                        if dialog.session_index == 0 {
-                            dialog.focus = ImportFocus::Filter;
-                        } else {
-                            dialog.session_index -= 1;
-                        }
-                    }
-                    ImportFocus::Filter | ImportFocus::Cancel | ImportFocus::Import => {}
-                }
-                self.mode = Mode::Import(dialog);
-                DashboardAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                match dialog.focus {
-                    ImportFocus::Filter => {
-                        dialog.focus = ImportFocus::Sessions;
-                    }
-                    ImportFocus::Profiles => {
-                        move_index(&mut dialog.profile_index, dialog.profiles.len(), 1);
-                        dialog.session_index = 0;
-                    }
-                    ImportFocus::Sessions => {
-                        let len = dialog.filtered_sessions().len();
-                        move_index(&mut dialog.session_index, len, 1);
-                    }
-                    ImportFocus::Cancel | ImportFocus::Import => {}
-                }
-                self.mode = Mode::Import(dialog);
-                DashboardAction::None
-            }
-            KeyCode::Enter if dialog.focus == ImportFocus::Profiles => {
-                dialog.focus = ImportFocus::Filter;
-                self.mode = Mode::Import(dialog);
-                DashboardAction::None
-            }
-            KeyCode::Enter if dialog.focus == ImportFocus::Filter => {
-                dialog.focus = ImportFocus::Sessions;
-                self.mode = Mode::Import(dialog);
-                DashboardAction::None
-            }
-            KeyCode::Enter if dialog.focus == ImportFocus::Sessions => {
-                let available = dialog
-                    .selected_session()
-                    .is_some_and(|session| session.unavailable_reason.is_none());
-                if available {
-                    dialog.focus = ImportFocus::Import;
-                }
-                self.mode = Mode::Import(dialog);
-                DashboardAction::None
-            }
-            KeyCode::Enter if dialog.focus == ImportFocus::Cancel => {
-                self.cancel_modal();
-                DashboardAction::None
-            }
-            KeyCode::Enter if dialog.focus == ImportFocus::Import => {
-                let Some(profile_id) = dialog
-                    .profiles
-                    .get(dialog.profile_index)
-                    .map(|profile| profile.profile_id.clone())
-                else {
-                    self.mode = Mode::Import(dialog);
-                    return DashboardAction::None;
-                };
-                let Some(session) = dialog.selected_session() else {
-                    self.mode = Mode::Import(dialog);
-                    return DashboardAction::None;
-                };
-                if session.unavailable_reason.is_some() {
-                    self.mode = Mode::Import(dialog);
-                    return DashboardAction::None;
-                }
-                let action = DashboardAction::ImportSession {
-                    profile_id,
-                    native_session_id: session.native_session_id.clone(),
-                    display_title: session.title.clone(),
-                };
-                self.cancel_modal();
-                action
-            }
-            _ => {
-                self.mode = Mode::Import(dialog);
-                DashboardAction::None
-            }
-        }
     }
 
     pub(crate) fn begin_rename(&mut self) {
@@ -1506,7 +1027,11 @@ impl DashboardState {
                 return self.activate_confirmation_button(confirmation, index);
             }
             ButtonKey::Cancel => {
-                self.cancel_modal();
+                if let Confirmation::DeleteStopped { reopen, .. } = confirmation {
+                    self.restore_after_confirmation(reopen);
+                } else {
+                    self.cancel_modal();
+                }
                 return DashboardAction::None;
             }
             ButtonKey::Focus(next) => next,
@@ -1540,9 +1065,9 @@ impl DashboardState {
                 self.cancel_modal();
                 DashboardAction::Close { session_id }
             }
-            (Confirmation::DeleteArchived { session_id }, 1) => {
-                self.cancel_modal();
-                DashboardAction::DeleteArchived { session_id }
+            (Confirmation::DeleteStopped { session_id, reopen }, 1) => {
+                self.restore_after_confirmation(reopen);
+                DashboardAction::DeleteStopped { session_id }
             }
             (Confirmation::CloseFailed { session_id, .. }, 1) => {
                 self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::ForceDestroy {
@@ -1555,10 +1080,23 @@ impl DashboardState {
                 self.cancel_modal();
                 DashboardAction::Close { session_id }
             }
+            (Confirmation::DeleteStopped { reopen, .. }, _) => {
+                self.restore_after_confirmation(reopen);
+                DashboardAction::None
+            }
             _ => {
                 self.cancel_modal();
                 DashboardAction::None
             }
+        }
+    }
+
+    /// Returns to the resume dialog a confirmation interrupted, or to the
+    /// dashboard when the confirmation did not come from one.
+    fn restore_after_confirmation(&mut self, reopen: Option<Box<crate::resume::ResumeDialog>>) {
+        match reopen {
+            Some(dialog) => self.mode = Mode::ResumeDialog(*dialog),
+            None => self.cancel_modal(),
         }
     }
 
@@ -1657,23 +1195,22 @@ impl DashboardState {
 mod tests {
     use std::time::Instant;
 
-    use crossterm::event::{KeyCode, MouseEventKind};
+    use crossterm::event::KeyCode;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
 
-    use hel::hel_config::HarnessKind;
     use hel::hel_state::SessionState;
 
     use super::*;
     use crate::test_support::*;
 
     use crate::render::render;
-    use crate::{DashboardAction, DashboardState, Focus, MOUSE_SCROLL_ROWS, Mode};
+    use crate::{DashboardAction, DashboardState, Mode};
 
     #[test]
     fn delete_active_is_immediate_without_assistant_messages_and_guarded_after_one() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         session.checkpoint = None;
         let mut dashboard = dashboard_with_session(session);
@@ -1697,7 +1234,7 @@ mod tests {
     }
 
     fn dashboard_with_container_session() -> DashboardState {
-        let mut session = archived_session();
+        let mut session = running_session();
         session.additional_mounts = vec![AdditionalMount {
             source: PathBuf::from("/srv/data"),
             destination: PathBuf::from("/mnt/data"),
@@ -1887,7 +1424,7 @@ mod tests {
 
     #[test]
     fn rename_uses_acp_title_as_the_initial_value() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(running_session());
         dashboard.handle_key(ctrl_key('r'));
         let Mode::Rename(editor) = &dashboard.mode else {
             panic!("expected rename editor");
@@ -1907,7 +1444,7 @@ mod tests {
     }
 
     fn dashboard_with_rename_editor() -> DashboardState {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(running_session());
         dashboard.handle_key(ctrl_key('r'));
         assert!(matches!(dashboard.mode, Mode::Rename(_)));
         dashboard
@@ -2100,7 +1637,7 @@ mod tests {
 
     #[test]
     fn import_progress_renders_a_focused_cancel_button_that_enter_presses() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         dashboard.show_import_progress("Chosen session".into());
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
         terminal
@@ -2124,199 +1661,8 @@ mod tests {
     }
 
     #[test]
-    fn import_dialog_selects_a_session_from_the_chosen_profile() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        assert_eq!(
-            dashboard.handle_key(ctrl_key('i')),
-            DashboardAction::OpenImport
-        );
-        let profiles = vec![
-            ImportProfileOption {
-                profile_id: "codex-1".into(),
-                harness_kind: HarnessKind::Codex,
-                sessions: vec![ImportSessionOption {
-                    native_session_id: "codex-session".into(),
-                    title: "Codex title".into(),
-                    project_directory: "/home/user/Projects/hel".into(),
-                    details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
-                    unavailable_reason: None,
-                }],
-                scan_progress: Some((1, 1)),
-                error: None,
-            },
-            ImportProfileOption {
-                profile_id: "claude-1".into(),
-                harness_kind: HarnessKind::Claude,
-                sessions: vec![ImportSessionOption {
-                    native_session_id: "claude-session".into(),
-                    title: "Claude title".into(),
-                    project_directory: "/home/user/Projects/hel".into(),
-                    details: "4m ago · master · 2.0MB · ~/Projects/hel".into(),
-                    unavailable_reason: None,
-                }],
-                scan_progress: Some((1, 1)),
-                error: None,
-            },
-        ];
-        dashboard.show_import_dialog(1, profiles.clone());
-        dashboard.apply_import_profiles(1, profiles);
-
-        dashboard.handle_key(key(KeyCode::Down));
-        dashboard.handle_key(key(KeyCode::Right));
-        dashboard.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::None
-        );
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::ImportSession {
-                profile_id: "claude-1".into(),
-                native_session_id: "claude-session".into(),
-                display_title: "Claude title".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn import_dialog_focuses_profiles_then_filters_each_selected_profile() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        let session = |id: &str, title: &str, project_directory: &str| ImportSessionOption {
-            native_session_id: id.into(),
-            title: title.into(),
-            project_directory: project_directory.into(),
-            details: format!("just now · master · 1.0KB · {project_directory}"),
-            unavailable_reason: None,
-        };
-        let profiles = vec![
-            ImportProfileOption {
-                profile_id: "codex-1".into(),
-                harness_kind: HarnessKind::Codex,
-                sessions: vec![
-                    session("title-only", "Hel project", "/work/other"),
-                    session("codex-match", "Matching cwd", "/work/Projects/HEL"),
-                ],
-                scan_progress: Some((2, 2)),
-                error: None,
-            },
-            ImportProfileOption {
-                profile_id: "claude-1".into(),
-                harness_kind: HarnessKind::Claude,
-                sessions: vec![session(
-                    "claude-match",
-                    "Claude matching cwd",
-                    "/Users/me/projects/hel",
-                )],
-                scan_progress: Some((1, 1)),
-                error: None,
-            },
-        ];
-        dashboard.show_import_dialog(1, profiles);
-
-        let Mode::Import(dialog) = &dashboard.mode else {
-            panic!("expected import dialog");
-        };
-        assert_eq!(dialog.focus, ImportFocus::Profiles);
-
-        dashboard.handle_key(key(KeyCode::Tab));
-        dashboard.handle_paste("hEl\n");
-        let Mode::Import(dialog) = &dashboard.mode else {
-            panic!("expected import dialog");
-        };
-        assert_eq!(dialog.focus, ImportFocus::Filter);
-        assert_eq!(dialog.filter, "hEl");
-        assert_eq!(
-            dialog
-                .filtered_sessions()
-                .iter()
-                .map(|session| session.native_session_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["codex-match"]
-        );
-
-        dashboard.handle_key(key(KeyCode::Down));
-        let Mode::Import(dialog) = &dashboard.mode else {
-            panic!("expected import dialog");
-        };
-        assert_eq!(dialog.focus, ImportFocus::Sessions);
-        dashboard.handle_key(key(KeyCode::Up));
-        let Mode::Import(dialog) = &dashboard.mode else {
-            panic!("expected import dialog");
-        };
-        assert_eq!(dialog.focus, ImportFocus::Filter);
-
-        dashboard.handle_key(key(KeyCode::Left));
-        dashboard.handle_key(key(KeyCode::Down));
-        dashboard.handle_key(key(KeyCode::Right));
-        let Mode::Import(dialog) = &dashboard.mode else {
-            panic!("expected import dialog");
-        };
-        assert_eq!(dialog.focus, ImportFocus::Filter);
-        assert_eq!(dialog.filter, "hEl");
-        assert_eq!(
-            dialog.filtered_sessions()[0].native_session_id,
-            "claude-match"
-        );
-        dashboard.handle_key(key(KeyCode::Enter));
-        dashboard.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::ImportSession {
-                profile_id: "claude-1".into(),
-                native_session_id: "claude-match".into(),
-                display_title: "Claude matching cwd".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn import_dialog_explains_and_blocks_unavailable_sessions() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        let profiles = vec![ImportProfileOption {
-            profile_id: "codex-1".into(),
-            harness_kind: HarnessKind::Codex,
-            sessions: vec![ImportSessionOption {
-                native_session_id: "legacy-session".into(),
-                title: "Legacy Codex session".into(),
-                project_directory: "/home/user/Projects/hel".into(),
-                details: "2d ago · master · 1.0MB · ~/Projects/hel".into(),
-                unavailable_reason: Some(
-                    "Legacy Codex history cannot be imported; run codex migrate-rollouts --apply"
-                        .into(),
-                ),
-            }],
-            scan_progress: Some((1, 1)),
-            error: None,
-        }];
-        dashboard.show_import_dialog(1, profiles.clone());
-        dashboard.apply_import_profiles(1, profiles);
-        dashboard.handle_key(key(KeyCode::Enter));
-
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::None
-        );
-        assert!(matches!(dashboard.mode, Mode::Import(_)));
-
-        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw dashboard");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("unavailable"));
-        assert!(rendered.contains("Cannot import: Legacy Codex history"));
-        assert!(rendered.contains("codex migrate-rollouts --apply"));
-    }
-
-    #[test]
     fn import_safety_defaults_to_ignoring_untracked_files_and_can_include_them() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         dashboard.show_import_bundle_confirmation(
             vec!["/work/repo — 1 tracked change · 222561 untracked paths".into()],
             Vec::new(),
@@ -2367,7 +1713,7 @@ mod tests {
 
     #[test]
     fn import_safety_lists_scratch_repositories_left_out_of_the_workspace() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         dashboard.show_import_bundle_confirmation(
             Vec::new(),
             Vec::new(),
@@ -2392,7 +1738,7 @@ mod tests {
 
     #[test]
     fn import_safety_buttons_toggle_the_checkbox_and_cancel_from_the_cancel_button() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         dashboard.show_import_bundle_confirmation(
             vec!["/work/repo — 1 tracked change · 3 untracked paths".into()],
             Vec::new(),
@@ -2438,194 +1784,8 @@ mod tests {
     }
 
     #[test]
-    fn incremental_import_results_preserve_the_selected_session() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        let session = |id: &str| ImportSessionOption {
-            native_session_id: id.into(),
-            title: "Same title".into(),
-            project_directory: "/home/user/Projects/hel".into(),
-            details: "just now · master · 1.0KB · ~/Projects/hel".into(),
-            unavailable_reason: None,
-        };
-        let profile = |sessions: Vec<ImportSessionOption>, progress| ImportProfileOption {
-            profile_id: "codex-1".into(),
-            harness_kind: HarnessKind::Codex,
-            sessions,
-            scan_progress: Some(progress),
-            error: None,
-        };
-        let initial = vec![profile(vec![session("a"), session("b")], (2, 3))];
-        dashboard.show_import_dialog(1, initial.clone());
-        dashboard.apply_import_profiles(1, initial);
-        dashboard.handle_key(key(KeyCode::Enter));
-        dashboard.handle_key(key(KeyCode::Down));
-        dashboard.handle_key(key(KeyCode::Down));
-
-        dashboard.apply_import_profile(
-            1,
-            profile(vec![session("a"), session("b"), session("c")], (3, 3)),
-        );
-
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::None
-        );
-        assert_eq!(
-            dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::ImportSession {
-                profile_id: "codex-1".into(),
-                native_session_id: "b".into(),
-                display_title: "Same title".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn import_dialog_renders_profile_and_session_panes() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        let profiles = vec![ImportProfileOption {
-            profile_id: "codex-1".into(),
-            harness_kind: HarnessKind::Codex,
-            sessions: vec![ImportSessionOption {
-                native_session_id: "native-session-1".into(),
-                title: "Native session title".into(),
-                project_directory: "/home/user/Projects/hel".into(),
-                details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
-                unavailable_reason: None,
-            }],
-            scan_progress: Some((1, 1)),
-            error: None,
-        }];
-        dashboard.show_import_dialog(1, profiles.clone());
-        dashboard.apply_import_profiles(1, profiles);
-        let backend = TestBackend::new(120, 30);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw dashboard");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains("Profiles"));
-        assert!(rendered.contains("Native sessions"));
-        assert!(rendered.contains("Filter:"));
-        assert!(rendered.contains("codex-1"));
-        assert!(rendered.contains("Native session title"));
-        assert!(rendered.contains("1.0MB"));
-        assert!(rendered.contains("~/Projects/hel"));
-        assert!(rendered.contains("1/1 sessions scanned"));
-        assert!(!rendered.contains("Parsing sessions"));
-    }
-
-    #[test]
-    fn import_dialog_tab_cycles_through_panes_and_buttons() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        let profiles = vec![ImportProfileOption {
-            profile_id: "codex-1".into(),
-            harness_kind: HarnessKind::Codex,
-            sessions: vec![ImportSessionOption {
-                native_session_id: "native-session-1".into(),
-                title: "Native session title".into(),
-                project_directory: "/home/user/Projects/hel".into(),
-                details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
-                unavailable_reason: None,
-            }],
-            scan_progress: Some((1, 1)),
-            error: None,
-        }];
-        dashboard.show_import_dialog(1, profiles.clone());
-        dashboard.apply_import_profiles(1, profiles);
-        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
-
-        for (expected_focus, expected_cursors) in [
-            (ImportFocus::Profiles, 1),
-            (ImportFocus::Filter, 0),
-            (ImportFocus::Sessions, 1),
-            (ImportFocus::Cancel, 0),
-            (ImportFocus::Import, 0),
-        ] {
-            let Mode::Import(dialog) = &dashboard.mode else {
-                panic!("expected import dialog");
-            };
-            assert_eq!(dialog.focus, expected_focus);
-            terminal
-                .draw(|frame| render_import_dialog(frame, frame.area(), dialog))
-                .expect("draw import dialog");
-            assert_eq!(
-                terminal
-                    .backend()
-                    .buffer()
-                    .content()
-                    .iter()
-                    .filter(|cell| cell.symbol() == "›")
-                    .count(),
-                expected_cursors
-            );
-            dashboard.handle_key(key(KeyCode::Tab));
-        }
-    }
-
-    #[test]
-    fn import_session_list_renders_a_scrollbar_and_accepts_mouse_wheel() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        let sessions = (0..20)
-            .map(|index| ImportSessionOption {
-                native_session_id: format!("native-session-{index}"),
-                title: format!("Native session {index}"),
-                project_directory: "/home/user/Projects/hel".into(),
-                details: "2m ago · master · 1.0MB · ~/Projects/hel".into(),
-                unavailable_reason: None,
-            })
-            .collect();
-        dashboard.show_import_dialog(
-            1,
-            vec![ImportProfileOption {
-                profile_id: "codex-1".into(),
-                harness_kind: HarnessKind::Codex,
-                sessions,
-                scan_progress: Some((20, 20)),
-                error: None,
-            }],
-        );
-        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw import dialog");
-        let symbols = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<Vec<_>>();
-        assert!(symbols.contains(&"▲"));
-        assert!(symbols.contains(&"▼"));
-
-        let sessions_area = dashboard
-            .import_sessions_area
-            .expect("import session pane hitbox");
-        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollDown, sessions_area));
-        let Mode::Import(dialog) = &dashboard.mode else {
-            panic!("expected import dialog");
-        };
-        assert_eq!(dialog.focus, ImportFocus::Sessions);
-        assert_eq!(dialog.session_index, MOUSE_SCROLL_ROWS as usize);
-
-        dashboard.handle_mouse(mouse_in(MouseEventKind::ScrollUp, sessions_area));
-        let Mode::Import(dialog) = &dashboard.mode else {
-            panic!("expected import dialog");
-        };
-        assert_eq!(dialog.session_index, 0);
-    }
-
-    #[test]
     fn importing_session_renders_unknown_then_known_progress_and_ignores_navigation() {
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         dashboard.show_import_progress("Chosen session".into());
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Down)),
@@ -2680,39 +1840,8 @@ mod tests {
     }
 
     #[test]
-    fn import_dialog_shows_profiles_while_sessions_are_still_loading() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        dashboard.show_import_dialog(
-            7,
-            vec![ImportProfileOption {
-                profile_id: "codex-1".into(),
-                harness_kind: HarnessKind::Codex,
-                sessions: Vec::new(),
-                scan_progress: None,
-                error: None,
-            }],
-        );
-        let backend = TestBackend::new(120, 30);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw dashboard");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains("codex-1"));
-        assert!(rendered.contains("Scanning native sessions"));
-        assert!(rendered.contains("Parsing sessions"));
-    }
-
-    #[test]
     fn failed_archive_dialog_offers_retry_or_explicit_force_destroy() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         dashboard.handle_key(ctrl_key('p'));
@@ -2723,7 +1852,7 @@ mod tests {
             }
         );
 
-        // "Retry pause" is the primary button, so it is focused when the dialog opens.
+        // "Retry stop" is the primary button, so it is focused when the dialog opens.
         dashboard.show_close_failure("session-1".into(), "archive unavailable");
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
@@ -2737,7 +1866,7 @@ mod tests {
             dashboard.handle_key(key(KeyCode::Char('x'))),
             DashboardAction::None
         );
-        // "Force destroy" sits between Cancel and Retry pause.
+        // "Force destroy" sits between Cancel and Retry stop.
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Left)),
             DashboardAction::None
@@ -2769,12 +1898,12 @@ mod tests {
 
     #[test]
     fn close_failure_cancel_button_closes_the_dialog_without_acting() {
-        let mut session = archived_session();
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         dashboard.show_close_failure("session-1".into(), "archive unavailable");
 
-        // Tab from the rightmost button (Retry pause) wraps to Cancel.
+        // Tab from the rightmost button (Retry stop) wraps to Cancel.
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Tab)),
             DashboardAction::None
@@ -2790,8 +1919,8 @@ mod tests {
         assert!(matches!(dashboard.mode, Mode::Dashboard));
     }
 
-    fn running_dashboard_with_pause_dialog() -> DashboardState {
-        let mut session = archived_session();
+    fn running_dashboard_with_stop_dialog() -> DashboardState {
+        let mut session = stopped_session();
         session.state = SessionState::Running;
         let mut dashboard = dashboard_with_session(session);
         dashboard.handle_key(ctrl_key('p'));
@@ -2806,14 +1935,14 @@ mod tests {
     }
 
     #[test]
-    fn pause_confirmation_focuses_the_primary_button_so_enter_pauses() {
-        let mut dashboard = running_dashboard_with_pause_dialog();
+    fn stop_confirmation_focuses_the_primary_button_so_enter_stops() {
+        let mut dashboard = running_dashboard_with_stop_dialog();
         let Mode::Confirm(dialog) = &dashboard.mode else {
-            panic!("expected pause confirmation");
+            panic!("expected stop confirmation");
         };
         assert_eq!(
             confirmation_buttons(&dialog.confirmation),
-            &["Cancel", "Pause"]
+            &["Cancel", "Stop"]
         );
         assert_eq!(dialog.focus, 1);
         assert_eq!(
@@ -2826,17 +1955,17 @@ mod tests {
     }
 
     #[test]
-    fn pause_confirmation_cycles_focus_and_cancels_from_the_cancel_button() {
+    fn stop_confirmation_cycles_focus_and_cancels_from_the_cancel_button() {
         for cycle_key in [
             KeyCode::Tab,
             KeyCode::Left,
             KeyCode::Right,
             KeyCode::BackTab,
         ] {
-            let mut dashboard = running_dashboard_with_pause_dialog();
+            let mut dashboard = running_dashboard_with_stop_dialog();
             assert_eq!(dashboard.handle_key(key(cycle_key)), DashboardAction::None);
             let Mode::Confirm(dialog) = &dashboard.mode else {
-                panic!("expected pause confirmation to stay open for {cycle_key:?}");
+                panic!("expected stop confirmation to stay open for {cycle_key:?}");
             };
             assert_eq!(dialog.focus, 0, "{cycle_key:?}");
             assert_eq!(
@@ -2849,8 +1978,8 @@ mod tests {
     }
 
     #[test]
-    fn pause_confirmation_wraps_focus_back_to_the_primary_button() {
-        let mut dashboard = running_dashboard_with_pause_dialog();
+    fn stop_confirmation_wraps_focus_back_to_the_primary_button() {
+        let mut dashboard = running_dashboard_with_stop_dialog();
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Tab)),
             DashboardAction::None
@@ -2868,9 +1997,9 @@ mod tests {
     }
 
     #[test]
-    fn pause_confirmation_escape_cancels_from_any_button() {
+    fn stop_confirmation_escape_cancels_from_any_button() {
         for presses in 0..3 {
-            let mut dashboard = running_dashboard_with_pause_dialog();
+            let mut dashboard = running_dashboard_with_stop_dialog();
             for _ in 0..presses {
                 dashboard.handle_key(key(KeyCode::Tab));
             }
@@ -2884,9 +2013,9 @@ mod tests {
     }
 
     #[test]
-    fn pause_confirmation_ignores_the_removed_letter_accelerators() {
+    fn stop_confirmation_ignores_the_removed_letter_accelerators() {
         for accelerator in ['y', 'Y', 'n', 'N'] {
-            let mut dashboard = running_dashboard_with_pause_dialog();
+            let mut dashboard = running_dashboard_with_stop_dialog();
             assert_eq!(
                 dashboard.handle_key(key(KeyCode::Char(accelerator))),
                 DashboardAction::None,
@@ -2906,26 +2035,26 @@ mod tests {
     }
 
     #[test]
-    fn pause_confirmation_renders_cancel_and_pause_buttons_with_pause_focused() {
-        let mut dashboard = running_dashboard_with_pause_dialog();
+    fn stop_confirmation_renders_cancel_and_stop_buttons_with_stop_focused() {
+        let mut dashboard = running_dashboard_with_stop_dialog();
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut dashboard))
-            .expect("draw pause confirmation");
+            .expect("draw stop confirmation");
         let buffer = terminal.backend().buffer();
         let lines = buffer_lines(buffer);
         let row = lines
             .iter()
-            .position(|line| line.contains(" Cancel ") && line.contains(" Pause "))
+            .position(|line| line.contains(" Cancel ") && line.contains(" Stop "))
             .expect("button row");
         let button_y = buffer.area.y + row as u16;
         let cancel_x = buffer.area.x + cell_column(&lines[row], "Cancel");
-        let pause_x = buffer.area.x + cell_column(&lines[row], "Pause");
-        assert_eq!(buffer[(pause_x, button_y)].bg, Color::Cyan);
+        let stop_x = buffer.area.x + cell_column(&lines[row], "Stop");
+        assert_eq!(buffer[(stop_x, button_y)].bg, Color::Cyan);
         assert_eq!(buffer[(cancel_x, button_y)].bg, Color::DarkGray);
         // Each label keeps its one-cell padding inside the button background.
         assert_eq!(buffer[(cancel_x - 1, button_y)].bg, Color::DarkGray);
-        assert_eq!(buffer[(pause_x - 1, button_y)].bg, Color::Cyan);
+        assert_eq!(buffer[(stop_x - 1, button_y)].bg, Color::Cyan);
         assert!(!lines.iter().any(|line| line.contains("Press y/Enter")));
     }
 
@@ -2935,8 +2064,9 @@ mod tests {
             Confirmation::Close {
                 session_id: "session-1".into(),
             },
-            Confirmation::DeleteArchived {
+            Confirmation::DeleteStopped {
                 session_id: "session-1".into(),
+                reopen: None,
             },
             Confirmation::CloseFailed {
                 session_id: "session-1".into(),
@@ -2949,7 +2079,7 @@ mod tests {
         ];
         for confirmation in confirmations {
             for (width, height) in [(120, 30), (100, 24), (72, 22)] {
-                let mut dashboard = dashboard_with_session(archived_session());
+                let mut dashboard = dashboard_with_session(stopped_session());
                 dashboard.mode = Mode::Confirm(ConfirmDialog::new(confirmation.clone()));
                 let mut terminal =
                     Terminal::new(TestBackend::new(width, height)).expect("terminal");
@@ -2968,9 +2098,9 @@ mod tests {
     }
 
     #[test]
-    fn delete_archived_confirmation_deletes_from_its_primary_button() {
-        let mut dashboard = dashboard_with_session(archived_session());
-        dashboard.focus = Focus::Archived;
+    fn delete_stopped_confirmation_deletes_from_its_primary_button() {
+        let mut dashboard = dashboard_with_session(stopped_session());
+        dashboard.show_resume_dialog(1, Vec::new());
         dashboard.handle_key(key(KeyCode::Delete));
         let Mode::Confirm(dialog) = &dashboard.mode else {
             panic!("expected delete confirmation");
@@ -2981,10 +2111,12 @@ mod tests {
         );
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::DeleteArchived {
+            DashboardAction::DeleteStopped {
                 session_id: "session-1".into()
             }
         );
+        // Deleting from the dialog leaves the user in the dialog.
+        assert!(matches!(dashboard.mode, Mode::ResumeDialog(_)));
     }
 
     #[test]
@@ -2999,12 +2131,12 @@ mod tests {
             resource_allocation: None,
         };
 
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         dashboard.show_dirty_local_confirmation(create(false), vec!["project".into()]);
         assert_eq!(dashboard.handle_key(key(KeyCode::Enter)), create(true));
         assert!(matches!(dashboard.mode, Mode::Dashboard));
 
-        let mut dashboard = dashboard_with_session(archived_session());
+        let mut dashboard = dashboard_with_session(stopped_session());
         dashboard.show_dirty_local_confirmation(create(false), vec!["project".into()]);
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Char('y'))),
