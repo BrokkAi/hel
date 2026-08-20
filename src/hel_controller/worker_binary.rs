@@ -1119,6 +1119,37 @@ pub(super) fn replace_installed_worker_binary(
     Ok(())
 }
 
+/// Stop the detached worker daemon at `worker_root` without deleting its files.
+///
+/// The script signals the worker's process group so a wedged ACP child dies
+/// with it. Checkpoint then restarts the daemon against the same relay root.
+pub(super) fn stop_worker(
+    executor: &impl CommandExecutor,
+    locator: &hel_targets::TargetLocator,
+    worker_root: &str,
+) -> Result<()> {
+    let script = hel_targets::stop_worker_daemon_script(worker_root);
+    let command = match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("sh", ["-c", &script]),
+        hel_targets::TargetLocator::LocalPodman { container_id } => {
+            CommandSpec::new("podman", ["exec", container_id, "sh", "-c", &script])
+        }
+        hel_targets::TargetLocator::AppleContainer { container_id } => {
+            CommandSpec::new("container", ["exec", container_id, "sh", "-c", &script])
+        }
+        hel_targets::TargetLocator::AwsEc2 { ssh, .. }
+        | hel_targets::TargetLocator::SshBare { ssh, .. } => {
+            ssh_command_spec(ssh, ["sh", "-lc", &script])
+        }
+        hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
+            ssh_command_spec(ssh, ["podman", "exec", container_id, "sh", "-c", &script])
+        }
+    }
+    .purpose("stop Hel worker daemon");
+    execute_checked(executor, command)?;
+    Ok(())
+}
+
 pub(super) fn start_worker(
     executor: &impl CommandExecutor,
     locator: &hel_targets::TargetLocator,
@@ -1378,6 +1409,48 @@ mod tests {
                 "the exit record must be cleared before the daemon starts: {script}"
             );
         }
+    }
+    #[test]
+    fn stopping_a_worker_runs_the_daemon_stop_script() {
+        struct RecordingExecutor {
+            commands: RefCell<Vec<CommandSpec>>,
+        }
+
+        impl CommandExecutor for RecordingExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.commands.borrow_mut().push(command.clone());
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let locator = hel_targets::TargetLocator::SshBare {
+            ssh: SshTarget {
+                destination: "user@example.test".into(),
+                ssh_args: Vec::new(),
+            },
+            workspace: "/workspace".into(),
+        };
+        let executor = RecordingExecutor {
+            commands: RefCell::new(Vec::new()),
+        };
+        stop_worker(&executor, &locator, "/worker/root").unwrap();
+
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].purpose, "stop Hel worker daemon");
+        let script = commands[0]
+            .args
+            .iter()
+            .find(|argument| argument.contains("worker run --root"))
+            .unwrap_or_else(|| panic!("stop script missing from {commands:?}"));
+        assert!(
+            script.contains("hel_match=\"worker run --root $hel_root\""),
+            "stop must match only this session's worker: {script}"
+        );
     }
     struct PodmanInstallExecutor {
         commands: RefCell<Vec<CommandSpec>>,

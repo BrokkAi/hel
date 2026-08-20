@@ -2070,6 +2070,33 @@ mod tests {
     }
 
     #[test]
+    fn an_in_flight_prompt_blocks_checkpoint_barrier_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();
+        submit_relay(&mut relay, "stuck-prompt", prompt("keep running"));
+        let prompt = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(prompt.len(), 1);
+        assert_eq!(prompt[0].command_id, "stuck-prompt");
+
+        submit_relay(
+            &mut relay,
+            "barrier-command",
+            RelayCommand::BeginCheckpoint { reason: None },
+        );
+        assert!(
+            relay.claim_pending_commands(true).unwrap().is_empty(),
+            "a live ACP turn must keep the checkpoint barrier queued"
+        );
+
+        relay
+            .record_command_interrupted("stuck-prompt", "worker restarted")
+            .unwrap();
+        let claimed = relay.claim_pending_commands(true).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].command_id, "barrier-command");
+    }
+
+    #[test]
     fn cancel_dispatches_while_the_prompt_it_targets_is_in_flight() {
         let temp = tempfile::tempdir().unwrap();
         let mut relay = DurableRelay::open(temp.path(), SESSION, "1.0.0").unwrap();

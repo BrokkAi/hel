@@ -185,6 +185,13 @@ impl ManagedSessionLease {
             .expect("managed session lease has already been released")
     }
 
+    /// Swap the leased proxy after the worker process behind it was replaced.
+    /// The actor stays leased, so queued prompts cannot race the new latch.
+    pub fn replace_connection(&mut self, connection: StandaloneSession) {
+        drop(self.connection.take());
+        self.connection = Some(connection);
+    }
+
     pub fn release(mut self) {
         let lease_id = self
             .lease_id

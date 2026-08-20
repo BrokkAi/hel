@@ -1856,7 +1856,7 @@ pub fn worker_root(locator: &TargetLocator, session_id: &str) -> Result<String> 
 /// first to take the agent down with it. Shells disagree about how to write a
 /// negative PID (`dash` rejects `--`), hence the two forms before the
 /// single-process fallback for daemons predating the group leadership.
-fn stop_worker_daemon_script(worker_root: &str) -> String {
+pub(crate) fn stop_worker_daemon_script(worker_root: &str) -> String {
     format!(
         r#"hel_root={root}
 hel_match="worker run --root $hel_root"

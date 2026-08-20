@@ -28,10 +28,18 @@ use crate::hel_targets::{self, CommandExecutor, CommandOutput, CommandSpec, Proc
 use crate::hel_worker::{RelayCommand, RelayCursor, RelayExecutionState};
 
 use super::backend::backend_locator;
+use super::readiness::{connect_started_worker, wait_for_native_session};
+use super::worker_binary::{start_worker, stop_worker};
 use super::{
     Controller, execute_checked, now, persist_session_record_transition_or_restore,
     scp_command_spec, ssh_command_spec, target_kind, target_profile_home,
 };
+
+/// How long an ordinary checkpoint waits for ACP to admit its barrier.
+const CHECKPOINT_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
+/// After a wedged ACP forces a worker restart, wait as long as native-session
+/// startup: session/load of a long kimi transcript can outlast 30s.
+const CHECKPOINT_BARRIER_TIMEOUT_AFTER_RESTART: Duration = Duration::from_secs(300);
 
 /// Remove checkpoint archives installed by a process that exited before its
 /// database transaction committed. Call this only while holding the
@@ -156,6 +164,19 @@ impl ControllerRelayLease {
                     .context("managed session has no snapshot")
             }
             Self::Standalone(connection) => connection.sync().await,
+        }
+    }
+
+    /// Swap the proxy after the worker process behind it was restarted.
+    fn replace_connection(&mut self, connection: StandaloneSession) {
+        match self {
+            Self::Managed {
+                lease: Some(lease), ..
+            } => lease.replace_connection(connection),
+            Self::Standalone(existing) => *existing = connection,
+            Self::Managed { lease: None, .. } => {
+                *self = Self::Standalone(connection);
+            }
         }
     }
 
@@ -545,18 +566,50 @@ impl Controller {
                 StandaloneSession::connect_command(&reconnect, session_id).await?,
             )
         };
-        let barrier_command_id = new_command_id("checkpoint")?;
-        let barrier = {
-            let connection = relay.connection_mut();
-            connection
-                .submit(
-                    barrier_command_id.clone(),
-                    RelayCommand::BeginCheckpoint {
-                        reason: Some("controller archive checkpoint".into()),
-                    },
-                )
-                .await?;
-            wait_for_checkpoint_barrier(connection, &barrier_command_id).await?
+        let mut restarted_worker = false;
+        let (barrier, barrier_command_id) = loop {
+            let barrier_command_id = new_command_id("checkpoint")?;
+            let timeout = if restarted_worker {
+                CHECKPOINT_BARRIER_TIMEOUT_AFTER_RESTART
+            } else {
+                CHECKPOINT_BARRIER_TIMEOUT
+            };
+            let result = {
+                let connection = relay.connection_mut();
+                connection
+                    .submit(
+                        barrier_command_id.clone(),
+                        RelayCommand::BeginCheckpoint {
+                            reason: Some("controller archive checkpoint".into()),
+                        },
+                    )
+                    .await?;
+                wait_for_checkpoint_barrier(connection, &barrier_command_id, timeout).await
+            };
+            match result {
+                Ok(barrier) => break (barrier, barrier_command_id),
+                Err(error)
+                    if !restarted_worker && checkpoint_barrier_needs_worker_restart(&error) =>
+                {
+                    tracing::warn!(
+                        session_id,
+                        "ACP did not admit the checkpoint barrier; restarting the worker and retrying: {error:#}"
+                    );
+                    let worker_root = hel_targets::worker_root(&backend, session_id)?;
+                    let connection = self
+                        .restart_worker_for_checkpoint(
+                            session_id,
+                            executor,
+                            &backend,
+                            &worker_root,
+                            &reconnect,
+                        )
+                        .await?;
+                    relay.replace_connection(connection);
+                    restarted_worker = true;
+                }
+                Err(error) => return Err(error),
+            }
         };
         let cursor = barrier
             .operational
@@ -833,13 +886,41 @@ impl Controller {
             completion,
         })
     }
+
+    /// Kill a worker whose ACP turn will not finish, install the current
+    /// binary, and reconnect. Restart recovery interrupts the in-flight prompt
+    /// so a later BeginCheckpoint can be admitted.
+    async fn restart_worker_for_checkpoint(
+        &self,
+        session_id: &str,
+        executor: &(impl CommandExecutor + Sync),
+        backend: &hel_targets::TargetLocator,
+        worker_root: &str,
+        reconnect: &hel_targets::CommandSpec,
+    ) -> Result<StandaloneSession> {
+        stop_worker(executor, backend, worker_root)
+            .context("stop wedged Hel worker before retrying checkpoint")?;
+        self.prepare_worker_files(session_id, backend, worker_root, executor)
+            .context("install current Hel worker before retrying checkpoint")?;
+        start_worker(executor, backend, worker_root)
+            .context("start Hel worker after interrupting a wedged ACP turn")?;
+        let mut connection =
+            connect_started_worker(reconnect, session_id, executor, backend, worker_root)
+                .await
+                .context("connect to Hel worker after restarting it for checkpoint")?;
+        wait_for_native_session(&mut connection, executor)
+            .await
+            .context("wait for ACP session after restarting the worker for checkpoint")?;
+        Ok(connection)
+    }
 }
 
 async fn wait_for_checkpoint_barrier(
     relay: &mut StandaloneSession,
     command_id: &str,
+    timeout: Duration,
 ) -> Result<ManagedSessionSnapshot> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let snapshot = relay.sync().await?;
         if checkpoint_barrier_is_ready(&snapshot, command_id) {
@@ -853,6 +934,12 @@ async fn wait_for_checkpoint_barrier(
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+fn checkpoint_barrier_needs_worker_restart(error: &anyhow::Error) -> bool {
+    let detail = format!("{error:#}");
+    detail.contains("ACP relay did not reach checkpoint barrier")
+        || detail.contains("ACP runtime stopped before reaching the checkpoint barrier")
 }
 
 fn checkpoint_barrier_is_ready(snapshot: &ManagedSessionSnapshot, command_id: &str) -> bool {
@@ -1814,6 +1901,18 @@ mod tests {
         );
     }
     #[test]
+    fn a_stuck_checkpoint_barrier_is_retried_by_restarting_the_worker() {
+        assert!(checkpoint_barrier_needs_worker_restart(&anyhow::anyhow!(
+            "ACP relay did not reach checkpoint barrier checkpoint-976f6746887c5ccd93b9d8bbe120ef06"
+        )));
+        assert!(checkpoint_barrier_needs_worker_restart(&anyhow::anyhow!(
+            "ACP runtime stopped before reaching the checkpoint barrier"
+        )));
+        assert!(!checkpoint_barrier_needs_worker_restart(&anyhow::anyhow!(
+            "export target checkpoint failed with status 1"
+        )));
+    }
+    #[test]
     fn export_spec_schema_mismatch_is_detected_from_the_parse_error() {
         assert!(export_spec_schema_unsupported(
             "Error: parse checkpoint export spec from standard input\n\nCaused by:\n    \
@@ -2026,9 +2125,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let barrier = wait_for_checkpoint_barrier(connection, &barrier_command_id)
-            .await
-            .unwrap();
+        let barrier = wait_for_checkpoint_barrier(
+            connection,
+            &barrier_command_id,
+            CHECKPOINT_BARRIER_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             barrier.materialized.applied_event_ordinal,
             barrier.operational.latest_ordinal
