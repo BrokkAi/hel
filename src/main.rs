@@ -385,6 +385,10 @@ struct ServerArgs {
     /// running with MagicDNS and HTTPS Certificates enabled.
     #[arg(long)]
     no_tailscale_detect: bool,
+    /// TCP port to listen on. Local `mj` sessions read the running server's
+    /// port, so they follow a non-default choice without extra flags.
+    #[arg(long, default_value_t = remote::DEFAULT_REMOTE_CONTROL_PORT, value_parser = clap::value_parser!(u16).range(1..))]
+    port: u16,
     /// Days of disconnected-session history to keep. Sessions (and their
     /// queued prompts) whose last update is older are deleted by the
     /// periodic sweeper. Pass 0 to keep history forever.
@@ -670,6 +674,7 @@ async fn main() -> Result<()> {
                 remote::run_server(remote::ServerOptions {
                     hostname: args.hostname,
                     tailscale_detect: !args.no_tailscale_detect,
+                    port: args.port,
                     history_days: args.history_days,
                     session_ttl_days: args.session_ttl_days,
                     logout_all: args.logout_all,
@@ -4319,8 +4324,27 @@ mod tests {
                 assert!(!args.no_tailscale_detect, "detection is on by default");
                 assert_eq!(args.session_ttl_days, 30);
                 assert!(!args.logout_all);
+                assert_eq!(args.port, remote::DEFAULT_REMOTE_CONTROL_PORT);
             }
             _ => panic!("expected Server subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_server_subcommand_with_port() {
+        let cli = try_parse_hermetic(&["mj", "server", "--port", "9443"]).expect("parse");
+        match cli.command {
+            Some(Commands::Server(args)) => assert_eq!(args.port, 9443),
+            _ => panic!("expected Server subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_server_rejects_out_of_range_ports() {
+        for port in ["0", "70000"] {
+            let error = try_parse_hermetic(&["mj", "server", "--port", port])
+                .expect_err("port out of range");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
         }
     }
 

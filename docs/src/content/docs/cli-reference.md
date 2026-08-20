@@ -35,7 +35,7 @@ mj memory list
 mj memory add [--global] "one short fact"
 mj memory forget m7
 mj memory clear --yes
-mj server [--hostname HOST] [--no-tailscale-detect]
+mj server [--hostname HOST] [--no-tailscale-detect] [--port PORT]
 ```
 
 See [Sessions, worktrees, and resume](/sessions-worktrees/) and [Mjolnir
