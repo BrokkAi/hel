@@ -19838,6 +19838,7 @@ mod tests {
         editor.tab = crate::settings::SettingsTab::Reviewer;
         editor.selected = 0;
         state.mjconfig_menu_key(KeyCode::Down);
+        state.mjconfig_menu_key(KeyCode::Down);
         state.mjconfig_menu_key(KeyCode::Char(' '));
         state.mjconfig_menu_key(KeyCode::Down);
         state.mjconfig_menu_key(KeyCode::Right);

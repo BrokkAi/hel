@@ -1,5 +1,5 @@
 //! Agentic discrete review over the changes a single user turn just authored.
-//! A first-class read-only supervisor may launch useful Norse reviewers
+//! A first-class supervisor may launch useful Norse reviewers
 //! asynchronously, then receives their reports in follow-up turns before
 //! returning one verdict.
 //!
@@ -8,8 +8,9 @@
 //! * Every dispatch produces **exactly one** [`ReviewOutcome`]. Model turns
 //!   have no wall-clock deadline; explicit user/session cancellation reaps
 //!   every owned agent before the review returns.
-//! * Reviewer sessions are fresh, read-only, visible through the ordinary
-//!   subagent UI, and never modify the workspace.
+//! * Reviewer sessions are fresh and visible through the ordinary subagent UI.
+//!   Mjolnir-hosted ACP filesystem and terminal capabilities are read-only;
+//!   provider-owned tools use the configured native permission mode.
 //! * Reviewer reports are untrusted evidence delivered asynchronously. The
 //!   supervisor must vet them and cannot issue a final verdict while selected
 //!   reviewers remain outstanding.
@@ -54,6 +55,7 @@ use crate::{
 use mj_core::{
     acp::{PreparedAgentCommand, RuntimeAccessMode},
     agent_usage::Seat,
+    config::PermissionPreset,
     event::{InternalMessage, InternalMessageKind, SubagentOutcome, UiEvent},
     roster::ResolvedAgent,
 };
@@ -258,6 +260,8 @@ pub struct FanoutConfig {
     pub agent_stderr: Option<PathBuf>,
     pub snapshot_exclusions: Vec<PathBuf>,
     pub fs_max_text_bytes: u64,
+    /// Provider-native policy applied to reviewer and supervisor sessions.
+    pub permission: PermissionPreset,
     /// Shared with the subagent pool so a lane's status row cannot land on the
     /// same id as a running subagent's. Lanes are *not* pool members: they keep
     /// their own [`MAX_PARALLEL_LANES`] semaphore and never occupy a slot.
@@ -735,10 +739,6 @@ fn review_run_context(config: &FanoutConfig) -> RunContext {
     }
 }
 
-fn requires_native_review_policy(source_id: &str) -> bool {
-    mj_core::roster::AdapterKind::from_source_id(source_id).is_some()
-}
-
 fn configure_review_pool(
     mut config: SubagentConfig,
     fanout: &FanoutConfig,
@@ -748,10 +748,6 @@ fn configure_review_pool(
 ) -> SubagentConfig {
     if let Some(role) = config.role_config.as_mut() {
         role.session_tag = fanout.session_tag.clone();
-        // Built-in adapters have provider-specific review hardening. An
-        // embedding platform's external adapter uses the ordinary discrete
-        // review runtime and permission flow.
-        role.require_native_read_only = requires_native_review_policy(&role.adapter_source_id);
     }
     config
         .with_reports(reports)
@@ -765,6 +761,7 @@ fn configure_review_pool(
         })
         .with_mcp_servers(Vec::new())
         .with_usage_seat(Seat::Review)
+        .with_permission_mode(fanout.permission)
         .with_retain_after_completion(retain)
         .with_debrief(false)
 }
@@ -2735,6 +2732,7 @@ mod tests {
             agent_stderr: None,
             snapshot_exclusions: Vec::new(),
             fs_max_text_bytes: 1_000_000,
+            permission: PermissionPreset::Auto,
             id_allocator: SubagentIdAllocator::default(),
         }
     }
@@ -4711,13 +4709,6 @@ mod tests {
         assert_eq!(context.snapshot_exclusions, vec![PathBuf::from("target")]);
         assert_eq!(context.fs_max_text_bytes, 4096);
         assert_eq!(context.access_mode, RuntimeAccessMode::ReadOnly);
-    }
-
-    #[test]
-    fn external_review_routes_use_the_normal_discrete_review_runtime() {
-        assert!(requires_native_review_policy("codex-acp"));
-        assert!(requires_native_review_policy("claude-acp"));
-        assert!(!requires_native_review_policy("sidecar"));
     }
 
     #[test]
