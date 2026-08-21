@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::hel_config::{ProjectBundle, data_dir};
+use crate::hel_session_manager::WorkerRecoveryPlan;
 use crate::hel_targets::{
     self, CommandExecutor, CommandPlan, CommandSpec, ProcessExecutor, ProvisionStage, SshTarget,
 };
@@ -163,17 +164,20 @@ impl Controller {
         worker_last_words(executor, &backend, &worker_root)
     }
 
-    /// Commands that replace a dead session worker without touching its
-    /// durable relay files. The session manager runs this plan off its async
-    /// actor when reconnects prove the daemon is gone.
-    pub fn worker_restart_plan(&self, session_id: &str) -> Result<CommandPlan> {
+    /// A non-destructive liveness probe plus commands that replace a confirmed
+    /// dead session worker without touching its durable relay files. The
+    /// session manager runs both off its async actor.
+    pub fn worker_recovery_plan(&self, session_id: &str) -> Result<WorkerRecoveryPlan> {
         let (backend, worker_root) = self.worker_placement(session_id)?;
-        Ok(CommandPlan {
-            description: format!("restart Hel worker for session {session_id}"),
-            commands: vec![
-                stop_worker_command(&backend, &worker_root),
-                start_worker_command(&backend, &worker_root),
-            ],
+        Ok(WorkerRecoveryPlan {
+            liveness_probe: worker_liveness_command(&backend, &worker_root),
+            restart: CommandPlan {
+                description: format!("restart Hel worker for session {session_id}"),
+                commands: vec![
+                    stop_worker_command(&backend, &worker_root),
+                    start_worker_command(&backend, &worker_root),
+                ],
+            },
         })
     }
 }
@@ -1166,6 +1170,27 @@ fn stop_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str) 
         }
     }
     .purpose("stop Hel worker daemon")
+}
+
+fn worker_liveness_command(locator: &hel_targets::TargetLocator, worker_root: &str) -> CommandSpec {
+    let script = hel_targets::worker_daemon_liveness_script(worker_root);
+    match locator {
+        hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("sh", ["-c", &script]),
+        hel_targets::TargetLocator::LocalPodman { container_id } => {
+            CommandSpec::new("podman", ["exec", container_id, "sh", "-c", &script])
+        }
+        hel_targets::TargetLocator::AppleContainer { container_id } => {
+            CommandSpec::new("container", ["exec", container_id, "sh", "-c", &script])
+        }
+        hel_targets::TargetLocator::AwsEc2 { ssh, .. }
+        | hel_targets::TargetLocator::SshBare { ssh, .. } => {
+            ssh_command_spec(ssh, ["sh", "-lc", &script])
+        }
+        hel_targets::TargetLocator::SshPodman { ssh, container_id } => {
+            ssh_command_spec(ssh, ["podman", "exec", container_id, "sh", "-c", &script])
+        }
+    }
+    .purpose("probe Hel worker daemon liveness")
 }
 
 pub(super) fn start_worker(

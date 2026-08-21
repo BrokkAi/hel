@@ -427,7 +427,7 @@ pub(crate) fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPol
             Some(WorkerPollTarget {
                 session_id: session.id.clone(),
                 spec,
-                restart_plan: controller.worker_restart_plan(&session.id).ok(),
+                worker_recovery: controller.worker_recovery_plan(&session.id).ok(),
             })
         })
         .collect()

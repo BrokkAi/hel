@@ -18,7 +18,7 @@ use crate::hel_projection::{
     apply_committed_projection_event, materialized_session_from_canonical, project_relay_event,
 };
 use crate::hel_state::{ManagedSessionSnapshot, MaterializedSession};
-use crate::hel_targets::{CancellableProcessExecutor, CommandPlan, CommandSpec};
+use crate::hel_targets::{CancellableProcessExecutor, CommandExecutor, CommandPlan, CommandSpec};
 use crate::hel_worker::{RelayCommand, RelayCursor, RelayOperationalState, validate_relay_event};
 use crate::hel_worker_client::{RelayClient, RelayEventPage, RelayRejected};
 
@@ -44,9 +44,16 @@ fn reconnect_delay(failures: u32) -> Duration {
 pub struct RelaySessionTarget {
     pub session_id: String,
     pub spec: CommandSpec,
-    /// Stop and start the worker daemon while retaining its relay root. Direct
-    /// relay clients omit this; controller-managed sessions can self-heal.
-    pub restart_plan: Option<CommandPlan>,
+    /// Prove the exact worker is absent before restarting it in place. Direct
+    /// relay clients omit recovery; controller-managed sessions self-heal
+    /// without turning a shared transport outage into destructive restarts.
+    pub worker_recovery: Option<WorkerRecoveryPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRecoveryPlan {
+    pub liveness_probe: CommandSpec,
+    pub restart: CommandPlan,
 }
 
 pub(crate) fn worker_connect_needs_restart(error: &anyhow::Error) -> bool {
@@ -61,15 +68,37 @@ pub(crate) fn worker_connect_needs_restart(error: &anyhow::Error) -> bool {
         || detail.contains("worker relay did not accept")
 }
 
-async fn restart_worker(plan: CommandPlan) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerRecoveryOutcome {
+    Alive,
+    Restarted,
+}
+
+async fn recover_worker(plan: WorkerRecoveryPlan) -> Result<WorkerRecoveryOutcome> {
     tokio::task::spawn_blocking(move || {
-        plan.execute(&CancellableProcessExecutor::with_timeout(
-            WORKER_RESTART_TIMEOUT,
-        ))
-        .map(|_| ())
+        let executor = CancellableProcessExecutor::with_timeout(WORKER_RESTART_TIMEOUT);
+        let output = executor
+            .execute(&plan.liveness_probe)
+            .context("probe relay worker liveness")?;
+        if output.status != 0 {
+            bail!(
+                "{} failed with status {}: {}",
+                plan.liveness_probe.purpose,
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "alive" => Ok(WorkerRecoveryOutcome::Alive),
+            "dead" => {
+                plan.restart.execute(&executor)?;
+                Ok(WorkerRecoveryOutcome::Restarted)
+            }
+            output => bail!("worker liveness probe returned unexpected output {output:?}"),
+        }
     })
     .await
-    .context("worker restart task failed")?
+    .context("worker recovery task failed")?
 }
 
 /// Why a managed session stopped producing fresh views. The kind matters to
@@ -701,7 +730,7 @@ async fn run_session_actor(
 ) {
     let mut connection: Option<StandaloneSession> = None;
     let mut failures = 0_u32;
-    let mut last_restart = None;
+    let mut last_recovery_probe = None;
     let mut lifecycle = ActorLifecycle::default();
     let mut deferred_submits: VecDeque<DeferredSubmit> = VecDeque::new();
     let mut next_lease_id = 1_u64;
@@ -743,11 +772,11 @@ async fn run_session_actor(
                         // retry, so report it at once rather than waiting for
                         // the unreachable threshold.
                         let integrity = projection_integrity_failure(&error);
-                        let restart_due = !integrity
+                        let recovery_due = !integrity
                             && failures >= UNREACHABLE_FAILURE_THRESHOLD
                             && worker_connect_needs_restart(&error)
-                            && target.restart_plan.is_some()
-                            && last_restart.is_none_or(|last: tokio::time::Instant| {
+                            && target.worker_recovery.is_some()
+                            && last_recovery_probe.is_none_or(|last: tokio::time::Instant| {
                                 last.elapsed() >= WORKER_RESTART_COOLDOWN
                             });
                         if integrity || failures >= UNREACHABLE_FAILURE_THRESHOLD {
@@ -757,8 +786,8 @@ async fn run_session_actor(
                             // this actor on its own view.
                             let snapshot = view_tx.borrow().snapshot.clone();
                             let mut detail = format!("{error:#}");
-                            if restart_due {
-                                detail.push_str("; restarting the relay worker");
+                            if recovery_due {
+                                detail.push_str("; checking whether the relay worker is dead");
                             }
                             publish_view(&target.session_id, ManagedSessionView {
                                 snapshot,
@@ -770,32 +799,55 @@ async fn run_session_actor(
                                 }),
                             }, &view_tx, &updates);
                         }
-                        if restart_due {
-                            last_restart = Some(tokio::time::Instant::now());
+                        if recovery_due {
+                            last_recovery_probe = Some(tokio::time::Instant::now());
                             let plan = target
-                                .restart_plan
+                                .worker_recovery
                                 .clone()
-                                .expect("restart eligibility requires a plan");
+                                .expect("recovery eligibility requires a plan");
                             tracing::warn!(
                                 session_id = target.session_id,
-                                "relay worker is unreachable; restarting it: {error:#}"
+                                "relay worker is unreachable; probing it before recovery: {error:#}"
                             );
-                            match restart_worker(plan).await {
-                                Ok(()) => {
+                            match recover_worker(plan).await {
+                                Ok(WorkerRecoveryOutcome::Restarted) => {
                                     failures = 0;
+                                    let snapshot = view_tx.borrow().snapshot.clone();
+                                    publish_view(&target.session_id, ManagedSessionView {
+                                        snapshot,
+                                        connected: false,
+                                        error: Some(ViewError::Unreachable(format!(
+                                            "{error:#}; confirmed the relay worker was dead and restarted it"
+                                        ))),
+                                    }, &view_tx, &updates);
                                     interval.reset_after(RECONNECT_INTERVAL);
                                 }
-                                Err(restart_error) => {
+                                Ok(WorkerRecoveryOutcome::Alive) => {
                                     tracing::warn!(
                                         session_id = target.session_id,
-                                        "automatic relay worker restart failed: {restart_error:#}"
+                                        "relay transport failed but the worker is alive; leaving it running"
                                     );
                                     let snapshot = view_tx.borrow().snapshot.clone();
                                     publish_view(&target.session_id, ManagedSessionView {
                                         snapshot,
                                         connected: false,
                                         error: Some(ViewError::Unreachable(format!(
-                                            "{error:#}; automatic relay worker restart failed: {restart_error:#}"
+                                            "{error:#}; relay worker is still alive, so it was not restarted"
+                                        ))),
+                                    }, &view_tx, &updates);
+                                    interval.reset_after(reconnect_delay(failures));
+                                }
+                                Err(recovery_error) => {
+                                    tracing::warn!(
+                                        session_id = target.session_id,
+                                        "automatic relay worker recovery failed safely: {recovery_error:#}"
+                                    );
+                                    let snapshot = view_tx.borrow().snapshot.clone();
+                                    publish_view(&target.session_id, ManagedSessionView {
+                                        snapshot,
+                                        connected: false,
+                                        error: Some(ViewError::Unreachable(format!(
+                                            "{error:#}; could not confirm the relay worker was dead, so it was not restarted: {recovery_error:#}"
                                         ))),
                                     }, &view_tx, &updates);
                                     interval.reset_after(reconnect_delay(failures));
@@ -1172,7 +1224,7 @@ impl StandaloneSession {
         Self::connect(&RelaySessionTarget {
             session_id: session_id.to_owned(),
             spec: spec.clone(),
-            restart_plan: None,
+            worker_recovery: None,
         })
         .await
     }
@@ -1490,11 +1542,40 @@ mod tests {
         )));
     }
 
+    #[tokio::test]
+    async fn recovery_never_restarts_a_worker_the_probe_reports_alive() {
+        let directory = tempfile::tempdir().unwrap();
+        let restarted = directory.path().join("restarted");
+        let recovery = |liveness: &str| WorkerRecoveryPlan {
+            liveness_probe: CommandSpec::new("printf", [format!("{liveness}\n")])
+                .purpose("probe test worker liveness"),
+            restart: CommandPlan {
+                description: "restart test worker".into(),
+                commands: vec![
+                    CommandSpec::new("touch", [restarted.to_string_lossy().into_owned()])
+                        .purpose("restart test worker"),
+                ],
+            },
+        };
+
+        assert_eq!(
+            recover_worker(recovery("alive")).await.unwrap(),
+            WorkerRecoveryOutcome::Alive
+        );
+        assert!(!restarted.exists(), "a live worker must not be restarted");
+
+        assert_eq!(
+            recover_worker(recovery("dead")).await.unwrap(),
+            WorkerRecoveryOutcome::Restarted
+        );
+        assert!(restarted.exists(), "a confirmed dead worker is restarted");
+    }
+
     fn target(program: &str) -> RelaySessionTarget {
         RelaySessionTarget {
             session_id: "session-1".to_owned(),
             spec: CommandSpec::new(program, std::iter::empty::<&str>()),
-            restart_plan: None,
+            worker_recovery: None,
         }
     }
 
@@ -1891,17 +1972,21 @@ mod tests {
             AUTO_RESTART_MARKER.to_owned(),
             restarted.to_string_lossy().into_owned(),
         );
-        let restart_plan = CommandPlan {
-            description: "restart test relay worker".into(),
-            commands: vec![
-                CommandSpec::new("touch", [restarted.to_string_lossy().into_owned()])
-                    .purpose("restart test relay worker"),
-            ],
+        let worker_recovery = WorkerRecoveryPlan {
+            liveness_probe: CommandSpec::new("printf", ["dead\n"])
+                .purpose("probe test relay worker"),
+            restart: CommandPlan {
+                description: "restart test relay worker".into(),
+                commands: vec![
+                    CommandSpec::new("touch", [restarted.to_string_lossy().into_owned()])
+                        .purpose("restart test relay worker"),
+                ],
+            },
         };
         let target = RelaySessionTarget {
             session_id: LEASED_RELAY_SESSION.to_owned(),
             spec,
-            restart_plan: Some(restart_plan),
+            worker_recovery: Some(worker_recovery),
         };
         let (_commands_tx, commands_rx) = mpsc::channel(4);
         let (_releases_tx, releases_rx) = mpsc::unbounded_channel();
@@ -1971,7 +2056,7 @@ mod tests {
         RelaySessionTarget {
             session_id: LEASED_RELAY_SESSION.to_owned(),
             spec,
-            restart_plan: None,
+            worker_recovery: None,
         }
     }
 

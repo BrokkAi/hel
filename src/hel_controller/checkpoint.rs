@@ -2233,7 +2233,7 @@ mod tests {
         crate::hel_session_manager::RelaySessionTarget {
             session_id: LATCH_RELAY_SESSION.to_owned(),
             spec,
-            restart_plan: None,
+            worker_recovery: None,
         }
     }
     /// Start a session manager against a live relay and latch a checkpoint on
