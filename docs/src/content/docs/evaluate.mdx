@@ -1,0 +1,385 @@
+---
+title: Evaluate Mjolnir in ten minutes
+description: Watch an isolated worktree session delegate a change, a cross-provider review challenge and validate every changed turn, and the same session move between terminal and browser.
+---
+
+import { Image } from 'astro:assets';
+import shotDelegating from '../../assets/evaluate/worktree-delegating.png';
+import shotSubagentDetail from '../../assets/evaluate/subagent-detail.png';
+import shotReportReview from '../../assets/evaluate/report-and-review.png';
+import shotDiscreteVerdict from '../../assets/evaluate/discrete-verdict.png';
+import shotPermissionCard from '../../assets/evaluate/permission-card.png';
+import shotConfigReviewer from '../../assets/evaluate/mjconfig-reviewer.png';
+import shotExtendedVerdict from '../../assets/evaluate/extended-verdict.png';
+import shotReviewLedger from '../../assets/evaluate/review-ledger.png';
+import shotServerTailscale from '../../assets/evaluate/server-tailscale.png';
+import shotWebSession from '../../assets/evaluate/web-session.png';
+import shotConfigTeam from '../../assets/evaluate/mjconfig-team.png';
+import shotConfigAppearance from '../../assets/evaluate/mjconfig-appearance.png';
+
+> Fixture, CLI surface, and screenshots produced against Mjolnir 1.11.3 on
+> 2026-08-20. Live provider output is model- and availability-dependent and is
+> not run in docs CI.
+
+This evaluation uses the coding team you select — Codex, Claude, or a mixed
+team — against a checked-in Python fixture in a disposable Git repository.
+The point of the exercise is not "the agent edits a file": it is watching
+Mjolnir keep the work isolated in a linked worktree, delegate a bounded change
+to a background subagent, challenge every changed turn with an independent
+cross-provider review that validates its own findings before showing them,
+and hand the same session between your terminal and a browser.
+
+It does not prove large-repository performance, consistent quality across
+models, predictable provider cost, safe unattended shell execution, or
+remote-server security.
+
+## Before you start: install and connect a team
+
+Everything in this evaluation runs on a team you set up once, so do the setup
+first, up front. You need Python 3 for the fixture tests, Git, and a Codex or
+Claude account — ideally both, because the mixed teams are the interesting
+ones here: the provider that wrote the change is never the provider that
+reviews it. Provider use may cost money.
+
+### 1. Install Mjolnir
+
+Any route from [Install and run](/install/) works; the quickest:
+
+```bash
+npm install -g @brokkai/mjolnir
+```
+
+```bash
+mj --version
+```
+
+### 2. Sign in to Codex, Claude, or both
+
+Run `mj` in any repository. First launch opens onboarding; its **ACP
+Servers** tab signs you in without leaving the terminal:
+
+- **Anthropic / Claude** — choose **Claude subscription** (Pro, Max, Team, or
+  Enterprise) or **Anthropic Console** (API usage billing). Mjolnir launches
+  the Claude Code executable supplied by the ACP route and returns to
+  onboarding after sign-in.
+- **OpenAI / ChatGPT** — choose **Browser** (`codex login`) or **Device
+  code** (`codex login --device-auth`).
+
+You do not need global `@anthropic-ai/claude-code` or `@openai/codex`
+installations: each ACP route ships a compatible CLI, and Mjolnir detects the
+credentials those sign-ins write. The equivalent manual commands, if you
+prefer to authenticate outside onboarding, are:
+
+```bash
+npx -y @agentclientprotocol/claude-agent-acp --cli auth login --claudeai
+```
+
+```bash
+npx --yes --package=@agentclientprotocol/codex-acp codex login
+```
+
+### 3. Choose the team
+
+Onboarding's **Team** tab (later: the same tab in `/mjconfig`) offers four
+configurations: **Codex**, **Claude**, **Codex coder + Claude reviewer**, and
+**Claude coder + Codex reviewer**. A team pins the primary seat to its coder
+and the review and subagent seats to its reviewer while keeping all three
+models on Auto.
+
+With both providers signed in, Mjolnir defaults to **Claude coder + Codex
+reviewer** so review lands on the model that did not write the code. With one
+provider, that provider's own team is the default — every journey below still
+works, but the reviewer then shares the coder's provider. This page's
+screenshots come from a **Claude coder + Codex reviewer** run.
+
+### 4. Confirm the seats
+
+Before starting the journeys, check onboarding (or `/mjconfig`) reports your
+provider signed in and its ACP server enabled, and that **Discrete review**
+is on — the evaluation depends on it. After launch, `/agents` records the
+model and adapter that actually bound to each seat, and the status line shows
+the resolved primary model. Team changes apply to the next session.
+
+## Prepare the disposable fixture
+
+From a Mjolnir checkout:
+
+```bash
+EVAL_DIR="$(mktemp -d)/mjolnir-eval"
+cp -R docs/fixtures/ten-minute-evaluation "$EVAL_DIR"
+cd "$EVAL_DIR"
+git init
+git add .
+git -c user.name="Mjolnir Eval" \
+    -c user.email="mjolnir-eval@example.invalid" \
+    commit -m "Add weather status and Fahrenheit helpers"
+python3 -m unittest -v
+```
+
+If you are reading the published docs, clone the repository first:
+
+```bash
+git clone https://github.com/BrokkAi/mjolnir.git
+cd mjolnir
+```
+
+The baseline has three passing tests over two small helpers, `status()` and
+`fahrenheit()`. That is deliberately boring: the journeys below are about
+what Mjolnir wraps around the work, not the work itself.
+
+## Journey 1: an isolated worktree and a delegated change
+
+Start Mjolnir in a linked Git worktree:
+
+```bash
+mj --worktree
+```
+
+On first use it offers to add `.mjolnir/worktrees/` to `.gitignore`; accept.
+The status line shows the generated worktree name (for example
+`.mjolnir/worktrees/bright-oak/`). Everything the session changes lands in
+that worktree — your checkout stays untouched.
+
+Send this prompt:
+
+```text
+Use the create_subagent tool from the mj-subagents MCP server to delegate
+this bounded change to a background subagent, then end your turn without
+waiting for it: update weather.py so status(0) returns "freezing", negative
+values return "below freezing", values below 20 return "cold", and all other
+values return "warm". The subagent should add focused tests for the new
+statuses, run python3 -m unittest -v, and report the result. Do not change
+anything else yourself.
+```
+
+Naming the `create_subagent` tool matters: coding agents ship their own
+in-process helpers, and a bare "launch a subagent" can route to those instead
+of Mjolnir's delegated subagent seat.
+
+Expected observations:
+
+1. The primary agent launches the subagent and ends its turn instead of
+   waiting — the prompt is immediately yours again.
+2. A stable `Subagents` workflow row appears with elapsed time and
+   running/done counts. The subagent runs on the subagent seat's provider —
+   on a mixed team, the coder's counterpart rather than the coder.
+
+<figure class="shot">
+  <a class="shot__zoom" href={shotDelegating.src} aria-label="Open the full-size screenshot: the delegation turn">
+    <Image src={shotDelegating} alt="Mjolnir TUI: the primary agent reports it launched the weather-status-update subagent and ended its turn; a live Subagents workflow row shows one subagent running; the status line shows the .mjolnir/worktrees/bright-oak/ path." />
+  </a>
+  <figcaption>The primary delegates and ends its turn. The <strong>Subagents</strong> row tracks the background work; the status line shows the session is confined to the <code>bright-oak</code> worktree.</figcaption>
+</figure>
+
+3. `/subagents` opens the retained nested-agent transcripts: the live
+   implementation subagent, and any review agents from earlier turns, each
+   with its adapter and model.
+
+<figure class="shot">
+  <a class="shot__zoom" href={shotSubagentDetail.src} aria-label="Open the full-size screenshot: the /subagents detail view">
+    <Image src={shotSubagentDetail} alt="The /subagents overlay: a list of retained nested agents with the implementation subagent running on codex-acp, and its live transcript showing the new status() implementation and the tests it added." />
+  </a>
+  <figcaption><code>/subagents</code> shows every nested agent the session has run — here the implementation subagent, live, on the other provider's model — with its full transcript.</figcaption>
+</figure>
+
+4. Any permission request the subagent raises is fully readable before you
+   decide and is labelled with the subagent's id.
+5. When the subagent finishes, its report is injected as a new user turn and
+   the primary responds to it — verify the claims, then summarize.
+6. Because that turn changed the workspace, a discrete review starts
+   automatically: an independent reviewer session (a Norse-named specialist
+   such as `vor`, on the reviewer seat's provider) challenges the diff, a
+   validator checks each finding, and the verdict is rendered before the turn
+   is released.
+
+<figure class="shot">
+  <a class="shot__zoom" href={shotReportReview.src} aria-label="Open the full-size screenshot: the subagent report and the review that follows">
+    <Image src={shotReportReview} alt="The subagent's pushed-back report summarized by the primary, a completed Subagents workflow row, and a live Review workflow row in its specialist-review phase." />
+  </a>
+  <figcaption>The pushed-back report becomes a user turn; the <strong>Subagents</strong> row completes and a <strong>Review</strong> row takes over as the independent reviewer starts.</figcaption>
+</figure>
+
+<figure class="shot">
+  <a class="shot__zoom" href={shotDiscreteVerdict.src} aria-label="Open the full-size screenshot: the discrete review verdict">
+    <Image src={shotDiscreteVerdict} alt="A review verdict block: one validated P3 issue about generated __pycache__ bytecode included in the cumulative patch, with the completed Review workflow row offering F9 details." />
+  </a>
+  <figcaption>Advisory findings, validated before display. Even on a toy change the reviewer has an opinion — here a <code>P3</code> about test-run bytecode landing in the workspace. <strong>F9</strong> opens the session-wide issue ledger.</figcaption>
+</figure>
+
+7. Prove the isolation from another terminal, in the fixture directory:
+
+```bash
+git status --short && git worktree list
+```
+
+The main checkout reports no modified files; the change exists only in the
+linked worktree.
+
+The exact wording and tool sequence differ by model. If the primary ignores
+the explicit delegation or the change is wrong, record the selected models and
+adapter in your evaluation notes; that is a failed outcome, not a docs
+failure.
+
+## Journey 2: turn up the review
+
+Journey 1 used the default **Quick** review depth: one independent reviewer,
+then a validation pass over its findings. This journey makes the review earn
+its keep, then raises the stakes.
+
+Ask for a direct change with a deliberately lazy test:
+
+```text
+Add a describe(temp_c) function to weather.py that combines the existing
+helpers: return the status word followed by the Fahrenheit reading in
+parentheses, with the conversion shown to one decimal place. Reuse status()
+and fahrenheit() exactly as they are - do not modify or reimplement them.
+Add one focused test that describe(12) starts with "cold", then run
+python3 -m unittest -v.
+```
+
+Because the primary edits files itself this time, each edit and shell command
+arrives as a fully readable permission card — the diff it wants to apply sits
+under the question:
+
+<figure class="shot">
+  <a class="shot__zoom" href={shotPermissionCard.src} aria-label="Open the full-size screenshot: a permission card over the diff">
+    <Image src={shotPermissionCard} alt="A permission request card titled Edit weather.py with Deny, Allow Once, and Always Allow choices, drawn over the diff adding the describe() function." />
+  </a>
+  <figcaption>Nothing is applied behind your back: the card sits on top of the exact diff, and Deny is the default.</figcaption>
+</figure>
+
+In our run the quick review answered that lazy `startswith` test with a
+validated `P2` — the assertion cannot detect a malformed reading — which the
+very next turn then had to address. Findings vary by model; what is stable is
+that every workspace-changing turn gets this challenge before it is released.
+
+Now raise the depth. Open `/mjconfig`, go to the **Reviewer** tab, and set
+**Review depth** to **Extended** — the adversarial supervisor with on-demand
+Norse specialist lanes. It costs far more tokens and applies from the next
+dispatch:
+
+<figure class="shot">
+  <a class="shot__zoom" href={shotConfigReviewer.src} aria-label="Open the full-size screenshot: the /mjconfig Reviewer tab">
+    <Image src={shotConfigReviewer} alt="The /mjconfig Reviewer tab: review model on auto via codex-acp, Codex session options, the discrete review toggle, and Review depth set to Extended." />
+  </a>
+  <figcaption>The <strong>Reviewer</strong> tab owns the other provider's seat: its model, its session options, the discrete-review toggle, and the Quick/Extended depth.</figcaption>
+</figure>
+
+Send a small follow-up (for example, round the Fahrenheit reading in
+`describe()` to a whole degree). The `Review` workflow row now walks through
+the extended pipeline — intent analysis, a supervisor, specialist lanes, and
+correction rounds when a finding sticks:
+
+<figure class="shot">
+  <a class="shot__zoom" href={shotExtendedVerdict.src} aria-label="Open the full-size screenshot: the extended review verdict">
+    <Image src={shotExtendedVerdict} alt="The extended review outcome: the primary explains that a specialist's P1 claim was rejected after verification against git evidence, the correction pass changed nothing, and the completed Review row reads issues 1 found, 1 invalidated." />
+  </a>
+  <figcaption>The part worth paying for: a specialist raised a plausible <code>P1</code>, the validator refuted it against <code>git diff</code> evidence, and the correction pass explicitly changed nothing — <strong>issues 1 found · 1 invalidated</strong>.</figcaption>
+</figure>
+
+Findings are session-state, not scrollback. **F9** opens the ledger, which
+tracks every issue across turns as open, fixed, or invalidated:
+
+<figure class="shot">
+  <a class="shot__zoom" href={shotReviewLedger.src} aria-label="Open the full-size screenshot: the F9 review issue ledger">
+    <Image src={shotReviewLedger} alt="The session review ledger: 2 found, 1 open, 0 fixed, 1 invalidated — the open P2 about the weak describe test and the invalidated P1 with the note that the correction turn changed nothing." />
+  </a>
+  <figcaption>The session ledger keeps score: the honest <code>P2</code> stays open until a turn fixes it, and the refuted <code>P1</code> is recorded as invalidated rather than silently dropped.</figcaption>
+</figure>
+
+One scope note to calibrate expectations: discrete review judges **the turn's
+diff** against your instructions. It reads surrounding code as context, but
+it is not a whole-repository audit — pre-existing defects in files a turn
+never touched are out of its jurisdiction.
+
+## Journey 3: leave the desk, keep the session
+
+Mjolnir Web publishes the same sessions to a browser. In a second terminal:
+
+```bash
+mj server
+```
+
+When the machine is on a tailnet with MagicDNS and HTTPS certificates
+enabled, the server detects it, serves a trusted certificate for the
+machine's `ts.net` name, and prints a QR code plus a six-digit viewer code —
+scan it from your phone anywhere on the tailnet. Without tailscale (or with
+`--no-tailscale-detect`) it binds `https://localhost:11921` with a
+self-signed certificate and explains why the QR is hidden. `--port` changes
+the port; local `mj` sessions follow it automatically.
+
+<figure class="shot">
+  <a class="shot__zoom" href={shotServerTailscale.src} aria-label="Open the full-size screenshot: mj server startup with tailscale detected">
+    <Image src={shotServerTailscale} alt="mj server startup output: a trusted certificate obtained for the machine's ts.net name, a login QR code, and a six-digit viewer code. QR, hostname, and code are redacted in this screenshot." />
+  </a>
+  <figcaption><code>mj server</code> with tailscale detected: trusted TLS for the machine's <code>ts.net</code> name and a QR sign-in for your phone. (Hostname, QR, and viewer code redacted here.)</figcaption>
+</figure>
+
+Sign in with the viewer code. The running TUI session from the journeys above
+is already in the session list — same transcript, same review results, same
+permission prompts. Remember the `P2` the ledger still holds open? Close it
+from the browser:
+
+```text
+Address the open P2 from the review ledger: make the describe test assert
+the exact output, then run python3 -m unittest -v.
+```
+
+<figure class="shot">
+  <a class="shot__zoom" href={shotWebSession.src} aria-label="Open the full-size screenshot: the same session in Mjolnir Web">
+    <Image src={shotWebSession} alt="Mjolnir Web showing the same session: the extended review recap with the invalidated P1 explanation in the transcript, and the P2 fix requested from the browser composer with the agent working." />
+  </a>
+  <figcaption>The browser is the same session, not a copy — Journey 2's review recap is right there in the transcript, and the <code>P2</code> fix starts from the web composer.</figcaption>
+</figure>
+
+Back at the terminal, exit with **Ctrl-D** on an empty prompt. Mjolnir asks
+whether to keep or remove the worktree, then prints the way back:
+
+```text
+To resume: mj resume <session-id> --worktree <name>
+```
+
+Run the printed command. The session returns through its saved ACP adapter and
+model provenance — including the turn you ran from the browser. That is the
+whole loop: start at the desk, continue from a phone, come back to the
+terminal.
+
+## Configuration and appearance
+
+`/mjconfig` opens the same editor onboarding uses, live in the session:
+
+<figure class="shot">
+  <a class="shot__zoom" href={shotConfigTeam.src} aria-label="Open the full-size screenshot: the /mjconfig Team tab">
+    <Image src={shotConfigTeam} alt="The /mjconfig editor on its Team tab: Team, Agent, Reviewer, Subagents, ACP Servers, and Appearance tabs, with the four team configurations listed and Claude coder + Codex reviewer selected." />
+  </a>
+  <figcaption>The <strong>Team</strong> tab pins who codes and who reviews; the other tabs override each seat, manage ACP servers, and tune the interface.</figcaption>
+</figure>
+
+<figure class="shot">
+  <a class="shot__zoom" href={shotConfigAppearance.src} aria-label="Open the full-size screenshot: the /mjconfig Appearance tab">
+    <Image src={shotConfigAppearance} alt="The /mjconfig Appearance tab: theme, spinner, thought output, feature tips, keep awake, and the inline-versus-fullscreen interface choice, with live preview." />
+  </a>
+  <figcaption>Appearance changes preview immediately: theme, spinner, thought verbosity, and the inline vs. fullscreen interface for the next session.</figcaption>
+</figure>
+
+## Voice
+
+On supported desktop platforms, **Ctrl-R** starts locally transcribed
+dictation straight into the prompt — no audio leaves the machine. Try it on
+any of the journey prompts above; see [Voice dictation](/voice/) for platform
+support and model download details.
+
+## Interpret the result
+
+A successful run proves the selected team can, on one small repository: keep
+agent changes out of your checkout, delegate and supervise background work,
+challenge every changed turn with a validated cross-provider review, and move
+one session between terminal and browser. Record model IDs, elapsed time,
+token/cost telemetry, whether the delegation occurred, what each review pass
+raised and how the validator disposed of it, and any manual intervention.
+Then repeat with another team from `/mjconfig` — the mixed teams are the
+quickest way to watch one provider's reviewer challenge the other provider's
+change.
+
+Before broader use, read [Permissions and workspace scope](/permissions/) and
+[Data and trust boundaries](/data-boundaries/).
