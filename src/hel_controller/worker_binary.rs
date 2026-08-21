@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::hel_config::{ProjectBundle, data_dir};
 use crate::hel_targets::{
-    self, CommandExecutor, CommandSpec, ProcessExecutor, ProvisionStage, SshTarget,
+    self, CommandExecutor, CommandPlan, CommandSpec, ProcessExecutor, ProvisionStage, SshTarget,
 };
 use crate::hel_worker_runtime::{WorkerLaunchConfig, WorkerOwnership};
 
@@ -161,6 +161,20 @@ impl Controller {
         let backend = backend_locator(locator, session, &self.config).ok()?;
         let worker_root = hel_targets::worker_root(&backend, session_id).ok()?;
         worker_last_words(executor, &backend, &worker_root)
+    }
+
+    /// Commands that replace a dead session worker without touching its
+    /// durable relay files. The session manager runs this plan off its async
+    /// actor when reconnects prove the daemon is gone.
+    pub fn worker_restart_plan(&self, session_id: &str) -> Result<CommandPlan> {
+        let (backend, worker_root) = self.worker_placement(session_id)?;
+        Ok(CommandPlan {
+            description: format!("restart Hel worker for session {session_id}"),
+            commands: vec![
+                stop_worker_command(&backend, &worker_root),
+                start_worker_command(&backend, &worker_root),
+            ],
+        })
     }
 }
 
@@ -1129,8 +1143,13 @@ pub(super) fn stop_worker(
     locator: &hel_targets::TargetLocator,
     worker_root: &str,
 ) -> Result<()> {
+    execute_checked(executor, stop_worker_command(locator, worker_root))?;
+    Ok(())
+}
+
+fn stop_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str) -> CommandSpec {
     let script = hel_targets::stop_worker_daemon_script(worker_root);
-    let command = match locator {
+    match locator {
         hel_targets::TargetLocator::LocalBare { .. } => CommandSpec::new("sh", ["-c", &script]),
         hel_targets::TargetLocator::LocalPodman { container_id } => {
             CommandSpec::new("podman", ["exec", container_id, "sh", "-c", &script])
@@ -1146,9 +1165,7 @@ pub(super) fn stop_worker(
             ssh_command_spec(ssh, ["podman", "exec", container_id, "sh", "-c", &script])
         }
     }
-    .purpose("stop Hel worker daemon");
-    execute_checked(executor, command)?;
-    Ok(())
+    .purpose("stop Hel worker daemon")
 }
 
 pub(super) fn start_worker(
@@ -1156,6 +1173,11 @@ pub(super) fn start_worker(
     locator: &hel_targets::TargetLocator,
     worker_root: &str,
 ) -> Result<()> {
+    execute_checked(executor, start_worker_command(locator, worker_root))?;
+    Ok(())
+}
+
+fn start_worker_command(locator: &hel_targets::TargetLocator, worker_root: &str) -> CommandSpec {
     let binary = format!("{worker_root}/hel");
     let config = format!("{worker_root}/launch.json");
     // The exit record describes the worker's previous life. Clear it as part
@@ -1194,7 +1216,7 @@ pub(super) fn start_worker(
         ]),
         hel_targets::join_remote_command(&[format!("{worker_root}/worker.log")]),
     );
-    let command = match locator {
+    match locator {
         hel_targets::TargetLocator::LocalBare { .. } => {
             CommandSpec::new("sh", ["-c", &detached_script])
         }
@@ -1226,9 +1248,7 @@ pub(super) fn start_worker(
     .purpose("start detached Hel worker")
     // Everything before this moves data into the target and reports as Sync.
     // Start begins here, with the daemon launch.
-    .stage(ProvisionStage::Starting);
-    execute_checked(executor, command)?;
-    Ok(())
+    .stage(ProvisionStage::Starting)
 }
 
 /// Enrich an opaque handshake failure by running the installed worker binary

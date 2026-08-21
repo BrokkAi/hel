@@ -19,7 +19,7 @@ use crate::hel_config::sessions_dir;
 use crate::hel_projection::canonical_session_from_materialized;
 use crate::hel_session_manager::{
     ManagedSessionHandle, ManagedSessionLease, SessionManagerControl, StandaloneSession,
-    new_command_id,
+    new_command_id, worker_connect_needs_restart,
 };
 use crate::hel_state::{
     CheckpointMetadata, HelState, ManagedSessionSnapshot, SessionRecord, SessionState,
@@ -1077,15 +1077,6 @@ fn checkpoint_barrier_needs_worker_restart(error: &anyhow::Error) -> bool {
     let detail = format!("{error:#}");
     detail.contains("ACP relay did not reach checkpoint barrier")
         || detail.contains("ACP runtime stopped before reaching the checkpoint barrier")
-}
-
-fn worker_connect_needs_restart(error: &anyhow::Error) -> bool {
-    let detail = format!("{error:#}").to_ascii_lowercase();
-    detail.contains("relay proxy disconnected")
-        || detail.contains("disconnected during hello")
-        || detail.contains("connect worker at")
-        || detail.contains("connection refused")
-        || detail.contains("worker relay did not accept")
 }
 
 fn checkpoint_barrier_is_ready(snapshot: &ManagedSessionSnapshot, command_id: &str) -> bool {
@@ -2242,6 +2233,7 @@ mod tests {
         crate::hel_session_manager::RelaySessionTarget {
             session_id: LATCH_RELAY_SESSION.to_owned(),
             spec,
+            restart_plan: None,
         }
     }
     /// Start a session manager against a live relay and latch a checkpoint on

@@ -423,13 +423,12 @@ pub(crate) fn dashboard_worker_targets(controller: &Controller) -> Vec<WorkerPol
         .values()
         .filter(|session| session.state.is_active() && session.target.is_some())
         .filter_map(|session| {
-            controller
-                .reconnect_command(&session.id)
-                .ok()
-                .map(|spec| WorkerPollTarget {
-                    session_id: session.id.clone(),
-                    spec,
-                })
+            let spec = controller.reconnect_command(&session.id).ok()?;
+            Some(WorkerPollTarget {
+                session_id: session.id.clone(),
+                spec,
+                restart_plan: controller.worker_restart_plan(&session.id).ok(),
+            })
         })
         .collect()
 }

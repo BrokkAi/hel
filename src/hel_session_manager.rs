@@ -18,7 +18,7 @@ use crate::hel_projection::{
     apply_committed_projection_event, materialized_session_from_canonical, project_relay_event,
 };
 use crate::hel_state::{ManagedSessionSnapshot, MaterializedSession};
-use crate::hel_targets::CommandSpec;
+use crate::hel_targets::{CancellableProcessExecutor, CommandPlan, CommandSpec};
 use crate::hel_worker::{RelayCommand, RelayCursor, RelayOperationalState, validate_relay_event};
 use crate::hel_worker_client::{RelayClient, RelayEventPage, RelayRejected};
 
@@ -28,6 +28,8 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 /// user acts, so retrying it every second only burns process spawns.
 const RECONNECT_BACKOFF_CEILING: Duration = Duration::from_secs(30);
 const UNREACHABLE_FAILURE_THRESHOLD: u32 = 4;
+const WORKER_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
+const WORKER_RESTART_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Delay before the next reconnect attempt after `failures` consecutive
 /// failures. Doubles from `RECONNECT_INTERVAL` up to the ceiling.
@@ -42,6 +44,32 @@ fn reconnect_delay(failures: u32) -> Duration {
 pub struct RelaySessionTarget {
     pub session_id: String,
     pub spec: CommandSpec,
+    /// Stop and start the worker daemon while retaining its relay root. Direct
+    /// relay clients omit this; controller-managed sessions can self-heal.
+    pub restart_plan: Option<CommandPlan>,
+}
+
+pub(crate) fn worker_connect_needs_restart(error: &anyhow::Error) -> bool {
+    let detail = format!("{error:#}").to_ascii_lowercase();
+    detail.contains("relay proxy disconnected")
+        || detail.contains("disconnected during hello")
+        || detail.contains("relay hello timed out")
+        || detail.contains("broken pipe")
+        || detail.contains("connection reset by peer")
+        || detail.contains("connect worker at")
+        || detail.contains("connection refused")
+        || detail.contains("worker relay did not accept")
+}
+
+async fn restart_worker(plan: CommandPlan) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        plan.execute(&CancellableProcessExecutor::with_timeout(
+            WORKER_RESTART_TIMEOUT,
+        ))
+        .map(|_| ())
+    })
+    .await
+    .context("worker restart task failed")?
 }
 
 /// Why a managed session stopped producing fresh views. The kind matters to
@@ -673,6 +701,7 @@ async fn run_session_actor(
 ) {
     let mut connection: Option<StandaloneSession> = None;
     let mut failures = 0_u32;
+    let mut last_restart = None;
     let mut lifecycle = ActorLifecycle::default();
     let mut deferred_submits: VecDeque<DeferredSubmit> = VecDeque::new();
     let mut next_lease_id = 1_u64;
@@ -714,23 +743,67 @@ async fn run_session_actor(
                         // retry, so report it at once rather than waiting for
                         // the unreachable threshold.
                         let integrity = projection_integrity_failure(&error);
+                        let restart_due = !integrity
+                            && failures >= UNREACHABLE_FAILURE_THRESHOLD
+                            && worker_connect_needs_restart(&error)
+                            && target.restart_plan.is_some()
+                            && last_restart.is_none_or(|last: tokio::time::Instant| {
+                                last.elapsed() >= WORKER_RESTART_COOLDOWN
+                            });
                         if integrity || failures >= UNREACHABLE_FAILURE_THRESHOLD {
                             // Bind the clone first: borrowing inside the call
                             // would hold the watch read guard while
                             // `publish_view` takes the write lock, deadlocking
                             // this actor on its own view.
                             let snapshot = view_tx.borrow().snapshot.clone();
+                            let mut detail = format!("{error:#}");
+                            if restart_due {
+                                detail.push_str("; restarting the relay worker");
+                            }
                             publish_view(&target.session_id, ManagedSessionView {
                                 snapshot,
                                 connected: false,
                                 error: Some(if integrity {
-                                    ViewError::ProjectionIntegrity(format!("{error:#}"))
+                                    ViewError::ProjectionIntegrity(detail)
                                 } else {
-                                    ViewError::Unreachable(format!("{error:#}"))
+                                    ViewError::Unreachable(detail)
                                 }),
                             }, &view_tx, &updates);
                         }
-                        interval.reset_after(reconnect_delay(failures));
+                        if restart_due {
+                            last_restart = Some(tokio::time::Instant::now());
+                            let plan = target
+                                .restart_plan
+                                .clone()
+                                .expect("restart eligibility requires a plan");
+                            tracing::warn!(
+                                session_id = target.session_id,
+                                "relay worker is unreachable; restarting it: {error:#}"
+                            );
+                            match restart_worker(plan).await {
+                                Ok(()) => {
+                                    failures = 0;
+                                    interval.reset_after(RECONNECT_INTERVAL);
+                                }
+                                Err(restart_error) => {
+                                    tracing::warn!(
+                                        session_id = target.session_id,
+                                        "automatic relay worker restart failed: {restart_error:#}"
+                                    );
+                                    let snapshot = view_tx.borrow().snapshot.clone();
+                                    publish_view(&target.session_id, ManagedSessionView {
+                                        snapshot,
+                                        connected: false,
+                                        error: Some(ViewError::Unreachable(format!(
+                                            "{error:#}; automatic relay worker restart failed: {restart_error:#}"
+                                        ))),
+                                    }, &view_tx, &updates);
+                                    interval.reset_after(reconnect_delay(failures));
+                                }
+                            }
+                        } else {
+                            interval.reset_after(reconnect_delay(failures));
+                        }
                     }
                 }
             }
@@ -1099,6 +1172,7 @@ impl StandaloneSession {
         Self::connect(&RelaySessionTarget {
             session_id: session_id.to_owned(),
             spec: spec.clone(),
+            restart_plan: None,
         })
         .await
     }
@@ -1397,10 +1471,30 @@ mod tests {
         assert_eq!(reconnect_delay(u32::MAX), RECONNECT_BACKOFF_CEILING);
     }
 
+    #[test]
+    fn only_dead_worker_connection_failures_request_a_restart() {
+        for detail in [
+            "relay proxy disconnected during hello",
+            "relay hello timed out after 15 seconds",
+            "write relay hello request: Broken pipe",
+            "connect worker at /worker/root",
+            "Connection refused (os error 111)",
+        ] {
+            assert!(worker_connect_needs_restart(&anyhow::anyhow!(detail)));
+        }
+        assert!(!worker_connect_needs_restart(&anyhow::anyhow!(
+            "relay negotiated unsupported protocol 9"
+        )));
+        assert!(!worker_connect_needs_restart(&anyhow::anyhow!(
+            "controller projection is corrupt"
+        )));
+    }
+
     fn target(program: &str) -> RelaySessionTarget {
         RelaySessionTarget {
             session_id: "session-1".to_owned(),
             spec: CommandSpec::new(program, std::iter::empty::<&str>()),
+            restart_plan: None,
         }
     }
 
@@ -1693,6 +1787,10 @@ mod tests {
 
     const LEASED_RELAY_ROOT: &str = "HEL_TEST_LEASED_RELAY_ROOT";
     #[cfg(unix)]
+    const AUTO_RESTART_TEST_CHILD: &str = "HEL_TEST_AUTO_RESTART_CHILD";
+    #[cfg(unix)]
+    const AUTO_RESTART_MARKER: &str = "HEL_TEST_AUTO_RESTART_MARKER";
+    #[cfg(unix)]
     const DEFERRED_SUBMIT_TEST_CHILD: &str = "HEL_TEST_DEFERRED_SUBMIT_CHILD";
     #[cfg(unix)]
     const RETIRED_SUBMIT_TEST_CHILD: &str = "HEL_TEST_RETIRED_SUBMIT_CHILD";
@@ -1754,6 +1852,86 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dead_relay_worker_is_restarted_and_reconnected() {
+        if std::env::var_os(AUTO_RESTART_TEST_CHILD).is_none() {
+            run_in_isolated_child(
+                AUTO_RESTART_TEST_CHILD,
+                "dead_relay_worker_is_restarted_and_reconnected",
+            );
+            return;
+        }
+        fail_if_the_actor_stalls("dead relay worker was never restarted");
+        register_leased_relay_session();
+        let relay_root = tempfile::tempdir().unwrap();
+        let restarted = relay_root.path().join("worker-restarted");
+        let script = format!(
+            "if [ ! -f \"${AUTO_RESTART_MARKER}\" ]; then IFS= read -r _; exit 0; fi; \
+             \"$0\" --exact {} --nocapture | grep --line-buffered '^{{'",
+            exact_test_name("leased_relay_child_serves_stdio")
+        );
+        let mut spec = CommandSpec::new(
+            "sh",
+            [
+                "-c".to_owned(),
+                script,
+                std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+        )
+        .purpose("test restartable relay");
+        spec.env.insert(
+            LEASED_RELAY_ROOT.to_owned(),
+            relay_root.path().to_string_lossy().into_owned(),
+        );
+        spec.env.insert(
+            AUTO_RESTART_MARKER.to_owned(),
+            restarted.to_string_lossy().into_owned(),
+        );
+        let restart_plan = CommandPlan {
+            description: "restart test relay worker".into(),
+            commands: vec![
+                CommandSpec::new("touch", [restarted.to_string_lossy().into_owned()])
+                    .purpose("restart test relay worker"),
+            ],
+        };
+        let target = RelaySessionTarget {
+            session_id: LEASED_RELAY_SESSION.to_owned(),
+            spec,
+            restart_plan: Some(restart_plan),
+        };
+        let (_commands_tx, commands_rx) = mpsc::channel(4);
+        let (_releases_tx, releases_rx) = mpsc::unbounded_channel();
+        let (_retirement_tx, retirement_rx) = watch::channel(false);
+        let (view_tx, mut view_rx) = watch::channel(ManagedSessionView::default());
+        let (updates_tx, _updates_rx) = coalesced_update_channel();
+        tokio::spawn(run_session_actor(
+            target,
+            commands_rx,
+            releases_rx,
+            retirement_rx,
+            view_tx,
+            updates_tx,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                view_rx.changed().await.unwrap();
+                let view = view_rx.borrow_and_update().clone();
+                if view.connected {
+                    assert!(restarted.exists(), "the restart plan did not run");
+                    assert!(view.error.is_none());
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("relay stayed disconnected: {:?}", view_rx.borrow().error));
+    }
+
     /// A deferred submission that is never answered would hang the suite
     /// instead of failing it, so turn a stall into a hard error.
     #[cfg(unix)]
@@ -1793,6 +1971,7 @@ mod tests {
         RelaySessionTarget {
             session_id: LEASED_RELAY_SESSION.to_owned(),
             spec,
+            restart_plan: None,
         }
     }
 
