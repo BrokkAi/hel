@@ -980,6 +980,10 @@ impl ThorHost {
 /// Clonable launch command (mirror of `picker::LaunchCommand`).
 #[derive(Debug, Clone)]
 pub struct Launch {
+    /// Adapter source this launch runs (e.g. `codex-acp`). Fighters,
+    /// reviewers, and Thor connect without a role config, so the launch
+    /// itself must say which adapter it is for memory injection.
+    pub source_id: String,
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
@@ -1004,6 +1008,7 @@ pub async fn muster(
                 mean_cost_usd: role.model.mean_cost_usd,
             },
             launch: Launch {
+                source_id: role.launch.source_id.clone(),
                 program: role.launch.command.clone(),
                 args: role.launch.args.clone(),
                 env: role.launch.env.clone(),
@@ -1885,6 +1890,11 @@ fn runtime_config(
     resume_session: Option<String>,
     termination: Option<CancellationToken>,
 ) -> acp::AcpRuntimeConfig {
+    // Combatants share the project knowledge every other lane sees, but
+    // injection-only: the save tools stay with primary sessions. Derived
+    // from the launch, not role_config — fighters, reviewers, and Thor
+    // connect without one.
+    let memory = mj_core::memory::worker_lane_memory(&launch.source_id, cwd);
     acp::AcpRuntimeConfig {
         command: launch.program.clone(),
         args: launch.args.clone(),
@@ -1902,7 +1912,7 @@ fn runtime_config(
         saved_session_config,
         role_config,
         subagents: None,
-        memory: None,
+        memory,
         side_prompt_policy: false,
         termination,
     }
@@ -3817,6 +3827,7 @@ mod tests {
                 mean_cost_usd: 0.0,
             },
             launch: Launch {
+                source_id: agent.to_string(),
                 program: PathBuf::from("true"),
                 args: vec![],
                 env: HashMap::new(),
@@ -4998,6 +5009,7 @@ mod tests {
     #[test]
     fn agent_runtime_config_forwards_exact_resume_session() {
         let launch = Launch {
+            source_id: "mock-agent".to_string(),
             program: PathBuf::from("mock-agent"),
             args: vec!["--acp".to_string()],
             env: HashMap::new(),
