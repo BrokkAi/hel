@@ -1409,12 +1409,12 @@ mod tests {
         assert!(rendered.contains("Scan failed for codex-1"), "{rendered}");
     }
 
-    /// The dialog is the only surface for non-live sessions, and Ctrl+I opens it.
+    /// The dialog is the only surface for non-live sessions, and Ctrl+T opens it.
     #[test]
     fn the_dashboard_opens_the_dialog_and_names_the_key_in_the_footer() {
         let mut dashboard = dashboard_with_session(running_session());
         assert_eq!(
-            dashboard.handle_key(ctrl_key('i')),
+            dashboard.handle_key(ctrl_key('t')),
             DashboardAction::OpenResumeDialog
         );
         assert_eq!(dashboard.focus, Focus::Active);
@@ -1424,7 +1424,8 @@ mod tests {
             .draw(|frame| crate::render::render(frame, &mut dashboard))
             .expect("draw the dashboard");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(rendered.contains("resume/[I]mport"), "{rendered}");
+        assert!(rendered.contains("[T] Resume"), "{rendered}");
+        assert!(!rendered.contains("Import"), "{rendered}");
     }
 
     /// The in-dialog keys are advertised where the user can see them.
