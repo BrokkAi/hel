@@ -4960,7 +4960,6 @@ mod tests {
             project: temp.path().to_path_buf(),
             inject: true,
             tools: true,
-            import_claude_auto: false,
         };
         let server = memory::ToolServer::start(&session_memory)
             .await
