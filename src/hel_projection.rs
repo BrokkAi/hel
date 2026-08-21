@@ -2261,6 +2261,10 @@ mod tests {
 
         assert_eq!(published.transcript.len(), 1);
         assert_eq!(session.transcript.len(), 2);
+        assert!(matches!(
+            &session.transcript[1].body,
+            TranscriptBody::System { text } if text == "warning: disk is nearly full"
+        ));
         assert!(
             Arc::ptr_eq(&session.transcript[0], &published.transcript[0]),
             "cloning a session must share earlier transcript items, not copy them"

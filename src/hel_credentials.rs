@@ -210,40 +210,73 @@ pub fn write_credential_file(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Full-phrase markers that a harness rejected the session's credentials.
 /// Kept tight on purpose: a false positive costs one redundant sync and one
 /// notice, but a noisy list would train operators to ignore both.
-const AUTH_FAILURE_PHRASES: [&str; 5] = [
-    "OAuth session expired and could not be refreshed",
-    "Please run /login",
+const AUTH_FAILURE_PHRASES: [&str; 7] = [
+    "oauth session expired and could not be refreshed",
+    "please run /login",
     "authentication_error",
     "invalid_grant",
+    "oauthunauthorizederror",
+    "authorization grant is invalid",
     // Hel's own marker for a turn the bridge failed with ACP `auth_required`.
     // The bridge's wording ("Authentication required") is too generic to match.
-    crate::hel_acp::PROMPT_AUTH_REQUIRED_MARKER,
+    "acp auth_required",
 ];
 
 fn contains_auth_failure_signature(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
     AUTH_FAILURE_PHRASES
         .iter()
-        .any(|phrase| text.contains(phrase))
+        .any(|phrase| normalized.contains(phrase))
 }
 
 pub fn auth_failure_signature(_kind: HarnessKind, text: &str) -> bool {
     contains_auth_failure_signature(text)
 }
 
-/// Detect an authentication failure only in relay observations originating
-/// from the harness. Durable prompt commands are deliberately excluded, so a
-/// user merely mentioning an auth error cannot trigger credential sync.
-pub fn relay_event_reports_auth_failure(event: &RelayEvent) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSyncReason {
+    AuthenticationFailure,
+    EmptyPromptResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialSyncSignal {
+    pub ordinal: u64,
+    pub reason: CredentialSyncReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialSyncCause {
+    pub session_id: String,
+    pub reason: CredentialSyncReason,
+}
+
+/// Detect a reason for immediate credential reconciliation only in relay
+/// observations originating from the harness. Durable prompt commands are
+/// deliberately excluded, so user text cannot trigger a sync.
+pub fn relay_event_credential_sync_reason(event: &RelayEvent) -> Option<CredentialSyncReason> {
     match &event.observation {
-        RelayObservation::Warning { message } => contains_auth_failure_signature(message),
+        RelayObservation::Warning { message } if contains_auth_failure_signature(message) => {
+            Some(CredentialSyncReason::AuthenticationFailure)
+        }
+        RelayObservation::Warning { message }
+            if message.contains(crate::hel_acp::PROMPT_EMPTY_RESPONSE_MARKER) =>
+        {
+            Some(CredentialSyncReason::EmptyPromptResponse)
+        }
         RelayObservation::SessionUpdate { update } => serde_json::to_string(update.as_ref())
-            .is_ok_and(|payload| contains_auth_failure_signature(&payload)),
-        _ => false,
+            .ok()
+            .filter(|payload| contains_auth_failure_signature(payload))
+            .map(|_| CredentialSyncReason::AuthenticationFailure),
+        _ => None,
     }
 }
 
 pub fn events_report_auth_failure(_kind: HarnessKind, events: &[RelayEvent]) -> bool {
-    events.iter().any(relay_event_reports_auth_failure)
+    events.iter().any(|event| {
+        relay_event_credential_sync_reason(event)
+            == Some(CredentialSyncReason::AuthenticationFailure)
+    })
 }
 
 /// Build the harness's own interactive login command for a profile.
@@ -312,8 +345,8 @@ pub struct CredentialSyncOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialSyncResult {
     pub profile_id: String,
-    /// Session whose authentication failure asked for this sync, when any.
-    pub triggered_by: Option<String>,
+    /// Session event that asked for an immediate sync, when any.
+    pub trigger: Option<CredentialSyncCause>,
     /// The whole reconcile stopped before it could report per-session
     /// outcomes. Kept separate so the failure is reported, never dropped.
     pub failure: Option<String>,
@@ -384,7 +417,7 @@ impl CredentialSyncResult {
 #[derive(Debug, Clone)]
 pub(crate) struct SyncTrigger {
     pub(crate) profile_id: String,
-    pub(crate) session_id: Option<String>,
+    pub(crate) cause: Option<CredentialSyncCause>,
 }
 
 /// Handle the UI loops keep. Publishing targets and asking for an immediate
@@ -403,10 +436,10 @@ impl CredentialSyncHandle {
     }
 
     /// Reconcile one profile now instead of waiting for the next cycle.
-    pub fn sync_profile_now(&self, profile_id: &str, session_id: Option<&str>) {
+    pub fn sync_profile_now(&self, profile_id: &str, cause: Option<CredentialSyncCause>) {
         let _ = self.triggers.send(SyncTrigger {
             profile_id: profile_id.to_owned(),
-            session_id: session_id.map(ToOwned::to_owned),
+            cause,
         });
     }
 }
@@ -420,7 +453,7 @@ pub(crate) fn profiles_with_targets(targets: &[CredentialSyncTarget]) -> Vec<Str
 }
 
 pub(crate) fn enqueue(queue: &mut VecDeque<SyncTrigger>, trigger: SyncTrigger) {
-    if trigger.session_id.is_none()
+    if trigger.cause.is_none()
         && queue
             .iter()
             .any(|queued| queued.profile_id == trigger.profile_id)
@@ -717,6 +750,10 @@ mod tests {
             HarnessKind::Kimi,
             "invalid_grant: refresh token rejected"
         ));
+        assert!(auth_failure_signature(
+            HarnessKind::Kimi,
+            "OAuthUnauthorizedError: The provided authorization grant is invalid"
+        ));
         assert!(!auth_failure_signature(
             HarnessKind::Claude,
             "the OAuth session expired last week, but we refreshed it"
@@ -728,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn only_relay_warnings_and_session_updates_report_auth_failures() {
+    fn only_harness_observations_request_credential_sync() {
         use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, SessionUpdate};
 
         let event = |observation| RelayEvent {
@@ -771,6 +808,12 @@ mod tests {
                 created_at_ms: 1,
             })]
         ));
+        assert_eq!(
+            relay_event_credential_sync_reason(&event(RelayObservation::Warning {
+                message: crate::hel_acp::PROMPT_EMPTY_RESPONSE_MARKER.into(),
+            })),
+            Some(CredentialSyncReason::EmptyPromptResponse)
+        );
     }
 
     #[test]
@@ -837,24 +880,33 @@ mod tests {
             &mut queue,
             SyncTrigger {
                 profile_id: "work".into(),
-                session_id: None,
+                cause: None,
             },
         );
         enqueue(
             &mut queue,
             SyncTrigger {
                 profile_id: "work".into(),
-                session_id: None,
+                cause: None,
             },
         );
         enqueue(
             &mut queue,
             SyncTrigger {
                 profile_id: "work".into(),
-                session_id: Some("session".into()),
+                cause: Some(CredentialSyncCause {
+                    session_id: "session".into(),
+                    reason: CredentialSyncReason::EmptyPromptResponse,
+                }),
             },
         );
         assert_eq!(queue.len(), 2);
-        assert_eq!(queue[1].session_id.as_deref(), Some("session"));
+        assert_eq!(
+            queue[1]
+                .cause
+                .as_ref()
+                .map(|cause| cause.session_id.as_str()),
+            Some("session")
+        );
     }
 }

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
 use crate::hel_config::{HarnessKind, HelConfig, atomic_write, data_dir, validate_id};
+use crate::hel_credentials::CredentialSyncSignal;
 use crate::hel_targets::{AdditionalMount, validate_additional_mounts};
 use crate::hel_worker::{
     RELAY_EVENT_GENESIS_DIGEST, RelayOperationalState, SequencedEvent, WorkerEvent,
@@ -201,10 +202,10 @@ impl MaterializedSession {
 pub struct ManagedSessionSnapshot {
     pub materialized: MaterializedSession,
     pub operational: RelayOperationalState,
-    /// Newest relay event observed by this live actor that reports an
-    /// authentication failure. This is intentionally ephemeral: it avoids
+    /// Newest relay event observed by this live actor that asks for immediate
+    /// credential reconciliation. This is intentionally ephemeral: it avoids
     /// retaining raw replay pages or rescanning projected history.
-    pub latest_auth_failure_ordinal: Option<u64>,
+    pub latest_credential_sync_signal: Option<CredentialSyncSignal>,
 }
 
 /// One session's activity, reported to the recovery coordinator.

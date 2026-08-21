@@ -20,9 +20,9 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
     SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, TerminalExitStatus, TerminalId,
-    TerminalOutputRequest, TerminalOutputResponse, TextContent, WaitForTerminalExitRequest,
-    WaitForTerminalExitResponse,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalExitStatus,
+    TerminalId, TerminalOutputRequest, TerminalOutputResponse, TextContent,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -560,6 +560,8 @@ where
     T: ConnectTo<Client>,
 {
     let notification_events = events.clone();
+    let session_update_count = Arc::new(AtomicU64::new(0));
+    let notification_session_update_count = session_update_count.clone();
     let permission_events = events.clone();
     let ext_events = events.clone();
     let elicitation_events = events.clone();
@@ -607,6 +609,7 @@ where
                         format!("serialize ACP session update for relay: {error}"),
                     ))
                 })?;
+                notification_session_update_count.fetch_add(1, Ordering::Release);
                 notification_events
                     .send(RuntimeEvent::SessionUpdate { update })
                     .await
@@ -897,6 +900,7 @@ where
                 terminals,
                 session_elicitations,
                 opened,
+                session_update_count,
             )
             .await
             {
@@ -1159,12 +1163,25 @@ const PROMPT_ERROR_STOP_REASON: &str = "error";
 /// not the bridge's wording — decides whether the credential heuristic fires.
 pub const PROMPT_AUTH_REQUIRED_MARKER: &str = "ACP auth_required";
 
+/// Marker on a successful ACP response that carried no session updates. Some
+/// bridges use this shape when their underlying turn failed, so completing it
+/// silently would leave a user line with no answer or explanation.
+pub const PROMPT_EMPTY_RESPONSE_MARKER: &str = "ACP prompt returned no session updates";
+
 fn prompt_failure_warning(error: &agent_client_protocol::Error) -> String {
     if error.code == agent_client_protocol::ErrorCode::AuthRequired {
         format!("prompt failed ({PROMPT_AUTH_REQUIRED_MARKER}): {error}")
     } else {
         format!("prompt failed: {error}")
     }
+}
+
+fn prompt_returned_without_updates(
+    stop_reason: &StopReason,
+    updates_before: u64,
+    updates_after: u64,
+) -> bool {
+    *stop_reason != StopReason::Cancelled && updates_before == updates_after
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1177,6 +1194,7 @@ async fn drive_connection(
     terminals: TerminalRegistry,
     pending_elicitations: PendingElicitations,
     opened: Arc<Mutex<Option<OpenedSession>>>,
+    session_update_count: Arc<AtomicU64>,
 ) -> Result<Option<String>> {
     // Terminals belong to the connection. However the session ends — closed,
     // failed, or with its command channel dropped — their process groups must
@@ -1190,6 +1208,7 @@ async fn drive_connection(
         &terminals,
         &pending_elicitations,
         opened,
+        &session_update_count,
     )
     .await;
     pending_elicitations
@@ -1241,6 +1260,7 @@ async fn serve_session(
     terminals: &TerminalRegistry,
     pending_elicitations: &PendingElicitations,
     opened: Arc<Mutex<Option<OpenedSession>>>,
+    session_update_count: &AtomicU64,
 ) -> Result<Option<String>> {
     let mut meta = serde_json::Map::new();
     meta.insert("terminal_output".into(), serde_json::Value::Bool(true));
@@ -1402,6 +1422,7 @@ async fn serve_session(
                     .await?;
                     continue;
                 }
+                let updates_before = session_update_count.load(Ordering::Acquire);
                 let prompt = connection
                     .send_request(PromptRequest::new(session_id.clone(), prompt))
                     .block_task();
@@ -1416,7 +1437,22 @@ async fn serve_session(
                             // is recovered by `run_bridge` via child exit or a
                             // protocol error after the session is open.
                             let stop_reason = match response {
-                                Ok(response) => format!("{:?}", response.stop_reason),
+                                Ok(response) => {
+                                    if prompt_returned_without_updates(
+                                        &response.stop_reason,
+                                        updates_before,
+                                        session_update_count.load(Ordering::Acquire),
+                                    ) {
+                                        emit_runtime_event(
+                                            events,
+                                            RuntimeEvent::Warning {
+                                                message: PROMPT_EMPTY_RESPONSE_MARKER.to_owned(),
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                    format!("{:?}", response.stop_reason)
+                                }
                                 Err(error) => {
                                     emit_runtime_event(
                                         events,
@@ -2300,6 +2336,17 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn only_non_cancelled_prompts_without_updates_need_an_empty_response_warning() {
+        assert!(prompt_returned_without_updates(&StopReason::EndTurn, 7, 7));
+        assert!(!prompt_returned_without_updates(&StopReason::EndTurn, 7, 8));
+        assert!(!prompt_returned_without_updates(
+            &StopReason::Cancelled,
+            7,
+            7
+        ));
+    }
+
     /// Answers `initialize` and `session/new`, then fails the first
     /// `session/prompt` with a JSON-RPC error and completes the second.
     async fn scripted_bridge(stream: tokio::io::DuplexStream) -> usize {
@@ -2334,6 +2381,23 @@ mod tests {
                             "error": {"code": -32000, "message": "Authentication required"},
                         })
                     } else {
+                        if prompts == 3 {
+                            let update = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {
+                                    "sessionId": "scripted",
+                                    "update": {
+                                        "sessionUpdate": "agent_message_chunk",
+                                        "content": {"type": "text", "text": "answer"}
+                                    }
+                                }
+                            });
+                            write
+                                .write_all(format!("{update}\n").as_bytes())
+                                .await
+                                .expect("write scripted session update");
+                        }
                         serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"stopReason": "end_turn"}})
                     }
                 }
@@ -3106,16 +3170,43 @@ mod tests {
             })
             .await
             .unwrap();
+        let mut empty_warning = None;
         let completed = loop {
-            if let RuntimeEvent::PromptFinished {
-                request_id,
-                stop_reason,
-            } = next_event(&mut event_rx).await
-            {
-                break (request_id, stop_reason);
+            match next_event(&mut event_rx).await {
+                RuntimeEvent::Warning { message } => empty_warning = Some(message),
+                RuntimeEvent::PromptFinished {
+                    request_id,
+                    stop_reason,
+                } => break (request_id, stop_reason),
+                _ => {}
             }
         };
         assert_eq!(completed, ("second".to_owned(), "EndTurn".to_owned()));
+        assert_eq!(empty_warning.as_deref(), Some(PROMPT_EMPTY_RESPONSE_MARKER));
+
+        request_tx
+            .send(CommandRequest::Prompt {
+                request_id: "third".into(),
+                prompt: vec![ContentBlock::Text(TextContent::new("answer this"))],
+            })
+            .await
+            .unwrap();
+        let mut saw_update = false;
+        let mut warning = None;
+        let completed = loop {
+            match next_event(&mut event_rx).await {
+                RuntimeEvent::SessionUpdate { .. } => saw_update = true,
+                RuntimeEvent::Warning { message } => warning = Some(message),
+                RuntimeEvent::PromptFinished {
+                    request_id,
+                    stop_reason,
+                } => break (request_id, stop_reason),
+                _ => {}
+            }
+        };
+        assert_eq!(completed, ("third".to_owned(), "EndTurn".to_owned()));
+        assert!(saw_update, "the scripted response must publish its update");
+        assert_eq!(warning, None, "a response with output must not warn");
 
         drop(request_tx);
         tokio::time::timeout(std::time::Duration::from_secs(5), driver)
@@ -3123,7 +3214,7 @@ mod tests {
             .expect("closing the command channel must end the runtime")
             .expect("the runtime task must not panic")
             .expect("a failed prompt must not fail the runtime");
-        assert_eq!(bridge.await.unwrap(), 2);
+        assert_eq!(bridge.await.unwrap(), 3);
     }
 
     /// Answers `initialize` and both `session/new` calls, then leaves the

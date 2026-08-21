@@ -764,7 +764,7 @@ impl CredentialSyncCoordinator {
                 tokio::select! {
                     _ = tick.tick() => {
                         for profile_id in profiles_with_targets(&targets_rx.borrow()) {
-                            enqueue(&mut queue, SyncTrigger { profile_id, session_id: None });
+                            enqueue(&mut queue, SyncTrigger { profile_id, cause: None });
                         }
                     }
                     trigger = triggers_rx.recv() => {
@@ -774,7 +774,7 @@ impl CredentialSyncCoordinator {
                     completed = completed_rx.recv() => {
                         let Some(result) = completed else { break };
                         busy.remove(&result.profile_id);
-                        if result.triggered_by.is_some()
+                        if result.trigger.is_some()
                             || result.failure.is_some()
                             || !result.outcomes.is_empty()
                         {
@@ -796,10 +796,10 @@ impl CredentialSyncCoordinator {
                         .cloned()
                         .collect();
                     if targets.is_empty() {
-                        if trigger.session_id.is_some() {
+                        if trigger.cause.is_some() {
                             let _ = results_tx.send(CredentialSyncResult {
                                 profile_id: trigger.profile_id,
-                                triggered_by: trigger.session_id,
+                                trigger: trigger.cause,
                                 failure: None,
                                 outcomes: Vec::new(),
                             });
@@ -822,7 +822,7 @@ impl CredentialSyncCoordinator {
                         };
                         let _ = completed_tx.send(CredentialSyncResult {
                             profile_id: trigger.profile_id,
-                            triggered_by: trigger.session_id,
+                            trigger: trigger.cause,
                             failure,
                             outcomes,
                         });

@@ -21,11 +21,11 @@ use hel::hel_worker::RelayCommand;
 use hel::hel_worker_client::CredentialSyncCoordinator;
 
 use crate::pollers::{
-    AuthFailureSyncTracker, CredentialSyncNotices, LifecycleUpdate, apply_worker_record_update,
-    credential_sync_targets, dashboard_worker_targets, interrupted_close_session_ids,
-    merge_recovery_result, projected_queued_prompts, queued_prompt_projection,
-    quota_refresh_profiles, reserve_recovery_or_cancel, schedule_due_auth_failure_syncs,
-    spawn_dashboard_worker_poller, spawn_interrupted_close_recovery,
+    CredentialSyncNotices, CredentialSyncSignalTracker, LifecycleUpdate,
+    apply_worker_record_update, credential_sync_targets, dashboard_worker_targets,
+    interrupted_close_session_ids, merge_recovery_result, projected_queued_prompts,
+    queued_prompt_projection, quota_refresh_profiles, reserve_recovery_or_cancel,
+    schedule_due_credential_syncs, spawn_dashboard_worker_poller, spawn_interrupted_close_recovery,
 };
 
 #[derive(Debug, Args)]
@@ -168,7 +168,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
     let mut credential_sync = CredentialSyncCoordinator::spawn();
     let credential_sync_handle = credential_sync.handle();
     credential_sync_handle.set_targets(credential_sync_targets(&controller));
-    let mut auth_failure_syncs = AuthFailureSyncTracker::default();
+    let mut credential_sync_signals = CredentialSyncSignalTracker::default();
     let mut credential_sync_notices = CredentialSyncNotices::default();
     let termination = hel::termination::Coordinator::install().token();
     let mut options = ServerOptions::new(bind, snapshot_rx, conversation_rx, action_tx)?;
@@ -217,16 +217,16 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     let Some(update) = update else { break };
                     if let Some(snapshot) = update.view.snapshot.as_ref()
                         && let Some(session) = controller.state.sessions.get(&update.session_id)
-                        && let Some(ordinal) = snapshot.latest_auth_failure_ordinal
+                        && let Some(signal) = snapshot.latest_credential_sync_signal.clone()
                     {
-                        auth_failure_syncs.observe(
+                        credential_sync_signals.observe(
                             &update.session_id,
                             &session.last_profile,
-                            ordinal,
+                            signal,
                         );
                     }
-                    schedule_due_auth_failure_syncs(
-                        &mut auth_failure_syncs,
+                    schedule_due_credential_syncs(
+                        &mut credential_sync_signals,
                         &credential_sync_handle,
                         Instant::now(),
                     );
@@ -270,8 +270,8 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     }
                 }
                 _ = recovery_tick.tick() => {
-                    schedule_due_auth_failure_syncs(
-                        &mut auth_failure_syncs,
+                    schedule_due_credential_syncs(
+                        &mut credential_sync_signals,
                         &credential_sync_handle,
                         Instant::now(),
                     );

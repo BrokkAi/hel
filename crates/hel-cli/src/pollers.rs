@@ -16,7 +16,10 @@ use anyhow::{Context, Result, bail};
 use hel::clock::epoch_seconds;
 use hel::hel_config::HelConfig;
 use hel::hel_controller::Controller;
-use hel::hel_credentials::{CredentialSyncHandle, CredentialSyncTarget};
+use hel::hel_credentials::{
+    CredentialSyncCause, CredentialSyncHandle, CredentialSyncReason, CredentialSyncSignal,
+    CredentialSyncTarget,
+};
 use hel::hel_quota::{ProfileQuota, QuotaManager, QuotaRefreshRequest};
 use hel::hel_recovery::{RecoveryCoordinator, RecoveryResult};
 use hel::hel_session_manager::{
@@ -461,36 +464,41 @@ pub(crate) fn credential_sync_targets(controller: &Controller) -> Vec<Credential
         .collect()
 }
 
-/// One automatic sync and notice per session per cooldown, so a harness that
-/// fails authentication on every retry does not flood the UI.
-pub(crate) const AUTH_FAILURE_SYNC_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+/// One immediate sync and notice per session per cooldown, so a harness that
+/// repeats the same failed turn does not flood the UI.
+pub(crate) const IMMEDIATE_CREDENTIAL_SYNC_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingAuthFailure {
-    ordinal: u64,
+struct PendingCredentialSync {
+    signal: CredentialSyncSignal,
     profile_id: String,
 }
 
 /// Deduplicates the actor's sticky failure marker while retaining a newer
 /// failure until its session cooldown expires.
 #[derive(Debug, Default)]
-pub(crate) struct AuthFailureSyncTracker {
+pub(crate) struct CredentialSyncSignalTracker {
     handled_ordinals: std::collections::BTreeMap<String, u64>,
     last_attempts: std::collections::BTreeMap<String, Instant>,
-    pending: std::collections::BTreeMap<String, PendingAuthFailure>,
+    pending: std::collections::BTreeMap<String, PendingCredentialSync>,
 }
 
-impl AuthFailureSyncTracker {
-    pub(crate) fn observe(&mut self, session_id: &str, profile_id: &str, ordinal: u64) {
+impl CredentialSyncSignalTracker {
+    pub(crate) fn observe(
+        &mut self,
+        session_id: &str,
+        profile_id: &str,
+        signal: CredentialSyncSignal,
+    ) {
         if self
             .handled_ordinals
             .get(session_id)
-            .is_some_and(|handled| *handled >= ordinal)
+            .is_some_and(|handled| *handled >= signal.ordinal)
         {
             return;
         }
-        let pending = PendingAuthFailure {
-            ordinal,
+        let pending = PendingCredentialSync {
+            signal,
             profile_id: profile_id.to_owned(),
         };
         match self.pending.entry(session_id.to_owned()) {
@@ -498,7 +506,7 @@ impl AuthFailureSyncTracker {
                 entry.insert(pending);
             }
             std::collections::btree_map::Entry::Occupied(mut entry)
-                if entry.get().ordinal <= ordinal =>
+                if entry.get().signal.ordinal <= pending.signal.ordinal =>
             {
                 entry.insert(pending);
             }
@@ -506,13 +514,13 @@ impl AuthFailureSyncTracker {
         }
     }
 
-    fn drain_due(&mut self, now: Instant) -> Vec<(String, String)> {
+    fn drain_due(&mut self, now: Instant) -> Vec<(String, String, CredentialSyncReason)> {
         let due = self
             .pending
             .keys()
             .filter(|session_id| {
                 self.last_attempts.get(*session_id).is_none_or(|previous| {
-                    now.saturating_duration_since(*previous) >= AUTH_FAILURE_SYNC_COOLDOWN
+                    now.saturating_duration_since(*previous) >= IMMEDIATE_CREDENTIAL_SYNC_COOLDOWN
                 })
             })
             .cloned()
@@ -522,23 +530,26 @@ impl AuthFailureSyncTracker {
                 let pending = self
                     .pending
                     .remove(&session_id)
-                    .expect("due authentication failure disappeared");
+                    .expect("due credential sync signal disappeared");
                 self.handled_ordinals
-                    .insert(session_id.clone(), pending.ordinal);
+                    .insert(session_id.clone(), pending.signal.ordinal);
                 self.last_attempts.insert(session_id.clone(), now);
-                (session_id, pending.profile_id)
+                (session_id, pending.profile_id, pending.signal.reason)
             })
             .collect()
     }
 }
 
-pub(crate) fn schedule_due_auth_failure_syncs(
-    tracker: &mut AuthFailureSyncTracker,
+pub(crate) fn schedule_due_credential_syncs(
+    tracker: &mut CredentialSyncSignalTracker,
     credential_sync: &CredentialSyncHandle,
     now: Instant,
 ) {
-    for (session_id, profile_id) in tracker.drain_due(now) {
-        credential_sync.sync_profile_now(&profile_id, Some(&session_id));
+    for (session_id, profile_id, reason) in tracker.drain_due(now) {
+        credential_sync.sync_profile_now(
+            &profile_id,
+            Some(CredentialSyncCause { session_id, reason }),
+        );
     }
 }
 
@@ -556,30 +567,60 @@ pub(crate) struct CredentialSyncNotices {
 
 impl CredentialSyncNotices {
     /// Healthy no-op cycles stay out of the UI; only actions, new failures, and
-    /// answers to an authentication failure are worth a notice.
+    /// answers to an event-triggered reconciliation are worth a notice.
     pub(crate) fn notice(
         &mut self,
         result: &hel::hel_credentials::CredentialSyncResult,
     ) -> Option<String> {
-        // Authentication-triggered syncs always speak: the upstream per-session
+        // Event-triggered syncs always speak: the upstream per-session
         // cooldown, not this dedup, is what keeps them rare.
-        if let Some(session_id) = &result.triggered_by {
+        if let Some(trigger) = &result.trigger {
+            let session_id = &trigger.session_id;
+            let sync_failure = result.failure.as_deref().or_else(|| {
+                result.failures().find_map(|(failed_session, detail)| {
+                    (failed_session == session_id).then_some(detail)
+                })
+            });
+            if let Some(detail) = sync_failure {
+                return Some(match trigger.reason {
+                    CredentialSyncReason::AuthenticationFailure => format!(
+                        "Auth failure on profile {} (session {}); credential reconciliation failed: {detail}. Run `hel login --profile {}`.",
+                        result.profile_id,
+                        short_id(session_id),
+                        result.profile_id
+                    ),
+                    CredentialSyncReason::EmptyPromptResponse => format!(
+                        "Session {} returned no response; credential reconciliation for profile {} failed: {detail}. The failure is recorded in the transcript.",
+                        short_id(session_id),
+                        result.profile_id
+                    ),
+                });
+            }
             // The first ~80 columns are all most people read before a notice
             // scrolls off, so the profile leads and the advice trails.
-            return Some(if result.pushed_to(session_id) {
-                format!(
+            return Some(match (trigger.reason, result.pushed_to(session_id)) {
+                (CredentialSyncReason::AuthenticationFailure, true) => format!(
                     "Auth failure on profile {} (session {}); refreshed credentials were pushed. Retry the prompt, and if it repeats run `hel login --profile {}`.",
                     result.profile_id,
                     short_id(session_id),
                     result.profile_id
-                )
-            } else {
-                format!(
+                ),
+                (CredentialSyncReason::AuthenticationFailure, false) => format!(
                     "Auth failure on profile {} (session {}); nothing fresher to push. Run `hel login --profile {}`.",
                     result.profile_id,
                     short_id(session_id),
                     result.profile_id
-                )
+                ),
+                (CredentialSyncReason::EmptyPromptResponse, true) => format!(
+                    "Session {} returned no response; fresher credentials from profile {} were pushed. Retry the prompt.",
+                    short_id(session_id),
+                    result.profile_id
+                ),
+                (CredentialSyncReason::EmptyPromptResponse, false) => format!(
+                    "Session {} returned no response; profile {} had no newer credentials to push. The failure is recorded in the transcript.",
+                    short_id(session_id),
+                    result.profile_id
+                ),
             });
         }
 
@@ -1399,41 +1440,74 @@ mod tests {
     }
 
     #[test]
-    fn a_new_auth_failure_waits_out_the_cooldown_without_being_lost() {
-        let mut tracker = AuthFailureSyncTracker::default();
+    fn a_new_credential_signal_waits_out_the_cooldown_without_being_lost() {
+        let signal = |ordinal, reason| CredentialSyncSignal { ordinal, reason };
+        let mut tracker = CredentialSyncSignalTracker::default();
         let started = Instant::now();
-        tracker.observe("session", "work", 41);
+        tracker.observe(
+            "session",
+            "work",
+            signal(41, CredentialSyncReason::AuthenticationFailure),
+        );
         assert_eq!(
             tracker.drain_due(started),
-            vec![("session".into(), "work".into())]
+            vec![(
+                "session".into(),
+                "work".into(),
+                CredentialSyncReason::AuthenticationFailure
+            )]
         );
 
-        tracker.observe("session", "work", 42);
+        tracker.observe(
+            "session",
+            "work",
+            signal(42, CredentialSyncReason::AuthenticationFailure),
+        );
         assert!(
             tracker
                 .drain_due(started + Duration::from_secs(60))
                 .is_empty()
         );
-        tracker.observe("session", "new-profile", 43);
-        assert_eq!(tracker.pending["session"].ordinal, 43);
+        tracker.observe(
+            "session",
+            "new-profile",
+            signal(43, CredentialSyncReason::EmptyPromptResponse),
+        );
+        assert_eq!(tracker.pending["session"].signal.ordinal, 43);
 
         // No repeated observation is needed: the loop timer drains the sticky
         // failure once its cooldown expires.
         assert_eq!(
-            tracker.drain_due(started + AUTH_FAILURE_SYNC_COOLDOWN),
-            vec![("session".into(), "new-profile".into())]
+            tracker.drain_due(started + IMMEDIATE_CREDENTIAL_SYNC_COOLDOWN),
+            vec![(
+                "session".into(),
+                "new-profile".into(),
+                CredentialSyncReason::EmptyPromptResponse
+            )]
         );
-        tracker.observe("session", "new-profile", 43);
+        tracker.observe(
+            "session",
+            "new-profile",
+            signal(43, CredentialSyncReason::EmptyPromptResponse),
+        );
         assert!(
             tracker
-                .drain_due(started + (AUTH_FAILURE_SYNC_COOLDOWN * 2))
+                .drain_due(started + (IMMEDIATE_CREDENTIAL_SYNC_COOLDOWN * 2))
                 .is_empty()
         );
 
-        tracker.observe("other", "personal", 1);
+        tracker.observe(
+            "other",
+            "personal",
+            signal(1, CredentialSyncReason::AuthenticationFailure),
+        );
         assert_eq!(
             tracker.drain_due(started + Duration::from_secs(60)),
-            vec![("other".into(), "personal".into())]
+            vec![(
+                "other".into(),
+                "personal".into(),
+                CredentialSyncReason::AuthenticationFailure
+            )]
         );
     }
 
@@ -1441,7 +1515,7 @@ mod tests {
     fn a_healthy_credential_cycle_stays_out_of_the_ui() {
         let result = hel::hel_credentials::CredentialSyncResult {
             profile_id: "work".into(),
-            triggered_by: None,
+            trigger: None,
             failure: None,
             outcomes: Vec::new(),
         };
@@ -1457,7 +1531,10 @@ mod tests {
         let mut notices = CredentialSyncNotices::default();
         let pushed = CredentialSyncResult {
             profile_id: "work".into(),
-            triggered_by: Some("018f9dd2-a3b4".into()),
+            trigger: Some(CredentialSyncCause {
+                session_id: "018f9dd2-a3b4".into(),
+                reason: CredentialSyncReason::AuthenticationFailure,
+            }),
             failure: None,
             outcomes: vec![CredentialSyncOutcome {
                 session_id: "018f9dd2-a3b4".into(),
@@ -1469,7 +1546,10 @@ mod tests {
         assert!(notice.contains("hel login --profile work"), "{notice}");
 
         let nothing_to_push = CredentialSyncResult {
-            triggered_by: Some("018f9dd2-a3b4".into()),
+            trigger: Some(CredentialSyncCause {
+                session_id: "018f9dd2-a3b4".into(),
+                reason: CredentialSyncReason::AuthenticationFailure,
+            }),
             outcomes: Vec::new(),
             ..pushed
         };
@@ -1481,12 +1561,55 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_prompt_notice_does_not_claim_authentication_failed() {
+        use hel::hel_credentials::{
+            CredentialSyncAction, CredentialSyncOutcome, CredentialSyncResult,
+        };
+
+        let result = CredentialSyncResult {
+            profile_id: "work".into(),
+            trigger: Some(CredentialSyncCause {
+                session_id: "018f9dd2-a3b4".into(),
+                reason: CredentialSyncReason::EmptyPromptResponse,
+            }),
+            failure: None,
+            outcomes: vec![CredentialSyncOutcome {
+                session_id: "018f9dd2-a3b4".into(),
+                outcome: Ok(vec![CredentialSyncAction::Pushed]),
+            }],
+        };
+        let notice = CredentialSyncNotices::default().notice(&result).unwrap();
+        assert!(notice.contains("returned no response"), "{notice}");
+        assert!(notice.contains("were pushed"), "{notice}");
+        assert!(!notice.contains("Auth failure"), "{notice}");
+    }
+
+    #[test]
+    fn an_immediate_sync_failure_is_not_reported_as_no_new_credentials() {
+        use hel::hel_credentials::CredentialSyncResult;
+
+        let result = CredentialSyncResult {
+            profile_id: "work".into(),
+            trigger: Some(CredentialSyncCause {
+                session_id: "018f9dd2-a3b4".into(),
+                reason: CredentialSyncReason::AuthenticationFailure,
+            }),
+            failure: Some("controller credential file is unreadable".into()),
+            outcomes: Vec::new(),
+        };
+        let notice = CredentialSyncNotices::default().notice(&result).unwrap();
+        assert!(notice.contains("reconciliation failed"), "{notice}");
+        assert!(notice.contains("credential file is unreadable"), "{notice}");
+        assert!(!notice.contains("nothing fresher"), "{notice}");
+    }
+
+    #[test]
     fn a_failed_credential_sync_is_reported() {
         use hel::hel_credentials::{CredentialSyncOutcome, CredentialSyncResult};
 
         let result = CredentialSyncResult {
             profile_id: "work".into(),
-            triggered_by: None,
+            trigger: None,
             failure: None,
             outcomes: vec![CredentialSyncOutcome {
                 session_id: "018f9dd2-a3b4".into(),
@@ -1505,7 +1628,7 @@ mod tests {
 
         let failed = |detail: &str| CredentialSyncResult {
             profile_id: "work".into(),
-            triggered_by: None,
+            trigger: None,
             failure: None,
             outcomes: vec![CredentialSyncOutcome {
                 session_id: "018f9dd2-a3b4".into(),
@@ -1528,7 +1651,7 @@ mod tests {
         // A clean cycle forgets the failure, so a recurrence is reported again.
         let healthy = CredentialSyncResult {
             profile_id: "work".into(),
-            triggered_by: None,
+            trigger: None,
             failure: None,
             outcomes: vec![CredentialSyncOutcome {
                 session_id: "018f9dd2-a3b4".into(),
@@ -1549,7 +1672,7 @@ mod tests {
 
         let failed = |profile_id: &str| CredentialSyncResult {
             profile_id: profile_id.to_owned(),
-            triggered_by: None,
+            trigger: None,
             failure: Some("controller home is unreadable".into()),
             outcomes: Vec::new(),
         };
@@ -1571,7 +1694,7 @@ mod tests {
 
         let result = CredentialSyncResult {
             profile_id: "work".into(),
-            triggered_by: None,
+            trigger: None,
             failure: None,
             outcomes: vec![
                 CredentialSyncOutcome {

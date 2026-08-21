@@ -1387,7 +1387,7 @@ mod tests {
         ManagedSessionView {
             snapshot: Some(crate::hel_state::ManagedSessionSnapshot {
                 materialized: session,
-                latest_auth_failure_ordinal: None,
+                latest_credential_sync_signal: None,
                 operational: crate::hel_worker::RelayOperationalState {
                     session_id,
                     execution: crate::hel_worker::RelayExecutionState::Idle,

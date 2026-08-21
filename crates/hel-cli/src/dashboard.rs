@@ -50,12 +50,12 @@ use crate::import::{
     spawn_dashboard_import,
 };
 use crate::pollers::{
-    AuthFailureSyncTracker, CapacityPollUpdate, CredentialSyncNotices, Feed, LifecycleUpdate,
+    CapacityPollUpdate, CredentialSyncNotices, CredentialSyncSignalTracker, Feed, LifecycleUpdate,
     QuotaRefreshBatch, QuotaUpdate, ResourcePollTarget, ResourcePollUpdate, WorkerDiagnosisTracker,
     WorkerPollTarget, apply_worker_poll_update, complete_manual_quota_refresh,
     dashboard_worker_targets, interrupted_close_session_ids, merge_recovery_result,
     projected_queued_prompts, quota_refresh_profiles, refresh_dashboard_poll_targets,
-    schedule_due_auth_failure_syncs, spawn_dashboard_capacity_poller,
+    schedule_due_credential_syncs, spawn_dashboard_capacity_poller,
     spawn_dashboard_quota_refresher, spawn_dashboard_resource_poller,
     spawn_dashboard_worker_poller, spawn_interrupted_close_recovery, spawn_worker_diagnosis,
 };
@@ -124,7 +124,7 @@ pub(crate) struct DashboardContext {
 
     credential_sync: Feed<CredentialSyncCoordinator>,
     credential_sync_handle: CredentialSyncHandle,
-    auth_failure_syncs: AuthFailureSyncTracker,
+    credential_sync_signals: CredentialSyncSignalTracker,
     credential_sync_notices: CredentialSyncNotices,
 
     resource_targets_tx: watch::Sender<Vec<ResourcePollTarget>>,
@@ -470,7 +470,7 @@ impl DashboardContext {
             lifecycle_operations,
             credential_sync: Feed::new(credential_sync),
             credential_sync_handle,
-            auth_failure_syncs: AuthFailureSyncTracker::default(),
+            credential_sync_signals: CredentialSyncSignalTracker::default(),
             credential_sync_notices: CredentialSyncNotices::default(),
             resource_targets_tx,
             resource_triggers_tx,
@@ -702,8 +702,8 @@ impl DashboardContext {
     fn drain_feeds(&mut self) {
         self.drain_quota_updates();
         self.drain_worker_updates();
-        schedule_due_auth_failure_syncs(
-            &mut self.auth_failure_syncs,
+        schedule_due_credential_syncs(
+            &mut self.credential_sync_signals,
             &self.credential_sync_handle,
             Instant::now(),
         );
@@ -751,9 +751,12 @@ impl DashboardContext {
             if let Some(snapshot) = update.view.snapshot.as_ref()
                 && let Some(session) = self.controller.state.sessions.get(&session_id).cloned()
             {
-                if let Some(ordinal) = snapshot.latest_auth_failure_ordinal {
-                    self.auth_failure_syncs
-                        .observe(&session_id, &session.last_profile, ordinal);
+                if let Some(signal) = snapshot.latest_credential_sync_signal.clone() {
+                    self.credential_sync_signals.observe(
+                        &session_id,
+                        &session.last_profile,
+                        signal,
+                    );
                 }
                 // Queued, never awaited: the copy decision belongs to the
                 // coordinator, and the dashboard loop must stay free to draw.

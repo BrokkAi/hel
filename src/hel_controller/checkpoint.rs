@@ -1648,7 +1648,7 @@ mod tests {
         materialized.applied_event_digest = cursor.digest.clone();
         ManagedSessionSnapshot {
             materialized,
-            latest_auth_failure_ordinal: None,
+            latest_credential_sync_signal: None,
             operational: crate::hel_worker::RelayOperationalState {
                 session_id: "session-1".into(),
                 execution: RelayExecutionState::Idle,

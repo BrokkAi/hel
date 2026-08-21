@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::hel_archive::verify_archive_streaming;
-use crate::hel_credentials::relay_event_reports_auth_failure;
+use crate::hel_credentials::{CredentialSyncSignal, relay_event_credential_sync_reason};
 use crate::hel_database::{
     ProjectionApplyOutcome, ProjectionIntegrityError, apply_projection_event,
     save_materialized_session,
@@ -1159,7 +1159,7 @@ fn view_is_unchanged(current: &ManagedSessionView, next: &ManagedSessionView) ->
         (None, None) => true,
         (Some(current), Some(next)) => {
             let (current_session, next_session) = (&current.materialized, &next.materialized);
-            current.latest_auth_failure_ordinal == next.latest_auth_failure_ordinal
+            current.latest_credential_sync_signal == next.latest_credential_sync_signal
                 && current.operational == next.operational
                 && current_session.session_id == next_session.session_id
                 && current_session.applied_event_ordinal == next_session.applied_event_ordinal
@@ -1201,7 +1201,7 @@ pub struct StandaloneSession {
     client: RelayClient,
     materialized: MaterializedSession,
     operational: RelayOperationalState,
-    latest_auth_failure_ordinal: Option<u64>,
+    latest_credential_sync_signal: Option<CredentialSyncSignal>,
 }
 
 impl StandaloneSession {
@@ -1214,7 +1214,7 @@ impl StandaloneSession {
             client,
             materialized,
             operational,
-            latest_auth_failure_ordinal: None,
+            latest_credential_sync_signal: None,
         };
         connection.sync_in_place().await?;
         Ok(connection)
@@ -1367,7 +1367,7 @@ impl StandaloneSession {
         ManagedSessionSnapshot {
             materialized: self.materialized.clone(),
             operational: self.operational.clone(),
-            latest_auth_failure_ordinal: self.latest_auth_failure_ordinal,
+            latest_credential_sync_signal: self.latest_credential_sync_signal.clone(),
         }
     }
 
@@ -1418,8 +1418,11 @@ impl StandaloneSession {
                         event,
                         projected.mutation,
                     )?;
-                    if relay_event_reports_auth_failure(event) {
-                        self.latest_auth_failure_ordinal = Some(event.ordinal);
+                    if let Some(reason) = relay_event_credential_sync_reason(event) {
+                        self.latest_credential_sync_signal = Some(CredentialSyncSignal {
+                            ordinal: event.ordinal,
+                            reason,
+                        });
                     }
                 }
                 ProjectionApplyOutcome::AlreadyApplied => {
@@ -1623,7 +1626,7 @@ mod tests {
                     checkpoint_barrier: None,
                     checkpoint_ready: None,
                 },
-                latest_auth_failure_ordinal: None,
+                latest_credential_sync_signal: None,
             }),
             connected: true,
             error: None,
