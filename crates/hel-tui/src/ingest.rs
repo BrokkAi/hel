@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hel::hel_chat::{Notices, TranscriptSnapshot, materialized_content_text};
+use hel::hel_chat::{
+    Notices, TranscriptSnapshot, materialized_content_text, materialized_tool_diffstats,
+};
 use hel::hel_config::HelConfig;
 use hel::hel_quota::ProfileQuota;
 use hel::hel_state::{
@@ -72,6 +74,9 @@ pub struct MaterializedProjectionCache {
     agent_messages: Vec<(usize, u64)>,
     /// Transcript index and text of the last agent message with text.
     pub(crate) last_agent_message: Option<(usize, Arc<str>)>,
+    /// Exact stats for terminal tool items, keyed by logical identity and
+    /// revision so unrelated transcript updates never repeat their diff.
+    tool_diffstats: BTreeMap<(String, i64), Vec<String>>,
 }
 
 impl MaterializedProjectionCache {
@@ -162,6 +167,19 @@ impl PreparedMaterializedSessionDetail {
         let unchanged_prefix = previous.unchanged_prefix(&session.transcript);
         let last_agent_message =
             last_agent_message(&session.transcript, unchanged_prefix, &previous);
+        let mut cached_tool_diffstats = previous.tool_diffstats;
+        let mut tool_diffstats = BTreeMap::new();
+        let mut current_tool_diffstats = BTreeMap::new();
+        for item in &session.transcript {
+            let key = (item.stable_id.clone(), item.last_changed_at_ms);
+            let stats = cached_tool_diffstats
+                .remove(&key)
+                .or_else(|| materialized_tool_diffstats(item));
+            if let Some(stats) = stats {
+                current_tool_diffstats.insert(item.stable_id.clone(), stats.clone());
+                tool_diffstats.insert(key, stats);
+            }
+        }
         // Unread counting needs every agent message, so the list is carried
         // forward and only its changed tail is rebuilt.
         let mut agent_messages = previous.agent_messages;
@@ -198,7 +216,8 @@ impl PreparedMaterializedSessionDetail {
         let last_activity_at_ms = session
             .last_activity_at_ms()
             .and_then(|value| u64::try_from(value).ok());
-        let transcript = TranscriptSnapshot::from_materialized(&session);
+        let transcript =
+            TranscriptSnapshot::from_materialized_with_diffstats(&session, &current_tool_diffstats);
         Self {
             session_id,
             applied_event_ordinal,
@@ -216,6 +235,7 @@ impl PreparedMaterializedSessionDetail {
                 transcript: session.transcript,
                 agent_messages,
                 last_agent_message,
+                tool_diffstats,
             },
         }
     }
@@ -869,6 +889,52 @@ mod tests {
             );
             cache = incremental.projection;
         }
+    }
+
+    #[test]
+    fn projection_cache_keeps_terminal_diffstats_across_unrelated_updates() {
+        let tool = Arc::new(TranscriptItem {
+            stable_id: "tool:edit".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 1,
+            last_changed_at_ms: 2,
+            body: TranscriptBody::Tool {
+                call: serde_json::json!({
+                    "toolCallId": "edit",
+                    "title": "Edit src/lib.rs",
+                    "status": "completed",
+                    "content": [{
+                        "type": "diff",
+                        "path": "/workspace/src/lib.rs",
+                        "oldText": "alpha\n",
+                        "newText": "alpha\nbeta\n"
+                    }]
+                }),
+                terminal_outputs: Vec::new(),
+                terminal_refs: Vec::new(),
+            },
+        });
+        let first = PreparedMaterializedSessionDetail::from_materialized(
+            materialized_session_for("session-1", vec![tool.clone()]),
+            0,
+            MaterializedProjectionCache::default(),
+        );
+        assert_eq!(first.projection.tool_diffstats.len(), 1);
+
+        let second = PreparedMaterializedSessionDetail::from_materialized(
+            materialized_session_for(
+                "session-1",
+                vec![tool, agent_message(2, "unrelated update")],
+            ),
+            0,
+            first.projection,
+        );
+        assert_eq!(second.projection.tool_diffstats.len(), 1);
+        assert_eq!(
+            second.transcript.browser_transcript(None).entries[0].lines,
+            ["Edit src/lib.rs", "/workspace/src/lib.rs  +1 −0"]
+        );
     }
 
     /// Unchanged items keep their handles, so a projection that follows one

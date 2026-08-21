@@ -27,12 +27,14 @@ use hel::hel_credentials::CredentialSyncHandle;
 use hel::hel_recovery::RecoveryCoordinator;
 use hel::hel_session_manager::{SessionManagerControl, SessionManagerUpdates, ViewError};
 use hel::hel_setup::{SetupOutcome, run_setup_dialog};
-use hel::hel_state::{RecoveryObserver, SessionResourceAllocation, SessionState};
+use hel::hel_state::{
+    MaterializedSession, RecoveryObserver, SessionResourceAllocation, SessionState,
+};
 use hel::hel_targets::DeploymentCapacityTarget;
 use hel::hel_worker_client::CredentialSyncCoordinator;
 use hel_tui::{
-    DashboardAction, DashboardState, ImportProfileOption, SessionOperationKind, render,
-    resume_profile_placeholders,
+    DashboardAction, DashboardState, ImportProfileOption, PreparedMaterializedSessionDetail,
+    SessionOperationKind, render, resume_profile_placeholders,
 };
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
@@ -147,6 +149,9 @@ pub(crate) struct DashboardContext {
 
     pub(crate) dashboard_io_tx: UnboundedSender<DashboardIoUpdate>,
     dashboard_io: Feed<UnboundedReceiver<DashboardIoUpdate>>,
+    materialized_projection_permits: Arc<tokio::sync::Semaphore>,
+    materialized_projections_in_flight: BTreeSet<String>,
+    pending_materialized_projections: BTreeMap<String, (MaterializedSession, u64)>,
 
     checkpoint_archive_targets_seen: BTreeMap<String, std::path::PathBuf>,
     checkpoint_archive_generation: u64,
@@ -159,6 +164,25 @@ type AwsResourceOptions = (
     std::result::Result<Vec<SessionResourceAllocation>, String>,
 );
 type AwsResourceOptionsSender = UnboundedSender<AwsResourceOptions>;
+
+fn enqueue_materialized_projection(
+    in_flight: &mut BTreeSet<String>,
+    pending: &mut BTreeMap<String, (MaterializedSession, u64)>,
+    materialized: MaterializedSession,
+    detached_after_event_ordinal: u64,
+) -> Option<(MaterializedSession, u64)> {
+    let session_id = materialized.session_id.clone();
+    if !in_flight.insert(session_id.clone()) {
+        let replace = pending.get(&session_id).is_none_or(|(queued, _)| {
+            materialized.applied_event_ordinal >= queued.applied_event_ordinal
+        });
+        if replace {
+            pending.insert(session_id, (materialized, detached_after_event_ordinal));
+        }
+        return None;
+    }
+    Some((materialized, detached_after_event_ordinal))
+}
 
 pub(crate) async fn run_dashboard() -> Result<()> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin())
@@ -466,11 +490,63 @@ impl DashboardContext {
             active_import: None,
             dashboard_io_tx,
             dashboard_io: Feed::new(dashboard_io_rx),
+            materialized_projection_permits: Arc::new(tokio::sync::Semaphore::new(2)),
+            materialized_projections_in_flight: BTreeSet::new(),
+            pending_materialized_projections: BTreeMap::new(),
             checkpoint_archive_targets_seen: BTreeMap::new(),
             checkpoint_archive_generation: 0,
         };
         context.request_quota_refresh();
         Ok(Some(context))
+    }
+
+    /// Keeps one projection per session in flight and remembers only the
+    /// newest snapshot that arrived behind it. The shared permits bound work
+    /// across different sessions as well.
+    pub(super) fn request_materialized_projection(
+        &mut self,
+        materialized: MaterializedSession,
+        detached_after_event_ordinal: u64,
+    ) {
+        let Some((materialized, detached_after_event_ordinal)) = enqueue_materialized_projection(
+            &mut self.materialized_projections_in_flight,
+            &mut self.pending_materialized_projections,
+            materialized,
+            detached_after_event_ordinal,
+        ) else {
+            return;
+        };
+
+        let session_id = materialized.session_id.clone();
+        let previous = self.dashboard.take_projection_cache(&session_id);
+        spawn_materialized_session_projection(
+            materialized,
+            detached_after_event_ordinal,
+            previous,
+            self.dashboard_io_tx.clone(),
+            Arc::clone(&self.materialized_projection_permits),
+        );
+    }
+
+    pub(super) fn finish_materialized_projection(
+        &mut self,
+        session_id: String,
+        result: std::result::Result<Box<PreparedMaterializedSessionDetail>, String>,
+    ) {
+        self.materialized_projections_in_flight.remove(&session_id);
+        match result {
+            Ok(detail) => {
+                self.dashboard.apply_prepared_materialized_session(*detail);
+            }
+            Err(error) => self
+                .dashboard
+                .set_notice(format!("Could not update session transcript: {error}")),
+        }
+        if let Some((materialized, detached_after_event_ordinal)) =
+            self.pending_materialized_projections.remove(&session_id)
+        {
+            self.request_materialized_projection(materialized, detached_after_event_ordinal);
+        }
     }
 
     /// Redraws the view on screen, if anything asked for a redraw.
@@ -710,12 +786,9 @@ impl DashboardContext {
                             .sessions
                             .get(&session_id)
                             .map_or(0, |session| session.detached_after_event_ordinal);
-                        let previous = self.dashboard.take_projection_cache(&session_id);
-                        spawn_materialized_session_projection(
+                        self.request_materialized_projection(
                             materialized,
                             detached_after_event_ordinal,
-                            previous,
-                            self.dashboard_io_tx.clone(),
                         );
                     }
                 }
@@ -1265,5 +1338,31 @@ mod tests {
             },
         );
         assert!(!configuration_needs_setup(&config));
+    }
+
+    #[test]
+    fn materialized_projections_are_single_flight_and_coalesce_to_the_latest_snapshot() {
+        let mut in_flight = BTreeSet::new();
+        let mut pending = BTreeMap::new();
+        let mut first = MaterializedSession::empty("session-1");
+        first.applied_event_ordinal = 1;
+        let mut superseded = MaterializedSession::empty("session-1");
+        superseded.applied_event_ordinal = 2;
+        let mut latest = MaterializedSession::empty("session-1");
+        latest.applied_event_ordinal = 3;
+        let mut stale = MaterializedSession::empty("session-1");
+        stale.applied_event_ordinal = 2;
+
+        assert!(enqueue_materialized_projection(&mut in_flight, &mut pending, first, 0).is_some());
+        assert!(
+            enqueue_materialized_projection(&mut in_flight, &mut pending, superseded, 1).is_none()
+        );
+        assert!(enqueue_materialized_projection(&mut in_flight, &mut pending, latest, 2).is_none());
+        assert!(enqueue_materialized_projection(&mut in_flight, &mut pending, stale, 1).is_none());
+
+        let (queued, receipt) = pending.remove("session-1").unwrap();
+        assert_eq!(queued.applied_event_ordinal, 3);
+        assert_eq!(receipt, 2);
+        assert_eq!(in_flight, BTreeSet::from(["session-1".to_owned()]));
     }
 }

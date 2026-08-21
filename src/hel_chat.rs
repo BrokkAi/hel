@@ -57,15 +57,15 @@ use elicitation::ElicitationDialog;
 use history::{HistorySearch, HistorySearchRequest};
 use rendering::{TranscriptRenderMode, sanitize_terminal_text};
 use transcript::{
-    TAIL_SEED_ITEMS, TranscriptAnchor, TranscriptRenderCache, content_block_text,
-    materialized_chat_entries_reusing, plan_status, tool_content_details, tool_diffstats,
-    tool_location_details, tool_status,
+    TAIL_SEED_ITEMS, ToolDiffstatRequest, TranscriptAnchor, TranscriptRenderCache,
+    content_block_text, materialized_chat_entries_reusing, plan_status, tool_content_details,
+    tool_diff_paths, tool_location_details, tool_status,
 };
 
 pub use active::ActiveChat;
 pub use transcript::{
     BrowserTranscript, BrowserTranscriptEntry, TranscriptSnapshot, materialized_chunks_text,
-    materialized_content_text, render_agent_message_tail,
+    materialized_content_text, materialized_tool_diffstats, render_agent_message_tail,
 };
 
 const MOUSE_SCROLL_ROWS: usize = 3;
@@ -239,6 +239,8 @@ pub struct ChatState {
     latest_seq: u64,
     last_compaction_seq: u64,
     entries: Vec<ChatEntry>,
+    pending_diffstats: VecDeque<ToolDiffstatRequest>,
+    scheduled_diffstats: BTreeSet<(String, u64)>,
     /// Leading transcript items that are not converted to entries yet, because
     /// a large session opens on its tail and converts the rest off the event
     /// loop. Zero whenever the projection is complete.
@@ -308,6 +310,8 @@ impl ChatState {
             latest_seq: 0,
             last_compaction_seq: 0,
             entries: Vec::new(),
+            pending_diffstats: VecDeque::new(),
+            scheduled_diffstats: BTreeSet::new(),
             unconverted_prefix: 0,
             input: String::new(),
             input_cursor: 0,
@@ -472,6 +476,15 @@ impl ChatState {
                 self.unconverted_prefix,
                 std::mem::take(&mut self.entries),
             );
+            for item in session.transcript.iter().skip(self.unconverted_prefix) {
+                let Some(request) = ToolDiffstatRequest::from_item(item) else {
+                    continue;
+                };
+                let key = (request.tool_call_id.clone(), request.revision);
+                if self.scheduled_diffstats.insert(key) {
+                    self.pending_diffstats.push_back(request);
+                }
+            }
             self.queued_prompts = session
                 .queued_prompts
                 .iter()
@@ -507,6 +520,45 @@ impl ChatState {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
             .or_else(|| config_current_value(config_options, "effort"));
+    }
+
+    fn take_diffstat_requests(&mut self, maximum: usize) -> Vec<ToolDiffstatRequest> {
+        let count = maximum.min(self.pending_diffstats.len());
+        self.pending_diffstats.drain(..count).collect()
+    }
+
+    fn queue_diffstat_requests(&mut self, requests: Vec<ToolDiffstatRequest>) {
+        for request in requests {
+            let key = (request.tool_call_id.clone(), request.revision);
+            if self.scheduled_diffstats.insert(key) {
+                self.pending_diffstats.push_back(request);
+            }
+        }
+    }
+
+    pub(super) fn apply_diffstats(
+        &mut self,
+        tool_call_id: &str,
+        revision: u64,
+        result: std::result::Result<Vec<String>, String>,
+    ) {
+        let key = (tool_call_id.to_owned(), revision);
+        let Some(entry) = self.entries.iter_mut().rev().find(|entry| {
+            entry.tool_call_id.as_deref() == Some(tool_call_id) && entry.revision == revision
+        }) else {
+            self.scheduled_diffstats.remove(&key);
+            return;
+        };
+        match result {
+            Ok(diffstats) => {
+                entry.tool_diffstats = diffstats;
+                self.invalidate_render_cache();
+            }
+            Err(error) => {
+                self.scheduled_diffstats.remove(&key);
+                self.set_notice(format!("Could not calculate diff summary: {error}"));
+            }
+        }
     }
 
     fn sync_elicitation(&mut self, pending: &[ElicitationRequest]) {
@@ -1398,7 +1450,7 @@ impl ChatState {
                 );
                 entry.tool_content =
                     tool_content_details(&call.content, &[], call.raw_output.as_ref());
-                entry.tool_diffstats = tool_diffstats(&call.content);
+                entry.tool_diffstats = tool_diff_paths(&call.content);
                 entry.tool_locations = tool_location_details(&call.locations);
                 self.entries.push(entry);
             }
@@ -1420,7 +1472,7 @@ impl ChatState {
                 if let Some(content) = update.fields.content {
                     entry.tool_content =
                         tool_content_details(&content, &[], update.fields.raw_output.as_ref());
-                    entry.tool_diffstats = tool_diffstats(&content);
+                    entry.tool_diffstats = tool_diff_paths(&content);
                 }
                 if let Some(locations) = update.fields.locations {
                     entry.tool_locations = tool_location_details(&locations);
@@ -2392,5 +2444,45 @@ mod tests {
 
         assert_eq!(chat.entries[0].text, "first");
         assert!(chat.queued_prompts.is_empty());
+    }
+
+    #[test]
+    fn materialized_diff_counts_arrive_after_the_path_and_ignore_stale_revisions() {
+        let mut session = MaterializedSession::empty("session-diffstats");
+        session.applied_event_ordinal = 1;
+        session.transcript.push(Arc::new(TranscriptItem {
+            stable_id: "tool:edit".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 10,
+            last_changed_at_ms: 10,
+            body: TranscriptBody::Tool {
+                call: serde_json::json!({
+                    "toolCallId": "edit",
+                    "title": "Edit src/lib.rs",
+                    "status": "completed",
+                    "content": [{
+                        "type": "diff",
+                        "path": "/workspace/src/lib.rs",
+                        "oldText": "alpha\n",
+                        "newText": "alpha\nbeta\n"
+                    }]
+                }),
+                terminal_outputs: Vec::new(),
+                terminal_refs: Vec::new(),
+            },
+        }));
+
+        let mut chat = ChatState::from_materialized(&session, &[], &[]);
+        assert_eq!(chat.entries[0].tool_diffstats, ["/workspace/src/lib.rs"]);
+        let request = chat.take_diffstat_requests(1).pop().unwrap();
+        let exact = request.clone().compute();
+        chat.apply_diffstats("tool:edit", 9, exact.clone());
+        assert_eq!(chat.entries[0].tool_diffstats, ["/workspace/src/lib.rs"]);
+        chat.apply_diffstats("tool:edit", 10, exact);
+        assert_eq!(
+            chat.entries[0].tool_diffstats,
+            ["/workspace/src/lib.rs  +1 −0"]
+        );
     }
 }

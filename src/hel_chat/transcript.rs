@@ -2,6 +2,7 @@
 //! session, the render cache and collapse rules behind them, the scrollable
 //! viewport, and the rows every surface draws.
 
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -109,7 +110,17 @@ impl TranscriptSnapshot {
     /// stable browser identity, while the current projection frontier is a
     /// conservative update cursor for rebuilt snapshots.
     pub fn from_materialized(session: &MaterializedSession) -> Self {
-        let entries = materialized_chat_entries(session);
+        Self::from_materialized_with_diffstats(session, &BTreeMap::new())
+    }
+
+    /// Render a materialized session with exact diffstats computed by the
+    /// caller's background projection. Missing entries deliberately fall back
+    /// to path-only labels; rendering never performs the expensive diff.
+    pub fn from_materialized_with_diffstats(
+        session: &MaterializedSession,
+        diffstats: &BTreeMap<String, Vec<String>>,
+    ) -> Self {
+        let entries = materialized_chat_entries_with_diffstats(session, diffstats);
         Self::from_entries_at(entries, session.applied_event_ordinal)
     }
 
@@ -232,11 +243,25 @@ impl TranscriptSnapshot {
     }
 }
 
+#[cfg(test)]
 fn materialized_chat_entries(session: &MaterializedSession) -> Vec<ChatEntry> {
+    materialized_chat_entries_with_diffstats(session, &BTreeMap::new())
+}
+
+fn materialized_chat_entries_with_diffstats(
+    session: &MaterializedSession,
+    diffstats: &BTreeMap<String, Vec<String>>,
+) -> Vec<ChatEntry> {
     session
         .transcript
         .iter()
-        .map(|item| materialized_chat_entry(item, session.applied_event_ordinal))
+        .map(|item| {
+            materialized_chat_entry_with_diffstats(
+                item,
+                session.applied_event_ordinal,
+                diffstats.get(&item.stable_id),
+            )
+        })
         .collect()
 }
 
@@ -324,6 +349,14 @@ fn entry_matches_transcript_item(entry: &ChatEntry, item: &TranscriptItem) -> bo
 }
 
 fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEntry {
+    materialized_chat_entry_with_diffstats(item, frontier, None)
+}
+
+fn materialized_chat_entry_with_diffstats(
+    item: &Arc<TranscriptItem>,
+    frontier: u64,
+    exact_diffstats: Option<&Vec<String>>,
+) -> ChatEntry {
     let mut entry = match &item.body {
         TranscriptBody::User { content } => ChatEntry::plain(
             item.position,
@@ -357,7 +390,9 @@ fn materialized_chat_entry(item: &Arc<TranscriptItem>, frontier: u64) -> ChatEnt
             if let Some(call) = call {
                 entry.tool_content =
                     tool_content_details(&call.content, terminal_outputs, call.raw_output.as_ref());
-                entry.tool_diffstats = tool_diffstats(&call.content);
+                entry.tool_diffstats = exact_diffstats
+                    .cloned()
+                    .unwrap_or_else(|| tool_diff_paths(&call.content));
                 entry.tool_locations = tool_location_details(&call.locations);
             }
             entry
@@ -936,7 +971,7 @@ pub(super) fn tool_content_details(
     for item in content {
         let detail = match item {
             ToolCallContent::Content(content) => content_block_text(&content.content),
-            ToolCallContent::Diff(diff) => Some(format_diffstat(diff)),
+            ToolCallContent::Diff(_) => None,
             // Kimi-style agents send a terminal reference and no textual copy
             // of the output, so the record hel captured is the only thing a
             // reader ever sees. Until the terminal is reaped there is none.
@@ -1011,7 +1046,17 @@ fn terminal_exit_summary(record: &TerminalOutputRecord) -> String {
     summary
 }
 
-pub(super) fn tool_diffstats(content: &[ToolCallContent]) -> Vec<String> {
+pub(super) fn tool_diff_paths(content: &[ToolCallContent]) -> Vec<String> {
+    content
+        .iter()
+        .filter_map(|item| match item {
+            ToolCallContent::Diff(diff) => Some(diff.path.display().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+pub(super) fn compute_tool_diffstats(content: &[ToolCallContent]) -> Vec<String> {
     content
         .iter()
         .filter_map(|item| match item {
@@ -1019,6 +1064,55 @@ pub(super) fn tool_diffstats(content: &[ToolCallContent]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+pub fn materialized_tool_diffstats(item: &TranscriptItem) -> Option<Vec<String>> {
+    let TranscriptBody::Tool { call, .. } = &item.body else {
+        return None;
+    };
+    let call = ToolCall::deserialize(call).ok()?;
+    if !matches!(
+        tool_status(&call.status),
+        ToolStatus::Completed | ToolStatus::Failed
+    ) {
+        return None;
+    }
+    let diffstats = compute_tool_diffstats(&call.content);
+    (!diffstats.is_empty()).then_some(diffstats)
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ToolDiffstatRequest {
+    pub(super) tool_call_id: String,
+    pub(super) revision: u64,
+    item: Arc<TranscriptItem>,
+}
+
+impl ToolDiffstatRequest {
+    pub(super) fn from_item(item: &Arc<TranscriptItem>) -> Option<Self> {
+        let TranscriptBody::Tool { call, .. } = &item.body else {
+            return None;
+        };
+        let call = ToolCall::deserialize(call).ok()?;
+        let terminal = matches!(
+            tool_status(&call.status),
+            ToolStatus::Completed | ToolStatus::Failed
+        );
+        let has_diff = call
+            .content
+            .iter()
+            .any(|item| matches!(item, ToolCallContent::Diff(_)));
+        (terminal && has_diff).then(|| Self {
+            tool_call_id: item.stable_id.clone(),
+            revision: u64::try_from(item.last_changed_at_ms).unwrap_or_default(),
+            item: Arc::clone(item),
+        })
+    }
+
+    pub(super) fn compute(self) -> Result<Vec<String>, String> {
+        materialized_tool_diffstats(&self.item)
+            .ok_or_else(|| format!("tool {} no longer has a final diff", self.tool_call_id))
+    }
 }
 
 fn format_diffstat(diff: &agent_client_protocol::schema::v1::Diff) -> String {
@@ -1250,6 +1344,7 @@ fn entry_logical_lines(
     let details = entry
         .tool_content
         .iter()
+        .chain(&entry.tool_diffstats)
         .chain(&entry.tool_locations)
         .cloned()
         .collect::<Vec<_>>();
@@ -1849,7 +1944,7 @@ mod tests {
     }
 
     #[test]
-    fn acp_diffs_render_diffstats_and_replacement_updates_replace_them() {
+    fn live_acp_diffs_render_paths_without_counting_lines_on_the_event_loop() {
         let mut chat = ChatState::new(&snapshot(), &[]);
         chat.apply_session_update(
             1,
@@ -1872,7 +1967,7 @@ mod tests {
             [
                 "● Tool · running",
                 "│ Edit src/lib.rs",
-                "│ /workspace/src/lib.rs  +1 −0",
+                "│ /workspace/src/lib.rs",
                 ""
             ]
         );
@@ -1892,16 +1987,13 @@ mod tests {
             }),
         );
 
-        assert_eq!(
-            chat.entries[0].tool_diffstats,
-            ["/workspace/src/lib.rs  +1 −1"]
-        );
+        assert_eq!(chat.entries[0].tool_diffstats, ["/workspace/src/lib.rs"]);
         assert_eq!(
             transcript_text(&mut chat, 80),
             [
                 "✓ Tool · done",
                 "│ Edit src/lib.rs",
-                "│ /workspace/src/lib.rs  +1 −1",
+                "│ /workspace/src/lib.rs",
                 ""
             ]
         );
@@ -2162,6 +2254,38 @@ mod tests {
         let diff = agent_client_protocol::schema::v1::Diff::new("/workspace/new.txt", "one\ntwo\n");
 
         assert_eq!(format_diffstat(&diff), "/workspace/new.txt  +2 −0");
+    }
+
+    #[test]
+    fn exact_diffstats_are_available_only_after_the_tool_finishes() {
+        let item = |status: &str| TranscriptItem {
+            stable_id: "tool:edit".into(),
+            position: 1,
+            latest_content_event_ordinal: None,
+            created_at_ms: 1,
+            last_changed_at_ms: 2,
+            body: TranscriptBody::Tool {
+                call: serde_json::json!({
+                    "toolCallId": "edit",
+                    "title": "Edit src/lib.rs",
+                    "status": status,
+                    "content": [{
+                        "type": "diff",
+                        "path": "/workspace/src/lib.rs",
+                        "oldText": "alpha\n",
+                        "newText": "alpha\nbeta\n"
+                    }]
+                }),
+                terminal_outputs: Vec::new(),
+                terminal_refs: Vec::new(),
+            },
+        };
+
+        assert_eq!(materialized_tool_diffstats(&item("in_progress")), None);
+        assert_eq!(
+            materialized_tool_diffstats(&item("completed")),
+            Some(vec!["/workspace/src/lib.rs  +1 −0".into()])
+        );
     }
 
     #[test]
@@ -2878,7 +3002,13 @@ mod tests {
         assert!(entries[0].tool_content.contains(&"wrote the file".into()));
         assert_eq!(entries[0].tool_locations, ["/workspace/src/lib.rs:2"]);
 
-        let browser = TranscriptSnapshot::from_materialized(&session).browser_transcript(None);
+        let exact_diffstats = BTreeMap::from([(
+            "tool:edit".to_owned(),
+            materialized_tool_diffstats(&session.transcript[0]).unwrap(),
+        )]);
+        let browser =
+            TranscriptSnapshot::from_materialized_with_diffstats(&session, &exact_diffstats)
+                .browser_transcript(None);
         assert_eq!(
             browser.entries[0].lines,
             ["Edit src/lib.rs", "/workspace/src/lib.rs  +1 −0"],

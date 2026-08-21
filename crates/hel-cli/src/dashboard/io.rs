@@ -44,7 +44,8 @@ pub(crate) enum DashboardIoUpdate {
         result: std::result::Result<(), String>,
     },
     MaterializedSessionProjection {
-        detail: Box<PreparedMaterializedSessionDetail>,
+        session_id: String,
+        result: std::result::Result<Box<PreparedMaterializedSessionDetail>, String>,
     },
     CreateSession(Box<DashboardCreateSessionUpdate>),
     RenameSession {
@@ -253,16 +254,29 @@ pub(crate) fn spawn_materialized_session_projection(
     detached_after_event_ordinal: u64,
     previous: hel_tui::MaterializedProjectionCache,
     updates: UnboundedSender<DashboardIoUpdate>,
+    permits: Arc<tokio::sync::Semaphore>,
 ) {
-    tokio::task::spawn_blocking(move || {
-        let detail = PreparedMaterializedSessionDetail::from_materialized(
-            materialized,
-            detached_after_event_ordinal,
-            previous,
-        );
-        let _ = updates.send(DashboardIoUpdate::MaterializedSessionProjection {
-            detail: Box::new(detail),
-        });
+    let session_id = materialized.session_id.clone();
+    tokio::spawn(async move {
+        let result = match permits.acquire_owned().await {
+            Ok(permit) => {
+                let result = tokio::task::spawn_blocking(move || {
+                    PreparedMaterializedSessionDetail::from_materialized(
+                        materialized,
+                        detached_after_event_ordinal,
+                        previous,
+                    )
+                })
+                .await
+                .map(Box::new)
+                .map_err(|error| format!("session projection task failed: {error}"));
+                drop(permit);
+                result
+            }
+            Err(error) => Err(format!("session projection worker stopped: {error}")),
+        };
+        let _ =
+            updates.send(DashboardIoUpdate::MaterializedSessionProjection { session_id, result });
     });
 }
 
@@ -674,8 +688,8 @@ impl DashboardContext {
                     spawn_hidden_native_sessions_load(self.dashboard_io_tx.clone());
                 }
             }
-            DashboardIoUpdate::MaterializedSessionProjection { detail } => {
-                self.dashboard.apply_prepared_materialized_session(*detail);
+            DashboardIoUpdate::MaterializedSessionProjection { session_id, result } => {
+                self.finish_materialized_projection(session_id, result);
             }
             DashboardIoUpdate::CreateSession(update) => self.apply_create_session_update(*update),
             DashboardIoUpdate::RenameSession {
@@ -878,7 +892,13 @@ impl DashboardContext {
                 target_id,
                 materialized,
             }) => {
-                self.dashboard.apply_materialized_session(&materialized);
+                let detached_after_event_ordinal = self
+                    .controller
+                    .state
+                    .sessions
+                    .get(&session_id)
+                    .map_or(0, |session| session.detached_after_event_ordinal);
+                self.request_materialized_projection(*materialized, detached_after_event_ordinal);
                 self.dashboard.select_active_session(&session_id);
                 self.dashboard.set_notice(format!(
                     "Resumed {} with {profile_id} on {target_id}",

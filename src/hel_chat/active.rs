@@ -34,8 +34,8 @@ use super::remote::{
 };
 use super::rendering::{display_width, truncate_line_to_width, truncate_to_width};
 use super::transcript::{
-    TranscriptAnchor, agent_text_spans, materialized_chunks_text, materialized_prefix_entries,
-    render_transcript,
+    ToolDiffstatRequest, TranscriptAnchor, agent_text_spans, materialized_chunks_text,
+    materialized_prefix_entries, render_transcript,
 };
 use super::{
     ChatAction, ChatEventOutcome, ChatFocus, ChatState, Notices, OtherSessionActivity,
@@ -48,6 +48,7 @@ use crate::clock::epoch_seconds;
 /// How many conversations the pane shows at once. The transcript owns the rest
 /// of the screen, so the list stays a window however many sessions are open.
 const CONVERSATIONS_PANE_MAX_ROWS: usize = 7;
+const MAX_DIFFSTAT_TASKS: usize = 2;
 
 #[derive(Debug)]
 enum ChatIoUpdate {
@@ -63,7 +64,12 @@ enum ChatIoUpdate {
     /// keeps changing under the conversion cannot retry for ever.
     TranscriptPrefix {
         attempt: u32,
-        result: std::result::Result<Vec<ChatEntry>, String>,
+        result: std::result::Result<(Vec<ChatEntry>, Vec<ToolDiffstatRequest>), String>,
+    },
+    ToolDiffstats {
+        tool_call_id: String,
+        revision: u64,
+        result: std::result::Result<Vec<String>, String>,
     },
 }
 
@@ -229,6 +235,31 @@ fn dispatch_history_search_request(
     });
 }
 
+fn dispatch_diffstat_requests(
+    chat: &mut ChatState,
+    updates: &tokio::sync::mpsc::UnboundedSender<ChatIoUpdate>,
+    in_flight: &mut usize,
+) {
+    let available = MAX_DIFFSTAT_TASKS.saturating_sub(*in_flight);
+    for request in chat.take_diffstat_requests(available) {
+        *in_flight += 1;
+        let tool_call_id = request.tool_call_id.clone();
+        let revision = request.revision;
+        let updates = updates.clone();
+        tokio::spawn(async move {
+            let result = match tokio::task::spawn_blocking(move || request.compute()).await {
+                Ok(result) => result,
+                Err(error) => Err(format!("diff summary task failed: {error}")),
+            };
+            let _ = updates.send(ChatIoUpdate::ToolDiffstats {
+                tool_call_id,
+                revision,
+                result,
+            });
+        });
+    }
+}
+
 /// The history a tail-first open still owes the view: the transcript items in
 /// front of the loaded tail, and the frontier they are converted against.
 /// Cloning the item vector copies handles, not conversations.
@@ -256,7 +287,13 @@ fn spawn_transcript_prefix(
 ) {
     tokio::spawn(async move {
         let result = match tokio::task::spawn_blocking(move || {
-            materialized_prefix_entries(&pending.items, pending.frontier)
+            let entries = materialized_prefix_entries(&pending.items, pending.frontier);
+            let diffstats = pending
+                .items
+                .iter()
+                .filter_map(ToolDiffstatRequest::from_item)
+                .collect();
+            (entries, diffstats)
         })
         .await
         {
@@ -281,8 +318,9 @@ enum PrefixRebuild {
 fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) -> PrefixRebuild {
     match update {
         ChatIoUpdate::TranscriptPrefix { attempt, result } => match result {
-            Ok(entries) => {
+            Ok((entries, diffstats)) => {
                 if chat.splice_transcript_prefix(entries) {
+                    chat.queue_diffstat_requests(diffstats);
                     return PrefixRebuild::NotNeeded;
                 }
                 if attempt >= MAX_PREFIX_CONVERSION_ATTEMPTS {
@@ -309,6 +347,11 @@ fn apply_chat_io_update(chat: &mut ChatState, update: ChatIoUpdate) -> PrefixReb
             chat.set_notice(format!("Paste failed: {error}"));
         }
         ChatIoUpdate::OtherSessions(sessions) => chat.other_sessions = sessions,
+        ChatIoUpdate::ToolDiffstats {
+            tool_call_id,
+            revision,
+            result,
+        } => chat.apply_diffstats(&tool_call_id, revision, result),
     }
     PrefixRebuild::NotNeeded
 }
@@ -576,6 +619,7 @@ pub struct ActiveChat {
     /// clipboard and history tasks have somewhere to report.
     chat_io_tx: tokio::sync::mpsc::UnboundedSender<ChatIoUpdate>,
     chat_io_rx: tokio::sync::mpsc::UnboundedReceiver<ChatIoUpdate>,
+    diffstats_in_flight: usize,
     /// Held for the same reason, and cloned into each dictation thread.
     voice_updates_tx: tokio::sync::mpsc::UnboundedSender<VoiceUpdate>,
     voice_updates_rx: tokio::sync::mpsc::UnboundedReceiver<VoiceUpdate>,
@@ -684,6 +728,8 @@ impl ActiveChat {
             state.set_notice("Connecting to session relay…");
             queue_chat_remote_operation(remote.operations(), ChatRemoteOperation::Sync, &mut state);
         }
+        let mut diffstats_in_flight = 0;
+        dispatch_diffstat_requests(&mut state, &chat_io_tx, &mut diffstats_in_flight);
         Self {
             state,
             session,
@@ -692,6 +738,7 @@ impl ActiveChat {
             remote,
             chat_io_tx,
             chat_io_rx,
+            diffstats_in_flight,
             voice_updates_tx,
             voice_updates_rx,
             voice_cancel: None,
@@ -790,10 +837,18 @@ impl ActiveChat {
     }
 
     fn apply_io_update(&mut self, update: ChatIoUpdate) {
+        if matches!(&update, ChatIoUpdate::ToolDiffstats { .. }) {
+            self.diffstats_in_flight = self.diffstats_in_flight.saturating_sub(1);
+        }
         if let PrefixRebuild::Needed { attempt } = apply_chat_io_update(&mut self.state, update) {
             self.rebuild_transcript_prefix(attempt);
         }
         dispatch_history_search_request(&mut self.state, &self.chat_io_tx);
+        dispatch_diffstat_requests(
+            &mut self.state,
+            &self.chat_io_tx,
+            &mut self.diffstats_in_flight,
+        );
     }
 
     /// Restarts the history conversion against the session's current snapshot,
@@ -837,6 +892,11 @@ impl ActiveChat {
 
     fn apply_session_view(&mut self, view: Result<ManagedSessionView>) {
         self.session_open = apply_session_view(&mut self.state, view);
+        dispatch_diffstat_requests(
+            &mut self.state,
+            &self.chat_io_tx,
+            &mut self.diffstats_in_flight,
+        );
     }
 
     /// Applies one terminal event and reports what it asked for.
@@ -2280,7 +2340,7 @@ mod tests {
             &mut chat,
             ChatIoUpdate::TranscriptPrefix {
                 attempt: 1,
-                result: Ok(prefix),
+                result: Ok((prefix, Vec::new())),
             },
         );
 
@@ -2306,7 +2366,7 @@ mod tests {
             &mut chat,
             ChatIoUpdate::TranscriptPrefix {
                 attempt: 1,
-                result: Ok(stale.clone()),
+                result: Ok((stale.clone(), Vec::new())),
             },
         );
 
@@ -2318,7 +2378,7 @@ mod tests {
             &mut chat,
             ChatIoUpdate::TranscriptPrefix {
                 attempt: MAX_PREFIX_CONVERSION_ATTEMPTS,
-                result: Ok(stale),
+                result: Ok((stale, Vec::new())),
             },
         );
 
