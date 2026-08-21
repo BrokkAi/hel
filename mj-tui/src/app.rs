@@ -3161,6 +3161,14 @@ impl AppState {
         )
     }
 
+    /// Whether a prompt submitted right now can be steered into the running
+    /// turn: the agent supports `_session/steering` and a turn is actively
+    /// streaming. A turn being cancelled or a fork in flight has nothing left
+    /// to steer, so those states keep the queueing path.
+    pub fn can_steer(&self) -> bool {
+        self.steering_supported && self.connection_state == ConnectionState::Streaming
+    }
+
     pub fn active_turn_elapsed(&self) -> Option<Duration> {
         if self.is_busy() {
             self.turn_started_at.map(|started| started.elapsed())
@@ -3760,6 +3768,18 @@ impl AppState {
         self.record_user_prompt_with_resources(text, Vec::new());
     }
 
+    /// Record a steered mid-turn user message. It joins the turn that is
+    /// already running, so the transcript and prompt history are updated
+    /// without restarting turn bookkeeping (timer, prompt-turn rows,
+    /// provisional title). The agent's open streaming message is closed so
+    /// prose produced after the steer starts a new entry below it.
+    pub fn record_steered_prompt(&mut self, text: String, resources: Vec<PromptResource>) {
+        self.finalize_message(EntryKind::Agent);
+        self.transcript.push(Entry::UserPrompt(text.clone()));
+        self.record_prompt_history_with_resources(text, resources);
+        self.bump_transcript_revision();
+    }
+
     pub fn record_user_prompt_with_resources(
         &mut self,
         text: String,
@@ -4243,6 +4263,7 @@ impl AppState {
                 session_fork_supported,
                 side_session_supported,
                 side_session_unsupported_reason,
+                steering_supported,
                 ..
             } => {
                 // Keep the pre-filled agent_label (the configured
@@ -4253,6 +4274,7 @@ impl AppState {
                 self.session_fork_supported = session_fork_supported;
                 self.side_session_supported = side_session_supported;
                 self.side_session_unsupported_reason = side_session_unsupported_reason;
+                self.steering_supported = steering_supported;
                 if self.is_side {
                     install_side_builtin_commands(&mut self.available_commands);
                 } else {
@@ -9261,6 +9283,7 @@ mod tests {
             session_load_supported: false,
             side_session_supported: false,
             side_session_unsupported_reason: None,
+            steering_supported: false,
         });
         assert_eq!(s.connection_state, ConnectionState::Initializing);
 
@@ -9298,6 +9321,7 @@ mod tests {
             session_load_supported: false,
             side_session_supported: false,
             side_session_unsupported_reason: None,
+            steering_supported: false,
         });
         assert_eq!(state.connection_state, ConnectionState::Streaming);
         state.apply_event(UiEvent::SessionStarted {
@@ -9334,6 +9358,7 @@ mod tests {
             session_load_supported: false,
             side_session_supported: false,
             side_session_unsupported_reason: None,
+            steering_supported: false,
         });
         state.announce_waiting_for_primary();
 
@@ -9354,6 +9379,7 @@ mod tests {
             session_load_supported: false,
             side_session_supported: false,
             side_session_unsupported_reason: None,
+            steering_supported: false,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -9392,6 +9418,7 @@ mod tests {
             session_load_supported: false,
             side_session_supported: false,
             side_session_unsupported_reason: None,
+            steering_supported: false,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -9435,6 +9462,7 @@ mod tests {
             session_load_supported: false,
             side_session_supported: false,
             side_session_unsupported_reason: None,
+            steering_supported: false,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -9461,6 +9489,7 @@ mod tests {
             session_load_supported: false,
             side_session_supported: false,
             side_session_unsupported_reason: None,
+            steering_supported: false,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -9762,6 +9791,7 @@ mod tests {
             session_load_supported: false,
             side_session_supported: false,
             side_session_unsupported_reason: None,
+            steering_supported: false,
         });
         s.apply_event(UiEvent::SessionStarted {
             session_id: "sess-1".into(),
@@ -10844,6 +10874,7 @@ mod tests {
             session_load_supported: false,
             side_session_supported: false,
             side_session_unsupported_reason: None,
+            steering_supported: false,
         });
         s.input = "/".to_string();
         s.update_autocomplete();
@@ -10887,6 +10918,7 @@ mod tests {
             session_load_supported: false,
             side_session_supported: false,
             side_session_unsupported_reason: None,
+            steering_supported: false,
         });
         s.apply_event(UiEvent::SessionUpdate(
             SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
@@ -11294,6 +11326,7 @@ mod tests {
             session_load_supported: false,
             side_session_supported: false,
             side_session_unsupported_reason: None,
+            steering_supported: false,
         });
         assert!(
             !s.is_streaming(),

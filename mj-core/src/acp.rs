@@ -2,6 +2,7 @@
 //! stdio, and bridges UI commands/events through two mpsc channels.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,7 +29,7 @@ use agent_client_protocol::schema::v1::{
     ToolKind, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
     WriteTextFileResponse,
 };
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
+use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo, UntypedMessage};
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -319,6 +320,22 @@ struct ConnectedEventFields {
     session_load_supported: bool,
     side_session_supported: bool,
     side_session_unsupported_reason: Option<String>,
+    steering_supported: bool,
+}
+
+/// Wire method of the ACP steering extension: injects a follow-up message
+/// into the turn that is currently running instead of queueing it as a
+/// separate `session/prompt`. Not part of ACP core; agents advertise it via
+/// `InitializeResponse._meta.steering.supported`.
+const SESSION_STEERING_METHOD: &str = "_session/steering";
+
+/// Whether the agent advertises the `_session/steering` extension in its
+/// top-level initialize `_meta` (a sibling of `agentCapabilities`).
+fn steering_supported_from_meta(meta: Option<&agent_client_protocol::schema::v1::Meta>) -> bool {
+    meta.and_then(|meta| meta.get("steering"))
+        .and_then(|steering| steering.get("supported"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn side_session_capability_error(capabilities: &AgentCapabilities) -> Option<String> {
@@ -2615,7 +2632,9 @@ async fn drive_session(
                 .is_some(),
         side_session_supported: side_session_unsupported_reason.is_none(),
         side_session_unsupported_reason,
+        steering_supported: steering_supported_from_meta(init_resp.meta.as_ref()),
     };
+    let steering_supported = connected_fields.steering_supported;
     emit_connected(ui_tx, &connected_fields);
 
     let (mut session_id, initial_config, resumed) = match resume_session {
@@ -2834,7 +2853,15 @@ async fn drive_session(
             },
         };
         match cmd {
+            // A `SteerPrompt` that reaches the idle loop lost its race
+            // against the turn it meant to steer; deliver it as an ordinary
+            // prompt so the message is never dropped.
             UiCommand::SendPrompt {
+                text,
+                images,
+                resources,
+            }
+            | UiCommand::SteerPrompt {
                 text,
                 images,
                 resources,
@@ -2903,6 +2930,10 @@ async fn drive_session(
                     session_has_history,
                     &mut deferred_prompts,
                     &mut deferred_config_updates,
+                    PromptSteeringConfig {
+                        supported: steering_supported,
+                        side_prompt_policy,
+                    },
                 )
                 .await?;
                 session_has_history = true;
@@ -3182,6 +3213,7 @@ fn emit_connected(ui_tx: &mpsc::UnboundedSender<UiEvent>, fields: &ConnectedEven
         session_load_supported: fields.session_load_supported,
         side_session_supported: fields.side_session_supported,
         side_session_unsupported_reason: fields.side_session_unsupported_reason.clone(),
+        steering_supported: fields.steering_supported,
     });
 }
 
@@ -3497,11 +3529,18 @@ async fn drive_fork_session(
                     Some(UiCommand::Shutdown) | None => {
                         return Ok(false);
                     }
-                    Some(UiCommand::SendPrompt {
-                        text,
-                        images,
-                        resources,
-                    }) => {
+                    Some(
+                        UiCommand::SendPrompt {
+                            text,
+                            images,
+                            resources,
+                        }
+                        | UiCommand::SteerPrompt {
+                            text,
+                            images,
+                            resources,
+                        },
+                    ) => {
                         deferred_prompts.push_back((text, images, resources));
                         let _ = ui_tx.send(UiEvent::Info(
                             "prompt queued; it will be sent when the session fork completes"
@@ -5816,11 +5855,18 @@ async fn drive_config_update(
                     Some(UiCommand::Shutdown) | None => {
                         return Ok(false);
                     }
-                    Some(UiCommand::SendPrompt {
-                        text,
-                        images,
-                        resources,
-                    }) => {
+                    Some(
+                        UiCommand::SendPrompt {
+                            text,
+                            images,
+                            resources,
+                        }
+                        | UiCommand::SteerPrompt {
+                            text,
+                            images,
+                            resources,
+                        },
+                    ) => {
                         deferred_prompts.push_back((text, images, resources));
                         let _ = ui_tx.send(UiEvent::Info(
                             "prompt queued; it will be sent when the config update completes"
@@ -5922,6 +5968,253 @@ struct PromptTurnDiffConfig<'a> {
     turn_id: u64,
 }
 
+/// How a prompt turn treats [`UiCommand::SteerPrompt`]: whether the agent
+/// advertises `_session/steering`, and how steered content blocks are built.
+struct PromptSteeringConfig {
+    supported: bool,
+    side_prompt_policy: bool,
+}
+
+/// One `_session/steering` request in flight, holding the original payload so
+/// a miss (the turn settled before the steer landed) can be requeued as an
+/// ordinary prompt instead of being lost.
+struct PendingSteer {
+    response: std::pin::Pin<
+        Box<dyn Future<Output = Result<serde_json::Value, agent_client_protocol::Error>> + Send>,
+    >,
+    text: String,
+    images: Vec<PromptImage>,
+    resources: Vec<PromptResource>,
+}
+
+/// Issue a `_session/steering` request for a user message submitted while a
+/// turn is running.
+fn start_steer(
+    conn: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    text: String,
+    images: Vec<PromptImage>,
+    resources: Vec<PromptResource>,
+    side_prompt_policy: bool,
+) -> PendingSteer {
+    let blocks = prompt_content_blocks(
+        text.clone(),
+        images.clone(),
+        resources.clone(),
+        side_prompt_policy,
+    );
+    // `idleBehavior: promptRequired` opts into the host-owned idle fallback:
+    // if the turn settles before the steer lands, the agent hands the message
+    // back (outcome `promptRequired`) instead of starting a detached turn this
+    // runtime has no pending request for. codex-acp tolerates but ignores the
+    // opt-in and answers `startedNewTurn` in that race.
+    let request = UntypedMessage {
+        method: SESSION_STEERING_METHOD.to_string(),
+        params: serde_json::json!({
+            "sessionId": session_id,
+            "prompt": blocks,
+            "_meta": { "steering": { "idleBehavior": "promptRequired" } },
+        }),
+    };
+    let response = conn.send_request(request).block_task();
+    PendingSteer {
+        response: Box::pin(response),
+        text,
+        images,
+        resources,
+    }
+}
+
+/// What happens to a steered message the agent did not deliver. Resending is
+/// the normal path (the message becomes the next ordinary prompt); after a
+/// failed turn it is dropped instead, mirroring the TUI's failure-path queue
+/// drop — auto-resubmitting into a degraded runtime would hide the failure.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SteerFallbackDisposition {
+    Resend,
+    Drop,
+}
+
+/// Fold a finished steering request into the turn: confirm delivery, or hand
+/// the undelivered payload back to the caller, narrating the chosen fallback.
+async fn apply_steer_outcome(
+    conn: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    session_state: &RuntimeSessionState,
+    steer: PendingSteer,
+    outcome: Result<serde_json::Value, agent_client_protocol::Error>,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    disposition: SteerFallbackDisposition,
+) -> Option<(String, Vec<PromptImage>, Vec<PromptResource>)> {
+    let PendingSteer {
+        text,
+        images,
+        resources,
+        ..
+    } = steer;
+    let fallback_tail = match disposition {
+        SteerFallbackDisposition::Resend => "the message will be sent as the next prompt",
+        SteerFallbackDisposition::Drop => {
+            "the message was dropped because the turn failed; resubmit it if still wanted"
+        }
+    };
+    match outcome {
+        Ok(value) => match value.get("outcome").and_then(serde_json::Value::as_str) {
+            Some("injected") => {
+                let _ = ui_tx.send(UiEvent::Info(
+                    "message steered into the running turn".to_string(),
+                ));
+                None
+            }
+            // The turn settled first and the agent started a detached turn
+            // with the message (codex-acp's idle-race answer). That turn has
+            // no prompt request on this side and no completion path, so
+            // reclaim the message: cancel the detached turn and let the
+            // disposition deliver (or drop) it as an owned prompt. The
+            // cancel makes the requeue safe — without it the message would
+            // run twice.
+            Some("startedNewTurn") => {
+                // Full cancel sequence, mirroring the user-cancel path: the
+                // detached turn may already have raised a permission request,
+                // which must not stay actionable after its turn is cancelled.
+                session_state.mark_permissions_cancelled(session_id).await;
+                let _ = ui_tx.send(UiEvent::CancelPendingPermissions);
+                if let Err(error) =
+                    conn.send_notification(CancelNotification::new(session_id.clone()))
+                {
+                    let _ = ui_tx.send(UiEvent::Warning(format!(
+                        "could not cancel the agent's detached steering turn: {error}"
+                    )));
+                }
+                let _ = ui_tx.send(UiEvent::Info(format!(
+                    "the turn had already ended, so the agent started a detached turn with the \
+                     message; cancelling that turn — {fallback_tail}"
+                )));
+                Some((text, images, resources))
+            }
+            Some("promptRequired") => {
+                let _ = ui_tx.send(UiEvent::Info(format!(
+                    "the turn ended before the message could be steered; {fallback_tail}"
+                )));
+                Some((text, images, resources))
+            }
+            // `failed` (codex-acp) and anything unrecognized: the agent did
+            // not confirm delivery — a visible duplicate beats a silently
+            // dropped instruction.
+            other => {
+                let _ = ui_tx.send(UiEvent::Warning(format!(
+                    "steering was not applied (outcome {}); {fallback_tail}",
+                    other.unwrap_or("missing"),
+                )));
+                Some((text, images, resources))
+            }
+        },
+        Err(error) => {
+            let _ = ui_tx.send(UiEvent::Warning(format!(
+                "steering failed: {error}; {fallback_tail}"
+            )));
+            Some((text, images, resources))
+        }
+    }
+}
+
+/// Settle steering state when the prompt turn resolves. An in-flight steer is
+/// briefly awaited — the turn just settled, so the agent answers promptly with
+/// either the injection confirmation or the miss. On a normal or cancelled
+/// turn, undelivered and never-sent steers become ordinary prompts (matching
+/// queued-prompt drain semantics); on a failed turn they are dropped with a
+/// warning, mirroring the TUI's failure-path queue drop.
+/// Per-turn steering state owned by [`drive_prompt_turn`]: the single
+/// in-flight `_session/steering` request, later steers waiting behind it, and
+/// undelivered payloads awaiting the turn's outcome.
+#[derive(Default)]
+struct TurnSteerState {
+    in_flight: Option<PendingSteer>,
+    queued: VecDeque<(String, Vec<PromptImage>, Vec<PromptResource>)>,
+    fallbacks: VecDeque<(String, Vec<PromptImage>, Vec<PromptResource>)>,
+}
+
+async fn flush_pending_steers(
+    conn: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    session_state: &RuntimeSessionState,
+    steers: TurnSteerState,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    deferred_prompts: &mut VecDeque<(String, Vec<PromptImage>, Vec<PromptResource>)>,
+    turn_failed: bool,
+) {
+    let TurnSteerState {
+        in_flight,
+        queued: queued_steers,
+        fallbacks,
+    } = steers;
+    let disposition = if turn_failed {
+        SteerFallbackDisposition::Drop
+    } else {
+        SteerFallbackDisposition::Resend
+    };
+    // The in-flight steer narrates its own fallback; buffered and never-sent
+    // steers are aggregated below so each message is announced exactly once.
+    let mut undelivered_in_flight = None;
+    if let Some(mut steer) = in_flight {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), steer.response.as_mut()).await
+        {
+            Ok(outcome) => {
+                undelivered_in_flight = apply_steer_outcome(
+                    conn,
+                    session_id,
+                    session_state,
+                    steer,
+                    outcome,
+                    ui_tx,
+                    disposition,
+                )
+                .await;
+            }
+            Err(_elapsed) => {
+                let PendingSteer {
+                    text,
+                    images,
+                    resources,
+                    ..
+                } = steer;
+                let tail = match disposition {
+                    SteerFallbackDisposition::Resend => {
+                        "the message will be sent as the next prompt"
+                    }
+                    SteerFallbackDisposition::Drop => {
+                        "the message was dropped because the turn failed; resubmit it if still \
+                         wanted"
+                    }
+                };
+                let _ = ui_tx.send(UiEvent::Warning(format!(
+                    "steering did not answer before the turn ended; {tail}"
+                )));
+                undelivered_in_flight = Some((text, images, resources));
+            }
+        }
+    }
+    match disposition {
+        SteerFallbackDisposition::Resend => {
+            deferred_prompts.extend(fallbacks);
+            if let Some(parts) = undelivered_in_flight {
+                deferred_prompts.push_back(parts);
+            }
+            deferred_prompts.extend(queued_steers);
+        }
+        SteerFallbackDisposition::Drop => {
+            // `undelivered_in_flight` was already narrated above.
+            let dropped = fallbacks.len() + queued_steers.len();
+            if dropped > 0 {
+                let _ = ui_tx.send(UiEvent::Warning(format!(
+                    "{dropped} steered message(s) dropped after the turn failed; resubmit them \
+                     if still wanted"
+                )));
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_prompt_turn(
     conn: &ConnectionTo<Agent>,
@@ -5935,6 +6228,7 @@ async fn drive_prompt_turn(
     side_source_has_history: bool,
     deferred_prompts: &mut VecDeque<(String, Vec<PromptImage>, Vec<PromptResource>)>,
     deferred_config_updates: &mut VecDeque<(SessionConfigTarget, SessionConfigValueId)>,
+    steering: PromptSteeringConfig,
 ) -> Result<bool> {
     let turn_diff_tracker =
         TurnDiffTracker::snapshot(diff_config.workspace_roots, diff_config.max_text_bytes).await;
@@ -5942,9 +6236,16 @@ async fn drive_prompt_turn(
     tokio::pin!(prompt);
 
     let mut cancel_sent = false;
+    // At most one `_session/steering` request runs at a time; codex-acp
+    // serializes them per session anyway, and one slot keeps the fallback
+    // ordering deterministic. Later steers wait in `steers.queued`, and
+    // payloads the agent reported as undelivered wait in `steers.fallbacks`
+    // (whether they are resent or dropped depends on how the turn ends).
+    let mut steers = TurnSteerState::default();
     loop {
         tokio::select! {
             prompt_result = &mut prompt => {
+                let turn_failed = prompt_result.is_err();
                 match prompt_result {
                     Ok(resp) => {
                         turn_diff_tracker
@@ -5969,7 +6270,56 @@ async fn drive_prompt_turn(
                         let _ = ui_tx.send(UiEvent::PromptFailed { message });
                     }
                 }
+                flush_pending_steers(
+                    conn,
+                    session_id,
+                    session_state,
+                    std::mem::take(&mut steers),
+                    ui_tx,
+                    deferred_prompts,
+                    turn_failed,
+                )
+                .await;
                 return Ok(true);
+            }
+            steer_outcome = async {
+                steers
+                    .in_flight
+                    .as_mut()
+                    .expect("branch runs only while a steer is in flight")
+                    .response
+                    .as_mut()
+                    .await
+            }, if steers.in_flight.is_some() => {
+                let steer = steers
+                    .in_flight
+                    .take()
+                    .expect("branch runs only while a steer is in flight");
+                // The promised resend only happens if the turn ends without
+                // failing; `flush_pending_steers` decides at turn end.
+                if let Some(parts) = apply_steer_outcome(
+                    conn,
+                    session_id,
+                    session_state,
+                    steer,
+                    steer_outcome,
+                    ui_tx,
+                    SteerFallbackDisposition::Resend,
+                )
+                .await
+                {
+                    steers.fallbacks.push_back(parts);
+                }
+                if let Some((text, images, resources)) = steers.queued.pop_front() {
+                    steers.in_flight = Some(start_steer(
+                        conn,
+                        session_id,
+                        text,
+                        images,
+                        resources,
+                        steering.side_prompt_policy,
+                    ));
+                }
             }
             maybe_cmd = ui_rx.recv() => {
                 match maybe_cmd {
@@ -6009,6 +6359,32 @@ async fn drive_prompt_turn(
                             "prompt queued; it will be sent when the current turn completes"
                                 .to_string(),
                         ));
+                    }
+                    Some(UiCommand::SteerPrompt {
+                        text,
+                        images,
+                        resources,
+                    }) => {
+                        // Steering a turn that is already being cancelled is
+                        // pointless; treat the message as the next prompt.
+                        if !steering.supported || cancel_sent {
+                            deferred_prompts.push_back((text, images, resources));
+                            let _ = ui_tx.send(UiEvent::Info(
+                                "prompt queued; it will be sent when the current turn completes"
+                                    .to_string(),
+                            ));
+                        } else if steers.in_flight.is_some() {
+                            steers.queued.push_back((text, images, resources));
+                        } else {
+                            steers.in_flight = Some(start_steer(
+                                conn,
+                                session_id,
+                                text,
+                                images,
+                                resources,
+                                steering.side_prompt_policy,
+                            ));
+                        }
                     }
                     Some(UiCommand::SetSessionConfigOption { target, value }) => {
                         deferred_config_updates.push_back((target, value));
@@ -8243,6 +8619,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn steering_capability_requires_a_true_supported_flag() {
+        let meta = |value: serde_json::Value| {
+            value
+                .as_object()
+                .cloned()
+                .expect("meta literals are objects")
+        };
+        assert!(steering_supported_from_meta(Some(&meta(
+            serde_json::json!({
+                "steering": { "supported": true }
+            })
+        ))));
+        assert!(!steering_supported_from_meta(Some(&meta(
+            serde_json::json!({ "steering": { "supported": false } })
+        ))));
+        assert!(!steering_supported_from_meta(Some(&meta(
+            serde_json::json!({ "steering": { "supported": "yes" } })
+        ))));
+        assert!(!steering_supported_from_meta(Some(&meta(
+            serde_json::json!({ "steering": {} })
+        ))));
+        assert!(!steering_supported_from_meta(Some(&meta(
+            serde_json::json!({})
+        ))));
+        assert!(!steering_supported_from_meta(None));
+    }
+
     fn current_select_value(option: &SessionConfigOption) -> Option<String> {
         match &option.kind {
             SessionConfigKind::Select(select) => Some(select.current_value.to_string()),
@@ -8973,6 +9377,128 @@ mod tests {
                     Ok(())
                 },
                 agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(transport, |_cx| async move {
+                futures::future::pending::<()>().await;
+                Ok(())
+            })
+            .await;
+    }
+
+    /// Mock agent for `_session/steering`. When `advertise` is set the
+    /// initialize response carries `_meta.steering.supported`. The first
+    /// prompt stays in flight until a steering request arrives (or the
+    /// fallback delay passes) and then completes — or errors, when
+    /// `fail_first_prompt` is set; later prompts resolve immediately.
+    /// Steering requests are logged and answered with `steer_outcome`.
+    async fn run_mock_agent_with_steering(
+        stream: tokio::io::DuplexStream,
+        advertise: bool,
+        steer_outcome: &'static str,
+        fail_first_prompt: bool,
+        prompts: Arc<std::sync::Mutex<Vec<String>>>,
+        steers: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        cancels: Arc<AtomicU64>,
+    ) {
+        let (r, w) = split(stream);
+        let transport = ByteStreams::new(w.compat_write(), r.compat());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let prompt_release = Arc::clone(&release);
+        let cancel_prompts = Arc::clone(&prompts);
+        let _ = AgentRole
+            .builder()
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::v1::InitializeRequest,
+                            responder,
+                            _cx| {
+                    let mut response =
+                        InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1);
+                    if advertise {
+                        let meta = serde_json::json!({ "steering": { "supported": true } })
+                            .as_object()
+                            .cloned()
+                            .expect("meta object");
+                        response = response.meta(meta);
+                    }
+                    responder.respond(response)
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: agent_client_protocol::schema::v1::NewSessionRequest,
+                            responder,
+                            _cx| {
+                    responder.respond(NewSessionResponse::new(SessionId::new("test-session")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: agent_client_protocol::schema::v1::PromptRequest,
+                            responder,
+                            cx: ConnectionTo<agent_client_protocol::Client>| {
+                    let text = req
+                        .prompt
+                        .iter()
+                        .map(content_block_text)
+                        .collect::<Vec<_>>()
+                        .join("");
+                    let first = {
+                        let mut log = prompts.lock().expect("prompt log");
+                        log.push(text);
+                        log.len() == 1
+                    };
+                    // Stream a chunk immediately so the turn is visibly in
+                    // flight before the racing steer arrives.
+                    let _ = cx.send_notification(SessionNotification::new(
+                        req.session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                            TextContent::new("ack"),
+                        ))),
+                    ));
+                    if first {
+                        let release = Arc::clone(&prompt_release);
+                        tokio::spawn(async move {
+                            let _ =
+                                tokio::time::timeout(Duration::from_secs(2), release.notified())
+                                    .await;
+                            let _ = if fail_first_prompt {
+                                responder.respond_with_result(Err(
+                                    agent_client_protocol::Error::internal_error(),
+                                ))
+                            } else {
+                                responder.respond(PromptResponse::new(StopReason::EndTurn))
+                            };
+                        });
+                        Ok(())
+                    } else {
+                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: UntypedMessage, responder, _cx| {
+                    assert_eq!(req.method, SESSION_STEERING_METHOD);
+                    steers.lock().expect("steer log").push(req.params.clone());
+                    release.notify_one();
+                    responder.respond(serde_json::json!({ "outcome": steer_outcome }))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_notification(
+                async move |_notif: agent_client_protocol::schema::v1::CancelNotification, _cx| {
+                    cancels.fetch_add(1, Ordering::SeqCst);
+                    // Record into the shared event log so tests can assert
+                    // the cancel's ORDER relative to prompt requests: a
+                    // cancel arriving after the owned resend would kill the
+                    // resent turn instead of the detached one.
+                    cancel_prompts
+                        .lock()
+                        .expect("prompt log")
+                        .push("«session/cancel»".to_string());
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
             )
             .connect_with(transport, |_cx| async move {
                 futures::future::pending::<()>().await;
@@ -10565,6 +11091,361 @@ mod tests {
         cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
         let _ = tokio::time::timeout(Duration::from_secs(2), client_task).await;
         agent_task.abort();
+    }
+
+    struct SteeringRig {
+        prompts: Arc<std::sync::Mutex<Vec<String>>>,
+        steers: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        cancels: Arc<AtomicU64>,
+        cmd_tx: mpsc::UnboundedSender<UiCommand>,
+        ui_rx: mpsc::UnboundedReceiver<UiEvent>,
+        client_task: tokio::task::JoinHandle<Result<()>>,
+        agent_task: tokio::task::JoinHandle<()>,
+        /// Keeps the runtime's workspace directory alive for the run.
+        _workspace: tempfile::TempDir,
+    }
+
+    impl SteeringRig {
+        async fn shutdown(self) {
+            self.cmd_tx.send(UiCommand::Shutdown).expect("shutdown");
+            let _ = tokio::time::timeout(Duration::from_secs(2), self.client_task).await;
+            self.agent_task.abort();
+        }
+    }
+
+    /// Rig for the steering tests: spawn the steering mock plus a client,
+    /// confirm the advertised capability on `Connected`, and start one turn
+    /// that stays in flight until the mock's steer/fallback releases it.
+    async fn steering_rig(advertise: bool, steer_outcome: &'static str) -> SteeringRig {
+        steering_rig_with(advertise, steer_outcome, false).await
+    }
+
+    async fn steering_rig_with(
+        advertise: bool,
+        steer_outcome: &'static str,
+        fail_first_prompt: bool,
+    ) -> SteeringRig {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = split(client_side);
+        let client_transport = ByteStreams::new(cw.compat_write(), cr.compat());
+
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let steers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cancels = Arc::new(AtomicU64::new(0));
+        let agent_task = tokio::spawn(run_mock_agent_with_steering(
+            agent_side,
+            advertise,
+            steer_outcome,
+            fail_first_prompt,
+            Arc::clone(&prompts),
+            Arc::clone(&steers),
+            Arc::clone(&cancels),
+        ));
+
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+        let client_task = tokio::spawn(drive_client(
+            client_transport,
+            temp.path().to_path_buf(),
+            None,
+            ui_tx,
+            cmd_rx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let mut advertised = None;
+        loop {
+            let ev = tokio::time::timeout(EVENT_DEADLINE, ui_rx.recv())
+                .await
+                .expect("timed out waiting for SessionStarted")
+                .expect("ui event channel closed");
+            match ev {
+                UiEvent::Connected {
+                    steering_supported, ..
+                } => advertised = Some(steering_supported),
+                UiEvent::SessionStarted { session_id, .. } => {
+                    assert_eq!(session_id, "test-session");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            advertised,
+            Some(advertise),
+            "Connected must mirror the agent's steering advertisement"
+        );
+
+        cmd_tx
+            .send(UiCommand::SendPrompt {
+                text: "start work".to_string(),
+                images: Vec::new(),
+                resources: Vec::new(),
+            })
+            .expect("send prompt");
+        cmd_tx
+            .send(UiCommand::SteerPrompt {
+                text: "steer me".to_string(),
+                images: Vec::new(),
+                resources: Vec::new(),
+            })
+            .expect("send steer");
+
+        SteeringRig {
+            prompts,
+            steers,
+            cancels,
+            cmd_tx,
+            ui_rx,
+            client_task,
+            agent_task,
+            _workspace: temp,
+        }
+    }
+
+    /// Collect UI events until `count` `PromptDone`s were seen; returns every
+    /// Info/Warning text observed along the way.
+    async fn collect_until_prompt_done(
+        ui_rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+        count: usize,
+    ) -> Vec<String> {
+        let mut notices = Vec::new();
+        let mut done = 0;
+        while done < count {
+            let ev = tokio::time::timeout(EVENT_DEADLINE, ui_rx.recv())
+                .await
+                .expect("timed out waiting for PromptDone")
+                .expect("ui event channel closed");
+            match ev {
+                UiEvent::Info(text) | UiEvent::Warning(text) => notices.push(text),
+                UiEvent::PromptDone { .. } => done += 1,
+                UiEvent::PromptFailed { message } => panic!("prompt failed: {message}"),
+                UiEvent::Fatal(message) => panic!("fatal: {message}"),
+                _ => {}
+            }
+        }
+        notices
+    }
+
+    #[tokio::test]
+    async fn steer_prompt_mid_turn_is_injected_and_not_resent() {
+        let mut rig = steering_rig(true, "injected").await;
+
+        let mut notices = collect_until_prompt_done(&mut rig.ui_rx, 1).await;
+        // The injection confirmation may resolve after the turn does; keep
+        // draining until it shows up.
+        while !notices
+            .iter()
+            .any(|text| text == "message steered into the running turn")
+        {
+            let ev = tokio::time::timeout(EVENT_DEADLINE, rig.ui_rx.recv())
+                .await
+                .expect("timed out waiting for the steering confirmation")
+                .expect("ui event channel closed");
+            if let UiEvent::Info(text) | UiEvent::Warning(text) = ev {
+                notices.push(text);
+            }
+        }
+
+        let steer = rig.steers.lock().expect("steer log")[0].clone();
+        assert_eq!(steer["sessionId"], "test-session");
+        assert_eq!(steer["prompt"][0]["type"], "text");
+        assert_eq!(steer["prompt"][0]["text"], "steer me");
+        assert_eq!(
+            steer["_meta"]["steering"]["idleBehavior"], "promptRequired",
+            "the runtime must opt into the host-owned idle fallback"
+        );
+
+        // An injected message joins the running turn; it must never be
+        // resent as its own prompt, and nothing gets cancelled.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            rig.prompts.lock().expect("prompt log").as_slice(),
+            ["start work"]
+        );
+        assert_eq!(rig.cancels.load(Ordering::SeqCst), 0);
+
+        rig.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn steer_answered_started_new_turn_is_cancelled_and_resent_owned() {
+        // codex-acp's idle-race answer starts a detached turn mjolnir has no
+        // prompt request for and no way to await. The runtime reclaims the
+        // message: cancel the detached turn, then deliver the message as an
+        // owned prompt with a real completion path.
+        let mut rig = steering_rig(true, "startedNewTurn").await;
+
+        let mut notices = Vec::new();
+        let mut saw_permission_clear = false;
+        let mut done = 0;
+        while done < 2 {
+            let ev = tokio::time::timeout(EVENT_DEADLINE, rig.ui_rx.recv())
+                .await
+                .expect("timed out waiting for the owned resend")
+                .expect("ui event channel closed");
+            match ev {
+                UiEvent::Info(text) | UiEvent::Warning(text) => notices.push(text),
+                UiEvent::PromptDone { .. } => done += 1,
+                // The detached turn may already have raised a permission
+                // request; its prompt must not stay actionable.
+                UiEvent::CancelPendingPermissions => saw_permission_clear = true,
+                UiEvent::PromptFailed { message } => panic!("prompt failed: {message}"),
+                UiEvent::Fatal(message) => panic!("fatal: {message}"),
+                _ => {}
+            }
+        }
+        assert!(
+            notices
+                .iter()
+                .any(|text| text.contains("cancelling that turn")),
+            "the reclaim must be narrated: {notices:?}"
+        );
+        assert!(
+            saw_permission_clear,
+            "pending permission prompts must be cleared alongside the cancel"
+        );
+        wait_for_prompt_count(&rig.prompts, 3).await;
+        // Order matters: the cancel must reach the agent BEFORE the owned
+        // resend, or it would kill the resent turn instead of the detached
+        // one. The mock records both in one wire-ordered log.
+        assert_eq!(
+            rig.prompts.lock().expect("prompt log").as_slice(),
+            ["start work", "«session/cancel»", "steer me"]
+        );
+        assert_eq!(rig.cancels.load(Ordering::SeqCst), 1);
+
+        rig.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn steer_prompt_missing_the_turn_is_resent_as_the_next_prompt() {
+        // `promptRequired` is the agent's answer when the turn settled before
+        // the steer landed: the message stays host-owned and must be
+        // delivered as an ordinary prompt right after the turn.
+        let mut rig = steering_rig(true, "promptRequired").await;
+
+        let notices = collect_until_prompt_done(&mut rig.ui_rx, 2).await;
+        assert!(
+            notices
+                .iter()
+                .any(|text| text.contains("the turn ended before the message could be steered")),
+            "the miss must be narrated: {notices:?}"
+        );
+        wait_for_prompt_count(&rig.prompts, 2).await;
+        assert_eq!(
+            rig.prompts.lock().expect("prompt log").as_slice(),
+            ["start work", "steer me"]
+        );
+        assert_eq!(rig.steers.lock().expect("steer log").len(), 1);
+
+        rig.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn steer_fallbacks_preserve_submission_order_when_the_turn_ends() {
+        // The connection is only used by the `startedNewTurn` reclaim path;
+        // an unanswered duplex peer keeps it inert for this outcome.
+        let (client_side, _agent_side) = tokio::io::duplex(1024);
+        let (r, w) = split(client_side);
+        let transport = ByteStreams::new(w.compat_write(), r.compat());
+        let _ = Client
+            .builder()
+            .connect_with(transport, |conn: ConnectionTo<Agent>| async move {
+                let steers = TurnSteerState {
+                    in_flight: Some(PendingSteer {
+                        response: Box::pin(async {
+                            Ok(serde_json::json!({ "outcome": "promptRequired" }))
+                        }),
+                        text: "second".to_string(),
+                        images: Vec::new(),
+                        resources: Vec::new(),
+                    }),
+                    queued: VecDeque::from([("third".to_string(), Vec::new(), Vec::new())]),
+                    fallbacks: VecDeque::from([("first".to_string(), Vec::new(), Vec::new())]),
+                };
+                let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+                let mut deferred = VecDeque::new();
+
+                flush_pending_steers(
+                    &conn,
+                    &SessionId::new("test-session"),
+                    &RuntimeSessionState::new(),
+                    steers,
+                    &ui_tx,
+                    &mut deferred,
+                    false,
+                )
+                .await;
+
+                assert_eq!(
+                    deferred
+                        .into_iter()
+                        .map(|(text, _, _)| text)
+                        .collect::<Vec<_>>(),
+                    ["first", "second", "third"]
+                );
+                Ok(())
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn steer_fallback_is_dropped_when_the_turn_fails() {
+        // The TUI drops queued prompts on PromptFailed so a degraded runtime
+        // is not auto-resubmitted into before the user sees the failure. An
+        // undelivered steer must follow the same policy: dropped with a
+        // warning, never replayed as the next prompt.
+        let mut rig = steering_rig_with(true, "promptRequired", true).await;
+
+        let mut saw_failed = false;
+        let mut drop_notice = None;
+        while !saw_failed || drop_notice.is_none() {
+            let ev = tokio::time::timeout(EVENT_DEADLINE, rig.ui_rx.recv())
+                .await
+                .expect("timed out waiting for the failure and drop notice")
+                .expect("ui event channel closed");
+            match ev {
+                UiEvent::PromptFailed { .. } => saw_failed = true,
+                UiEvent::Warning(text) if text.contains("dropped") => drop_notice = Some(text),
+                _ => {}
+            }
+        }
+
+        // Nothing may be resent into the failed runtime.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            rig.prompts.lock().expect("prompt log").as_slice(),
+            ["start work"]
+        );
+        assert_eq!(rig.steers.lock().expect("steer log").len(), 1);
+
+        rig.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn steer_prompt_without_agent_support_queues_until_turn_end() {
+        let mut rig = steering_rig(false, "injected").await;
+
+        let notices = collect_until_prompt_done(&mut rig.ui_rx, 2).await;
+        assert!(
+            notices.iter().any(
+                |text| text == "prompt queued; it will be sent when the current turn completes"
+            ),
+            "queueing must stay visible when the agent cannot steer: {notices:?}"
+        );
+        wait_for_prompt_count(&rig.prompts, 2).await;
+        assert_eq!(
+            rig.prompts.lock().expect("prompt log").as_slice(),
+            ["start work", "steer me"]
+        );
+        assert!(
+            rig.steers.lock().expect("steer log").is_empty(),
+            "no steering request may be sent to an agent that does not advertise it"
+        );
+
+        rig.shutdown().await;
     }
 
     #[tokio::test]
