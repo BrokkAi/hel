@@ -57,6 +57,37 @@ pub(crate) struct RenameEditor {
     pub(crate) focus: RenameFocus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepositoryOriginDialog {
+    pub(crate) session_id: String,
+    pub(crate) repository_id: String,
+    pub(crate) missing_commit: String,
+    pub(crate) archived_origin: String,
+    pub(crate) configured_origin: String,
+    pub(crate) replacement: String,
+    pub(crate) error: Option<String>,
+    pub(crate) focus: RepositoryOriginFocus,
+    pub(crate) launch: Box<DashboardAction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepositoryOriginFocus {
+    Field,
+    Cancel,
+    Validate,
+}
+
+const REPOSITORY_ORIGIN_BUTTONS: &[&str] = &["Cancel", "Check origin"];
+
+impl RepositoryOriginFocus {
+    fn button_index(self) -> usize {
+        match self {
+            Self::Cancel => 0,
+            Self::Field | Self::Validate => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RenameFocus {
     Field,
@@ -596,6 +627,46 @@ pub(crate) fn render_rename_editor(frame: &mut Frame, area: Rect, editor: &Renam
     frame.render_widget(paragraph, popup);
 }
 
+pub(crate) fn render_repository_origin(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &RepositoryOriginDialog,
+) {
+    let mut lines = vec![
+        Line::raw(format!("Repository: {}", dialog.repository_id)),
+        Line::raw(""),
+        Line::raw(format!(
+            "Checkpoint base {} is absent from the configured source.",
+            dialog.missing_commit
+        )),
+        Line::raw(format!("Archived origin: {}", dialog.archived_origin)),
+        Line::raw(format!("Configured source: {}", dialog.configured_origin)),
+        Line::raw(""),
+        Line::raw("Did this repository move? Enter its new GitHub origin or absolute local path:"),
+        Line::styled(dialog.replacement.clone(), Style::default().fg(Color::Cyan)),
+    ];
+    if let Some(error) = &dialog.error {
+        lines.push(Line::styled(
+            error.clone(),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    lines.extend([
+        Line::raw(""),
+        focused_buttons(REPOSITORY_ORIGIN_BUTTONS, dialog.focus.button_index()),
+    ]);
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Repository history is missing "),
+        )
+        .wrap(Wrap { trim: false });
+    let popup = centered_rect(76, popup_height(&paragraph, 76, 14, area), area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
 pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &ConfirmDialog) {
     let confirmation = &dialog.confirmation;
     // Minimum height per dialog; `popup_height` grows it to fit wrapped content.
@@ -688,6 +759,100 @@ pub(crate) fn render_confirmation(frame: &mut Frame, area: Rect, dialog: &Confir
 }
 
 impl DashboardState {
+    pub fn show_repository_origin_dialog(
+        &mut self,
+        session_id: String,
+        repository_id: String,
+        missing_commit: String,
+        archived_origin: String,
+        configured_origin: String,
+        launch: DashboardAction,
+    ) {
+        self.mode = Mode::RepositoryOrigin(RepositoryOriginDialog {
+            session_id,
+            repository_id,
+            missing_commit,
+            archived_origin,
+            replacement: String::new(),
+            configured_origin,
+            error: None,
+            focus: RepositoryOriginFocus::Field,
+            launch: Box::new(launch),
+        });
+    }
+
+    pub fn apply_repository_origin_failure(&mut self, repository_id: &str, error: String) {
+        if let Mode::RepositoryOrigin(dialog) = &mut self.mode
+            && dialog.repository_id == repository_id
+        {
+            dialog.error = Some(error);
+            dialog.focus = RepositoryOriginFocus::Field;
+        }
+    }
+
+    pub fn finish_resume_repository_preflight(&mut self) {
+        self.cancel_modal();
+    }
+
+    pub(crate) fn handle_repository_origin_key(
+        &mut self,
+        code: KeyCode,
+        mut dialog: RepositoryOriginDialog,
+    ) -> DashboardAction {
+        match code {
+            KeyCode::Esc => {
+                self.cancel_modal();
+                return DashboardAction::None;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                dialog.focus = cycle_control(
+                    dialog.focus,
+                    &[
+                        RepositoryOriginFocus::Field,
+                        RepositoryOriginFocus::Cancel,
+                        RepositoryOriginFocus::Validate,
+                    ],
+                    code == KeyCode::BackTab,
+                );
+            }
+            KeyCode::Backspace if dialog.focus == RepositoryOriginFocus::Field => {
+                dialog.replacement.pop();
+                dialog.error = None;
+            }
+            KeyCode::Char(character) if dialog.focus == RepositoryOriginFocus::Field => {
+                dialog.replacement.push(character);
+                dialog.error = None;
+            }
+            KeyCode::Enter if dialog.focus == RepositoryOriginFocus::Cancel => {
+                self.cancel_modal();
+                return DashboardAction::None;
+            }
+            KeyCode::Enter
+                if matches!(
+                    dialog.focus,
+                    RepositoryOriginFocus::Field | RepositoryOriginFocus::Validate
+                ) =>
+            {
+                if dialog.replacement.trim().is_empty() {
+                    dialog.error = Some("Enter the repository's new origin.".into());
+                    dialog.focus = RepositoryOriginFocus::Field;
+                } else {
+                    let action = DashboardAction::ReplaceResumeRepositoryOrigin {
+                        session_id: dialog.session_id.clone(),
+                        repository_id: dialog.repository_id.clone(),
+                        replacement: dialog.replacement.clone(),
+                        launch: dialog.launch.clone(),
+                    };
+                    self.mode = Mode::RepositoryOrigin(dialog);
+                    return action;
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::RepositoryOrigin(dialog);
+        DashboardAction::None
+    }
+
     /// Open the container editor for the selected session, if that session
     /// runs on a container-backed target.
     pub(crate) fn begin_container_edit(&mut self) {
@@ -2151,5 +2316,54 @@ mod tests {
             DashboardAction::None
         );
         assert!(matches!(dashboard.mode, Mode::Dashboard));
+    }
+
+    #[test]
+    fn missing_checkpoint_history_dialog_accepts_a_replacement_origin() {
+        let launch = DashboardAction::ResumeSession {
+            session_id: "session-1".into(),
+            profile_id: "codex-1".into(),
+            target_template_id: "podman".into(),
+            additional_mounts: Vec::new(),
+            resource_allocation: None,
+            discard_queue: false,
+        };
+        let mut dashboard = dashboard_with_session(stopped_session());
+        dashboard.show_repository_origin_dialog(
+            "session-1".into(),
+            "bifrost".into(),
+            "b41dc78".into(),
+            "https://github.com/BrokkAi/bifrost.git".into(),
+            "BrokkAi/bifrost".into(),
+            launch.clone(),
+        );
+        dashboard.handle_paste("BrokkAi/bifrost-dev\n");
+
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Enter)),
+            DashboardAction::ReplaceResumeRepositoryOrigin {
+                session_id: "session-1".into(),
+                repository_id: "bifrost".into(),
+                replacement: "BrokkAi/bifrost-dev".into(),
+                launch: Box::new(launch),
+            }
+        );
+        let Mode::RepositoryOrigin(dialog) = &dashboard.mode else {
+            panic!("expected repository origin dialog");
+        };
+        assert_eq!(dialog.missing_commit, "b41dc78");
+
+        dashboard.apply_repository_origin_failure(
+            "bifrost",
+            "That origin does not contain checkpoint base b41dc78.".into(),
+        );
+        let Mode::RepositoryOrigin(dialog) = &dashboard.mode else {
+            panic!("expected repository origin dialog");
+        };
+        assert_eq!(dialog.focus, RepositoryOriginFocus::Field);
+        assert_eq!(
+            dialog.error.as_deref(),
+            Some("That origin does not contain checkpoint base b41dc78.")
+        );
     }
 }

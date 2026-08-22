@@ -394,6 +394,21 @@ pub struct VerifiedArchiveMetadata {
     pub archive_sha256: String,
 }
 
+/// Repository state retained by the resume source preflight. The rest of the
+/// archive is still streamed, hashed, and validated without being held in
+/// memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRepositoryBundle {
+    pub metadata: RepositoryMetadata,
+    pub committed_bundle: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRepositoryBundles {
+    pub archive_sha256: String,
+    pub repositories: Vec<VerifiedRepositoryBundle>,
+}
+
 #[derive(Debug)]
 pub enum CloseVerification {
     Verified {
@@ -508,6 +523,55 @@ pub fn verify_archive_streaming(path: &Path) -> Result<VerifiedArchiveMetadata> 
         manifest: contents.manifest,
         canonical_session: contents.canonical_session,
         archive_sha256: digest_reader(&mut file)?,
+    })
+}
+
+/// Verify an archive while retaining only its Git bundle payloads.
+///
+/// Resume uses this before provisioning to prove that the configured sources
+/// still provide every prerequisite of each thin bundle. Native artifacts and
+/// patches can be very large, so they stay on the streaming path.
+pub fn verify_repository_bundles_streaming(path: &Path) -> Result<VerifiedRepositoryBundles> {
+    let contents = read_verified_zip(path, PayloadRetention::CanonicalAndGitBundles)?;
+    let repositories = contents
+        .manifest
+        .repositories
+        .iter()
+        .map(|repository| {
+            let role = PayloadRole::GitBundle {
+                repository_id: repository.metadata.id.clone(),
+            };
+            let descriptor = contents
+                .manifest
+                .payloads
+                .iter()
+                .find(|descriptor| descriptor.role == role)
+                .with_context(|| {
+                    format!(
+                        "repository {:?} has no committed bundle payload",
+                        repository.metadata.id
+                    )
+                })?;
+            let committed_bundle = contents
+                .payloads
+                .get(&descriptor.path)
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "verified committed bundle for repository {:?} was not retained",
+                        repository.metadata.id
+                    )
+                })?;
+            Ok(VerifiedRepositoryBundle {
+                metadata: repository.metadata.clone(),
+                committed_bundle,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    Ok(VerifiedRepositoryBundles {
+        archive_sha256: digest_reader(&mut file)?,
+        repositories,
     })
 }
 
@@ -840,6 +904,7 @@ fn compress_entry(entry: &PlannedEntry<'_>) -> Result<Vec<u8>> {
 enum PayloadRetention {
     All,
     CanonicalOnly,
+    CanonicalAndGitBundles,
 }
 
 struct VerifiedZipContents {
@@ -876,7 +941,10 @@ fn open_archive(path: &Path) -> Result<zip::ZipArchive<File>> {
 
 /// Payload bodies the caller keeps.
 fn retains_payload(retention: PayloadRetention, role: &PayloadRole) -> bool {
-    retention == PayloadRetention::All || *role == PayloadRole::CanonicalSession
+    retention == PayloadRetention::All
+        || *role == PayloadRole::CanonicalSession
+        || (retention == PayloadRetention::CanonicalAndGitBundles
+            && matches!(role, PayloadRole::GitBundle { .. }))
 }
 
 /// Part bodies the reader has to hold until reassembly. Tar safety is a
@@ -1038,10 +1106,13 @@ fn read_verified_zip(path: &Path, retention: PayloadRetention) -> Result<Verifie
                 "archive contains duplicate canonical session payloads"
             );
         }
-        if retention == PayloadRetention::All {
+        if retention == PayloadRetention::All
+            || (retention == PayloadRetention::CanonicalAndGitBundles
+                && matches!(descriptor.role, PayloadRole::GitBundle { .. }))
+        {
             payloads.insert(
                 descriptor.path.clone(),
-                bytes.expect("all payloads are retained by the full reader"),
+                bytes.expect("selected payloads are retained by the reader"),
             );
         }
     }
@@ -2819,6 +2890,22 @@ mod tests {
         assert_eq!(verified.canonical_session, input().canonical_session);
         assert_eq!(verified.manifest.schema_version, ARCHIVE_SCHEMA_VERSION);
         assert_eq!(verified.archive_sha256.len(), 64);
+        let repository_bundles = verify_repository_bundles_streaming(&path).unwrap();
+        assert_eq!(repository_bundles.archive_sha256, verified.archive_sha256);
+        assert_eq!(
+            repository_bundles
+                .repositories
+                .iter()
+                .map(|repository| (
+                    repository.metadata.id.as_str(),
+                    repository.committed_bundle.as_slice(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("hel", b"bundle-hel".as_slice()),
+                ("worker", b"bundle-worker".as_slice()),
+            ]
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

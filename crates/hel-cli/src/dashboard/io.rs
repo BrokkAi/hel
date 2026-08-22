@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use hel::hel_config::{HarnessKind, HelConfig, ProjectBundle, ProjectRepository};
+use hel::hel_controller::ResumeRepositorySourcePreflight;
 use hel::hel_controller::{Controller, SessionLaunchOptions};
 use hel::hel_import::{configured_bundle_for_local, configured_bundle_for_origin};
 use hel::hel_setup::github_repository_from_origin;
@@ -89,6 +90,11 @@ pub(crate) enum DashboardIoUpdate {
         launch: Box<DashboardAction>,
         result: std::result::Result<Option<(String, String)>, String>,
     },
+    ResumeRepositoryPreflight {
+        launch: Box<DashboardAction>,
+        submitted_repository_id: Option<String>,
+        result: Box<std::result::Result<ResumeRepositoryPreflightApply, String>>,
+    },
     ProjectValidation {
         directory: String,
         result: std::result::Result<(), String>,
@@ -146,6 +152,11 @@ pub(crate) struct ImportedDashboardSessionApply {
 pub(crate) struct CreatedBundleUpdate {
     config: HelConfig,
     bundle_id: String,
+}
+
+pub(crate) struct ResumeRepositoryPreflightApply {
+    pub(crate) config: Option<HelConfig>,
+    pub(crate) preflight: ResumeRepositorySourcePreflight,
 }
 
 pub(crate) struct LifecycleReload {
@@ -808,7 +819,18 @@ impl DashboardContext {
             DashboardIoUpdate::SessionMountValidation { launch, result } => match result {
                 Ok(None) => {
                     self.dashboard.finish_session_mount_preflight();
-                    super::actions::start_session_launch(self, *launch);
+                    match *launch {
+                        DashboardAction::PreflightResumeRepositories { launch } => {
+                            if let Err(error) =
+                                super::actions::start_resume_repository_preflight(self, launch)
+                            {
+                                self.dashboard.set_notice(format!(
+                                    "Could not check checkpoint repositories: {error:#}"
+                                ));
+                            }
+                        }
+                        launch => super::actions::start_session_launch(self, launch),
+                    }
                 }
                 Ok(Some((source, error))) => {
                     self.dashboard
@@ -817,6 +839,56 @@ impl DashboardContext {
                 Err(error) => self
                     .dashboard
                     .set_notice(format!("Could not check attached directories: {error}")),
+            },
+            DashboardIoUpdate::ResumeRepositoryPreflight {
+                launch,
+                submitted_repository_id,
+                result,
+            } => match *result {
+                Ok(applied) => {
+                    if let Some(config) = applied.config {
+                        self.controller.config = config.clone();
+                        self.dashboard.set_config(config);
+                    }
+                    match applied.preflight {
+                        ResumeRepositorySourcePreflight::Ready => {
+                            self.dashboard.finish_resume_repository_preflight();
+                            super::actions::start_session_launch(self, *launch);
+                        }
+                        ResumeRepositorySourcePreflight::RepositoryMoved(mismatch) => {
+                            if submitted_repository_id.as_deref()
+                                == Some(mismatch.repository_id.as_str())
+                            {
+                                self.dashboard.apply_repository_origin_failure(
+                                    &mismatch.repository_id,
+                                    format!(
+                                        "That origin does not contain checkpoint base {}.",
+                                        mismatch.missing_commit
+                                    ),
+                                );
+                            } else {
+                                self.dashboard.show_repository_origin_dialog(
+                                    mismatch.session_id,
+                                    mismatch.repository_id,
+                                    mismatch.missing_commit,
+                                    mismatch.archived_origin,
+                                    mismatch.configured_origin,
+                                    *launch,
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    if let Some(repository_id) = submitted_repository_id {
+                        self.dashboard
+                            .apply_repository_origin_failure(&repository_id, error);
+                    } else {
+                        self.dashboard.set_notice(format!(
+                            "Could not check checkpoint repositories: {error}"
+                        ));
+                    }
+                }
             },
             DashboardIoUpdate::ProjectValidation { directory, result } => self
                 .dashboard

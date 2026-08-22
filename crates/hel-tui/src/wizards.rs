@@ -2716,31 +2716,11 @@ impl DashboardState {
         }
     }
 
-    fn resume_session_action(
-        &mut self,
-        wizard: ResumeWizard,
-        profile_id: String,
-    ) -> DashboardAction {
-        let action = DashboardAction::ResumeSession {
-            session_id: wizard.session_id,
-            profile_id,
-            target_template_id: nth_key(&self.config.targets, wizard.target),
-            additional_mounts: wizard.mounts.mounts,
-            resource_allocation: wizard.resource_allocation,
-            discard_queue: wizard.discard_queue,
-        };
-        self.cancel_modal();
-        action
-    }
-
     fn preflight_resume_session_action(
         &mut self,
         wizard: ResumeWizard,
         profile_id: String,
     ) -> DashboardAction {
-        if wizard.mounts.mounts.is_empty() {
-            return self.resume_session_action(wizard, profile_id);
-        }
         let target_template_id = nth_key(&self.config.targets, wizard.target);
         let mounts = wizard.mounts.mounts.clone();
         let launch = DashboardAction::ResumeSession {
@@ -2752,10 +2732,17 @@ impl DashboardState {
             discard_queue: wizard.discard_queue,
         };
         self.mode = Mode::Resume(wizard);
-        DashboardAction::ValidateSessionMounts {
-            target_template_id,
-            mounts,
+        let preflight = DashboardAction::PreflightResumeRepositories {
             launch: Box::new(launch),
+        };
+        if mounts.is_empty() {
+            preflight
+        } else {
+            DashboardAction::ValidateSessionMounts {
+                target_template_id,
+                mounts,
+                launch: Box::new(preflight),
+            }
         }
     }
 
@@ -3684,16 +3671,18 @@ mod tests {
         dashboard.handle_key(key(KeyCode::Enter));
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Enter)),
-            DashboardAction::ResumeSession {
-                session_id: "session-1".into(),
-                profile_id: "claude-1".into(),
-                target_template_id: "podman".into(),
-                additional_mounts: vec![],
-                resource_allocation: Some(SessionResourceAllocation::Container {
-                    cpus: BASELINE_CPUS,
-                    memory_bytes: BASELINE_MEMORY_BYTES,
+            DashboardAction::PreflightResumeRepositories {
+                launch: Box::new(DashboardAction::ResumeSession {
+                    session_id: "session-1".into(),
+                    profile_id: "claude-1".into(),
+                    target_template_id: "podman".into(),
+                    additional_mounts: vec![],
+                    resource_allocation: Some(SessionResourceAllocation::Container {
+                        cpus: BASELINE_CPUS,
+                        memory_bytes: BASELINE_MEMORY_BYTES,
+                    }),
+                    discard_queue: false,
                 }),
-                discard_queue: false,
             }
         );
     }
@@ -3808,20 +3797,22 @@ mod tests {
                     destination: "/mnt/cache".into(),
                     read_only: false,
                 }],
-                launch: Box::new(DashboardAction::ResumeSession {
-                    session_id: "session-1".into(),
-                    profile_id: "codex-1".into(),
-                    target_template_id: "podman".into(),
-                    additional_mounts: vec![AdditionalMount {
-                        source: "/opt/cache".into(),
-                        destination: "/mnt/cache".into(),
-                        read_only: false,
-                    }],
-                    resource_allocation: Some(SessionResourceAllocation::Container {
-                        cpus: BASELINE_CPUS,
-                        memory_bytes: BASELINE_MEMORY_BYTES,
+                launch: Box::new(DashboardAction::PreflightResumeRepositories {
+                    launch: Box::new(DashboardAction::ResumeSession {
+                        session_id: "session-1".into(),
+                        profile_id: "codex-1".into(),
+                        target_template_id: "podman".into(),
+                        additional_mounts: vec![AdditionalMount {
+                            source: "/opt/cache".into(),
+                            destination: "/mnt/cache".into(),
+                            read_only: false,
+                        }],
+                        resource_allocation: Some(SessionResourceAllocation::Container {
+                            cpus: BASELINE_CPUS,
+                            memory_bytes: BASELINE_MEMORY_BYTES,
+                        }),
+                        discard_queue: false,
                     }),
-                    discard_queue: false,
                 }),
             }
         );

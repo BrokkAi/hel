@@ -20,7 +20,7 @@ use hel::hel_targets::DeploymentCapacityKind;
 
 use crate::dialogs::{
     render_confirmation, render_container_editor, render_import_bundle_confirmation,
-    render_import_progress, render_rename_editor,
+    render_import_progress, render_rename_editor, render_repository_origin,
 };
 use crate::ingest::{SessionDetail, SessionOperationDisplay, TranscriptHydration};
 use crate::resume::{render_resume_dialog, resume_sessions_pane};
@@ -82,6 +82,7 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
         Mode::New(wizard) => render_new_wizard(frame, area, dashboard, wizard),
         Mode::Resume(wizard) => render_resume_wizard(frame, area, dashboard, wizard),
         Mode::ResumeDialog(dialog) => render_resume_dialog(frame, area, dashboard, dialog),
+        Mode::RepositoryOrigin(dialog) => render_repository_origin(frame, area, dialog),
         Mode::Rename(editor) => render_rename_editor(frame, area, editor),
         Mode::EditContainer(editor) => render_container_editor(frame, area, editor),
         Mode::Importing(progress) => render_import_progress(frame, area, progress),
@@ -325,6 +326,7 @@ fn render_adaptive_dashboard(
         Mode::New(wizard) => render_new_wizard(frame, frame_area, dashboard, wizard),
         Mode::Resume(wizard) => render_resume_wizard(frame, frame_area, dashboard, wizard),
         Mode::ResumeDialog(dialog) => render_resume_dialog(frame, frame_area, dashboard, dialog),
+        Mode::RepositoryOrigin(dialog) => render_repository_origin(frame, frame_area, dialog),
         Mode::Rename(editor) => render_rename_editor(frame, frame_area, editor),
         Mode::EditContainer(editor) => render_container_editor(frame, frame_area, editor),
         Mode::Importing(progress) => render_import_progress(frame, frame_area, progress),

@@ -19,7 +19,7 @@ use hel::hel_targets::AdditionalMount;
 
 use crate::dialogs::{
     ConfirmDialog, Confirmation, ContainerEditor, FORCE_CONFIRMATION, ImportBundleConfirmation,
-    ImportProgress, RenameEditor, RenameFocus,
+    ImportProgress, RenameEditor, RenameFocus, RepositoryOriginDialog,
 };
 use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay, TranscriptHydration};
 use crate::resume::ResumeDialog;
@@ -93,6 +93,15 @@ pub enum DashboardAction {
         additional_mounts: Vec<AdditionalMount>,
         resource_allocation: Option<SessionResourceAllocation>,
         discard_queue: bool,
+    },
+    PreflightResumeRepositories {
+        launch: Box<DashboardAction>,
+    },
+    ReplaceResumeRepositoryOrigin {
+        session_id: String,
+        repository_id: String,
+        replacement: String,
+        launch: Box<DashboardAction>,
     },
     CancelOperation {
         session_id: String,
@@ -220,6 +229,7 @@ pub(crate) enum Mode {
     Resume(ResumeWizard),
     /// The unified picker for every session that is not live.
     ResumeDialog(ResumeDialog),
+    RepositoryOrigin(RepositoryOriginDialog),
     Rename(RenameEditor),
     EditContainer(ContainerEditor),
     Importing(ImportProgress),
@@ -385,6 +395,7 @@ impl DashboardState {
             Mode::New(wizard) => self.handle_new_key(key.code, wizard),
             Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
             Mode::ResumeDialog(dialog) => self.handle_resume_dialog_key(key, dialog),
+            Mode::RepositoryOrigin(dialog) => self.handle_repository_origin_key(key.code, dialog),
             Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
             Mode::EditContainer(editor) => self.handle_container_edit_key(key.code, editor),
             // The only control is the Cancel button, so Enter presses it too.
@@ -442,6 +453,12 @@ impl DashboardState {
                         .take(remaining)
                         .map(|character| character.to_ascii_uppercase()),
                 );
+            }
+            Mode::RepositoryOrigin(dialog)
+                if dialog.focus == dialogs::RepositoryOriginFocus::Field =>
+            {
+                dialog.replacement.push_str(&pasted);
+                dialog.error = None;
             }
             _ => {}
         }

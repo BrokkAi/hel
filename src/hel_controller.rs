@@ -36,6 +36,7 @@ use provisioning::apply_failed_new_session_rollback;
 
 pub use checkpoint::{CheckpointArtifact, reconcile_managed_checkpoint_archives};
 pub use recovery_scan::{RecoveryCandidate, RecoveryScan};
+pub use resume::{ResumeRepositorySourceMismatch, ResumeRepositorySourcePreflight};
 pub use worker_binary::{WorkerBinaryAvailability, worker_binary_prerequisite_for_arch};
 pub use worktree::{ResumePlan, resume_compatibility};
 
@@ -573,14 +574,29 @@ fn ssh_args_with_identity(args: &[String], identity: Option<&Path>) -> Vec<Strin
 fn execute_checked(executor: &impl CommandExecutor, command: CommandSpec) -> Result<CommandOutput> {
     let output = executor.execute(&command)?;
     if output.status != 0 {
-        bail!(
-            "{} failed with status {}: {}",
-            command.purpose,
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let detail = command_error_detail(&output.stderr);
+        if detail.is_empty() {
+            bail!("{} failed with status {}", command.purpose, output.status);
+        }
+        bail!("{detail}");
     }
     Ok(output)
+}
+
+fn command_error_detail(stderr: &[u8]) -> String {
+    let reported = String::from_utf8_lossy(stderr);
+    let reported = reported.trim();
+    let detail = reported
+        .rsplit_once("\nCaused by:\n")
+        .map_or(reported, |(_, causes)| causes);
+    let detail = detail.strip_prefix("Error: ").unwrap_or(detail);
+    detail
+        .lines()
+        .map(|line| line.strip_prefix("    ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
 }
 
 fn now() -> String {
@@ -644,6 +660,16 @@ mod tests {
     use crate::hel_targets::ProcessExecutor;
 
     use super::*;
+
+    #[test]
+    fn command_errors_report_the_root_cause_without_worker_wrappers() {
+        let stderr = b"Error: restore target checkpoint failed with status 1: Error: restore repository \"bifrost\"\n\nCaused by:\n    checkpoint base b41dc78 is absent from configured source\n    repository may have moved\n";
+
+        assert_eq!(
+            command_error_detail(stderr),
+            "checkpoint base b41dc78 is absent from configured source\nrepository may have moved"
+        );
+    }
 
     #[test]
     fn controller_store_lock_excludes_a_second_process_owner() {

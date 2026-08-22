@@ -1,25 +1,26 @@
 //! Resuming a stopped session onto a profile and target.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::hel_archive::{
-    CanonicalQueuedCommandKind, CanonicalSessionSnapshot, SystemGit, verify_archive_streaming,
+    CanonicalQueuedCommandKind, CanonicalSessionSnapshot, SystemGit, VerifiedRepositoryBundle,
+    verify_archive_streaming, verify_repository_bundles_streaming,
 };
 use crate::hel_checkpoint::{CheckpointRestoreSpec, restore_command};
-use crate::hel_config::mount_history_host;
+use crate::hel_config::{ProjectRepository, mount_history_host};
 use crate::hel_projection::materialized_session_from_canonical;
 use crate::hel_session_manager::new_command_id;
 use crate::hel_state::{
     MaterializedSession, SessionRecord, SessionResourceAllocation, SessionState,
 };
 use crate::hel_targets::{
-    self, AdditionalMount, CancellableProcessExecutor, CommandExecutor, ProcessExecutor,
-    ProvisionStage,
+    self, AdditionalMount, CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec,
+    ProcessExecutor, ProvisionStage,
 };
 use crate::hel_worker::RelayCommand;
 
@@ -37,6 +38,388 @@ use super::worktree::{
     resume_compatibility, retire_managed_worktree,
 };
 use super::{Controller, SessionResumeOptions, execute_checked, now, target_profile_home};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeRepositorySourceMismatch {
+    pub session_id: String,
+    pub bundle_id: String,
+    pub repository_id: String,
+    pub missing_commit: String,
+    pub archived_origin: String,
+    pub configured_origin: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeRepositorySourcePreflight {
+    Ready,
+    RepositoryMoved(ResumeRepositorySourceMismatch),
+}
+
+impl Controller {
+    /// Prove that each configured repository source still supplies the commit
+    /// boundary its checkpoint bundle expects, before provisioning anything.
+    pub fn preflight_resume_repository_sources(
+        &self,
+        session_id: &str,
+        executor: &impl CommandExecutor,
+    ) -> Result<ResumeRepositorySourcePreflight> {
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?;
+        let checkpoint = session
+            .checkpoint
+            .as_ref()
+            .context("session has no checkpoint")?;
+        let verified = verify_repository_bundles_streaming(&checkpoint.archive_path)?;
+        ensure!(
+            verified.archive_sha256 == checkpoint.sha256,
+            "persisted checkpoint verification failed"
+        );
+        if verified.repositories.is_empty() {
+            return Ok(ResumeRepositorySourcePreflight::Ready);
+        }
+        let bundle = self
+            .config
+            .bundles
+            .get(&session.bundle_id)
+            .with_context(|| format!("session bundle {:?} is missing", session.bundle_id))?;
+        for archived in &verified.repositories {
+            let configured = bundle
+                .repositories
+                .iter()
+                .find(|repository| repository.id == archived.metadata.id)
+                .with_context(|| {
+                    format!(
+                        "session bundle {:?} no longer contains repository {:?}",
+                        session.bundle_id, archived.metadata.id
+                    )
+                })?;
+            if let Some(missing_commit) = checkpoint_source_missing_commit(
+                configured,
+                archived,
+                executor,
+                controller_github_token().as_deref(),
+            )? {
+                return Ok(ResumeRepositorySourcePreflight::RepositoryMoved(
+                    ResumeRepositorySourceMismatch {
+                        session_id: session_id.to_owned(),
+                        bundle_id: session.bundle_id.clone(),
+                        repository_id: configured.id.clone(),
+                        missing_commit,
+                        archived_origin: archived.metadata.origin.clone(),
+                        configured_origin: configured.source_label(),
+                    },
+                ));
+            }
+        }
+        Ok(ResumeRepositorySourcePreflight::Ready)
+    }
+
+    /// Validate a replacement first, then atomically save it and re-run the
+    /// whole session preflight so multi-repository bundles can report the next
+    /// moved source without ever provisioning a partial target.
+    pub fn replace_resume_repository_origin(
+        &mut self,
+        session_id: &str,
+        repository_id: &str,
+        replacement: &str,
+        executor: &impl CommandExecutor,
+    ) -> Result<ResumeRepositorySourcePreflight> {
+        let session = self
+            .state
+            .sessions
+            .get(session_id)
+            .with_context(|| format!("unknown session {session_id}"))?;
+        let bundle_id = session.bundle_id.clone();
+        let checkpoint = session
+            .checkpoint
+            .as_ref()
+            .context("session has no checkpoint")?;
+        let replacement = replacement_repository_source(repository_id, replacement)?;
+        let verified = verify_repository_bundles_streaming(&checkpoint.archive_path)?;
+        ensure!(
+            verified.archive_sha256 == checkpoint.sha256,
+            "persisted checkpoint verification failed"
+        );
+        let archived = verified
+            .repositories
+            .iter()
+            .find(|repository| repository.metadata.id == repository_id)
+            .with_context(|| format!("checkpoint does not contain repository {repository_id:?}"))?;
+        if let Some(missing_commit) = checkpoint_source_missing_commit(
+            &replacement,
+            archived,
+            executor,
+            controller_github_token().as_deref(),
+        )? {
+            return Ok(ResumeRepositorySourcePreflight::RepositoryMoved(
+                ResumeRepositorySourceMismatch {
+                    session_id: session_id.to_owned(),
+                    bundle_id,
+                    repository_id: repository_id.to_owned(),
+                    missing_commit,
+                    archived_origin: archived.metadata.origin.clone(),
+                    configured_origin: replacement.source_label(),
+                },
+            ));
+        }
+        let bundle = self
+            .config
+            .bundles
+            .get_mut(&bundle_id)
+            .with_context(|| format!("session bundle {bundle_id:?} is missing"))?;
+        let repository = bundle
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.id == repository_id)
+            .with_context(|| {
+                format!(
+                    "session bundle {:?} no longer contains repository {repository_id:?}",
+                    bundle_id
+                )
+            })?;
+        repository.github = replacement.github;
+        repository.local = replacement.local;
+        self.config.save()?;
+        self.preflight_resume_repository_sources(session_id, executor)
+    }
+}
+
+fn replacement_repository_source(id: &str, replacement: &str) -> Result<ProjectRepository> {
+    let replacement = replacement.trim();
+    ensure!(!replacement.is_empty(), "enter the repository's new origin");
+    let path = Path::new(replacement);
+    let (github, local) = if path.is_absolute() {
+        ensure!(
+            path.is_dir(),
+            "local repository {replacement:?} is not a directory"
+        );
+        (
+            None,
+            Some(crate::hel_local_git::canonical_repository(path)?),
+        )
+    } else {
+        let github = crate::hel_setup::github_repository_from_origin(replacement)
+            .context("origin must be a GitHub repository or an absolute local repository path")?;
+        (
+            Some(format!("{}/{}", github.owner, github.repository)),
+            None,
+        )
+    };
+    Ok(ProjectRepository {
+        id: id.to_owned(),
+        github,
+        local,
+        destination: PathBuf::from(id),
+        git_ref: None,
+    })
+}
+
+fn checkpoint_source_missing_commit(
+    configured: &ProjectRepository,
+    archived: &VerifiedRepositoryBundle,
+    executor: &impl CommandExecutor,
+    github_token: Option<&str>,
+) -> Result<Option<String>> {
+    let staging = tempfile::tempdir().context("create repository source preflight")?;
+    let repository = staging.path().join("repository.git");
+    checked_preflight_git(
+        executor,
+        CommandSpec::new(
+            "git",
+            [
+                "init".to_owned(),
+                "--bare".to_owned(),
+                "--quiet".to_owned(),
+                repository.to_string_lossy().into_owned(),
+            ],
+        )
+        .purpose("initialize repository source preflight"),
+    )?;
+    let bundle = staging.path().join("checkpoint.bundle");
+    std::fs::write(&bundle, &archived.committed_bundle)
+        .context("write checkpoint bundle for source preflight")?;
+
+    let mut missing = if archived.committed_bundle.is_empty() {
+        vec![archived.metadata.head_commit.clone()]
+    } else {
+        missing_commits(&fetch_checkpoint_bundle(executor, &repository, &bundle)?)
+    };
+    let mut checked = std::collections::BTreeSet::new();
+    while let Some(commit) = missing.pop() {
+        if !checked.insert(commit.clone()) {
+            bail!(
+                "checkpoint bundle still lacks commit {commit} after fetching it from the configured source"
+            );
+        }
+        let output = fetch_source_commit(executor, &repository, configured, &commit, github_token)?;
+        if output.status != 0 {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if source_does_not_have_commit(&stderr) {
+                return Ok(Some(commit));
+            }
+            bail!(
+                "could not check configured source {:?}: {}",
+                configured.source_label(),
+                stderr.trim()
+            );
+        }
+        if archived.committed_bundle.is_empty() {
+            return Ok(None);
+        }
+        let output = fetch_checkpoint_bundle(executor, &repository, &bundle)?;
+        if output.status == 0 {
+            return Ok(None);
+        }
+        let next = missing_commits(&output);
+        ensure!(
+            !next.is_empty(),
+            "checkpoint bundle could not be completed from configured source {:?}: {}",
+            configured.source_label(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        missing.extend(next);
+    }
+    Ok(None)
+}
+
+fn fetch_checkpoint_bundle(
+    executor: &impl CommandExecutor,
+    repository: &Path,
+    bundle: &Path,
+) -> Result<CommandOutput> {
+    executor.execute(
+        &CommandSpec::new(
+            "git",
+            [
+                "-C".to_owned(),
+                repository.to_string_lossy().into_owned(),
+                "fetch".to_owned(),
+                "--no-tags".to_owned(),
+                bundle.to_string_lossy().into_owned(),
+                "HEAD".to_owned(),
+            ],
+        )
+        .purpose("check checkpoint bundle prerequisites"),
+    )
+}
+
+fn fetch_source_commit(
+    executor: &impl CommandExecutor,
+    repository: &Path,
+    configured: &ProjectRepository,
+    commit: &str,
+    github_token: Option<&str>,
+) -> Result<CommandOutput> {
+    let mut arguments = Vec::new();
+    let mut token_auth = false;
+    let mut ssh_transport = false;
+    let source = if let Some(local) = &configured.local {
+        local.to_string_lossy().into_owned()
+    } else {
+        let source = configured
+            .github
+            .as_deref()
+            .context("repository source is missing")?;
+        let github = crate::hel_setup::github_repository_from_origin(source)
+            .context("configured repository is not a GitHub source")?;
+        if github_token.is_some() {
+            token_auth = true;
+            arguments.extend([
+                "-c".to_owned(),
+                "credential.helper=!f() { if [ \"$1\" = get ]; then echo username=x-access-token; echo \"password=$GH_TOKEN\"; fi; }; f".to_owned(),
+            ]);
+            format!(
+                "https://github.com/{}/{}.git",
+                github.owner, github.repository
+            )
+        } else {
+            ssh_transport = true;
+            format!("git@github.com:{}/{}.git", github.owner, github.repository)
+        }
+    };
+    arguments.extend([
+        "-C".to_owned(),
+        repository.to_string_lossy().into_owned(),
+        "fetch".to_owned(),
+        "--no-tags".to_owned(),
+        "--filter=blob:none".to_owned(),
+        source,
+        commit.to_owned(),
+    ]);
+    let mut command = CommandSpec::new("git", arguments).purpose("check checkpoint base commit");
+    command
+        .env
+        .insert("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned());
+    if token_auth {
+        let token = github_token.expect("token authentication requires a GitHub token");
+        command.env.insert("GH_TOKEN".to_owned(), token.to_owned());
+    }
+    if ssh_transport {
+        command.env.insert(
+            "GIT_SSH_COMMAND".to_owned(),
+            "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
+                .to_owned(),
+        );
+    }
+    executor.execute(&command)
+}
+
+fn missing_commits(output: &CommandOutput) -> Vec<String> {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut prerequisites = false;
+    let mut missing = Vec::new();
+    for line in stderr.lines() {
+        let line = line.trim();
+        if line.contains("Repository lacks these prerequisite commits") {
+            prerequisites = true;
+            continue;
+        }
+        let candidate = line
+            .strip_prefix("error: Could not read ")
+            .or_else(|| {
+                prerequisites
+                    .then(|| line.strip_prefix("error: "))
+                    .flatten()
+            })
+            .and_then(|value| value.split_ascii_whitespace().next());
+        if let Some(commit) = candidate
+            && (commit.len() == 40 || commit.len() == 64)
+            && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            missing.push(commit.to_ascii_lowercase());
+        }
+    }
+    missing
+}
+
+fn source_does_not_have_commit(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    [
+        "not our ref",
+        "couldn't find remote ref",
+        "not a valid object name",
+        "no such ref was fetched",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle))
+}
+
+fn checked_preflight_git(
+    executor: &impl CommandExecutor,
+    command: CommandSpec,
+) -> Result<CommandOutput> {
+    let output = executor.execute(&command)?;
+    ensure!(
+        output.status == 0,
+        "{}: {}",
+        command.purpose,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output)
+}
 
 impl Controller {
     /// Resume a stopped logical session on any configured profile and
@@ -111,6 +494,17 @@ impl Controller {
             .checkpoint
             .as_ref()
             .context("session has no checkpoint")?;
+        if let ResumeRepositorySourcePreflight::RepositoryMoved(mismatch) =
+            self.preflight_resume_repository_sources(session_id, executor)?
+        {
+            bail!(
+                "checkpoint base commit {} is missing from configured source {:?} for repository {:?}; the repository may have moved (archived origin: {:?})",
+                mismatch.missing_commit,
+                mismatch.configured_origin,
+                mismatch.repository_id,
+                mismatch.archived_origin,
+            );
+        }
         // Take the snapshot out of the verified metadata and share it behind an
         // `Arc`: on a long session it is tens of megabytes, and resume reads it
         // from three places that used to hold private copies.
@@ -718,10 +1112,8 @@ pub(super) fn apply_failed_resume_rollback(
             current.state = SessionState::Stopped;
             current.target = None;
             current.updated_at = now();
-            let failure =
-                format!("{original_error}; partial target removed and session returned to stopped");
-            current.last_error = Some(format!("resume failed: {failure}"));
-            anyhow::anyhow!(failure)
+            current.last_error = Some(format!("resume failed: {original_error}"));
+            anyhow::anyhow!(original_error.to_owned())
         }
         Some(cleanup_error) => {
             let failure = format!(
@@ -829,7 +1221,7 @@ mod tests {
 
     use anyhow::Result;
 
-    use crate::hel_archive::verify_archive_streaming;
+    use crate::hel_archive::{GitCommandRunner, verify_archive_streaming};
     use crate::hel_config::{
         ContainerTemplate as ConfigContainer, HarnessProfile, HelConfig, ProjectBundle,
         ProjectRepository, TargetTemplate,
@@ -846,6 +1238,102 @@ mod tests {
     use super::*;
 
     const RESUME_ROLLBACK_TEST_CHILD: &str = "HEL_RESUME_ROLLBACK_TEST_CHILD";
+
+    #[test]
+    fn repository_preflight_distinguishes_the_original_source_from_a_reused_name() {
+        fn git(repository: &Path, arguments: &[&str]) {
+            let output = SystemGit
+                .run(
+                    repository,
+                    &crate::hel_archive::GitCommand {
+                        arguments: arguments.iter().map(std::ffi::OsString::from).collect(),
+                        stdin: Vec::new(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                output.status,
+                0,
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let origin = directory.path().join("original");
+        std::fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "-q", "-b", "main"]);
+        git(&origin, &["config", "user.name", "Hel Test"]);
+        git(&origin, &["config", "user.email", "hel@example.test"]);
+        git(&origin, &["commit", "--allow-empty", "-qm", "base"]);
+        let source = directory.path().join("source");
+        git(
+            directory.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "source"],
+        );
+        git(&source, &["config", "user.name", "Hel Test"]);
+        git(&source, &["config", "user.email", "hel@example.test"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "session"]);
+        let snapshot = crate::hel_archive::collect_git_snapshot(
+            &SystemGit,
+            &source,
+            &crate::hel_archive::GitCollectionSpec {
+                id: "project".into(),
+                relative_destination: "project".into(),
+                history: crate::hel_archive::GitHistoryMode::SessionDelta,
+                origin_override: None,
+            },
+        )
+        .unwrap();
+        let configured = ProjectRepository {
+            id: "project".into(),
+            github: None,
+            local: Some(origin.clone()),
+            destination: "project".into(),
+            git_ref: None,
+        };
+        assert_eq!(
+            checkpoint_source_missing_commit(
+                &configured,
+                &VerifiedRepositoryBundle {
+                    metadata: snapshot.metadata.clone(),
+                    committed_bundle: snapshot.committed_bundle.clone(),
+                },
+                &ProcessExecutor,
+                None,
+            )
+            .unwrap(),
+            None
+        );
+
+        let replacement = directory.path().join("replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        git(&replacement, &["init", "-q", "-b", "main"]);
+        git(&replacement, &["config", "user.name", "Hel Test"]);
+        git(&replacement, &["config", "user.email", "hel@example.test"]);
+        git(
+            &replacement,
+            &["commit", "--allow-empty", "-qm", "different history"],
+        );
+        let configured = ProjectRepository {
+            local: Some(replacement),
+            ..configured
+        };
+        assert!(
+            checkpoint_source_missing_commit(
+                &configured,
+                &VerifiedRepositoryBundle {
+                    metadata: snapshot.metadata,
+                    committed_bundle: snapshot.committed_bundle,
+                },
+                &ProcessExecutor,
+                None,
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
     #[test]
     fn bundle_sessions_refuse_a_local_bare_resume_before_the_record_changes() {
         struct UnusedExecutor;
@@ -1127,7 +1615,11 @@ mod tests {
         assert_eq!(cleaned.state, SessionState::Stopped);
         assert_eq!(cleaned.last_profile, "codex-old");
         assert_eq!(cleaned.target, None);
-        assert!(failure.to_string().contains("returned to stopped"));
+        assert_eq!(failure.to_string(), "worker upload failed");
+        assert_eq!(
+            cleaned.last_error.as_deref(),
+            Some("resume failed: worker upload failed")
+        );
 
         let mut cleanup_failed = previous.clone();
         cleanup_failed.state = SessionState::Error;
@@ -1300,7 +1792,11 @@ mod tests {
             ))
             .unwrap_err();
         let detail = format!("{error:#}");
-        assert!(detail.contains("returned to stopped"), "{detail}");
+        assert!(
+            detail.contains("podman is temporarily unavailable"),
+            "{detail}"
+        );
+        assert!(!detail.contains("returned to stopped"), "{detail}");
         assert!(!detail.contains("unknown session"), "{detail}");
         assert_eq!(
             executor.mounts_during_provisioning.into_inner().unwrap(),
@@ -1425,9 +1921,10 @@ mod tests {
             ))
             .unwrap_err();
         assert!(
-            format!("{error:#}").contains("returned to stopped"),
+            format!("{error:#}").contains("podman is temporarily unavailable"),
             "{error:#}"
         );
+        assert!(!format!("{error:#}").contains("returned to stopped"));
 
         // The bundle stays: it was saved before the record referenced it, and a
         // retry reuses it instead of adding another.

@@ -8,16 +8,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, bail};
-use hel::hel_controller::SessionResumeOptions;
+use hel::hel_controller::{Controller, SessionResumeOptions};
 use hel::hel_setup::SetupOutcome;
 use hel::hel_targets::{CancellableProcessExecutor, ProcessExecutor};
 use hel_tui::{DashboardAction, SessionOperationKind};
 
 use crate::dashboard::io::{
-    ContainerSettingsRequest, DashboardIoUpdate, LifecycleOperationRequest, StageReportingExecutor,
-    config_only_controller, spawn_archive_write, spawn_create_bundle,
-    spawn_dashboard_container_settings, spawn_dashboard_create_session, spawn_dashboard_rename,
-    spawn_io, spawn_lifecycle_operation,
+    ContainerSettingsRequest, DashboardIoUpdate, LifecycleOperationRequest,
+    ResumeRepositoryPreflightApply, StageReportingExecutor, config_only_controller,
+    spawn_archive_write, spawn_create_bundle, spawn_dashboard_container_settings,
+    spawn_dashboard_create_session, spawn_dashboard_rename, spawn_io, spawn_lifecycle_operation,
 };
 use crate::dashboard::{DashboardContext, QUOTA_REFRESH_NOTICE, View, resume_progress_notice};
 use crate::import::{DashboardImportSafety, PendingDashboardImport};
@@ -231,6 +231,39 @@ pub(crate) async fn apply_dashboard_action(
                 move |result| DashboardIoUpdate::SessionMountValidation { launch, result },
             );
         }
+        DashboardAction::PreflightResumeRepositories { launch } => {
+            start_resume_repository_preflight(context, launch)?;
+        }
+        DashboardAction::ReplaceResumeRepositoryOrigin {
+            session_id,
+            repository_id,
+            replacement,
+            launch,
+        } => {
+            context.dashboard.set_notice("Checking replacement origin…");
+            let submitted_repository_id = repository_id.clone();
+            spawn_io(
+                context.dashboard_io_tx.clone(),
+                move || {
+                    let mut controller = Controller::load()?;
+                    let preflight = controller.replace_resume_repository_origin(
+                        &session_id,
+                        &repository_id,
+                        &replacement,
+                        &ProcessExecutor,
+                    )?;
+                    Ok(ResumeRepositoryPreflightApply {
+                        config: Some(controller.config),
+                        preflight,
+                    })
+                },
+                move |result| DashboardIoUpdate::ResumeRepositoryPreflight {
+                    launch,
+                    submitted_repository_id: Some(submitted_repository_id),
+                    result: Box::new(result),
+                },
+            );
+        }
         DashboardAction::ValidateProjectDirectory {
             target_template_id,
             directory,
@@ -339,6 +372,40 @@ pub(crate) async fn apply_dashboard_action(
         }
     }
     Ok(ControlFlow::Continue(()))
+}
+
+fn resume_launch_session_id(action: &DashboardAction) -> Result<&str> {
+    match action {
+        DashboardAction::ResumeSession { session_id, .. } => Ok(session_id),
+        _ => bail!("repository preflight did not receive a resume launch"),
+    }
+}
+
+pub(crate) fn start_resume_repository_preflight(
+    context: &mut DashboardContext,
+    launch: Box<DashboardAction>,
+) -> Result<()> {
+    let session_id = resume_launch_session_id(&launch)?.to_owned();
+    context
+        .dashboard
+        .set_notice("Checking checkpoint repository history…");
+    spawn_io(
+        context.dashboard_io_tx.clone(),
+        move || {
+            let controller = Controller::load()?;
+            Ok(ResumeRepositoryPreflightApply {
+                config: None,
+                preflight: controller
+                    .preflight_resume_repository_sources(&session_id, &ProcessExecutor)?,
+            })
+        },
+        move |result| DashboardIoUpdate::ResumeRepositoryPreflight {
+            launch,
+            submitted_repository_id: None,
+            result: Box::new(result),
+        },
+    );
+    Ok(())
 }
 
 pub(crate) fn start_session_launch(context: &mut DashboardContext, action: DashboardAction) {
