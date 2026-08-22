@@ -10,7 +10,7 @@ use rayon::prelude::*;
 
 use crate::hel_archive::{
     CanonicalQueuedCommandKind, CanonicalSessionSnapshot, CheckpointRepositoryBundle, SystemGit,
-    read_checkpoint_repository_bundles, verify_archive_streaming,
+    checkpoint_bundle_prerequisites, read_checkpoint_repository_bundles, verify_archive_streaming,
 };
 use crate::hel_checkpoint::{CheckpointRestoreSpec, restore_command};
 use crate::hel_config::{ProjectRepository, mount_history_host};
@@ -346,32 +346,17 @@ fn checkpoint_source_missing_commit(
         )
         .purpose("initialize repository source preflight"),
     )?;
-    let bundle = staging.path().join("checkpoint.bundle");
-    std::fs::write(&bundle, &archived.committed_bundle)
-        .context("write checkpoint bundle for source preflight")?;
-
-    let bundle_output = (!archived.committed_bundle.is_empty())
-        .then(|| fetch_checkpoint_bundle(executor, &repository, &bundle))
-        .transpose()?;
-    if bundle_output
-        .as_ref()
-        .is_some_and(|output| output.status == 0)
-    {
+    let missing = checkpoint_bundle_prerequisites(archived)?;
+    if missing.is_empty() {
+        let bundle = staging.path().join("checkpoint.bundle");
+        std::fs::write(&bundle, &archived.committed_bundle)
+            .context("write self-contained checkpoint bundle for source preflight")?;
+        checked_preflight_git(
+            executor,
+            checkpoint_bundle_import_command(&repository, &bundle),
+        )?;
         return Ok(None);
     }
-    let missing = if archived.committed_bundle.is_empty() {
-        vec![archived.metadata.head_commit.clone()]
-    } else {
-        missing_commits(bundle_output.as_ref().expect("nonempty bundle was checked"))
-    };
-    ensure!(
-        !missing.is_empty(),
-        "checkpoint bundle could not identify its missing prerequisite: {}",
-        bundle_output
-            .as_ref()
-            .map(|output| String::from_utf8_lossy(&output.stderr).trim().to_owned())
-            .unwrap_or_default()
-    );
     // The restore clone will obtain the reachable ancestry. This probe only
     // needs to establish that the source still serves each boundary object, so
     // stop at that object instead of downloading and walking its whole graph.
@@ -395,25 +380,26 @@ fn checkpoint_source_missing_commit(
     Ok(None)
 }
 
-fn fetch_checkpoint_bundle(
-    executor: &impl CommandExecutor,
-    repository: &Path,
-    bundle: &Path,
-) -> Result<CommandOutput> {
-    executor.execute(
-        &CommandSpec::new(
-            "git",
-            [
-                "-C".to_owned(),
-                repository.to_string_lossy().into_owned(),
-                "fetch".to_owned(),
-                "--no-tags".to_owned(),
-                bundle.to_string_lossy().into_owned(),
-                "HEAD".to_owned(),
-            ],
-        )
-        .purpose("check checkpoint bundle prerequisites"),
+fn checkpoint_bundle_import_command(repository: &Path, bundle: &Path) -> CommandSpec {
+    let mut command = CommandSpec::new(
+        "git",
+        [
+            "-C".to_owned(),
+            repository.to_string_lossy().into_owned(),
+            "fetch".to_owned(),
+            "--no-tags".to_owned(),
+            bundle.to_string_lossy().into_owned(),
+            "HEAD".to_owned(),
+        ],
     )
+    .purpose("validate self-contained checkpoint bundle");
+    command
+        .env
+        .insert("GIT_NO_LAZY_FETCH".to_owned(), "1".to_owned());
+    command
+        .env
+        .insert("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned());
+    command
 }
 
 fn fetch_source_commit(
@@ -439,6 +425,8 @@ fn fetch_source_commit(
             token_auth = true;
             arguments.extend([
                 "-c".to_owned(),
+                "credential.helper=".to_owned(),
+                "-c".to_owned(),
                 "credential.helper=!f() { if [ \"$1\" = get ]; then echo username=x-access-token; echo \"password=$GH_TOKEN\"; fi; }; f".to_owned(),
             ]);
             format!(
@@ -463,6 +451,9 @@ fn fetch_source_commit(
     let mut command = CommandSpec::new("git", arguments).purpose("check checkpoint base commit");
     command
         .env
+        .insert("GIT_NO_LAZY_FETCH".to_owned(), "1".to_owned());
+    command
+        .env
         .insert("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned());
     if token_auth {
         let token = github_token.expect("token authentication requires a GitHub token");
@@ -476,34 +467,6 @@ fn fetch_source_commit(
         );
     }
     executor.execute(&command)
-}
-
-fn missing_commits(output: &CommandOutput) -> Vec<String> {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let mut prerequisites = false;
-    let mut missing = Vec::new();
-    for line in stderr.lines() {
-        let line = line.trim();
-        if line.contains("Repository lacks these prerequisite commits") {
-            prerequisites = true;
-            continue;
-        }
-        let candidate = line
-            .strip_prefix("error: Could not read ")
-            .or_else(|| {
-                prerequisites
-                    .then(|| line.strip_prefix("error: "))
-                    .flatten()
-            })
-            .and_then(|value| value.split_ascii_whitespace().next());
-        if let Some(commit) = candidate
-            && (commit.len() == 40 || commit.len() == 64)
-            && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            missing.push(commit.to_ascii_lowercase());
-        }
-    }
-    missing
 }
 
 fn source_does_not_have_commit(stderr: &str) -> bool {
@@ -1560,6 +1523,122 @@ mod tests {
             .repositories[0]
             .local = Some(PathBuf::from("/different-origin"));
         assert!(!controller.repository_source_receipt_is_current(session_id, &receipt));
+    }
+
+    #[test]
+    fn repository_preflight_checks_declared_boundary_without_importing_delta_bundle() {
+        struct RecordingExecutor {
+            commands: Mutex<Vec<CommandSpec>>,
+        }
+
+        impl CommandExecutor for RecordingExecutor {
+            fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+                self.commands.lock().unwrap().push(command.clone());
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        let prerequisite = "a".repeat(40);
+        let head = "b".repeat(40);
+        let archived = CheckpointRepositoryBundle {
+            metadata: crate::hel_archive::RepositoryMetadata {
+                id: "project".into(),
+                relative_destination: "project".into(),
+                origin: "https://github.com/archived/should-not-be-contacted.git".into(),
+                base_commit: prerequisite.clone(),
+                head_commit: head.clone(),
+                branch: Some("main".into()),
+            },
+            committed_bundle: format!(
+                "# v2 git bundle\n-{prerequisite} base\n{head} HEAD\n\nPACKnot-read"
+            )
+            .into_bytes(),
+        };
+        let configured = ProjectRepository {
+            id: "project".into(),
+            github: Some("configured/project".into()),
+            local: None,
+            destination: "project".into(),
+            git_ref: None,
+        };
+        let executor = RecordingExecutor {
+            commands: Mutex::new(Vec::new()),
+        };
+
+        assert_eq!(
+            checkpoint_source_missing_commit(
+                &configured,
+                &archived,
+                &executor,
+                Some("secret-token")
+            )
+            .unwrap(),
+            None
+        );
+
+        let commands = executor.commands.into_inner().unwrap();
+        assert_eq!(commands.len(), 2, "commands: {commands:?}");
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.purpose.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "initialize repository source preflight",
+                "check checkpoint base commit"
+            ]
+        );
+        let source_check = &commands[1];
+        assert!(
+            source_check
+                .args
+                .iter()
+                .any(|argument| argument == "credential.helper=")
+        );
+        assert_eq!(
+            source_check
+                .env
+                .get("GIT_NO_LAZY_FETCH")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            source_check
+                .env
+                .get("GIT_TERMINAL_PROMPT")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            source_check.args.last().map(String::as_str),
+            Some(prerequisite.as_str())
+        );
+        assert!(
+            !source_check
+                .args
+                .iter()
+                .any(|argument| argument.contains("archived"))
+        );
+    }
+
+    #[test]
+    fn self_contained_bundle_validation_cannot_lazy_fetch_or_prompt() {
+        let command = checkpoint_bundle_import_command(
+            Path::new("/tmp/repository.git"),
+            Path::new("/tmp/checkpoint.bundle"),
+        );
+        assert_eq!(
+            command.env.get("GIT_NO_LAZY_FETCH").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            command.env.get("GIT_TERMINAL_PROMPT").map(String::as_str),
+            Some("0")
+        );
     }
 
     #[test]

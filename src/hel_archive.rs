@@ -415,6 +415,89 @@ pub struct CheckpointRepositoryBundle {
     pub committed_bundle: Vec<u8>,
 }
 
+/// Read the source commits a checkpoint bundle requires without asking Git to
+/// import its pack. Importing into an empty repository can make partial-clone
+/// Git versions lazily contact the archived origin before Hel has installed
+/// the configured source's credentials.
+pub(crate) fn checkpoint_bundle_prerequisites(
+    repository: &CheckpointRepositoryBundle,
+) -> Result<Vec<String>> {
+    let bundle = &repository.committed_bundle;
+    if bundle.is_empty() {
+        return Ok(vec![repository.metadata.head_commit.clone()]);
+    }
+
+    let header_end = bundle
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .context("checkpoint Git bundle has no header terminator")?;
+    ensure!(
+        bundle[header_end + 2..].starts_with(b"PACK"),
+        "checkpoint Git bundle has no pack payload"
+    );
+    let mut lines = bundle[..header_end].split(|byte| *byte == b'\n');
+    let version = lines
+        .next()
+        .context("checkpoint Git bundle has no header")?;
+    ensure!(
+        matches!(version, b"# v2 git bundle" | b"# v3 git bundle"),
+        "unsupported checkpoint Git bundle version"
+    );
+
+    let mut prerequisites = Vec::new();
+    let mut advertised_head = None;
+    for line in lines {
+        if let Some(prerequisite) = line.strip_prefix(b"-") {
+            prerequisites.push(bundle_header_object_id(prerequisite, "prerequisite")?);
+            continue;
+        }
+        if line.starts_with(b"@") {
+            ensure!(
+                version == b"# v3 git bundle",
+                "Git bundle v2 contains a capability"
+            );
+            continue;
+        }
+        let separator = line
+            .iter()
+            .position(u8::is_ascii_whitespace)
+            .context("checkpoint Git bundle contains an invalid reference")?;
+        let (object_id, reference) = line.split_at(separator);
+        let object_id = bundle_header_object_id(object_id, "reference")?;
+        if reference
+            .iter()
+            .copied()
+            .skip_while(u8::is_ascii_whitespace)
+            .eq(b"HEAD".iter().copied())
+        {
+            ensure!(
+                advertised_head.replace(object_id).is_none(),
+                "checkpoint Git bundle advertises HEAD more than once"
+            );
+        }
+    }
+    let advertised_head =
+        advertised_head.context("checkpoint Git bundle does not advertise HEAD")?;
+    ensure!(
+        advertised_head.eq_ignore_ascii_case(&repository.metadata.head_commit),
+        "checkpoint Git bundle HEAD does not match checkpoint metadata"
+    );
+    Ok(prerequisites)
+}
+
+fn bundle_header_object_id(line: &[u8], kind: &str) -> Result<String> {
+    let object_id = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .next()
+        .context("checkpoint Git bundle contains an empty object ID")?;
+    ensure!(
+        matches!(object_id.len(), 40 | 64) && object_id.iter().all(u8::is_ascii_hexdigit),
+        "checkpoint Git bundle contains an invalid {kind} object ID"
+    );
+    Ok(String::from_utf8(object_id.to_ascii_lowercase())
+        .expect("ASCII hexadecimal object ID is UTF-8"))
+}
+
 #[derive(Debug)]
 pub enum CloseVerification {
     Verified {
@@ -2927,6 +3010,81 @@ mod tests {
             unstaged_patch: format!("unstaged-{id}").into_bytes(),
             untracked_tar: tar_with_file("scripts/tool.sh", b"#!/bin/sh\n", 0o755),
         }
+    }
+
+    fn checkpoint_bundle(head: &str, contents: impl Into<Vec<u8>>) -> CheckpointRepositoryBundle {
+        CheckpointRepositoryBundle {
+            metadata: RepositoryMetadata {
+                id: "project".into(),
+                relative_destination: "project".into(),
+                origin: "https://github.com/example/project.git".into(),
+                base_commit: String::new(),
+                head_commit: head.into(),
+                branch: Some("main".into()),
+            },
+            committed_bundle: contents.into(),
+        }
+    }
+
+    #[test]
+    fn checkpoint_bundle_header_reports_declared_prerequisites_without_importing_pack() {
+        let first = "a".repeat(40);
+        let second = "B".repeat(40);
+        let head = "c".repeat(40);
+        let contents = format!(
+            "# v2 git bundle\n-{first} first base\n-{second} second base\n{head} HEAD\n\nPACKnot-read"
+        );
+
+        assert_eq!(
+            checkpoint_bundle_prerequisites(&checkpoint_bundle(&head, contents)).unwrap(),
+            [first, second.to_ascii_lowercase()]
+        );
+    }
+
+    #[test]
+    fn checkpoint_bundle_header_accepts_v3_sha256_and_self_contained_bundles() {
+        let prerequisite = "a".repeat(64);
+        let head = "b".repeat(64);
+        let contents = format!(
+            "# v3 git bundle\n@object-format=sha256\n-{prerequisite} base\n{head} HEAD\n\nPACKnot-read"
+        );
+        assert_eq!(
+            checkpoint_bundle_prerequisites(&checkpoint_bundle(&head, contents)).unwrap(),
+            [prerequisite]
+        );
+
+        let self_contained = format!("# v2 git bundle\n{head} HEAD\n\nPACKnot-read");
+        assert!(
+            checkpoint_bundle_prerequisites(&checkpoint_bundle(&head, self_contained))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn checkpoint_bundle_header_rejects_metadata_mismatch_and_malformed_payloads() {
+        let head = "b".repeat(40);
+        let other = "c".repeat(40);
+        let mismatch = format!("# v2 git bundle\n{other} HEAD\n\nPACKnot-read");
+        let error = checkpoint_bundle_prerequisites(&checkpoint_bundle(&head, mismatch))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HEAD does not match"), "{error}");
+
+        let malformed = format!("# v2 git bundle\n{head} HEAD\n\nnot-a-pack");
+        let error = checkpoint_bundle_prerequisites(&checkpoint_bundle(&head, malformed))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no pack payload"), "{error}");
+    }
+
+    #[test]
+    fn checkpoint_without_a_bundle_uses_its_head_as_the_source_boundary() {
+        let head = "b".repeat(40);
+        assert_eq!(
+            checkpoint_bundle_prerequisites(&checkpoint_bundle(&head, Vec::new())).unwrap(),
+            [head]
+        );
     }
 
     fn input() -> ArchiveInput {
