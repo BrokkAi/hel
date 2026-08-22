@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use hel::hel_controller::{Controller, SessionLaunchOptions, SessionResumeOptions};
-use hel::hel_quota::QuotaManager;
+use hel::hel_quota::ProfileQuota;
 use hel::hel_server::{
     ControllerAction, ControllerRequest, ResumeQueueDisposition, ServerOptions, ViewerQueuedPrompt,
     ViewerQuota, ViewerSnapshot,
@@ -21,11 +21,12 @@ use hel::hel_worker::RelayCommand;
 use hel::hel_worker_client::CredentialSyncCoordinator;
 
 use crate::pollers::{
-    CredentialSyncNotices, CredentialSyncSignalTracker, LifecycleUpdate,
-    apply_worker_record_update, credential_sync_targets, dashboard_worker_targets,
+    CredentialSyncNotices, CredentialSyncSignalTracker, LifecycleUpdate, QuotaRefreshBatch,
+    QuotaUpdate, apply_worker_record_update, credential_sync_targets, dashboard_worker_targets,
     interrupted_close_session_ids, merge_recovery_result, projected_queued_prompts,
     queued_prompt_projection, quota_refresh_profiles, reserve_recovery_or_cancel,
     schedule_due_credential_syncs, spawn_dashboard_worker_poller, spawn_interrupted_close_recovery,
+    spawn_quota_refresher,
 };
 
 #[derive(Debug, Args)]
@@ -131,8 +132,12 @@ impl PhoneActionControl {
 pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
     let bind = args.bind.parse().context("parse --bind socket address")?;
     let mut controller = Controller::load()?;
-    let mut quotas = QuotaManager::default();
-    refresh_all_quotas(&controller, &mut quotas).await;
+    let mut quotas = std::collections::BTreeMap::new();
+    let (quota_profiles_tx, mut quota_updates_rx) = spawn_quota_refresher();
+    quota_profiles_tx.send_replace(QuotaRefreshBatch {
+        generation: 1,
+        profiles: quota_refresh_profiles(&controller),
+    });
     let mut revision = 1;
     let mut conversations = std::collections::BTreeMap::new();
     let mut queued_prompts = projected_queued_prompts(&controller)?;
@@ -202,6 +207,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
         let mut next_action_id = 0_u64;
         let mut action_cancellations = std::collections::BTreeMap::<u64, PhoneActionControl>::new();
         let mut action_sessions = std::collections::BTreeMap::<u64, String>::new();
+        let mut quota_updates_open = true;
         loop {
             tokio::select! {
                 _ = termination.cancelled() => {
@@ -213,6 +219,30 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     }
                     break;
                 },
+                update = quota_updates_rx.recv(), if quota_updates_open => {
+                    match update {
+                        Some(QuotaUpdate::Report(outcome)) => {
+                            if outcome.credentials_changed {
+                                credential_sync_handle
+                                    .sync_profile_now(&outcome.report.profile_id, None);
+                            }
+                            quotas.insert(outcome.report.profile_id.clone(), outcome.report);
+                            revision += 1;
+                            let _ = snapshot_tx.send(viewer_snapshot(
+                                &controller,
+                                &quotas,
+                                &conversations,
+                                &queued_prompts,
+                                revision,
+                            ));
+                        }
+                        Some(QuotaUpdate::Refreshing { .. } | QuotaUpdate::Finished { .. }) => {}
+                        None => {
+                            quota_updates_open = false;
+                            tracing::warn!("quota refresher stopped while the phone server is running");
+                        }
+                    }
+                }
                 update = worker_updates_rx.recv() => {
                     let Some(update) = update else { break };
                     if let Some(snapshot) = update.view.snapshot.as_ref()
@@ -458,7 +488,6 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
         result = serve => result,
         result = control => result,
     }?;
-    quotas.shutdown().await;
     Ok(())
 }
 
@@ -662,7 +691,7 @@ async fn apply_phone_action(
 
 fn viewer_snapshot(
     controller: &Controller,
-    quotas: &QuotaManager,
+    quotas: &std::collections::BTreeMap<String, ProfileQuota>,
     conversations: &std::collections::BTreeMap<String, hel::hel_chat::BrowserTranscript>,
     queued_prompts: &std::collections::BTreeMap<String, Vec<hel::hel_worker::QueuedPrompt>>,
     revision: u64,
@@ -674,7 +703,7 @@ fn viewer_snapshot(
         .unwrap_or_default()
         .as_secs();
     for profile in &mut snapshot.profiles {
-        let Some(quota) = quotas.reports().get(&profile.id) else {
+        let Some(quota) = quotas.get(&profile.id) else {
             continue;
         };
         profile.quota = Some(ViewerQuota {
@@ -724,14 +753,6 @@ fn viewer_snapshot(
         }
     }
     snapshot
-}
-
-async fn refresh_all_quotas(controller: &Controller, quotas: &mut QuotaManager) {
-    quotas
-        .refresh_profiles(quota_refresh_profiles(controller), |_| {
-            std::future::ready(())
-        })
-        .await;
 }
 
 #[cfg(test)]

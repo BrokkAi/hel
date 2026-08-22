@@ -20,7 +20,7 @@ use hel::hel_credentials::{
     CredentialSyncCause, CredentialSyncHandle, CredentialSyncReason, CredentialSyncSignal,
     CredentialSyncTarget,
 };
-use hel::hel_quota::{ProfileQuota, QuotaManager, QuotaRefreshRequest};
+use hel::hel_quota::{QuotaManager, QuotaRefreshOutcome, QuotaRefreshRequest};
 use hel::hel_recovery::{RecoveryCoordinator, RecoveryResult};
 use hel::hel_session_manager::{
     RelaySessionTarget, SessionManagerControl, SessionManagerUpdate, SessionManagerUpdates,
@@ -176,7 +176,7 @@ pub(crate) struct QuotaRefreshBatch {
 #[derive(Debug)]
 pub(crate) enum QuotaUpdate {
     Refreshing { profile_ids: Vec<String> },
-    Report(ProfileQuota),
+    Report(QuotaRefreshOutcome),
     Finished { generation: u64 },
 }
 
@@ -322,7 +322,7 @@ pub(crate) fn quota_refresh_profiles(controller: &Controller) -> Vec<QuotaRefres
         .collect()
 }
 
-pub(crate) fn spawn_dashboard_quota_refresher() -> (
+pub(crate) fn spawn_quota_refresher() -> (
     tokio::sync::watch::Sender<QuotaRefreshBatch>,
     tokio::sync::mpsc::Receiver<QuotaUpdate>,
 ) {

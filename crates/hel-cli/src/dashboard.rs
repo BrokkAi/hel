@@ -56,8 +56,8 @@ use crate::pollers::{
     dashboard_worker_targets, interrupted_close_session_ids, merge_recovery_result,
     projected_queued_prompts, quota_refresh_profiles, refresh_dashboard_poll_targets,
     schedule_due_credential_syncs, spawn_dashboard_capacity_poller,
-    spawn_dashboard_quota_refresher, spawn_dashboard_resource_poller,
-    spawn_dashboard_worker_poller, spawn_interrupted_close_recovery, spawn_worker_diagnosis,
+    spawn_dashboard_resource_poller, spawn_dashboard_worker_poller,
+    spawn_interrupted_close_recovery, spawn_quota_refresher, spawn_worker_diagnosis,
 };
 use crate::{TerminalGuard, short_id, startup_greeting};
 
@@ -388,7 +388,7 @@ impl DashboardContext {
             }
         }
 
-        let (quota_profiles_tx, quota_updates_rx) = spawn_dashboard_quota_refresher();
+        let (quota_profiles_tx, quota_updates_rx) = spawn_quota_refresher();
         let (worker_targets_tx, worker_updates_rx, worker_commands_tx) =
             spawn_dashboard_worker_poller()?;
         worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
@@ -724,7 +724,13 @@ impl DashboardContext {
                 QuotaUpdate::Refreshing { profile_ids } => {
                     self.dashboard.begin_quota_refresh(profile_ids)
                 }
-                QuotaUpdate::Report(quota) => self.dashboard.apply_quota(quota),
+                QuotaUpdate::Report(outcome) => {
+                    if outcome.credentials_changed {
+                        self.credential_sync_handle
+                            .sync_profile_now(&outcome.report.profile_id, None);
+                    }
+                    self.dashboard.apply_quota(outcome.report);
+                }
                 QuotaUpdate::Finished { generation } => {
                     if complete_manual_quota_refresh(
                         &mut self.manual_quota_refresh_generation,

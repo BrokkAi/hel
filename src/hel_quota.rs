@@ -12,6 +12,8 @@ use crate::claude_usage;
 use crate::codex_usage::{self, CodexUsageClient, CodexUsageStatus};
 use crate::grok_usage;
 use crate::hel_config::HarnessKind;
+use crate::hel_credentials::{MAX_CREDENTIAL_BYTES, credential_fingerprint};
+use crate::hel_setup::harness_authentication_marker;
 
 #[derive(Debug, Clone)]
 pub struct QuotaRefreshRequest {
@@ -44,6 +46,12 @@ pub struct ProfileQuota {
     pub extra: Option<String>,
     pub error: Option<String>,
     pub refreshed_at_epoch_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaRefreshOutcome {
+    pub report: ProfileQuota,
+    pub credentials_changed: bool,
 }
 
 impl ProfileQuota {
@@ -175,7 +183,7 @@ impl QuotaManager {
         requests: Vec<QuotaRefreshRequest>,
         mut on_report: F,
     ) where
-        F: FnMut(ProfileQuota) -> Fut,
+        F: FnMut(QuotaRefreshOutcome) -> Fut,
         Fut: Future<Output = ()> + Send,
     {
         let mut tasks = tokio::task::JoinSet::new();
@@ -185,7 +193,7 @@ impl QuotaManager {
         }
 
         while let Some(result) = tasks.join_next().await {
-            let (report, client) = match result {
+            let (outcome, client) = match result {
                 Ok(output) => output,
                 Err(error) => {
                     tracing::warn!(%error, "quota refresh task failed");
@@ -193,11 +201,12 @@ impl QuotaManager {
                 }
             };
             if let Some(client) = client {
-                self.codex_clients.insert(report.profile_id.clone(), client);
+                self.codex_clients
+                    .insert(outcome.report.profile_id.clone(), client);
             }
             self.reports
-                .insert(report.profile_id.clone(), report.clone());
-            on_report(report).await;
+                .insert(outcome.report.profile_id.clone(), outcome.report.clone());
+            on_report(outcome).await;
         }
     }
 
@@ -211,7 +220,9 @@ impl QuotaManager {
 async fn refresh_profile(
     request: QuotaRefreshRequest,
     mut codex_client: Option<CodexUsageClient>,
-) -> (ProfileQuota, Option<CodexUsageClient>) {
+) -> (QuotaRefreshOutcome, Option<CodexUsageClient>) {
+    let credential_path = harness_authentication_marker(request.harness, &request.source_home);
+    let credential_before = credential_marker_fingerprint(&credential_path).await;
     let QuotaRefreshRequest {
         profile_id,
         harness,
@@ -253,7 +264,7 @@ async fn refresh_profile(
                 CodexUsageStatus::Unavailable(error) => Err(anyhow::anyhow!(error)),
             }
         }
-        HarnessKind::Claude => claude_usage::query(source_home)
+        HarnessKind::Claude => claude_usage::query(source_home, environment)
             .await
             .map(|report| ProfileQuota {
                 profile_id: profile_id.clone(),
@@ -331,7 +342,39 @@ async fn refresh_profile(
         error: Some(error.to_string()),
         refreshed_at_epoch_seconds,
     });
-    (report, codex_client)
+    let credential_after = credential_marker_fingerprint(&credential_path).await;
+    let credentials_changed = match (credential_before, credential_after) {
+        (Ok(before), Ok(after)) => before != after,
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::warn!(path = %credential_path.display(), %error, "could not fingerprint quota credentials");
+            false
+        }
+    };
+    (
+        QuotaRefreshOutcome {
+            report,
+            credentials_changed,
+        },
+        codex_client,
+    )
+}
+
+async fn credential_marker_fingerprint(path: &Path) -> Result<Option<String>> {
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect credential marker"),
+    };
+    if metadata.len() > MAX_CREDENTIAL_BYTES as u64 {
+        bail!("credential marker exceeds {MAX_CREDENTIAL_BYTES} bytes");
+    }
+    let bytes = tokio::fs::read(path)
+        .await
+        .context("read credential marker")?;
+    if bytes.len() > MAX_CREDENTIAL_BYTES {
+        bail!("credential marker exceeds {MAX_CREDENTIAL_BYTES} bytes");
+    }
+    Ok(Some(credential_fingerprint(&bytes)))
 }
 
 async fn query_kimi(
@@ -872,25 +915,32 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("grok");
+        std::fs::write(directory.path().join("auth.json"), b"old credentials").unwrap();
         std::fs::write(
             &executable,
-            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *initialize*) printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\\n' ;;\n    *billing*) printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"config\":{\"creditUsagePercent\":25.0,\"currentPeriod\":{\"type\":\"USAGE_PERIOD_TYPE_WEEKLY\",\"end\":\"2026-08-18T05:22:07+00:00\"}},\"subscription_tier\":\"X Premium+\"}}\\n' ;;\n  esac\ndone\n",
+            "#!/bin/sh\nprintf 'refreshed credentials' > \"$GROK_HOME/auth.json\"\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *initialize*) printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\\n' ;;\n    *billing*) printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"config\":{\"creditUsagePercent\":25.0,\"currentPeriod\":{\"type\":\"USAGE_PERIOD_TYPE_WEEKLY\",\"end\":\"2026-08-18T05:22:07+00:00\"}},\"subscription_tier\":\"X Premium+\"}}\\n' ;;\n  esac\ndone\n",
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = BTreeMap::from([(
+            "GROK_HOME".to_owned(),
+            directory.path().to_string_lossy().into_owned(),
+        )]);
 
-        let (report, _) = refresh_profile(
+        let (outcome, _) = refresh_profile(
             QuotaRefreshRequest {
                 profile_id: "grok".into(),
                 harness: HarnessKind::Grok,
                 source_home: directory.path().to_path_buf(),
                 executable: Some(executable),
-                environment: BTreeMap::new(),
+                environment,
                 cwd: directory.path().to_path_buf(),
             },
             None,
         )
         .await;
+        assert!(outcome.credentials_changed);
+        let report = outcome.report;
 
         assert_eq!(report.error, None, "{:?}", report.error);
         // One long window and no short one: Grok Build has no 5-hour budget.
@@ -907,7 +957,7 @@ mod tests {
     async fn an_unreachable_grok_reports_the_failure_instead_of_a_zero_reading() {
         let directory = tempfile::tempdir().unwrap();
 
-        let (report, _) = refresh_profile(
+        let (outcome, _) = refresh_profile(
             QuotaRefreshRequest {
                 profile_id: "grok".into(),
                 harness: HarnessKind::Grok,
@@ -919,6 +969,7 @@ mod tests {
             None,
         )
         .await;
+        let report = outcome.report;
 
         assert!(report.windows.is_empty());
         assert_eq!(
@@ -935,7 +986,6 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "claudeAiOauth": {
                     "accessToken": "sk-ant-oat01-expired",
-                    "refreshToken": "refresh",
                     "expiresAt": 1,
                 }
             }))
@@ -943,7 +993,7 @@ mod tests {
         )
         .unwrap();
 
-        let (report, _) = refresh_profile(
+        let (outcome, _) = refresh_profile(
             QuotaRefreshRequest {
                 profile_id: "claude2".into(),
                 harness: HarnessKind::Claude,
@@ -955,6 +1005,7 @@ mod tests {
             None,
         )
         .await;
+        let report = outcome.report;
 
         assert!(report.windows.is_empty());
         assert_eq!(report.error.as_deref(), Some(claude_usage::LOGIN_EXPIRED));

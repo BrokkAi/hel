@@ -2735,6 +2735,27 @@ mod tests {
         ))));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_executor_drains_large_stdout_and_stderr_concurrently() {
+        let output = CancellableProcessExecutor::with_timeout(Duration::from_secs(5))
+            .execute(
+                &CommandSpec::new(
+                    "sh",
+                    [
+                        "-c",
+                        "head -c 131072 /dev/zero | tr '\\000' x; head -c 131072 /dev/zero | tr '\\000' y >&2",
+                    ],
+                )
+                .purpose("emit large command output"),
+            )
+            .unwrap();
+
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout, vec![b'x'; 128 * 1024]);
+        assert_eq!(output.stderr, vec![b'y'; 128 * 1024]);
+    }
+
     fn bundle() -> ProjectBundleSpec {
         ProjectBundleSpec {
             primary: "app".to_owned(),

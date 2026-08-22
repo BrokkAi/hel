@@ -5,13 +5,18 @@
 //! this module independent from the UI state machine so the parser can be
 //! tested against captured command output without spawning `claude`.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::hel_targets::{CancellableProcessExecutor, CommandExecutor, CommandOutput, CommandSpec};
+
 const USAGE_TIMEOUT: Duration = Duration::from_secs(20);
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
 /// Quota-row copy when the stored Claude OAuth access token is past `expiresAt`.
@@ -85,6 +90,7 @@ pub enum ClaudeUsageError {
     NotInstalled,
     NotSignedIn,
     LoginExpired,
+    Refresh(String),
     #[cfg(test)]
     Launch(String),
     Query(String),
@@ -106,6 +112,7 @@ impl ClaudeUsageError {
             Self::NotInstalled => "Claude Code not installed",
             Self::NotSignedIn => "not signed in",
             Self::LoginExpired => LOGIN_EXPIRED,
+            Self::Refresh(_) => "could not refresh Claude login",
             Self::Launch(_) => "could not launch Claude Code",
             Self::Query(_) => "could not query Claude usage",
             Self::Exit { detail, .. } if is_authentication_error(detail) => "not signed in",
@@ -124,6 +131,7 @@ impl fmt::Display for ClaudeUsageError {
             Self::NotInstalled => write!(f, "Claude Code executable not found"),
             Self::NotSignedIn => write!(f, "Claude Code is not signed in"),
             Self::LoginExpired => write!(f, "{LOGIN_EXPIRED}"),
+            Self::Refresh(error) => write!(f, "refresh Claude login: {error}"),
             #[cfg(test)]
             Self::Launch(error) => write!(f, "run claude /usage: {error}"),
             Self::Query(error) => write!(f, "query Claude usage: {error}"),
@@ -143,21 +151,68 @@ impl fmt::Display for ClaudeUsageError {
 }
 
 /// Query the same OAuth usage endpoint as Claude Code's interactive `/usage`.
-/// Print mode does not execute that slash command and can return an estimated,
-/// stale-looking response instead of the account's authoritative limits.
-pub async fn query(home: PathBuf) -> Result<ClaudeUsageReport, ClaudeUsageError> {
-    let credentials = tokio::fs::read(home.join(".credentials.json"))
-        .await
-        .map_err(|_| ClaudeUsageError::NotSignedIn)?;
-    let credentials: Value =
-        serde_json::from_slice(&credentials).map_err(|_| ClaudeUsageError::NotSignedIn)?;
-    let token = oauth_access_token(&credentials, crate::clock::epoch_millis())?;
+/// The CLI is invoked only to refresh rejected credentials; its print-mode
+/// usage output is approximate, so the API response remains authoritative.
+pub async fn query(
+    home: PathBuf,
+    environment: HashMap<String, String>,
+) -> Result<ClaudeUsageReport, ClaudeUsageError> {
+    query_with(
+        home,
+        environment,
+        USAGE_URL,
+        Arc::new(CancellableProcessExecutor::with_timeout(REFRESH_TIMEOUT)),
+    )
+    .await
+}
+
+async fn query_with(
+    home: PathBuf,
+    environment: HashMap<String, String>,
+    usage_url: &str,
+    executor: Arc<dyn CommandExecutor + Send + Sync>,
+) -> Result<ClaudeUsageReport, ClaudeUsageError> {
     let client = reqwest::Client::builder()
         .timeout(USAGE_TIMEOUT)
         .build()
         .map_err(|error| ClaudeUsageError::Query(error.to_string()))?;
+    let credentials = read_credentials(&home).await?;
+    match oauth_access_token(&credentials, crate::clock::epoch_millis()) {
+        Ok(token) => match query_api(&client, usage_url, token).await {
+            Err(ClaudeUsageError::LoginExpired) if oauth_has_refresh_token(&credentials) => {
+                refresh_and_retry(
+                    &client,
+                    usage_url,
+                    home,
+                    environment,
+                    executor,
+                    Some(token.to_owned()),
+                )
+                .await
+            }
+            result => result,
+        },
+        Err(ClaudeUsageError::LoginExpired) if oauth_has_refresh_token(&credentials) => {
+            refresh_and_retry(&client, usage_url, home, environment, executor, None).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn read_credentials(home: &std::path::Path) -> Result<Value, ClaudeUsageError> {
+    let credentials = tokio::fs::read(home.join(".credentials.json"))
+        .await
+        .map_err(|_| ClaudeUsageError::NotSignedIn)?;
+    serde_json::from_slice(&credentials).map_err(|_| ClaudeUsageError::NotSignedIn)
+}
+
+async fn query_api(
+    client: &reqwest::Client,
+    usage_url: &str,
+    token: &str,
+) -> Result<ClaudeUsageReport, ClaudeUsageError> {
     let response = client
-        .get(USAGE_URL)
+        .get(usage_url)
         .bearer_auth(token)
         .header("anthropic-beta", "oauth-2025-04-20")
         .send()
@@ -185,6 +240,63 @@ pub async fn query(home: PathBuf) -> Result<ClaudeUsageReport, ClaudeUsageError>
     parse_api_usage(&payload).ok_or(ClaudeUsageError::Parse)
 }
 
+async fn refresh_and_retry(
+    client: &reqwest::Client,
+    usage_url: &str,
+    home: PathBuf,
+    environment: HashMap<String, String>,
+    executor: Arc<dyn CommandExecutor + Send + Sync>,
+    rejected_token: Option<String>,
+) -> Result<ClaudeUsageReport, ClaudeUsageError> {
+    let refresh_error = run_claude_refresh(environment, executor).await.err();
+    let credentials = match read_credentials(&home).await {
+        Ok(credentials) => credentials,
+        Err(error) => return Err(refresh_error.unwrap_or(error)),
+    };
+    let token = match oauth_access_token(&credentials, crate::clock::epoch_millis()) {
+        Ok(token) => token,
+        Err(error) => return Err(refresh_error.unwrap_or(error)),
+    };
+    if rejected_token.as_deref() == Some(token)
+        && let Some(error) = refresh_error
+    {
+        return Err(error);
+    }
+    query_api(client, usage_url, token).await
+}
+
+async fn run_claude_refresh(
+    environment: HashMap<String, String>,
+    executor: Arc<dyn CommandExecutor + Send + Sync>,
+) -> Result<(), ClaudeUsageError> {
+    let mut command = CommandSpec::new(
+        if cfg!(windows) {
+            "claude.cmd"
+        } else {
+            "claude"
+        },
+        ["-p", "/usage", "--no-session-persistence"],
+    )
+    .purpose("refresh Claude login");
+    command.env.extend(environment);
+    let output = tokio::task::spawn_blocking(move || executor.execute(&command))
+        .await
+        .map_err(|error| ClaudeUsageError::Refresh(format!("worker failed: {error}")))?
+        .map_err(|error| ClaudeUsageError::Refresh(error.to_string()))?;
+    successful_refresh_output(output)
+}
+
+fn successful_refresh_output(output: CommandOutput) -> Result<(), ClaudeUsageError> {
+    if output.status == 0 {
+        Ok(())
+    } else {
+        Err(ClaudeUsageError::Refresh(format!(
+            "Claude /usage exited with status {}",
+            output.status
+        )))
+    }
+}
+
 fn oauth_access_token(credentials: &Value, now_ms: i64) -> Result<&str, ClaudeUsageError> {
     let oauth = credentials
         .get("claudeAiOauth")
@@ -206,6 +318,13 @@ fn oauth_expires_at(oauth: &Value) -> Option<i64> {
         .as_i64()
         .or_else(|| value.as_u64().and_then(|ms| i64::try_from(ms).ok()))
         .or_else(|| value.as_str()?.parse().ok())
+}
+
+fn oauth_has_refresh_token(credentials: &Value) -> bool {
+    credentials
+        .pointer("/claudeAiOauth/refreshToken")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.is_empty())
 }
 
 fn parse_api_usage(payload: &Value) -> Option<ClaudeUsageReport> {
@@ -657,6 +776,292 @@ fn normalize_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct RefreshExecutor {
+        home: PathBuf,
+        replacement: Option<Value>,
+        status: i32,
+        commands: Arc<Mutex<Vec<CommandSpec>>>,
+    }
+
+    impl CommandExecutor for RefreshExecutor {
+        fn execute(&self, command: &CommandSpec) -> anyhow::Result<CommandOutput> {
+            self.commands.lock().unwrap().push(command.clone());
+            if let Some(replacement) = &self.replacement {
+                std::fs::write(
+                    self.home.join(".credentials.json"),
+                    serde_json::to_vec(replacement)?,
+                )?;
+            }
+            Ok(CommandOutput {
+                status: self.status,
+                stdout: b"Approximate local usage".to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct UsageServerState {
+        reject_first: bool,
+        authorizations: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn test_usage(
+        State(state): State<UsageServerState>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<Value>) {
+        let authorization = headers
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let mut authorizations = state.authorizations.lock().unwrap();
+        let reject = state.reject_first && authorizations.is_empty();
+        authorizations.push(authorization);
+        drop(authorizations);
+        if reject {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
+        }
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "five_hour": {"utilization": 25.0, "resets_at": "2026-08-23T00:00:00Z"},
+                "seven_day": {"utilization": 40.0, "resets_at": "2026-08-29T00:00:00Z"}
+            })),
+        )
+    }
+
+    async fn spawn_usage_server(
+        reject_first: bool,
+    ) -> (String, UsageServerState, tokio::task::JoinHandle<()>) {
+        let state = UsageServerState {
+            reject_first,
+            authorizations: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/usage", get(test_usage))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/usage"), state, server)
+    }
+
+    fn credentials(token: &str, refresh: Option<&str>, expires_at: i64) -> Value {
+        let mut oauth = serde_json::json!({
+            "accessToken": token,
+            "expiresAt": expires_at,
+        });
+        if let Some(refresh) = refresh {
+            oauth["refreshToken"] = Value::String(refresh.to_owned());
+        }
+        serde_json::json!({"claudeAiOauth": oauth})
+    }
+
+    #[tokio::test]
+    async fn expired_login_asks_claude_to_refresh_without_persisting_a_session() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".credentials.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&credentials("old", Some("refresh"), 1)).unwrap(),
+        )
+        .unwrap();
+        let fresh = credentials(
+            "fresh",
+            Some("rotated"),
+            crate::clock::epoch_millis() + 60_000,
+        );
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let executor = RefreshExecutor {
+            home: home.path().to_path_buf(),
+            replacement: Some(fresh),
+            status: 0,
+            commands: commands.clone(),
+        };
+        let (usage_url, server_state, server) = spawn_usage_server(false).await;
+        let environment = HashMap::from([(
+            "CLAUDE_CONFIG_DIR".to_owned(),
+            home.path().to_string_lossy().into_owned(),
+        )]);
+
+        let report = query_with(
+            home.path().to_path_buf(),
+            environment.clone(),
+            &usage_url,
+            Arc::new(executor),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.five_hour.unwrap().remaining_percent, 75);
+        let commands = commands.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].args,
+            ["-p", "/usage", "--no-session-persistence"]
+        );
+        assert_eq!(commands[0].env, environment.into_iter().collect());
+        assert_eq!(
+            server_state.authorizations.lock().unwrap().as_slice(),
+            ["Bearer fresh"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn authoritative_rejection_refreshes_once_and_retries_with_new_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        let fresh_expiry = crate::clock::epoch_millis() + 60_000;
+        std::fs::write(
+            home.path().join(".credentials.json"),
+            serde_json::to_vec(&credentials("old", Some("refresh"), fresh_expiry)).unwrap(),
+        )
+        .unwrap();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let executor = RefreshExecutor {
+            home: home.path().to_path_buf(),
+            replacement: Some(credentials("fresh", Some("rotated"), fresh_expiry)),
+            status: 0,
+            commands: commands.clone(),
+        };
+        let (usage_url, server_state, server) = spawn_usage_server(true).await;
+
+        query_with(
+            home.path().to_path_buf(),
+            HashMap::new(),
+            &usage_url,
+            Arc::new(executor),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(commands.lock().unwrap().len(), 1);
+        assert_eq!(
+            server_state.authorizations.lock().unwrap().as_slice(),
+            ["Bearer old", "Bearer fresh"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn valid_credentials_query_authoritative_usage_without_launching_claude() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".credentials.json"),
+            serde_json::to_vec(&credentials(
+                "current",
+                Some("refresh"),
+                crate::clock::epoch_millis() + 60_000,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let executor = RefreshExecutor {
+            home: home.path().to_path_buf(),
+            replacement: None,
+            status: 0,
+            commands: commands.clone(),
+        };
+        let (usage_url, server_state, server) = spawn_usage_server(false).await;
+
+        query_with(
+            home.path().to_path_buf(),
+            HashMap::new(),
+            &usage_url,
+            Arc::new(executor),
+        )
+        .await
+        .unwrap();
+
+        assert!(commands.lock().unwrap().is_empty());
+        assert_eq!(
+            server_state.authorizations.lock().unwrap().as_slice(),
+            ["Bearer current"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_of_a_rejected_token_is_not_mislabeled_login_expired() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".credentials.json"),
+            serde_json::to_vec(&credentials(
+                "rejected",
+                Some("refresh"),
+                crate::clock::epoch_millis() + 60_000,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let executor = RefreshExecutor {
+            home: home.path().to_path_buf(),
+            replacement: None,
+            status: 1,
+            commands: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (usage_url, server_state, server) = spawn_usage_server(true).await;
+
+        let error = query_with(
+            home.path().to_path_buf(),
+            HashMap::new(),
+            &usage_url,
+            Arc::new(executor),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ClaudeUsageError::Refresh(_)));
+        assert_eq!(
+            server_state.authorizations.lock().unwrap().as_slice(),
+            ["Bearer rejected"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_cli_is_accepted_when_credentials_were_refreshed_concurrently() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".credentials.json"),
+            serde_json::to_vec(&credentials("old", Some("refresh"), 1)).unwrap(),
+        )
+        .unwrap();
+        let executor = RefreshExecutor {
+            home: home.path().to_path_buf(),
+            replacement: Some(credentials(
+                "fresh",
+                Some("rotated"),
+                crate::clock::epoch_millis() + 60_000,
+            )),
+            status: 1,
+            commands: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (usage_url, _, server) = spawn_usage_server(false).await;
+
+        let report = query_with(
+            home.path().to_path_buf(),
+            HashMap::new(),
+            &usage_url,
+            Arc::new(executor),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.week.unwrap().remaining_percent, 60);
+        server.abort();
+    }
 
     #[test]
     fn parses_remaining_percent_lines() {
