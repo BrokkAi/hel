@@ -36,7 +36,9 @@ use provisioning::apply_failed_new_session_rollback;
 
 pub use checkpoint::{CheckpointArtifact, reconcile_managed_checkpoint_archives};
 pub use recovery_scan::{RecoveryCandidate, RecoveryScan};
-pub use resume::{ResumeRepositorySourceMismatch, ResumeRepositorySourcePreflight};
+pub use resume::{
+    ResumeRepositorySourceMismatch, ResumeRepositorySourcePreflight, ResumeRepositorySourceReceipt,
+};
 pub use worker_binary::{WorkerBinaryAvailability, worker_binary_prerequisite_for_arch};
 pub use worktree::{ResumePlan, resume_compatibility};
 

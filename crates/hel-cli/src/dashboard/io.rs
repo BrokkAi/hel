@@ -851,9 +851,11 @@ impl DashboardContext {
                         self.dashboard.set_config(config);
                     }
                     match applied.preflight {
-                        ResumeRepositorySourcePreflight::Ready => {
+                        ResumeRepositorySourcePreflight::Ready(receipt) => {
                             self.dashboard.finish_resume_repository_preflight();
-                            super::actions::start_session_launch(self, *launch);
+                            super::actions::start_preflighted_session_launch(
+                                self, *launch, receipt,
+                            );
                         }
                         ResumeRepositorySourcePreflight::RepositoryMoved(mismatch) => {
                             if submitted_repository_id.as_deref()

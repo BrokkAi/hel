@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, bail};
-use hel::hel_controller::{Controller, SessionResumeOptions};
+use hel::hel_controller::{Controller, ResumeRepositorySourceReceipt, SessionResumeOptions};
 use hel::hel_setup::SetupOutcome;
 use hel::hel_targets::{CancellableProcessExecutor, ProcessExecutor};
 use hel_tui::{DashboardAction, SessionOperationKind};
@@ -409,8 +409,25 @@ pub(crate) fn start_resume_repository_preflight(
 }
 
 pub(crate) fn start_session_launch(context: &mut DashboardContext, action: DashboardAction) {
+    start_session_launch_with_repository_preflight(context, action, None);
+}
+
+pub(crate) fn start_preflighted_session_launch(
+    context: &mut DashboardContext,
+    action: DashboardAction,
+    repository_preflight: ResumeRepositorySourceReceipt,
+) {
+    start_session_launch_with_repository_preflight(context, action, Some(repository_preflight));
+}
+
+fn start_session_launch_with_repository_preflight(
+    context: &mut DashboardContext,
+    action: DashboardAction,
+    repository_preflight: Option<ResumeRepositorySourceReceipt>,
+) {
     match action {
         action @ DashboardAction::CreateSession { .. } => {
+            debug_assert!(repository_preflight.is_none());
             context.dashboard.set_notice("Preparing session launch…");
             spawn_dashboard_create_session(
                 action,
@@ -450,17 +467,20 @@ pub(crate) fn start_session_launch(context: &mut DashboardContext, action: Dashb
                     session_id.clone(),
                     stage_updates,
                 );
-                let materialized = runtime.block_on(controller.resume_session_controlled(
-                    &session_id,
-                    &profile_id,
-                    &target_template_id,
-                    SessionResumeOptions {
-                        additional_mounts: Some(additional_mounts),
-                        resource_allocation,
-                        discard_queue,
-                    },
-                    &executor,
-                ))?;
+                let materialized = runtime.block_on(
+                    controller.resume_session_controlled_with_repository_preflight(
+                        &session_id,
+                        &profile_id,
+                        &target_template_id,
+                        SessionResumeOptions {
+                            additional_mounts: Some(additional_mounts),
+                            resource_allocation,
+                            discard_queue,
+                        },
+                        repository_preflight,
+                        &executor,
+                    ),
+                )?;
                 Ok(LifecycleSuccess::Resumed {
                     profile_id,
                     target_id: target_template_id,

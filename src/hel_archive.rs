@@ -409,6 +409,12 @@ pub struct VerifiedRepositoryBundles {
     pub repositories: Vec<VerifiedRepositoryBundle>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointRepositoryBundle {
+    pub metadata: RepositoryMetadata,
+    pub committed_bundle: Vec<u8>,
+}
+
 #[derive(Debug)]
 pub enum CloseVerification {
     Verified {
@@ -573,6 +579,124 @@ pub fn verify_repository_bundles_streaming(path: &Path) -> Result<VerifiedReposi
         archive_sha256: digest_reader(&mut file)?,
         repositories,
     })
+}
+
+/// Read only the repository bundles from a checkpoint whose complete archive
+/// digest was already persisted after full verification.
+///
+/// Resume uses this narrow reader for its source-availability preflight. The
+/// restore path still performs full payload verification before changing any
+/// target state. This deliberately avoids re-hashing the archive or bundle:
+/// Git validates the pack during the preflight, and restore validates every
+/// payload before using it.
+pub fn read_checkpoint_repository_bundles(path: &Path) -> Result<Vec<CheckpointRepositoryBundle>> {
+    let mut archive = open_archive(path)?;
+    let manifest_bytes = {
+        let mut entry = archive
+            .by_name(MANIFEST_PATH)
+            .with_context(|| format!("archive is missing {MANIFEST_PATH}"))?;
+        ensure!(!entry.is_dir(), "archive manifest is a directory entry");
+        ensure!(
+            entry.size() <= MAX_MANIFEST_BYTES,
+            "archive manifest is too large"
+        );
+        let mut bytes = Vec::with_capacity(entry.size().min(usize::MAX as u64) as usize);
+        entry
+            .read_to_end(&mut bytes)
+            .context("read archive manifest")?;
+        bytes
+    };
+    let manifest = parse_archive_manifest(&manifest_bytes)?;
+    let repositories = manifest
+        .repositories
+        .iter()
+        .map(|repository| {
+            let role = PayloadRole::GitBundle {
+                repository_id: repository.metadata.id.clone(),
+            };
+            let descriptor = manifest
+                .payloads
+                .iter()
+                .find(|descriptor| descriptor.role == role)
+                .with_context(|| {
+                    format!(
+                        "repository {:?} has no committed bundle payload",
+                        repository.metadata.id
+                    )
+                })?;
+            let committed_bundle = read_checkpoint_payload(&mut archive, descriptor)?;
+            Ok(CheckpointRepositoryBundle {
+                metadata: repository.metadata.clone(),
+                committed_bundle,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(repositories)
+}
+
+fn read_checkpoint_payload(
+    archive: &mut zip::ZipArchive<File>,
+    descriptor: &PayloadDescriptor,
+) -> Result<Vec<u8>> {
+    if descriptor.parts.is_empty() {
+        return read_checkpoint_entry(archive, &descriptor.path, descriptor.size, descriptor.mode);
+    }
+    let mut bytes = Vec::with_capacity(descriptor.size.min(usize::MAX as u64) as usize);
+    for part in &descriptor.parts {
+        bytes.extend_from_slice(&read_checkpoint_entry(
+            archive,
+            &part.path,
+            part.size,
+            descriptor.mode,
+        )?);
+    }
+    ensure!(
+        bytes.len() as u64 == descriptor.size,
+        "size mismatch for payload '{}'",
+        descriptor.path
+    );
+    ensure!(
+        digest_bytes(&bytes) == descriptor.sha256,
+        "SHA-256 mismatch for payload '{}'",
+        descriptor.path
+    );
+    Ok(bytes)
+}
+
+fn read_checkpoint_entry(
+    archive: &mut zip::ZipArchive<File>,
+    path: &str,
+    expected_size: u64,
+    expected_mode: u32,
+) -> Result<Vec<u8>> {
+    let mut entry = archive
+        .by_name(path)
+        .with_context(|| format!("archive is missing payload '{path}'"))?;
+    ensure!(!entry.is_dir(), "archive payload '{path}' is a directory");
+    let enclosed = entry
+        .enclosed_name()
+        .ok_or_else(|| anyhow!("unsafe ZIP entry path '{}'", entry.name()))?;
+    ensure!(
+        slash_path(&enclosed)? == path,
+        "archive payload path does not match '{path}'"
+    );
+    ensure!(
+        entry.size() == expected_size,
+        "size mismatch for payload '{path}'"
+    );
+    ensure!(
+        entry.unix_mode().unwrap_or(0o600) & 0o7777 == expected_mode,
+        "mode mismatch for payload '{path}'"
+    );
+    let mut bytes = Vec::with_capacity(expected_size.min(usize::MAX as u64) as usize);
+    entry
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read ZIP entry '{path}'"))?;
+    ensure!(
+        bytes.len() as u64 == expected_size,
+        "size mismatch for payload '{path}'"
+    );
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -2892,6 +3016,20 @@ mod tests {
         assert_eq!(verified.archive_sha256.len(), 64);
         let repository_bundles = verify_repository_bundles_streaming(&path).unwrap();
         assert_eq!(repository_bundles.archive_sha256, verified.archive_sha256);
+        assert_eq!(
+            read_checkpoint_repository_bundles(&path)
+                .unwrap()
+                .iter()
+                .map(|repository| (
+                    repository.metadata.id.as_str(),
+                    repository.committed_bundle.as_slice(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("hel", b"bundle-hel".as_slice()),
+                ("worker", b"bundle-worker".as_slice()),
+            ]
+        );
         assert_eq!(
             repository_bundles
                 .repositories
