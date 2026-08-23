@@ -13,8 +13,6 @@ pub use mj_core::session_state::{permission_prompt_title, remote_elicitation_out
 
 use crate::event::{SessionConfigTarget, TerminalOutputSnapshot};
 
-pub use crate::app::{RagnarokDraftPrStatus, RagnarokObservation};
-
 #[derive(Debug)]
 pub struct SessionState {
     pub session_id: Option<String>,

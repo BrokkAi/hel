@@ -31,10 +31,6 @@ and remote-control surface.
 - **Local voice input:** dictate prompts on macOS, Linux, and Windows with
   cross-platform, on-device speech recognition.
 
-### Terminal
-
-![Mjolnir review session showing the primary agent, reviewer progress, and usage](docs/readme-images/default-ui.png)
-
 ### Web interface
 
 ![Mjolnir browser interface showing session history, streaming agent output, and queued prompt controls](docs/readme-images/remote-ui.png)

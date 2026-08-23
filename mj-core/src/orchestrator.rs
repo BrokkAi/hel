@@ -3786,8 +3786,8 @@ mod tests {
                     );
                     ReviewVerdict::Findings {
                         synthesis: "[P1] tracked.txt:1 -- second finding".to_string(),
-                        // `run_async` merges the inherited Mímir outcome with
-                        // the newly selected Týr outcome before returning.
+                        // `run_async` merges the inherited control-flow outcome with
+                        // the newly selected error-handling outcome before returning.
                         evidence: ReviewPassEvidence {
                             intent_brief: prior.evidence.intent_brief.clone(),
                             intent_available: true,
