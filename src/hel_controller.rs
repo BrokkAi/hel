@@ -21,7 +21,6 @@ use chrono::Utc;
 use crate::hel_config::{
     HelConfig, SshConnection, TargetTemplate, data_dir, is_bare_project_target, mount_history_host,
 };
-use crate::hel_database::advance_detached_after_event_ordinal;
 use crate::hel_local_git::dirty_local_repositories;
 use crate::hel_state::{
     HelState, SessionRecord, SessionResourceAllocation, SessionState, new_session_id,
@@ -464,25 +463,6 @@ impl Controller {
         record.container_memory = memory;
         record.additional_mounts = additional_mounts;
         record.updated_at = updated_at;
-        Ok(())
-    }
-
-    pub fn mark_session_detached_after(
-        &mut self,
-        session_id: &str,
-        event_ordinal: u64,
-    ) -> Result<()> {
-        ensure!(
-            self.state.sessions.contains_key(session_id),
-            "unknown session {session_id}"
-        );
-        let receipt = advance_detached_after_event_ordinal(session_id, event_ordinal)?;
-        let record = self
-            .state
-            .sessions
-            .get_mut(session_id)
-            .expect("session was checked before advancing its read receipt");
-        record.detached_after_event_ordinal = receipt;
         Ok(())
     }
 }
