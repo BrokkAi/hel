@@ -301,6 +301,9 @@ pub struct DashboardState {
     pub(crate) resume_sessions_area: Option<Rect>,
     /// Native sessions the resume dialog hides, loaded from Hel's database.
     pub(crate) hidden_native_sessions: BTreeSet<(HarnessKind, String)>,
+    /// The row list the open resume dialog shows, kept so one key press and
+    /// the frame that follows it share a single build.
+    pub(crate) resume_rows_cache: crate::resume::ResumeRowsCache,
     /// Hitbox of the selected session's conversation preview, so the wheel can
     /// scroll that preview instead of moving the selection.
     pub(crate) selected_preview_area: Option<Rect>,
@@ -341,6 +344,7 @@ impl DashboardState {
             pane_areas: None,
             resume_sessions_area: None,
             hidden_native_sessions: BTreeSet::new(),
+            resume_rows_cache: crate::resume::ResumeRowsCache::default(),
             selected_preview_area: None,
             active_row_areas: Vec::new(),
             preview_scroll: 0,
@@ -400,11 +404,16 @@ impl DashboardState {
         // has been on screen long enough to read: for a background failure
         // this bar is the only report there is.
         self.notices.dismiss(now);
+        // The resume dialog carries every scanned native session, so it is
+        // handled where it lives rather than through a copy of the mode.
+        if matches!(self.mode, Mode::ResumeDialog(_)) {
+            return self.handle_resume_dialog_key(key);
+        }
         match self.mode.clone() {
             Mode::Dashboard => self.handle_dashboard_key(key),
             Mode::New(wizard) => self.handle_new_key(key.code, wizard),
             Mode::Resume(wizard) => self.handle_resume_key(key.code, wizard),
-            Mode::ResumeDialog(dialog) => self.handle_resume_dialog_key(key, dialog),
+            Mode::ResumeDialog(_) => unreachable!("the resume dialog is handled in place"),
             Mode::RepositoryOrigin(dialog) => self.handle_repository_origin_key(key.code, dialog),
             Mode::Rename(editor) => self.handle_rename_key(key.code, editor),
             Mode::EditContainer(editor) => self.handle_container_edit_key(key.code, editor),
@@ -475,7 +484,7 @@ impl DashboardState {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> DashboardAction {
-        if let Mode::ResumeDialog(dialog) = &self.mode {
+        if matches!(self.mode, Mode::ResumeDialog(_)) {
             let Some(area) = self.resume_sessions_area else {
                 return DashboardAction::None;
             };
@@ -487,11 +496,12 @@ impl DashboardState {
                 MouseEventKind::ScrollDown => MOUSE_SCROLL_ROWS,
                 _ => return DashboardAction::None,
             };
-            let len = self.resume_rows(dialog).len();
+            let len = self.refreshed_resume_rows().len();
+            let Mode::ResumeDialog(dialog) = &mut self.mode else {
+                return DashboardAction::None;
+            };
+            dialog.focus = crate::resume::ResumeFocus::Sessions;
             let index = offset_index(dialog.row_index, len, delta);
-            if let Mode::ResumeDialog(dialog) = &mut self.mode {
-                dialog.focus = crate::resume::ResumeFocus::Sessions;
-            }
             self.select_resume_row(index);
             return DashboardAction::None;
         }

@@ -14,7 +14,7 @@ use hel::hel_targets::{CancellableProcessExecutor, ProcessExecutor};
 use hel_tui::{DashboardAction, SessionOperationKind};
 
 use crate::dashboard::io::{
-    ContainerSettingsRequest, DashboardIoUpdate, LifecycleOperationRequest,
+    ArchiveWriteTarget, ContainerSettingsRequest, DashboardIoUpdate, LifecycleOperationRequest,
     ResumeRepositoryPreflightApply, StageReportingExecutor, config_only_controller,
     spawn_archive_write, spawn_create_bundle, spawn_dashboard_container_settings,
     spawn_dashboard_create_session, spawn_dashboard_rename, spawn_io, spawn_lifecycle_operation,
@@ -65,6 +65,10 @@ pub(crate) async fn apply_dashboard_action(
             let id = session_id.clone();
             spawn_archive_write(
                 what,
+                ArchiveWriteTarget::Session {
+                    session_id: session_id.clone(),
+                    archived: !archived,
+                },
                 move || hel::hel_database::set_session_archived(&id, archived),
                 context.dashboard_io_tx.clone(),
             );
@@ -82,6 +86,7 @@ pub(crate) async fn apply_dashboard_action(
             let what = format!("native session {}", short_id(&native_session_id));
             spawn_archive_write(
                 what,
+                ArchiveWriteTarget::HiddenNativeSessions,
                 move || {
                     hel::hel_database::set_native_session_hidden(
                         harness_kind,

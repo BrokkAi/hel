@@ -254,6 +254,12 @@ pub(crate) struct CapacityDetail {
     pub(crate) target: DeploymentCapacityTarget,
     pub(crate) usage: Option<DeploymentCapacityUsage>,
     pub(crate) on_demand: bool,
+    /// When the reading in `usage` was taken. A sample that stopped refreshing
+    /// must not read as current, so the clock travels with the reading.
+    pub(crate) sampled_at_epoch_seconds: Option<u64>,
+    /// Why the most recent probe failed, if it did. The last good reading stays
+    /// on screen beside it rather than vanishing on one failed probe.
+    pub(crate) probe_error: Option<String>,
 }
 
 impl DashboardState {
@@ -263,12 +269,14 @@ impl DashboardState {
 
     pub fn set_config(&mut self, config: HelConfig) {
         self.config = config;
+        self.invalidate_resume_rows();
         self.cancel_modal();
         self.clamp_selections();
     }
 
     pub fn set_state(&mut self, state: HelState) {
         self.state = state;
+        self.invalidate_resume_rows();
         self.session_details
             .retain(|session_id, _| self.state.sessions.contains_key(session_id));
         for session_id in self.state.sessions.keys() {
@@ -311,6 +319,7 @@ impl DashboardState {
             },
         );
         self.apply_operation_projection();
+        self.invalidate_resume_rows();
         self.clamp_selections();
     }
 
@@ -352,6 +361,7 @@ impl DashboardState {
             self.session_operations.insert(session_id, operation);
         }
         self.apply_operation_projection();
+        self.invalidate_resume_rows();
         self.clamp_selections();
     }
 
@@ -365,6 +375,7 @@ impl DashboardState {
         {
             self.state.sessions.remove(session_id);
         }
+        self.invalidate_resume_rows();
         self.clamp_selections();
     }
 
@@ -421,6 +432,8 @@ impl DashboardState {
                         target: target.clone(),
                         usage: None,
                         on_demand: false,
+                        sampled_at_epoch_seconds: None,
+                        probe_error: None,
                     },
                     |mut detail| {
                         detail.target = target;
@@ -435,18 +448,26 @@ impl DashboardState {
             .min(self.capacity_details.len().saturating_sub(1));
     }
 
+    /// Folds in one capacity sample. A failed probe keeps the last reading and
+    /// records why the probe failed, so the pane can mark the row stale instead
+    /// of showing an hours-old sample as if it were current.
     pub fn apply_deployment_capacity(
         &mut self,
         target_id: &str,
         result: std::result::Result<Option<DeploymentCapacityUsage>, String>,
-        _sampled_at_epoch_seconds: u64,
+        sampled_at_epoch_seconds: u64,
     ) {
         let Some(detail) = self.capacity_details.get_mut(target_id) else {
             return;
         };
-        if let Ok(usage) = result {
-            detail.on_demand = usage.is_none();
-            detail.usage = usage;
+        match result {
+            Ok(usage) => {
+                detail.on_demand = usage.is_none();
+                detail.usage = usage;
+                detail.sampled_at_epoch_seconds = Some(sampled_at_epoch_seconds);
+                detail.probe_error = None;
+            }
+            Err(error) => detail.probe_error = Some(error),
         }
         let affected_targets = detail.target.target_ids.clone();
         let limits = detail
@@ -544,6 +565,7 @@ impl DashboardState {
             && let Some(record) = self.state.sessions.get_mut(&prepared.session_id)
         {
             record.acp_session_title = Some(title.clone());
+            self.invalidate_resume_rows();
         }
         true
     }
@@ -568,6 +590,7 @@ impl DashboardState {
 
     pub fn apply_checkpoint_archive_sizes(&mut self, sizes: BTreeMap<String, Option<u64>>) {
         self.checkpoint_archive_sizes = sizes;
+        self.invalidate_resume_rows();
     }
 
     /// Installs the process-wide notifications bar, so every view reports

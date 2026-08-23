@@ -10,7 +10,8 @@
 //! as [`ImportProfileOption`] updates, and the merge below is a pure function
 //! over what has already been received.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -134,7 +135,11 @@ pub(crate) struct ResumeDialog {
     pub(crate) discovery_id: u64,
     /// Native scan results, one entry per configured profile. Entries appear
     /// immediately as placeholders and fill in as background scans report.
-    pub(crate) profiles: Vec<ImportProfileOption>,
+    ///
+    /// A harness home holds thousands of sessions, and the dialog is copied
+    /// whenever a confirmation interrupts it, so the scan results are shared
+    /// rather than duplicated.
+    pub(crate) profiles: Arc<Vec<ImportProfileOption>>,
     pub(crate) selected: Option<ResumeRowKey>,
     pub(crate) row_index: usize,
     pub(crate) filter: String,
@@ -295,26 +300,25 @@ pub(crate) fn merged_resume_rows(
     rows
 }
 
-impl DashboardState {
-    /// The rows this dialog shows: the merged list with the archived toggle and
-    /// the text filter applied.
-    pub(crate) fn resume_rows(&self, dialog: &ResumeDialog) -> Vec<ResumeRow> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let needle = dialog.filter.to_lowercase();
-        merged_resume_rows(
-            &self.config,
-            &self.state,
-            &dialog.profiles,
-            &self.hidden_native_sessions,
-            now_ms,
-        )
+/// The rows one dialog shows: the merged list with the checkpoint sizes
+/// appended, the archived toggle applied, and the text filter applied.
+fn build_resume_rows(
+    config: &HelConfig,
+    state: &HelState,
+    dialog: &ResumeDialog,
+    hidden_native: &BTreeSet<(HarnessKind, String)>,
+    checkpoint_archive_sizes: &BTreeMap<String, Option<u64>>,
+    now_ms: i64,
+) -> Vec<ResumeRow> {
+    let needle = dialog.filter.to_lowercase();
+    merged_resume_rows(config, state, &dialog.profiles, hidden_native, now_ms)
         .into_iter()
         .map(|mut row| {
             // The checkpoint's size is loaded in the background, so it is
             // appended here rather than folded into the pure merge.
             if let Some(size) = row
                 .session_id()
-                .and_then(|id| self.checkpoint_archive_sizes.get(id))
+                .and_then(|id| checkpoint_archive_sizes.get(id))
                 .copied()
                 .flatten()
             {
@@ -331,6 +335,83 @@ impl DashboardState {
                 || row.profile_id.to_lowercase().contains(&needle)
         })
         .collect()
+}
+
+/// The last row list built for the open dialog. Building it merges, sorts, and
+/// filters every Hel record and every scanned native session, which one key
+/// press would otherwise ask for two or three times over.
+#[derive(Debug, Default)]
+pub(crate) struct ResumeRowsCache {
+    built: Option<BuiltResumeRows>,
+}
+
+#[derive(Debug)]
+struct BuiltResumeRows {
+    filter: String,
+    show_archived: bool,
+    /// Whole second the relative ages were rendered against, so "2m ago" keeps
+    /// moving and any invalidation this cache missed cannot outlive a second.
+    now_seconds: i64,
+    rows: Vec<ResumeRow>,
+}
+
+impl ResumeRowsCache {
+    pub(crate) fn rows(&self) -> &[ResumeRow] {
+        self.built.as_ref().map_or(&[], |built| &built.rows)
+    }
+}
+
+impl DashboardState {
+    /// Rebuilds the open dialog's rows when anything they are built from
+    /// changed. Everything that mutates those inputs calls
+    /// [`DashboardState::invalidate_resume_rows`]; the filter, the archived
+    /// toggle, and the clock are compared here.
+    pub(crate) fn refresh_resume_rows(&mut self) {
+        let Mode::ResumeDialog(dialog) = &self.mode else {
+            self.resume_rows_cache.built = None;
+            return;
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_seconds = now_ms.div_euclid(1_000);
+        if self.resume_rows_cache.built.as_ref().is_some_and(|built| {
+            built.now_seconds == now_seconds
+                && built.show_archived == dialog.show_archived
+                && built.filter == dialog.filter
+        }) {
+            return;
+        }
+        let rows = build_resume_rows(
+            &self.config,
+            &self.state,
+            dialog,
+            &self.hidden_native_sessions,
+            &self.checkpoint_archive_sizes,
+            now_ms,
+        );
+        self.resume_rows_cache.built = Some(BuiltResumeRows {
+            filter: dialog.filter.clone(),
+            show_archived: dialog.show_archived,
+            now_seconds,
+            rows,
+        });
+    }
+
+    /// Drops rows that no longer match what they were built from. The next
+    /// read rebuilds them.
+    pub(crate) fn invalidate_resume_rows(&mut self) {
+        self.resume_rows_cache.built = None;
+    }
+
+    /// The rows the open dialog shows, rebuilt first if anything changed.
+    pub(crate) fn refreshed_resume_rows(&mut self) -> &[ResumeRow] {
+        self.refresh_resume_rows();
+        self.resume_rows_cache.rows()
+    }
+
+    /// The rows the last refresh built. Rendering reads this: the frame
+    /// refreshes once, before it decides what to draw.
+    pub(crate) fn resume_rows(&self) -> &[ResumeRow] {
+        self.resume_rows_cache.rows()
     }
 
     /// Whether anything on screen animates on its own and so needs a redraw
@@ -345,9 +426,10 @@ impl DashboardState {
     }
 
     pub fn show_resume_dialog(&mut self, discovery_id: u64, profiles: Vec<ImportProfileOption>) {
+        self.invalidate_resume_rows();
         self.mode = Mode::ResumeDialog(ResumeDialog {
             discovery_id,
-            profiles,
+            profiles: Arc::new(profiles),
             selected: None,
             row_index: 0,
             filter: String::new(),
@@ -369,20 +451,22 @@ impl DashboardState {
         if dialog.discovery_id != discovery_id {
             return;
         }
-        match dialog
-            .profiles
+        let profiles = Arc::make_mut(&mut dialog.profiles);
+        match profiles
             .iter()
             .position(|candidate| candidate.profile_id == profile.profile_id)
         {
-            Some(index) => dialog.profiles[index] = profile,
-            None => dialog.profiles.push(profile),
+            Some(index) => profiles[index] = profile,
+            None => profiles.push(profile),
         }
+        self.invalidate_resume_rows();
         self.resync_resume_selection();
     }
 
     /// Replaces the hidden set loaded from Hel's database.
     pub fn set_hidden_native_sessions(&mut self, hidden: BTreeSet<(HarnessKind, String)>) {
         self.hidden_native_sessions = hidden;
+        self.invalidate_resume_rows();
     }
 
     /// Applies a hide/reveal locally so the row moves immediately; the caller
@@ -400,6 +484,7 @@ impl DashboardState {
             self.hidden_native_sessions
                 .remove(&(harness, native_session_id));
         }
+        self.invalidate_resume_rows();
     }
 
     /// Applies an archive/unarchive of a Hel record locally, for the same
@@ -408,17 +493,20 @@ impl DashboardState {
         if let Some(session) = self.state.sessions.get_mut(session_id) {
             session.archived = archived;
         }
+        self.invalidate_resume_rows();
     }
 
     /// Keeps `row_index` pointed at the selected row after the list changed.
     fn resync_resume_selection(&mut self) {
+        self.refresh_resume_rows();
         let Mode::ResumeDialog(dialog) = &self.mode else {
             return;
         };
-        let rows = self.resume_rows(dialog);
-        let selected = dialog.selected.clone();
-        let index = selected
-            .and_then(|key| rows.iter().position(|row| row.key == key))
+        let rows = self.resume_rows_cache.rows();
+        let index = dialog
+            .selected
+            .as_ref()
+            .and_then(|key| rows.iter().position(|row| &row.key == key))
             .unwrap_or_else(|| dialog.row_index.min(rows.len().saturating_sub(1)));
         let key = rows.get(index).map(|row| row.key.clone());
         let Mode::ResumeDialog(dialog) = &mut self.mode else {
@@ -428,20 +516,23 @@ impl DashboardState {
         dialog.selected = key;
     }
 
-    fn move_resume_selection(&mut self, dialog: ResumeDialog, delta: isize) {
+    fn move_resume_selection(&mut self, delta: isize) {
+        let len = self.refreshed_resume_rows().len();
+        let Mode::ResumeDialog(dialog) = &self.mode else {
+            return;
+        };
         let mut index = dialog.row_index;
-        let len = self.resume_rows(&dialog).len();
-        self.mode = Mode::ResumeDialog(dialog);
         move_index(&mut index, len, delta);
         self.select_resume_row(index);
     }
 
     pub(crate) fn select_resume_row(&mut self, index: usize) {
-        let Mode::ResumeDialog(dialog) = &self.mode else {
-            return;
-        };
-        let rows = self.resume_rows(dialog);
-        let key = rows.get(index).map(|row| row.key.clone());
+        self.refresh_resume_rows();
+        let key = self
+            .resume_rows_cache
+            .rows()
+            .get(index)
+            .map(|row| row.key.clone());
         let Mode::ResumeDialog(dialog) = &mut self.mode else {
             return;
         };
@@ -449,35 +540,38 @@ impl DashboardState {
         dialog.selected = key;
     }
 
-    pub(crate) fn selected_resume_row(&self, dialog: &ResumeDialog) -> Option<ResumeRow> {
-        let rows = self.resume_rows(dialog);
+    /// The row the open dialog points at.
+    pub(crate) fn selected_resume_row(&mut self) -> Option<ResumeRow> {
+        self.refresh_resume_rows();
+        let Mode::ResumeDialog(dialog) = &self.mode else {
+            return None;
+        };
+        let rows = self.resume_rows_cache.rows();
         let index = selected_index(dialog, rows.len())?;
-        rows.into_iter().nth(index)
+        rows.get(index).cloned()
     }
 
-    pub(crate) fn handle_resume_dialog_key(
-        &mut self,
-        key: KeyEvent,
-        mut dialog: ResumeDialog,
-    ) -> DashboardAction {
-        let typing = dialog.focus == ResumeFocus::Filter;
+    /// Handles one key for the open dialog. The dialog is edited where it
+    /// lives: a scan of a busy harness home fills it with thousands of rows,
+    /// which no key press should have to copy.
+    pub(crate) fn handle_resume_dialog_key(&mut self, key: KeyEvent) -> DashboardAction {
+        let Mode::ResumeDialog(dialog) = &mut self.mode else {
+            return DashboardAction::None;
+        };
+        let focus = dialog.focus;
+        let typing = focus == ResumeFocus::Filter;
         match key.code {
             KeyCode::Esc => {
                 self.cancel_modal();
                 DashboardAction::None
             }
             KeyCode::Tab | KeyCode::BackTab => {
-                dialog.focus = cycle_control(
-                    dialog.focus,
-                    &RESUME_FOCUS_ORDER,
-                    key.code == KeyCode::BackTab,
-                );
-                self.mode = Mode::ResumeDialog(dialog);
+                dialog.focus =
+                    cycle_control(focus, &RESUME_FOCUS_ORDER, key.code == KeyCode::BackTab);
                 DashboardAction::None
             }
             KeyCode::Backspace if typing => {
                 dialog.filter.pop();
-                self.mode = Mode::ResumeDialog(dialog);
                 self.select_resume_row(0);
                 DashboardAction::None
             }
@@ -488,7 +582,6 @@ impl DashboardState {
                     ) =>
             {
                 dialog.filter.push(character);
-                self.mode = Mode::ResumeDialog(dialog);
                 self.select_resume_row(0);
                 DashboardAction::None
             }
@@ -496,28 +589,25 @@ impl DashboardState {
             // walking its results needs no Tab in between.
             KeyCode::Down if typing => {
                 dialog.focus = ResumeFocus::Sessions;
-                self.mode = Mode::ResumeDialog(dialog);
                 DashboardAction::None
             }
             KeyCode::Up | KeyCode::Char('k') if !typing => {
-                self.move_resume_selection(dialog, -1);
+                self.move_resume_selection(-1);
                 DashboardAction::None
             }
             KeyCode::Down | KeyCode::Char('j') if !typing => {
-                self.move_resume_selection(dialog, 1);
+                self.move_resume_selection(1);
                 DashboardAction::None
             }
             // `/` jumps to the filter from anywhere, so the list keeps its
             // single-letter action keys.
             KeyCode::Char('/') if !typing => {
                 dialog.focus = ResumeFocus::Filter;
-                self.mode = Mode::ResumeDialog(dialog);
                 DashboardAction::None
             }
             KeyCode::Char('s') if !typing => {
                 dialog.show_archived = !dialog.show_archived;
                 let shown = dialog.show_archived;
-                self.mode = Mode::ResumeDialog(dialog);
                 self.resync_resume_selection();
                 self.notices.set(if shown {
                     "Showing archived sessions."
@@ -527,21 +617,23 @@ impl DashboardState {
                 DashboardAction::None
             }
             KeyCode::Char('a') if !typing => {
-                let row = self.selected_resume_row(&dialog);
-                self.mode = Mode::ResumeDialog(dialog);
+                let row = self.selected_resume_row();
                 self.toggle_selected_resume_archive(row)
             }
             KeyCode::Char('d') | KeyCode::Delete if !typing => {
-                let row = self.selected_resume_row(&dialog);
-                let Some(row) = row else {
-                    self.mode = Mode::ResumeDialog(dialog);
+                let Some(row) = self.selected_resume_row() else {
                     return DashboardAction::None;
                 };
                 let Some(session_id) = row.session_id().map(ToOwned::to_owned) else {
-                    self.mode = Mode::ResumeDialog(dialog);
                     self.notices.set(
                         "Hel never deletes a harness's own session. Press a to archive this row.",
                     );
+                    return DashboardAction::None;
+                };
+                // The confirmation carries the dialog so it can reopen on
+                // exactly the list the user was looking at.
+                let Mode::ResumeDialog(dialog) = std::mem::replace(&mut self.mode, Mode::Dashboard)
+                else {
                     return DashboardAction::None;
                 };
                 self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteStopped {
@@ -550,24 +642,19 @@ impl DashboardState {
                 }));
                 DashboardAction::None
             }
-            KeyCode::Enter if dialog.focus == ResumeFocus::Cancel => {
+            KeyCode::Enter if focus == ResumeFocus::Cancel => {
                 self.cancel_modal();
                 DashboardAction::None
             }
-            KeyCode::Enter if dialog.focus == ResumeFocus::Filter => {
+            KeyCode::Enter if focus == ResumeFocus::Filter => {
                 dialog.focus = ResumeFocus::Sessions;
-                self.mode = Mode::ResumeDialog(dialog);
                 DashboardAction::None
             }
             KeyCode::Enter => {
-                let row = self.selected_resume_row(&dialog);
-                self.mode = Mode::ResumeDialog(dialog);
+                let row = self.selected_resume_row();
                 self.activate_selected_resume_row(row)
             }
-            _ => {
-                self.mode = Mode::ResumeDialog(dialog);
-                DashboardAction::None
-            }
+            _ => DashboardAction::None,
         }
     }
 
@@ -721,7 +808,7 @@ pub(crate) fn render_resume_dialog(
         rows[0],
     );
 
-    let list_rows = dashboard.resume_rows(dialog);
+    let list_rows = dashboard.resume_rows();
     let sessions_focused = dialog.focus == ResumeFocus::Sessions;
     let block = Block::default()
         .borders(Borders::ALL)
@@ -930,11 +1017,12 @@ mod tests {
         }
     }
 
-    fn rows(dashboard: &DashboardState) -> Vec<ResumeRow> {
-        let Mode::ResumeDialog(dialog) = &dashboard.mode else {
-            panic!("expected the resume dialog");
-        };
-        dashboard.resume_rows(dialog)
+    fn rows(dashboard: &mut DashboardState) -> Vec<ResumeRow> {
+        assert!(
+            matches!(dashboard.mode, Mode::ResumeDialog(_)),
+            "expected the resume dialog"
+        );
+        dashboard.refreshed_resume_rows().to_vec()
     }
 
     fn titles(rows: &[ResumeRow]) -> Vec<&str> {
@@ -1093,7 +1181,7 @@ mod tests {
             ])],
         );
 
-        let visible = titles(&rows(&dashboard))
+        let visible = titles(&rows(&mut dashboard))
             .into_iter()
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
@@ -1103,7 +1191,7 @@ mod tests {
         assert!(!visible.contains(&"Hidden native".to_owned()));
 
         dashboard.handle_key(key(KeyCode::Char('s')));
-        let shown = titles(&rows(&dashboard))
+        let shown = titles(&rows(&mut dashboard))
             .into_iter()
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
@@ -1126,9 +1214,9 @@ mod tests {
         let mut dashboard = DashboardState::new(config(), state_with(Vec::new()), BTreeMap::new());
         dashboard.show_resume_dialog(1, vec![codex_profile(vec![natively_archived])]);
 
-        assert!(rows(&dashboard).is_empty());
+        assert!(rows(&mut dashboard).is_empty());
         dashboard.handle_key(key(KeyCode::Char('s')));
-        assert_eq!(titles(&rows(&dashboard)), ["Archived in Codex"]);
+        assert_eq!(titles(&rows(&mut dashboard)), ["Archived in Codex"]);
 
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Char('a'))),
@@ -1141,7 +1229,7 @@ mod tests {
                 .unwrap_or_default()
                 .contains("archived in its own harness")
         );
-        assert!(rows(&dashboard)[0].natively_archived);
+        assert!(rows(&mut dashboard)[0].natively_archived);
     }
 
     /// Archiving reports the persistence the caller must do, and hides the row
@@ -1161,7 +1249,7 @@ mod tests {
                 NEWER_THAN_THE_CHECKPOINT,
             )])],
         );
-        assert_eq!(rows(&dashboard).len(), 2);
+        assert_eq!(rows(&mut dashboard).len(), 2);
 
         // The native row is newest, so it is selected first.
         assert_eq!(
@@ -1172,7 +1260,7 @@ mod tests {
                 hidden: true,
             }
         );
-        assert_eq!(titles(&rows(&dashboard)), ["ACP pretty name"]);
+        assert_eq!(titles(&rows(&mut dashboard)), ["ACP pretty name"]);
 
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Char('a'))),
@@ -1181,11 +1269,11 @@ mod tests {
                 archived: true,
             }
         );
-        assert!(rows(&dashboard).is_empty());
+        assert!(rows(&mut dashboard).is_empty());
 
         // The toggle reveals both, and archiving again reverses each one.
         dashboard.handle_key(key(KeyCode::Char('s')));
-        assert_eq!(rows(&dashboard).len(), 2);
+        assert_eq!(rows(&mut dashboard).len(), 2);
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Char('a'))),
             DashboardAction::SetNativeSessionHidden {
@@ -1218,7 +1306,7 @@ mod tests {
                 DashboardState::new(config(), state_with(vec![session]), BTreeMap::new());
             dashboard.show_resume_dialog(1, Vec::new());
 
-            let row = &rows(&dashboard)[0];
+            let row = &rows(&mut dashboard)[0];
             assert!(!row.status.is_recoverable());
             assert_eq!(row.status.warning(), Some(marker));
             assert!(row.details.contains(reason), "{}", row.details);
@@ -1340,7 +1428,7 @@ mod tests {
         assert!(on_dashboard.contains(&SessionState::Closing));
         assert!(on_dashboard.contains(&SessionState::Checkpointing));
 
-        let in_dialog = rows(&dashboard)
+        let in_dialog = rows(&mut dashboard)
             .into_iter()
             .map(|row| row.key)
             .collect::<Vec<_>>();
@@ -1366,7 +1454,7 @@ mod tests {
             BTreeMap::new(),
         );
         dashboard.show_resume_dialog(1, vec![codex_profile(Vec::new())]);
-        assert_eq!(titles(&rows(&dashboard)), ["ACP pretty name"]);
+        assert_eq!(titles(&rows(&mut dashboard)), ["ACP pretty name"]);
         let Mode::ResumeDialog(dialog) = &dashboard.mode else {
             panic!("expected the resume dialog");
         };
@@ -1384,7 +1472,7 @@ mod tests {
         assert_eq!(dialog.row_index, 1);
         // A late update for another discovery is ignored.
         dashboard.apply_resume_profile(99, codex_profile(Vec::new()));
-        assert_eq!(rows(&dashboard).len(), 2);
+        assert_eq!(rows(&mut dashboard).len(), 2);
     }
 
     /// A scan that failed is reported rather than dropped.
@@ -1426,6 +1514,178 @@ mod tests {
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(rendered.contains("[T] Resume"), "{rendered}");
         assert!(!rendered.contains("Import"), "{rendered}");
+    }
+
+    /// The row list is built once and reused, so every input that can change
+    /// it has to say so. A state reload, a checkpoint size that arrives from
+    /// the background, and a hidden set read out of the database all reach the
+    /// open dialog straight away.
+    #[test]
+    fn the_row_list_follows_state_reloads_and_background_updates_while_the_dialog_is_open() {
+        let mut dashboard = DashboardState::new(
+            config(),
+            state_with(vec![stopped_session()]),
+            BTreeMap::new(),
+        );
+        dashboard.show_resume_dialog(
+            1,
+            vec![codex_profile(vec![native(
+                "native-2",
+                "Native",
+                NEWER_THAN_THE_CHECKPOINT,
+            )])],
+        );
+        assert_eq!(titles(&rows(&mut dashboard)), ["Native", "ACP pretty name"]);
+
+        let mut reloaded = stopped_session();
+        reloaded.id = "session-2".into();
+        reloaded.native_session_id = None;
+        reloaded.acp_session_title = Some("Reloaded record".into());
+        dashboard.set_state(state_with(vec![stopped_session(), reloaded]));
+        assert!(
+            titles(&rows(&mut dashboard)).contains(&"Reloaded record"),
+            "{:?}",
+            titles(&rows(&mut dashboard))
+        );
+
+        dashboard.apply_checkpoint_archive_sizes(BTreeMap::from([(
+            "session-1".to_owned(),
+            Some(2_048),
+        )]));
+        let listed = rows(&mut dashboard);
+        let sized = listed
+            .iter()
+            .find(|row| row.key == ResumeRowKey::Hel("session-1".into()))
+            .expect("the checkpointed record");
+        assert!(sized.details.contains("2.0K"), "{}", sized.details);
+
+        dashboard.set_hidden_native_sessions(BTreeSet::from([(
+            HarnessKind::Codex,
+            "native-2".to_owned(),
+        )]));
+        assert!(
+            !titles(&rows(&mut dashboard)).contains(&"Native"),
+            "{:?}",
+            titles(&rows(&mut dashboard))
+        );
+    }
+
+    /// Walking the list must not rebuild it. The bound is measured against one
+    /// uncached build in the same run, so a loaded machine slows both sides.
+    #[test]
+    fn walking_a_large_dialog_does_not_rebuild_the_row_list_per_key() {
+        const NATIVE: usize = 2_000;
+        const KEYS: usize = 200;
+
+        let sessions = (0..NATIVE)
+            .map(|index| {
+                native(
+                    &format!("native-{index:04}"),
+                    &format!("Native conversation {index}"),
+                    index as i64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut dashboard = DashboardState::new(
+            config(),
+            state_with(vec![stopped_session()]),
+            BTreeMap::new(),
+        );
+        dashboard.show_resume_dialog(1, vec![codex_profile(sessions)]);
+        let Mode::ResumeDialog(dialog) = dashboard.mode.clone() else {
+            panic!("expected the resume dialog");
+        };
+
+        let started = Instant::now();
+        let built = build_resume_rows(
+            &dashboard.config,
+            &dashboard.state,
+            &dialog,
+            &dashboard.hidden_native_sessions,
+            &dashboard.checkpoint_archive_sizes,
+            chrono::Utc::now().timestamp_millis(),
+        );
+        let one_build = started.elapsed();
+        assert_eq!(built.len(), NATIVE + 1);
+
+        let started = Instant::now();
+        for _ in 0..KEYS {
+            dashboard.handle_key(key(KeyCode::Down));
+        }
+        let walking = started.elapsed();
+
+        assert!(
+            walking < one_build * 5,
+            "{KEYS} key presses took {walking:?}, more than five builds of {one_build:?}"
+        );
+    }
+
+    /// Cost of the merged row list and of one keypress, on a dialog the size a
+    /// long-lived harness home produces. Run with
+    /// `cargo test -p hel-tui resume_row_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing measurement, not a behavior assertion"]
+    fn resume_row_cost_for_a_few_thousand_sessions() {
+        const NATIVE: usize = 4_000;
+        const RECORDS: usize = 400;
+        const ROUNDS: usize = 200;
+
+        let records = (0..RECORDS)
+            .map(|index| {
+                let mut session = stopped_session();
+                session.id = format!("session-{index:04}");
+                session.native_session_id = None;
+                session.acp_session_title = Some(format!("Record {index}"));
+                session
+            })
+            .collect::<Vec<_>>();
+        let sessions = (0..NATIVE)
+            .map(|index| {
+                native(
+                    &format!("native-{index:04}"),
+                    &format!("Native conversation {index}"),
+                    index as i64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut dashboard = DashboardState::new(config(), state_with(records), BTreeMap::new());
+        dashboard.show_resume_dialog(1, vec![codex_profile(sessions)]);
+
+        let Mode::ResumeDialog(dialog) = dashboard.mode.clone() else {
+            panic!("expected the resume dialog");
+        };
+        // What one uncached read costs: the merge, the sizes, and the filters.
+        let started = Instant::now();
+        let mut built = 0;
+        for _ in 0..ROUNDS {
+            built += build_resume_rows(
+                &dashboard.config,
+                &dashboard.state,
+                &dialog,
+                &dashboard.hidden_native_sessions,
+                &dashboard.checkpoint_archive_sizes,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .len();
+        }
+        let rebuild = started.elapsed();
+
+        // What the dialog actually pays per key: a copy of the mode and every
+        // read of the row list the key press asks for.
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            dashboard.handle_key(key(KeyCode::Down));
+        }
+        let keypresses = started.elapsed();
+
+        println!(
+            "rows={} rebuild={:?} per_rebuild={:?} keypresses={:?} per_key={:?}",
+            built / ROUNDS,
+            rebuild,
+            rebuild / ROUNDS as u32,
+            keypresses,
+            keypresses / ROUNDS as u32,
+        );
     }
 
     /// The in-dialog keys are advertised where the user can see them.

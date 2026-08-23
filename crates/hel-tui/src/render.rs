@@ -22,7 +22,7 @@ use crate::dialogs::{
     render_confirmation, render_container_editor, render_import_bundle_confirmation,
     render_import_progress, render_rename_editor, render_repository_origin,
 };
-use crate::ingest::{SessionDetail, SessionOperationDisplay, TranscriptHydration};
+use crate::ingest::{CapacityDetail, SessionDetail, SessionOperationDisplay, TranscriptHydration};
 use crate::resume::{render_resume_dialog, resume_sessions_pane};
 use crate::widgets::{focus_border, format_resource_bytes};
 use crate::wizards::{render_new_wizard, render_resume_wizard};
@@ -55,6 +55,9 @@ pub fn render(frame: &mut Frame, dashboard: &mut DashboardState) {
     }
     dashboard.resume_sessions_area =
         matches!(dashboard.mode, Mode::ResumeDialog(_)).then(|| resume_sessions_pane(area));
+    // One build per frame, before the frame decides what to draw: the dialog
+    // and its scrollbar then read the same list.
+    dashboard.refresh_resume_rows();
 
     if !dashboard.config_is_empty() {
         render_adaptive_dashboard(frame, area, area, dashboard);
@@ -885,7 +888,33 @@ fn recovery_warning_name(session: &SessionRecord, name: String, now_epoch_second
     }
 }
 
+/// A reading older than this stopped tracking the host: the poller samples
+/// every 30 seconds, so three missed rounds mean the number on screen is no
+/// longer what the host is doing.
+const CAPACITY_SAMPLE_STALE_AFTER_SECONDS: u64 = 90;
+
+/// Why the row's reading cannot be trusted, if it cannot: a probe that failed,
+/// or a sample that stopped refreshing. `None` means the reading is current.
+fn capacity_staleness(detail: &CapacityDetail, now_epoch_seconds: u64) -> Option<String> {
+    if let Some(error) = &detail.probe_error {
+        return Some(format!("stale: {error}"));
+    }
+    let sampled_at = detail.sampled_at_epoch_seconds?;
+    (now_epoch_seconds.saturating_sub(sampled_at) > CAPACITY_SAMPLE_STALE_AFTER_SECONDS).then(
+        || {
+            format!(
+                "stale: sampled {}",
+                refresh_age(now_epoch_seconds, sampled_at)
+            )
+        },
+    )
+}
+
 fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) {
+    let now_epoch_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let rows = dashboard.capacity_details.values().map(|detail| {
         let capacity = match (&detail.target.kind, &detail.usage) {
             (DeploymentCapacityKind::Host, Some(usage)) => {
@@ -910,10 +939,17 @@ fn render_capacity(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState
             (DeploymentCapacityKind::AwsFleet, None) if detail.on_demand => "on demand".into(),
             _ => "unavailable".into(),
         };
+        let mut in_use = vec![Span::raw(capacity)];
+        if let Some(staleness) = capacity_staleness(detail, now_epoch_seconds) {
+            in_use.push(Span::styled(
+                format!("  · {staleness}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
         Row::new([
-            detail.target.host.clone(),
-            detail.target.target_ids.join(", "),
-            capacity,
+            Cell::from(detail.target.host.clone()),
+            Cell::from(detail.target.target_ids.join(", ")),
+            Cell::from(Line::from(in_use)),
         ])
     });
     let focused = dashboard.focus == Focus::Capacity;
@@ -1602,6 +1638,8 @@ mod tests {
         assert_ne!(session_name(&session), session.title);
     }
 
+    /// A capacity sample the poller keeps refreshing carries no clock column
+    /// and no staleness marker: the number on screen is the current one.
     #[test]
     fn capacity_pane_renders_grouped_host_load_without_sample_clock() {
         let mut dashboard = DashboardState::new(config(), HelState::default(), BTreeMap::new());
@@ -1617,9 +1655,8 @@ mod tests {
                 logical_cores: 8,
                 disk_total_bytes: None,
             })),
-            1,
+            now_epoch_seconds(),
         );
-        dashboard.apply_deployment_capacity("local", Err("probe failed".into()), 2);
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
@@ -1648,6 +1685,63 @@ mod tests {
             .find(|line| line.contains("Host / fleet") && line.contains("Targets"))
             .expect("capacity header");
         assert!(header.contains("In Use"));
+    }
+
+    fn now_epoch_seconds() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn host_capacity_usage() -> DeploymentCapacityUsage {
+        DeploymentCapacityUsage {
+            cpu_percent: Some(37),
+            memory_used_bytes: 3,
+            memory_total_bytes: 4,
+            logical_cores: 8,
+            disk_total_bytes: None,
+        }
+    }
+
+    fn drawn_dashboard(dashboard: &mut DashboardState, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 40)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, dashboard))
+            .expect("draw dashboard");
+        buffer_lines(terminal.backend().buffer()).join("\n")
+    }
+
+    /// A probe that failed and a reading that stopped refreshing both keep the
+    /// last numbers on screen and say why they cannot be trusted, instead of
+    /// rendering exactly like a reading taken a moment ago.
+    #[test]
+    fn capacity_rows_mark_a_failed_probe_and_a_sample_that_stopped_refreshing() {
+        let mut failed = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        failed.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        failed.apply_deployment_capacity(
+            "local",
+            Ok(Some(host_capacity_usage())),
+            now_epoch_seconds(),
+        );
+        failed.apply_deployment_capacity(
+            "local",
+            Err("probe timed out".into()),
+            now_epoch_seconds(),
+        );
+        let rendered = drawn_dashboard(&mut failed, 200);
+        assert!(rendered.contains("37% CPU · 75% RAM"), "{rendered}");
+        assert!(rendered.contains("stale: probe timed out"), "{rendered}");
+
+        let mut aged = DashboardState::new(config(), HelState::default(), BTreeMap::new());
+        aged.set_deployment_capacity_targets(vec![test_capacity_target()]);
+        aged.apply_deployment_capacity(
+            "local",
+            Ok(Some(host_capacity_usage())),
+            now_epoch_seconds().saturating_sub(3_600),
+        );
+        let rendered = drawn_dashboard(&mut aged, 200);
+        assert!(rendered.contains("stale: sampled 1h ago"), "{rendered}");
     }
 
     /// Active sessions whose previews differ in length, plus stopped sessions,

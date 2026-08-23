@@ -114,12 +114,46 @@ pub(crate) enum DashboardIoUpdate {
         result: std::result::Result<BTreeSet<(HarnessKind, String)>, String>,
     },
     /// A hide or reveal that has already been applied optimistically. Only a
-    /// failure needs handling; the dashboard reloads the set so the row cannot
+    /// failure needs handling; `target` says what to put back so no row can
     /// stay out of step with what is stored.
     ArchiveWrite {
         what: String,
+        target: ArchiveWriteTarget,
         result: std::result::Result<(), String>,
     },
+}
+
+/// Which hidden-row store an archive write was aimed at, and what the record
+/// held before the optimistic update overwrote it.
+pub(crate) enum ArchiveWriteTarget {
+    /// A Hel session record. Its archived flag lives in two in-memory copies —
+    /// the controller's state and the dashboard's — and both are restored.
+    Session { session_id: String, archived: bool },
+    /// The hidden native session set, which is re-read from the database
+    /// rather than reconstructed.
+    HiddenNativeSessions,
+}
+
+/// Puts back what an archive write did not manage to store. Returns whether
+/// the hidden native set still has to be re-read from the database.
+pub(crate) fn revert_archive_write(
+    target: &ArchiveWriteTarget,
+    state: &mut HelState,
+    dashboard: &mut hel_tui::DashboardState,
+) -> bool {
+    match target {
+        ArchiveWriteTarget::Session {
+            session_id,
+            archived,
+        } => {
+            if let Some(session) = state.sessions.get_mut(session_id) {
+                session.archived = *archived;
+            }
+            dashboard.set_session_archived(session_id, *archived);
+            false
+        }
+        ArchiveWriteTarget::HiddenNativeSessions => true,
+    }
 }
 
 pub(crate) struct ActiveLifecycleOperation {
@@ -199,14 +233,19 @@ pub(crate) fn spawn_hidden_native_sessions_load(
 }
 
 /// Persists one archive or unarchive. The dashboard already moved the row, so
-/// only the failure path matters here.
+/// only the failure path matters here: `target` carries what to restore.
 pub(crate) fn spawn_archive_write(
     what: String,
+    target: ArchiveWriteTarget,
     write: impl FnOnce() -> Result<()> + Send + 'static,
     updates: UnboundedSender<DashboardIoUpdate>,
 ) -> JoinHandle<()> {
     spawn_io(updates, write, move |result| {
-        DashboardIoUpdate::ArchiveWrite { what, result }
+        DashboardIoUpdate::ArchiveWrite {
+            what,
+            target,
+            result,
+        }
     })
 }
 
@@ -689,14 +728,24 @@ impl DashboardContext {
                     .dashboard
                     .set_notice(format!("Could not read archived sessions: {error}")),
             },
-            DashboardIoUpdate::ArchiveWrite { what, result } => {
+            DashboardIoUpdate::ArchiveWrite {
+                what,
+                target,
+                result,
+            } => {
                 if let Err(error) = result {
                     self.dashboard
                         .set_notice(format!("Could not archive {what}: {error}"));
-                    // The optimistic update no longer matches storage, so both
-                    // sources are read back rather than left to drift.
-                    self.controller_changed = true;
-                    spawn_hidden_native_sessions_load(self.dashboard_io_tx.clone());
+                    // The optimistic update no longer matches storage, so the
+                    // row it moved goes back where storage still has it.
+                    if revert_archive_write(
+                        &target,
+                        &mut self.controller.state,
+                        &mut self.dashboard,
+                    ) {
+                        spawn_hidden_native_sessions_load(self.dashboard_io_tx.clone());
+                    }
+                    self.dirty = true;
                 }
             }
             DashboardIoUpdate::MaterializedSessionProjection { session_id, result } => {
@@ -1185,5 +1234,98 @@ mod tests {
             "app-2"
         );
         assert_eq!(config.bundles.len(), 2);
+    }
+
+    fn archivable_session(id: &str) -> SessionRecord {
+        SessionRecord {
+            archived: false,
+            container_cpus: None,
+            container_memory: None,
+            id: id.into(),
+            title: "Raise the dead".into(),
+            harness_kind: HarnessKind::Codex,
+            last_profile: "codex-1".into(),
+            bundle_id: "hel".into(),
+            project_directory: None,
+            managed_worktree: None,
+            target_template_id: "podman".into(),
+            resource_allocation: None,
+            additional_mounts: Vec::new(),
+            state: SessionState::Stopped,
+            target: None,
+            native_session_id: None,
+            acp_session_title: None,
+            session_title_override: Some("Raise the dead".into()),
+            created_at: "2026-08-14T00:00:00Z".into(),
+            updated_at: "2026-08-14T00:00:00Z".into(),
+            detached_after_event_ordinal: 0,
+            draft_input: String::new(),
+            last_error: None,
+            last_checkpoint_error: None,
+            checkpoint: None,
+        }
+    }
+
+    /// An archive write that never reached the database must not leave the
+    /// dashboard and the controller holding a row the database still shows.
+    /// Both in-memory copies go back, and the row returns to the dialog.
+    #[test]
+    fn a_failed_session_archive_write_puts_both_copies_of_the_record_back() {
+        let mut state = HelState::default();
+        state
+            .sessions
+            .insert("session-1".into(), archivable_session("session-1"));
+        let mut dashboard =
+            hel_tui::DashboardState::new(HelConfig::default(), state.clone(), BTreeMap::new());
+        dashboard.show_resume_dialog(1, Vec::new());
+
+        // What pressing `a` applies before the write is even scheduled.
+        dashboard.set_session_archived("session-1", true);
+        state
+            .sessions
+            .get_mut("session-1")
+            .expect("the session")
+            .archived = true;
+
+        let reload_hidden_native = revert_archive_write(
+            &ArchiveWriteTarget::Session {
+                session_id: "session-1".into(),
+                archived: false,
+            },
+            &mut state,
+            &mut dashboard,
+        );
+
+        assert!(
+            !reload_hidden_native,
+            "a hel record is restored from what the write knew, not from the native set"
+        );
+        assert!(!state.sessions["session-1"].archived);
+        // The row is listed again, so archiving it asks for the same write the
+        // failed one attempted rather than an unarchive.
+        assert_eq!(
+            dashboard.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('a'),
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            DashboardAction::SetSessionArchived {
+                session_id: "session-1".into(),
+                archived: true,
+            }
+        );
+    }
+
+    /// The native hidden set has no per-row memory to restore, so a failed
+    /// hide is repaired by re-reading what the database holds.
+    #[test]
+    fn a_failed_native_hide_write_asks_for_the_stored_set() {
+        let mut state = HelState::default();
+        let mut dashboard =
+            hel_tui::DashboardState::new(HelConfig::default(), state.clone(), BTreeMap::new());
+        assert!(revert_archive_write(
+            &ArchiveWriteTarget::HiddenNativeSessions,
+            &mut state,
+            &mut dashboard,
+        ));
     }
 }
