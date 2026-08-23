@@ -1036,6 +1036,19 @@ fn quota_bar(window: Option<&QuotaWindow>) -> Line<'static> {
     ])
 }
 
+fn five_hour_quota_bar(quota: &ProfileQuota) -> Line<'static> {
+    let weekly_exhausted = quota
+        .weekly_window()
+        .and_then(quota_remaining_percent)
+        .is_some_and(|remaining| remaining < 1);
+    let five_hour = if weekly_exhausted {
+        None
+    } else {
+        quota.five_hour_window()
+    };
+    quota_bar(five_hour)
+}
+
 fn quota_reset_summary(quota: &ProfileQuota) -> String {
     let weekly = quota
         .weekly_window()
@@ -1078,7 +1091,7 @@ fn render_quotas(frame: &mut Frame, area: Rect, dashboard: &mut DashboardState) 
             match dashboard.quotas.get(id) {
                 Some(quota) if quota.error.is_none() => (
                     quota_bar(quota.weekly_window()),
-                    quota_bar(quota.five_hour_window()),
+                    five_hour_quota_bar(quota),
                     quota_reset_summary(quota),
                 ),
                 Some(quota) => (
@@ -2629,6 +2642,54 @@ mod tests {
         assert_eq!(bar.spans[0].style.fg, Some(Color::Green));
         assert_eq!(bar.spans[2].style.fg, Some(Color::DarkGray));
         assert!(quota_bar(None).spans.is_empty());
+    }
+
+    #[test]
+    fn quota_render_hides_five_hour_bar_when_weekly_quota_is_exhausted() {
+        let quota = ProfileQuota {
+            profile_id: "codex-1".into(),
+            harness: HarnessKind::Codex,
+            windows: vec![
+                QuotaWindow {
+                    label: "Week".into(),
+                    remaining_percent: Some(0),
+                    used: None,
+                    limit: None,
+                    resets: Some("09:00 Aug 20".into()),
+                    resets_at_epoch_seconds: Some(604_800),
+                },
+                QuotaWindow {
+                    label: "5H".into(),
+                    remaining_percent: Some(70),
+                    used: None,
+                    limit: None,
+                    resets: Some("14:00 Aug 13".into()),
+                    resets_at_epoch_seconds: Some(14_400),
+                },
+            ],
+            extra: None,
+            error: None,
+            refreshed_at_epoch_seconds: 0,
+        };
+        let mut dashboard = DashboardState::new(
+            config(),
+            HelState::default(),
+            BTreeMap::from([("codex-1".into(), quota)]),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(140, 28)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut dashboard))
+            .expect("draw dashboard");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("0%"));
+        assert!(!rendered.contains("70%"));
     }
 
     #[test]
