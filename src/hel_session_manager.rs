@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::hel_archive::verify_archive_streaming;
 use crate::hel_credentials::{CredentialSyncSignal, relay_event_credential_sync_reason};
 use crate::hel_database::{
-    ProjectionApplyOutcome, ProjectionIntegrityError, apply_projection_event,
+    ProjectionApplyOutcome, ProjectionIntegrityError, apply_projection_page,
     save_materialized_session,
 };
 use crate::hel_elicitation::ElicitationResponse;
@@ -19,7 +19,7 @@ use crate::hel_projection::{
 };
 use crate::hel_state::{ManagedSessionSnapshot, MaterializedSession};
 use crate::hel_targets::{CancellableProcessExecutor, CommandExecutor, CommandPlan, CommandSpec};
-use crate::hel_worker::{RelayCommand, RelayCursor, RelayOperationalState, validate_relay_event};
+use crate::hel_worker::{RelayCommand, RelayCursor, RelayOperationalState};
 use crate::hel_worker_client::{RelayClient, RelayEventPage, RelayRejected};
 
 const SESSION_SYNC_INTERVAL: Duration = Duration::from_millis(150);
@@ -1395,58 +1395,61 @@ impl StandaloneSession {
         self.client.compact(prompt).await
     }
 
+    /// Apply one relay page and acknowledge it. The whole page commits in a
+    /// single projection transaction, so a failure part-way leaves both the
+    /// durable and the in-memory projection at the previous frontier and the
+    /// relay redelivers the page.
     async fn apply_event_page(&mut self, page: RelayEventPage) -> Result<RelayCursor> {
-        let mut delivered_through = self.materialized.applied_event_ordinal;
-        let mut delivered_digest = self.materialized.applied_event_digest.clone();
-        for event in &page.events {
-            validate_relay_event(delivered_through, &delivered_digest, event)?;
-            delivered_through = event.ordinal;
-            delivered_digest.clone_from(&event.digest);
-            let projected = project_relay_event(&self.materialized, event)?;
-            match apply_projection_event(
-                &self.materialized.session_id,
-                event.ordinal,
-                &event.previous_digest,
-                &event.digest,
-                &projected.mutation,
-            )? {
-                ProjectionApplyOutcome::Applied => {
-                    // The mutation is durable now, so hand its values to the
-                    // in-memory projection rather than copying them again.
-                    apply_committed_projection_event(
-                        &mut self.materialized,
-                        event,
-                        projected.mutation,
-                    )?;
-                    if let Some(reason) = relay_event_credential_sync_reason(event) {
-                        self.latest_credential_sync_signal = Some(CredentialSyncSignal {
-                            ordinal: event.ordinal,
-                            reason,
-                        });
+        if !page.events.is_empty() {
+            // The in-memory projection advances on a working copy, so it is
+            // published only once the page it belongs to is durable.
+            let mut projection = self.materialized.clone();
+            let mut credential_sync_signal = None;
+            apply_projection_page(&self.materialized.session_id, |committed| {
+                for event in &page.events {
+                    let mutation = project_relay_event(&projection, event)?.mutation;
+                    match committed.apply(
+                        event.ordinal,
+                        &event.previous_digest,
+                        &event.digest,
+                        &mutation,
+                    )? {
+                        ProjectionApplyOutcome::Applied => {
+                            // The mutation commits with the page, so hand its
+                            // values to the projection rather than copying them
+                            // again.
+                            apply_committed_projection_event(&mut projection, event, mutation)?;
+                            if let Some(reason) = relay_event_credential_sync_reason(event) {
+                                credential_sync_signal = Some(CredentialSyncSignal {
+                                    ordinal: event.ordinal,
+                                    reason,
+                                });
+                            }
+                        }
+                        ProjectionApplyOutcome::AlreadyApplied => {
+                            bail!(
+                                "session actor received relay event {} after its projection had already applied it",
+                                event.ordinal
+                            );
+                        }
                     }
                 }
-                ProjectionApplyOutcome::AlreadyApplied => {
-                    bail!(
-                        "session actor received relay event {} after its projection had already applied it",
-                        event.ordinal
-                    );
-                }
+                Ok(())
+            })?;
+            self.materialized = projection;
+            if let Some(signal) = credential_sync_signal {
+                self.latest_credential_sync_signal = Some(signal);
             }
         }
+        let delivered_through = self.materialized.applied_event_ordinal;
         ensure!(
             delivered_through == page.through_ordinal,
             "relay page claimed frontier {} but delivered through {delivered_through}",
             page.through_ordinal
         );
         ensure!(
-            delivered_digest == page.through_digest,
+            self.materialized.applied_event_digest == page.through_digest,
             "relay page digest does not match its claimed frontier"
-        );
-        ensure!(
-            self.materialized.applied_event_ordinal == page.through_ordinal,
-            "controller projection frontier {} does not match committed relay page {}",
-            self.materialized.applied_event_ordinal,
-            page.through_ordinal,
         );
         if page.through_ordinal > 0 {
             let acknowledged = self
@@ -1465,7 +1468,7 @@ impl StandaloneSession {
         }
         Ok(RelayCursor {
             ordinal: delivered_through,
-            digest: delivered_digest,
+            digest: self.materialized.applied_event_digest.clone(),
         })
     }
 }

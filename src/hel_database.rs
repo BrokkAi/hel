@@ -1,9 +1,9 @@
 //! Normalized controller state and composer history stored in SQLite.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -94,8 +94,65 @@ fn open(path: &Path) -> Result<Connection> {
          PRAGMA journal_mode = WAL;
          PRAGMA synchronous = FULL;",
     )?;
-    migrate_schema(&connection)?;
+    verify_schema_once(path, &connection)?;
     Ok(connection)
+}
+
+/// Databases this process has already migrated. A controller owns its store
+/// exclusively (`ControllerStoreGuard`), so a schema verified once stays
+/// verified and later connections skip the migration probes entirely.
+fn verified_schemas() -> &'static Mutex<HashSet<PathBuf>> {
+    static VERIFIED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    VERIFIED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Stable cache identity for a database. The file itself may not exist yet, so
+/// the canonicalized parent directory carries the identity.
+fn schema_cache_key(path: &Path) -> PathBuf {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return path.to_owned();
+    };
+    match (fs::canonicalize(parent), path.file_name()) {
+        (Ok(canonical), Some(name)) => canonical.join(name),
+        _ => path.to_owned(),
+    }
+}
+
+/// Run the migration ladder the first time this process opens a database.
+/// Later opens confirm only the recorded schema version, which keeps relay
+/// catch-up from paying for the full probe sequence on every connection. A
+/// database whose version no longer matches is migrated again, so a recreated
+/// file under a reused path still converges.
+fn verify_schema_once(path: &Path, connection: &Connection) -> Result<()> {
+    let key = schema_cache_key(path);
+    let mut verified = verified_schemas()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if verified.contains(&key) {
+        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+    }
+    // Holding the lock across the ladder keeps two first opens of the same
+    // database from running the additive migration steps against each other.
+    migrate_schema(connection)?;
+    verified.insert(key);
+    Ok(())
+}
+
+/// Forget that this process verified a database's schema. Only tests need it:
+/// they simulate a store written by an older build by editing the schema of a
+/// database this process has already opened, which no controller can do.
+#[cfg(test)]
+fn forget_verified_schema(path: &Path) {
+    verified_schemas()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&schema_cache_key(path));
 }
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
@@ -1460,9 +1517,185 @@ fn save_materialized_session_to(path: &Path, materialized: &MaterializedSession)
     Ok(())
 }
 
-/// Apply the projection effects of exactly one relay event. The projection
-/// changes and event frontier commit atomically, so callers may acknowledge
-/// the ordinal to the relay after this returns `Applied`.
+/// One relay page being applied inside a single write transaction. The relay
+/// retains everything past the last acknowledgement, so a page that fails
+/// part-way rolls back to the previous durable frontier and is simply
+/// redelivered. Only a committed page may be acknowledged.
+pub struct ProjectionPage<'a> {
+    session_id: &'a str,
+    transaction: Transaction<'a>,
+    applied_ordinal: u64,
+    applied_digest: String,
+}
+
+impl ProjectionPage<'_> {
+    /// Apply the projection effects of the next relay event to the open page.
+    /// The event must continue the chain the page has reached so far, which is
+    /// the persisted frontier plus every event already applied to this page.
+    pub fn apply(
+        &mut self,
+        event_ordinal: u64,
+        previous_event_digest: &str,
+        event_digest: &str,
+        mutation: &MaterializedSessionMutation,
+    ) -> Result<ProjectionApplyOutcome> {
+        if event_ordinal == 0 {
+            bail!("relay event ordinal must be positive");
+        }
+        validate_relay_event_digest(previous_event_digest, "previous relay event digest")?;
+        validate_relay_event_frontier(event_ordinal, event_digest, "relay event frontier")?;
+        let session_id = self.session_id;
+        let applied = self.applied_ordinal;
+        if event_ordinal < applied {
+            return Ok(ProjectionApplyOutcome::AlreadyApplied);
+        }
+        if event_ordinal == applied {
+            if event_digest != self.applied_digest {
+                bail!(
+                    "relay event digest mismatch for session {session_id} at ordinal {event_ordinal}: projection has {}, received {event_digest}",
+                    self.applied_digest
+                );
+            }
+            return Ok(ProjectionApplyOutcome::AlreadyApplied);
+        }
+        let expected = applied
+            .checked_add(1)
+            .context("materialized event ordinal overflow")?;
+        if event_ordinal != expected {
+            bail!(
+                "relay event gap for session {session_id}: expected ordinal {expected}, received {event_ordinal}"
+            );
+        }
+        if previous_event_digest != self.applied_digest {
+            bail!(
+                "relay event chain diverged for session {session_id} before ordinal {event_ordinal}: projection has {}, event follows {previous_event_digest}",
+                self.applied_digest
+            );
+        }
+
+        let tx = &self.transaction;
+        if let Some(activity_at_ms) = mutation.last_activity_at_ms {
+            tx.execute(
+                "UPDATE materialized_sessions
+                 SET last_activity_at_ms = CASE
+                     WHEN last_activity_at_ms IS NULL OR last_activity_at_ms < ?2 THEN ?2
+                     ELSE last_activity_at_ms
+                 END
+                 WHERE session_id = ?1",
+                params![session_id, activity_at_ms],
+            )?;
+        }
+        if let Some(execution) = mutation.execution {
+            let (state, started_at_ms) = materialized_execution_columns(execution);
+            tx.execute(
+                "UPDATE materialized_sessions
+                 SET execution_state = ?2, running_started_at_ms = ?3
+                 WHERE session_id = ?1",
+                params![session_id, state, started_at_ms],
+            )?;
+        }
+        if let Some(title) = &mutation.session_title {
+            if title.as_ref().is_some_and(|title| title.trim().is_empty()) {
+                bail!("materialized session title cannot be empty");
+            }
+            tx.execute(
+                "UPDATE materialized_sessions SET session_title = ?2 WHERE session_id = ?1",
+                params![session_id, title],
+            )?;
+        }
+        if let Some(configuration) = &mutation.configuration {
+            tx.execute(
+                "UPDATE materialized_sessions SET configuration_json = ?2 WHERE session_id = ?1",
+                params![session_id, serde_json::to_string(configuration)?],
+            )?;
+        }
+        for item_mutation in &mutation.transcript {
+            match item_mutation {
+                TranscriptMutation::Upsert(item) => {
+                    item.validate(event_ordinal)?;
+                    upsert_transcript_item(tx, session_id, item)?;
+                }
+                TranscriptMutation::Remove { stable_id } => {
+                    if stable_id.trim().is_empty() {
+                        bail!("cannot remove a transcript item with an empty stable id");
+                    }
+                    tx.execute(
+                        "DELETE FROM materialized_transcript_items
+                         WHERE session_id = ?1 AND stable_id = ?2",
+                        params![session_id, stable_id],
+                    )?;
+                }
+            }
+        }
+        if let Some(queued_prompts) = &mutation.queued_prompts {
+            replace_materialized_queue(tx, session_id, queued_prompts)?;
+        }
+        if let Some(pending_elicitations) = &mutation.pending_elicitations {
+            tx.execute(
+                "UPDATE materialized_sessions
+                 SET pending_elicitations_json = ?2 WHERE session_id = ?1",
+                params![session_id, serde_json::to_string(pending_elicitations)?],
+            )?;
+        }
+        tx.execute(
+            "UPDATE materialized_sessions
+             SET applied_event_ordinal = ?2, applied_event_digest = ?3
+             WHERE session_id = ?1",
+            params![session_id, event_ordinal, event_digest],
+        )?;
+        self.applied_ordinal = event_ordinal;
+        event_digest.clone_into(&mut self.applied_digest);
+        Ok(ProjectionApplyOutcome::Applied)
+    }
+}
+
+/// Apply one relay page in a single transaction. `fill` feeds the page's
+/// events through [`ProjectionPage::apply`]; the projection changes and the
+/// event frontier commit together only when `fill` succeeds, so callers may
+/// acknowledge the page's last ordinal to the relay after this returns.
+pub fn apply_projection_page<T>(
+    session_id: &str,
+    fill: impl FnOnce(&mut ProjectionPage<'_>) -> Result<T>,
+) -> Result<T> {
+    apply_projection_page_to(&database_path(), session_id, fill)
+}
+
+fn apply_projection_page_to<T>(
+    path: &Path,
+    session_id: &str,
+    fill: impl FnOnce(&mut ProjectionPage<'_>) -> Result<T>,
+) -> Result<T> {
+    let mut connection = open(path)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (applied_ordinal, applied_digest) = transaction
+        .query_row(
+            "SELECT applied_event_ordinal, applied_event_digest
+             FROM materialized_sessions WHERE session_id = ?1",
+            [session_id],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .with_context(|| format!("unknown session {session_id}"))?;
+    validate_relay_event_frontier(
+        applied_ordinal,
+        &applied_digest,
+        "persisted relay event frontier",
+    )?;
+    let mut page = ProjectionPage {
+        session_id,
+        transaction,
+        applied_ordinal,
+        applied_digest,
+    };
+    // Dropping the page on failure rolls the whole transaction back, leaving
+    // the projection at the frontier the relay last saw acknowledged.
+    let filled = fill(&mut page)?;
+    page.transaction.commit()?;
+    Ok(filled)
+}
+
+/// Apply exactly one relay event, as a page of one.
 pub fn apply_projection_event(
     session_id: &str,
     event_ordinal: u64,
@@ -1488,121 +1721,9 @@ fn apply_projection_event_to(
     event_digest: &str,
     mutation: &MaterializedSessionMutation,
 ) -> Result<ProjectionApplyOutcome> {
-    if event_ordinal == 0 {
-        bail!("relay event ordinal must be positive");
-    }
-    validate_relay_event_digest(previous_event_digest, "previous relay event digest")?;
-    validate_relay_event_frontier(event_ordinal, event_digest, "relay event frontier")?;
-    let mut connection = open(path)?;
-    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let (applied, applied_digest) = tx
-        .query_row(
-            "SELECT applied_event_ordinal, applied_event_digest
-             FROM materialized_sessions WHERE session_id = ?1",
-            [session_id],
-            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?
-        .with_context(|| format!("unknown session {session_id}"))?;
-    validate_relay_event_frontier(applied, &applied_digest, "persisted relay event frontier")?;
-    if event_ordinal < applied {
-        tx.commit()?;
-        return Ok(ProjectionApplyOutcome::AlreadyApplied);
-    }
-    if event_ordinal == applied {
-        if event_digest != applied_digest {
-            bail!(
-                "relay event digest mismatch for session {session_id} at ordinal {event_ordinal}: projection has {applied_digest}, received {event_digest}"
-            );
-        }
-        tx.commit()?;
-        return Ok(ProjectionApplyOutcome::AlreadyApplied);
-    }
-    let expected = applied
-        .checked_add(1)
-        .context("materialized event ordinal overflow")?;
-    if event_ordinal != expected {
-        bail!(
-            "relay event gap for session {session_id}: expected ordinal {expected}, received {event_ordinal}"
-        );
-    }
-    if previous_event_digest != applied_digest {
-        bail!(
-            "relay event chain diverged for session {session_id} before ordinal {event_ordinal}: projection has {applied_digest}, event follows {previous_event_digest}"
-        );
-    }
-
-    if let Some(activity_at_ms) = mutation.last_activity_at_ms {
-        tx.execute(
-            "UPDATE materialized_sessions
-             SET last_activity_at_ms = CASE
-                 WHEN last_activity_at_ms IS NULL OR last_activity_at_ms < ?2 THEN ?2
-                 ELSE last_activity_at_ms
-             END
-             WHERE session_id = ?1",
-            params![session_id, activity_at_ms],
-        )?;
-    }
-    if let Some(execution) = mutation.execution {
-        let (state, started_at_ms) = materialized_execution_columns(execution);
-        tx.execute(
-            "UPDATE materialized_sessions
-             SET execution_state = ?2, running_started_at_ms = ?3
-             WHERE session_id = ?1",
-            params![session_id, state, started_at_ms],
-        )?;
-    }
-    if let Some(title) = &mutation.session_title {
-        if title.as_ref().is_some_and(|title| title.trim().is_empty()) {
-            bail!("materialized session title cannot be empty");
-        }
-        tx.execute(
-            "UPDATE materialized_sessions SET session_title = ?2 WHERE session_id = ?1",
-            params![session_id, title],
-        )?;
-    }
-    if let Some(configuration) = &mutation.configuration {
-        tx.execute(
-            "UPDATE materialized_sessions SET configuration_json = ?2 WHERE session_id = ?1",
-            params![session_id, serde_json::to_string(configuration)?],
-        )?;
-    }
-    for item_mutation in &mutation.transcript {
-        match item_mutation {
-            TranscriptMutation::Upsert(item) => {
-                item.validate(event_ordinal)?;
-                upsert_transcript_item(&tx, session_id, item)?;
-            }
-            TranscriptMutation::Remove { stable_id } => {
-                if stable_id.trim().is_empty() {
-                    bail!("cannot remove a transcript item with an empty stable id");
-                }
-                tx.execute(
-                    "DELETE FROM materialized_transcript_items
-                     WHERE session_id = ?1 AND stable_id = ?2",
-                    params![session_id, stable_id],
-                )?;
-            }
-        }
-    }
-    if let Some(queued_prompts) = &mutation.queued_prompts {
-        replace_materialized_queue(&tx, session_id, queued_prompts)?;
-    }
-    if let Some(pending_elicitations) = &mutation.pending_elicitations {
-        tx.execute(
-            "UPDATE materialized_sessions
-             SET pending_elicitations_json = ?2 WHERE session_id = ?1",
-            params![session_id, serde_json::to_string(pending_elicitations)?],
-        )?;
-    }
-    tx.execute(
-        "UPDATE materialized_sessions
-         SET applied_event_ordinal = ?2, applied_event_digest = ?3
-         WHERE session_id = ?1",
-        params![session_id, event_ordinal, event_digest],
-    )?;
-    tx.commit()?;
-    Ok(ProjectionApplyOutcome::Applied)
+    apply_projection_page_to(path, session_id, |page| {
+        page.apply(event_ordinal, previous_event_digest, event_digest, mutation)
+    })
 }
 
 /// Advance the persisted detach/read receipt monotonically. A receipt cannot
@@ -2935,6 +3056,9 @@ mod tests {
             )
             .unwrap();
         drop(connection);
+        // Editing the schema of an already-open store is something only this
+        // test does, so it has to retract the process's verification too.
+        forget_verified_schema(&database);
 
         assert_eq!(
             load_state_from(&database).unwrap().sessions["session-1"].additional_mounts,
@@ -4397,6 +4521,172 @@ mod tests {
         assert!(loaded.queued_prompts.is_empty());
         assert_eq!(loaded.last_activity_at_ms(), Some(500));
         assert_eq!(loaded.applied_event_ordinal, 2);
+    }
+
+    /// One agent message per relay event, shaped so the projection can store it.
+    fn agent_message_mutation(ordinal: u64) -> MaterializedSessionMutation {
+        MaterializedSessionMutation {
+            last_activity_at_ms: Some(1_000 + ordinal as i64),
+            transcript: vec![TranscriptMutation::Upsert(TranscriptItem {
+                stable_id: format!("item-{ordinal}"),
+                position: ordinal,
+                latest_content_event_ordinal: Some(ordinal),
+                created_at_ms: 1_000 + ordinal as i64,
+                last_changed_at_ms: 1_000 + ordinal as i64,
+                body: TranscriptBody::Agent {
+                    chunks: vec![serde_json::json!({
+                        "content": {"type": "text", "text": format!("event {ordinal}")}
+                    })],
+                    streaming: false,
+                },
+            })],
+            ..MaterializedSessionMutation::default()
+        }
+    }
+
+    #[test]
+    fn projection_page_advances_the_frontier_only_when_the_whole_page_commits() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        save_session_to(&database, &session("session-1", "project-1")).unwrap();
+
+        // The second event breaks the chain only after the first has written
+        // its rows, so the page has to unwind work it already did.
+        let interrupted = apply_projection_page_to(&database, "session-1", |page| {
+            page.apply(
+                1,
+                RELAY_EVENT_GENESIS_DIGEST,
+                &event_digest(1),
+                &agent_message_mutation(1),
+            )?;
+            page.apply(
+                3,
+                &event_digest(1),
+                &event_digest(3),
+                &agent_message_mutation(3),
+            )
+        })
+        .unwrap_err();
+        assert!(
+            interrupted.to_string().contains("expected ordinal 2"),
+            "unexpected page failure: {interrupted:#}"
+        );
+
+        // The relay retains everything past the last acknowledgement, so an
+        // interrupted page must leave the durable frontier where it was.
+        let rolled_back = load_materialized_session_from(&database, "session-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rolled_back.applied_event_ordinal, 0);
+        assert_eq!(rolled_back.applied_event_digest, RELAY_EVENT_GENESIS_DIGEST);
+        assert!(rolled_back.transcript.is_empty());
+        assert_eq!(rolled_back.last_activity_at_ms(), None);
+
+        apply_projection_page_to(&database, "session-1", |page| {
+            page.apply(
+                1,
+                RELAY_EVENT_GENESIS_DIGEST,
+                &event_digest(1),
+                &agent_message_mutation(1),
+            )?;
+            page.apply(
+                2,
+                &event_digest(1),
+                &event_digest(2),
+                &agent_message_mutation(2),
+            )
+        })
+        .unwrap();
+
+        let committed = load_materialized_session_from(&database, "session-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.applied_event_ordinal, 2);
+        assert_eq!(committed.applied_event_digest, event_digest(2));
+        assert_eq!(
+            committed
+                .transcript
+                .iter()
+                .map(|item| item.stable_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["item-1".to_owned(), "item-2".to_owned()]
+        );
+        assert_eq!(committed.last_activity_at_ms(), Some(1_002));
+    }
+
+    /// The process caches which databases it has migrated. A database that is
+    /// gone and recreated under the same path must still be migrated.
+    #[test]
+    fn reopening_a_recreated_database_migrates_it_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        save_session_to(&database, &session("session-1", "project-1")).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let sidecar = directory.path().join(format!("hel.sqlite3{suffix}"));
+            if sidecar.exists() {
+                fs::remove_file(&sidecar).unwrap();
+            }
+        }
+
+        save_session_to(&database, &session("session-2", "project-1")).unwrap();
+        let state = load_state_from(&database).unwrap();
+        assert!(state.sessions.contains_key("session-2"));
+        assert!(!state.sessions.contains_key("session-1"));
+    }
+
+    /// Catch-up throughput: one durable commit per page instead of one per
+    /// event. Ignored by default because it measures wall-clock time.
+    #[test]
+    #[ignore = "timing benchmark; run with --ignored --nocapture"]
+    fn projection_page_apply_outruns_per_event_apply() {
+        const EVENTS: u64 = 2_000;
+        let directory = tempfile::tempdir().unwrap();
+
+        let per_event_database = directory.path().join("per-event/hel.sqlite3");
+        save_session_to(&per_event_database, &session("session-1", "project-1")).unwrap();
+        let started = std::time::Instant::now();
+        for ordinal in 1..=EVENTS {
+            apply_projection_event_to(
+                &per_event_database,
+                "session-1",
+                ordinal,
+                &event_digest(ordinal - 1),
+                &event_digest(ordinal),
+                &agent_message_mutation(ordinal),
+            )
+            .unwrap();
+        }
+        let per_event = started.elapsed();
+
+        let per_page_database = directory.path().join("per-page/hel.sqlite3");
+        save_session_to(&per_page_database, &session("session-1", "project-1")).unwrap();
+        let started = std::time::Instant::now();
+        apply_projection_page_to(&per_page_database, "session-1", |page| {
+            for ordinal in 1..=EVENTS {
+                page.apply(
+                    ordinal,
+                    &event_digest(ordinal - 1),
+                    &event_digest(ordinal),
+                    &agent_message_mutation(ordinal),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let per_page = started.elapsed();
+
+        println!("{EVENTS} events per-event: {per_event:?}, one page: {per_page:?}");
+        assert_eq!(
+            load_materialized_session_from(&per_page_database, "session-1")
+                .unwrap()
+                .unwrap()
+                .applied_event_ordinal,
+            EVENTS
+        );
+        assert!(
+            per_page < per_event,
+            "one page took {per_page:?} against {per_event:?} per event"
+        );
     }
 
     #[test]
