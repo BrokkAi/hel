@@ -41,19 +41,57 @@ const MAX_CODE_FAILURES: u32 = 5;
 const CODE_LOCKOUT: Duration = Duration::from_secs(30);
 const MAX_TITLE_CHARS: usize = 120;
 const MAX_PROMPT_CHARS: usize = 64 * 1024;
+const COOKIE_KEY_BYTES: usize = 32;
+const COOKIE_KEY_FILE: &str = "phone-cookie-key";
+
+/// Where the phone cookie signing key lives: beside Hel's other private
+/// controller state, never in the shared config directory.
+pub fn cookie_key_path() -> PathBuf {
+    crate::hel_config::data_dir().join(COOKIE_KEY_FILE)
+}
+
+/// Load the phone cookie signing key, creating it on first use.
+///
+/// Session cookies are stateless, so this file is the only thing that keeps a
+/// signed-in phone signed in across `hel server` restarts. Deleting it is
+/// therefore the explicit sign-everyone-out gesture: the next start writes a
+/// new key and every outstanding cookie stops validating. A missing file is
+/// ordinary first use; an unreadable or too-short one is replaced loudly,
+/// because refusing to start would be a worse answer than asking phones to
+/// enter the viewer code again.
+pub fn load_or_create_cookie_key(path: &std::path::Path) -> AnyResult<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(key) if key.len() >= COOKIE_KEY_BYTES => return Ok(key),
+        Ok(key) => tracing::warn!(
+            path = %path.display(),
+            bytes = key.len(),
+            "phone cookie key is shorter than {COOKIE_KEY_BYTES} bytes; generating a new key signs every phone out"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            "could not read the phone cookie key ({error}); generating a new key signs every phone out"
+        ),
+    }
+    let key = generate_cookie_key()?;
+    crate::hel_config::atomic_write(path, &key)
+        .with_context(|| format!("persist Hel phone cookie key {}", path.display()))?;
+    Ok(key.to_vec())
+}
 
 /// Options for the explicit `hel server` process.
 ///
 /// `ServerOptions::new` generates both the six-digit viewer code and an
 /// ephemeral cookie key. A caller that wants cookies to survive server
-/// restarts can replace `cookie_key` with bytes loaded from its private Hel
-/// data directory. The key and viewer code are intentionally omitted from
-/// `Debug` output.
+/// restarts installs a persisted key with `set_cookie_key`, which
+/// `load_or_create_cookie_key` reads from its private Hel data directory. The
+/// key and viewer code are intentionally omitted from `Debug` output.
 pub struct ServerOptions {
     pub bind: SocketAddr,
     pub snapshot_rx: watch::Receiver<ViewerSnapshot>,
     pub conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
     pub action_tx: mpsc::Sender<ControllerRequest>,
+    pub receipt_tx: mpsc::Sender<ReadReceiptRequest>,
     pub shutdown: CancellationToken,
     pub session_ttl: Duration,
     /// Keep this enabled for direct HTTPS or an HTTPS reverse proxy. It may be
@@ -70,12 +108,14 @@ impl ServerOptions {
         snapshot_rx: watch::Receiver<ViewerSnapshot>,
         conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
         action_tx: mpsc::Sender<ControllerRequest>,
+        receipt_tx: mpsc::Sender<ReadReceiptRequest>,
     ) -> AnyResult<Self> {
         Ok(Self {
             bind,
             snapshot_rx,
             conversation_rx,
             action_tx,
+            receipt_tx,
             shutdown: CancellationToken::new(),
             session_ttl: DEFAULT_SESSION_TTL,
             secure_cookie: true,
@@ -101,8 +141,8 @@ impl ServerOptions {
     /// out without maintaining a server-side session database.
     pub fn set_cookie_key(&mut self, key: Vec<u8>) -> AnyResult<()> {
         anyhow::ensure!(
-            key.len() >= 32,
-            "cookie signing key must be at least 32 bytes"
+            key.len() >= COOKIE_KEY_BYTES,
+            "cookie signing key must be at least {COOKIE_KEY_BYTES} bytes"
         );
         self.cookie_key = key;
         Ok(())
@@ -347,10 +387,6 @@ pub enum ControllerAction {
     Open {
         session_id: String,
     },
-    Read {
-        session_id: String,
-        through: u64,
-    },
     Prompt {
         session_id: String,
         text: String,
@@ -380,11 +416,28 @@ pub struct ControllerRequest {
     pub reply: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
+/// A phone acknowledging how far it has read a conversation.
+///
+/// This deliberately is not a `ControllerAction`: the viewer posts it after
+/// every conversation fetch, and a fetch follows every revision. Routing it
+/// through the action pipeline made each receipt reload the controller, bump
+/// the revision and broadcast a snapshot, which triggered the next fetch, so
+/// viewer and controller never went quiet; it also consumed the session's
+/// single action slot, intermittently rejecting real actions. A receipt
+/// therefore travels on its own channel and only persists one cursor field.
+#[derive(Debug)]
+pub struct ReadReceiptRequest {
+    pub session_id: String,
+    pub through: u64,
+    pub reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
 #[derive(Clone)]
 struct ServerState {
     snapshot_rx: watch::Receiver<ViewerSnapshot>,
     conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
     action_tx: mpsc::Sender<ControllerRequest>,
+    receipt_tx: mpsc::Sender<ReadReceiptRequest>,
     viewer_code: Arc<str>,
     cookie_key: Arc<[u8]>,
     session_ttl: Duration,
@@ -403,6 +456,7 @@ fn router(options: ServerOptions) -> Router {
         snapshot_rx: options.snapshot_rx,
         conversation_rx: options.conversation_rx,
         action_tx: options.action_tx,
+        receipt_tx: options.receipt_tx,
         viewer_code: options.viewer_code.into(),
         cookie_key: options.cookie_key.into(),
         session_ttl: options.session_ttl,
@@ -566,12 +620,10 @@ async fn mark_conversation_read(
     require_session_record(&state.snapshot_rx.borrow(), &session_id)?;
     let (reply, result) = tokio::sync::oneshot::channel();
     state
-        .action_tx
-        .send(ControllerRequest {
-            action: ControllerAction::Read {
-                session_id,
-                through: request.through,
-            },
+        .receipt_tx
+        .send(ReadReceiptRequest {
+            session_id,
+            through: request.through,
             reply,
         })
         .await
@@ -669,8 +721,7 @@ fn validate_action(action: &ControllerAction, snapshot: &ViewerSnapshot) -> Resu
         }
         ControllerAction::Open { session_id }
         | ControllerAction::Close { session_id }
-        | ControllerAction::Cancel { session_id }
-        | ControllerAction::Read { session_id, .. } => {
+        | ControllerAction::Cancel { session_id } => {
             validate_public_id(session_id)?;
             require_session_record(snapshot, session_id)?;
         }
@@ -831,8 +882,8 @@ fn generate_viewer_code() -> AnyResult<String> {
     }
 }
 
-fn generate_cookie_key() -> AnyResult<[u8; 32]> {
-    let mut key = [0_u8; 32];
+fn generate_cookie_key() -> AnyResult<[u8; COOKIE_KEY_BYTES]> {
+    let mut key = [0_u8; COOKIE_KEY_BYTES];
     getrandom::fill(&mut key)
         .map_err(|error| anyhow::anyhow!("generate Hel cookie key: {error}"))?;
     Ok(key)
@@ -996,16 +1047,16 @@ const VIEWER_HTML: &str = r##"<!doctype html>
 <main id="login" class="card"><h2>Unlock viewer</h2><p class="dim">Enter the six-digit code shown by <code>hel server</code>.</p><form id="login-form" class="row"><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required><button>Enter</button></form><p id="login-error"></p></main>
 <main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><input id="new-project-directory" class="hidden" placeholder="Absolute project directory"><button>Start</button></form><p id="action-error"></p></section><section><h2>Sessions</h2><div id="sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div></section><form id="prompt-form" class="card"><textarea id="prompt-text" maxlength="65536" placeholder="Message the agent" required></textarea><button>Send or queue</button><p id="conversation-error"></p></form></section></main>
 <script>
-const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),newProjectDirectory=document.querySelector('#new-project-directory'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue');let snapshot,currentSession,cursor=0,eventsStarted=false;
+const login=document.querySelector('#login'),app=document.querySelector('#app'),dashboard=document.querySelector('#dashboard'),conversation=document.querySelector('#conversation'),sessions=document.querySelector('#sessions'),configured=document.querySelector('#configured'),logout=document.querySelector('#logout'),newForm=document.querySelector('#new-form'),newProfile=document.querySelector('#new-profile'),newBundle=document.querySelector('#new-bundle'),newTarget=document.querySelector('#new-target'),newProjectDirectory=document.querySelector('#new-project-directory'),actionError=document.querySelector('#action-error'),feed=document.querySelector('#conversation-feed'),queue=document.querySelector('#conversation-queue');let snapshot,currentSession,cursor=0,acknowledged=0,eventsStarted=false;
 async function request(url,options={}){const response=await fetch(url,{...options,headers:{'content-type':'application/json',...(options.headers||{})}});if(response.status===401)throw new Error('unauthorized');if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||response.statusText)}return response.status===204?null:response.json()}
 function options(items,selected){return items.map(x=>`<option value="${escapeAttr(x.id)}" ${x.id===selected?'selected':''}>${escapeHtml(x.id)}</option>`).join('')}
 function syncProjectDirectory(){const required=snapshot?.targets.find(x=>x.id===newTarget.value)?.requires_project_directory===true;newProjectDirectory.classList.toggle('hidden',!required);newProjectDirectory.required=required;if(!required)newProjectDirectory.value=''}
 async function refresh(){try{snapshot=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);syncProjectDirectory();sessions.innerHTML=snapshot.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span> ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available?'':'disabled'}>Open</button>${x.state==='provisioning'?`<button class="danger" data-action="cancel" data-id="${escapeAttr(x.id)}">Cancel</button>`:`<button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Stop</button>`}</div></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);document.querySelector('#conversation-state').textContent=session.state}}if(!eventsStarted){eventsStarted=true;const source=new EventSource('/api/events');source.addEventListener('revision',()=>{refresh();if(currentSession)loadConversation(true)})}}catch(e){if(e.message==='unauthorized'){login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}}}
 function renderQueue(session){queue.innerHTML=(session.queued_prompts||[]).map((x,i)=>`<div class="queue-item"><span>${i+1}. ${escapeHtml(x.text)}</span><button class="danger" data-queue-id="${escapeAttr(x.id)}">Remove</button></div>`).join('')||'<p class="dim">No queued prompts.</p>'}
 function renderEntries(entries,replace){if(replace)feed.innerHTML='';for(const entry of entries){let node=document.querySelector(`[data-entry-id="${entry.id}"]`);if(!node){node=document.createElement('article');node.dataset.entryId=entry.id;feed.append(node)}node.className=`entry ${entry.role}`;const title=document.createElement('strong');title.textContent=entry.label;const body=document.createElement('pre');body.textContent=entry.lines.join('\n');node.replaceChildren(title,body)}window.scrollTo(0,document.body.scrollHeight)}
-async function loadConversation(delta=false){if(!currentSession)return;try{const result=await request(`/api/conversations/${encodeURIComponent(currentSession)}${delta&&cursor?`?after_seq=${cursor}`:''}`);renderEntries(result.entries,!delta||result.reset);cursor=result.latest_seq;await request(`/api/conversations/${encodeURIComponent(currentSession)}/read`,{method:'POST',body:JSON.stringify({through:cursor})})}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
-async function openConversation(id){currentSession=id;cursor=0;location.hash=`conversation/${id}`;dashboard.classList.add('hidden');conversation.classList.remove('hidden');const session=snapshot.sessions.find(x=>x.id===id);document.querySelector('#conversation-title').textContent=session?.title||'Conversation';document.querySelector('#conversation-state').textContent=session?.state||'';renderQueue(session||{});await loadConversation(false)}
-function showDashboard(){currentSession=null;cursor=0;location.hash='';conversation.classList.add('hidden');dashboard.classList.remove('hidden')}
+async function loadConversation(delta=false){if(!currentSession)return;try{const result=await request(`/api/conversations/${encodeURIComponent(currentSession)}${delta&&cursor?`?after_seq=${cursor}`:''}`);renderEntries(result.entries,!delta||result.reset);cursor=result.latest_seq;if(cursor>acknowledged){const through=cursor;await request(`/api/conversations/${encodeURIComponent(currentSession)}/read`,{method:'POST',body:JSON.stringify({through})});acknowledged=through}}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
+async function openConversation(id){currentSession=id;cursor=0;acknowledged=0;location.hash=`conversation/${id}`;dashboard.classList.add('hidden');conversation.classList.remove('hidden');const session=snapshot.sessions.find(x=>x.id===id);document.querySelector('#conversation-title').textContent=session?.title||'Conversation';document.querySelector('#conversation-state').textContent=session?.state||'';renderQueue(session||{});await loadConversation(false)}
+function showDashboard(){currentSession=null;cursor=0;acknowledged=0;location.hash='';conversation.classList.add('hidden');dashboard.classList.remove('hidden')}
 document.querySelector('#login-form').onsubmit=async e=>{e.preventDefault();try{await request('/auth/session',{method:'POST',body:JSON.stringify({code:document.querySelector('#code').value})});document.querySelector('#login-error').textContent='';refresh()}catch(err){document.querySelector('#login-error').textContent=err.message}};
 logout.onclick=async()=>{await request('/auth/session',{method:'DELETE'});location.reload()};
 newTarget.onchange=syncProjectDirectory;
@@ -1112,27 +1163,52 @@ mod tests {
         (config, state)
     }
 
-    fn app() -> (Router, mpsc::Receiver<ControllerRequest>) {
+    type TestServer = (
+        Router,
+        mpsc::Receiver<ControllerRequest>,
+        mpsc::Receiver<ReadReceiptRequest>,
+    );
+
+    fn app() -> TestServer {
         app_with_conversations(BTreeMap::new())
     }
 
-    fn app_with_conversations(
-        conversations: BTreeMap<String, BrowserTranscript>,
-    ) -> (Router, mpsc::Receiver<ControllerRequest>) {
+    fn app_with_conversations(conversations: BTreeMap<String, BrowserTranscript>) -> TestServer {
         let (config, state) = sample_config_state();
         let snapshot = ViewerSnapshot::from_config_state(&config, &state, 1);
         let (_snapshot_tx, snapshot_rx) = watch::channel(snapshot);
         let (_conversation_tx, conversation_rx) = watch::channel(conversations);
         let (action_tx, action_rx) = mpsc::channel(8);
-        let options = ServerOptions::new(
+        let (receipt_tx, receipt_rx) = mpsc::channel(8);
+        let options = test_options(snapshot_rx, conversation_rx, action_tx, receipt_tx)
+            .with_test_credentials("123456", b"01234567890123456789012345678901");
+        (router(options), action_rx, receipt_rx)
+    }
+
+    fn test_options(
+        snapshot_rx: watch::Receiver<ViewerSnapshot>,
+        conversation_rx: watch::Receiver<BTreeMap<String, BrowserTranscript>>,
+        action_tx: mpsc::Sender<ControllerRequest>,
+        receipt_tx: mpsc::Sender<ReadReceiptRequest>,
+    ) -> ServerOptions {
+        ServerOptions::new(
             "127.0.0.1:0".parse().unwrap(),
             snapshot_rx,
             conversation_rx,
             action_tx,
+            receipt_tx,
         )
         .unwrap()
-        .with_test_credentials("123456", b"01234567890123456789012345678901");
-        (router(options), action_rx)
+    }
+
+    fn detached_options() -> ServerOptions {
+        let (config, state) = sample_config_state();
+        let (_snapshot_tx, snapshot_rx) =
+            watch::channel(ViewerSnapshot::from_config_state(&config, &state, 1));
+        let (_conversation_tx, conversation_rx) = watch::channel(BTreeMap::new());
+        let (action_tx, _action_rx) = mpsc::channel(1);
+        let (receipt_tx, _receipt_rx) = mpsc::channel(1);
+        test_options(snapshot_rx, conversation_rx, action_tx, receipt_tx)
     }
 
     async fn login_cookie(app: &Router) -> String {
@@ -1161,7 +1237,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_requires_a_valid_signed_cookie() {
-        let (app, _) = app();
+        let (app, _, _) = app();
         let unauthorized = app
             .clone()
             .oneshot(Request::get("/api/snapshot").body(Body::empty()).unwrap())
@@ -1223,7 +1299,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_action_is_typed_and_forwarded() {
-        let (app, mut actions) = app();
+        let (app, mut actions, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -1251,7 +1327,7 @@ mod tests {
 
     #[tokio::test]
     async fn bare_new_action_forwards_an_explicit_safe_project_directory() {
-        let (app, mut actions) = app();
+        let (app, mut actions, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -1324,7 +1400,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_action_is_typed_and_forwarded() {
-        let (app, mut actions) = app();
+        let (app, mut actions, _) = app();
         let cookie = login_cookie(&app).await;
         let response = tokio::spawn(
             app.oneshot(
@@ -1414,7 +1490,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_endpoint_returns_only_public_projection() {
-        let (app, _) = app();
+        let (app, _, _) = app();
         let cookie = login_cookie(&app).await;
         let response = app
             .oneshot(
@@ -1465,7 +1541,8 @@ mod tests {
                 },
             ],
         };
-        let (app, _) = app_with_conversations(BTreeMap::from([("session-1".into(), transcript)]));
+        let (app, _, _) =
+            app_with_conversations(BTreeMap::from([("session-1".into(), transcript)]));
         let cookie = login_cookie(&app).await;
         let response = app
             .oneshot(
@@ -1486,9 +1563,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conversation_read_receipt_is_typed_and_forwarded() {
-        let (app, mut actions) = app();
+    async fn conversation_read_receipt_never_contends_with_a_running_action() {
+        let (app, mut actions, mut receipts) = app();
         let cookie = login_cookie(&app).await;
+        // A prompt for the same session stays in flight for the whole test, so
+        // a receipt that still travelled the action pipeline would either
+        // queue behind it or be rejected for the occupied session slot.
+        let prompt = tokio::spawn(
+            app.clone().oneshot(
+                Request::post("/api/actions")
+                    .header(COOKIE, cookie.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"action":"prompt","session_id":"session-1","text":"ship it"}"#,
+                    ))
+                    .unwrap(),
+            ),
+        );
+        let action = actions.recv().await.unwrap();
+
         let response = tokio::spawn(
             app.oneshot(
                 Request::post("/api/conversations/session-1/read")
@@ -1498,18 +1591,74 @@ mod tests {
                     .unwrap(),
             ),
         );
-        let action = actions.recv().await.unwrap();
-        assert_eq!(
-            action.action,
-            ControllerAction::Read {
-                session_id: "session-1".into(),
-                through: 42,
-            }
-        );
-        action.reply.send(Ok(())).unwrap();
+        let receipt = receipts.recv().await.unwrap();
+        assert_eq!(receipt.session_id, "session-1");
+        assert_eq!(receipt.through, 42);
+        receipt.reply.send(Ok(())).unwrap();
         assert_eq!(
             response.await.unwrap().unwrap().status(),
             StatusCode::NO_CONTENT
         );
+        assert!(
+            actions.try_recv().is_err(),
+            "a read receipt must not queue a controller action"
+        );
+
+        action.reply.send(Ok(())).unwrap();
+        assert_eq!(
+            prompt.await.unwrap().unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+    }
+
+    #[test]
+    fn persisted_cookie_key_survives_a_restart_and_stays_owner_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("phone-cookie-key");
+
+        let first = load_or_create_cookie_key(&path).unwrap();
+        assert!(first.len() >= COOKIE_KEY_BYTES);
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // Two server processes started from the same key file honour each
+        // other's cookies; a process that kept its generated key would not.
+        let mut restarted = detached_options();
+        restarted
+            .set_cookie_key(load_or_create_cookie_key(&path).unwrap())
+            .unwrap();
+        let mut original = detached_options();
+        original.set_cookie_key(first.clone()).unwrap();
+        let cookie = signed_cookie_value(&original.cookie_key, 200);
+        assert!(session_cookie_valid(&restarted.cookie_key, &cookie, 100));
+        assert!(!session_cookie_valid(
+            &detached_options().cookie_key,
+            &cookie,
+            100
+        ));
+
+        // Deleting the key file is the explicit sign-everyone-out gesture.
+        std::fs::remove_file(&path).unwrap();
+        let rotated = load_or_create_cookie_key(&path).unwrap();
+        assert_ne!(rotated, first);
+        assert!(!session_cookie_valid(&rotated, &cookie, 100));
+    }
+
+    #[test]
+    fn corrupt_cookie_key_is_regenerated_instead_of_blocking_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("phone-cookie-key");
+        std::fs::write(&path, b"short").unwrap();
+
+        let key = load_or_create_cookie_key(&path).unwrap();
+
+        assert!(key.len() >= COOKIE_KEY_BYTES);
+        assert_eq!(std::fs::read(&path).unwrap(), key);
+        assert_eq!(load_or_create_cookie_key(&path).unwrap(), key);
     }
 }

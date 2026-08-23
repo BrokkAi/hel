@@ -11,8 +11,8 @@ use clap::Args;
 use hel::hel_controller::{Controller, SessionLaunchOptions, SessionResumeOptions};
 use hel::hel_quota::ProfileQuota;
 use hel::hel_server::{
-    ControllerAction, ControllerRequest, ResumeQueueDisposition, ServerOptions, ViewerQueuedPrompt,
-    ViewerQuota, ViewerSnapshot,
+    ControllerAction, ControllerRequest, ReadReceiptRequest, ResumeQueueDisposition, ServerOptions,
+    ViewerQueuedPrompt, ViewerQuota, ViewerSnapshot,
 };
 use hel::hel_session_manager::{SessionManagerControl, new_command_id};
 use hel::hel_state::{HelState, SessionRecord};
@@ -48,6 +48,47 @@ struct PhoneActionStarted {
     action_id: u64,
     session: SessionRecord,
     published: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+}
+
+struct ReadReceiptPersisted {
+    session_id: String,
+    result: std::result::Result<u64, String>,
+    reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+}
+
+/// What one phone read receipt actually needs.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadReceiptPlan {
+    UnknownSession,
+    /// The cursor has not advanced, so the receipt needs no work at all.
+    AlreadyRead,
+    /// The cursor advanced: persist it, then refresh the snapshot.
+    Persist,
+}
+
+fn plan_read_receipt(state: &HelState, session_id: &str, through: u64) -> ReadReceiptPlan {
+    let Some(session) = state.sessions.get(session_id) else {
+        return ReadReceiptPlan::UnknownSession;
+    };
+    if through > session.detached_after_event_ordinal {
+        ReadReceiptPlan::Persist
+    } else {
+        ReadReceiptPlan::AlreadyRead
+    }
+}
+
+/// Record a persisted receipt in the in-memory projection, reporting whether
+/// the cursor moved. That is exactly when the snapshot revision has to move,
+/// so surfaces showing unread state refresh and nothing else does.
+fn apply_read_receipt(state: &mut HelState, session_id: &str, receipt: u64) -> bool {
+    let Some(session) = state.sessions.get_mut(session_id) else {
+        return false;
+    };
+    if receipt <= session.detached_after_event_ordinal {
+        return false;
+    }
+    session.detached_after_event_ordinal = receipt;
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -150,6 +191,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
     ));
     let (conversation_tx, conversation_rx) = tokio::sync::watch::channel(conversations.clone());
     let (action_tx, mut action_rx) = tokio::sync::mpsc::channel(32);
+    let (receipt_tx, mut receipt_rx) = tokio::sync::mpsc::channel(32);
     let (worker_targets_tx, mut worker_updates_rx, worker_commands_tx) =
         spawn_dashboard_worker_poller()?;
     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
@@ -176,8 +218,16 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
     let mut credential_sync_signals = CredentialSyncSignalTracker::default();
     let mut credential_sync_notices = CredentialSyncNotices::default();
     let termination = hel::termination::Coordinator::install().token();
-    let mut options = ServerOptions::new(bind, snapshot_rx, conversation_rx, action_tx)?;
+    let mut options =
+        ServerOptions::new(bind, snapshot_rx, conversation_rx, action_tx, receipt_tx)?;
     options.shutdown = termination.clone();
+    // Session cookies are stateless, so a per-process key would sign every
+    // phone out on every restart. Delete the key file to sign them out on
+    // purpose.
+    let cookie_key_path = hel::hel_server::cookie_key_path();
+    options.set_cookie_key(hel::hel_server::load_or_create_cookie_key(
+        &cookie_key_path,
+    )?)?;
     if let (Some(cert), Some(key)) = (args.tls_cert, args.tls_key) {
         options.set_tls_config(
             axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
@@ -201,6 +251,8 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
         )>();
         let (action_started_tx, mut action_started_rx) =
             tokio::sync::mpsc::unbounded_channel::<PhoneActionStarted>();
+        let (receipt_done_tx, mut receipt_done_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ReadReceiptPersisted>();
         let mut active_actions = interrupted_close_ids
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
@@ -342,6 +394,64 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     conversation_tx.send_replace(conversations.clone());
                     let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, revision));
                 }
+                receipt = receipt_rx.recv() => {
+                    let Some(ReadReceiptRequest { session_id, through, reply }) = receipt else { break };
+                    match plan_read_receipt(&controller.state, &session_id, through) {
+                        ReadReceiptPlan::UnknownSession => {
+                            let _ = reply.send(Err("unknown session".into()));
+                        }
+                        // The viewer re-posts its cursor after every refresh.
+                        // A cursor that has not moved is not work: no database
+                        // write, no revision, and so no refresh to answer.
+                        ReadReceiptPlan::AlreadyRead => {
+                            let _ = reply.send(Ok(()));
+                        }
+                        ReadReceiptPlan::Persist => {
+                            let done = receipt_done_tx.clone();
+                            let persisted_session_id = session_id.clone();
+                            tokio::spawn(async move {
+                                let joined = tokio::task::spawn_blocking(move || {
+                                    hel::hel_database::advance_detached_after_event_ordinal(
+                                        &persisted_session_id,
+                                        through,
+                                    )
+                                })
+                                .await;
+                                let result = match joined {
+                                    Ok(result) => result.map_err(|error| format!("{error:#}")),
+                                    Err(error) => Err(format!("phone read receipt task failed: {error}")),
+                                };
+                                if done.send(ReadReceiptPersisted { session_id, result, reply }).is_err() {
+                                    tracing::debug!("phone read receipt finished after the server stopped");
+                                }
+                            });
+                        }
+                    }
+                }
+                persisted = receipt_done_rx.recv() => {
+                    let Some(ReadReceiptPersisted { session_id, result, reply }) = persisted else { continue };
+                    match result {
+                        Ok(receipt) => {
+                            // Only an advanced cursor changes what any surface
+                            // shows, so only then does the revision move.
+                            if apply_read_receipt(&mut controller.state, &session_id, receipt) {
+                                revision += 1;
+                                let _ = snapshot_tx.send(viewer_snapshot(
+                                    &controller,
+                                    &quotas,
+                                    &conversations,
+                                    &queued_prompts,
+                                    revision,
+                                ));
+                            }
+                            let _ = reply.send(Ok(()));
+                        }
+                        Err(error) => {
+                            tracing::warn!(%session_id, "could not persist a phone read receipt: {error}");
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                }
                 action = action_rx.recv() => {
                     let Some(request) = action else { break };
                     if let ControllerAction::Cancel { session_id } = &request.action {
@@ -396,7 +506,6 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                                     }
                                     ControllerAction::New { .. }
                                     | ControllerAction::Open { .. }
-                                    | ControllerAction::Read { .. }
                                     | ControllerAction::Cancel { .. } => None,
                                 };
                                 if control.cancelled.load(Ordering::Acquire) {
@@ -498,7 +607,6 @@ fn controller_action_session_id(action: &ControllerAction) -> Option<String> {
         | ControllerAction::Close { session_id }
         | ControllerAction::Resume { session_id, .. }
         | ControllerAction::Open { session_id }
-        | ControllerAction::Read { session_id, .. }
         | ControllerAction::Cancel { session_id }
         | ControllerAction::RemoveQueuedPrompt { session_id, .. } => Some(session_id.clone()),
     }
@@ -666,10 +774,6 @@ async fn apply_phone_action(
         ControllerAction::Cancel { .. } => {
             bail!("cancel actions must be handled by the phone control loop")
         }
-        ControllerAction::Read {
-            session_id,
-            through,
-        } => controller.mark_session_detached_after(&session_id, through),
         ControllerAction::RemoveQueuedPrompt {
             session_id,
             queue_id,
@@ -760,24 +864,12 @@ mod tests {
     use super::*;
     use hel::hel_state::SessionState;
 
-    #[test]
-    fn phone_action_capacity_is_bounded() {
-        assert!(phone_action_capacity_available(
-            MAX_CONCURRENT_PHONE_ACTIONS - 1
-        ));
-        assert!(!phone_action_capacity_available(
-            MAX_CONCURRENT_PHONE_ACTIONS
-        ));
-    }
-
-    #[test]
-    fn started_phone_session_is_visible_and_mapped_before_provisioning() {
-        let session_id = "0123456789abcdef0123456789abcdef";
-        let session = SessionRecord {
+    fn phone_session(id: &str, detached_after_event_ordinal: u64) -> SessionRecord {
+        SessionRecord {
             archived: false,
             container_cpus: None,
             container_memory: None,
-            id: session_id.into(),
+            id: id.into(),
             title: "Phone launch".into(),
             harness_kind: hel::hel_config::HarnessKind::Codex,
             last_profile: "codex".into(),
@@ -794,12 +886,66 @@ mod tests {
             session_title_override: Some("Phone launch".into()),
             created_at: "2026-08-14T00:00:00Z".into(),
             updated_at: "2026-08-14T00:00:00Z".into(),
-            detached_after_event_ordinal: 0,
+            detached_after_event_ordinal,
             draft_input: String::new(),
             last_error: None,
             last_checkpoint_error: None,
             checkpoint: None,
-        };
+        }
+    }
+
+    #[test]
+    fn read_receipt_only_persists_and_refreshes_when_the_cursor_advances() {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let mut state = HelState::default();
+        state
+            .sessions
+            .insert(session_id.into(), phone_session(session_id, 5));
+
+        // The viewer re-posts its cursor after every refresh; a repeat must
+        // not reach the database and must not move the revision.
+        assert_eq!(
+            plan_read_receipt(&state, session_id, 5),
+            ReadReceiptPlan::AlreadyRead
+        );
+        assert_eq!(
+            plan_read_receipt(&state, session_id, 4),
+            ReadReceiptPlan::AlreadyRead
+        );
+        assert_eq!(
+            plan_read_receipt(&state, "missing", 9),
+            ReadReceiptPlan::UnknownSession
+        );
+        assert_eq!(
+            plan_read_receipt(&state, session_id, 9),
+            ReadReceiptPlan::Persist
+        );
+
+        assert!(apply_read_receipt(&mut state, session_id, 9));
+        assert_eq!(state.sessions[session_id].detached_after_event_ordinal, 9);
+        assert!(!apply_read_receipt(&mut state, session_id, 9));
+        assert!(!apply_read_receipt(&mut state, session_id, 7));
+        assert!(!apply_read_receipt(&mut state, "missing", 9));
+        assert_eq!(
+            plan_read_receipt(&state, session_id, 9),
+            ReadReceiptPlan::AlreadyRead
+        );
+    }
+
+    #[test]
+    fn phone_action_capacity_is_bounded() {
+        assert!(phone_action_capacity_available(
+            MAX_CONCURRENT_PHONE_ACTIONS - 1
+        ));
+        assert!(!phone_action_capacity_available(
+            MAX_CONCURRENT_PHONE_ACTIONS
+        ));
+    }
+
+    #[test]
+    fn started_phone_session_is_visible_and_mapped_before_provisioning() {
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let session = phone_session(session_id, 0);
         let mut state = HelState::default();
         let mut active_actions = std::collections::BTreeSet::new();
         let mut action_sessions = std::collections::BTreeMap::new();
