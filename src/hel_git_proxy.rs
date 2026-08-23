@@ -2,15 +2,18 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions, TryLockError};
+use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use crate::hel_local_git::canonical_repository;
 use crate::hel_targets::CommandSpec;
@@ -21,6 +24,24 @@ const MAX_OPEN: usize = 16 * 1024;
 /// How long a broker waits for its target bridge to exit once the frame
 /// stream between them has closed.
 const BRIDGE_EXIT_GRACE: Duration = Duration::from_secs(5);
+/// How long a client may take to name its repository and service.
+///
+/// The proxy writes its open line as soon as it connects, so a connection that
+/// is still silent this much later is one that will never speak. Exchanges are
+/// served one at a time, so without this deadline such a client holds the
+/// session's whole bridge.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
+/// How long one exchange may move nothing in either direction before the
+/// bridge gives up on it.
+///
+/// The deadline is idle rather than total because a legitimate transfer can
+/// run for a very long time while still making progress — a huge clone is slow
+/// but never silent. Only the longest legitimately quiet phase of a Git
+/// service has to fit inside the window: counting and compressing objects
+/// before the first pack byte, or indexing a pushed pack before the report.
+/// Five minutes covers that for very large repositories while still turning a
+/// wedged client into a reported failure in minutes instead of never.
+const EXCHANGE_IDLE_DEADLINE: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,7 +210,14 @@ async fn run_bridge_process(
     ensure!(magic == BRIDGE_MAGIC, "target Git bridge version mismatch");
     crate::hel_config::atomic_write(&spec.ready_path, b"ready\n")?;
 
-    let outcome = serve_bridge(&mut input, &mut output, &repositories, &spec.session_id).await;
+    let outcome = serve_bridge(
+        &mut input,
+        &mut output,
+        &repositories,
+        &spec.session_id,
+        EXCHANGE_IDLE_DEADLINE,
+    )
+    .await;
     // Closing the frame stream is how an idle target bridge learns that its
     // broker is finished with it.
     drop(input);
@@ -219,12 +247,111 @@ enum Exchange {
     Failed(anyhow::Error),
 }
 
+/// Idle watchdog for one exchange, shared by both halves of its transfer.
+///
+/// Every frame and every byte moved in either direction marks progress. When
+/// nothing moves for a whole idle window the exchange is aborted, which is how
+/// a client that wedges mid-transfer becomes its own connection's failure
+/// instead of a bridge that serves nobody again.
+struct ExchangeWatch {
+    idle: Duration,
+    start: Instant,
+    /// Milliseconds after `start` at which progress was last marked.
+    progress: AtomicU64,
+    abort: CancellationToken,
+}
+
+impl ExchangeWatch {
+    fn new(idle: Duration) -> Self {
+        Self {
+            idle,
+            start: Instant::now(),
+            progress: AtomicU64::new(0),
+            abort: CancellationToken::new(),
+        }
+    }
+
+    /// Record that this exchange moved something, in either direction.
+    fn mark(&self) {
+        let elapsed = self.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        self.progress.store(elapsed, Ordering::Relaxed);
+    }
+
+    /// Resolve once no progress has been marked for a whole idle window.
+    async fn stalled(&self) {
+        loop {
+            let progress = self.progress.load(Ordering::Relaxed);
+            let deadline = self.start + Duration::from_millis(progress) + self.idle;
+            tokio::time::sleep_until(deadline.into()).await;
+            if self.progress.load(Ordering::Relaxed) == progress {
+                return;
+            }
+        }
+    }
+
+    /// Give up on this exchange: both halves stop touching their own endpoint
+    /// and finish their framing. The idle window restarts, so the peer still
+    /// gets a full one to end its half of the exchange.
+    fn abort(&self) {
+        self.mark();
+        self.abort.cancel();
+    }
+
+    fn is_aborted(&self) -> bool {
+        self.abort.is_cancelled()
+    }
+
+    /// Resolve once this exchange has been given up on.
+    async fn aborted(&self) {
+        self.abort.cancelled().await;
+    }
+
+    fn stall(&self) -> anyhow::Error {
+        anyhow!(
+            "a bridged Git exchange moved nothing for {} seconds",
+            self.idle.as_secs_f64()
+        )
+    }
+}
+
+/// Run one exchange's transfer under its idle watchdog.
+///
+/// The watchdog never drops the transfer: a half dropped mid-frame would leave
+/// a partial frame in the stream and desynchronise every exchange after it.
+/// The first idle window aborts the transfer instead, which makes both halves
+/// let go of their own endpoint and still write the framing the peer is
+/// reading for. Only a second idle window is fatal, because a peer that never
+/// ends its half of an aborted exchange leaves a frame stream that can no
+/// longer be interpreted.
+///
+/// Returns the transfer's own result together with the stall that aborted it,
+/// if one did.
+async fn watch_exchange<T>(
+    watch: &ExchangeWatch,
+    transfer: impl Future<Output = Result<T>>,
+) -> Result<(T, Option<anyhow::Error>)> {
+    tokio::pin!(transfer);
+    tokio::select! {
+        result = &mut transfer => Ok((result?, None)),
+        () = watch.stalled() => {
+            watch.abort();
+            tokio::select! {
+                result = &mut transfer => Ok((result?, Some(watch.stall()))),
+                () = watch.stalled() => Err(watch
+                    .stall()
+                    .context("a stalled Git bridge exchange was never ended by its peer")),
+            }
+        }
+    }
+}
+
 /// Serve bridged Git exchanges until the target bridge closes its stream.
 async fn serve_bridge(
     input: &mut (impl AsyncWrite + Unpin),
     output: &mut (impl AsyncRead + Unpin),
     repositories: &BTreeMap<String, PathBuf>,
     session_id: &str,
+    idle: Duration,
 ) -> Result<()> {
     loop {
         let open = match read_frame(output, MAX_OPEN).await? {
@@ -239,7 +366,7 @@ async fn serve_bridge(
                 continue;
             }
         };
-        match serve_exchange(input, output, repositories, &open).await? {
+        match serve_exchange(input, output, repositories, &open, idle).await? {
             Exchange::Completed => {}
             Exchange::Failed(error) => tracing::warn!(
                 session_id,
@@ -255,6 +382,7 @@ async fn serve_exchange(
     output: &mut (impl AsyncRead + Unpin),
     repositories: &BTreeMap<String, PathBuf>,
     open: &[u8],
+    idle: Duration,
 ) -> Result<Exchange> {
     let request: GitOpen = match serde_json::from_slice(open) {
         Ok(request) => request,
@@ -274,7 +402,7 @@ async fn serve_exchange(
         Ok(command) => command,
         Err(error) => return refuse_exchange(input, output, error).await,
     };
-    serve_git(input, output, repository, command).await
+    serve_git(input, output, repository, command, idle).await
 }
 
 fn git_service(service: &str) -> Result<&'static str> {
@@ -313,6 +441,7 @@ async fn serve_git<W, R>(
     bridge_output: &mut R,
     repository: &Path,
     command: &str,
+    idle: Duration,
 ) -> Result<Exchange>
 where
     W: AsyncWrite + Unpin,
@@ -344,18 +473,30 @@ where
         return refuse_exchange(bridge_input, bridge_output, error).await;
     };
 
+    let watch = ExchangeWatch::new(idle);
+    let watch = &watch;
     let to_target = async {
         let mut buffer = vec![0; 64 * 1024];
         let mut failure = None;
         loop {
-            match git_output.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(count) => write_frame(bridge_input, &buffer[..count]).await?,
-                Err(error) => {
-                    failure = Some(anyhow!(error).context(format!("read git {command} output")));
-                    break;
-                }
-            }
+            let count = tokio::select! {
+                biased;
+                // The watchdog gave up on this exchange: let go of a service
+                // that has stopped moving and end our half of the stream.
+                () = watch.aborted() => break,
+                // `read` is cancel-safe, and every frame is written outside
+                // the select, so no partial frame can reach the target.
+                result = git_output.read(&mut buffer) => match result {
+                    Ok(0) => break,
+                    Ok(count) => count,
+                    Err(error) => {
+                        failure = Some(anyhow!(error).context(format!("read git {command} output")));
+                        break;
+                    }
+                },
+            };
+            watch.mark();
+            write_frame(bridge_input, &buffer[..count]).await?;
         }
         // Exactly one end frame per exchange, on every path: the target reads
         // until it arrives.
@@ -367,9 +508,20 @@ where
             match read_frame(bridge_output, MAX_FRAME).await? {
                 // A service that has already exited must not stop the drain:
                 // the frame stream stays in sync only if every frame of this
-                // exchange is read.
+                // exchange is read. Writing to the service is local to this
+                // exchange, so the watchdog may abandon a write; reading the
+                // shared frame stream never stops short of the end frame.
                 Frame::Data(frame) => {
-                    let _ = git_input.write_all(&frame).await;
+                    watch.mark();
+                    if !watch.is_aborted() {
+                        tokio::select! {
+                            biased;
+                            () = watch.aborted() => {}
+                            result = git_input.write_all(&frame) => {
+                                let _ = result;
+                            }
+                        }
+                    }
                 }
                 Frame::End => break,
                 Frame::Closed => bail!("the target Git bridge closed mid-exchange"),
@@ -383,7 +535,16 @@ where
     };
     // Both halves always run to completion, so one interrupted transfer can
     // never leave unread frames in front of the next exchange.
-    let (service_failure, ()) = tokio::try_join!(to_target, from_target)?;
+    let ((service_failure, ()), stalled) =
+        watch_exchange(watch, async { tokio::try_join!(to_target, from_target) }).await?;
+    if let Some(stalled) = stalled {
+        // A service that outlived its exchange would hold the repository and
+        // its pipes for as long as it liked.
+        let _ = git.kill().await;
+        return Ok(Exchange::Failed(
+            stalled.context(format!("git {command} stalled")),
+        ));
+    }
     if let Some(failure) = service_failure {
         let _ = git.kill().await;
         return Ok(Exchange::Failed(failure));
@@ -436,7 +597,14 @@ async fn read_frame(reader: &mut (impl AsyncRead + Unpin), maximum: usize) -> Re
 
 #[cfg(unix)]
 pub async fn run_worker_bridge(root: &Path) -> Result<()> {
-    run_worker_bridge_over(root, tokio::io::stdin(), tokio::io::stdout()).await
+    run_worker_bridge_over(
+        root,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        HANDSHAKE_DEADLINE,
+        EXCHANGE_IDLE_DEADLINE,
+    )
+    .await
 }
 
 #[cfg(unix)]
@@ -444,6 +612,8 @@ async fn run_worker_bridge_over(
     root: &Path,
     mut broker_input: impl AsyncRead + Unpin,
     mut broker_output: impl AsyncWrite + Unpin,
+    handshake: Duration,
+    idle: Duration,
 ) -> Result<()> {
     use tokio::net::UnixListener;
 
@@ -469,7 +639,15 @@ async fn run_worker_bridge_over(
                 _ => bail!("Git broker sent a frame between exchanges"),
             },
         };
-        match serve_client(stream, &mut broker_input, &mut broker_output).await? {
+        match serve_client(
+            stream,
+            &mut broker_input,
+            &mut broker_output,
+            handshake,
+            idle,
+        )
+        .await?
+        {
             Exchange::Completed => {}
             Exchange::Failed(error) => {
                 tracing::warn!(error = format!("{error:#}"), "bridged Git client failed")
@@ -484,16 +662,26 @@ async fn serve_client(
     stream: tokio::net::UnixStream,
     broker_input: &mut (impl AsyncRead + Unpin),
     broker_output: &mut (impl AsyncWrite + Unpin),
+    handshake: Duration,
+    idle: Duration,
 ) -> Result<Exchange> {
     let (mut read, mut write) = stream.into_split();
-    let open = match read_handshake(&mut read).await {
-        Ok(open) => open,
-        // Nothing has been framed upstream yet, so a client that dies during
-        // its handshake costs the bridge nothing at all.
-        Err(error) => return Ok(Exchange::Failed(error)),
+    // Nothing has been framed upstream yet, so a client that dies — or never
+    // speaks — during its handshake costs the bridge nothing but this wait.
+    let open = match tokio::time::timeout(handshake, read_handshake(&mut read)).await {
+        Ok(Ok(open)) => open,
+        Ok(Err(error)) => return Ok(Exchange::Failed(error)),
+        Err(_) => {
+            return Ok(Exchange::Failed(anyhow!(
+                "a Git proxy client sent no handshake within {} seconds",
+                handshake.as_secs_f64()
+            )));
+        }
     };
     write_frame(broker_output, &open).await?;
 
+    let watch = ExchangeWatch::new(idle);
+    let watch = &watch;
     let served = tokio::sync::Notify::new();
     let to_broker = async {
         let mut buffer = vec![0; 64 * 1024];
@@ -504,6 +692,9 @@ async fn serve_client(
                 // The service finished, so stop reading a client that may
                 // never hang up instead of holding the exchange open.
                 () = served.notified() => break,
+                // The watchdog gave up on this exchange: let go of a client
+                // that has stopped moving and end our half of the stream.
+                () = watch.aborted() => break,
                 // `read` is cancel-safe, and every frame is written outside
                 // the select, so no partial frame can reach the broker.
                 result = read.read(&mut buffer) => match result {
@@ -515,6 +706,7 @@ async fn serve_client(
                     }
                 },
             };
+            watch.mark();
             write_frame(broker_output, &buffer[..count]).await?;
         }
         // Exactly one end frame per exchange, on every path.
@@ -526,9 +718,20 @@ async fn serve_client(
             match read_frame(broker_input, MAX_FRAME).await? {
                 // A client that has gone away must not stop the drain: the
                 // frame stream stays in sync only if every frame of this
-                // exchange is read.
+                // exchange is read. Writing to the client is local to this
+                // exchange, so the watchdog may abandon a write; reading the
+                // shared frame stream never stops short of the end frame.
                 Frame::Data(frame) => {
-                    let _ = write.write_all(&frame).await;
+                    watch.mark();
+                    if !watch.is_aborted() {
+                        tokio::select! {
+                            biased;
+                            () = watch.aborted() => {}
+                            result = write.write_all(&frame) => {
+                                let _ = result;
+                            }
+                        }
+                    }
                 }
                 Frame::End => break,
                 Frame::Closed => bail!("the Git broker closed the bridge"),
@@ -538,8 +741,12 @@ async fn serve_client(
         served.notify_one();
         Ok::<_, anyhow::Error>(())
     };
-    let (client_failure, ()) = tokio::try_join!(to_broker, from_broker)?;
-    Ok(match client_failure {
+    let (client_failure, stalled) = watch_exchange(watch, async {
+        let (failure, ()) = tokio::try_join!(to_broker, from_broker)?;
+        Ok(failure)
+    })
+    .await?;
+    Ok(match stalled.or(client_failure) {
         Some(error) => Exchange::Failed(error),
         None => Exchange::Completed,
     })
@@ -631,11 +838,20 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn write_all_framed(writer: &mut (impl AsyncWrite + Unpin), data: &[u8]) {
         for chunk in data.chunks(64 * 1024) {
             write_frame(writer, chunk).await.unwrap();
         }
         write_frame(writer, &[]).await.unwrap();
+    }
+
+    /// What a client writes to the proxy socket to open its exchange.
+    #[cfg(unix)]
+    fn handshake_line(repository: &str) -> Vec<u8> {
+        let mut line = open_frame(repository);
+        line.push(b'\n');
+        line
     }
 
     fn open_frame(repository: &str) -> Vec<u8> {
@@ -699,7 +915,14 @@ mod tests {
         let (mut broker_read, mut broker_write) = tokio::io::split(broker_end);
         let (mut target_read, mut target_write) = tokio::io::split(target_end);
         let serving = tokio::spawn(async move {
-            serve_bridge(&mut broker_write, &mut broker_read, &repositories, "test").await
+            serve_bridge(
+                &mut broker_write,
+                &mut broker_read,
+                &repositories,
+                "test",
+                EXCHANGE_IDLE_DEADLINE,
+            )
+            .await
         });
 
         // An unknown repository is refused, not fatal.
@@ -758,10 +981,16 @@ mod tests {
         let (worker_end, broker_end) = tokio::io::duplex(16 * 1024);
         let (worker_read, worker_write) = tokio::io::split(worker_end);
         let (mut broker_read, mut broker_write) = tokio::io::split(broker_end);
-        let serving =
-            tokio::spawn(
-                async move { run_worker_bridge_over(&root, worker_read, worker_write).await },
-            );
+        let serving = tokio::spawn(async move {
+            run_worker_bridge_over(
+                &root,
+                worker_read,
+                worker_write,
+                HANDSHAKE_DEADLINE,
+                EXCHANGE_IDLE_DEADLINE,
+            )
+            .await
+        });
 
         let mut magic = vec![0; BRIDGE_MAGIC.len()];
         broker_read.read_exact(&mut magic).await.unwrap();
@@ -822,6 +1051,226 @@ mod tests {
         // Closing the frame stream stops an idle bridge; both halves have to
         // go for the stream itself to close.
         drop((broker_read, broker_write));
+        serving.await.unwrap().unwrap();
+    }
+
+    /// A client that connects and then says nothing must not hold the socket
+    /// the whole session shares.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_client_that_never_finishes_its_handshake_is_timed_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let handshake = Duration::from_millis(500);
+        let (worker_end, broker_end) = tokio::io::duplex(16 * 1024);
+        let (worker_read, worker_write) = tokio::io::split(worker_end);
+        let (mut broker_read, mut broker_write) = tokio::io::split(broker_end);
+        let serving = tokio::spawn(async move {
+            run_worker_bridge_over(
+                &root,
+                worker_read,
+                worker_write,
+                handshake,
+                EXCHANGE_IDLE_DEADLINE,
+            )
+            .await
+        });
+        let mut magic = vec![0; BRIDGE_MAGIC.len()];
+        broker_read.read_exact(&mut magic).await.unwrap();
+        let socket = directory.path().join("git.sock");
+
+        // A client that connects and stalls before its newline.
+        let mut silent = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let line = handshake_line("silent");
+        silent.write_all(&line[..line.len() - 1]).await.unwrap();
+
+        // The next client is served once the silent one runs out of time, and
+        // the silent one never reaches the broker at all.
+        let (mut client_read, mut client_write) = tokio::net::UnixStream::connect(&socket)
+            .await
+            .unwrap()
+            .into_split();
+        client_write
+            .write_all(&handshake_line("served"))
+            .await
+            .unwrap();
+        let open = tokio::time::timeout(Duration::from_secs(30), read_data_frame(&mut broker_read))
+            .await
+            .expect("a silent client held the bridge");
+        assert!(
+            String::from_utf8_lossy(&open).contains("served"),
+            "first framed request was {}",
+            String::from_utf8_lossy(&open)
+        );
+
+        // A timed-out client is disconnected rather than left hanging.
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), silent.read(&mut byte))
+                .await
+                .expect("a timed-out client was left connected")
+                .unwrap(),
+            0
+        );
+
+        // The served exchange still completes normally. Its reply is far
+        // larger than one pipe buffer, so the client has to be read while the
+        // broker writes.
+        let reply = vec![b'r'; 256 * 1024];
+        let receiving = tokio::spawn(async move {
+            let mut received = Vec::new();
+            client_read.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        write_all_framed(&mut broker_write, &reply).await;
+        assert!(read_exchange(&mut broker_read).await.is_empty());
+        assert_eq!(receiving.await.unwrap().len(), 256 * 1024);
+        drop(client_write);
+
+        drop((broker_read, broker_write));
+        serving.await.unwrap().unwrap();
+    }
+
+    /// A client that wedges mid-transfer must lose its own exchange and
+    /// nothing else: the frame stream stays in sync for the next one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_client_that_stalls_mid_transfer_loses_only_its_own_exchange() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let idle = Duration::from_millis(500);
+        let (worker_end, broker_end) = tokio::io::duplex(16 * 1024);
+        let (worker_read, worker_write) = tokio::io::split(worker_end);
+        let (mut broker_read, mut broker_write) = tokio::io::split(broker_end);
+        let serving = tokio::spawn(async move {
+            run_worker_bridge_over(&root, worker_read, worker_write, HANDSHAKE_DEADLINE, idle).await
+        });
+        let mut magic = vec![0; BRIDGE_MAGIC.len()];
+        broker_read.read_exact(&mut magic).await.unwrap();
+        let socket = directory.path().join("git.sock");
+        let request = vec![b'q'; 256 * 1024];
+        let reply = vec![b'r'; 256 * 1024];
+
+        // This client streams a large request and then wedges: it sends no
+        // more, reads nothing, and never hangs up.
+        let mut wedged = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        wedged.write_all(&handshake_line("wedged")).await.unwrap();
+        let open = read_data_frame(&mut broker_read).await;
+        assert!(String::from_utf8_lossy(&open).contains("wedged"));
+        let started = Instant::now();
+        let draining = tokio::spawn(async move {
+            let received =
+                tokio::time::timeout(Duration::from_secs(30), read_exchange(&mut broker_read))
+                    .await
+                    .expect("a wedged client held the bridge");
+            (broker_read, received)
+        });
+        wedged.write_all(&request).await.unwrap();
+        let (mut broker_read, received) = draining.await.unwrap();
+        assert_eq!(received.len(), 256 * 1024);
+        assert!(
+            started.elapsed() >= idle,
+            "the exchange ended after {:?}, before its idle window",
+            started.elapsed()
+        );
+
+        // The broker still owes its half of the aborted exchange, which the
+        // bridge reads through without touching the client it gave up on.
+        write_all_framed(&mut broker_write, &reply).await;
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), wedged.read(&mut byte))
+                .await
+                .expect("an abandoned client was left connected")
+                .unwrap(),
+            0
+        );
+
+        // The next client is served in full, both ways.
+        let (mut client_read, mut client_write) = tokio::net::UnixStream::connect(&socket)
+            .await
+            .unwrap()
+            .into_split();
+        client_write
+            .write_all(&handshake_line("main"))
+            .await
+            .unwrap();
+        let open = read_data_frame(&mut broker_read).await;
+        assert!(String::from_utf8_lossy(&open).contains("main"));
+        let sending = tokio::spawn(async move {
+            client_write.write_all(&request).await.unwrap();
+            client_write.shutdown().await.unwrap();
+        });
+        let receiving = tokio::spawn(async move {
+            let mut received = Vec::new();
+            client_read.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        let received_request = read_exchange(&mut broker_read).await;
+        sending.await.unwrap();
+        write_all_framed(&mut broker_write, &reply).await;
+        assert_eq!(received_request.len(), 256 * 1024);
+        assert_eq!(receiving.await.unwrap().len(), 256 * 1024);
+
+        drop((broker_read, broker_write));
+        serving.await.unwrap().unwrap();
+    }
+
+    /// A Git service that stops moving must not hold the broker either.
+    #[tokio::test]
+    async fn the_broker_gives_up_on_a_service_that_stops_moving() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = repository_with_large_advertisement(directory.path());
+        let repositories = BTreeMap::from([("main".to_owned(), repository)]);
+        let idle = Duration::from_secs(1);
+        let (broker_end, target_end) = tokio::io::duplex(16 * 1024);
+        let (mut broker_read, mut broker_write) = tokio::io::split(broker_end);
+        let (mut target_read, mut target_write) = tokio::io::split(target_end);
+        let serving = tokio::spawn(async move {
+            serve_bridge(
+                &mut broker_write,
+                &mut broker_read,
+                &repositories,
+                "test",
+                idle,
+            )
+            .await
+        });
+
+        // `upload-pack` advertises its refs and then waits for a client that
+        // never answers and never hangs up.
+        write_frame(&mut target_write, &open_frame("main"))
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let advertisement =
+            tokio::time::timeout(Duration::from_secs(60), read_exchange(&mut target_read))
+                .await
+                .expect("a stalled Git service held the broker");
+        assert!(
+            advertisement.len() > 64 * 1024,
+            "advertisement was {} bytes",
+            advertisement.len()
+        );
+        assert!(
+            started.elapsed() >= idle,
+            "the exchange ended after {:?}, before its idle window",
+            started.elapsed()
+        );
+        // The target still owes its half of the aborted exchange.
+        write_frame(&mut target_write, &[]).await.unwrap();
+
+        // The broker serves the next exchange over the same stream.
+        write_frame(&mut target_write, &open_frame("main"))
+            .await
+            .unwrap();
+        write_frame(&mut target_write, b"0000").await.unwrap();
+        write_frame(&mut target_write, &[]).await.unwrap();
+        let advertisement = read_exchange(&mut target_read).await;
+        assert!(advertisement.len() > 64 * 1024);
+        assert!(String::from_utf8_lossy(&advertisement).contains("refs/heads/main"));
+
+        drop((target_read, target_write));
         serving.await.unwrap().unwrap();
     }
 
