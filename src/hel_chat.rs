@@ -1056,6 +1056,18 @@ impl ChatState {
         let chained = std::mem::take(&mut self.chain_kill);
         let (code, modifiers) = normalize_key(key.code, key.modifiers);
 
+        // Leaving the view is never an answer to the agent, so these two come
+        // before the elicitation dialog. A pending elicitation is durable
+        // projection state: it is rebuilt from `pending_elicitations` the next
+        // time the session is opened, so stepping out loses nothing but field
+        // text that was typed and not submitted.
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('g') {
+            return ChatAction::Back;
+        }
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('q') {
+            return ChatAction::QuitDetach;
+        }
+
         if let Some(dialog) = self.elicitation.as_mut() {
             if code == KeyCode::Char('v')
                 && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
@@ -1078,13 +1090,6 @@ impl ChatState {
 
         if modifiers.contains(KeyModifiers::ALT) && code == KeyCode::Char('v') {
             return ChatAction::ToggleVoice;
-        }
-
-        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('g') {
-            return ChatAction::Back;
-        }
-        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('q') {
-            return ChatAction::QuitDetach;
         }
 
         if self.history_search.is_some() {
@@ -1595,42 +1600,117 @@ fn queued_prompt_preview(prompt: &str) -> String {
     preview
 }
 
+/// How long a notice is guaranteed on screen before an unrelated key press
+/// may dismiss it. Background failures report through this bar and nowhere
+/// else, so a keystroke that races one must not wipe it unread.
+pub const NOTICE_MINIMUM_DISPLAY: std::time::Duration = std::time::Duration::from_secs(4);
+
+#[derive(Debug)]
+struct Notice {
+    text: String,
+    set_at: std::time::Instant,
+}
+
+#[derive(Debug, Default)]
+struct NoticeSlot {
+    notice: Option<Notice>,
+    /// Bumped on every write, so a dirty-gated renderer can tell that the bar
+    /// moved without keeping a copy of its text.
+    generation: u64,
+}
+
+impl NoticeSlot {
+    fn write(&mut self, notice: Option<Notice>) {
+        self.notice = notice;
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
+
 /// The one-line notifications bar shared by every view. Cloning shares the
 /// same underlying slot; the latest notice wins and a clear in one view
 /// clears it for all.
+///
+/// Each notice carries the time it was set. That is what lets an incidental
+/// key press dismiss a notice the user has had a chance to read while leaving
+/// a fresh one standing.
 #[derive(Debug, Clone, Default)]
-pub struct Notices(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+pub struct Notices(std::sync::Arc<std::sync::Mutex<NoticeSlot>>);
 
 impl Notices {
     /// Sets the notice, replacing whatever is showing. Sanitizes the text so
     /// escape sequences or stray carriage returns from background work
     /// cannot corrupt the footer row.
     pub fn set(&self, notice: impl Into<String>) {
-        let sanitized = sanitize_terminal_text(&notice.into());
-        *self.0.lock().expect("notices lock poisoned") = Some(sanitized);
+        let text = sanitize_terminal_text(&notice.into());
+        self.lock().write(Some(Notice {
+            text,
+            set_at: std::time::Instant::now(),
+        }));
     }
 
     /// Replaces the notice only if it still reads `expected`, so a
     /// background task can upgrade its own "in progress" notice to a result
     /// without clobbering whatever replaced it in the meantime. Returns
-    /// whether the replacement happened.
+    /// whether the replacement happened. The replacement is a new report, so
+    /// it starts its own display period.
     pub fn replace_if(&self, expected: &str, replacement: impl Into<String>) -> bool {
-        let mut current = self.0.lock().expect("notices lock poisoned");
-        if current.as_deref() != Some(expected) {
+        let mut slot = self.lock();
+        if slot.notice.as_ref().map(|notice| notice.text.as_str()) != Some(expected) {
             return false;
         }
-        *current = Some(sanitize_terminal_text(&replacement.into()));
+        let text = sanitize_terminal_text(&replacement.into());
+        slot.write(Some(Notice {
+            text,
+            set_at: std::time::Instant::now(),
+        }));
         true
     }
 
-    /// Clears the notice everywhere it is shown.
+    /// Clears the notice everywhere it is shown, however recent it is. This
+    /// is for callers that know the notice no longer applies; a key press
+    /// that merely happened to arrive uses [`Notices::dismiss`].
     pub fn clear(&self) {
-        *self.0.lock().expect("notices lock poisoned") = None;
+        let mut slot = self.lock();
+        if slot.notice.is_some() {
+            slot.write(None);
+        }
+    }
+
+    /// Clears the notice if it has been showing for at least
+    /// [`NOTICE_MINIMUM_DISPLAY`] at `now`. Returns whether the bar is clear
+    /// afterwards, so a caller can tell a survivor from a dismissal.
+    pub fn dismiss(&self, now: std::time::Instant) -> bool {
+        let mut slot = self.lock();
+        match slot.notice.as_ref() {
+            None => true,
+            Some(notice) => {
+                if now.saturating_duration_since(notice.set_at) < NOTICE_MINIMUM_DISPLAY {
+                    return false;
+                }
+                slot.write(None);
+                true
+            }
+        }
     }
 
     /// The current notice, if any.
     pub fn current(&self) -> Option<String> {
-        self.0.lock().expect("notices lock poisoned").clone()
+        self.lock()
+            .notice
+            .as_ref()
+            .map(|notice| notice.text.clone())
+    }
+
+    /// Counts writes to the shared slot. A renderer that records this with
+    /// each frame can tell that the bar changed since it last drew, which is
+    /// what keeps a notice set by background work from being missed by a
+    /// dirty-gated draw.
+    pub fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, NoticeSlot> {
+        self.0.lock().expect("notices lock poisoned")
     }
 }
 
@@ -1858,6 +1938,99 @@ mod tests {
 
         clone.clear();
         assert_eq!(notices.current(), None);
+    }
+
+    /// Dismissal is what an incidental key press asks for, and a notice that
+    /// nobody has had time to read must survive it.
+    #[test]
+    fn a_notice_is_dismissed_only_once_it_has_been_showing_long_enough() {
+        let notices = Notices::default();
+        assert!(notices.dismiss(std::time::Instant::now()));
+
+        notices.set("Credential sync failed");
+        let after_set = std::time::Instant::now();
+        assert!(!notices.dismiss(after_set));
+        assert_eq!(notices.current().as_deref(), Some("Credential sync failed"));
+
+        assert!(notices.dismiss(after_set + NOTICE_MINIMUM_DISPLAY));
+        assert_eq!(notices.current(), None);
+    }
+
+    /// Draws are gated on a dirty flag that background work never sets, so a
+    /// renderer tells the bar moved by recording this counter with each frame.
+    #[test]
+    fn every_write_to_the_notice_slot_bumps_its_generation() {
+        let notices = Notices::default();
+        let drawn = notices.generation();
+
+        notices.set("Import failed");
+        assert_ne!(notices.generation(), drawn);
+        let drawn = notices.generation();
+
+        assert!(notices.replace_if("Import failed", "Import failed: no space left"));
+        assert_ne!(notices.generation(), drawn);
+        let drawn = notices.generation();
+
+        notices.clear();
+        assert_ne!(notices.generation(), drawn);
+
+        // Clearing an empty bar changes nothing on screen.
+        let drawn = notices.generation();
+        notices.clear();
+        assert_eq!(notices.generation(), drawn);
+    }
+
+    fn text_elicitation() -> ElicitationRequest {
+        ElicitationRequest {
+            id: "ask-1".into(),
+            message: "Which branch should I use?".into(),
+            title: None,
+            description: None,
+            fields: vec![crate::hel_elicitation::ElicitationField {
+                id: "branch".into(),
+                title: "Branch".into(),
+                description: None,
+                required: false,
+                secret: false,
+                custom_answer_for: None,
+                kind: crate::hel_elicitation::ElicitationFieldKind::Text {
+                    default: None,
+                    min_length: None,
+                    max_length: None,
+                    pattern: None,
+                    format: None,
+                },
+            }],
+        }
+    }
+
+    /// A pending elicitation is durable projection state, rebuilt from the
+    /// session the next time it is opened, so leaving the view is a different
+    /// act from answering the agent.
+    #[test]
+    fn control_g_and_control_q_leave_a_chat_whose_elicitation_is_still_open() {
+        let mut chat = ChatState::new(&snapshot(), &[]);
+        let request = text_elicitation();
+        chat.restore_elicitation(request.clone());
+
+        assert_eq!(chat.handle_key(ctrl('g')), ChatAction::Back);
+        assert_eq!(chat.handle_key(ctrl('q')), ChatAction::QuitDetach);
+        assert_eq!(
+            chat.materialized_session().pending_elicitations,
+            vec![request.clone()]
+        );
+
+        // Every other key still belongs to the form, and Escape still answers
+        // the agent rather than leaving.
+        assert_eq!(chat.handle_key(key(KeyCode::Char('q'))), ChatAction::None);
+        assert_eq!(
+            chat.handle_key(key(KeyCode::Esc)),
+            ChatAction::RespondElicitation {
+                request,
+                response: ElicitationResponse::Cancel,
+            }
+        );
+        assert!(chat.materialized_session().pending_elicitations.is_empty());
     }
 
     #[test]

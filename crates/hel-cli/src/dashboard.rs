@@ -101,6 +101,11 @@ pub(crate) struct DashboardContext {
     pub(crate) active_chat: Option<hel::hel_chat::ActiveChat>,
     /// The first pass always draws; after that a redraw needs a wakeup.
     pub(crate) dirty: bool,
+    /// The notice generation the frame on screen was drawn from. Background
+    /// work writes the shared slot without touching `dirty`, so the draw
+    /// compares against this rather than trusting every setter to ask for a
+    /// frame.
+    drawn_notice_generation: u64,
     /// The poll targets are recomputed only after the controller may have
     /// changed.
     pub(crate) controller_changed: bool,
@@ -454,6 +459,7 @@ impl DashboardContext {
             view: View::Dashboard,
             active_chat: None,
             dirty: true,
+            drawn_notice_generation: 0,
             controller_changed: true,
             quit_detached: false,
             quota_profiles_tx,
@@ -550,11 +556,20 @@ impl DashboardContext {
     }
 
     /// Redraws the view on screen, if anything asked for a redraw.
+    ///
+    /// A notice is the only report several background failures get, and it can
+    /// be written from any task through the shared slot. Comparing the slot
+    /// with what the last frame drew is what makes a notice reach the screen
+    /// even when nothing else marked the view dirty; without it a notice could
+    /// be replaced or dismissed having rendered zero frames.
     fn draw(&mut self) -> Result<()> {
+        let notice_generation = self.notices.generation();
+        self.dirty |= notice_generation != self.drawn_notice_generation;
         if !self.dirty {
             return Ok(());
         }
         self.dirty = false;
+        self.drawn_notice_generation = notice_generation;
         let Self {
             terminal,
             dashboard,

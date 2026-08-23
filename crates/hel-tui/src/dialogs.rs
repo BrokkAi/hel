@@ -1373,13 +1373,40 @@ mod tests {
     use crate::render::render;
     use crate::{DashboardAction, DashboardState, Mode};
 
+    fn asks_to_type_destroy(dashboard: &DashboardState) -> bool {
+        matches!(
+            dashboard.mode,
+            Mode::Confirm(ConfirmDialog {
+                confirmation: Confirmation::DeleteActive { .. },
+                ..
+            })
+        )
+    }
+
     #[test]
-    fn delete_active_is_immediate_without_assistant_messages_and_guarded_after_one() {
+    fn delete_active_is_immediate_only_once_a_hydrated_transcript_shows_no_assistant_messages() {
         let mut session = stopped_session();
         session.state = SessionState::Running;
         session.checkpoint = None;
         let mut dashboard = dashboard_with_session(session);
 
+        // Nothing has hydrated yet, so a session that looks empty may simply
+        // be one Hel has not read.
+        assert_eq!(
+            dashboard.handle_key(key(KeyCode::Delete)),
+            DashboardAction::None
+        );
+        assert!(asks_to_type_destroy(&dashboard));
+        dashboard.handle_key(key(KeyCode::Esc));
+
+        // A transcript that could not be read is no better evidence.
+        dashboard.mark_transcript_unavailable("session-1");
+        assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
+        assert!(asks_to_type_destroy(&dashboard));
+        dashboard.handle_key(key(KeyCode::Esc));
+
+        // Hydrated and empty: there is no agent work to lose.
+        apply_materialized_transcript(&mut dashboard, Vec::new());
         assert_eq!(
             dashboard.handle_key(key(KeyCode::Delete)),
             DashboardAction::DeleteActive {
@@ -1389,13 +1416,7 @@ mod tests {
 
         apply_materialized_transcript(&mut dashboard, vec![agent_message(1, "hello")]);
         assert_eq!(dashboard.handle_key(ctrl_key('d')), DashboardAction::None);
-        assert!(matches!(
-            dashboard.mode,
-            Mode::Confirm(ConfirmDialog {
-                confirmation: Confirmation::DeleteActive { .. },
-                ..
-            })
-        ));
+        assert!(asks_to_type_destroy(&dashboard));
     }
 
     fn dashboard_with_container_session() -> DashboardState {

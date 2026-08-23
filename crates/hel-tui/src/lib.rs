@@ -373,6 +373,13 @@ impl DashboardState {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
+        self.handle_key_at(key, Instant::now())
+    }
+
+    /// Handles one key with an explicit reading of the clock. `now` decides
+    /// whether the notice on screen has been readable long enough for this
+    /// key press to dismiss it.
+    pub fn handle_key_at(&mut self, key: KeyEvent, now: Instant) -> DashboardAction {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return DashboardAction::None;
         }
@@ -389,7 +396,10 @@ impl DashboardState {
             return DashboardAction::QuitDetach;
         }
 
-        self.notices.clear();
+        // Retire the notice this key press is stepping past, but only once it
+        // has been on screen long enough to read: for a background failure
+        // this bar is the only report there is.
+        self.notices.dismiss(now);
         match self.mode.clone() {
             Mode::Dashboard => self.handle_dashboard_key(key),
             Mode::New(wizard) => self.handle_new_key(key.code, wizard),
@@ -646,15 +656,20 @@ impl DashboardState {
                 }
                 if let Some(session) = self.selected_session() {
                     let session_id = session.id.clone();
-                    let has_assistant_messages =
+                    // Deleting without the typed confirmation needs Hel to
+                    // KNOW there is no agent work to lose. A transcript that
+                    // has not hydrated yet reads exactly like an empty one, so
+                    // only a hydrated, empty transcript takes the fast path.
+                    let known_to_have_no_assistant_messages =
                         self.session_details.get(&session_id).is_some_and(|detail| {
-                            detail.last_agent_message.is_some()
-                                || detail
+                            detail.transcript_hydration == TranscriptHydration::Ready
+                                && detail.last_agent_message.is_none()
+                                && !detail
                                     .transcript
                                     .as_ref()
                                     .is_some_and(TranscriptSnapshot::has_assistant_messages)
                         });
-                    if !has_assistant_messages {
+                    if known_to_have_no_assistant_messages {
                         return DashboardAction::DeleteActive { session_id };
                     }
                     self.mode = Mode::Confirm(ConfirmDialog::new(Confirmation::DeleteActive {
@@ -1033,6 +1048,58 @@ mod tests {
             DashboardAction::None
         );
         assert_eq!(dashboard.focus, Focus::Capacity);
+    }
+
+    /// The notice bar is the only report a background failure gets, so a key
+    /// press that happens to arrive while one is fresh must not wipe it.
+    #[test]
+    fn a_fresh_notice_survives_a_key_press_and_clears_once_it_has_been_readable() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+
+        dashboard.set_notice("Rename failed: relay unreachable");
+        let shown_at = Instant::now();
+
+        assert_eq!(
+            dashboard.handle_key_at(key(KeyCode::Down), shown_at),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.notice().as_deref(),
+            Some("Rename failed: relay unreachable")
+        );
+
+        assert_eq!(
+            dashboard.handle_key_at(
+                key(KeyCode::Down),
+                shown_at + hel::hel_chat::NOTICE_MINIMUM_DISPLAY
+            ),
+            DashboardAction::None
+        );
+        assert_eq!(dashboard.notice(), None);
+    }
+
+    /// A key press that reports something of its own replaces the notice
+    /// whatever its age; the display period only defends against incidental
+    /// keys.
+    #[test]
+    fn a_key_press_with_its_own_notice_replaces_a_fresh_one() {
+        let mut session = stopped_session();
+        session.state = SessionState::Running;
+        let mut dashboard = dashboard_with_session(session);
+
+        dashboard.set_notice("Rename failed: relay unreachable");
+        let shown_at = Instant::now();
+
+        assert_eq!(
+            dashboard.handle_key_at(ctrl_key('s'), shown_at),
+            DashboardAction::None
+        );
+        assert_eq!(
+            dashboard.notice().as_deref(),
+            Some("Sort by recent activity")
+        );
     }
 
     #[test]
