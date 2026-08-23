@@ -1086,7 +1086,7 @@ pub(crate) fn apply_worker_record_update(
         && session
             .last_error
             .as_deref()
-            .is_some_and(|message| message.starts_with("relay unreachable:"));
+            .is_some_and(hel::hel_database::is_relay_unreachable_error);
     let mut changed = false;
     if let Some(title) = changed_title {
         if dashboard_io_tx.is_none() {

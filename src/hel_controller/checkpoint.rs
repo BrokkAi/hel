@@ -1064,19 +1064,48 @@ async fn wait_for_checkpoint_barrier(
             return Ok(snapshot);
         }
         if snapshot.operational.execution == RelayExecutionState::Closed {
-            bail!("ACP runtime stopped before reaching the checkpoint barrier");
+            return Err(CheckpointBarrierUnreachable::runtime_stopped().into());
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("ACP relay did not reach checkpoint barrier {command_id}");
+            return Err(CheckpointBarrierUnreachable::not_admitted(command_id).into());
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
+/// The ACP runtime never admitted a checkpoint barrier: it stopped first, or it
+/// never reached the barrier before the deadline.
+///
+/// [`wait_for_checkpoint_barrier`] is the only producer, and the retry decision
+/// downcasts for this marker rather than reading the message, so rewording a
+/// diagnostic cannot silently disable the restart-and-retry path.
+#[derive(Debug)]
+struct CheckpointBarrierUnreachable(String);
+
+impl CheckpointBarrierUnreachable {
+    fn runtime_stopped() -> Self {
+        Self("ACP runtime stopped before reaching the checkpoint barrier".to_owned())
+    }
+
+    fn not_admitted(command_id: &str) -> Self {
+        Self(format!(
+            "ACP relay did not reach checkpoint barrier {command_id}"
+        ))
+    }
+}
+
+impl std::fmt::Display for CheckpointBarrierUnreachable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CheckpointBarrierUnreachable {}
+
 fn checkpoint_barrier_needs_worker_restart(error: &anyhow::Error) -> bool {
-    let detail = format!("{error:#}");
-    detail.contains("ACP relay did not reach checkpoint barrier")
-        || detail.contains("ACP runtime stopped before reaching the checkpoint barrier")
+    error
+        .downcast_ref::<CheckpointBarrierUnreachable>()
+        .is_some()
 }
 
 fn checkpoint_barrier_is_ready(snapshot: &ManagedSessionSnapshot, command_id: &str) -> bool {
@@ -1581,6 +1610,7 @@ mod tests {
     };
     use crate::hel_targets::{self, CommandExecutor, CommandOutput, CommandSpec};
     use crate::hel_worker::{RelayCommand, RelayCursor, RelayExecutionState};
+    use crate::hel_worker_client::RelayTransportDead;
 
     use super::*;
 
@@ -2039,27 +2069,31 @@ mod tests {
     }
     #[test]
     fn a_stuck_checkpoint_barrier_is_retried_by_restarting_the_worker() {
-        assert!(checkpoint_barrier_needs_worker_restart(&anyhow::anyhow!(
-            "ACP relay did not reach checkpoint barrier checkpoint-976f6746887c5ccd93b9d8bbe120ef06"
-        )));
-        assert!(checkpoint_barrier_needs_worker_restart(&anyhow::anyhow!(
-            "ACP runtime stopped before reaching the checkpoint barrier"
-        )));
+        // Both ways the wait can end without a barrier, each wrapped the way
+        // the checkpoint path wraps them, and each still asking for the retry.
+        for failure in [
+            CheckpointBarrierUnreachable::not_admitted(
+                "checkpoint-976f6746887c5ccd93b9d8bbe120ef06",
+            ),
+            CheckpointBarrierUnreachable::runtime_stopped(),
+        ] {
+            let error = anyhow::Error::new(failure).context("latch a session checkpoint");
+            assert!(checkpoint_barrier_needs_worker_restart(&error), "{error:#}");
+        }
         assert!(!checkpoint_barrier_needs_worker_restart(&anyhow::anyhow!(
             "export target checkpoint failed with status 1"
+        )));
+        // The decision reads the type, not the text, so the old wording alone
+        // no longer restarts a worker and rewording one cannot stop it either.
+        assert!(!checkpoint_barrier_needs_worker_restart(&anyhow::anyhow!(
+            "ACP relay did not reach checkpoint barrier checkpoint-1"
         )));
     }
     #[test]
     fn a_dead_worker_hello_failure_is_retried_by_restarting_the_worker() {
-        assert!(worker_connect_needs_restart(&anyhow::anyhow!(
-            "relay proxy disconnected during hello"
-        )));
-        assert!(worker_connect_needs_restart(&anyhow::anyhow!(
-            "relay proxy disconnected"
-        )));
-        assert!(worker_connect_needs_restart(&anyhow::anyhow!(
-            "Connection refused (os error 111)"
-        )));
+        let dead = anyhow::Error::new(RelayTransportDead::new("the proxy is gone"))
+            .context("connect to the session worker for checkpoint");
+        assert!(worker_connect_needs_restart(&dead), "{dead:#}");
         assert!(!worker_connect_needs_restart(&anyhow::anyhow!(
             "unknown session"
         )));

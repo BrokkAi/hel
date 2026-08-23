@@ -1115,6 +1115,25 @@ fn set_session_acp_title_to(path: &Path, session_id: &str, title: Option<&str>) 
     Ok(())
 }
 
+/// The one spelling of a stored "the relay could not be reached" failure.
+///
+/// [`mark_session_relay_reconnected`] clears exactly the errors that carry this
+/// prefix, so every producer must build its message with
+/// [`relay_unreachable_error`] instead of writing the words again. Reword the
+/// detail freely; the prefix is the contract, and it has one owner.
+const RELAY_UNREACHABLE_ERROR_PREFIX: &str = "relay unreachable: ";
+
+/// Build the stored failure message for a session whose relay is unreachable.
+pub fn relay_unreachable_error(detail: impl std::fmt::Display) -> String {
+    format!("{RELAY_UNREACHABLE_ERROR_PREFIX}{detail}")
+}
+
+/// Whether a stored failure message reports an unreachable relay, and so can be
+/// cleared by a later reconnection.
+pub fn is_relay_unreachable_error(message: &str) -> bool {
+    message.starts_with(RELAY_UNREACHABLE_ERROR_PREFIX)
+}
+
 /// Clear a transient relay-unreachable error only if that exact error state is
 /// still current. A concurrent lifecycle transition must never be rewritten
 /// back to Running by a stale poll result.
@@ -1150,13 +1169,17 @@ pub fn mark_session_worker_connected(
 
 fn mark_session_relay_reconnected_to(path: &Path, session_id: &str) -> Result<bool> {
     let connection = open(path)?;
+    // The prefix is matched from its owning constant, so the pattern cannot
+    // drift away from what `relay_unreachable_error` writes. It contains no
+    // LIKE wildcards, so appending `%` is the whole pattern.
+    let unreachable_pattern = format!("{RELAY_UNREACHABLE_ERROR_PREFIX}%");
     let changed = connection.execute(
         "UPDATE sessions
          SET state = 'running', last_error = NULL
          WHERE session_id = ?1
            AND state = 'error'
-           AND last_error LIKE 'relay unreachable:%'",
-        [session_id],
+           AND last_error LIKE ?2",
+        params![session_id, unreachable_pattern],
     )?;
     if changed == 1 {
         return Ok(true);
@@ -3237,7 +3260,7 @@ mod tests {
         let database = directory.path().join("hel.sqlite3");
         let mut stale = session("session-1", "project-1");
         stale.state = SessionState::Error;
-        stale.last_error = Some("relay unreachable: connection refused".into());
+        stale.last_error = Some(relay_unreachable_error("connection refused"));
         save_session_to(&database, &stale).unwrap();
         let recovered = CheckpointMetadata {
             archive_path: PathBuf::from("sessions/recovered.hel.zip"),
@@ -3278,6 +3301,47 @@ mod tests {
             load_state_from(&database).unwrap().sessions["session-1"]
                 .acp_session_title
                 .is_none()
+        );
+    }
+
+    /// The words are written in one place and matched in another, once across
+    /// a crate boundary. Prove the two agree through the shared definition, and
+    /// that only the owned prefix decides: a reworded detail still reconnects,
+    /// and a failure that is not an unreachable relay still does not.
+    #[test]
+    fn a_reconnection_clears_any_relay_unreachable_error_this_module_can_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hel.sqlite3");
+        for detail in [
+            "connection refused",
+            "the proxy went away while nobody was looking",
+        ] {
+            let mut unreachable = session("session-1", "project-1");
+            unreachable.state = SessionState::Error;
+            unreachable.last_error = Some(relay_unreachable_error(detail));
+            save_session_to(&database, &unreachable).unwrap();
+
+            assert!(is_relay_unreachable_error(
+                unreachable.last_error.as_deref().unwrap()
+            ));
+            assert!(mark_session_relay_reconnected_to(&database, "session-1").unwrap());
+            let reconnected = &load_state_from(&database).unwrap().sessions["session-1"];
+            assert_eq!(reconnected.state, SessionState::Running);
+            assert!(reconnected.last_error.is_none());
+        }
+
+        let mut bootstrap_failure = session("session-1", "project-1");
+        bootstrap_failure.state = SessionState::Error;
+        bootstrap_failure.last_error = Some("worker bootstrap failed: upload failed".into());
+        save_session_to(&database, &bootstrap_failure).unwrap();
+
+        assert!(!is_relay_unreachable_error(
+            bootstrap_failure.last_error.as_deref().unwrap()
+        ));
+        assert!(!mark_session_relay_reconnected_to(&database, "session-1").unwrap());
+        assert_eq!(
+            load_state_from(&database).unwrap().sessions["session-1"].state,
+            SessionState::Error
         );
     }
 

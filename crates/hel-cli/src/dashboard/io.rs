@@ -1071,7 +1071,9 @@ impl DashboardContext {
     ) {
         let completion = self.worker_diagnoses.finish(&session_id, episode_id);
         if let Some(error) = completion.display_error {
-            let mut message = format!("relay unreachable: {error}");
+            // The database owns this wording: a reconnection clears exactly the
+            // errors this constructor produces.
+            let mut message = hel::hel_database::relay_unreachable_error(&error);
             match &result {
                 Ok(Some(diagnosis)) => {
                     message.push_str("; ");

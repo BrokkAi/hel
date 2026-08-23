@@ -105,6 +105,52 @@ impl RelayRejected {
     }
 }
 
+/// A relay transport that can no longer carry requests: the proxy exited, one
+/// of its pipes failed, or the handshake never completed.
+///
+/// Every site that can prove this attaches the marker, and recovery decisions
+/// such as worker auto-restart downcast for it. Nothing reads the message text,
+/// so rewording a diagnostic can never silently disable recovery.
+#[derive(Debug)]
+pub struct RelayTransportDead(String);
+
+impl std::fmt::Display for RelayTransportDead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RelayTransportDead {}
+
+impl RelayTransportDead {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    /// Mark an I/O failure on the relay's pipes. The marker reports exactly
+    /// what the I/O error reported, so it adds a type without adding text.
+    fn from_io(error: std::io::Error) -> Self {
+        Self(error.to_string())
+    }
+
+    /// Whether this error, or any cause behind it, is a dead relay transport.
+    pub fn marks(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
+/// Whether an exchange is the handshake that proves the transport carries
+/// traffic at all.
+///
+/// A handshake that never answers means the worker is not serving; a later
+/// call's timeout can just be a busy worker, and restarting that worker would
+/// be worse than waiting for it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExchangeKind {
+    Handshake,
+    Call,
+}
+
 /// Controller-side connection to the durable ACP relay protocol.
 ///
 /// This type does not construct transcript state or request an unbounded
@@ -500,7 +546,9 @@ impl RelayClient {
             protocol_version: self.protocol_version,
             request,
         };
-        let line = self.exchange(&envelope, operation, timeout).await?;
+        let line = self
+            .exchange(&envelope, operation, timeout, ExchangeKind::Call)
+            .await?;
         decode_relay_response(&line, &request_id, self.protocol_version)
             .with_context(|| format!("relay {} could not perform {operation}", self.relay_version))
     }
@@ -514,7 +562,9 @@ impl RelayClient {
             request,
         };
         let timeout = self.request_timeout;
-        let line = self.exchange(&envelope, operation, timeout).await?;
+        let line = self
+            .exchange(&envelope, operation, timeout, ExchangeKind::Handshake)
+            .await?;
         decode_relay_hello_response(&line, &request_id)
     }
 
@@ -532,6 +582,7 @@ impl RelayClient {
         envelope: &RelayRequestEnvelope,
         operation: &str,
         timeout: Duration,
+        kind: ExchangeKind,
     ) -> Result<String> {
         if let Some(reason) = &self.abandoned {
             bail!("{reason}");
@@ -545,15 +596,21 @@ impl RelayClient {
             self.input
                 .write_all(&frame)
                 .await
+                .map_err(RelayTransportDead::from_io)
                 .with_context(|| format!("write relay {operation} request"))?;
             self.input
                 .flush()
                 .await
+                .map_err(RelayTransportDead::from_io)
                 .with_context(|| format!("flush relay {operation} request"))?;
             read_bounded_frame(&mut self.output)
                 .await
                 .with_context(|| format!("read relay {operation} response"))?
-                .ok_or_else(|| anyhow!("relay proxy disconnected during {operation}"))
+                .ok_or_else(|| {
+                    anyhow::Error::new(RelayTransportDead::new(format!(
+                        "relay proxy disconnected during {operation}"
+                    )))
+                })
         })
         .await;
         match exchanged {
@@ -563,7 +620,13 @@ impl RelayClient {
                 self.abandoned = Some(format!(
                     "relay connection abandoned after {operation} timed out after {seconds} seconds"
                 ));
-                bail!("relay {operation} timed out after {seconds} seconds")
+                let timed_out = format!("relay {operation} timed out after {seconds} seconds");
+                match kind {
+                    ExchangeKind::Handshake => {
+                        Err(anyhow::Error::new(RelayTransportDead::new(timed_out)))
+                    }
+                    ExchangeKind::Call => Err(anyhow!(timed_out)),
+                }
             }
         }
     }
@@ -613,12 +676,20 @@ async fn read_bounded_frame_with_limit(
 ) -> Result<Option<String>> {
     let mut frame = Vec::new();
     loop {
-        let available = reader.fill_buf().await?;
+        // A failed read and a half-written frame are transport deaths; the
+        // limit and encoding failures below are protocol violations that a
+        // worker restart would not fix, so only these two carry the marker.
+        let available = reader
+            .fill_buf()
+            .await
+            .map_err(RelayTransportDead::from_io)?;
         if available.is_empty() {
             if frame.is_empty() {
                 return Ok(None);
             }
-            bail!("relay proxy disconnected in the middle of a response frame");
+            return Err(anyhow::Error::new(RelayTransportDead::new(
+                "relay proxy disconnected in the middle of a response frame",
+            )));
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
         let consumed = newline.map_or(available.len(), |position| position + 1);
@@ -1179,6 +1250,24 @@ sys.stdin.read()
                 .contains("negotiated unsupported protocol 3"),
             "{error:#}"
         );
+        // The transport carried the answer perfectly well; restarting the
+        // worker cannot make it speak a protocol it does not implement.
+        assert!(!RelayTransportDead::marks(&error), "{error:#}");
+    }
+
+    /// A proxy that exits without answering is the ordinary shape of a dead
+    /// worker. Recovery hangs on this being typed rather than read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_proxy_that_exits_before_hello_reports_a_dead_transport() {
+        let spec = CommandSpec::new("sh", ["-c", "exit 1"]).purpose("exiting relay proxy");
+
+        let error = RelayClient::connect_with_timeout(&spec, SESSION_ID, Duration::from_secs(5))
+            .await
+            .err()
+            .expect("a proxy that exits cannot complete hello");
+
+        assert!(RelayTransportDead::marks(&error), "{error:#}");
     }
 
     #[cfg(unix)]
@@ -1193,6 +1282,8 @@ sys.stdin.read()
             .expect("silent relay must time out");
 
         assert!(error.to_string().contains("relay hello timed out"));
+        // A handshake that never answers means the transport carries nothing.
+        assert!(RelayTransportDead::marks(&error), "{error:#}");
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
@@ -1231,6 +1322,9 @@ cat > /dev/null
             format!("{timed_out:#}").contains("relay status timed out"),
             "{timed_out:#}"
         );
+        // A busy worker that misses one deadline is not a dead transport: it
+        // answered the handshake, and killing it would be worse than waiting.
+        assert!(!RelayTransportDead::marks(&timed_out), "{timed_out:#}");
 
         // The abandoned reply is still in flight. A later call must not read it
         // as its own response, so it fails at once with the real cause. The
@@ -1290,6 +1384,21 @@ cat > /dev/null
 
         write.await.unwrap();
         assert!(error.to_string().contains("frame is too large"));
+        // An oversized frame is a protocol violation, not a dead transport:
+        // the same worker would send the same frame after a restart.
+        assert!(!RelayTransportDead::marks(&error), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn a_half_written_response_frame_reports_a_dead_transport() {
+        let (mut writer, reader) = tokio::io::duplex(32);
+        writer.write_all(b"{\"partial\":").await.unwrap();
+        drop(writer);
+        let mut reader = BufReader::new(reader);
+
+        let error = read_bounded_frame(&mut reader).await.unwrap_err();
+
+        assert!(RelayTransportDead::marks(&error), "{error:#}");
     }
 
     #[test]

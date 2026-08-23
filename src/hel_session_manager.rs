@@ -20,7 +20,7 @@ use crate::hel_projection::{
 use crate::hel_state::{ManagedSessionSnapshot, MaterializedSession};
 use crate::hel_targets::{CancellableProcessExecutor, CommandExecutor, CommandPlan, CommandSpec};
 use crate::hel_worker::{RelayCommand, RelayCursor, RelayOperationalState};
-use crate::hel_worker_client::{RelayClient, RelayEventPage, RelayRejected};
+use crate::hel_worker_client::{RelayClient, RelayEventPage, RelayRejected, RelayTransportDead};
 
 const SESSION_SYNC_INTERVAL: Duration = Duration::from_millis(150);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
@@ -56,16 +56,14 @@ pub struct WorkerRecoveryPlan {
     pub restart: CommandPlan,
 }
 
+/// Whether a relay failure means the transport to the worker is gone, so
+/// restarting that worker is the only recovery left.
+///
+/// Every failure that proves it is marked with [`RelayTransportDead`] where it
+/// is produced, and this decision downcasts for that marker. Message text is
+/// never read: a reworded diagnostic must not be able to disable auto-restart.
 pub(crate) fn worker_connect_needs_restart(error: &anyhow::Error) -> bool {
-    let detail = format!("{error:#}").to_ascii_lowercase();
-    detail.contains("relay proxy disconnected")
-        || detail.contains("disconnected during hello")
-        || detail.contains("relay hello timed out")
-        || detail.contains("broken pipe")
-        || detail.contains("connection reset by peer")
-        || detail.contains("connect worker at")
-        || detail.contains("connection refused")
-        || detail.contains("worker relay did not accept")
+    RelayTransportDead::marks(error)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,10 +364,7 @@ impl ManagedSessionHandle {
             .send(ActorCommand::Lease { reply })
             .await
             .context("session manager stopped")?;
-        let (lease_id, connection) = response
-            .await
-            .context("session manager stopped")?
-            .map_err(anyhow::Error::msg)?;
+        let (lease_id, connection) = response.await.context("session manager stopped")??;
         Ok(ManagedSessionLease {
             lease_id: Some(lease_id),
             connection: Some(connection),
@@ -461,8 +456,11 @@ enum ActorCommand {
         response: ElicitationResponse,
         reply: oneshot::Sender<std::result::Result<(), String>>,
     },
+    /// The connection is handed over whole, and so is the failure: a caller
+    /// that must decide whether to restart the worker needs the typed cause,
+    /// which formatting the error to a string would destroy.
     Lease {
-        reply: oneshot::Sender<std::result::Result<(u64, StandaloneSession), String>>,
+        reply: oneshot::Sender<Result<(u64, StandaloneSession)>>,
     },
 }
 
@@ -479,7 +477,7 @@ impl ActorCommand {
                 let _ = reply.send(Err(message.to_owned()));
             }
             Self::Lease { reply } => {
-                let _ = reply.send(Err(message.to_owned()));
+                let _ = reply.send(Err(anyhow::anyhow!(message.to_owned())));
             }
         }
     }
@@ -954,9 +952,9 @@ async fn run_session_actor(
                     }
                     ActorCommand::Lease { reply } => {
                         if lifecycle.is_leased() {
-                            let _ = reply.send(Err(
-                                "session already has a lifecycle operation".into(),
-                            ));
+                            let _ = reply.send(Err(anyhow::anyhow!(
+                                "session already has a lifecycle operation"
+                            )));
                             continue;
                         }
                         let lease_id = next_lease_id;
@@ -973,8 +971,7 @@ async fn run_session_actor(
                                     .take()
                                     .expect("successful sync retained its connection"),
                             )
-                        })
-                        .map_err(|error| format!("{error:#}"));
+                        });
                         if result.is_err() {
                             connection = None;
                         }
@@ -1547,21 +1544,77 @@ mod tests {
 
     #[test]
     fn only_dead_worker_connection_failures_request_a_restart() {
+        // The wording is deliberately unlike anything a matcher could have
+        // been written against: the marker, not the message, decides.
+        let reworded = anyhow::Error::new(RelayTransportDead::new(
+            "the session proxy vanished mid-conversation",
+        ))
+        .context("connect to the session worker for checkpoint");
+        assert!(worker_connect_needs_restart(&reworded), "{reworded:#}");
+
+        // Text alone proves nothing now, not even the exact text the producing
+        // sites still use: an unmarked failure must never restart a worker.
         for detail in [
             "relay proxy disconnected during hello",
-            "relay hello timed out after 15 seconds",
-            "write relay hello request: Broken pipe",
-            "connect worker at /worker/root",
             "Connection refused (os error 111)",
+            "relay negotiated unsupported protocol 9",
+            "controller projection is corrupt",
         ] {
-            assert!(worker_connect_needs_restart(&anyhow::anyhow!(detail)));
+            assert!(!worker_connect_needs_restart(&anyhow::anyhow!(detail)));
         }
-        assert!(!worker_connect_needs_restart(&anyhow::anyhow!(
-            "relay negotiated unsupported protocol 9"
-        )));
-        assert!(!worker_connect_needs_restart(&anyhow::anyhow!(
-            "controller projection is corrupt"
-        )));
+    }
+
+    /// The producing side of the same contract: a proxy that dies without
+    /// serving the handshake must ask for a worker restart, whatever its
+    /// failure happens to read like.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_proxy_that_dies_before_hello_requests_a_worker_restart() {
+        let mut dead = target("sh");
+        dead.spec = CommandSpec::new("sh", ["-c", "exit 1"]).purpose("dead relay proxy fixture");
+
+        let error = StandaloneSession::connect(&dead)
+            .await
+            .err()
+            .expect("a proxy that exits cannot serve a session");
+
+        assert!(worker_connect_needs_restart(&error), "{error:#}");
+    }
+
+    /// A lease answer crosses a channel. Formatting the failure into a string
+    /// there would strip the cause and silently cost the checkpoint path its
+    /// restart decision, so prove the typed cause survives the handoff.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_lease_keeps_the_cause_that_decides_a_worker_restart() {
+        let (commands_tx, commands_rx) = mpsc::channel(4);
+        let (_releases_tx, releases_rx) = mpsc::unbounded_channel();
+        let (_retirement_tx, retirement_rx) = watch::channel(false);
+        let (view_tx, _view_rx) = watch::channel(ManagedSessionView::default());
+        let (updates_tx, _updates_rx) = coalesced_update_channel();
+        let mut dead = target("sh");
+        dead.spec = CommandSpec::new("sh", ["-c", "exit 1"]).purpose("dead relay proxy fixture");
+        tokio::spawn(run_session_actor(
+            dead,
+            commands_rx,
+            releases_rx,
+            retirement_rx,
+            view_tx,
+            updates_tx,
+        ));
+
+        let (reply, response) = oneshot::channel();
+        commands_tx
+            .send(ActorCommand::Lease { reply })
+            .await
+            .unwrap();
+        let error = response
+            .await
+            .expect("actor answered the lease request")
+            .err()
+            .expect("a dead proxy cannot be leased");
+
+        assert!(worker_connect_needs_restart(&error), "{error:#}");
     }
 
     #[tokio::test]
