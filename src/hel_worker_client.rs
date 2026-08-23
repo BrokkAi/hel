@@ -115,6 +115,9 @@ pub struct RelayClient {
     input: ChildStdin,
     output: BufReader<ChildStdout>,
     request_timeout: Duration,
+    /// Why this connection can no longer be used, once a call gave up on a
+    /// reply that is still in flight. See [`RelayClient::exchange`].
+    abandoned: Option<String>,
     next_request: u64,
     connection_nonce: u64,
     protocol_version: u32,
@@ -166,6 +169,7 @@ impl RelayClient {
             input,
             output: BufReader::new(output),
             request_timeout,
+            abandoned: None,
             next_request: 1,
             connection_nonce: u64::from_le_bytes(nonce_bytes),
             protocol_version: RELAY_PROTOCOL_VERSION,
@@ -496,67 +500,72 @@ impl RelayClient {
             protocol_version: self.protocol_version,
             request,
         };
-        let mut frame = serde_json::to_vec(&envelope)?;
-        if frame.len() > MAX_FRAME_BYTES {
-            bail!("relay request frame is too large");
-        }
-        frame.push(b'\n');
-        let line = tokio::time::timeout(timeout, async {
-            self.input
-                .write_all(&frame)
-                .await
-                .context("write relay request")?;
-            self.input.flush().await.context("flush relay request")?;
-            read_bounded_frame(&mut self.output)
-                .await
-                .context("read relay response")?
-                .ok_or_else(|| anyhow!("relay proxy disconnected"))
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "relay {operation} timed out after {} seconds",
-                timeout.as_secs_f64()
-            )
-        })??;
+        let line = self.exchange(&envelope, operation, timeout).await?;
         decode_relay_response(&line, &request_id, self.protocol_version)
             .with_context(|| format!("relay {} could not perform {operation}", self.relay_version))
     }
 
     async fn call_hello(&mut self, request: RelayRequest) -> Result<RelayResponsePayload> {
+        let operation = request.method_name();
         let request_id = self.request_id();
         let envelope = RelayRequestEnvelope {
             request_id: request_id.clone(),
             protocol_version: RELAY_PROTOCOL_VERSION,
             request,
         };
-        let mut frame = serde_json::to_vec(&envelope)?;
+        let timeout = self.request_timeout;
+        let line = self.exchange(&envelope, operation, timeout).await?;
+        decode_relay_hello_response(&line, &request_id)
+    }
+
+    /// Write one request frame and read the reply that belongs to it.
+    ///
+    /// The connection is strictly sequential, so giving up on a reply does not
+    /// cancel it: the relay may still answer, and that answer would be read as
+    /// the *next* call's response. Timeouts therefore abandon the connection
+    /// rather than the single call. Every later call fails immediately with the
+    /// true cause, so callers reconnect deliberately instead of chasing a
+    /// mismatched response ID. This matters most where a short bookkeeping
+    /// deadline and a long compaction deadline share one connection.
+    async fn exchange(
+        &mut self,
+        envelope: &RelayRequestEnvelope,
+        operation: &str,
+        timeout: Duration,
+    ) -> Result<String> {
+        if let Some(reason) = &self.abandoned {
+            bail!("{reason}");
+        }
+        let mut frame = serde_json::to_vec(envelope)?;
         if frame.len() > MAX_FRAME_BYTES {
-            bail!("relay hello request frame is too large");
+            bail!("relay {operation} request frame is too large");
         }
         frame.push(b'\n');
-        let line = tokio::time::timeout(self.request_timeout, async {
+        let exchanged = tokio::time::timeout(timeout, async {
             self.input
                 .write_all(&frame)
                 .await
-                .context("write relay hello request")?;
+                .with_context(|| format!("write relay {operation} request"))?;
             self.input
                 .flush()
                 .await
-                .context("flush relay hello request")?;
+                .with_context(|| format!("flush relay {operation} request"))?;
             read_bounded_frame(&mut self.output)
                 .await
-                .context("read relay hello response")?
-                .ok_or_else(|| anyhow!("relay proxy disconnected during hello"))
+                .with_context(|| format!("read relay {operation} response"))?
+                .ok_or_else(|| anyhow!("relay proxy disconnected during {operation}"))
         })
-        .await
-        .with_context(|| {
-            format!(
-                "relay hello timed out after {} seconds",
-                self.request_timeout.as_secs_f64()
-            )
-        })??;
-        decode_relay_hello_response(&line, &request_id)
+        .await;
+        match exchanged {
+            Ok(line) => line,
+            Err(_elapsed) => {
+                let seconds = timeout.as_secs_f64();
+                self.abandoned = Some(format!(
+                    "relay connection abandoned after {operation} timed out after {seconds} seconds"
+                ));
+                bail!("relay {operation} timed out after {seconds} seconds")
+            }
+        }
     }
 
     fn request_id(&mut self) -> String {
@@ -1185,6 +1194,86 @@ sys.stdin.read()
 
         assert!(error.to_string().contains("relay hello timed out"));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A relay that answers `hello` at once and then stalls, replying to the
+    /// next request long after any controller deadline. `$1` is the session id.
+    #[cfg(unix)]
+    const STALLING_RELAY: &str = r#"
+IFS= read -r hello
+id=$(printf '%s' "$hello" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+printf '{"request_id":"%s","protocol_version":1,"result":"ok","payload":{"type":"hello","data":{"negotiated":1,"relay_version":"stalling-fixture","session_id":"%s"}}}\n' "$id" "$1"
+IFS= read -r stalled
+id=$(printf '%s' "$stalled" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+sleep 5
+printf '{"request_id":"%s","protocol_version":1,"result":"error","error":{"code":"internal","message":"late reply","retryable":false}}\n' "$id"
+cat > /dev/null
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_call_abandons_the_connection_instead_of_desynchronizing_it() {
+        let spec = CommandSpec::new(
+            "sh",
+            ["-c", STALLING_RELAY, "hel-relay-fixture", SESSION_ID],
+        )
+        .purpose("stalling relay fixture");
+        let mut client =
+            RelayClient::connect_with_timeout(&spec, SESSION_ID, Duration::from_millis(500))
+                .await
+                .expect("the fixture answers hello immediately");
+
+        let timed_out = client
+            .status()
+            .await
+            .expect_err("the stalled status call must time out");
+        assert!(
+            format!("{timed_out:#}").contains("relay status timed out"),
+            "{timed_out:#}"
+        );
+
+        // The abandoned reply is still in flight. A later call must not read it
+        // as its own response, so it fails at once with the real cause. The
+        // compaction deadline is minutes long: without this the controller
+        // would block on someone else's reply.
+        let started = std::time::Instant::now();
+        let compaction = client
+            .compact("summarize".into())
+            .await
+            .expect_err("a call on an abandoned connection must fail");
+        let elapsed = started.elapsed();
+        assert!(
+            format!("{compaction:#}").contains("relay connection abandoned after status timed out"),
+            "{compaction:#}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "an abandoned connection must fail fast, took {elapsed:?}"
+        );
+
+        let repeated = client
+            .status()
+            .await
+            .expect_err("the connection stays abandoned");
+        assert!(
+            format!("{repeated:#}").contains("relay connection abandoned after status timed out"),
+            "{repeated:#}"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_method_answer_still_reads_as_missing_skills_sync() {
+        // Workers that predate skills sync answer the unknown method with an
+        // `InvalidRequest` rejection, and so does a current worker's structured
+        // unsupported-method response. Both must skip the session quietly.
+        let response = crate::hel_worker::unsupported_relay_method_response(
+            "relay-1".into(),
+            RELAY_PROTOCOL_VERSION,
+            "skills_state".into(),
+        );
+        let encoded = serde_json::to_string(&response).unwrap();
+        let error = decode_relay_response(&encoded, "relay-1", RELAY_PROTOCOL_VERSION).unwrap_err();
+        assert!(skills_sync_unsupported(&error), "{error:#}");
     }
 
     #[tokio::test]

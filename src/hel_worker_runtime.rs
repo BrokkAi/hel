@@ -108,11 +108,13 @@ mod unix {
     use super::{AcpSupervisorSpec, CredentialEndpoint, WorkerLaunchConfig};
     use crate::hel_acp::{self, CommandRequest, LaunchSpec, RuntimeEvent};
     use crate::hel_worker::{
-        ClaimedRelayCommand, DurableRelay, RELAY_PROTOCOL_VERSION, RelayCommand,
-        RelayCommandOutcome, RelayErrorCode, RelayObservation, RelayProtocolError, RelayRequest,
-        RelayRequestEnvelope, RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload,
-        incompatible_request_protocol_response,
+        ClaimedRelayCommand, DurableRelay, RelayCommand, RelayCommandOutcome, RelayErrorCode,
+        RelayObservation, RelayProtocolError, RelayRequest, RelayRequestEnvelope,
+        RelayResponseBody, RelayResponseEnvelope, RelayResponsePayload,
+        incompatible_request_protocol_response, invalid_relay_request_response,
+        unsupported_relay_method_response,
     };
+    use crate::hel_worker_protocol::{DecodedRelayRequest, decode_relay_request};
 
     pub(super) const ACP_EVENT_CHANNEL_CAPACITY: usize = 256;
 
@@ -896,10 +898,28 @@ mod unix {
             while let Some(line) =
                 read_bounded_line(&mut reader, crate::hel_worker::MAX_FRAME_BYTES).await?
             {
-                let envelope = match serde_json::from_str::<RelayRequestEnvelope>(&line) {
-                    Ok(envelope) => envelope,
-                    Err(error) => {
-                        let response = invalid_relay_request(&line, &error.to_string());
+                // One decoder owns this boundary: an unknown method is a
+                // protocol error the controller can act on, and an unreadable
+                // frame is answered rather than dropping the connection.
+                let envelope = match decode_relay_request(line.as_bytes()) {
+                    DecodedRelayRequest::Known(envelope) => envelope,
+                    DecodedRelayRequest::Unknown {
+                        request_id,
+                        protocol_version,
+                        method,
+                    } => {
+                        let response =
+                            unsupported_relay_method_response(request_id, protocol_version, method);
+                        write_response(&mut writer, &response).await?;
+                        continue;
+                    }
+                    DecodedRelayRequest::Invalid {
+                        request_id,
+                        protocol_version,
+                        message,
+                    } => {
+                        let response =
+                            invalid_relay_request_response(request_id, protocol_version, message);
                         write_response(&mut writer, &response).await?;
                         continue;
                     }
@@ -1336,32 +1356,6 @@ mod unix {
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Closed(())) => bail!("relay coordinator stopped"),
-        }
-    }
-
-    fn invalid_relay_request(line: &str, message: &str) -> RelayResponseEnvelope {
-        let value = serde_json::from_str::<serde_json::Value>(line).unwrap_or_default();
-        let request_id = value
-            .get("request_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("invalid-request")
-            .to_owned();
-        let protocol_version = value
-            .get("protocol_version")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|version| u32::try_from(version).ok())
-            .unwrap_or(RELAY_PROTOCOL_VERSION);
-        RelayResponseEnvelope {
-            request_id,
-            protocol_version,
-            body: RelayResponseBody::Error {
-                error: RelayProtocolError {
-                    code: RelayErrorCode::InvalidRequest,
-                    message: message.to_owned(),
-                    retryable: false,
-                    detail: None,
-                },
-            },
         }
     }
 
@@ -4247,6 +4241,70 @@ mod relay_tests {
 
         let status = RelayRequestEnvelope {
             request_id: "valid-after-invalid".into(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            request: RelayRequest::Status,
+        };
+        let mut encoded = serde_json::to_vec(&status).unwrap();
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.unwrap();
+        let accepted: RelayResponseEnvelope =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(
+            accepted.body,
+            RelayResponseBody::Ok {
+                payload: RelayResponsePayload::Status(_)
+            }
+        ));
+
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        drop(lines);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_relay_method_is_named_in_its_rejection() {
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(Mutex::new(
+            DurableRelay::open(temp.path(), SESSION_ID, "1.0.0").unwrap(),
+        ));
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(unix::serve_client(
+            server,
+            relay,
+            wake_tx,
+            test_credentials(),
+            None,
+            fatal_reports().0,
+        ));
+        let (reader, mut writer) = client.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        writer
+            .write_all(
+                b"{\"request_id\":\"future\",\"protocol_version\":1,\"request\":{\"method\":\"subscribe\",\"params\":{\"after_seq\":0}}}\n",
+            )
+            .await
+            .unwrap();
+        let rejected: RelayResponseEnvelope =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(rejected.request_id, "future");
+        let RelayResponseBody::Error { error } = rejected.body else {
+            panic!("an unknown method must be rejected");
+        };
+        assert_eq!(error.code, RelayErrorCode::InvalidRequest);
+        assert!(
+            error.message.contains("does not support method")
+                && error.message.contains("subscribe"),
+            "{}",
+            error.message
+        );
+
+        // The connection is a protocol boundary, not a casualty of the
+        // rejection: the next request is still served.
+        let status = RelayRequestEnvelope {
+            request_id: "after-unknown-method".into(),
             protocol_version: RELAY_PROTOCOL_VERSION,
             request: RelayRequest::Status,
         };
