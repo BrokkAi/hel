@@ -137,7 +137,7 @@ impl HarnessKind {
             Self::Claude => "Claude Code",
             Self::Kimi => "Kimi Code",
             Self::Grok => "Grok Build",
-            Self::Deepseek => "DeepSeek Harness",
+            Self::Deepseek => "DSH",
         }
     }
 
@@ -967,6 +967,7 @@ mod tests {
         assert_eq!(HarnessKind::Grok.id(), "grok");
         assert_eq!(HarnessKind::Grok.display_name(), "Grok Build");
         assert_eq!(HarnessKind::Grok.default_home_leaf(), ".grok");
+        assert_eq!(HarnessKind::Deepseek.display_name(), "DSH");
         assert_eq!(HarnessKind::Deepseek.home_env(), "DSH_HOME");
         assert!("nope".parse::<HarnessKind>().is_err());
     }

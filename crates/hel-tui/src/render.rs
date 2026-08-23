@@ -2616,6 +2616,8 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("API Pricing"));
+        assert!(rendered.contains("DSH"));
+        assert!(!rendered.contains("DeepSeek Harness"));
         assert!(!rendered.contains("unavailable"));
         assert!(!rendered.contains('%'));
     }
