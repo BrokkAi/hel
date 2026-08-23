@@ -457,8 +457,7 @@ fn workspace_paths(
     Ok((primary_path, additional))
 }
 
-// npx fallbacks for images that do not already carry an ACP bridge. Keep these
-// in lockstep with the global npm installs in
+// Package versions for ACP bridges. Keep these in lockstep with the global npm installs in
 // containers/Containerfile.agent-dev; bridge_pins_match_containerfile() below
 // fails the build when they drift.
 const CODEX_ACP_FALLBACK_VERSION: &str = "1.1.14";
@@ -523,7 +522,7 @@ fn bridge_launch(
             vec![
                 "-lc".into(),
                 format!(
-                    "{}; if command -v dsh-acp-server >/dev/null 2>&1; then exec dsh-acp-server; fi; exec npx -y -p @deepseek-ai/dsh@{DEEPSEEK_HARNESS_FALLBACK_VERSION} -p dsh-acp-server@{DEEPSEEK_ACP_FALLBACK_VERSION} dsh-acp-server",
+                    "{}; if command -v dsh >/dev/null 2>&1 && command -v dsh-acp-server >/dev/null 2>&1; then exec dsh-acp-server; fi; echo 'Hel needs @deepseek-ai/dsh@{DEEPSEEK_HARNESS_FALLBACK_VERSION} and dsh-acp-server@{DEEPSEEK_ACP_FALLBACK_VERSION} installed on PATH' >&2; exit 127",
                     ensure_node_22_script(),
                 ),
             ],
@@ -1771,6 +1770,7 @@ mod tests {
             bridge_launch(crate::hel_config::HarnessKind::Deepseek, None, true);
         assert!(deepseek_arguments[1].contains("@deepseek-ai/dsh@0.1.1-rc.2"));
         assert!(deepseek_arguments[1].contains("dsh-acp-server@0.10.0"));
+        assert!(!deepseek_arguments[1].contains("npx -y -p @deepseek-ai/dsh"));
         assert!(deepseek_arguments[1].contains("exec dsh-acp-server"));
     }
     #[test]

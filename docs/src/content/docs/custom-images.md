@@ -34,13 +34,12 @@ the container (see [Container targets](/containers/)).
 
 For each harness, hel first looks for an image-baked bridge binary on
 `PATH`: `codex-acp`, `claude-agent-acp`, `kimi`, `grok`, or
-`dsh-acp-server`. If it doesn't find one, Codex, Claude Code, and DeepSeek
-Harness fall back to running the bridge with `npx -y`, pinned to hel's fallback
-versions. DeepSeek Harness requires Node 22 or newer. That fallback needs
-`npx`; if it's missing, hel
-tries to install Node using the same package-manager detection it uses for Git.
-Kimi Code and Grok Build have no npm bridge: hel runs their official installer
-with `curl` instead, which needs `curl` in the image.
+`dsh-acp-server`. If it doesn't find one, Codex and Claude Code fall back to
+running the bridge with `npx -y`, pinned to hel's fallback versions. DeepSeek
+Harness requires Node 22 or newer and follows its adapter's supported install
+model: bake the pinned `@deepseek-ai/dsh` and `dsh-acp-server` packages into the
+image. Kimi Code and Grok Build have no npm bridge: hel runs their official
+installer with `curl` instead, which needs `curl` in the image.
 
 Baking the bridges in, the way the reference image does, avoids that
 per-session install cost and pins the exact bridge version through the image
