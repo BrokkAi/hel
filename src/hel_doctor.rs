@@ -2,22 +2,26 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::hel_config::{ContainerTemplate, HarnessKind, HelConfig, TargetTemplate, config_path};
+use crate::hel_config::{
+    ContainerTemplate, HarnessKind, HarnessProfile, HelConfig, TargetTemplate, config_path,
+};
 use crate::hel_controller::{
     WorkerBinaryAvailability, backend_ssh, worker_binary_prerequisite_for_arch,
 };
+use crate::hel_credentials::login_command;
 use crate::hel_setup::{
     DiscoveredHome, discover_harness_homes, harness_authentication_marker, harness_is_authenticated,
 };
 use crate::hel_targets::{
-    CommandExecutor, CommandSpec, ContainerTemplate as RuntimeContainerTemplate, ProcessExecutor,
-    SshTarget as RuntimeSshTarget, TargetTemplate as RuntimeTargetTemplate, run_setup_smoke_test,
-    ssh_connectivity_probe, verify_local_podman, verify_ssh_podman,
+    BoundedProcessExecutor, CommandExecutor, CommandSpec,
+    ContainerTemplate as RuntimeContainerTemplate, ProcessExecutor, SshTarget as RuntimeSshTarget,
+    TargetTemplate as RuntimeTargetTemplate, run_setup_smoke_test, ssh_connectivity_probe,
+    verify_local_podman, verify_ssh_podman,
 };
 
 // Only the image for the Apple container smoke test when the config has no
@@ -27,6 +31,20 @@ use crate::hel_targets::{
 // a poor trade.
 const DEFAULT_CONTAINER_IMAGE: &str = "ubuntu:24.04";
 const APPLE_CONTAINER_INSTALL_URL: &str = "https://github.com/apple/container#initial-install";
+
+/// How long a single prerequisite probe may take before doctor reports it as a
+/// fixable check instead of waiting for it.
+///
+/// Every probe outside the opt-in smoke tests is a local or short network call,
+/// so this only ever fires for a wedged runtime socket, a blackholed network,
+/// or a credential helper waiting on something that will never arrive.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The executor `hel doctor` and `hel setup` run their prerequisite probes
+/// through: one deadline per probe, so a wedged runtime cannot hang the run.
+pub const fn probe_executor() -> BoundedProcessExecutor {
+    BoundedProcessExecutor::new(PROBE_TIMEOUT)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,7 +84,7 @@ impl DoctorCheck {
         }
     }
 
-    fn fixable(
+    pub(crate) fn fixable(
         id: impl Into<String>,
         title: impl Into<String>,
         detail: impl Into<String>,
@@ -118,11 +136,18 @@ pub enum InstructionsPlatform {
 }
 
 pub fn run_current(options: DoctorOptions) -> Vec<DoctorCheck> {
-    run_with(
-        &ProcessExecutor,
-        current_apple_platform(&ProcessExecutor),
-        options,
-    )
+    if options.smoke {
+        // A smoke test may legitimately pull a multi-gigabyte image, which no
+        // probe deadline could tell apart from a hung runtime, so an opt-in
+        // `--smoke` run keeps waiting for its commands.
+        return run_with(
+            &ProcessExecutor,
+            current_apple_platform(&ProcessExecutor),
+            options,
+        );
+    }
+    let executor = probe_executor();
+    run_with(&executor, current_apple_platform(&executor), options)
 }
 
 pub fn run_with(
@@ -370,7 +395,7 @@ fn harness_checks(config: Option<&HelConfig>) -> Vec<DoctorCheck> {
                     format!("harness.{id}"),
                     title,
                     format!("Authentication marker {} is missing", marker.display()),
-                    harness_login_remediation(profile.kind, &profile.home),
+                    harness_login_remediation(id, profile),
                 );
             }
             DoctorCheck::ready(
@@ -386,22 +411,19 @@ fn harness_checks(config: Option<&HelConfig>) -> Vec<DoctorCheck> {
         .collect()
 }
 
-fn harness_login_remediation(kind: HarnessKind, home: &std::path::Path) -> String {
-    let environment = kind.home_env();
-    match kind {
-        HarnessKind::Codex => {
-            format!("Run `{environment}={} codex login`.", home.display())
-        }
-        HarnessKind::Claude => format!(
-            "Run `{environment}={} claude` and complete the sign-in prompt.",
-            home.display()
-        ),
-        HarnessKind::Kimi => format!(
-            "Run `{environment}={} kimi` and complete the sign-in prompt.",
-            home.display()
-        ),
-        HarnessKind::Grok => format!("Run `{environment}={} grok login`.", home.display()),
-    }
+/// Point an unauthenticated profile at `hel login`, which already knows how to
+/// sign each harness in.
+///
+/// The underlying command is named only for the reader's benefit; it comes from
+/// [`login_command`], the one place that tracks what each harness CLI actually
+/// accepts, so this text cannot drift away from what `hel login` runs.
+fn harness_login_remediation(id: &str, profile: &HarnessProfile) -> String {
+    let (program, arguments) = login_command(profile);
+    format!(
+        "Run `hel login --profile {id}`; it runs `{program} {}` against {}.",
+        arguments.join(" "),
+        profile.home.display()
+    )
 }
 
 /// Host Podman prerequisites, then one image check per `local-podman` target.
@@ -1735,6 +1757,41 @@ mod tests {
         assert_eq!(checks[0].id, "worker.remote");
         assert_ne!(checks[0].status, CheckStatus::Unsupported);
         assert!(checks[0].detail.contains("x86_64-unknown-linux-musl"));
+    }
+
+    #[test]
+    fn an_unauthenticated_profile_is_fixed_by_hel_login_for_that_profile() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("claude-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let profile = HarnessProfile {
+            kind: HarnessKind::Claude,
+            home,
+            executable: None,
+            environment: std::collections::BTreeMap::new(),
+            context_window_bytes: None,
+        };
+        let config = HelConfig {
+            profiles: [("work".to_owned(), profile.clone())].into_iter().collect(),
+            ..HelConfig::default()
+        };
+
+        let checks = harness_checks(Some(&config));
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, CheckStatus::Fixable);
+        let remediation = checks[0].remediation.as_deref().unwrap();
+        assert!(
+            remediation.contains("hel login --profile work"),
+            "{remediation}"
+        );
+        // The underlying command is quoted from the one place that verified it,
+        // so doctor cannot recommend something `hel login` does not run.
+        let (program, arguments) = login_command(&profile);
+        assert!(
+            remediation.contains(&format!("`{program} {}`", arguments.join(" "))),
+            "{remediation}"
+        );
     }
 
     #[test]

@@ -685,6 +685,51 @@ impl CommandExecutor for CancellableProcessExecutor {
     }
 }
 
+/// Runs every command with its own deadline.
+///
+/// [`CancellableProcessExecutor::with_timeout`] bounds a whole operation from a
+/// single shared deadline, which suits one provisioning run. Prerequisite
+/// probes are different: each one is expected to answer quickly, and a wedged
+/// socket or blackholed network must not stall the probes that follow it. A
+/// timeout here names the probe that hung, so the caller can report it the same
+/// way it reports any other probe failure.
+#[derive(Debug, Clone, Copy)]
+pub struct BoundedProcessExecutor {
+    timeout: Duration,
+}
+
+impl BoundedProcessExecutor {
+    pub const fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl CommandExecutor for BoundedProcessExecutor {
+    fn execute(&self, command: &CommandSpec) -> Result<CommandOutput> {
+        let executor = CancellableProcessExecutor::with_timeout(self.timeout);
+        executor.execute(command).map_err(|error| {
+            if executor.is_cancelled() {
+                anyhow::anyhow!(
+                    "`{}` did not answer within {} seconds while trying to {}",
+                    command.program,
+                    self.timeout.as_secs(),
+                    command.purpose
+                )
+            } else {
+                error
+            }
+        })
+    }
+
+    fn execute_with_stdin(
+        &self,
+        command: &CommandSpec,
+        input: &mut (dyn Read + Send),
+    ) -> Result<CommandOutput> {
+        CancellableProcessExecutor::with_timeout(self.timeout).execute_with_stdin(command, input)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodmanPreflight {
     pub version: String,
@@ -1632,8 +1677,14 @@ printf 'logical.cores=%s\n' "$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)"
 df -B1 -P -- "$1" | awk 'NR == 2 { print "disk.total=" $2 }'
 "#;
 
+// `du` is run on its own so a path it cannot measure fails the probe instead of
+// being silently dropped from the total: a session that reports less disk than
+// it uses is worse than one that reports none. Its stderr is deliberately left
+// attached, so the caller's failure message names the path that could not be
+// read.
 const AWS_SESSION_DISK_USAGE_SCRIPT: &str = r#"
-du -s -B1 -- "$@" 2>/dev/null | awk '{ total += $1 } END { print total + 0 }'
+usage=$(du -s -B1 -- "$@") || exit 1
+printf '%s\n' "$usage" | awk '{ total += $1 } END { print total + 0 }'
 "#;
 
 pub fn resource_probe(locator: &TargetLocator, session_id: &str) -> Result<SessionResourceProbe> {
@@ -1763,8 +1814,7 @@ pub fn parse_resource_usage(
         .map(|value| parse_cgroup_counter(value))
         .transpose()?
         .flatten();
-    let writable_disk_bytes =
-        disk_output.and_then(|output| String::from_utf8_lossy(output).trim().parse().ok());
+    let writable_disk_bytes = disk_output.map(parse_disk_usage).transpose()?;
     let cpu_percent = values
         .get("cpu.percent")
         .map(|value| parse_percent(value))
@@ -1778,6 +1828,18 @@ pub fn parse_resource_usage(
         swap_limit_bytes,
         writable_disk_bytes,
     })
+}
+
+/// Read the single byte count every writable-disk probe answers with.
+///
+/// A probe that ran and answered something else measured nothing, which must be
+/// reported as a failure rather than silently becoming "disk usage unknown":
+/// only a probe that was never run leaves the value unknown.
+fn parse_disk_usage(output: &[u8]) -> Result<u64> {
+    let text = String::from_utf8_lossy(output);
+    let text = text.trim();
+    text.parse()
+        .with_context(|| format!("disk usage probe answered {text:?} instead of a byte count"))
 }
 
 pub fn ssh_host_capacity_command(ssh: &SshTarget) -> CommandSpec {
@@ -3563,6 +3625,59 @@ mod tests {
     }
 
     #[test]
+    fn a_disk_probe_that_answered_garbage_is_a_failure_not_unknown_usage() {
+        let memory = b"memory.current=1073741824\n";
+
+        // A probe that never ran leaves the usage unknown.
+        let unknown = parse_resource_usage(memory, None).unwrap();
+        assert_eq!(unknown.writable_disk_bytes, None);
+
+        // A probe that ran and answered something that is not a byte count
+        // measured nothing, and must not be reported as usage.
+        let error = parse_resource_usage(memory, Some(b"du: cannot access\n")).unwrap_err();
+        assert!(
+            error.to_string().contains("instead of a byte count"),
+            "{error}"
+        );
+        assert!(parse_resource_usage(memory, Some(b"")).is_err());
+    }
+
+    #[test]
+    fn the_ec2_disk_probe_fails_instead_of_undercounting_an_unreadable_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let measured = directory.path().join("workspace");
+        fs::create_dir_all(&measured).unwrap();
+        fs::write(measured.join("file"), vec![0_u8; 64 * 1024]).unwrap();
+        let missing = directory.path().join("never-created");
+        let disk_probe = |paths: &[&Path]| {
+            let mut args = vec![
+                "-c".to_owned(),
+                AWS_SESSION_DISK_USAGE_SCRIPT.to_owned(),
+                "sh".to_owned(),
+            ];
+            args.extend(paths.iter().map(|path| path.to_string_lossy().into_owned()));
+            ProcessExecutor
+                .execute(&CommandSpec::new("sh", args).purpose("test the EC2 session disk probe"))
+                .unwrap()
+        };
+
+        let measured_only = disk_probe(&[&measured]);
+        assert_eq!(measured_only.status, 0);
+        let bytes = parse_disk_usage(&measured_only.stdout).unwrap();
+        assert!(bytes >= 64 * 1024, "{bytes}");
+
+        // One unreadable path must fail the probe rather than quietly reporting
+        // the total of the paths that did answer.
+        let with_missing = disk_probe(&[&measured, &missing]);
+        assert_ne!(with_missing.status, 0);
+        assert!(
+            String::from_utf8_lossy(&with_missing.stderr).contains("never-created"),
+            "the failure must name the path: {}",
+            String::from_utf8_lossy(&with_missing.stderr)
+        );
+    }
+
+    #[test]
     fn parses_host_and_aws_capacity_outputs() {
         let host = parse_host_capacity(
             b"cpu.percent=62.6\nmemory.current=300\nmemory.max=1000\nlogical.cores=8\n",
@@ -4427,6 +4542,34 @@ mod tests {
 
         assert!(error.to_string().contains("operation cancelled"));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn bounded_executor_times_out_naming_the_probe_and_still_runs_the_next_one() {
+        let executor = BoundedProcessExecutor::new(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+
+        let error = executor
+            .execute(
+                &CommandSpec::new("sh", ["-c", "sleep 30"]).purpose("check a wedged prerequisite"),
+            )
+            .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let message = error.to_string();
+        assert!(message.contains("`sh`"), "{message}");
+        assert!(
+            message.contains("check a wedged prerequisite"),
+            "the timeout must name the probe that hung: {message}"
+        );
+
+        // Each command gets its own deadline, so one hung probe does not
+        // cancel every probe that follows it.
+        let output = executor
+            .execute(&CommandSpec::new("sh", ["-c", "printf ready"]).purpose("check the next one"))
+            .unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout, b"ready");
     }
 
     #[test]

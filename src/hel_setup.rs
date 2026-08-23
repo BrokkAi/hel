@@ -3,18 +3,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
 use crate::hel_config::{
     AwsAddressSource, ContainerTemplate, HarnessKind, HarnessProfile, HelConfig, ProjectBundle,
-    ProjectRepository, SshConnection, TargetTemplate,
+    ProjectRepository, SshConnection, TargetTemplate, validate_id,
 };
 use crate::hel_doctor::{
-    CheckStatus, DoctorOptions, all_ready, apple_container_daemon_check, current_apple_platform,
-    local_podman_runtime_check, render_human, run_with_config_path,
+    CheckStatus, DoctorCheck, DoctorOptions, all_ready, apple_container_daemon_check,
+    current_apple_platform, local_podman_runtime_check, probe_executor, render_human,
+    run_with_config_path,
 };
 use crate::hel_targets::{
     CancellableProcessExecutor, CommandExecutor, CommandSpec,
@@ -150,7 +150,11 @@ pub enum SetupOutcome {
 
 /// Run the setup dialog using the user's normal standard input and output.
 pub fn run_setup_dialog(config_path: &Path) -> Result<SetupOutcome> {
-    let discovery = discover_current(&ProcessExecutor);
+    // Prerequisite probes run under doctor's per-probe deadline, so a wedged
+    // container socket cannot stall the first run; only the smoke test, which
+    // may pull an image, is allowed to take as long as it needs.
+    let probes = probe_executor();
+    let discovery = discover_current(&probes);
     let stdin = io::stdin();
     let stdout = io::stdout();
     run_setup_dialog_with(
@@ -159,6 +163,7 @@ pub fn run_setup_dialog(config_path: &Path) -> Result<SetupOutcome> {
         config_path,
         &discovery,
         &ProcessExecutor,
+        &probes,
     )
 }
 
@@ -172,7 +177,7 @@ pub fn discover_current(executor: &impl CommandExecutor) -> SetupDiscovery {
 
     SetupDiscovery {
         homes,
-        repository: discover_github_repository(&cwd),
+        repository: discover_github_repository(executor, &cwd),
         runtimes: probe_local_runtimes(executor, cfg!(target_os = "macos")),
         aws: detect_aws(&CancellableProcessExecutor::with_timeout(AWS_PROBE_TIMEOUT)),
         ssh_hosts: discover_ssh_hosts(home.as_deref()),
@@ -294,13 +299,28 @@ pub fn github_repository_from_origin(origin: &str) -> Option<GithubRepository> {
     })
 }
 
-fn discover_github_repository(cwd: &Path) -> Option<GithubRepository> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
+/// Read the current directory's GitHub origin, through the same executor every
+/// other discovery probe uses so it is bounded and can be faked in tests.
+///
+/// `git -C` selects the directory instead of a working-directory field on the
+/// command, which no executor carries.
+fn discover_github_repository(
+    executor: &impl CommandExecutor,
+    cwd: &Path,
+) -> Option<GithubRepository> {
+    let command = CommandSpec::new(
+        "git",
+        [
+            "-C".to_owned(),
+            cwd.to_string_lossy().into_owned(),
+            "remote".to_owned(),
+            "get-url".to_owned(),
+            "origin".to_owned(),
+        ],
+    )
+    .purpose("detect the current repository's GitHub origin");
+    let output = executor.execute(&command).ok()?;
+    if output.status != 0 {
         return None;
     }
     github_repository_from_origin(&String::from_utf8_lossy(&output.stdout))
@@ -392,7 +412,7 @@ fn build_config_with_runtime(
 ) -> HelConfig {
     let mut config = HelConfig::default();
     for home in homes {
-        let id = unique_profile_id(&config.profiles, home.kind.id());
+        let id = unique_id(&config.profiles, home.kind.id());
         config.profiles.insert(
             id,
             HarnessProfile {
@@ -483,7 +503,12 @@ fn build_config_with_runtime(
                 },
             },
         };
-        config.targets.insert(ssh.name.clone(), target);
+        // The dialog already refuses a name that collides, so this only guards
+        // a caller that builds a config without asking: a chosen SSH name must
+        // never silently replace a target configured moments earlier.
+        config
+            .targets
+            .insert(unique_id(&config.targets, &ssh.name), target);
     }
     config
 }
@@ -493,14 +518,16 @@ fn default_ssh_workspace_prefix() -> PathBuf {
     PathBuf::from(".local/share/hel/workspaces")
 }
 
-fn unique_profile_id(profiles: &BTreeMap<String, HarnessProfile>, base_id: &str) -> String {
-    if !profiles.contains_key(base_id) {
+/// The first free id at or after `base_id`, so building a config never drops an
+/// entry by inserting over one that is already there.
+fn unique_id<T>(entries: &BTreeMap<String, T>, base_id: &str) -> String {
+    if !entries.contains_key(base_id) {
         return base_id.to_owned();
     }
     let mut number = 2;
     loop {
         let candidate = format!("{base_id}-{number}");
-        if !profiles.contains_key(&candidate) {
+        if !entries.contains_key(&candidate) {
             return candidate;
         }
         number += 1;
@@ -521,12 +548,19 @@ fn config_id(value: &str) -> String {
     id
 }
 
+/// Ask the setup questions, write the configuration, and report on it.
+///
+/// The smoke test and the closing doctor report run through different
+/// executors on purpose: a smoke test may pull a multi-gigabyte image and must
+/// not be given a deadline, while every prerequisite probe must answer quickly
+/// or be reported as a fixable check.
 pub fn run_setup_dialog_with(
     input: &mut impl BufRead,
     output: &mut impl Write,
     config_path: &Path,
     discovery: &SetupDiscovery,
-    executor: &impl CommandExecutor,
+    smoke_executor: &impl CommandExecutor,
+    probe_executor: &impl CommandExecutor,
 ) -> Result<SetupOutcome> {
     writeln!(output, "Welcome to Hel setup.")?;
     writeln!(output)?;
@@ -555,13 +589,23 @@ pub fn run_setup_dialog_with(
         None
     };
     let aws = prompt_aws_target(input, output, discovery.aws.as_ref())?;
-    let ssh = prompt_ssh_target(input, output, &discovery.ssh_hosts)?;
+    let runtime_choice = runtime
+        .as_ref()
+        .map(|(runtime, image)| (*runtime, image.as_str()));
+    // Build what the earlier answers already claimed, so the SSH step can
+    // refuse a target name that would replace one of them.
+    let configured = build_config_with_runtime(
+        &discovery.homes,
+        discovery.repository.as_ref(),
+        runtime_choice,
+        aws.as_ref(),
+        None,
+    );
+    let ssh = prompt_ssh_target(input, output, &discovery.ssh_hosts, &configured.targets)?;
     let config = build_config_with_runtime(
         &discovery.homes,
         discovery.repository.as_ref(),
-        runtime
-            .as_ref()
-            .map(|(runtime, image)| (*runtime, image.as_str())),
+        runtime_choice,
         aws.as_ref(),
         ssh.as_ref(),
     );
@@ -582,11 +626,16 @@ pub fn run_setup_dialog_with(
 
     writeln!(output, "Writing {}...", config_path.display())?;
     config.save_to(config_path)?;
-    if let Some((runtime, image)) = runtime {
-        let smoke_target = smoke_target(runtime, &image);
-        run_smoke_test(output, &smoke_target, executor)?;
-    }
-    write_doctor_report(output, config_path, executor)?;
+    // A failed smoke test is a fixable prerequisite, not a reason to abandon
+    // the run: the configuration is already written, and this is exactly when
+    // the closing report's remediations matter most.
+    let smoke_failure = runtime.and_then(|(runtime, image)| {
+        let target = smoke_target(runtime, &image);
+        run_smoke_test(output, &target, smoke_executor)
+            .err()
+            .map(|error| smoke_failure_check(runtime, &image, &error))
+    });
+    write_doctor_report(output, config_path, probe_executor, smoke_failure)?;
     writeln!(
         output,
         "Advanced users can edit TOML for extra profiles, virtual monorepos, SSH, and AWS."
@@ -746,6 +795,7 @@ fn prompt_ssh_target(
     input: &mut impl BufRead,
     output: &mut impl Write,
     aliases: &[String],
+    configured: &BTreeMap<String, TargetTemplate>,
 ) -> Result<Option<SshTargetInput>> {
     if aliases.is_empty() {
         writeln!(
@@ -795,27 +845,84 @@ fn prompt_ssh_target(
         }
     };
 
-    let name = prompt(input, output, &format!("Target name [{host}]: "))?;
-    let name = if name.is_empty() { host.clone() } else { name };
+    let Some(name) = prompt_ssh_target_name(input, output, &host, configured)? else {
+        return Ok(None);
+    };
 
     Ok(Some(SshTargetInput { name, host, kind }))
 }
 
+/// Ask for the SSH target's name until the answer is a usable target id.
+///
+/// Both failures are caught here rather than by `config.validate()` after every
+/// question has been asked: an invalid id would otherwise discard the whole
+/// dialog, and a name that is already taken would silently replace the target
+/// it collides with.
+fn prompt_ssh_target_name(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    host: &str,
+    configured: &BTreeMap<String, TargetTemplate>,
+) -> Result<Option<String>> {
+    loop {
+        let Some(answer) = prompt_line(input, output, &format!("Target name [{host}]: "))? else {
+            writeln!(output, "Input ended; skipping the SSH target.")?;
+            return Ok(None);
+        };
+        let name = if answer.is_empty() {
+            host.to_owned()
+        } else {
+            answer
+        };
+        if let Err(error) = validate_id("target", &name) {
+            writeln!(output, "{error}")?;
+            continue;
+        }
+        if configured.contains_key(&name) {
+            writeln!(
+                output,
+                "Target {name} is already configured; choose another name."
+            )?;
+            continue;
+        }
+        return Ok(Some(name));
+    }
+}
+
+/// Phrase a failed setup smoke test the way `hel doctor --smoke` phrases the
+/// same failure, so it joins the closing report instead of ending the run.
+fn smoke_failure_check(runtime: RuntimeKind, image: &str, error: &anyhow::Error) -> DoctorCheck {
+    DoctorCheck::fixable(
+        format!("runtime.{}.smoke", runtime.id()),
+        format!("{} smoke test", runtime.label()),
+        format!("Disposable run/exec/remove smoke test failed for image {image}: {error:#}"),
+        format!(
+            "Fix the configured image or the {} runtime, then run `hel doctor --smoke` again.",
+            runtime.label()
+        ),
+    )
+}
+
 /// End setup with the same report `hel doctor` prints, so the user gets one
 /// ready/fixable summary with remediations instead of two different signals.
+///
+/// `extra` carries anything setup itself learned that doctor cannot repeat
+/// without the opt-in smoke test.
 fn write_doctor_report(
     output: &mut impl Write,
     config_path: &Path,
     executor: &impl CommandExecutor,
+    extra: Option<DoctorCheck>,
 ) -> Result<()> {
     writeln!(output)?;
     writeln!(output, "Running `hel doctor` checks on the new config...")?;
-    let checks = run_with_config_path(
+    let mut checks = run_with_config_path(
         config_path,
         executor,
         current_apple_platform(executor),
         DoctorOptions { smoke: false },
     );
+    checks.extend(extra);
     render_human(&checks, output)?;
     if all_ready(&checks) {
         writeln!(output, "Every check is ready.")?;
@@ -862,13 +969,26 @@ fn select_runtime(
 }
 
 fn prompt(input: &mut impl BufRead, output: &mut impl Write, label: &str) -> Result<String> {
+    Ok(prompt_line(input, output, label)?.unwrap_or_default())
+}
+
+/// Read one answer, reporting `None` once the input has ended.
+///
+/// Every question but one treats the end of input as an empty answer and takes
+/// its default. A question that must be asked again until it is answered needs
+/// the difference, or it would loop forever against a closed stdin.
+fn prompt_line(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    label: &str,
+) -> Result<Option<String>> {
     write!(output, "{label}")?;
     output.flush()?;
     let mut answer = String::new();
-    input
+    let read = input
         .read_line(&mut answer)
         .context("read setup response")?;
-    Ok(answer.trim().to_owned())
+    Ok((read > 0).then(|| answer.trim().to_owned()))
 }
 
 fn write_summary(
@@ -1363,7 +1483,7 @@ Host builder
         let mut output = Vec::new();
 
         assert_eq!(
-            prompt_ssh_target(&mut input, &mut output, &[]).unwrap(),
+            prompt_ssh_target(&mut input, &mut output, &[], &BTreeMap::new()).unwrap(),
             None
         );
         let output = String::from_utf8(output).unwrap();
@@ -1378,7 +1498,7 @@ Host builder
         let mut output = Vec::new();
 
         assert_eq!(
-            prompt_ssh_target(&mut input, &mut output, &aliases).unwrap(),
+            prompt_ssh_target(&mut input, &mut output, &aliases, &BTreeMap::new()).unwrap(),
             None
         );
         let config = build_config_with_runtime(&[], None, None, None, None);
@@ -1395,7 +1515,7 @@ Host builder
         let mut input = b"y\n1\n\n\n\n".as_slice();
         let mut output = Vec::new();
 
-        let ssh = prompt_ssh_target(&mut input, &mut output, &aliases)
+        let ssh = prompt_ssh_target(&mut input, &mut output, &aliases, &BTreeMap::new())
             .unwrap()
             .unwrap();
 
@@ -1427,7 +1547,7 @@ Host builder
         let mut input = b"y\nother.example.com\nn\nremote\n".as_slice();
         let mut output = Vec::new();
 
-        let ssh = prompt_ssh_target(&mut input, &mut output, &aliases)
+        let ssh = prompt_ssh_target(&mut input, &mut output, &aliases, &BTreeMap::new())
             .unwrap()
             .unwrap();
 
@@ -1445,6 +1565,116 @@ Host builder
         };
         assert_eq!(ssh.host, "other.example.com");
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn the_ssh_step_reasks_until_the_name_is_a_free_and_valid_target_id() {
+        let aliases = vec!["builder".to_owned()];
+        let configured = build_config_with_runtime(
+            &[],
+            None,
+            Some((RuntimeKind::Podman, DEFAULT_IMAGE)),
+            None,
+            None,
+        )
+        .targets;
+        // yes, host 1, no podman, then: a name that is already taken, a name
+        // that is not a usable id, and finally a free one.
+        let mut input = b"y\n1\nn\npodman\nbuild host\nbuilder\n".as_slice();
+        let mut output = Vec::new();
+
+        let ssh = prompt_ssh_target(&mut input, &mut output, &aliases, &configured)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(ssh.name, "builder");
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("Target podman is already configured"),
+            "{output}"
+        );
+        assert!(output.contains("invalid target id"), "{output}");
+    }
+
+    #[test]
+    fn the_ssh_step_stops_asking_for_a_name_once_the_input_ends() {
+        let aliases = vec!["podman".to_owned()];
+        let configured = build_config_with_runtime(
+            &[],
+            None,
+            Some((RuntimeKind::Podman, DEFAULT_IMAGE)),
+            None,
+            None,
+        )
+        .targets;
+        // yes, host 1, no podman, then nothing: the default name collides, so
+        // the question can never be answered.
+        let mut input = b"y\n1\nn\n".as_slice();
+        let mut output = Vec::new();
+
+        assert_eq!(
+            prompt_ssh_target(&mut input, &mut output, &aliases, &configured).unwrap(),
+            None
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Input ended; skipping"), "{output}");
+    }
+
+    #[test]
+    fn an_ssh_target_never_replaces_a_target_configured_earlier() {
+        let ssh = SshTargetInput {
+            name: "podman".into(),
+            host: "builder".into(),
+            kind: SshTargetKind::Bare,
+        };
+
+        let config = build_config_with_runtime(
+            &[],
+            None,
+            Some((RuntimeKind::Podman, DEFAULT_IMAGE)),
+            None,
+            Some(&ssh),
+        );
+
+        assert!(matches!(
+            config.targets["podman"],
+            TargetTemplate::LocalPodman { .. }
+        ));
+        assert!(matches!(
+            config.targets["podman-2"],
+            TargetTemplate::SshBare { .. }
+        ));
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn the_github_origin_is_discovered_through_the_shared_executor() {
+        let executor = RuntimeProbeExecutor::new([ok(b"git@github.com:BrokkAi/hel.git\n")]);
+
+        let repository = discover_github_repository(&executor, Path::new("/work/hel")).unwrap();
+
+        assert_eq!(repository.source(), "BrokkAi/hel");
+        let commands = executor.commands.borrow();
+        assert_eq!(commands[0].program, "git");
+        assert_eq!(
+            commands[0].args,
+            ["-C", "/work/hel", "remote", "get-url", "origin"]
+        );
+    }
+
+    #[test]
+    fn no_github_origin_is_reported_when_the_probe_fails() {
+        let failing = RuntimeProbeExecutor::new([failed(b"not a git repository")]);
+        assert_eq!(
+            discover_github_repository(&failing, Path::new("/work/plain")),
+            None
+        );
+
+        let missing = RuntimeProbeExecutor::new([]);
+        assert_eq!(
+            discover_github_repository(&missing, Path::new("/work/plain")),
+            None
+        );
     }
 
     #[test]
@@ -1514,8 +1744,15 @@ Host builder
         let mut output = Vec::new();
 
         assert_eq!(
-            run_setup_dialog_with(&mut input, &mut output, &config_path, &discovery, &executor,)
-                .unwrap(),
+            run_setup_dialog_with(
+                &mut input,
+                &mut output,
+                &config_path,
+                &discovery,
+                &executor,
+                &executor,
+            )
+            .unwrap(),
             SetupOutcome::Written
         );
         assert!(config_path.exists());
@@ -1528,6 +1765,61 @@ Host builder
             String::from_utf8(output)
                 .unwrap()
                 .ends_with("Press n to start your first session.\n")
+        );
+    }
+
+    #[test]
+    fn a_failed_smoke_test_becomes_a_fixable_line_in_the_closing_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let discovery = SetupDiscovery {
+            runtimes: vec![RuntimeProbe {
+                kind: RuntimeKind::Podman,
+                usable: true,
+                detail: "podman version 5".into(),
+                remediation: None,
+            }],
+            ..discovery_without_runtimes()
+        };
+        // Create the container, fail the command inside it, remove it.
+        let executor = FakeExecutor {
+            commands: RefCell::new(vec![]),
+            statuses: vec![0, 1, 0],
+        };
+        let mut input = b"\n\ny\n".as_slice();
+        let mut output = Vec::new();
+
+        let outcome = run_setup_dialog_with(
+            &mut input,
+            &mut output,
+            &config_path,
+            &discovery,
+            &executor,
+            &executor,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, SetupOutcome::Written);
+        assert!(config_path.exists());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("fixable Podman smoke test"), "{output}");
+        assert!(
+            output.contains("remediation: Fix the configured image or the Podman runtime"),
+            "{output}"
+        );
+        // The report the user was promised still runs, and still ends with the
+        // instruction to apply the remediations it just listed.
+        assert!(
+            output.contains("Running `hel doctor` checks on the new config..."),
+            "{output}"
+        );
+        assert!(
+            output.contains("Apply the remediations above, then rerun `hel doctor`."),
+            "{output}"
+        );
+        assert!(
+            output.ends_with("Press n to start your first session.\n"),
+            "{output}"
         );
     }
 
@@ -1547,8 +1839,15 @@ Host builder
         let mut input = b"y\n".as_slice();
         let mut output = Vec::new();
 
-        run_setup_dialog_with(&mut input, &mut output, &config_path, &discovery, &executor)
-            .unwrap();
+        run_setup_dialog_with(
+            &mut input,
+            &mut output,
+            &config_path,
+            &discovery,
+            &executor,
+            &executor,
+        )
+        .unwrap();
 
         let output = String::from_utf8(output).unwrap();
         // The report is doctor's own rendering: a status-prefixed line per
@@ -1596,8 +1895,15 @@ Host builder
         let mut output = Vec::new();
 
         assert_eq!(
-            run_setup_dialog_with(&mut input, &mut output, &config_path, &discovery, &executor)
-                .unwrap(),
+            run_setup_dialog_with(
+                &mut input,
+                &mut output,
+                &config_path,
+                &discovery,
+                &executor,
+                &executor,
+            )
+            .unwrap(),
             SetupOutcome::Written
         );
         let config = HelConfig::load_from(&config_path).unwrap();
