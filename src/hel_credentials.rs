@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_client_protocol::schema::v1::{ContentBlock, SessionUpdate};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
@@ -210,23 +211,42 @@ pub fn write_credential_file(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Full-phrase markers that a harness rejected the session's credentials.
 /// Kept tight on purpose: a false positive costs one redundant sync and one
 /// notice, but a noisy list would train operators to ignore both.
-const AUTH_FAILURE_PHRASES: [&str; 7] = [
+const AUTH_FAILURE_PHRASES: [&str; 4] = [
     "oauth session expired and could not be refreshed",
     "please run /login",
-    "authentication_error",
-    "invalid_grant",
-    "oauthunauthorizederror",
     "authorization grant is invalid",
     // Hel's own marker for a turn the bridge failed with ACP `auth_required`.
     // The bridge's wording ("Authentication required") is too generic to match.
     "acp auth_required",
 ];
 
+/// Machine-readable authentication errors must be complete identifiers. This
+/// avoids treating paths such as `authentication_error_status_code` as auth
+/// failures while still recognizing the codes in JSON and diagnostics.
+const AUTH_FAILURE_IDENTIFIERS: [&str; 3] = [
+    "authentication_error",
+    "invalid_grant",
+    "oauthunauthorizederror",
+];
+
+fn contains_ascii_identifier(text: &str, identifier: &str) -> bool {
+    text.match_indices(identifier).any(|(start, _)| {
+        let end = start + identifier.len();
+        let is_identifier_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        let starts_at_boundary = start == 0 || !is_identifier_byte(text.as_bytes()[start - 1]);
+        let ends_at_boundary = end == text.len() || !is_identifier_byte(text.as_bytes()[end]);
+        starts_at_boundary && ends_at_boundary
+    })
+}
+
 fn contains_auth_failure_signature(text: &str) -> bool {
     let normalized = text.to_ascii_lowercase();
     AUTH_FAILURE_PHRASES
         .iter()
         .any(|phrase| normalized.contains(phrase))
+        || AUTH_FAILURE_IDENTIFIERS
+            .iter()
+            .any(|identifier| contains_ascii_identifier(&normalized, identifier))
 }
 
 pub fn auth_failure_signature(_kind: HarnessKind, text: &str) -> bool {
@@ -264,10 +284,15 @@ pub fn relay_event_credential_sync_reason(event: &RelayEvent) -> Option<Credenti
         {
             Some(CredentialSyncReason::EmptyPromptResponse)
         }
-        RelayObservation::SessionUpdate { update } => serde_json::to_string(update.as_ref())
-            .ok()
-            .filter(|payload| contains_auth_failure_signature(payload))
-            .map(|_| CredentialSyncReason::AuthenticationFailure),
+        RelayObservation::SessionUpdate { update } => match update.as_ref() {
+            SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                ContentBlock::Text(text) if contains_auth_failure_signature(&text.text) => {
+                    Some(CredentialSyncReason::AuthenticationFailure)
+                }
+                _ => None,
+            },
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -754,6 +779,10 @@ mod tests {
             HarnessKind::Kimi,
             "OAuthUnauthorizedError: The provided authorization grant is invalid"
         ));
+        assert!(auth_failure_signature(
+            HarnessKind::Codex,
+            "error=INVALID_GRANT"
+        ));
         assert!(!auth_failure_signature(
             HarnessKind::Claude,
             "the OAuth session expired last week, but we refreshed it"
@@ -762,11 +791,26 @@ mod tests {
             HarnessKind::Claude,
             "authentication succeeded"
         ));
+        assert!(!auth_failure_signature(
+            HarnessKind::Codex,
+            "docs_src/authentication_error_status_code/tutorial001_an_py310.py"
+        ));
+        assert!(!auth_failure_signature(
+            HarnessKind::Codex,
+            "someauthentication_error"
+        ));
+        assert!(!auth_failure_signature(
+            HarnessKind::Codex,
+            "invalid_grant_result"
+        ));
     }
 
     #[test]
     fn only_harness_observations_request_credential_sync() {
-        use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, SessionUpdate};
+        use agent_client_protocol::schema::v1::{
+            ContentBlock, ContentChunk, SessionUpdate, ToolCall, ToolCallUpdate,
+            ToolCallUpdateFields,
+        };
 
         let event = |observation| RelayEvent {
             ordinal: 1,
@@ -789,6 +833,49 @@ mod tests {
                     ContentBlock::from("Please run /login to continue"),
                 ))),
             })]
+        ));
+        assert!(events_report_auth_failure(
+            HarnessKind::Codex,
+            &[event(RelayObservation::Warning {
+                message: format!("{}: codex", crate::hel_acp::PROMPT_AUTH_REQUIRED_MARKER),
+            })]
+        ));
+
+        let observed_false_positive =
+            "docs_src/authentication_error_status_code/tutorial001_an_py310.py";
+        assert!(!events_report_auth_failure(
+            HarnessKind::Codex,
+            &[
+                event(RelayObservation::SessionUpdate {
+                    update: Box::new(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        "call-1",
+                        ToolCallUpdateFields::new().title(observed_false_positive),
+                    ))),
+                }),
+                event(RelayObservation::SessionUpdate {
+                    update: Box::new(SessionUpdate::ToolCall(ToolCall::new(
+                        "call-2",
+                        observed_false_positive,
+                    ))),
+                }),
+                event(RelayObservation::SessionUpdate {
+                    update: Box::new(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+                        ContentBlock::from(observed_false_positive),
+                    ))),
+                }),
+                event(RelayObservation::SessionUpdate {
+                    update: Box::new(SessionUpdate::UserMessageChunk(ContentChunk::new(
+                        ContentBlock::from("explain authentication_error"),
+                    ))),
+                }),
+                event(RelayObservation::TerminalOutput {
+                    terminal_id: "terminal-1".into(),
+                    output: observed_false_positive.into(),
+                    truncated: false,
+                    exit_code: Some(0),
+                    signal: None,
+                }),
+            ]
         ));
         assert!(!events_report_auth_failure(
             HarnessKind::Claude,
