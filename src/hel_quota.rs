@@ -455,6 +455,15 @@ struct KimiCredentials {
 }
 
 impl KimiCredentials {
+    /// Whether this is a different pair from `other`. A refresh rotates the
+    /// access token, the refresh token and the expiry together, so those three
+    /// fields are what tells two pairs apart; the rest only describes them.
+    fn differs_from(&self, other: &Self) -> bool {
+        self.access_token != other.access_token
+            || self.refresh_token != other.refresh_token
+            || self.expires_at != other.expires_at
+    }
+
     fn needs_refresh(&self) -> bool {
         if self.expires_at == 0 {
             return false;
@@ -511,6 +520,14 @@ where
         .context("retry quota after authentication refresh")
 }
 
+/// Hand back a usable Kimi Code access token, refreshing the stored pair when
+/// it is stale or when the server rejected it.
+///
+/// The refresh lock is taken before the round trip, but a peer may break a lock
+/// it judges stale while that round trip is in flight, so ownership is checked
+/// again immediately before the credentials are written rather than only when
+/// the lock is released: see `decide_kimi_refresh_persist` for what a refresh
+/// that lost its lock does with the pair it fetched.
 async fn ensure_fresh_kimi_token(
     client: &reqwest::Client,
     home: &Path,
@@ -526,9 +543,7 @@ async fn ensure_fresh_kimi_token(
 
     let refresh_lock = KimiRefreshLock::acquire(home).await?;
     let active = read_kimi_credentials(credentials_path).await?;
-    let changed_while_waiting = active.access_token != initial.access_token
-        || active.refresh_token != initial.refresh_token
-        || active.expires_at != initial.expires_at;
+    let changed_while_waiting = active.differs_from(&initial);
     if (!force && !active.needs_refresh())
         || (force
             && (changed_while_waiting
@@ -607,12 +622,108 @@ async fn ensure_fresh_kimi_token(
             .to_string(),
         expires_in,
     };
-    let mut body = serde_json::to_vec_pretty(&refreshed)?;
+    // Prove the lock is still Hel's before the write, not after it: a peer that
+    // broke the lock during the round trip may already have stored a newer pair,
+    // and overwriting that would strand both refreshes.
+    let ownership = confirm_kimi_lock_ownership(&refresh_lock.path, &refresh_lock.ownership);
+    let on_disk = match &ownership {
+        // A proven loss makes the file the authority on which pair is live.
+        Err(KimiLockLoss::Stolen { .. } | KimiLockLoss::Gone) => {
+            read_kimi_credentials(credentials_path).await.ok()
+        }
+        Ok(_) | Err(KimiLockLoss::Unproven(_)) => None,
+    };
+    match decide_kimi_refresh_persist(&ownership, on_disk.as_ref(), &active) {
+        KimiRefreshPersist::Save => {
+            save_kimi_credentials(credentials_path, &refreshed)?;
+            if let Err(error) = refresh_lock.release().await {
+                // The lock was Hel's when the pair was written and the write
+                // landed; losing it in the microseconds since costs the lock,
+                // not a valid credential.
+                tracing::warn!(
+                    %error,
+                    "saved refreshed Kimi Code credentials, then lost the OAuth refresh lock before releasing it"
+                );
+            }
+            Ok(refreshed.access_token)
+        }
+        KimiRefreshPersist::SaveContested(loss) => {
+            save_kimi_credentials(credentials_path, &refreshed)?;
+            tracing::warn!(
+                path = %refresh_lock.path.display(),
+                %loss,
+                "another Kimi Code token refresh took the OAuth refresh lock, but left behind the pair this refresh already spent; saved Hel's refreshed pair, the only live one"
+            );
+            Ok(refreshed.access_token)
+        }
+        KimiRefreshPersist::Adopt { access_token, loss } => {
+            tracing::warn!(
+                path = %refresh_lock.path.display(),
+                %loss,
+                "another Kimi Code token refresh took the OAuth refresh lock and stored its own credentials; using those instead of the pair Hel just fetched"
+            );
+            Ok(access_token)
+        }
+    }
+}
+
+fn save_kimi_credentials(path: &Path, credentials: &KimiCredentials) -> Result<()> {
+    let mut body = serde_json::to_vec_pretty(credentials)?;
     body.push(b'\n');
-    crate::hel_config::atomic_write(credentials_path, &body)
-        .context("save refreshed Kimi Code credentials")?;
-    refresh_lock.release().await?;
-    Ok(refreshed.access_token)
+    crate::hel_config::atomic_write(path, &body).context("save refreshed Kimi Code credentials")
+}
+
+/// What a completed refresh does with the pair it just fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KimiRefreshPersist {
+    /// The lock is Hel's: save the refreshed pair and give the lock back.
+    Save,
+    /// The lock is another refresher's, and the file still holds the pair this
+    /// refresh spent: save the refreshed pair anyway and leave the lock alone.
+    SaveContested(KimiLockLoss),
+    /// The lock's new holder finished first and stored its own pair: return
+    /// that token and write nothing.
+    Adopt {
+        access_token: String,
+        loss: KimiLockLoss,
+    },
+}
+
+/// Decide how a completed refresh persists its result.
+///
+/// `ownership` is the lock check taken immediately before the write, `on_disk`
+/// the pair the credentials file carried when that check reported a proven
+/// loss (`None` when the file was not consulted, or could not be read), and
+/// `active` the pair whose refresh token this refresh spent at the server.
+///
+/// A lost lock never fails the refresh: exactly one of the two pairs is live,
+/// and the file says which. A pair on disk that moved on from `active` is the
+/// other refresher's, and it is the live one, because the server rotated Hel's
+/// pair away from it. A file that still holds `active` is dead whichever
+/// refresh wrote it — its refresh token is the one Hel just spent — so the
+/// refreshed pair is the only live credential anywhere and has to be stored,
+/// even over a contested lock; leaving the spent pair in place would force a
+/// `kimi login`. The peer recovers the same way Hel does, by re-reading the
+/// file when the server rejects its consumed token.
+fn decide_kimi_refresh_persist(
+    ownership: &Result<SystemTime, KimiLockLoss>,
+    on_disk: Option<&KimiCredentials>,
+    active: &KimiCredentials,
+) -> KimiRefreshPersist {
+    let loss = match ownership {
+        Ok(_) => return KimiRefreshPersist::Save,
+        // A check that could not read the directory proves nothing about who
+        // holds it, so it is no reason to treat the lock as lost.
+        Err(KimiLockLoss::Unproven(_)) => return KimiRefreshPersist::Save,
+        Err(loss) => loss.clone(),
+    };
+    match on_disk {
+        Some(pair) if pair.differs_from(active) => KimiRefreshPersist::Adopt {
+            access_token: pair.access_token.clone(),
+            loss,
+        },
+        _ => KimiRefreshPersist::SaveContested(loss),
+    }
 }
 
 fn required_string<'a>(payload: &'a Value, key: &str, context: &str) -> Result<&'a str> {
@@ -646,7 +757,7 @@ enum KimiLockOwnership {
 }
 
 /// Why the lock directory is not Hel's any more.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum KimiLockLoss {
     /// It carries a modification time Hel never published: another holder broke
     /// the lock and took it.
@@ -841,7 +952,10 @@ impl KimiRefreshLock {
     }
 
     /// Give the lock back. Fails when the lock stopped being Hel's, because the
-    /// refresh it was protecting then ran beside another one.
+    /// refresh it was protecting then ran beside another one. Callers that have
+    /// already confirmed ownership and stored valid credentials treat that
+    /// failure as a lost lock rather than a failed refresh; see
+    /// `ensure_fresh_kimi_token`.
     async fn release(mut self) -> Result<()> {
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.abort();
@@ -1682,6 +1796,282 @@ mod tests {
             "{error}"
         );
         assert!(!lock.exists(), "Hel must not recreate a lock it lost");
+    }
+
+    fn kimi_pair(access: &str, refresh: &str, expires_at: i64) -> KimiCredentials {
+        KimiCredentials {
+            access_token: access.into(),
+            refresh_token: refresh.into(),
+            expires_at,
+            scope: "kimi-code".into(),
+            token_type: "Bearer".into(),
+            expires_in: 900,
+        }
+    }
+
+    fn a_stolen_lock() -> KimiLockLoss {
+        KimiLockLoss::Stolen {
+            published: SystemTime::UNIX_EPOCH,
+            observed: SystemTime::UNIX_EPOCH + Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn a_lock_still_held_saves_the_refreshed_pair_and_releases() {
+        let active = kimi_pair("spent-access", "spent-refresh", 100);
+
+        assert_eq!(
+            decide_kimi_refresh_persist(&Ok(SystemTime::now()), None, &active),
+            KimiRefreshPersist::Save
+        );
+    }
+
+    #[test]
+    fn an_unprovable_ownership_check_still_saves_the_refreshed_pair() {
+        let active = kimi_pair("spent-access", "spent-refresh", 100);
+        let unproven = Err(KimiLockLoss::Unproven("stat failed".into()));
+
+        assert_eq!(
+            decide_kimi_refresh_persist(&unproven, None, &active),
+            KimiRefreshPersist::Save,
+            "a failed stat proves nothing about the lock and must not discard valid tokens"
+        );
+    }
+
+    #[test]
+    fn a_stolen_lock_adopts_the_thiefs_newer_credentials() {
+        let active = kimi_pair("spent-access", "spent-refresh", 100);
+        let thiefs = kimi_pair("thief-access", "thief-refresh", 900);
+
+        assert_eq!(
+            decide_kimi_refresh_persist(&Err(a_stolen_lock()), Some(&thiefs), &active),
+            KimiRefreshPersist::Adopt {
+                access_token: "thief-access".into(),
+                loss: a_stolen_lock(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_removed_lock_adopts_the_newer_credentials_left_on_disk() {
+        let active = kimi_pair("spent-access", "spent-refresh", 100);
+        let thiefs = kimi_pair("thief-access", "thief-refresh", 900);
+
+        assert_eq!(
+            decide_kimi_refresh_persist(&Err(KimiLockLoss::Gone), Some(&thiefs), &active),
+            KimiRefreshPersist::Adopt {
+                access_token: "thief-access".into(),
+                loss: KimiLockLoss::Gone,
+            }
+        );
+    }
+
+    /// The pair on disk is dead whoever wrote it: its refresh token is the one
+    /// this refresh just spent at the server.
+    #[test]
+    fn a_stolen_lock_saves_hels_pair_over_the_spent_one_on_disk() {
+        let active = kimi_pair("spent-access", "spent-refresh", 100);
+        let on_disk = active.clone();
+
+        assert_eq!(
+            decide_kimi_refresh_persist(&Err(a_stolen_lock()), Some(&on_disk), &active),
+            KimiRefreshPersist::SaveContested(a_stolen_lock())
+        );
+    }
+
+    #[test]
+    fn an_unreadable_credentials_file_after_a_lost_lock_saves_hels_pair() {
+        let active = kimi_pair("spent-access", "spent-refresh", 100);
+
+        assert_eq!(
+            decide_kimi_refresh_persist(&Err(KimiLockLoss::Gone), None, &active),
+            KimiRefreshPersist::SaveContested(KimiLockLoss::Gone),
+            "nothing readable is newer, so the refreshed pair is the only live one"
+        );
+    }
+
+    #[test]
+    fn any_rotated_field_marks_the_disk_pair_as_the_other_refreshers() {
+        let active = kimi_pair("spent-access", "spent-refresh", 100);
+        let rotations = [
+            kimi_pair("other-access", "spent-refresh", 100),
+            kimi_pair("spent-access", "other-refresh", 100),
+            kimi_pair("spent-access", "spent-refresh", 900),
+        ];
+
+        for on_disk in &rotations {
+            assert!(
+                matches!(
+                    decide_kimi_refresh_persist(&Err(a_stolen_lock()), Some(on_disk), &active),
+                    KimiRefreshPersist::Adopt { .. }
+                ),
+                "{on_disk:?} is a rotated pair, not the spent one"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disk_pair_that_differs_only_in_description_is_still_the_spent_one() {
+        let active = kimi_pair("spent-access", "spent-refresh", 100);
+        let on_disk = KimiCredentials {
+            scope: "kimi-code extra".into(),
+            token_type: "bearer".into(),
+            expires_in: 1_800,
+            ..active.clone()
+        };
+
+        assert_eq!(
+            decide_kimi_refresh_persist(&Err(a_stolen_lock()), Some(&on_disk), &active),
+            KimiRefreshPersist::SaveContested(a_stolen_lock())
+        );
+    }
+
+    #[derive(Clone)]
+    struct KimiThiefState {
+        home: std::path::PathBuf,
+        /// The pair the lock's new holder stores before Hel's own refresh
+        /// returns, when it got that far.
+        winner: Option<Value>,
+    }
+
+    /// Answer the refresh, but take the lock over first the way the Kimi Code
+    /// CLI takes over one it judges stale: rmdir, mkdir, then a modification
+    /// time of its own, dated ahead of the clock as the CLI dates its locks.
+    async fn test_kimi_refresh_stealing_the_lock(
+        State(state): State<KimiThiefState>,
+        _body: Bytes,
+    ) -> Json<Value> {
+        let lock = state.home.join("oauth/kimi-code.lock");
+        std::fs::remove_dir(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        touch_kimi_lock(&lock, SystemTime::now() + Duration::from_secs(30)).unwrap();
+        if let Some(winner) = &state.winner {
+            std::fs::write(
+                state.home.join("credentials/kimi-code.json"),
+                serde_json::to_vec(winner).unwrap(),
+            )
+            .unwrap();
+        }
+        Json(serde_json::json!({
+            "access_token": "hel-access",
+            "refresh_token": "hel-refresh",
+            "expires_in": 900,
+            "scope": "kimi-code",
+            "token_type": "Bearer"
+        }))
+    }
+
+    /// Serve one refresh that steals the lock while it is in flight, and hand
+    /// back what `ensure_fresh_kimi_token` made of it.
+    async fn refresh_against_a_lock_thief(
+        home: &Path,
+        winner: Option<Value>,
+    ) -> (Result<String>, std::path::PathBuf) {
+        let credentials_path = home.join("credentials/kimi-code.json");
+        tokio::fs::create_dir_all(credentials_path.parent().unwrap())
+            .await
+            .unwrap();
+        let soon = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 10;
+        tokio::fs::write(
+            &credentials_path,
+            serde_json::to_vec(&serde_json::json!({
+                "access_token": "spent-access",
+                "refresh_token": "spent-refresh",
+                "expires_at": soon,
+                "scope": "kimi-code",
+                "token_type": "Bearer",
+                "expires_in": 900
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/oauth/token",
+                post(test_kimi_refresh_stealing_the_lock),
+            )
+            .with_state(KimiThiefState {
+                home: home.to_path_buf(),
+                winner,
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let environment =
+            HashMap::from([("KIMI_CODE_OAUTH_HOST".into(), format!("http://{address}"))]);
+
+        let token = ensure_fresh_kimi_token(
+            &reqwest::Client::new(),
+            home,
+            &credentials_path,
+            &environment,
+            false,
+            None,
+        )
+        .await;
+        server.abort();
+        (token, credentials_path)
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_loses_its_lock_returns_the_winners_stored_token() {
+        let home = tempfile::tempdir().unwrap();
+        let winner = serde_json::json!({
+            "access_token": "winner-access",
+            "refresh_token": "winner-refresh",
+            "expires_at": 4_102_444_800i64,
+            "scope": "kimi-code",
+            "token_type": "Bearer",
+            "expires_in": 900
+        });
+
+        let (token, credentials_path) =
+            refresh_against_a_lock_thief(home.path(), Some(winner)).await;
+
+        assert_eq!(
+            token.unwrap(),
+            "winner-access",
+            "a contested lock must not fail a refresh when a live token exists"
+        );
+        let saved = read_kimi_credentials(&credentials_path).await.unwrap();
+        assert_eq!(
+            saved.access_token, "winner-access",
+            "Hel must not clobber the credentials the lock's new holder stored"
+        );
+        assert!(
+            home.path().join("oauth/kimi-code.lock").exists(),
+            "Hel must not remove a lock another holder owns"
+        );
+    }
+
+    /// The pair the thief left behind is the one this refresh already spent, so
+    /// it is dead: only Hel's pair can still authenticate, and storing it is
+    /// what keeps the peer's own recovery re-read working.
+    #[tokio::test]
+    async fn a_refresh_that_loses_its_lock_saves_its_pair_over_the_spent_one() {
+        let home = tempfile::tempdir().unwrap();
+
+        let (token, credentials_path) = refresh_against_a_lock_thief(home.path(), None).await;
+
+        assert_eq!(token.unwrap(), "hel-access");
+        let saved = read_kimi_credentials(&credentials_path).await.unwrap();
+        assert_eq!(
+            saved.access_token, "hel-access",
+            "leaving the spent pair on disk would force a `kimi login`"
+        );
+        assert_eq!(saved.refresh_token, "hel-refresh");
+        assert!(
+            home.path().join("oauth/kimi-code.lock").exists(),
+            "Hel must not remove a lock another holder owns"
+        );
     }
 
     /// The child is reaped by the shutdown, so a live pid means it was never
