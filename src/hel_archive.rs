@@ -1991,7 +1991,7 @@ fn slash_path(path: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-fn validate_component(value: &str, label: &str) -> Result<()> {
+pub(crate) fn validate_component(value: &str, label: &str) -> Result<()> {
     ensure!(!value.is_empty(), "{label} is empty");
     ensure!(value != "." && value != "..", "invalid {label} '{value}'");
     ensure!(
@@ -2003,31 +2003,55 @@ fn validate_component(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// The single interpretation of "this name holds credentials or harness
+/// configuration". Everything that decides whether a path may be archived,
+/// collected, or restored asks this, so a name blocked in one place is blocked
+/// everywhere.
+fn is_secret_like_component(component: &str) -> bool {
+    let component = component.to_ascii_lowercase();
+    component == ".env"
+        || component.starts_with(".env.")
+        || matches!(
+            component.as_str(),
+            ".git-credentials"
+                | "auth.json"
+                | "auth.toml"
+                | "config.json"
+                | "config.toml"
+                | "credentials"
+                | "settings.json"
+                | "token"
+                | "token.json"
+        )
+        || is_credentials_json(&component)
+}
+
+/// `credentials.json` on its own, or carrying that name behind a separator:
+/// `.credentials.json` (Claude's canonical credential file), and the
+/// `<vendor>_credentials.json` / `<vendor>-credentials.json` conventions.
+fn is_credentials_json(component: &str) -> bool {
+    component
+        .strip_suffix("credentials.json")
+        .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with(['.', '-', '_']))
+}
+
+/// A path is secret-like when any component is. A component that is not a
+/// plain name (`..`, a root, a prefix) cannot be interpreted, so it counts as
+/// secret-like and every caller refuses it.
+pub(crate) fn is_secret_like_path(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(component) => is_secret_like_component(&component.to_string_lossy()),
+        _ => true,
+    })
+}
+
 fn ensure_not_secret_path(path: &Path) -> Result<()> {
     for component in path.components() {
         let Component::Normal(component) = component else {
             bail!("unsafe artifact path '{}'", path.display());
         };
-        let component = component.to_string_lossy().to_ascii_lowercase();
-        let forbidden = component == ".env"
-            || component.starts_with(".env.")
-            || matches!(
-                component.as_str(),
-                ".git-credentials"
-                    | "credentials"
-                    | "credentials.json"
-                    | "auth.json"
-                    | "auth.toml"
-                    | "token"
-                    | "token.json"
-                    | "config.json"
-                    | "config.toml"
-                    | "settings.json"
-            )
-            || component.ends_with("_credentials.json")
-            || component.ends_with("-credentials.json");
         ensure!(
-            !forbidden,
+            !is_secret_like_component(&component.to_string_lossy()),
             "refusing to archive credential/config path '{}'",
             path.display()
         );
@@ -2757,7 +2781,9 @@ fn restore_untracked_tar(repository: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn ensure_no_symlink_ancestors(root: &Path, relative: &Path) -> Result<()> {
+/// Refuse a path whose already-existing intermediate directories include a
+/// symlink, so a restore can never be redirected out of `root`.
+pub(crate) fn ensure_no_symlink_ancestors(root: &Path, relative: &Path) -> Result<()> {
     let mut current = root.to_path_buf();
     let components: Vec<_> = relative.components().collect();
     for component in components.iter().take(components.len().saturating_sub(1)) {
@@ -4127,8 +4153,52 @@ mod tests {
     #[test]
     fn malicious_untracked_tar_is_rejected() {
         assert!(validate_archive_relative_path(Path::new("../escape")).is_err());
-        let tar = tar_with_file(".env", b"secret", 0o600);
-        assert!(validate_untracked_tar(&tar).is_err());
+        for path in [
+            ".env",
+            ".credentials.json",
+            "auth.toml",
+            "vendor_credentials.json",
+            "vendor-credentials.json",
+            "nested/.credentials.json",
+        ] {
+            let tar = tar_with_file(path, b"secret", 0o600);
+            assert!(
+                validate_untracked_tar(&tar).is_err(),
+                "untracked tar accepted '{path}'"
+            );
+        }
+    }
+
+    /// The untracked payload is built from paths Git reports, so credential
+    /// files a repository never tracked must be dropped as the tar is built,
+    /// not merely rejected later.
+    #[test]
+    fn untracked_tar_omits_credential_files_from_the_worktree() {
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join("nested")).unwrap();
+        for name in [
+            ".credentials.json",
+            "auth.toml",
+            "vendor_credentials.json",
+            "vendor-credentials.json",
+            "nested/.credentials.json",
+            "note.txt",
+        ] {
+            fs::write(source.path().join(name), b"payload").unwrap();
+        }
+        let paths = b".credentials.json\0auth.toml\0vendor_credentials.json\0\
+vendor-credentials.json\0nested/.credentials.json\0note.txt\0";
+
+        let tar = build_untracked_tar(source.path(), paths, &|_| Ok(())).unwrap();
+        validate_untracked_tar(&tar).unwrap();
+
+        let mut archive = tar::Archive::new(Cursor::new(&tar));
+        let entries: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect();
+        assert_eq!(entries, vec![PathBuf::from("note.txt")]);
     }
 
     #[test]

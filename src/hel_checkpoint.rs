@@ -21,8 +21,9 @@ use crate::hel_archive::{
     ArchiveInput, BundleManifest, CanonicalSessionSnapshot, CanonicalTranscriptBody,
     GitCollectionSpec, GitCommand, GitCommandRunner, GitHistoryMode, NativeArtifact, PayloadRole,
     RepositorySnapshot, SessionManifest, SystemGit, TargetManifest, collect_git_metadata_snapshot,
-    collect_git_snapshot, has_origin_refs, read_archive_verified, restore_git_snapshot,
-    verify_archive_streaming, write_archive_hashed,
+    collect_git_snapshot, ensure_no_symlink_ancestors, has_origin_refs, is_secret_like_path,
+    read_archive_verified, restore_git_snapshot, validate_component, verify_archive_streaming,
+    write_archive_hashed,
 };
 use crate::hel_config::HarnessKind;
 use crate::hel_targets::{
@@ -219,7 +220,8 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
     fs::create_dir_all(&spec.relay_root)?;
     crate::hel_worker::clear_native_session_identity(&spec.relay_root)?;
     write_private_file(
-        &crate::hel_worker::restored_relay_seed_path(&spec.relay_root),
+        &spec.relay_root,
+        Path::new(crate::hel_worker::RESTORED_RELAY_SEED_FILE),
         &serde_json::to_vec(&seed)?,
         0o600,
     )?;
@@ -251,11 +253,15 @@ pub fn restore_checkpoint(spec: &CheckpointRestoreSpec, git: &dyn GitCommandRunn
             )?;
             validate_relative_path(&relative_path)?;
             ensure!(
-                !secret_like_path(&relative_path),
+                !is_secret_like_path(&relative_path),
                 "native artifact path is secret-like"
             );
-            let destination = spec.harness_home.join(relative_path);
-            write_private_file(&destination, &native_data, descriptor.mode)?;
+            write_private_file(
+                &spec.harness_home,
+                &relative_path,
+                &native_data,
+                descriptor.mode,
+            )?;
         }
     }
     Ok(())
@@ -688,16 +694,50 @@ fn kimi_workspace_key(cwd: &Path) -> String {
     format!("wd_{basename}_{}", &digest[..12])
 }
 
-fn write_private_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+/// Write `relative` under `root` with owner-only permissions, refusing to
+/// follow a symlink anywhere along the way.
+///
+/// A restore lands in a directory the target user can write, so a planted
+/// symlink must never redirect the write outside `root`. `Path::exists`
+/// follows links and reports a dangling symlink as missing, so the destination
+/// is inspected with `symlink_metadata` and, on Unix, opened with `O_NOFOLLOW`
+/// so the check cannot be raced.
+fn write_private_file(root: &Path, relative: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    validate_relative_path(relative)?;
+    let path = root.join(relative);
+    ensure_no_symlink_ancestors(root, relative)?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create directory {}", parent.display()))?;
+        // `create_dir_all` walks through symlinked directories, so re-inspect
+        // the ancestors it just materialized.
+        ensure_no_symlink_ancestors(root, relative)?;
     }
-    ensure!(!path.exists() || !fs::symlink_metadata(path)?.file_type().is_symlink());
-    fs::write(path, bytes)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => ensure!(
+            !metadata.file_type().is_symlink(),
+            "refusing to write through symlink {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode & 0o700).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("write {}", path.display()))?;
+    std::io::Write::write_all(&mut file, bytes)
+        .with_context(|| format!("write {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o700))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode & 0o700))?;
     }
     #[cfg(not(unix))]
     let _ = mode;
@@ -935,9 +975,15 @@ fn load_codex_scan_cache(relay_root: &Path, session_id: &str) -> CodexScanCache 
 }
 
 fn save_codex_scan_cache(relay_root: &Path, cache: &CodexScanCache) -> Result<()> {
-    let path = relay_root.join(CODEX_SCAN_CACHE_FILE);
-    write_private_file(&path, &serde_json::to_vec(cache)?, 0o600)
-        .with_context(|| format!("write Codex scan cache {}", path.display()))
+    let relative = Path::new(CODEX_SCAN_CACHE_FILE);
+    write_private_file(relay_root, relative, &serde_json::to_vec(cache)?, 0o600).with_context(
+        || {
+            format!(
+                "write Codex scan cache {}",
+                relay_root.join(relative).display()
+            )
+        },
+    )
 }
 
 /// Codex native session IDs are UUIDv7, whose leading 48 bits hold the
@@ -1072,7 +1118,7 @@ pub fn collect_import_native_artifacts(
         source_path.display()
     );
     ensure!(
-        !secret_like_path(relative),
+        !is_secret_like_path(relative),
         "Codex rollout '{}' has a forbidden path",
         source_path.display()
     );
@@ -1240,7 +1286,7 @@ fn collect_claude_memory_tree(
         return Ok(());
     }
     let relative = path.strip_prefix(home)?;
-    if secret_like_path(relative) {
+    if is_secret_like_path(relative) {
         return Ok(());
     }
     ensure!(
@@ -1306,7 +1352,7 @@ fn collect_native_tree(
         HarnessKind::Kimi => inside && kimi_session_artifact(relative, session_id),
         HarnessKind::Grok => inside && grok_session_artifact(relative, session_id),
     };
-    if !selected || secret_like_path(relative) {
+    if !selected || is_secret_like_path(relative) {
         return Ok(());
     }
     ensure!(
@@ -1782,20 +1828,6 @@ fn validate_remote_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_component(value: &str, label: &str) -> Result<()> {
-    ensure!(
-        !value.is_empty() && value != "." && value != "..",
-        "invalid {label}"
-    );
-    ensure!(
-        value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
-        "invalid {label}"
-    );
-    Ok(())
-}
-
 fn validate_relative_path(path: &Path) -> Result<()> {
     ensure!(
         !path.as_os_str().is_empty() && !path.is_absolute(),
@@ -1829,30 +1861,6 @@ fn resolve_target_path(path: &Path) -> Result<PathBuf> {
     }
     ensure!(false, "target path must be absolute or start with '~'");
     unreachable!()
-}
-
-fn secret_like_path(path: &Path) -> bool {
-    path.components().any(|component| {
-        let Component::Normal(value) = component else {
-            return true;
-        };
-        let value = value.to_string_lossy().to_ascii_lowercase();
-        value == ".env"
-            || value.starts_with(".env.")
-            || matches!(
-                value.as_str(),
-                "auth.json"
-                    | "credentials"
-                    | "credentials.json"
-                    | ".credentials.json"
-                    | "token"
-                    | "token.json"
-                    | "config.json"
-                    | "config.toml"
-                    | "settings.json"
-                    | ".git-credentials"
-            )
-    })
 }
 
 #[cfg(unix)]
@@ -2544,6 +2552,46 @@ mod tests {
             "projects/-workspace-app/memory/settings.json"
         )));
         assert!(!paths.contains(&PathBuf::from("projects/-workspace-app/memory/.env")));
+    }
+
+    /// Collection and the archive gate read one shared rule set, so every
+    /// credential name is dropped while walking the session subtree instead of
+    /// failing the archive write afterwards.
+    #[test]
+    fn claude_allowlist_skips_credential_names_in_the_session_subtree() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("projects/-workspace-app");
+        let session = project.join(NATIVE);
+        fs::create_dir_all(&session).unwrap();
+        fs::write(project.join(format!("{NATIVE}.jsonl")), b"transcript").unwrap();
+        fs::write(session.join("notes.jsonl"), b"kept").unwrap();
+        for name in [
+            ".credentials.json",
+            "auth.toml",
+            "vendor-credentials.json",
+            "vendor_credentials.json",
+        ] {
+            fs::write(session.join(name), b"secret").unwrap();
+        }
+
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Claude, temp.path(), NATIVE, false).unwrap();
+        let paths: Vec<_> = artifacts
+            .iter()
+            .map(|artifact| artifact.relative_path.clone())
+            .collect();
+        let expected = [
+            PathBuf::from(format!("projects/-workspace-app/{NATIVE}.jsonl")),
+            PathBuf::from(format!("projects/-workspace-app/{NATIVE}/notes.jsonl")),
+        ];
+        assert_eq!(
+            paths.len(),
+            expected.len(),
+            "credential names leaked into the native artifacts: {paths:?}"
+        );
+        for path in expected {
+            assert!(paths.contains(&path), "{path:?} was not collected");
+        }
     }
 
     #[test]
@@ -3434,6 +3482,118 @@ mod tests {
             "{error:#}"
         );
         assert!(!crate::hel_worker::restored_relay_seed_path(&relay_root).exists());
+    }
+
+    /// `Path::exists` follows links, so a *dangling* symlink at the seed path
+    /// reads as "no file here" and used to send the write to the link target.
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_to_seed_the_relay_through_a_dangling_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        export_checkpoint(&spec).unwrap();
+        let relay_root = temp.path().join("symlinked-relay");
+        fs::create_dir_all(&relay_root).unwrap();
+        let outside = temp.path().join("outside/seed.json");
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(
+            &outside,
+            relay_root.join(crate::hel_worker::RESTORED_RELAY_SEED_FILE),
+        )
+        .unwrap();
+
+        let error = restore_checkpoint(
+            &CheckpointRestoreSpec {
+                archive_path: spec.output_path.clone(),
+                workspace_root: spec.workspace_root.clone(),
+                relay_root,
+                harness_home: temp.path().join("restored-harness"),
+                restore_repositories: false,
+                restore_native: false,
+                discard_queued_prompts: false,
+                primary_repository_root: None,
+            },
+            &SystemGit,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+        assert!(
+            !outside.exists(),
+            "the relay seed was written through the symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_a_native_artifact_under_a_symlinked_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        export_checkpoint(&spec).unwrap();
+        let harness_home = temp.path().join("symlinked-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        let outside = temp.path().join("outside-sessions");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, harness_home.join("sessions")).unwrap();
+
+        let error = restore_checkpoint(
+            &CheckpointRestoreSpec {
+                archive_path: spec.output_path.clone(),
+                workspace_root: spec.workspace_root.clone(),
+                relay_root: temp.path().join("symlinked-native-relay"),
+                harness_home,
+                restore_repositories: false,
+                restore_native: true,
+                discard_queued_prompts: false,
+                primary_repository_root: None,
+            },
+            &SystemGit,
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("traverses a symlink"),
+            "{error:#}"
+        );
+        assert!(
+            fs::read_dir(&outside).unwrap().next().is_none(),
+            "the restore wrote through the symlinked directory"
+        );
+    }
+
+    #[test]
+    fn restore_writes_native_artifacts_privately_under_the_harness_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, _) = fixture(temp.path());
+        export_checkpoint(&spec).unwrap();
+        let harness_home = temp.path().join("restored-native-harness");
+
+        restore_checkpoint(
+            &CheckpointRestoreSpec {
+                archive_path: spec.output_path.clone(),
+                workspace_root: spec.workspace_root.clone(),
+                relay_root: temp.path().join("restored-native-relay"),
+                harness_home: harness_home.clone(),
+                restore_repositories: false,
+                restore_native: true,
+                discard_queued_prompts: false,
+                primary_repository_root: None,
+            },
+            &SystemGit,
+        )
+        .unwrap();
+
+        let restored = harness_home.join(format!("sessions/2026/08/09/rollout-{NATIVE}.jsonl"));
+        assert_eq!(fs::read(&restored).unwrap(), b"native");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&restored).unwrap().permissions().mode() & 0o077,
+                0,
+                "restored native artifact is group- or world-accessible"
+            );
+        }
     }
 
     #[test]
