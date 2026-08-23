@@ -38,7 +38,14 @@ use hel_tui::DashboardState;
 use crate::dashboard::io::DashboardIoUpdate;
 use crate::short_id;
 
-const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+pub(crate) const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// When a quota reading stops counting as current. A reading only goes stale
+/// once a scheduled refresh should already have replaced it, so this is
+/// derived from the refresh interval rather than chosen next to it: a shorter
+/// threshold would label every healthy quota "stale" for part of every cycle.
+/// The extra interval is slack for a refresh that is itself still running.
+pub(crate) const QUOTA_STALE_AFTER: Duration =
+    Duration::from_secs(2 * QUOTA_REFRESH_INTERVAL.as_secs());
 pub(crate) const RESOURCE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const RESOURCE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const CAPACITY_POLL_INTERVAL: Duration = Duration::from_secs(30);

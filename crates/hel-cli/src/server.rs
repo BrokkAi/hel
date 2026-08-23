@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
+use hel::hel_config::HarnessProfile;
 use hel::hel_controller::{Controller, SessionLaunchOptions, SessionResumeOptions};
 use hel::hel_quota::ProfileQuota;
 use hel::hel_server::{
-    ControllerAction, ControllerRequest, ReadReceiptRequest, ResumeQueueDisposition, ServerOptions,
-    ViewerQueuedPrompt, ViewerQuota, ViewerSnapshot,
+    ActionOutcome, ControllerAction, ControllerRequest, ReadReceiptRequest, ResumeQueueDisposition,
+    ServerOptions, ViewerQueuedPrompt, ViewerQuota, ViewerSnapshot,
 };
 use hel::hel_session_manager::{SessionManagerControl, new_command_id};
 use hel::hel_state::{HelState, SessionRecord};
@@ -21,12 +22,12 @@ use hel::hel_worker::RelayCommand;
 use hel::hel_worker_client::CredentialSyncCoordinator;
 
 use crate::pollers::{
-    CredentialSyncNotices, CredentialSyncSignalTracker, LifecycleUpdate, QuotaRefreshBatch,
-    QuotaUpdate, apply_worker_record_update, credential_sync_targets, dashboard_worker_targets,
-    interrupted_close_session_ids, merge_recovery_result, projected_queued_prompts,
-    queued_prompt_projection, quota_refresh_profiles, reserve_recovery_or_cancel,
-    schedule_due_credential_syncs, spawn_dashboard_worker_poller, spawn_interrupted_close_recovery,
-    spawn_quota_refresher,
+    CredentialSyncNotices, CredentialSyncSignalTracker, LifecycleUpdate, QUOTA_STALE_AFTER,
+    QuotaRefreshBatch, QuotaUpdate, apply_worker_record_update, credential_sync_targets,
+    dashboard_worker_targets, interrupted_close_session_ids, merge_recovery_result,
+    projected_queued_prompts, queued_prompt_projection, quota_refresh_profiles,
+    reserve_recovery_or_cancel, schedule_due_credential_syncs, spawn_dashboard_worker_poller,
+    spawn_interrupted_close_recovery, spawn_quota_refresher,
 };
 
 #[derive(Debug, Args)]
@@ -48,6 +49,60 @@ struct PhoneActionStarted {
     action_id: u64,
     session: SessionRecord,
     published: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+}
+
+/// The phone replies the control loop still owes.
+///
+/// A phone is answered as soon as its action is admitted, because provisioning,
+/// resume and close run for minutes and a request held open that long dies on a
+/// mobile network. `new` is the one action whose acceptance means more than
+/// admission: the phone has no session id until the provisional session is
+/// published, so its reply is parked here until the loop publishes it — or
+/// until the action ends without ever getting that far.
+#[derive(Default)]
+struct PendingActionReplies(
+    std::collections::BTreeMap<u64, tokio::sync::oneshot::Sender<ActionOutcome>>,
+);
+
+impl PendingActionReplies {
+    fn accept(
+        &mut self,
+        action_id: u64,
+        action: &ControllerAction,
+        reply: tokio::sync::oneshot::Sender<ActionOutcome>,
+    ) {
+        if matches!(action, ControllerAction::New { .. }) {
+            self.0.insert(action_id, reply);
+        } else {
+            let _ = reply.send(ActionOutcome::Accepted);
+        }
+    }
+
+    fn resolve(&mut self, action_id: u64, outcome: ActionOutcome) {
+        if let Some(reply) = self.0.remove(&action_id) {
+            let _ = reply.send(outcome);
+        }
+    }
+}
+
+/// Admission control for one phone action, run before any work starts so the
+/// answer to the phone never waits on the operation itself. Reports the session
+/// the action occupies, or the outcome that refuses it.
+fn admit_phone_action(
+    action: &ControllerAction,
+    running_actions: usize,
+    active_sessions: &mut std::collections::BTreeSet<String>,
+) -> std::result::Result<Option<String>, ActionOutcome> {
+    if !phone_action_capacity_available(running_actions) {
+        return Err(ActionOutcome::Busy);
+    }
+    let session_id = controller_action_session_id(action);
+    if let Some(session_id) = &session_id
+        && !active_sessions.insert(session_id.clone())
+    {
+        return Err(ActionOutcome::SessionBusy);
+    }
+    Ok(session_id)
 }
 
 struct ReadReceiptPersisted {
@@ -175,10 +230,14 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
     let mut controller = Controller::load()?;
     let mut quotas = std::collections::BTreeMap::new();
     let (quota_profiles_tx, mut quota_updates_rx) = spawn_quota_refresher();
-    quota_profiles_tx.send_replace(QuotaRefreshBatch {
-        generation: 1,
-        profiles: quota_refresh_profiles(&controller),
-    });
+    let mut quota_batch = QuotaRefreshBatch::default();
+    let mut published_quota_profiles = std::collections::BTreeMap::new();
+    republish_quota_profiles(
+        &controller,
+        &mut published_quota_profiles,
+        &mut quota_batch,
+        &quota_profiles_tx,
+    );
     let mut revision = 1;
     let mut conversations = std::collections::BTreeMap::new();
     let mut queued_prompts = projected_queued_prompts(&controller)?;
@@ -246,7 +305,6 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
         let (action_done_tx, mut action_done_rx) = tokio::sync::mpsc::unbounded_channel::<(
             u64,
             Option<String>,
-            tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
             std::result::Result<(), String>,
         )>();
         let (action_started_tx, mut action_started_rx) =
@@ -259,18 +317,15 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
         let mut next_action_id = 0_u64;
         let mut action_cancellations = std::collections::BTreeMap::<u64, PhoneActionControl>::new();
         let mut action_sessions = std::collections::BTreeMap::<u64, String>::new();
+        let mut action_replies = PendingActionReplies::default();
         let mut quota_updates_open = true;
+        // A feed that ends is not a reason to exit quietly: the phone server
+        // exists to follow sessions, so losing that feed is a named failure
+        // rather than a silent success.
+        let mut failure: Option<anyhow::Error> = None;
         loop {
             tokio::select! {
-                _ = termination.cancelled() => {
-                    for cancelled in interrupted_close_cancellations.values() {
-                        cancelled.store(true, Ordering::Release);
-                    }
-                    for control in action_cancellations.values() {
-                        control.request_cancel();
-                    }
-                    break;
-                },
+                _ = termination.cancelled() => break,
                 update = quota_updates_rx.recv(), if quota_updates_open => {
                     match update {
                         Some(QuotaUpdate::Report(outcome)) => {
@@ -296,7 +351,10 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     }
                 }
                 update = worker_updates_rx.recv() => {
-                    let Some(update) = update else { break };
+                    let Some(update) = update else {
+                        failure = feed_stopped(termination.is_cancelled(), "the session manager stopped; the phone server can no longer follow sessions");
+                        break;
+                    };
                     if let Some(snapshot) = update.view.snapshot.as_ref()
                         && let Some(session) = controller.state.sessions.get(&update.session_id)
                         && let Some(signal) = snapshot.latest_credential_sync_signal.clone()
@@ -384,6 +442,12 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     }
                     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
                     credential_sync_handle.set_targets(credential_sync_targets(&controller));
+                    republish_quota_profiles(
+                        &controller,
+                        &mut published_quota_profiles,
+                        &mut quota_batch,
+                        &quota_profiles_tx,
+                    );
                     queued_prompts.retain(|session_id, _| {
                         controller.state.sessions.contains_key(session_id)
                     });
@@ -395,7 +459,10 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, revision));
                 }
                 receipt = receipt_rx.recv() => {
-                    let Some(ReadReceiptRequest { session_id, through, reply }) = receipt else { break };
+                    let Some(ReadReceiptRequest { session_id, through, reply }) = receipt else {
+                        failure = feed_stopped(termination.is_cancelled(), "the phone HTTP server stopped delivering read receipts");
+                        break;
+                    };
                     match plan_read_receipt(&controller.state, &session_id, through) {
                         ReadReceiptPlan::UnknownSession => {
                             let _ = reply.send(Err("unknown session".into()));
@@ -453,30 +520,35 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     }
                 }
                 action = action_rx.recv() => {
-                    let Some(request) = action else { break };
+                    let Some(request) = action else {
+                        failure = feed_stopped(termination.is_cancelled(), "the phone HTTP server stopped delivering actions");
+                        break;
+                    };
                     if let ControllerAction::Cancel { session_id } = &request.action {
-                        let result = request_phone_action_cancellation(
+                        let outcome = if request_phone_action_cancellation(
                             session_id,
                             &action_sessions,
                             &action_cancellations,
                             &interrupted_close_cancellations,
-                        )
-                        .then_some(())
-                        .ok_or_else(|| "the session has no cancellable operation".into());
-                        let _ = request.reply.send(result);
+                        ) {
+                            ActionOutcome::Accepted
+                        } else {
+                            ActionOutcome::NotCancellable
+                        };
+                        let _ = request.reply.send(outcome);
                         continue;
                     }
-                    if !phone_action_capacity_available(action_cancellations.len()) {
-                        let _ = request.reply.send(Err(
-                            "the controller is at its concurrent phone-action limit; retry shortly".into()
-                        ));
-                        continue;
-                    }
-                    let session_id = controller_action_session_id(&request.action);
-                    if session_id.as_ref().is_some_and(|id| !active_actions.insert(id.clone())) {
-                        let _ = request.reply.send(Err("another operation is already running for this session".into()));
-                        continue;
-                    }
+                    let session_id = match admit_phone_action(
+                        &request.action,
+                        action_cancellations.len(),
+                        &mut active_actions,
+                    ) {
+                        Ok(session_id) => session_id,
+                        Err(refusal) => {
+                            let _ = request.reply.send(refusal);
+                            continue;
+                        }
+                    };
                     let ControllerRequest { action, reply } = request;
                     let done = action_done_tx.clone();
                     let observer = recovery_observer.clone();
@@ -489,6 +561,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     if let Some(session_id) = &session_id {
                         action_sessions.insert(action_id, session_id.clone());
                     }
+                    action_replies.accept(action_id, &action, reply);
                     let runtime = tokio::runtime::Handle::current();
                     tokio::spawn(async move {
                         let joined = tokio::task::spawn_blocking(move || {
@@ -531,7 +604,7 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                             Ok(result) => result,
                             Err(error) => Err(format!("phone action task failed: {error}")),
                         };
-                        if done.send((action_id, session_id, reply, result)).is_err() {
+                        if done.send((action_id, session_id, result)).is_err() {
                             tracing::debug!(action_id, "phone action finished after the server stopped");
                         }
                     });
@@ -564,40 +637,93 @@ pub(crate) async fn run_server(args: ServerArgs) -> Result<()> {
                     {
                         control.request_cancel();
                     }
+                    // The phone asked for a session, and now there is one to
+                    // point at: that is what its request was waiting for.
+                    action_replies.resolve(
+                        started.action_id,
+                        if publication.is_ok() {
+                            ActionOutcome::Accepted
+                        } else {
+                            ActionOutcome::Failed
+                        },
+                    );
                     let _ = started.published.send(publication);
                 }
                 completed = action_done_rx.recv() => {
-                    let Some((action_id, session_id, reply, result)) = completed else { break };
+                    let Some((action_id, session_id, result)) = completed else {
+                        failure = feed_stopped(termination.is_cancelled(), "the phone action pipeline stopped reporting completions");
+                        break;
+                    };
                     action_cancellations.remove(&action_id);
-                    if let Some(session_id) = action_sessions.remove(&action_id).or(session_id) {
-                        active_actions.remove(&session_id);
+                    let session_id = action_sessions.remove(&action_id).or(session_id);
+                    if let Some(session_id) = &session_id {
+                        active_actions.remove(session_id);
                     }
+                    // A `new` that failed before publishing a session never
+                    // reached the arm that answers it, so its phone is still
+                    // waiting for a reply it can act on.
+                    action_replies.resolve(action_id, ActionOutcome::Failed);
                     if let Err(error) = &result {
                         eprintln!("Hel phone action failed: {error}");
                     }
                     if let Err(error) = controller.reload() {
-                        let _ = reply.send(Err(format!("action completed but state reload failed: {error:#}")));
+                        tracing::warn!(%error, "phone action completed but controller state could not be reloaded");
                         continue;
+                    }
+                    // Nothing is waiting on the request any more, so a failure
+                    // the action itself did not record would reach no one but
+                    // this process's stderr. Carry it on the session, where
+                    // the snapshot's `has_error` takes it to the phone.
+                    if let Err(error) = &result
+                        && let Some(session_id) = &session_id
+                        && let Some(session) = controller.state.sessions.get_mut(session_id)
+                        && session.last_error.is_none()
+                    {
+                        session.last_error = Some(error.clone());
                     }
                     worker_targets_tx.send_replace(dashboard_worker_targets(&controller));
                     credential_sync_handle.set_targets(credential_sync_targets(&controller));
+                    republish_quota_profiles(
+                        &controller,
+                        &mut published_quota_profiles,
+                        &mut quota_batch,
+                        &quota_profiles_tx,
+                    );
                     conversations.retain(|id, _| {
                         controller.state.sessions.get(id).is_some_and(|session| session.state.is_active())
                     });
                     revision += 1;
                     conversation_tx.send_replace(conversations.clone());
                     let _ = snapshot_tx.send(viewer_snapshot(&controller, &quotas, &conversations, &queued_prompts, revision));
-                    let _ = reply.send(result);
                 }
             }
         }
-        Ok::<(), anyhow::Error>(())
+        // Every exit stops in-flight work, whether it was asked for or forced.
+        for cancelled in interrupted_close_cancellations.values() {
+            cancelled.store(true, Ordering::Release);
+        }
+        for control in action_cancellations.values() {
+            control.request_cancel();
+        }
+        match failure {
+            Some(failure) => Err(failure),
+            None => Ok::<(), anyhow::Error>(()),
+        }
     };
     tokio::select! {
         result = serve => result,
         result = control => result,
     }?;
     Ok(())
+}
+
+/// Why the control loop is stopping because one of its feeds ended.
+///
+/// During shutdown every feed ends, and that is the plan. At any other time it
+/// means the phone server has lost the machinery it exists to drive, so it
+/// says which feed and exits non-zero instead of reporting success.
+fn feed_stopped(shutting_down: bool, reason: &'static str) -> Option<anyhow::Error> {
+    (!shutting_down).then(|| anyhow::anyhow!(reason))
 }
 
 fn controller_action_session_id(action: &ControllerAction) -> Option<String> {
@@ -614,6 +740,31 @@ fn controller_action_session_id(action: &ControllerAction) -> Option<String> {
 
 fn phone_action_capacity_available(active_actions: usize) -> bool {
     active_actions < MAX_CONCURRENT_PHONE_ACTIONS
+}
+
+/// Point the quota refresher at the profiles the configuration currently
+/// defines, alongside the worker-poll and credential-sync targets that are
+/// rebuilt from the same reload. A profile added to `config.toml` while the
+/// server runs otherwise reaches the snapshot but never the refresher, and
+/// reads "quota unavailable" until the next restart.
+///
+/// Sending a batch restarts every profile's refresh, which spawns a harness
+/// process per profile, so the batch travels only when the profiles changed.
+/// Reports whether it did.
+fn republish_quota_profiles(
+    controller: &Controller,
+    published: &mut std::collections::BTreeMap<String, HarnessProfile>,
+    batch: &mut QuotaRefreshBatch,
+    profiles_tx: &tokio::sync::watch::Sender<QuotaRefreshBatch>,
+) -> bool {
+    if *published == controller.config.profiles {
+        return false;
+    }
+    published.clone_from(&controller.config.profiles);
+    batch.generation = batch.generation.saturating_add(1);
+    batch.profiles = quota_refresh_profiles(controller);
+    profiles_tx.send_replace(batch.clone());
+    true
 }
 
 fn request_phone_action_cancellation(
@@ -816,7 +967,8 @@ fn viewer_snapshot(
                 .windows
                 .iter()
                 .find_map(|window| window.resets.clone()),
-            stale: now.saturating_sub(quota.refreshed_at_epoch_seconds) > 300,
+            stale: now.saturating_sub(quota.refreshed_at_epoch_seconds)
+                > QUOTA_STALE_AFTER.as_secs(),
             has_error: quota.error.is_some(),
         });
     }
@@ -862,7 +1014,52 @@ fn viewer_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pollers::QUOTA_REFRESH_INTERVAL;
+    use hel::hel_config::{CONFIG_VERSION, HarnessKind, HelConfig};
     use hel::hel_state::SessionState;
+
+    fn controller_with_profiles(ids: &[&str]) -> Controller {
+        Controller {
+            config: HelConfig {
+                version: CONFIG_VERSION,
+                profiles: ids
+                    .iter()
+                    .map(|id| {
+                        (
+                            (*id).to_owned(),
+                            HarnessProfile {
+                                context_window_bytes: None,
+                                kind: HarnessKind::Codex,
+                                home: PathBuf::from("/home/agent").join(id),
+                                executable: None,
+                                environment: std::collections::BTreeMap::new(),
+                            },
+                        )
+                    })
+                    .collect(),
+                bundles: std::collections::BTreeMap::new(),
+                targets: std::collections::BTreeMap::new(),
+            },
+            state: HelState::default(),
+        }
+    }
+
+    fn prompt_action() -> ControllerAction {
+        ControllerAction::Prompt {
+            session_id: "session-1".into(),
+            text: "ship it".into(),
+        }
+    }
+
+    fn new_action() -> ControllerAction {
+        ControllerAction::New {
+            profile_id: "codex".into(),
+            bundle_id: "project".into(),
+            target_id: "podman".into(),
+            title: "Phone launch".into(),
+            project_directory: None,
+        }
+    }
 
     fn phone_session(id: &str, detached_after_event_ordinal: u64) -> SessionRecord {
         SessionRecord {
@@ -930,6 +1127,174 @@ mod tests {
             plan_read_receipt(&state, session_id, 9),
             ReadReceiptPlan::AlreadyRead
         );
+    }
+
+    #[tokio::test]
+    async fn an_admitted_action_answers_its_phone_before_the_work_runs() {
+        let mut replies = PendingActionReplies::default();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+
+        replies.accept(1, &prompt_action(), reply);
+
+        // No completion has been reported, and the phone already has its
+        // answer: holding it until the action finished is what mobile
+        // networks time out on.
+        assert_eq!(answer.await.unwrap(), ActionOutcome::Accepted);
+    }
+
+    #[tokio::test]
+    async fn a_new_action_answers_once_its_provisional_session_is_published() {
+        let mut replies = PendingActionReplies::default();
+        let (reply, mut answer) = tokio::sync::oneshot::channel();
+
+        replies.accept(7, &new_action(), reply);
+        assert!(
+            matches!(
+                answer.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "a new session has no id to report before it is published"
+        );
+
+        replies.resolve(7, ActionOutcome::Accepted);
+        assert_eq!(answer.await.unwrap(), ActionOutcome::Accepted);
+    }
+
+    #[tokio::test]
+    async fn a_new_action_that_never_publishes_still_answers_its_phone() {
+        let mut replies = PendingActionReplies::default();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        replies.accept(7, &new_action(), reply);
+
+        // Registration failed before the session reached the loop, which is
+        // the completion path rather than the publication path.
+        replies.resolve(7, ActionOutcome::Failed);
+
+        assert_eq!(answer.await.unwrap(), ActionOutcome::Failed);
+        // A second resolution is a no-op, so a completion after a publication
+        // cannot overwrite the answer already sent.
+        replies.resolve(7, ActionOutcome::Accepted);
+    }
+
+    #[test]
+    fn a_refused_action_reports_the_reason_the_phone_can_act_on() {
+        let mut active = std::collections::BTreeSet::new();
+
+        assert_eq!(
+            admit_phone_action(&prompt_action(), 0, &mut active),
+            Ok(Some("session-1".to_owned()))
+        );
+        assert_eq!(
+            admit_phone_action(&prompt_action(), 1, &mut active),
+            Err(ActionOutcome::SessionBusy)
+        );
+        assert_eq!(
+            admit_phone_action(&new_action(), MAX_CONCURRENT_PHONE_ACTIONS, &mut active),
+            Err(ActionOutcome::Busy)
+        );
+        // A refusal must not consume the session slot it did not take.
+        assert_eq!(active.len(), 1);
+        assert_eq!(admit_phone_action(&new_action(), 1, &mut active), Ok(None));
+    }
+
+    #[test]
+    fn a_feed_that_ends_outside_shutdown_names_the_failure() {
+        assert!(feed_stopped(true, "the session manager stopped").is_none());
+        let failure = feed_stopped(false, "the session manager stopped").expect("named failure");
+        assert!(failure.to_string().contains("session manager"));
+    }
+
+    #[test]
+    fn a_profile_added_while_the_server_runs_reaches_the_quota_refresher() {
+        let (profiles_tx, profiles_rx) = tokio::sync::watch::channel(QuotaRefreshBatch::default());
+        let mut published = std::collections::BTreeMap::new();
+        let mut batch = QuotaRefreshBatch::default();
+        let controller = controller_with_profiles(&["codex"]);
+
+        assert!(republish_quota_profiles(
+            &controller,
+            &mut published,
+            &mut batch,
+            &profiles_tx
+        ));
+        assert_eq!(
+            profiles_rx
+                .borrow()
+                .profiles
+                .iter()
+                .map(|profile| profile.profile_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["codex".to_owned()]
+        );
+        let first_generation = profiles_rx.borrow().generation;
+
+        // Every finished action reloads the configuration; an unchanged one
+        // must not restart a harness process per profile.
+        assert!(!republish_quota_profiles(
+            &controller,
+            &mut published,
+            &mut batch,
+            &profiles_tx
+        ));
+        assert_eq!(profiles_rx.borrow().generation, first_generation);
+
+        let grown = controller_with_profiles(&["claude", "codex"]);
+        assert!(republish_quota_profiles(
+            &grown,
+            &mut published,
+            &mut batch,
+            &profiles_tx
+        ));
+        assert_eq!(
+            profiles_rx
+                .borrow()
+                .profiles
+                .iter()
+                .map(|profile| profile.profile_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["claude".to_owned(), "codex".to_owned()]
+        );
+        assert!(profiles_rx.borrow().generation > first_generation);
+    }
+
+    #[test]
+    fn a_quota_reads_stale_only_once_its_next_refresh_is_overdue() {
+        let controller = controller_with_profiles(&["codex"]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let quota_refreshed = |age: Duration| {
+            let quotas = std::collections::BTreeMap::from([(
+                "codex".to_owned(),
+                ProfileQuota {
+                    profile_id: "codex".into(),
+                    harness: HarnessKind::Codex,
+                    windows: Vec::new(),
+                    extra: None,
+                    error: None,
+                    refreshed_at_epoch_seconds: now - age.as_secs(),
+                },
+            )]);
+            viewer_snapshot(
+                &controller,
+                &quotas,
+                &std::collections::BTreeMap::new(),
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .profiles[0]
+                .quota
+                .as_ref()
+                .expect("the profile carries its quota")
+                .stale
+        };
+
+        // A reading taken one refresh interval ago is exactly what a healthy
+        // refresher produces, so it must not be labelled stale.
+        assert!(!quota_refreshed(QUOTA_REFRESH_INTERVAL));
+        assert!(!quota_refreshed(QUOTA_STALE_AFTER));
+        assert!(quota_refreshed(QUOTA_STALE_AFTER + Duration::from_secs(1)));
     }
 
     #[test]

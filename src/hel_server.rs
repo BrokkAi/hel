@@ -38,7 +38,8 @@ const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const EPHEMERAL_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_BODY_BYTES: usize = 128 * 1024;
 const MAX_CODE_FAILURES: u32 = 5;
-const CODE_LOCKOUT: Duration = Duration::from_secs(30);
+const CODE_LOCKOUT_BASE: Duration = Duration::from_secs(30);
+const CODE_LOCKOUT_CAP: Duration = Duration::from_secs(60 * 60);
 const MAX_TITLE_CHARS: usize = 120;
 const MAX_PROMPT_CHARS: usize = 64 * 1024;
 const COOKIE_KEY_BYTES: usize = 32;
@@ -410,10 +411,59 @@ pub enum ResumeQueueDisposition {
     Discard,
 }
 
+/// The controller's answer to one phone action.
+///
+/// The answer means "accepted", not "finished": provisioning, resume and close
+/// run for minutes, and a phone on a mobile network drops a request held open
+/// that long. How the action then goes travels in snapshots — session state,
+/// queued prompts, transcripts, and `has_error`.
+///
+/// Only the outcome crosses this boundary. The controller's own failure text
+/// names profile homes, project paths and SSH hosts, so it stays on the
+/// controller and the phone gets a fixed message it can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionOutcome {
+    /// Admitted and now running; watch the snapshot for what happens next.
+    Accepted,
+    /// The controller already runs as many phone actions as it allows.
+    Busy,
+    /// This session already has an operation running.
+    SessionBusy,
+    /// A cancel found no operation to cancel.
+    NotCancellable,
+    /// The controller could not start the action at all.
+    Failed,
+}
+
+impl ActionOutcome {
+    /// The reply an outcome owes the phone, or `None` when it was accepted.
+    const fn rejection(self) -> Option<ApiError> {
+        match self {
+            Self::Accepted => None,
+            Self::Busy => Some(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "the controller is at its concurrent action limit; retry shortly",
+            )),
+            Self::SessionBusy => Some(ApiError::new(
+                StatusCode::CONFLICT,
+                "another operation is already running for this session",
+            )),
+            Self::NotCancellable => Some(ApiError::new(
+                StatusCode::CONFLICT,
+                "the session has no cancellable operation",
+            )),
+            Self::Failed => Some(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the controller could not start this action",
+            )),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ControllerRequest {
     pub action: ControllerAction,
-    pub reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    pub reply: tokio::sync::oneshot::Sender<ActionOutcome>,
 }
 
 /// A phone acknowledging how far it has read a conversation.
@@ -445,10 +495,55 @@ struct ServerState {
     code_guard: Arc<Mutex<CodeGuard>>,
 }
 
+/// Online-guessing defence for the deliberately small viewer code.
+///
+/// Five wrong codes lock the endpoint, and each further lockout lasts twice as
+/// long as the one before it, up to an hour. The escalation count survives an
+/// expired lockout, so a script cannot recover its full allowance by waiting;
+/// a correct code clears the whole history, so one mistyped digit still costs
+/// at most a single short wait.
 #[derive(Debug, Default)]
 struct CodeGuard {
     failures: u32,
+    lockouts: u32,
     locked_until: Option<Instant>,
+}
+
+impl CodeGuard {
+    fn locked_at(&mut self, now: Instant) -> bool {
+        match self.locked_until {
+            Some(until) if now < until => true,
+            Some(_) => {
+                // The wait is served: allow a fresh run of attempts, but keep
+                // the escalation history that makes the next wait longer.
+                self.locked_until = None;
+                self.failures = 0;
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn record_failure_at(&mut self, now: Instant) {
+        self.failures = self.failures.saturating_add(1);
+        if self.failures < MAX_CODE_FAILURES {
+            return;
+        }
+        self.failures = 0;
+        self.lockouts = self.lockouts.saturating_add(1);
+        self.locked_until = Some(now + code_lockout(self.lockouts));
+    }
+}
+
+/// Doubling backoff, capped so the owner of a locked-out server is never shut
+/// out for longer than it takes to notice.
+fn code_lockout(lockouts: u32) -> Duration {
+    let multiplier = 1_u32
+        .checked_shl(lockouts.saturating_sub(1))
+        .unwrap_or(u32::MAX);
+    CODE_LOCKOUT_BASE
+        .saturating_mul(multiplier)
+        .min(CODE_LOCKOUT_CAP)
 }
 
 fn router(options: ServerOptions) -> Router {
@@ -562,22 +657,29 @@ async fn snapshot(State(state): State<ServerState>) -> Response<Body> {
     response
 }
 
+/// Hand one validated action to the controller and answer as soon as the
+/// controller accepts it. Waiting for completion would hold the request open
+/// for the whole of a provision, resume or close, which mobile networks end
+/// long before the work does — reporting failure for an action that is in fact
+/// still running.
 async fn action(
     State(state): State<ServerState>,
     Json(action): Json<ControllerAction>,
 ) -> Result<StatusCode, ApiError> {
     validate_action(&action, &state.snapshot_rx.borrow())?;
-    let (reply, result) = tokio::sync::oneshot::channel();
+    let (reply, outcome) = tokio::sync::oneshot::channel();
     state
         .action_tx
         .send(ControllerRequest { action, reply })
         .await
-        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "controller unavailable"))?;
-    result
+        .map_err(|_| ApiError::controller_unavailable())?;
+    let outcome = outcome
         .await
-        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "controller unavailable"))?
-        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "action failed"))?;
-    Ok(StatusCode::ACCEPTED)
+        .map_err(|_| ApiError::controller_unavailable())?;
+    match outcome.rejection() {
+        Some(rejection) => Err(rejection),
+        None => Ok(StatusCode::ACCEPTED),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -627,10 +729,10 @@ async fn mark_conversation_read(
             reply,
         })
         .await
-        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "controller unavailable"))?;
+        .map_err(|_| ApiError::controller_unavailable())?;
     result
         .await
-        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "controller unavailable"))?
+        .map_err(|_| ApiError::controller_unavailable())?
         .map_err(|_| ApiError::new(StatusCode::CONFLICT, "read receipt failed"))?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -827,6 +929,10 @@ impl ApiError {
     const fn not_found(message: &'static str) -> Self {
         Self::new(StatusCode::NOT_FOUND, message)
     }
+
+    const fn controller_unavailable() -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, "controller unavailable")
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -842,24 +948,19 @@ impl IntoResponse for ApiError {
 }
 
 fn code_locked(state: &ServerState) -> bool {
-    let mut guard = state.code_guard.lock().expect("viewer code guard poisoned");
-    match guard.locked_until {
-        Some(until) if Instant::now() < until => true,
-        Some(_) => {
-            *guard = CodeGuard::default();
-            false
-        }
-        None => false,
-    }
+    state
+        .code_guard
+        .lock()
+        .expect("viewer code guard poisoned")
+        .locked_at(Instant::now())
 }
 
 fn record_code_failure(state: &ServerState) {
-    let mut guard = state.code_guard.lock().expect("viewer code guard poisoned");
-    guard.failures = guard.failures.saturating_add(1);
-    if guard.failures >= MAX_CODE_FAILURES {
-        guard.failures = 0;
-        guard.locked_until = Some(Instant::now() + CODE_LOCKOUT);
-    }
+    state
+        .code_guard
+        .lock()
+        .expect("viewer code guard poisoned")
+        .record_failure_at(Instant::now());
 }
 
 fn reset_code_failures(state: &ServerState) {
@@ -1042,7 +1143,7 @@ const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 
 
 const VIEWER_HTML: &str = r##"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#08090d"><link rel="manifest" href="/manifest.webmanifest"><title>Hel</title>
-<style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}textarea{width:100%;box-sizing:border-box;min-height:76px}#conversation-feed{min-height:30vh}</style></head>
+<style>:root{color-scheme:dark;font:16px system-ui;background:#08090d;color:#ecf2e5}body{margin:0;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);max-width:760px;margin:auto}header{display:flex;align-items:baseline;justify-content:space-between}h1{font-size:42px;letter-spacing:.06em;margin:22px 0 4px;color:#b9ff5a}.dim{color:#899184}.card{background:#13161d;border:1px solid #292e38;border-radius:14px;margin:12px 0;padding:14px}.row{display:flex;gap:8px;flex-wrap:wrap}button,input,select,textarea{font:inherit;color:inherit;background:#1d222b;border:1px solid #3b424e;border-radius:9px;padding:10px}button{background:#b9ff5a;color:#10140b;font-weight:700}button:disabled{opacity:.45}.danger{background:#ff786f}.secondary{background:#303743;color:#ecf2e5}.hidden{display:none}.pill{font-size:12px;border:1px solid #475043;border-radius:99px;padding:3px 8px}.pill.alert{border-color:#ff786f;color:#ff786f}.session h3{margin:0 0 8px}.session p{margin:5px 0}.preview{white-space:pre-wrap;border-left:2px solid #475043;padding-left:10px}.entry{border-left:3px solid #475043;padding:4px 0 4px 12px;margin:15px 0}.entry.user{border-color:#5dd9ff}.entry.agent{border-color:#91df62}.entry.thought,.entry.system{border-color:#59616d;color:#aab1a5}.entry.tool{border-color:#e2b34d}.entry.plan{border-color:#d985ff}.entry strong{display:block;margin-bottom:5px}.entry pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.queue-item{display:flex;gap:8px;align-items:start;justify-content:space-between;border-top:1px solid #292e38;padding:8px 0}.queue-item span{white-space:pre-wrap;overflow-wrap:anywhere}textarea{width:100%;box-sizing:border-box;min-height:76px}#conversation-feed{min-height:30vh}</style></head>
 <body><header><div><h1>HEL</h1><div class="dim">Welcome to Hel.</div></div><button id="logout" class="hidden">Sign out</button></header>
 <main id="login" class="card"><h2>Unlock viewer</h2><p class="dim">Enter the six-digit code shown by <code>hel server</code>.</p><form id="login-form" class="row"><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required><button>Enter</button></form><p id="login-error"></p></main>
 <main id="app" class="hidden"><section id="dashboard"><section class="card"><h2>New session</h2><form id="new-form" class="row"><input id="new-title" maxlength="120" placeholder="Session title" required><select id="new-profile" aria-label="Profile"></select><select id="new-bundle" aria-label="Bundle"></select><select id="new-target" aria-label="Target"></select><input id="new-project-directory" class="hidden" placeholder="Absolute project directory"><button>Start</button></form><p id="action-error"></p></section><section><h2>Sessions</h2><div id="sessions"></div></section><section class="card"><h2>Configured</h2><div id="configured"></div></section></section><section id="conversation" class="hidden"><button id="back" class="secondary">← Dashboard</button><div class="card"><h2 id="conversation-title">Conversation</h2><span id="conversation-state" class="pill"></span><div id="conversation-feed"></div></div><section class="card"><h3>Queued prompts</h3><div id="conversation-queue"></div></section><form id="prompt-form" class="card"><textarea id="prompt-text" maxlength="65536" placeholder="Message the agent" required></textarea><button>Send or queue</button><p id="conversation-error"></p></form></section></main>
@@ -1051,7 +1152,7 @@ const login=document.querySelector('#login'),app=document.querySelector('#app'),
 async function request(url,options={}){const response=await fetch(url,{...options,headers:{'content-type':'application/json',...(options.headers||{})}});if(response.status===401)throw new Error('unauthorized');if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||response.statusText)}return response.status===204?null:response.json()}
 function options(items,selected){return items.map(x=>`<option value="${escapeAttr(x.id)}" ${x.id===selected?'selected':''}>${escapeHtml(x.id)}</option>`).join('')}
 function syncProjectDirectory(){const required=snapshot?.targets.find(x=>x.id===newTarget.value)?.requires_project_directory===true;newProjectDirectory.classList.toggle('hidden',!required);newProjectDirectory.required=required;if(!required)newProjectDirectory.value=''}
-async function refresh(){try{snapshot=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);syncProjectDirectory();sessions.innerHTML=snapshot.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span> ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available?'':'disabled'}>Open</button>${x.state==='provisioning'?`<button class="danger" data-action="cancel" data-id="${escapeAttr(x.id)}">Cancel</button>`:`<button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Stop</button>`}</div></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);document.querySelector('#conversation-state').textContent=session.state}}if(!eventsStarted){eventsStarted=true;const source=new EventSource('/api/events');source.addEventListener('revision',()=>{refresh();if(currentSession)loadConversation(true)})}}catch(e){if(e.message==='unauthorized'){login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}}}
+async function refresh(){try{snapshot=await request('/api/snapshot');login.classList.add('hidden');app.classList.remove('hidden');logout.classList.remove('hidden');if(!newProfile.value)newProfile.innerHTML=options(snapshot.profiles);if(!newBundle.value)newBundle.innerHTML=options(snapshot.bundles);if(!newTarget.value)newTarget.innerHTML=options(snapshot.targets);syncProjectDirectory();sessions.innerHTML=snapshot.sessions.map(x=>`<article class="card session"><h3>${escapeHtml(x.title)}</h3><p><span class="pill">${escapeHtml(x.state)}</span>${x.has_error?' <span class="pill alert">needs attention</span>':''} ${escapeHtml(x.harness_kind)} · ${escapeHtml(x.profile_id)}</p><p class="dim">${escapeHtml(x.bundle_id)} → ${escapeHtml(x.target_id)} · ${(x.queued_prompts||[]).length} queued</p>${x.preview?.length?`<p class="preview">${x.preview.map(escapeHtml).join('\n')}</p>`:''}<div class="row"><button data-action="open" data-id="${escapeAttr(x.id)}" ${x.conversation_available?'':'disabled'}>Open</button>${x.state==='provisioning'?`<button class="danger" data-action="cancel" data-id="${escapeAttr(x.id)}">Cancel</button>`:`<button data-action="resume" data-id="${escapeAttr(x.id)}" data-profile="${escapeAttr(x.profile_id)}" data-target="${escapeAttr(x.target_id)}">Resume</button><button class="danger" data-action="close" data-id="${escapeAttr(x.id)}">Stop</button>`}</div></article>`).join('')||'<p class="dim">No Hel-managed sessions.</p>';const profileRows=snapshot.profiles.map(p=>`<p><strong>${escapeHtml(p.id)}</strong> · ${escapeHtml(p.harness_kind)}<br><span class="dim">${p.quota?escapeHtml(p.quota.summary)+(p.quota.stale?' · stale':'')+(p.quota.has_error?' · unavailable':''):'quota unavailable'}</span></p>`).join('');configured.innerHTML=profileRows+`<p class="dim">${snapshot.targets.length} targets · ${snapshot.bundles.length} bundles</p>`;if(currentSession){const session=snapshot.sessions.find(x=>x.id===currentSession);if(!session?.conversation_available){showDashboard()}else{renderQueue(session);document.querySelector('#conversation-state').textContent=session.state}}if(!eventsStarted){eventsStarted=true;const source=new EventSource('/api/events');source.addEventListener('revision',()=>{refresh();if(currentSession)loadConversation(true)})}}catch(e){if(e.message==='unauthorized'){login.classList.remove('hidden');app.classList.add('hidden');logout.classList.add('hidden')}}}
 function renderQueue(session){queue.innerHTML=(session.queued_prompts||[]).map((x,i)=>`<div class="queue-item"><span>${i+1}. ${escapeHtml(x.text)}</span><button class="danger" data-queue-id="${escapeAttr(x.id)}">Remove</button></div>`).join('')||'<p class="dim">No queued prompts.</p>'}
 function renderEntries(entries,replace){if(replace)feed.innerHTML='';for(const entry of entries){let node=document.querySelector(`[data-entry-id="${entry.id}"]`);if(!node){node=document.createElement('article');node.dataset.entryId=entry.id;feed.append(node)}node.className=`entry ${entry.role}`;const title=document.createElement('strong');title.textContent=entry.label;const body=document.createElement('pre');body.textContent=entry.lines.join('\n');node.replaceChildren(title,body)}window.scrollTo(0,document.body.scrollHeight)}
 async function loadConversation(delta=false){if(!currentSession)return;try{const result=await request(`/api/conversations/${encodeURIComponent(currentSession)}${delta&&cursor?`?after_seq=${cursor}`:''}`);renderEntries(result.entries,!delta||result.reset);cursor=result.latest_seq;if(cursor>acknowledged){const through=cursor;await request(`/api/conversations/${encodeURIComponent(currentSession)}/read`,{method:'POST',body:JSON.stringify({through})});acknowledged=through}}catch(err){document.querySelector('#conversation-error').textContent=err.message}}
@@ -1320,7 +1421,7 @@ mod tests {
                 text: "ship it".into(),
             }
         );
-        action.reply.send(Ok(())).unwrap();
+        action.reply.send(ActionOutcome::Accepted).unwrap();
         let response = response.await.unwrap().unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
@@ -1351,7 +1452,7 @@ mod tests {
                 project_directory: Some(PathBuf::from("/work/project")),
             }
         );
-        action.reply.send(Ok(())).unwrap();
+        action.reply.send(ActionOutcome::Accepted).unwrap();
         assert_eq!(
             response.await.unwrap().unwrap().status(),
             StatusCode::ACCEPTED
@@ -1420,7 +1521,7 @@ mod tests {
                 session_id: "session-1".into(),
             }
         );
-        action.reply.send(Ok(())).unwrap();
+        action.reply.send(ActionOutcome::Accepted).unwrap();
         assert_eq!(
             response.await.unwrap().unwrap().status(),
             StatusCode::ACCEPTED
@@ -1604,11 +1705,135 @@ mod tests {
             "a read receipt must not queue a controller action"
         );
 
-        action.reply.send(Ok(())).unwrap();
+        action.reply.send(ActionOutcome::Accepted).unwrap();
         assert_eq!(
             prompt.await.unwrap().unwrap().status(),
             StatusCode::ACCEPTED
         );
+    }
+
+    #[tokio::test]
+    async fn each_rejected_action_keeps_its_own_status_and_guidance() {
+        for (outcome, status, guidance) in [
+            (
+                ActionOutcome::Busy,
+                StatusCode::TOO_MANY_REQUESTS,
+                "concurrent action limit",
+            ),
+            (
+                ActionOutcome::SessionBusy,
+                StatusCode::CONFLICT,
+                "another operation is already running",
+            ),
+            (
+                ActionOutcome::NotCancellable,
+                StatusCode::CONFLICT,
+                "no cancellable operation",
+            ),
+            (
+                ActionOutcome::Failed,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not start this action",
+            ),
+        ] {
+            let (app, mut actions, _) = app();
+            let cookie = login_cookie(&app).await;
+            let response = tokio::spawn(
+                app.oneshot(
+                    Request::post("/api/actions")
+                        .header(COOKIE, cookie)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"action":"close","session_id":"session-1"}"#))
+                        .unwrap(),
+                ),
+            );
+            let request = actions.recv().await.unwrap();
+            request.reply.send(outcome).unwrap();
+
+            let response = response.await.unwrap().unwrap();
+            assert_eq!(response.status(), status, "{outcome:?}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let error = body["error"].as_str().unwrap();
+            assert!(error.contains(guidance), "{outcome:?} answered {error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_viewer_shows_a_session_whose_action_failed_after_it_was_accepted() {
+        // An accepted action reports its outcome only through snapshots, so
+        // the page has to react to `has_error` for a late failure to be
+        // visible at all.
+        let (app, _, _) = app();
+        let page = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let page = String::from_utf8(page.to_vec()).unwrap();
+        assert!(page.contains("x.has_error?"), "viewer ignores has_error");
+    }
+
+    #[tokio::test]
+    async fn repeated_wrong_codes_lock_the_login_endpoint() {
+        let (app, _, _) = app();
+        let attempt = |code: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::post("/auth/session")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(format!(r#"{{"code":"{code}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        for _ in 0..MAX_CODE_FAILURES {
+            assert_eq!(attempt("000000").await, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(attempt("000000").await, StatusCode::TOO_MANY_REQUESTS);
+        // Even the right code waits out the lockout, so guessing cannot be
+        // hidden behind a correct-looking attempt.
+        assert_eq!(attempt("123456").await, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn viewer_code_lockouts_lengthen_instead_of_resetting_after_every_wait() {
+        let serve_one_lockout = |guard: &mut CodeGuard, now: Instant| {
+            for _ in 0..MAX_CODE_FAILURES {
+                assert!(!guard.locked_at(now));
+                guard.record_failure_at(now);
+            }
+            assert!(guard.locked_at(now));
+            guard.locked_until.expect("the guard is locked") - now
+        };
+
+        let start = Instant::now();
+        let mut guard = CodeGuard::default();
+        let first = serve_one_lockout(&mut guard, start);
+        assert_eq!(first, CODE_LOCKOUT_BASE);
+
+        // Waiting out a lockout buys another run of attempts, not another
+        // equally short lockout: a guard that reset here gave an attacker
+        // MAX_CODE_FAILURES guesses every CODE_LOCKOUT_BASE for ever.
+        let second_round = start + first;
+        let second = serve_one_lockout(&mut guard, second_round);
+        assert_eq!(second, CODE_LOCKOUT_BASE * 2);
+        let third = serve_one_lockout(&mut guard, second_round + second);
+        assert_eq!(third, CODE_LOCKOUT_BASE * 4);
+        assert_eq!(code_lockout(u32::MAX), CODE_LOCKOUT_CAP);
+
+        // A correct code clears the history, so one mistyped digit tomorrow
+        // still costs only the shortest wait.
+        let mut recovered = CodeGuard::default();
+        assert_eq!(serve_one_lockout(&mut recovered, start), CODE_LOCKOUT_BASE);
     }
 
     #[test]
