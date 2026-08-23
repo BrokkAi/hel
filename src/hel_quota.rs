@@ -602,13 +602,41 @@ struct KimiRefreshLock {
     heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// The Kimi Code CLI is the other holder of this lock, and it agrees that a
+/// live holder keeps the directory's mtime moving. It takes the lock through
+/// `proper-lockfile` with `stale: 5_000` (kimi-code
+/// `packages/oauth/src/oauth-manager.ts:216-220`; the shipped binary carries
+/// the same `stale: 5e3`), which rewrites the mtime every `stale / 2` for as
+/// long as the lock is held (proper-lockfile 4.1.2 `lib/lockfile.js:99-183`,
+/// interval resolved at `lib/lockfile.js:220-221`) and removes any lock whose
+/// mtime is older than `stale` (`lib/lockfile.js:67-79, 84-86`). A CLI refresh
+/// can hold the lock far longer than that — three tries against a 30s HTTP
+/// timeout plus backoff (`packages/oauth/src/oauth.ts:56-73, 226-263`) — but
+/// never silently, so a stopped mtime still means the holder is gone. Its
+/// mtimes can also land up to a second in the future
+/// (`lib/mtime-precision.js:44-52`), which `break_stale_kimi_lock` reads as
+/// "not stale" because `duration_since` fails: the safe answer.
+const KIMI_CLI_LOCK_STALE_AFTER: Duration = Duration::from_secs(5);
 /// A holder republishes the lock directory's modification time on this
-/// interval, so a lock whose mtime stopped moving has no live holder.
+/// interval, so a lock whose mtime stopped moving has no live holder. The CLI
+/// judges Hel's lock by that same mtime, so the interval has to fit inside
+/// `KIMI_CLI_LOCK_STALE_AFTER` with room for a missed beat.
 const KIMI_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 /// Several heartbeats of slack, so a live holder delayed by the scheduler keeps
-/// its lock. Derived from the heartbeat so the two cannot drift apart.
+/// its lock. Derived from the heartbeat so the two cannot drift apart, and
+/// deliberately more patient than the CLI's 5s: breaking later than the peer
+/// can never steal a live lock, and it costs no recovery time, because the CLI
+/// reclaims a lock a crashed Hel left behind after its own 5s.
 const KIMI_LOCK_STALE_AFTER: Duration =
     Duration::from_secs(5 * KIMI_LOCK_HEARTBEAT_INTERVAL.as_secs());
+const _: () = assert!(
+    2 * KIMI_LOCK_HEARTBEAT_INTERVAL.as_secs() <= KIMI_CLI_LOCK_STALE_AFTER.as_secs(),
+    "Hel must republish the lock mtime at least twice inside the window the Kimi Code CLI waits before breaking it"
+);
+const _: () = assert!(
+    KIMI_LOCK_STALE_AFTER.as_secs() >= KIMI_CLI_LOCK_STALE_AFTER.as_secs(),
+    "Hel must not call a lock stale sooner than the Kimi Code CLI does, or it can break a lock the CLI still holds"
+);
 const KIMI_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const KIMI_LOCK_WAIT: Duration = Duration::from_secs(60);
 
