@@ -102,6 +102,7 @@ const fn import_label(harness: HarnessKind) -> &'static str {
         HarnessKind::Codex => "Codex",
         HarnessKind::Kimi => "Kimi",
         HarnessKind::Grok => "Grok Build",
+        HarnessKind::Deepseek => "DeepSeek Harness",
     }
 }
 
@@ -112,6 +113,9 @@ fn harness_config_home(harness: HarnessKind) -> Result<PathBuf> {
         HarnessKind::Codex => codex_config_home(),
         HarnessKind::Kimi => kimi_config_home(),
         HarnessKind::Grok => grok_config_home(),
+        HarnessKind::Deepseek => bail!(
+            "DeepSeek Harness sessions resume directly through ACP; native import is unavailable"
+        ),
     }
 }
 
@@ -230,6 +234,9 @@ fn locate_for_import(
                 }),
             }
         }
+        HarnessKind::Deepseek => bail!(
+            "DeepSeek Harness sessions resume directly through ACP; native import is unavailable"
+        ),
     })
 }
 

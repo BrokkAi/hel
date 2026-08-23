@@ -396,6 +396,9 @@ pub fn locate_native_session(
             let located = locate_grok_session(home, selection)?;
             (located.native_session_id, located.session_path)
         }
+        HarnessKind::Deepseek => bail!(
+            "DeepSeek Harness sessions resume through ACP and are not imported from native storage"
+        ),
     };
     Ok(LocatedNativeSession {
         native_session_id,
@@ -413,6 +416,9 @@ pub fn read_native_transcript(
         HarnessKind::Claude => read_claude_transcript(source_path),
         HarnessKind::Kimi => read_kimi_transcript(source_path),
         HarnessKind::Grok => read_grok_transcript(source_path),
+        HarnessKind::Deepseek => bail!(
+            "DeepSeek Harness sessions resume through ACP and have no Hel native-import projection"
+        ),
     }
 }
 
@@ -482,6 +488,9 @@ pub fn scan_native_sessions(
             });
             forward(progress.scanned, progress.total, session);
         }),
+        HarnessKind::Deepseek => bail!(
+            "DeepSeek Harness sessions resume through ACP and are not imported from native storage"
+        ),
     }
 }
 

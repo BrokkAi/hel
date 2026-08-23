@@ -268,6 +268,7 @@ pub fn harness_authentication_marker(kind: HarnessKind, home: &Path) -> PathBuf 
         HarnessKind::Claude => ".credentials.json",
         HarnessKind::Kimi => "credentials/kimi-code.json",
         HarnessKind::Grok => "auth.json",
+        HarnessKind::Deepseek => ".credentials.yaml",
     })
 }
 
@@ -1191,23 +1192,31 @@ mod tests {
         let codex = home.join(".codex");
         let kimi = home.join(".kimi-code");
         let grok = home.join(".grok");
+        let deepseek = home.join(".dsh");
         let claude = directory.path().join("claude-override");
         fs::create_dir_all(&codex).unwrap();
         fs::create_dir_all(kimi.join("credentials")).unwrap();
         fs::create_dir_all(&grok).unwrap();
+        fs::create_dir_all(&deepseek).unwrap();
         fs::create_dir_all(&claude).unwrap();
         fs::write(codex.join("auth.json"), "{}").unwrap();
         fs::write(kimi.join("credentials/kimi-code.json"), "{}").unwrap();
         fs::write(grok.join("auth.json"), "{}").unwrap();
+        fs::write(deepseek.join(".credentials.yaml"), "version: 1\n").unwrap();
         fs::write(claude.join(".credentials.json"), "{}").unwrap();
 
         let homes = discover_harness_homes(Some(&home), [(HarnessKind::Claude, claude.clone())]);
 
-        assert_eq!(homes.len(), 4);
+        assert_eq!(homes.len(), 5);
         assert!(homes.iter().all(|home| home.authenticated));
         assert!(homes.iter().any(|home| home.path == codex));
         assert!(homes.iter().any(|home| home.path == claude));
         assert!(homes.iter().any(|home| home.path == kimi));
+        assert!(
+            homes
+                .iter()
+                .any(|home| { home.path == deepseek && home.kind == HarnessKind::Deepseek })
+        );
         assert!(
             homes
                 .iter()
@@ -1955,7 +1964,11 @@ Host builder
             "{kimi}"
         );
 
-        for kind in [HarnessKind::Codex, HarnessKind::Claude] {
+        for kind in [
+            HarnessKind::Codex,
+            HarnessKind::Claude,
+            HarnessKind::Deepseek,
+        ] {
             assert!(!warning(kind).contains("DANGER"), "{kind:?}");
         }
     }

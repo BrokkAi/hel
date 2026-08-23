@@ -29,7 +29,7 @@ use crate::hel_config::{HarnessKind, HarnessProfile};
 use crate::hel_targets::CommandSpec;
 use crate::hel_worker::{RelayEvent, RelayObservation};
 
-/// Credential files are small JSON documents. The cap keeps a hostile or
+/// Credential files are small JSON or YAML documents. The cap keeps a hostile or
 /// corrupt worker from making the controller buffer an arbitrary payload.
 pub const MAX_CREDENTIAL_BYTES: usize = 1024 * 1024;
 
@@ -59,9 +59,15 @@ pub fn credential_fingerprint(bytes: &[u8]) -> String {
 ///   value holding `{ "key", "refresh_token", "expires_at", ... }`.
 ///   `expires_at` is an RFC3339 string with nanosecond precision and a `Z`
 ///   suffix. A file may hold several grants, so the latest expiry wins.
+/// * DeepSeek Harness `~/.dsh/.credentials.yaml`: a versioned credential store
+///   without refresh timestamps. Divergent live copies are therefore never
+///   ordered by a guessed freshness value.
 ///
 /// Anything unparseable is `None` rather than a guess.
 pub fn credential_freshness(kind: HarnessKind, bytes: &[u8]) -> Option<i64> {
+    if kind == HarnessKind::Deepseek {
+        return None;
+    }
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     match kind {
         HarnessKind::Claude => value.get("claudeAiOauth")?.get("expiresAt")?.as_i64(),
@@ -85,12 +91,13 @@ pub fn credential_freshness(kind: HarnessKind, bytes: &[u8]) -> Option<i64> {
                     .map(|expiry| expiry.timestamp_millis())
             })
             .max(),
+        HarnessKind::Deepseek => unreachable!("handled before JSON parsing"),
     }
 }
 
 /// Reject anything that is not a plausible credential document before it
 /// replaces a canonical file or lands in a session home.
-pub fn validate_credential_payload(bytes: &[u8]) -> Result<()> {
+pub fn validate_credential_payload(kind: HarnessKind, bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() {
         bail!("credential payload is empty");
     }
@@ -101,7 +108,135 @@ pub fn validate_credential_payload(bytes: &[u8]) -> Result<()> {
         );
     }
     let text = std::str::from_utf8(bytes).context("credential payload is not valid UTF-8")?;
-    serde_json::from_str::<serde_json::Value>(text).context("credential payload is not JSON")?;
+    if kind == HarnessKind::Deepseek {
+        validate_deepseek_credentials(text)?;
+    } else {
+        serde_json::from_str::<serde_json::Value>(text)
+            .context("credential payload is not JSON")?;
+    }
+    Ok(())
+}
+
+fn validate_deepseek_credentials(text: &str) -> Result<()> {
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(text).context("DeepSeek credential payload is not YAML")?;
+    let document = value
+        .as_mapping()
+        .context("DeepSeek credential payload must be a mapping")?;
+    let key = |name: &str| serde_yaml::Value::String(name.to_owned());
+    if document
+        .get(key("version"))
+        .and_then(serde_yaml::Value::as_u64)
+        != Some(1)
+    {
+        bail!("DeepSeek credential payload must have version 1");
+    }
+    for name in document.keys().filter_map(serde_yaml::Value::as_str) {
+        if !matches!(name, "version" | "refs" | "records") {
+            bail!("DeepSeek credential payload has unknown top-level key {name:?}");
+        }
+    }
+    if document.keys().any(|name| name.as_str().is_none()) {
+        bail!("DeepSeek credential payload has a non-string top-level key");
+    }
+    if let Some(refs) = document.get(key("refs")) {
+        let refs = refs
+            .as_mapping()
+            .context("DeepSeek credential refs must be a mapping")?;
+        for (name, value) in refs {
+            let name = name
+                .as_str()
+                .context("DeepSeek credential ref name must be a string")?;
+            ensure_posix_credential_name(name)?;
+            if value.as_str().is_none_or(str::is_empty) {
+                bail!("DeepSeek credential ref {name:?} must be a non-empty string");
+            }
+        }
+    }
+    if let Some(records) = document.get(key("records")) {
+        let records = records
+            .as_mapping()
+            .context("DeepSeek credential records must be a mapping")?;
+        for (name, record) in records {
+            let name = name
+                .as_str()
+                .context("DeepSeek credential record name must be a string")?;
+            let (scope, id) = name
+                .split_once('/')
+                .context("DeepSeek credential record name must be <scope>/<id>")?;
+            if scope.is_empty() || id.is_empty() || id.contains('/') {
+                bail!("DeepSeek credential record name must be <scope>/<id>");
+            }
+            validate_deepseek_credential_record(name, record)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_posix_credential_name(name: &str) -> Result<()> {
+    let mut bytes = name.bytes();
+    if !bytes
+        .next()
+        .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+        || !bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+    {
+        bail!("DeepSeek credential ref {name:?} is not a POSIX identifier");
+    }
+    Ok(())
+}
+
+fn validate_deepseek_credential_record(name: &str, value: &serde_yaml::Value) -> Result<()> {
+    let record = value
+        .as_mapping()
+        .with_context(|| format!("DeepSeek credential record {name:?} must be a mapping"))?;
+    let key = |field: &str| serde_yaml::Value::String(field.to_owned());
+    let kind = record
+        .get(key("kind"))
+        .and_then(serde_yaml::Value::as_str)
+        .with_context(|| format!("DeepSeek credential record {name:?} has no string kind"))?;
+    let allowed: &[&str] = match kind {
+        "api-key" => &["kind", "key", "env"],
+        "grant" => &["kind", "payload"],
+        _ => bail!("DeepSeek credential record {name:?} has an unknown kind"),
+    };
+    for field in record.keys() {
+        let field = field.as_str().with_context(|| {
+            format!("DeepSeek credential record {name:?} has a non-string field")
+        })?;
+        if !allowed.contains(&field) {
+            bail!("DeepSeek credential record {name:?} has unknown field {field:?}");
+        }
+    }
+    if kind == "api-key" {
+        if let Some(value) = record.get(key("key"))
+            && value.as_str().is_none_or(str::is_empty)
+        {
+            bail!("DeepSeek credential record {name:?} key must be a non-empty string");
+        }
+        if let Some(env) = record.get(key("env")) {
+            let env = env.as_mapping().with_context(|| {
+                format!("DeepSeek credential record {name:?} env must be a mapping")
+            })?;
+            for (env_name, value) in env {
+                let env_name = env_name.as_str().with_context(|| {
+                    format!("DeepSeek credential record {name:?} env name must be a string")
+                })?;
+                ensure_posix_credential_name(env_name)?;
+                if value.as_str().is_none_or(str::is_empty) {
+                    bail!(
+                        "DeepSeek credential record {name:?} env {env_name:?} must be a non-empty string"
+                    );
+                }
+            }
+        }
+    } else {
+        let payload = record
+            .get(key("payload"))
+            .with_context(|| format!("DeepSeek credential record {name:?} has no payload"))?;
+        serde_json::to_value(payload).with_context(|| {
+            format!("DeepSeek credential record {name:?} payload is not JSON-compatible")
+        })?;
+    }
     Ok(())
 }
 
@@ -184,8 +319,8 @@ pub fn read_credential_file(
 /// Replace a credential file without exposing a partial write or widening its
 /// permissions. Refuses a symlinked destination so a compromised session home
 /// cannot redirect the write.
-pub fn write_credential_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    validate_credential_payload(bytes)?;
+pub fn write_credential_file(kind: HarnessKind, path: &Path, bytes: &[u8]) -> Result<()> {
+    validate_credential_payload(kind, bytes)?;
     if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         bail!(
             "credential destination {} is a symbolic link",
@@ -307,8 +442,8 @@ pub fn events_report_auth_failure(_kind: HarnessKind, events: &[RelayEvent]) -> 
 /// Build the harness's own interactive login command for a profile.
 ///
 /// Verified against the locally installed CLIs with `--help`: `codex login`,
-/// `claude auth login` (there is no bare `claude login`), `kimi login`, and
-/// `grok login`.
+/// `claude auth login` (there is no bare `claude login`), `kimi login`,
+/// `grok login`, and DeepSeek's `dsh web` credential settings UI.
 ///
 /// `profile.executable` overrides the *ACP bridge*, not the harness CLI: for
 /// Codex and Claude it names an adapter binary (`codex-acp`,
@@ -331,6 +466,7 @@ pub fn login_command(profile: &HarnessProfile) -> (String, Vec<String>) {
         ),
         HarnessKind::Kimi => (overridable("kimi"), vec!["login".to_owned()]),
         HarnessKind::Grok => (overridable("grok"), vec!["login".to_owned()]),
+        HarnessKind::Deepseek => ("dsh".to_owned(), vec!["web".to_owned()]),
     }
 }
 
@@ -633,7 +769,10 @@ mod tests {
                 grok_credentials(&["2026-08-17T02:19:01.724226598Z"]),
             ),
         ];
-        for kind in HarnessKind::ALL {
+        for kind in HarnessKind::ALL
+            .into_iter()
+            .filter(|kind| *kind != HarnessKind::Deepseek)
+        {
             let (_, bytes) = fixtures
                 .iter()
                 .find(|(fixture, _)| *fixture == kind)
@@ -658,11 +797,33 @@ mod tests {
     }
 
     #[test]
-    fn payload_validation_rejects_empty_oversized_and_non_json() {
-        assert!(validate_credential_payload(b"").is_err());
-        assert!(validate_credential_payload(b"not json").is_err());
-        assert!(validate_credential_payload(&vec![b'a'; MAX_CREDENTIAL_BYTES + 1]).is_err());
-        assert!(validate_credential_payload(&claude_credentials(1)).is_ok());
+    fn payload_validation_rejects_empty_oversized_and_malformed_documents() {
+        assert!(validate_credential_payload(HarnessKind::Claude, b"").is_err());
+        assert!(validate_credential_payload(HarnessKind::Claude, b"not json").is_err());
+        assert!(
+            validate_credential_payload(HarnessKind::Claude, &vec![b'a'; MAX_CREDENTIAL_BYTES + 1])
+                .is_err()
+        );
+        assert!(validate_credential_payload(HarnessKind::Claude, &claude_credentials(1)).is_ok());
+        assert!(
+            validate_credential_payload(
+                HarnessKind::Deepseek,
+                b"version: 1\nrefs:\n  DEEPSEEK_API_KEY: secret\n"
+            )
+            .is_ok()
+        );
+        assert!(validate_credential_payload(HarnessKind::Deepseek, b"version: 2\n").is_err());
+        for malformed in [
+            "version: 1\nsecret: value\n",
+            "version: 1\nrefs:\n  bad-name: secret\n",
+            "version: 1\nrefs:\n  DEEPSEEK_API_KEY: ''\n",
+            "version: 1\nrecords:\n  owner/model:\n    kind: mystery\n",
+        ] {
+            assert!(
+                validate_credential_payload(HarnessKind::Deepseek, malformed.as_bytes()).is_err(),
+                "accepted malformed DeepSeek credentials: {malformed}"
+            );
+        }
     }
 
     #[test]
@@ -725,8 +886,8 @@ mod tests {
     fn canonical_write_is_owner_only_and_replaces_the_previous_file() {
         let home = tempfile::tempdir().unwrap();
         let path = harness_authentication_marker(HarnessKind::Kimi, home.path());
-        write_credential_file(&path, &kimi_credentials(1)).unwrap();
-        write_credential_file(&path, &kimi_credentials(2)).unwrap();
+        write_credential_file(HarnessKind::Kimi, &path, &kimi_credentials(1)).unwrap();
+        write_credential_file(HarnessKind::Kimi, &path, &kimi_credentials(2)).unwrap();
         let (snapshot, bytes) = read_credential_file(HarnessKind::Kimi, &path).unwrap();
         assert!(snapshot.present);
         assert_eq!(bytes, kimi_credentials(2));
@@ -746,8 +907,12 @@ mod tests {
         std::fs::write(&elsewhere, b"{}").unwrap();
         let path = home.path().join("auth.json");
         std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
-        let error =
-            write_credential_file(&path, &codex_credentials("2026-01-01T00:00:00Z")).unwrap_err();
+        let error = write_credential_file(
+            HarnessKind::Codex,
+            &path,
+            &codex_credentials("2026-01-01T00:00:00Z"),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("symbolic link"));
         assert_eq!(std::fs::read(&elsewhere).unwrap(), b"{}");
     }
@@ -931,6 +1096,10 @@ mod tests {
             login_command(&profile(HarnessKind::Grok, None)),
             ("grok".to_owned(), vec!["login".to_owned()])
         );
+        assert_eq!(
+            login_command(&profile(HarnessKind::Deepseek, None)),
+            ("dsh".to_owned(), vec!["web".to_owned()])
+        );
     }
 
     #[test]
@@ -957,6 +1126,10 @@ mod tests {
         assert_eq!(
             login_command(&profile(HarnessKind::Claude)).0,
             "claude".to_owned()
+        );
+        assert_eq!(
+            login_command(&profile(HarnessKind::Deepseek)).0,
+            "dsh".to_owned()
         );
     }
 

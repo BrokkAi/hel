@@ -399,7 +399,7 @@ fn restored_native_relative_path(
             rewritten.extend(components);
             Ok(rewritten)
         }
-        HarnessKind::Codex => Ok(relative_path.to_path_buf()),
+        HarnessKind::Codex | HarnessKind::Deepseek => Ok(relative_path.to_path_buf()),
     }
 }
 
@@ -1038,7 +1038,7 @@ fn collect_native_artifacts_cached(
     let roots: &[&str] = match harness {
         HarnessKind::Codex => &["sessions", "archived_sessions"],
         HarnessKind::Claude => &["projects", "session-env", "file-history"],
-        HarnessKind::Kimi | HarnessKind::Grok => &["sessions"],
+        HarnessKind::Kimi | HarnessKind::Grok | HarnessKind::Deepseek => &["sessions"],
     };
     let mut probe = match harness {
         HarnessKind::Codex => CodexProbeContext {
@@ -1355,6 +1355,7 @@ fn collect_native_tree(
         HarnessKind::Claude => inside || name == format!("{session_id}.jsonl"),
         HarnessKind::Kimi => inside && kimi_session_artifact(relative, session_id),
         HarnessKind::Grok => inside && grok_session_artifact(relative, session_id),
+        HarnessKind::Deepseek => inside && name.starts_with("session.jsonl"),
     };
     if !selected || is_secret_like_path(relative) {
         return Ok(());
@@ -2386,6 +2387,29 @@ mod tests {
                 "system_prompt.txt",
             ]
             .map(|name| format!("sessions/%2Fhome%2Fme%2Fapp/{NATIVE}/{name}"))
+        );
+    }
+
+    #[test]
+    fn deepseek_allowlist_collects_only_the_selected_session_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = temp.path().join("sessions/--workspace-app--").join(NATIVE);
+        fs::create_dir_all(&session).unwrap();
+        fs::write(session.join("session.jsonl.zstd"), b"zstd frames").unwrap();
+        fs::write(session.join("runtime.lock"), b"ephemeral").unwrap();
+        let other = temp.path().join("sessions/--workspace-app--/other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("session.jsonl.zstd"), b"other").unwrap();
+
+        let artifacts =
+            collect_native_artifacts(HarnessKind::Deepseek, temp.path(), NATIVE, false).unwrap();
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            artifacts[0].relative_path,
+            PathBuf::from(format!(
+                "sessions/--workspace-app--/{NATIVE}/session.jsonl.zstd"
+            ))
         );
     }
 

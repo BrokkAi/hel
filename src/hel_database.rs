@@ -20,7 +20,7 @@ use crate::hel_state::{
 use crate::hel_targets::AdditionalMount;
 use crate::hel_worker::RELAY_EVENT_GENESIS_DIGEST;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// A deterministic projection integrity violation. Retrying cannot fix it, so
 /// callers must report it separately from transport failures.
@@ -411,6 +411,9 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
     if version < 10 {
         migrate_stopped_session_state(connection)?;
     }
+    if version < 11 {
+        migrate_deepseek_harness_kind(connection)?;
+    }
     let recorded: Option<i64> =
         connection.query_row("SELECT max(version) FROM schema_migrations", [], |row| {
             row.get(0)
@@ -752,6 +755,68 @@ fn migrate_stopped_session_state(connection: &Connection) -> Result<()> {
     let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
     if statement.exists([])? {
         bail!("foreign key violation after migrating the stopped session state");
+    }
+    Ok(())
+}
+
+/// Admit DeepSeek Harness in both stored sessions and Hel's native-session
+/// hidden set. SQLite requires rebuilding tables to widen CHECK constraints.
+fn migrate_deepseek_harness_kind(connection: &Connection) -> Result<()> {
+    connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let migration = connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE sessions_v11 (
+             session_id TEXT PRIMARY KEY REFERENCES session_contexts(session_id),
+             title TEXT NOT NULL CHECK(length(trim(title)) > 0),
+             harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi','grok','deepseek')),
+             last_profile TEXT NOT NULL,
+             target_template_id TEXT NOT NULL,
+             state TEXT NOT NULL CHECK(state IN (
+                 'provisioning','running','disconnected','checkpointing','closing','destroying',
+                 'stopped','lost','error','destroyed-with-data-loss'
+             )),
+             native_session_id TEXT,
+             acp_session_title TEXT CHECK(acp_session_title IS NULL OR length(trim(acp_session_title)) > 0),
+             session_title_override TEXT CHECK(session_title_override IS NULL OR length(trim(session_title_override)) > 0),
+             updated_at TEXT NOT NULL,
+             detached_after_event_ordinal INTEGER NOT NULL DEFAULT 0
+                 CHECK(detached_after_event_ordinal >= 0),
+             last_error TEXT,
+             resource_allocation TEXT,
+             last_checkpoint_error TEXT,
+             project_directory BLOB,
+             managed_worktree TEXT,
+             draft_input TEXT NOT NULL DEFAULT '',
+             container_cpus TEXT,
+             container_memory TEXT,
+             archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1))
+         ) STRICT;
+         INSERT INTO sessions_v11 SELECT * FROM sessions;
+         DROP TABLE sessions;
+         ALTER TABLE sessions_v11 RENAME TO sessions;
+         ALTER TABLE hidden_native_sessions RENAME TO hidden_native_sessions_v10;
+         CREATE TABLE hidden_native_sessions (
+             harness_kind TEXT NOT NULL CHECK(harness_kind IN ('codex','claude','kimi','grok','deepseek')),
+             native_session_id TEXT NOT NULL CHECK(length(trim(native_session_id)) > 0),
+             hidden_at TEXT NOT NULL,
+             PRIMARY KEY(harness_kind, native_session_id)
+         ) STRICT;
+         INSERT INTO hidden_native_sessions SELECT * FROM hidden_native_sessions_v10;
+         DROP TABLE hidden_native_sessions_v10;
+         INSERT INTO schema_migrations(version, applied_at)
+             VALUES (11, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+         PRAGMA user_version = 11;
+         COMMIT;",
+    );
+    if migration.is_err() {
+        let _ = connection.execute_batch("ROLLBACK;");
+    }
+    let foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+    migration.context("migrate sessions table for DeepSeek Harness")?;
+    foreign_keys.context("restore foreign key enforcement after schema migration")?;
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    if statement.exists([])? {
+        bail!("foreign key violation after migrating the DeepSeek Harness list");
     }
     Ok(())
 }
@@ -3816,6 +3881,19 @@ mod tests {
                  );",
             )
             .expect("a migrated database must accept a Grok Build session");
+
+        connection
+            .execute_batch(
+                "INSERT INTO session_contexts VALUES ('session-4', 'project-1', 'now');
+                 INSERT INTO sessions(
+                     session_id, title, harness_kind, last_profile, target_template_id,
+                     state, updated_at
+                 ) VALUES (
+                     'session-4', 'deepseek session', 'deepseek', 'deepseek-1', 'podman',
+                     'running', 'now'
+                 );",
+            )
+            .expect("a migrated database must accept a DeepSeek Harness session");
 
         // Version 10 renamed the `archived` lifecycle state to `stopped` and
         // gave sessions a display-only archived flag, defaulted off.

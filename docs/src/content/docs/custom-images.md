@@ -33,9 +33,11 @@ the container (see [Container targets](/containers/)).
 ## ACP bridges
 
 For each harness, hel first looks for an image-baked bridge binary on
-`PATH`: `codex-acp`, `claude-agent-acp`, `kimi`, or `grok`. If it doesn't find
-one, Codex and Claude Code fall back to running the bridge with `npx -y`, pinned
-to hel's fallback versions. That fallback needs `npx`; if it's missing, hel
+`PATH`: `codex-acp`, `claude-agent-acp`, `kimi`, `grok`, or
+`dsh-acp-server`. If it doesn't find one, Codex, Claude Code, and DeepSeek
+Harness fall back to running the bridge with `npx -y`, pinned to hel's fallback
+versions. DeepSeek Harness requires Node 22 or newer. That fallback needs
+`npx`; if it's missing, hel
 tries to install Node using the same package-manager detection it uses for Git.
 Kimi Code and Grok Build have no npm bridge: hel runs their official installer
 with `curl` instead, which needs `curl` in the image.
@@ -43,6 +45,13 @@ with `curl` instead, which needs `curl` in the image.
 Baking the bridges in, the way the reference image does, avoids that
 per-session install cost and pins the exact bridge version through the image
 instead of through hel's fallback.
+
+The DeepSeek bridge is the third-party `dsh-acp-server` package. Hel pins both
+it and `@deepseek-ai/dsh`, launches its self-managed ACP profile over stdio,
+and stages only `.credentials.yaml`, settings, instructions, skills, and agent
+presets from `DSH_HOME`. DeepSeek's adapter currently accepts one workspace
+root, so a DeepSeek profile cannot launch a multi-repository bundle or a
+session with additional mounted directories.
 
 ## Workspace and hel's own files
 

@@ -1292,7 +1292,7 @@ mod unix {
                 let bytes = BASE64
                     .decode(data.as_bytes())
                     .context("decode credential payload")?;
-                write_credential_file(&endpoint.marker, &bytes)?;
+                write_credential_file(endpoint.harness, &endpoint.marker, &bytes)?;
                 Ok(credential_state_payload(&CredentialSnapshot::of(
                     endpoint.harness,
                     &bytes,
@@ -2178,7 +2178,12 @@ mod relay_tests {
         ));
         let endpoint = credential_endpoint(&launch_config(&home.path().to_string_lossy())).unwrap();
         let original = codex_credentials("2026-08-05T02:51:00Z");
-        crate::hel_credentials::write_credential_file(&endpoint.marker, &original).unwrap();
+        crate::hel_credentials::write_credential_file(
+            endpoint.harness,
+            &endpoint.marker,
+            &original,
+        )
+        .unwrap();
         let replacement = codex_credentials("2026-08-06T02:51:00Z");
         let (wake_tx, _wake_rx) = mpsc::channel(1);
         let (server, client) = tokio::net::UnixStream::pair().unwrap();

@@ -21,6 +21,7 @@ pub enum HarnessKind {
     Claude,
     Kimi,
     Grok,
+    Deepseek,
 }
 
 /// How Hel puts a harness into the unrestricted mode where actions run without
@@ -35,6 +36,12 @@ pub enum UnrestrictedEnforcement {
         flag: &'static str,
         label: &'static str,
     },
+    /// Applied through the child environment at launch.
+    LaunchEnvironment {
+        key: &'static str,
+        value: &'static str,
+        label: &'static str,
+    },
 }
 
 impl UnrestrictedEnforcement {
@@ -43,6 +50,7 @@ impl UnrestrictedEnforcement {
         match self {
             Self::AcpMode(mode) => mode,
             Self::LaunchFlag { label, .. } => label,
+            Self::LaunchEnvironment { label, .. } => label,
         }
     }
 
@@ -50,7 +58,7 @@ impl UnrestrictedEnforcement {
     pub const fn acp_mode(self) -> Option<&'static str> {
         match self {
             Self::AcpMode(mode) => Some(mode),
-            Self::LaunchFlag { .. } => None,
+            Self::LaunchFlag { .. } | Self::LaunchEnvironment { .. } => None,
         }
     }
 
@@ -59,6 +67,14 @@ impl UnrestrictedEnforcement {
         match self {
             Self::AcpMode(_) => None,
             Self::LaunchFlag { flag, .. } => Some(flag),
+            Self::LaunchEnvironment { .. } => None,
+        }
+    }
+
+    pub const fn launch_environment(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::LaunchEnvironment { key, value, .. } => Some((key, value)),
+            Self::AcpMode(_) | Self::LaunchFlag { .. } => None,
         }
     }
 }
@@ -72,7 +88,13 @@ pub struct PlanModeIds {
 }
 
 impl HarnessKind {
-    pub const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::Kimi, Self::Grok];
+    pub const ALL: [Self; 5] = [
+        Self::Codex,
+        Self::Claude,
+        Self::Kimi,
+        Self::Grok,
+        Self::Deepseek,
+    ];
 
     /// Environment variable used to isolate this harness's configuration.
     pub const fn home_env(self) -> &'static str {
@@ -81,6 +103,7 @@ impl HarnessKind {
             Self::Claude => "CLAUDE_CONFIG_DIR",
             Self::Kimi => "KIMI_CODE_HOME",
             Self::Grok => "GROK_HOME",
+            Self::Deepseek => "DSH_HOME",
         }
     }
 
@@ -92,6 +115,7 @@ impl HarnessKind {
             Self::Claude => ".claude",
             Self::Kimi => ".kimi-code",
             Self::Grok => ".grok",
+            Self::Deepseek => ".dsh",
         }
     }
 
@@ -102,6 +126,7 @@ impl HarnessKind {
             Self::Claude => "claude",
             Self::Kimi => "kimi",
             Self::Grok => "grok",
+            Self::Deepseek => "deepseek",
         }
     }
 
@@ -112,6 +137,7 @@ impl HarnessKind {
             Self::Claude => "Claude Code",
             Self::Kimi => "Kimi Code",
             Self::Grok => "Grok Build",
+            Self::Deepseek => "DeepSeek Harness",
         }
     }
 
@@ -124,6 +150,11 @@ impl HarnessKind {
             Self::Grok => UnrestrictedEnforcement::LaunchFlag {
                 flag: "--always-approve",
                 label: "always-approve",
+            },
+            Self::Deepseek => UnrestrictedEnforcement::LaunchEnvironment {
+                key: "DSH_PERMISSION_MODE",
+                value: "danger-full-access",
+                label: "danger-full-access",
             },
         }
     }
@@ -140,7 +171,7 @@ impl HarnessKind {
     pub const fn auto_approves_on_bare_targets(self) -> bool {
         match self {
             Self::Kimi | Self::Grok => true,
-            Self::Codex | Self::Claude => false,
+            Self::Codex | Self::Claude | Self::Deepseek => false,
         }
     }
 
@@ -150,7 +181,7 @@ impl HarnessKind {
         match self {
             Self::Kimi => Some("its default auto mode"),
             Self::Grok => Some("Hel's --always-approve launch flag"),
-            Self::Codex | Self::Claude => None,
+            Self::Codex | Self::Claude | Self::Deepseek => None,
         }
     }
 
@@ -174,7 +205,7 @@ impl HarnessKind {
                 on: "plan",
                 off: "default",
             }),
-            Self::Codex | Self::Claude | Self::Kimi => None,
+            Self::Codex | Self::Claude | Self::Kimi | Self::Deepseek => None,
         }
     }
 
@@ -183,7 +214,7 @@ impl HarnessKind {
     pub fn bridge_override_args(self, unrestricted: bool) -> Vec<&'static str> {
         let flag = self.launch_flag_for(unrestricted);
         match self {
-            Self::Codex | Self::Claude => Vec::new(),
+            Self::Codex | Self::Claude | Self::Deepseek => Vec::new(),
             Self::Kimi => vec!["acp"],
             Self::Grok => ["agent"].into_iter().chain(flag).chain(["stdio"]).collect(),
         }
@@ -913,6 +944,13 @@ mod tests {
         assert_eq!(grok.acp_mode(), None);
         assert_eq!(grok.launch_flag(), Some("--always-approve"));
         assert_eq!(grok.label(), "always-approve");
+        let deepseek = HarnessKind::Deepseek.unrestricted_enforcement();
+        assert_eq!(deepseek.acp_mode(), None);
+        assert_eq!(deepseek.launch_flag(), None);
+        assert_eq!(
+            deepseek.launch_environment(),
+            Some(("DSH_PERMISSION_MODE", "danger-full-access"))
+        );
     }
 
     #[test]
@@ -929,6 +967,7 @@ mod tests {
         assert_eq!(HarnessKind::Grok.id(), "grok");
         assert_eq!(HarnessKind::Grok.display_name(), "Grok Build");
         assert_eq!(HarnessKind::Grok.default_home_leaf(), ".grok");
+        assert_eq!(HarnessKind::Deepseek.home_env(), "DSH_HOME");
         assert!("nope".parse::<HarnessKind>().is_err());
     }
 
@@ -941,7 +980,12 @@ mod tests {
                 off: "default",
             })
         );
-        for kind in [HarnessKind::Codex, HarnessKind::Claude, HarnessKind::Kimi] {
+        for kind in [
+            HarnessKind::Codex,
+            HarnessKind::Claude,
+            HarnessKind::Kimi,
+            HarnessKind::Deepseek,
+        ] {
             assert_eq!(kind.plan_mode_ids(), None);
         }
     }
@@ -963,6 +1007,11 @@ mod tests {
                 HarnessKind::Kimi.bridge_override_args(unrestricted),
                 ["acp"]
             );
+            assert!(
+                HarnessKind::Deepseek
+                    .bridge_override_args(unrestricted)
+                    .is_empty()
+            );
             // Grok Build asks by default and Hel answers by cancelling, so a
             // session without the flag could not write at all. It carries the
             // flag on every target, restricted ones included.
@@ -982,7 +1031,12 @@ mod tests {
                 Some("--always-approve")
             );
             // The ACP-mode harnesses have no launch flag to carry.
-            for kind in [HarnessKind::Codex, HarnessKind::Claude, HarnessKind::Kimi] {
+            for kind in [
+                HarnessKind::Codex,
+                HarnessKind::Claude,
+                HarnessKind::Kimi,
+                HarnessKind::Deepseek,
+            ] {
                 assert_eq!(kind.launch_flag_for(unrestricted), None, "{kind:?}");
             }
         }
@@ -998,7 +1052,11 @@ mod tests {
             HarnessKind::Grok.bare_target_auto_approval(),
             Some("Hel's --always-approve launch flag")
         );
-        for kind in [HarnessKind::Codex, HarnessKind::Claude] {
+        for kind in [
+            HarnessKind::Codex,
+            HarnessKind::Claude,
+            HarnessKind::Deepseek,
+        ] {
             assert_eq!(kind.bare_target_auto_approval(), None, "{kind:?}");
         }
         // The warning and the flag decision read the same fact.

@@ -333,6 +333,14 @@ impl Controller {
         if project_directory.is_none() && bundle.is_none() {
             bail!("unknown bundle {bundle_id:?}");
         }
+        if profile.kind == crate::hel_config::HarnessKind::Deepseek
+            && (!additional_mounts.is_empty()
+                || bundle.is_some_and(|bundle| bundle.repositories.len() > 1))
+        {
+            bail!(
+                "DeepSeek Harness ACP supports one workspace root; use a single-repository bundle without attached directories"
+            );
+        }
         let dirty = bundle
             .map(dirty_local_repositories)
             .transpose()?
@@ -705,6 +713,40 @@ mod tests {
             project_directory: None,
             session_title_override: None,
         }
+    }
+
+    #[test]
+    fn deepseek_registration_rejects_more_than_one_workspace_root_before_persisting() {
+        let mut config = registration_config();
+        config.profiles.get_mut("codex").unwrap().kind = HarnessKind::Deepseek;
+        let second = config.bundles["project"].repositories[0].clone();
+        config
+            .bundles
+            .get_mut("project")
+            .unwrap()
+            .repositories
+            .push(crate::hel_config::ProjectRepository {
+                id: "second".into(),
+                destination: "second".into(),
+                ..second
+            });
+        let mut controller = Controller {
+            config,
+            state: HelState::default(),
+        };
+
+        let error = controller
+            .register_session_with_resources(
+                "codex",
+                "project",
+                "podman",
+                "unsupported",
+                launch_options(Vec::new()),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("one workspace root"));
+        assert!(controller.state.sessions.is_empty());
     }
 
     /// HEL_DATA_DIR is process-global, so every test that reaches the

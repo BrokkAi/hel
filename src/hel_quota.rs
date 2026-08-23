@@ -359,6 +359,9 @@ async fn refresh_profile(
                 })
                 .map_err(|error| anyhow::anyhow!(error.to_string()))
         }
+        HarnessKind::Deepseek => Err(anyhow::anyhow!(
+            "usage-priced harness; no subscription quota window"
+        )),
     };
     let report = result.unwrap_or_else(|error| ProfileQuota {
         profile_id,
@@ -1441,6 +1444,29 @@ mod tests {
         assert_eq!(
             report.error.as_deref(),
             Some("Grok Build executable not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_reports_no_subscription_window_instead_of_inventing_quota() {
+        let directory = tempfile::tempdir().unwrap();
+        let (outcome, _) = refresh_profile(
+            QuotaRefreshRequest {
+                profile_id: "deepseek".into(),
+                harness: HarnessKind::Deepseek,
+                source_home: directory.path().to_path_buf(),
+                executable: None,
+                environment: BTreeMap::new(),
+                cwd: directory.path().to_path_buf(),
+            },
+            None,
+        )
+        .await;
+
+        assert!(outcome.report.windows.is_empty());
+        assert_eq!(
+            outcome.report.error.as_deref(),
+            Some("usage-priced harness; no subscription quota window")
         );
     }
 

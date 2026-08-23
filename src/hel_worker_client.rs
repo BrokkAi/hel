@@ -1044,13 +1044,13 @@ async fn reconcile_connected(
         }
         SyncAction::Pull => {
             let bytes = client.read_credentials().await?;
-            validate_credential_payload(&bytes).with_context(|| {
+            validate_credential_payload(target.harness, &bytes).with_context(|| {
                 format!(
                     "session {} returned an unusable credential file",
                     target.session_id
                 )
             })?;
-            write_credential_file(canonical_path, &bytes).with_context(|| {
+            write_credential_file(target.harness, canonical_path, &bytes).with_context(|| {
                 format!(
                     "install fresher credentials from session {} for profile {}",
                     target.session_id, target.profile_id

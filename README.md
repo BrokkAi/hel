@@ -1,7 +1,7 @@
 # Hel
 
 Hel is a terminal control plane for coding agents. It runs many long-lived
-agent sessions — Codex, Claude Code, Kimi Code, and Grok Build — in disposable
+agent sessions — Codex, Claude Code, Kimi Code, Grok Build, and DeepSeek Harness — in disposable
 isolated environments, keeps them working while you are away, and gives you one
 dashboard for their sessions, quotas, and credentials. Agents connect through
 the [Agent Client Protocol](https://agentclientprotocol.com) (ACP).
@@ -73,8 +73,9 @@ Hel exists for the second case.
 | Claude Code | yes | yes |
 | Kimi Code | yes | yes |
 | Grok Build | yes | yes |
+| DeepSeek Harness | credentials yes; usage-priced, no subscription quota | yes |
 
-The set is extensible by design: these four are reference integrations, not a
+The set is extensible by design: these five are reference integrations, not a
 closed list. A new ACP-speaking harness needs a launch recipe or bridge, its
 credential file shapes and login command, its home environment variable, a
 checkpoint allowlist for native session state, and optionally a quota reader.
@@ -116,7 +117,8 @@ authentication):
 podman pull ghcr.io/brokkai/hel/agent-dev:latest
 ```
 
-It includes Rust, Node, Git, GitHub CLI, and the Codex and Claude ACP bridges.
+It includes Rust, Node, Git, GitHub CLI, the Codex and Claude ACP bridges, and
+pinned DeepSeek Harness plus `dsh-acp-server` packages.
 See [docs/src/content/docs/custom-images.md](docs/src/content/docs/custom-images.md)
 to build your own.
 

@@ -70,7 +70,7 @@ fn production_compaction_config(harness: HarnessKind) -> Option<ProductionCompac
             effort: "high",
         }),
         // Both auto-compact and expose a native `/compact`.
-        HarnessKind::Kimi | HarnessKind::Grok => None,
+        HarnessKind::Kimi | HarnessKind::Grok | HarnessKind::Deepseek => None,
     }
 }
 

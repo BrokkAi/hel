@@ -84,6 +84,13 @@ impl Controller {
                 .iter()
                 .map(|resource| resource.destination.clone()),
         );
+        if profile.kind == crate::hel_config::HarnessKind::Deepseek
+            && !additional_directories.is_empty()
+        {
+            bail!(
+                "DeepSeek Harness ACP does not support multiple workspace roots; use a single-repository bundle"
+            );
+        }
         // The flag-enforced harnesses need the unrestricted decision on the
         // bridge command line, so it is taken before the launch config.
         let force_unrestricted = force_unrestricted_mode(backend);
@@ -94,6 +101,11 @@ impl Controller {
         );
         let mut environment = profile.environment.clone();
         environment.insert(profile.home_env().into(), target_profile_home.clone());
+        if force_unrestricted
+            && let Some((key, value)) = profile.kind.unrestricted_enforcement().launch_environment()
+        {
+            environment.insert(key.to_owned(), value.to_owned());
+        }
         let launch = WorkerLaunchConfig {
             session_id: session_id.to_string(),
             harness: profile.kind,
@@ -453,6 +465,10 @@ const CODEX_ACP_FALLBACK_VERSION: &str = "1.1.14";
 
 const CLAUDE_AGENT_ACP_FALLBACK_VERSION: &str = "0.68.0";
 
+const DEEPSEEK_HARNESS_FALLBACK_VERSION: &str = "0.1.1-rc.2";
+
+const DEEPSEEK_ACP_FALLBACK_VERSION: &str = "0.10.0";
+
 fn bridge_launch(
     harness: crate::hel_config::HarnessKind,
     executable: Option<&Path>,
@@ -502,11 +518,28 @@ fn bridge_launch(
                 ],
             )
         }
+        crate::hel_config::HarnessKind::Deepseek => (
+            "sh".into(),
+            vec![
+                "-lc".into(),
+                format!(
+                    "{}; if command -v dsh-acp-server >/dev/null 2>&1; then exec dsh-acp-server; fi; exec npx -y -p @deepseek-ai/dsh@{DEEPSEEK_HARNESS_FALLBACK_VERSION} -p dsh-acp-server@{DEEPSEEK_ACP_FALLBACK_VERSION} dsh-acp-server",
+                    ensure_node_22_script(),
+                ),
+            ],
+        ),
     }
 }
 
 fn ensure_node_script() -> &'static str {
     "if ! command -v npx >/dev/null 2>&1; then if [ \"$(id -u)\" = 0 ]; then SUDO=''; elif command -v sudo >/dev/null 2>&1 && sudo -n true; then SUDO='sudo'; else echo 'Hel needs Node/npx or passwordless sudo to install it' >&2; exit 127; fi; if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update && $SUDO apt-get install -y nodejs npm; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y nodejs npm; elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y nodejs npm; elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache nodejs npm; else echo 'Hel cannot install Node on this image; bake npx or a compatible ACP bridge into it' >&2; exit 127; fi; fi"
+}
+
+fn ensure_node_22_script() -> String {
+    format!(
+        "{}; if ! node -e 'process.exit(Number(process.versions.node.split(\".\")[0]) >= 22 ? 0 : 1)'; then echo 'DeepSeek Harness requires Node.js 22 or newer' >&2; exit 127; fi",
+        ensure_node_script()
+    )
 }
 
 const HEL_CONTAINER_ENVIRONMENT: &str = "## Hel container environment\n\nThis session runs in a disposable Hel container. When the session closes, Hel checkpoints everything in project workspace directories (`/workspace/...`), including committed work, staged and unstaged changes, and untracked files.\n\nEverything outside the workspace, including installed packages, `$HOME`, and `/tmp`, is ephemeral and will be lost when the session ends. Keep durable results in the workspace or push them to a remote.\n";
@@ -551,6 +584,13 @@ fn stage_profile(profile: &crate::hel_config::HarnessProfile, destination: &Path
             "skills",
             "plugins",
         ],
+        crate::hel_config::HarnessKind::Deepseek => &[
+            ".credentials.yaml",
+            "settings.yaml",
+            "AGENTS.md",
+            "skills",
+            ".agent-presets",
+        ],
     };
     // Allowlist entries (and, within each, a copied directory's children) are
     // independent of one another, so copying them concurrently shortens the
@@ -575,6 +615,7 @@ fn append_hel_container_environment(
         crate::hel_config::HarnessKind::Claude => "CLAUDE.md",
         crate::hel_config::HarnessKind::Kimi => "SYSTEM.md",
         crate::hel_config::HarnessKind::Grok => "AGENTS.md",
+        crate::hel_config::HarnessKind::Deepseek => "AGENTS.md",
     };
     let path = destination.join(instructions);
     let separator = match std::fs::read_to_string(&path) {
@@ -1725,6 +1766,12 @@ mod tests {
         let (_, claude_arguments) =
             bridge_launch(crate::hel_config::HarnessKind::Claude, None, true);
         assert!(claude_arguments[1].contains("@agentclientprotocol/claude-agent-acp@0.68.0"));
+
+        let (_, deepseek_arguments) =
+            bridge_launch(crate::hel_config::HarnessKind::Deepseek, None, true);
+        assert!(deepseek_arguments[1].contains("@deepseek-ai/dsh@0.1.1-rc.2"));
+        assert!(deepseek_arguments[1].contains("dsh-acp-server@0.10.0"));
+        assert!(deepseek_arguments[1].contains("exec dsh-acp-server"));
     }
     #[test]
     fn bridge_fallback_pins_match_the_agent_dev_containerfile() {
@@ -1745,6 +1792,16 @@ mod tests {
                  bridge_launch() npx fallbacks have to stay in lockstep, otherwise a container \
                  session and an npx session run different adapter versions."
         );
+
+        for package in [
+            format!("@deepseek-ai/dsh@{DEEPSEEK_HARNESS_FALLBACK_VERSION}"),
+            format!("dsh-acp-server@{DEEPSEEK_ACP_FALLBACK_VERSION}"),
+        ] {
+            assert!(
+                CONTAINERFILE.contains(&package),
+                "containers/Containerfile.agent-dev must install {package}"
+            );
+        }
     }
     #[test]
     fn kimi_default_bridge_uses_bash_for_the_official_installer() {
@@ -1789,6 +1846,7 @@ mod tests {
                 crate::hel_config::HarnessKind::Grok,
                 vec!["agent", "--always-approve", "stdio"],
             ),
+            (crate::hel_config::HarnessKind::Deepseek, Vec::new()),
         ] {
             for unrestricted in [false, true] {
                 let (command, arguments) = bridge_launch(kind, Some(&executable), unrestricted);
@@ -1888,12 +1946,46 @@ mod tests {
         assert!(staged.path().join("credentials/kimi-code.json").is_file());
     }
     #[test]
+    fn stage_deepseek_profile_copies_only_portable_configuration() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".credentials.yaml"),
+            "version: 1\nrefs: {}\n",
+        )
+        .unwrap();
+        std::fs::write(home.path().join("settings.yaml"), "models: {}\n").unwrap();
+        std::fs::create_dir(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/native-session"), "private state").unwrap();
+        std::fs::create_dir(home.path().join("profiles")).unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let profile = crate::hel_config::HarnessProfile {
+            kind: crate::hel_config::HarnessKind::Deepseek,
+            home: home.path().to_path_buf(),
+            executable: None,
+            environment: BTreeMap::new(),
+            context_window_bytes: None,
+        };
+
+        stage_profile(&profile, staged.path()).unwrap();
+
+        assert!(staged.path().join(".credentials.yaml").is_file());
+        assert!(staged.path().join("settings.yaml").is_file());
+        assert!(!staged.path().join("sessions").exists());
+        assert!(!staged.path().join("profiles").exists());
+        assert!(
+            std::fs::read_to_string(staged.path().join("AGENTS.md"))
+                .unwrap()
+                .contains("Hel container environment")
+        );
+    }
+    #[test]
     fn stage_profile_appends_container_environment_for_each_harness_without_touching_home() {
         for (kind, instructions) in [
             (crate::hel_config::HarnessKind::Codex, "AGENTS.md"),
             (crate::hel_config::HarnessKind::Claude, "CLAUDE.md"),
             (crate::hel_config::HarnessKind::Kimi, "SYSTEM.md"),
             (crate::hel_config::HarnessKind::Grok, "AGENTS.md"),
+            (crate::hel_config::HarnessKind::Deepseek, "AGENTS.md"),
         ] {
             let home = tempfile::tempdir().unwrap();
             let original = "# Controller instructions\n\nKeep this source unchanged.\n";

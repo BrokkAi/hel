@@ -33,9 +33,11 @@ const ARCHIVE_MAGIC: &[u8; 8] = b"HELSKIL1";
 /// matching the provisioning allowlist in `stage_profile`.
 pub fn synced_skill_dirs(kind: HarnessKind) -> &'static [&'static str] {
     match kind {
-        HarnessKind::Codex | HarnessKind::Claude | HarnessKind::Kimi | HarnessKind::Grok => {
-            &["skills"]
-        }
+        HarnessKind::Codex
+        | HarnessKind::Claude
+        | HarnessKind::Kimi
+        | HarnessKind::Grok
+        | HarnessKind::Deepseek => &["skills"],
     }
 }
 
